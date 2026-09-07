@@ -30,12 +30,12 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use crate::config::Config;
 use crate::ids::{ContextId, RingId};
 
-use super::budget::Budget;
 use super::context::{Context, Submitted, Unimplemented, Wait};
 use super::journal::Seq;
 use super::objects::ObjectKey;
 use super::ring::{ReplyStream, Ring, ShmResources};
 use super::ring_thread::{self, Dispatch, RingWaiter, Verdict};
+use crate::budget::Budget;
 use crate::vulkan::Global;
 
 /// Why a venus call could not be served. Both are the caller's mistake, not ours: a context that
@@ -80,7 +80,7 @@ pub struct Vkr {
     /// Held as the trait, not the table, so this module still never learns what a `Resource` is.
     resources: SharedResources,
     /// What every context together has made this process hold. One ledger per renderer, because
-    /// the host kills the *process* for the total -- see [`crate::venus::budget`]. Each context
+    /// the host kills the *process* for the total -- see [`crate::budget`]. Each context
     /// gets a key to it and can reach nothing else, which is what makes billing structural.
     budget: Arc<Budget>,
 }
@@ -110,7 +110,7 @@ impl ContextKey {
     }
 
     /// A key for a context no table stood up, for tests that build a `Context` or an
-    /// [`Account`](super::budget::Account) directly.
+    /// [`Account`](crate::budget::Account) directly.
     ///
     /// Its own counter, so two of these are two occupants even under one id -- which is the
     /// case worth testing, and the one a fixed generation would quietly make untestable.

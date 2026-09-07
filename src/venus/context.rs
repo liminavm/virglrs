@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ids::{ContextId, ResourceHandle, RingId};
 
-use super::budget::{Account, Budget};
 use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
@@ -129,6 +128,7 @@ use super::ring::{
 use super::ring_thread::{RingThread, RingWaiter, WaitRing, seqno_ge};
 use super::sync;
 use super::vkr::ContextKey;
+use crate::budget::{Account, Budget};
 use crate::vulkan::Global;
 
 /// `VK_COMMAND_GENERATE_REPLY_BIT_EXT`: the guest wants an answer to this command.
@@ -3130,7 +3130,7 @@ impl Commands for Handlers<'_> {
     /// guest will hit: past the cap its context is stopped. Left alone that reply actively
     /// misleads -- a client sizing its caches against tens of GiB is killed for believing us --
     /// and it is the only backpressure venus does not throw away, because a budget query is a
-    /// real round-trip while an allocation's result is discarded (see [`budget`]). Only
+    /// real round-trip while an allocation's result is discarded (see [`crate::budget`]). Only
     /// `DEVICE_LOCAL` heaps are rewritten: those are the ones our allocations land in.
     fn vkGetPhysicalDeviceMemoryProperties2(
         &mut self,

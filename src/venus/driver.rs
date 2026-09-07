@@ -14,7 +14,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::budget::{Account, Charge};
 use super::cs::{Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
 use super::objects::Doomed;
 use super::proto::types::{
@@ -51,6 +50,7 @@ use super::proto::types::{
     VkSubmitInfo, VkSubpassContents, VkSubresourceLayout, VkTimelineSemaphoreSubmitInfo,
     VkViewport, VkWriteDescriptorSet,
 };
+use crate::budget::{Account, Charge, Charged};
 use std::sync::Arc;
 
 use super::ring::ResourceBytes;
@@ -280,7 +280,7 @@ pub enum FreeRefused {
 /// Two refusals that are not the same thing. A driver's is the guest's own affair -- it asked for
 /// memory the host does not have, and unwinding from that is something it does on hardware too. A
 /// budget refusal is this renderer declining to serve a request it could have served, which the
-/// guest is given no way to find out about (see [`crate::venus::budget`]) and so cannot recover
+/// guest is given no way to find out about (see [`crate::budget`]) and so cannot recover
 /// from; the context stops instead, at the command that caused it rather than several later.
 #[derive(Debug)]
 pub enum NoMemory {
@@ -301,7 +301,7 @@ impl NoMemory {
 
 /// The driver objects one context has stood up.
 pub struct Driver {
-    /// This context's key to the host memory ledger -- see [`crate::venus::budget`]. Held here
+    /// This context's key to the host memory ledger -- see [`crate::budget`]. Held here
     /// rather than passed to the calls that allocate, because the record of what was allocated
     /// lives here too, and a charge is credited by that record going away.
     account: Account,
@@ -2298,7 +2298,7 @@ impl Driver {
             Allocated {
                 size: surface.alloc_size(),
                 backing: Backing::Owned {
-                    storage: Storage::Texture(Arc::new(Charged { it: surface, charge })),
+                    storage: Storage::Texture(Arc::new(Charged::new(surface, charge))),
                     published: false,
                 },
                 props: VkMemoryPropertyFlags(
@@ -3815,7 +3815,7 @@ impl Driver {
             (None, Ok(surface), _) => {
                 let charge = self.admit("IOSurface", surface.alloc_size())?;
                 Backing::Owned {
-                    storage: Storage::Texture(Arc::new(Charged { it: surface, charge })),
+                    storage: Storage::Texture(Arc::new(Charged::new(surface, charge))),
                     published: false,
                 }
             }
@@ -4146,7 +4146,10 @@ impl Driver {
         // there is nothing for `vkMapMemory` to map -- the driver imported them.
         if let Backing::Owned { storage: Storage::Linear(p), .. } = &record.backing {
             let n = buf.len().min(size as usize);
-            assert!(p.it.map.copy_out(0, &mut buf[..n]), "the census reads within pages it minted");
+            assert!(
+                p.it().map.copy_out(0, &mut buf[..n]),
+                "the census reads within pages it minted"
+            );
             return Ok(n);
         }
         let Some(d) = self.devices.get(&device) else {
@@ -4210,7 +4213,7 @@ impl Driver {
             return Ok(surface.write_from(src));
         }
         if let Backing::Owned { storage: Storage::Linear(p), .. } = &record.backing {
-            assert!(p.it.map.copy_in(0, src), "a write within pages this renderer minted");
+            assert!(p.it().map.copy_in(0, src), "a write within pages this renderer minted");
             return Ok(src.len());
         }
         let Some(d) = self.devices.get(&device) else {
@@ -4567,24 +4570,6 @@ impl core::fmt::Display for NoSurface {
     }
 }
 
-/// Storage this renderer minted, and what it cost -- one value, because they have one lifetime.
-///
-/// The charge lives with the storage rather than on the allocation record so that it is credited
-/// when the *storage* goes, not when the allocation does. A resource holding a share keeps the
-/// storage alive past the context that made it, and those bytes are still the host's to count; a
-/// charge on the record would have been credited at the context's destroy while the memory stood.
-pub struct Charged<T> {
-    it: T,
-    #[expect(dead_code, reason = "held for its Drop -- crediting the ledger is this going away")]
-    charge: Charge,
-}
-
-impl crate::metal::Held for Charged<Surface> {
-    fn surface(&self) -> &Surface {
-        &self.it
-    }
-}
-
 impl Storage {
     /// A share of this storage, as the keepalive an EGL image over its surface must hold.
     ///
@@ -4616,7 +4601,7 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn minted_for_test(surface: Surface, account: &Account) -> Storage {
         let charge = account.try_charge("IOSurface", surface.alloc_size()).expect("no cap");
-        Storage::Texture(Arc::new(Charged { it: surface, charge }))
+        Storage::Texture(Arc::new(Charged::new(surface, charge)))
     }
 
     /// A share over pages this renderer minted, charged to `account`, for the same tests.
@@ -4630,7 +4615,7 @@ impl Storage {
     /// A share over minted pages, carrying why they are not a surface.
     fn pages(map: GuestMap, charge: Charge, why: NoSurface) -> Storage {
         let it = Pages { map, why, said: std::sync::atomic::AtomicBool::new(false) };
-        Storage::Linear(Arc::new(Charged { it, charge }))
+        Storage::Linear(Arc::new(Charged::new(it, charge)))
     }
 }
 
@@ -4656,7 +4641,7 @@ impl core::fmt::Debug for Storage {
         match self {
             Storage::Texture(m) => f.debug_tuple("Texture").field(&m.surface().id()).finish(),
             Storage::Linear(p) => {
-                f.debug_tuple("Linear").field(&p.it.map.len()).field(&p.it.why).finish()
+                f.debug_tuple("Linear").field(&p.it().map.len()).field(&p.it().why).finish()
             }
         }
     }
@@ -4667,7 +4652,7 @@ impl Storage {
     pub fn span(&self) -> (usize, u64) {
         match self {
             Storage::Texture(m) => (m.surface().host_addr(), m.surface().alloc_size()),
-            Storage::Linear(p) => (p.it.map.host_addr(), p.it.map.len() as u64),
+            Storage::Linear(p) => (p.it().map.host_addr(), p.it().map.len() as u64),
         }
     }
 
@@ -4680,7 +4665,7 @@ impl Storage {
     pub fn mapping(&self) -> Option<&GuestMap> {
         match self {
             Storage::Texture(_) => None,
-            Storage::Linear(p) => Some(&p.it.map),
+            Storage::Linear(p) => Some(&p.it().map),
         }
     }
 
@@ -4690,7 +4675,7 @@ impl Storage {
     pub fn surface(&self) -> Result<&Surface, NoSurface> {
         match self {
             Storage::Texture(m) => Ok(m.surface()),
-            Storage::Linear(p) => Err(p.it.why),
+            Storage::Linear(p) => Err(p.it().why),
         }
     }
 
@@ -4700,7 +4685,7 @@ impl Storage {
     pub fn first_refusal(&self) -> bool {
         match self {
             Storage::Texture(_) => false,
-            Storage::Linear(p) => !p.it.said.swap(true, std::sync::atomic::Ordering::Relaxed),
+            Storage::Linear(p) => !p.it().said.swap(true, std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -5398,7 +5383,7 @@ mod tests {
     /// minted it happens to stand.
     #[test]
     fn a_shared_surface_stays_charged_after_its_allocation_is_gone() {
-        use super::super::budget::Budget;
+        use crate::budget::Budget;
         let budget = Budget::with_cap(None, false);
         let one = crate::ids::ContextId::new(1).expect("not zero");
         let mut d = Driver::new(Account::open(
@@ -5923,10 +5908,10 @@ mod tests {
     /// minted has only the driver's mapping to publish.
     #[test]
     fn host_addressable_memory_is_backed_by_pages_this_renderer_minted() {
-        use super::super::budget::Budget;
         use super::super::proto::types::{
             VkExportMemoryAllocateInfo, VkExternalMemoryHandleTypeFlags,
         };
+        use crate::budget::Budget;
         use std::cell::Cell;
 
         const DEVICE: VkDevice = VkDevice(3);

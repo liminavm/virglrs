@@ -8,7 +8,6 @@
 //! rather than C, and is built into `OUT_DIR` by `build.rs` -- never checked in, because generated
 //! code that is edited by hand is a bug in a place no one will look.
 
-pub mod budget;
 pub mod capset;
 pub mod context;
 pub mod cs;
