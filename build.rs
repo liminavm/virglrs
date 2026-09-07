@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! Run the venus protocol generator into `OUT_DIR`.
 //!
@@ -10,10 +10,32 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The reference C renderer, vendored by `scripts/vendor.sh` from the rev
+/// `third_party/manifest.toml` pins.
+///
+/// It is a build input, not only the harness's other leg: the format tables are generated from
+/// its `virgl_hw.h` and from Mesa's `u_format.yaml` beside it, and it carries the pinned
+/// venus-protocol the wire is generated from. A tree without it does not build, and says so here
+/// rather than in a generator's traceback.
+fn c_tree(manifest: &std::path::Path) -> PathBuf {
+    let tree = manifest.join("third_party/virglrenderer");
+    assert!(
+        tree.join("src/virgl_hw.h").is_file(),
+        "third_party/virglrenderer is not vendored: run scripts/vendor.sh"
+    );
+    tree
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let generator = manifest.join("venus-gen");
-    let protocol = manifest.parent().unwrap().join("subprojects/venus-protocol-1.0");
+    let tree = c_tree(&manifest);
+    let protocol = tree.join("subprojects/venus-protocol-1.0");
+    assert!(
+        protocol.join("vkxml.py").is_file(),
+        "venus-protocol is not materialized: run `meson subprojects download` in \
+         third_party/virglrenderer"
+    );
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("venus");
 
     for dep in ["gen.py", "rustgen.py", "templates"] {
@@ -67,7 +89,7 @@ fn gl_bindings(manifest: &std::path::Path) {
 /// from -- one copy of each (`vrend-gen/README.md`).
 fn vrend_formats(manifest: &std::path::Path) {
     let generator = manifest.join("vrend-gen");
-    let tree = manifest.parent().unwrap();
+    let tree = c_tree(manifest);
     let virgl_hw = tree.join("src/virgl_hw.h");
     let gallium = tree.join("src/gallium/auxiliary/util");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("vrend");
@@ -232,7 +254,7 @@ fn reply_oracle(manifest: &std::path::Path, protocol: &std::path::Path, out: &st
 /// `tests/oracle/video_oracle.c` is the shim that gives them entry points.
 #[cfg(feature = "video-oracle")]
 fn video_oracle(manifest: &std::path::Path) {
-    let tree = manifest.parent().unwrap();
+    let tree = c_tree(manifest);
     let oracle = manifest.join("tests/oracle");
     println!("cargo::rerun-if-changed={}", oracle.display());
     println!("cargo::rerun-if-changed={}", tree.join("src/vrend").display());
