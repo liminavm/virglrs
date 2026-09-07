@@ -902,6 +902,21 @@ impl Renderer {
         let (own, attached) = self
             .with_resource(handle, |r| (r.iov.clone(), r.attached.clone()))
             .ok_or(Error::NoResource)?;
+        // The other door into a resource, and the one a guest's CPU write to a scanout arrives
+        // through: the context stream's transfer is traced in `vrend::context`, and a transfer
+        // named by the VMM never touches it. Both have to be silent for "nothing wrote it" to
+        // mean anything.
+        if to_host && std::env::var_os("LIMINA_READBACK_TRACE").is_some() {
+            // Filtered on the resource resolving to a classic IOSurface, the same resolution the
+            // blank-readback trace makes -- so the two name the same surfaces or neither does.
+            if let Some(surface) = self.classic_surface(handle) {
+                let id = surface.id().0;
+                eprintln!(
+                    "[virglrs] scanout write: ctx {ctx:?} transfer into resource {handle:?} \
+                     (IOSurface {id}) from the VMM"
+                );
+            }
+        }
         if let Some(c) = ctx {
             if !self.contexts.contains_key(&c) {
                 return Err(Error::NoContext);
