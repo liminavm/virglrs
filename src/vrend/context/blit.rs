@@ -257,6 +257,13 @@ impl Context {
             && src.region.height == dst.region.height
             && src.region.depth == dst.region.depth;
         if copy_path {
+            super::trace_scanout_write(
+                host,
+                cmd,
+                "copy_sub_image",
+                dst.resource,
+                Some(src.resource),
+            );
             return self.copy_sub_image(
                 host,
                 cmd,
@@ -268,6 +275,7 @@ impl Context {
                 [dst.region.x, dst.region.y, dst.region.z],
             );
         }
+        super::trace_scanout_write(host, cmd, "blit_int", dst.resource, Some(src.resource));
         self.blit_int(host, b)
     }
 
@@ -688,6 +696,7 @@ impl Context {
         src_box: Box3,
     ) -> Result<(), Fault> {
         let cmd = Cmd::ResourceCopyRegion;
+        super::trace_scanout_write(host, cmd, "copy_region", dst, Some(src));
         let gl = host.gl;
         let formats = host.formats;
         let src_res = host.resource(cmd, src)?;
@@ -820,6 +829,7 @@ impl Context {
             let s = self.sub().surface(cmd, surface)?;
             (s.resource, s.format, s.level, s.layer(), s.view)
         };
+        super::trace_scanout_write(host, cmd, "clear_surface", resource, None);
         let entry = host.formats.get(format).ok_or(Fault::IllegalFormat { cmd, format })?;
         if !entry.can_render() && !entry.is_ds() {
             return Err(Fault::IllegalFormat { cmd, format });
