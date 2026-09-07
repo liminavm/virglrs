@@ -7,6 +7,8 @@
 # nothing else in the harness sees -- a missing symbol only shows at dlopen, a wrong offset never
 # shows at all, it just corrupts.
 #
+# The layout is exact; the symbols are a floor. See the checks at the bottom for why.
+#
 #   abi-fixture.sh            check the current build against the pinned fixtures
 #   abi-fixture.sh --pin      re-record them (do this only when the ABI is meant to change)
 #
@@ -56,15 +58,49 @@ cc -O0 -o "$TMP/abi-dump" "$HERE/abi-dump.c" -I"$ROOT/third_party/virglrenderer/
 "$TMP/abi-dump" > "$TMP/layout.txt"
 
 fail=0
-for f in symbols layout; do
-  if [ "$PIN" = 1 ]; then
-    cp "$TMP/$f.txt" "$HERE/$f.txt"
-    echo "pinned $f.txt ($(wc -l < "$TMP/$f.txt" | tr -d ' ') lines)"
-  elif diff -u "$HERE/$f.txt" "$TMP/$f.txt"; then
-    echo "$f matches"
-  else
-    echo "ABI FIXTURE MISMATCH: $f" >&2
-    fail=1
+
+# The layout is an exact match, on either implementation. A struct that crosses the ABI has one
+# shape; a field at the wrong offset compiles clean on both sides and corrupts at run time, so
+# there is no such thing as an acceptable difference here.
+if [ "$PIN" = 1 ]; then
+  cp "$TMP/layout.txt" "$HERE/layout.txt"
+  echo "pinned layout.txt ($(wc -l < "$TMP/layout.txt" | tr -d ' ') lines)"
+elif diff -u "$HERE/layout.txt" "$TMP/layout.txt"; then
+  echo "layout matches"
+else
+  echo "ABI FIXTURE MISMATCH: layout" >&2
+  fail=1
+fi
+
+# The symbols are a floor, not an exact list, because the two implementations legitimately differ:
+# virglrs serves `journal_held`, which the C header has no equivalent of. The failure this gate
+# exists for is a *missing* symbol -- it shows at dlopen and nowhere earlier -- and an extra one
+# satisfies every consumer of the list just as well. Extras are printed rather than ignored, so an
+# unintended export is still visible; it is just not a failure.
+if [ "$PIN" = 1 ]; then
+  # Pinning from the Rust build would raise the floor to include its extensions and fail the C
+  # leg on the next run -- and the diff would name the C as the regression.
+  if [ "$PREFIX" = "$ROOT/prefix" ]; then
+    echo "refusing to pin the symbol floor from the Rust build: it exports extensions the C" >&2
+    echo "does not, and a floor both must meet can only be recorded from the C." >&2
+    exit 2
   fi
-done
+  cp "$TMP/symbols.txt" "$HERE/symbols.txt"
+  echo "pinned symbols.txt ($(wc -l < "$TMP/symbols.txt" | tr -d ' ') lines)"
+else
+  missing="$(LC_ALL=C comm -23 "$HERE/symbols.txt" "$TMP/symbols.txt")"
+  extra="$(LC_ALL=C comm -13 "$HERE/symbols.txt" "$TMP/symbols.txt")"
+  if [ -n "$missing" ]; then
+    echo "symbols missing from $LIB:" >&2
+    echo "$missing" | sed 's/^/  - /' >&2
+    echo "ABI FIXTURE MISMATCH: symbols" >&2
+    fail=1
+  elif [ -n "$extra" ]; then
+    echo "symbols matches, plus extensions beyond the pinned floor:"
+    echo "$extra" | sed 's/^/  + /'
+  else
+    echo "symbols matches"
+  fi
+fi
+
 exit $fail
