@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! The classic wire, written. The inverse of [`decode`](super::decode): a [`Command`] back to the
 //! dwords the guest's encoder (`virgl_encode.c` in mesa) produces for it, bit for bit.

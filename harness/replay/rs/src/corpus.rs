@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! Reader for a venus capture (`src/venus/vkr_record.h`, format v3) and for the `VKJR` journal
 //! exports it carries as per-context prologues.

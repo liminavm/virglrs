@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! Replay a recorded venus corpus into a virglrenderer build, with no VM, no guest and no
 //! hypervisor -- harness layer 2 for venus (`harness/README.md`).

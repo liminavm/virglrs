@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 """Generate the GLES and EGL bindings from the Khronos registries.
 
     gen.py --outdir DIR [--registry DIR]

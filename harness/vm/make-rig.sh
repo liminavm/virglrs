@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 #
 # Build a self-contained VM rig under harness/vm: limina's app bundle with THIS tree's
 # virglrenderer swapped in, plus APFS clones of a couple of guest disks.

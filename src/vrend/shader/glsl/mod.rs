@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! The TGSI-to-GLSL emitter: `vrend_shader.c`'s `dump_ctx` and the passes that fill it.
 //!

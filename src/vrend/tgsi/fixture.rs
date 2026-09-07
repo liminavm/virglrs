@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! The C's shader log as a fixture: every shader the classic corpus creates, as `tgsi_dump`
 //! printed it and as `vrend_convert_shader` translated it (`harness/replay/vrend-shader-log.py`

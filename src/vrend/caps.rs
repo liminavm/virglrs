@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! The classic capsets, `virgl_caps_v1` and `virgl_caps_v2`: what the guest's virgl driver
 //! learns about this host before it draws anything. The guest reads them back by offset, so the

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT
- * Copyright © 2026 the limina authors
+ * Copyright © 2026 Gustavo Noronha Silva
  *
  * A stand-in for src/virgl_util.h, on the oracle build's include path ahead of the real one.
  *

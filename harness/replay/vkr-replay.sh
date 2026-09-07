@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 #
 # Replay a venus corpus against a renderer build, with no VM.
 #

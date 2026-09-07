@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! Hardware video decode: the codecs and decode targets a context owns, and the frames they
 //! decode.

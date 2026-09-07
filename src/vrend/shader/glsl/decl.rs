@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! The declaration side of the walk: what each `DCL`, `IMM` and `PROPERTY` records in the
 //! context, and the first pass that runs ahead of it.

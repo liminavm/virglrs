@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! TGSI, the shader language of the classic wire: a guest sends its shaders as TGSI *text*, and
 //! this module is what the text becomes -- the typed program the GLSL translator walks.

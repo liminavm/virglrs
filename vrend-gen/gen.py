@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 """Generate the classic renderer's format tables.
 
     gen.py --outdir DIR --virgl-hw PATH --gallium DIR

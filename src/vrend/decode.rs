@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! The classic wire's trust boundary: dwords in, [`Command`]s out, and everything the guest could
 //! have got wrong refused here.

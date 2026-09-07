@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! Draws: the program a draw runs, linked from the variants selected for the bound stages, and
 //! everything the C binds around it before the primitives go out (`vrend_draw_vbo`).

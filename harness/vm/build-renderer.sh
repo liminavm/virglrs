@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 #
 # Build THIS tree's virglrenderer into harness/vm/prefix, with the same options the limina
 # worker is built against: venus + video, surfaceless EGL, in-process render server.

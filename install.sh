@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 #
 # Build virglrs and lay it out as a virglrenderer prefix -- the same shape meson installs, so the
 # two implementations are swapped by pointing VIRGL_PREFIX at one or the other and nothing that

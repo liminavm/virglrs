@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 #
 # Boot a rig guest with a recorder armed, so a real workload becomes a replay corpus.
 #

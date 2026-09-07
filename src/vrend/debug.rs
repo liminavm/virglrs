@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! `VIRGLRS_DEBUG`: what the classic renderer prints beyond its errors. A comma-separated list
 //! of switches, read once; the C's is `VREND_DEBUG`, and the switches keep its names where they

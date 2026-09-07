@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! The classic renderer's root: the winsys, the driver, what it can do, and every GL object the
 //! guests own.

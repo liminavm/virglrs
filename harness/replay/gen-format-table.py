@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 #
 # Emit vrend-replay-formats.h: virgl format number -> bytes per block, and the block's width and
 # height in texels.

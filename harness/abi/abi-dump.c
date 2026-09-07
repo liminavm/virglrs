@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 //
 // Print the layout of every struct that crosses the C ABI, one field per line, as a file that can
 // be diffed. A layout mismatch is the failure mode nothing else in the harness catches: the Rust

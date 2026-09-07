@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! `tgsi_scan_shader`, reduced to what the translator reads and to what the scan refuses.
 //!

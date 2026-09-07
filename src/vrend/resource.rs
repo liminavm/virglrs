@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! A classic resource on the host: what the guest asked for, checked, and the GL object (or the
 //! host memory, or nothing) that backs it.

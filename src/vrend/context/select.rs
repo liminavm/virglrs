@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! Shader selection: the key the bound state makes for a stage, the variant that key names, and
 //! the GL shader the variant compiles to.
