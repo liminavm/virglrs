@@ -773,10 +773,32 @@ buildable throughout as the A-side reference.
   no golden, because the port is then graded against a bad frame. N runs, one hash.
 - **P5 — snapshot.** Journal export, `memory_write`, sync export/restore, classic
   content export/restore. Ends at suspend/resume parity.
-- **P6 — cutover.** Rust becomes the default prefix; limina's manifest and
-  `build-virglrenderer.sh` are reconciled to it and the C tree is tagged and
-  archived. Then the follow-up: delete rutabaga's FFI shim and depend on the crate
-  directly.
+- **P6 — cutover.** Done, and by a shorter route than this entry used to describe. There
+  is no default prefix to switch, because there is no prefix: rutabaga depends on the
+  `virglrs` crate by path (`rutabaga_gfx/Cargo.toml`) and reaches it through the Rust API,
+  so the renderer is linked into the worker rather than loaded. `build-virglrenderer.sh`,
+  `LIMINA_VIRGL_PREFIX`, `check-virgl-link.sh` and the pkg-config steering are gone rather
+  than reconciled — the link trap they defended against cannot happen when there is nothing
+  to load. The follow-up this entry named, deleting rutabaga's FFI shim, is what that
+  dependency *is*.
+
+  **The C tree is tagged (`virgl-pre-rewrite-2026-08-31`) and deliberately not archived.**
+  It is a build input: the format tables are generated from its `virgl_hw.h` and the venus
+  wire from the venus-protocol its meson wrap pins, and it is the harness's other leg, the
+  one the goldens are recorded from. Archiving it would take both.
+
+  So `ffi.rs` outlives the cutover. Its end date was "when rutabaga goes direct", and
+  rutabaga has; what keeps it is the harness, which drives *both* implementations through
+  the C ABI because that is the only surface the C has. It goes when the C stops being the
+  reference leg, not before. `crate-type` stays `["cdylib", "rlib"]` for exactly that
+  reason: the `rlib` is what ships, the `cdylib` is what gets measured.
+
+  Two things left, neither of them cutover work. The replay corpora still have no permanent
+  home and are not in git, so only the ABI layer of the harness runs on a fresh clone. And
+  `symbols.txt` pins one list for two implementations that legitimately differ — virglrs
+  exports `journal_held`, which the C header has no equivalent of — so the Rust leg cannot
+  match it and re-pinning would fail the C leg. Whether that fixture becomes a subset check
+  is [open](#open-and-owed-a-decision).
 
 ## Where virglrs deliberately differs from the C
 
@@ -821,6 +843,15 @@ to have it, each because reproducing the C would mean reproducing a defect.
 
 Each of these is a question about the renderers rather than about the harness, and each is
 waiting on a call rather than on work.
+
+- **One pinned symbol list cannot describe two implementations that differ.**
+  `harness/abi/symbols.txt` pins every symbol the dylib exports and is checked against whichever
+  build `VIRGL_PREFIX` selects. virglrs exports `journal_held`, a deliberate extension the C
+  header has no equivalent of, so the Rust leg cannot match the list and re-pinning to the Rust
+  side would fail the C leg. The fixture's own rationale argues for a subset check — a *missing*
+  symbol breaks `dlopen` and an extra one harms no consumer, and the stated point is that "a port
+  that exports the whole list satisfies every consumer of it". But that changes what the gate
+  means, so it is a decision: subset check, or one fixture per implementation.
 
 - **virglrs serves no push-descriptor command.** The C dispatches `vkCmdPushDescriptorSet` and
   `vkCmdPushDescriptorSet2`; virglrs implements neither, so a guest using them lands on the
