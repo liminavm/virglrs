@@ -98,13 +98,9 @@ pub struct StateKey {
 
 /// The state slot this command sets, or `None` if it leaves nothing that has to be rebuilt.
 ///
-/// `None` covers three kinds of command, and they are all deliberate. The transient ones --
-/// draws, clears, blits, barriers, queries, transfers -- describe work, not state, and the client
-/// re-issues them every frame. The structural ones -- creates, destroys, sub-context lifecycle --
-/// are retained somewhere that owns them instead. And `LINK_SHADER` is neither: it assembles a
-/// program early that a draw would otherwise assemble on demand, restoring the previous binds
-/// when it is done, so a rebuild that omits it is slower for one frame and identical after. The C
-/// design retains it; there is nothing in it to retain.
+/// The match is exhaustive and has no catch-all: every command answers the question, and a
+/// command added to the protocol does not compile until it answers too. The arms below say which
+/// kind of `None` each one is.
 pub fn state_key(cmd: &Command<'_>) -> Option<StateKey> {
     let stage_slot = |s: &ShaderStage, n: &u32| (s.index() as u32, *n);
     let (cmd, slot) = match cmd {
@@ -151,7 +147,68 @@ pub fn state_key(cmd: &Command<'_>) -> Option<StateKey> {
         Command::SetStreamoutTargets { .. } => (Cmd::SetStreamoutTargets, (0, 0)),
         Command::SetTessState(_) => (Cmd::SetTessState, (0, 0)),
         Command::SetRenderCondition { .. } => (Cmd::SetRenderCondition, (0, 0)),
-        _ => return None,
+
+        // Everything below rebuilds nothing, and each says which of the three kinds it is. The
+        // arms are spelled out because the catch-all they replace was a silent one: a command
+        // added to the protocol fell into it and was never retained, and nothing said so until a
+        // restored context died on the state it had lost. Now the build refuses the new variant
+        // until someone answers the question for it.
+
+        // Work, not state: the client re-issues these every frame, so a rebuild that starts with
+        // none of them is a rebuild that is simply between frames.
+        Command::Clear { .. }
+        | Command::ClearTexture { .. }
+        | Command::ClearSurface { .. }
+        | Command::DrawVbo { .. }
+        | Command::LaunchGrid { .. }
+        | Command::Blit { .. }
+        | Command::ResourceCopyRegion { .. }
+        | Command::ResourceInlineWrite { .. }
+        | Command::Transfer3d { .. }
+        | Command::CopyTransfer3d { .. }
+        | Command::EndTransfers { .. }
+        | Command::MemoryBarrier { .. }
+        | Command::TextureBarrier { .. } => return None,
+
+        // A question and its answer. Nothing is left behind to restore, and a query the guest
+        // opened across the rebuild has lost what it was counting either way.
+        Command::BeginQuery { .. }
+        | Command::EndQuery { .. }
+        | Command::GetQueryResult { .. }
+        | Command::GetQueryResultQbo { .. }
+        | Command::GetMemoryInfo { .. }
+        | Command::GetPipeResourceLayout { .. } => return None,
+
+        // A frame's worth of decoding. The codec and the target are retained on the records
+        // themselves; what happens between BEGIN_FRAME and END_FRAME is one picture, and a
+        // rebuild mid-picture has no reference frames to finish it with anyway.
+        Command::BeginFrame { .. }
+        | Command::DecodeMacroblock { .. }
+        | Command::DecodeBitstream { .. }
+        | Command::EncodeBitstream { .. }
+        | Command::EndFrame { .. } => return None,
+
+        // Structural: retained by whatever owns the thing itself, so that a destroy prunes the
+        // journal by dropping rather than by remembering to.
+        Command::CreateObject { .. }
+        | Command::DestroyObject { .. }
+        | Command::CreateSubCtx { .. }
+        | Command::DestroySubCtx { .. }
+        | Command::SetSubCtx { .. }
+        | Command::PipeResourceCreate { .. }
+        | Command::PipeResourceSetType { .. }
+        | Command::CreateVideoCodec { .. }
+        | Command::DestroyVideoCodec { .. }
+        | Command::CreateVideoBuffer { .. }
+        | Command::DestroyVideoBuffer { .. } => return None,
+
+        // Neither. `LINK_SHADER` assembles early a program a draw would assemble on demand,
+        // restoring the previous binds when it is done; a marker is a name for a human; debug
+        // flags and a nop are not context state at all.
+        Command::LinkShader { .. }
+        | Command::SendStringMarker { .. }
+        | Command::SetDebugFlags { .. }
+        | Command::Nop { .. } => return None,
     };
     Some(StateKey { cmd, slot })
 }
