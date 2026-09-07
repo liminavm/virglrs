@@ -746,6 +746,9 @@ pub struct Codec {
     width: u32,
     height: u32,
     gate: Gate,
+    /// Frames that reached END_FRAME with nothing behind them, counted because one is a
+    /// snapshot's half-frame and many is a stream decoding nothing at all.
+    nothing_to_decode: u32,
     frame: Frame,
     /// The live decompression session, rebuilt when the frame's shape changes.
     ///
@@ -1165,6 +1168,7 @@ impl Video {
             height,
             // Nothing has been decoded, so there are no reference pictures.
             gate: Gate::AwaitingKey { dropped: 0, freeze: None },
+            nothing_to_decode: 0,
             frame: Frame::Idle,
             session: None,
         });
@@ -1385,7 +1389,21 @@ impl Video {
         // No bitstream is the frame a snapshot cut in half: its slices reached the codec that
         // was saved and its END_FRAME reached the one that was restored. Nothing to decode, and
         // the same stale target as a dropped frame's.
+        //
+        // Exactly one of those is expected per restore, so this says so rather than returning in
+        // silence. A frame skipped here never reaches the gate, which means a key frame arriving
+        // this way cannot re-seed the codec -- so a stream that keeps taking this path decodes
+        // nothing, forever, while every per-frame command reports success.
+        // Read before the move below, so the message can say which of the two it was.
+        let why = if shape.is_none() { "no descriptor" } else { "no bitstream" };
         let (Some(shape), false) = (shape, bitstream.is_empty()) else {
+            if codec.nothing_to_decode == 0 {
+                eprintln!(
+                    "[virglrs] video codec {handle}: END_FRAME with nothing to decode ({why}); \
+                     the target keeps what it held"
+                );
+            }
+            codec.nothing_to_decode += 1;
             codec.gate.freeze(&buffer, gl);
             return Ok(());
         };
