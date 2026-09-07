@@ -17,6 +17,9 @@ scripts/vendor.sh     # third_party/virglrenderer at the pinned rev, + its meson
 cargo build
 ```
 
+`VIRGLRENDERER_SRC=/path/to/a/clone` sources the C from a local clone instead of the network —
+the pinned rev still decides what is checked out, only where it is fetched from changes.
+
 The vendored C tree is a build input, not optional scaffolding: the format tables are generated
 from its `virgl_hw.h` and from Mesa's `u_format.yaml`, and the venus wire from the venus-protocol
 its meson wrap pins. `build.rs` says so by name if it is missing. You also need `python3` with
