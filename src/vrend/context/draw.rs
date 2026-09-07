@@ -901,6 +901,14 @@ impl Context {
         next_ubo_id
     }
 
+    /// How many `vec4` constants may be bridged out of a bound buffer.
+    ///
+    /// A shader shaped this way holds a colour-space matrix or similar -- a handful of vectors,
+    /// never hundreds -- so the bound keeps the staging copy small and bounds what one draw does.
+    /// A shader wanting more than this is not the shape the bridge exists for, and keeps the
+    /// block it was bound as.
+    const MAX_BRIDGED_CONSTS: usize = 64;
+
     /// `vrend_draw_bind_const_shader`: the inline constants, as one `uvec4` array uniform.
     fn draw_bind_const(&mut self, host: &mut Host<'_>, stage: ShaderStage, new_program: bool) {
         let gl = host.gl;
@@ -918,10 +926,48 @@ impl Context {
             let n = (num_consts * 4).min(sub.consts[s].len());
             gl.uniform_4uiv(loc, &sub.consts[s][..n]);
             sub.const_dirty[s] = false;
+        } else if sub.consts[s].is_empty()
+            && let Some(loc) = prog.const_location[s]
+            && sub.shaders[s].is_some()
+            && (1..=Self::MAX_BRIDGED_CONSTS).contains(&num_consts)
+            && let Some(&Ubo { resource, offset, length }) = sub.ubos[s].get(&0)
+        {
+            // Constant buffer 0 delivered as a resource, feeding a shader that reads plain
+            // uniforms.
+            //
+            // The guest has two unrelated ways to deliver constants and they land in different
+            // places: SET_CONSTANT_BUFFER carries them inline, uploaded just above, while
+            // SET_UNIFORM_BUFFER names a buffer resource bound as a GL uniform block. Which of
+            // the two a shader can read is settled far away, by its TGSI -- a one-dimensional
+            // `DCL CONST[0..n]` becomes a plain `uniform uvec4 const0[]` array and never a block
+            // -- so a guest that declares them that way and then binds buffer 0 as a resource has
+            // a shader whose constants are never written. Nothing rejects the pairing and it
+            // reads as zeroes, which is why mesa's vl_compositor, exactly that shape, multiplied
+            // every texel by an all-zero colour-space matrix and rendered black.
+            //
+            // Read from the guest's own pages, and never by mapping the GL buffer. A map on the
+            // draw path is a synchronisation point, and a render thread parked in one does not
+            // answer the quiesce a suspend waits for -- which shows up as a hung suspend long
+            // after a frame that rendered perfectly. The pages are the right source anyway: these
+            // constants are CPU-produced and arrive by transfer, so the backing already holds
+            // them, and reading it touches no GL state at all.
+            let mut bytes = vec![0u8; num_consts * 4 * size_of::<u32>()];
+            let take = match length as usize {
+                0 => bytes.len(),
+                given => bytes.len().min(given),
+            };
+            let pages = host.guest.pages(host.ctx, resource);
+            if pages.is_some_and(|iov| iov.copy_out(u64::from(offset), &mut bytes[..take])) {
+                let words: Vec<u32> = bytes
+                    .as_chunks::<{ size_of::<u32>() }>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(u32::from_le_bytes)
+                    .collect();
+                gl.uniform_4uiv(loc, &words);
+            }
         }
-        // The C also bridges uniform buffer 0 into plain constants for a shader that declared
-        // them one-dimensional, out of the resource's guest pages; that is the video
-        // compositor's shape and lands with video.
     }
 
     /// `vrend_draw_bind_samplers_shader`.
