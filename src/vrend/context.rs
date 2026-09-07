@@ -952,6 +952,41 @@ impl SubContext {
     }
 }
 
+/// Name a write whose destination is a scanout, under `LIMINA_READBACK_TRACE`.
+///
+/// The readback side can say a scanout IOSurface is empty; it cannot say whether anything ever
+/// asked to put pixels in it. Draws are covered by the render-target line, and this covers the
+/// other half -- the copies and clears, which bind their own framebuffers and so never reach
+/// `attach_surface`. Silence from both, for a scanout that is being presented, means nothing on
+/// the host was ever asked to write it.
+///
+/// Filtered on the destination's SCANOUT bind, which is a handful of resources per boot, so it
+/// cannot flood a log the way a per-blit trace would.
+pub(super) fn trace_scanout_write(
+    host: &Host<'_>,
+    cmd: Cmd,
+    route: &str,
+    dst: ResourceHandle,
+    src: Option<ResourceHandle>,
+) {
+    if std::env::var_os("LIMINA_READBACK_TRACE").is_none() {
+        return;
+    }
+    let Ok(res) = host.resource(cmd, dst) else { return };
+    if !res.args.bind.has(resource::Bind::SCANOUT) {
+        return;
+    }
+    let surface = match &res.storage {
+        Storage::Texture(t) => t.image.as_ref().map(|i| i.surface().id().0),
+        _ => None,
+    };
+    eprintln!(
+        "[virglrs] scanout write: ctx {:?} {cmd:?} via {route} into resource {dst:?} \
+         (IOSurface {surface:?}) from {src:?}",
+        host.ctx,
+    );
+}
+
 /// Empty every view slot naming `handle` and mark each for rebinding. Whether any did.
 fn evict_view(
     views: &mut [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT],
@@ -3066,13 +3101,20 @@ impl Context {
         // readback side: renders still landing in the surfaces from before a display
         // reconfiguration (two owners of "the current scanout", only one updated) versus nothing
         // rendering at all. "The new surfaces are empty" is consistent with both.
+        // The context and the geometry are the load-bearing half: an id alone cannot say whether
+        // a rotation of surfaces is the compositor's framebuffers or a client's swapchain, and
+        // reading a compositor into one was how this trace was misread once already.
         if std::env::var_os("LIMINA_READBACK_TRACE").is_some()
             && let Some(image) = s.textures.image.as_ref()
         {
+            let id = image.surface().id().0;
+            let (w, h, bind) = host
+                .resource(cmd, s.resource)
+                .map_or((0, 0, 0), |r| (r.args.width, r.args.height, r.args.bind.0));
             eprintln!(
-                "[virglrs] render target: resource {:?} attachment {attachment} is IOSurface id {}",
-                s.resource,
-                image.surface().id().0
+                "[virglrs] render target: ctx {:?} resource {:?} attachment {attachment} is \
+                 IOSurface id {id} ({w}x{h}, bind {bind:#x})",
+                host.ctx, s.resource,
             );
         }
         transfer::attach_texture(
@@ -3764,6 +3806,7 @@ impl Context {
         data: [u32; 4],
     ) -> Result<(), Fault> {
         let cmd = Cmd::ClearTexture;
+        trace_scanout_write(host, cmd, "clear_texture", resource, None);
         let res = host.resource(cmd, resource)?;
         let Storage::Texture(t) = &res.storage else {
             return Err(Fault::IllegalResource { cmd, handle: resource });
@@ -3900,6 +3943,9 @@ impl Context {
         direction: TransferDirection,
     ) -> Result<(), Fault> {
         let cmd = Cmd::Transfer3d;
+        if direction == TransferDirection::ToHost {
+            trace_scanout_write(host, cmd, "transfer3d", t.resource, None);
+        }
         let guest = host.guest;
         let ctx = host.ctx;
         let formats = host.formats;

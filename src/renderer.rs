@@ -1688,11 +1688,25 @@ fn trace_blank_readback(
     if std::env::var_os("LIMINA_READBACK_TRACE").is_none() {
         return;
     }
-    let first_row = &dst[..stride.min(dst.len())];
-    if !first_row.is_empty() && first_row.iter().all(|&b| b == 0) {
+    // Sampled across the height, not just row 0: a frame painted below the top row is a picture
+    // this trace would otherwise report as blank, and "blank" is the whole claim it carries.
+    if stride == 0 || rows == 0 {
+        return;
+    }
+    let sampled = (0..16)
+        .map(|i| i * (rows as usize).max(1) / 16)
+        .filter_map(|row| dst.get(row * stride..(row + 1) * stride));
+    let mut looked = 0;
+    for row in sampled {
+        looked += 1;
+        if row.iter().any(|&b| b != 0) {
+            return;
+        }
+    }
+    if looked > 0 {
         eprintln!(
             "[virglrs] readback: resource {handle:?} resolved a {kind} IOSurface (id \
-             {surface_id}) whose first row is blank; {rows} rows read"
+             {surface_id}) blank in all {looked} sampled rows; {rows} rows read"
         );
     }
 }
