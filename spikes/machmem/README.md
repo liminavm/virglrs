@@ -47,12 +47,49 @@ parent an entry, and `SIGKILL`s itself with no cleanup of any kind.
 **Measured 2026-09-07, same host:** the parent's mapping stays readable and
 writable after the child dies on signal 9. A held entry is enough — storage does
 not have to be minted VMM-side, only *held* there.
+## `hvmap` — does any of it survive the hypervisor?
+
+Both spikes above run beside no VM at all, and guest RAM in production is a range
+`hv_vm_map` has stage-2 mapped. Two orderings, because they are different
+questions:
+
+* **forward**, the guest-RAM path: `hv_vm_map` the region, *then* make the entry
+  and share it.
+* **reverse**, the blob path — what `get_map_ptr` becomes in a split: the
+  renderer mints, the VMM maps the entry, and `hv_vm_map`s that address.
+
+```
+clang -O1 -Wall -Wextra -framework Hypervisor -o hvmap hvmap.c
+codesign --entitlements <libkrun hvf-entitlements.plist> -s - --force hvmap
+./hvmap forward ; ./hvmap reverse
+```
+
+**Measured 2026-09-07, same host:** both coherent both ways. An entry can be made
+over hv-mapped guest RAM and the second task sees the hypervisor's pages; and
+`hv_vm_map` accepts a mapping backed by another task's memory entry, so
+renderer-minted storage reaches the guest without the renderer ever being the
+process that talks to the hypervisor.
 
 ## What this settles
 
-Guest RAM can be mapped into a renderer process, and renderer-minted storage can
-outlive a renderer crash, both with mach ports alone. What neither spike touches:
-a range the hypervisor has already mapped (`hv_vm_map` needs an entitlement the
-spike does not carry), and the bootstrap lane under the app's sandbox — here
-`bootstrap_check_in` succeeded unentitled, which is the lane a spawned child
-looks the service up on.
+Guest RAM can be mapped into a renderer process, renderer-minted storage can be
+published to the guest and outlives a renderer crash, and all of it is mach ports
+alone — no descriptor anywhere.
+
+What none of it touches:
+
+* **The released-RAM path.** libkrun returns ballooned pages with
+  `MADV_FREE_REUSABLE` + `hv_vm_unmap` and heals on fault with `MADV_FREE_REUSE`
+  + `hv_vm_map` (`hvf/src/released_ram.rs`). It never re-`mmap`s over the range,
+  so the VM object — and therefore the entry — stays valid. But a renderer
+  mapping sits *outside* that fault-and-heal loop: a renderer touching a released
+  page gets a zero page and no heal. It should never touch one, because the guest
+  only ever names live pages in a ring or an iov, but that is an invariant to
+  state rather than one the kernel enforces. The settle sweep's
+  `mprotect(PROT_NONE)` is task-side and does not reach a renderer's mapping,
+  which also means a second mapping keeps those pages resident.
+* **Signing under App Sandbox.** These spikes reflect limina as it is signed
+  today: hardened runtime, no `app-sandbox`, which is why `bootstrap_check_in` on
+  an arbitrary name is a real lane. Under App Sandbox it is not, and the lane
+  becomes an in-bundle XPC service or an app-group-prefixed name. The memory
+  entries are unaffected; only how the port travels changes.
