@@ -29,8 +29,11 @@ PREFIX="$ROOT/harness/vm/prefix"
 ARGS=(-Dvenus=true -Dvideo=true -Dvulkan-dload=false -Drender-server-mode=thread
       -Drender-server-worker=thread -Dplatforms=egl --prefix "$PREFIX" --buildtype release)
 
-if [ -d "$BUILD" ]; then meson setup --reconfigure "$BUILD" "$ROOT" "${ARGS[@]}"
-else meson setup "$BUILD" "$ROOT" "${ARGS[@]}"; fi
+# The C tree is a pinned build input under this repository -- `meson.build` is there, not at the
+# root, which is where it was when virglrs lived inside it.
+CTREE="$ROOT/third_party/virglrenderer"
+if [ -d "$BUILD" ]; then meson setup --reconfigure "$BUILD" "$CTREE" "${ARGS[@]}"
+else meson setup "$BUILD" "$CTREE" "${ARGS[@]}"; fi
 ninja -C "$BUILD"
 meson install -C "$BUILD" >/dev/null
 

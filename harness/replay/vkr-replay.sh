@@ -92,7 +92,7 @@ cargo build --release --manifest-path "$HERE/rs/Cargo.toml" >/dev/null 2>&1
 # VIRGL_PREFIX selects the implementation under test, the same variable harness/abi and the vrend
 # replayer's build.sh use. --renderer names it more directly and wins where both are given.
 case "$CHOICE" in
-  rs) VIRGL_PREFIX="$ROOT/virglrs/prefix" ;;
+  rs) VIRGL_PREFIX="$ROOT/prefix" ;;
   c)  VIRGL_PREFIX="$ROOT/harness/vm/prefix" ;;
   "") [ -n "${VIRGL_PREFIX:-}" ] || usage ;;
   *)  VIRGL_PREFIX="" ;;   # a dylib path, used as given
@@ -109,9 +109,9 @@ if [ -n "${VIRGL_PREFIX:-}" ]; then
   # install.sh scores whatever was in the tree then, silently. That has already put a claim in
   # harness/README.md that was measured against a build three commits old. For the Rust prefix
   # the fix is to build it; for any other, say so and let the caller decide.
-  if [ "$VIRGL_PREFIX" = "$ROOT/virglrs/prefix" ]; then
-    "$ROOT/virglrs/install.sh" >/dev/null
-  elif find "$ROOT/src" -name '*.c' -newer "$LIB" 2>/dev/null | read -r _; then
+  if [ "$VIRGL_PREFIX" = "$ROOT/prefix" ]; then
+    "$ROOT/install.sh" >/dev/null
+  elif find "$ROOT/third_party/virglrenderer/src" -name '*.c' -newer "$LIB" 2>/dev/null | read -r _; then
     echo "warning: $LIB is older than the C sources it was built from -- stale build" >&2
   fi
 else
