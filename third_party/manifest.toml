@@ -1,0 +1,17 @@
+# The reference C renderer, pinned.
+#
+# virglrs is the rewrite; this is what it was written against and what the harness records its
+# goldens from. It is not optional scaffolding — `build.rs` generates the format tables from its
+# `virgl_hw.h` and from Mesa's `u_format.yaml` beside it, and the venus wire is generated from
+# the venus-protocol its meson wrap pins. A tree without it does not build.
+#
+# One pin, not two: venus-protocol's revision lives in the C tree's
+# `subprojects/venus-protocol.wrap`, and is materialized inside the clone. Pinning it here as
+# well would be two records of one revision, free to disagree.
+#
+# Bumping it = push the new fork head, then update `rev` here in the same commit.
+[virglrenderer]
+repo = "https://github.com/liminavm/virglrenderer.git"
+upstream = "https://gitlab.freedesktop.org/virgl/virglrenderer.git"
+branch = "limina"
+rev = "017b7e159a651a2597daacaef6d13695cfd12c6b"
