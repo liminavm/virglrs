@@ -115,9 +115,9 @@ use super::proto::types::{
     vn_command_vkImportSemaphoreResourceMESA, vn_command_vkInvalidateMappedMemoryRanges,
     vn_command_vkMergePipelineCaches, vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit,
     vn_command_vkQueueWaitIdle, vn_command_vkResetCommandBuffer, vn_command_vkResetCommandPool,
-    vn_command_vkResetDescriptorPool, vn_command_vkResetEvent, vn_command_vkResetFences,
-    vn_command_vkResetQueryPool, vn_command_vkSeekReplyCommandStreamMESA, vn_command_vkSetEvent,
-    vn_command_vkSetReplyCommandStreamMESA, vn_command_vkSignalSemaphore,
+    vn_command_vkResetDescriptorPool, vn_command_vkResetEvent, vn_command_vkResetFenceResourceMESA,
+    vn_command_vkResetFences, vn_command_vkResetQueryPool, vn_command_vkSeekReplyCommandStreamMESA,
+    vn_command_vkSetEvent, vn_command_vkSetReplyCommandStreamMESA, vn_command_vkSignalSemaphore,
     vn_command_vkSubmitVirtqueueSeqnoMESA, vn_command_vkTransitionImageLayout,
     vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences, vn_command_vkWaitRingSeqnoMESA,
     vn_command_vkWaitSemaphoreResourceMESA, vn_command_vkWaitSemaphores,
@@ -1822,13 +1822,13 @@ impl Handlers<'_> {
             Ok(VkResult::VK_SUCCESS) => {}
             Ok(r) => {
                 eprintln!("[virglrs] {cmd} refused by the driver: {r:?}");
-                self.reject = Some("asked for a semaphore payload the driver would not move");
+                self.reject = Some("asked for a sync payload the driver would not move");
             }
             Err(NoSyncFd::NoDevice) => {
-                self.reject = Some("moved a semaphore payload on a device it does not have");
+                self.reject = Some("moved a sync payload on a device it does not have");
             }
             Err(NoSyncFd::Unsupported) => {
-                eprintln!("[virglrs] {cmd}: this driver exports no external semaphore fd");
+                eprintln!("[virglrs] {cmd}: this driver exports no external sync fd");
                 self.reject = Some("asked for venus sync on a driver that cannot do it");
             }
         }
@@ -4700,6 +4700,21 @@ impl Commands for Handlers<'_> {
     ) {
         let done = self.driver.export_semaphore_sync_fd(args.device, args.semaphore);
         self.synced("vkWaitSemaphoreResourceMESA", done);
+    }
+
+    /// `vkResetFenceResourceMESA`: unsignal a fence mesa has already exported.
+    ///
+    /// The fence twin of the command above, and the same mechanism -- a `SYNC_FD` export moves
+    /// the payload out, which is what leaves the fence unsignalled. mesa sends this after taking
+    /// a fence fd, because the fd it holds is the payload and the host's fence must stop claiming
+    /// to have one.
+    ///
+    /// Not serving it is what a guest sees as a lost device several commands later: the command
+    /// carries no reply, so the generated default could only poison the ring, and the next
+    /// `vkQueueSubmit` on that ring returns `VK_ERROR_DEVICE_LOST` with nothing naming the cause.
+    fn vkResetFenceResourceMESA(&mut self, args: &mut vn_command_vkResetFenceResourceMESA<'_>) {
+        let done = self.driver.reset_fence_resource(args.device, args.fence);
+        self.synced("vkResetFenceResourceMESA", done);
     }
 
     fn vkImportSemaphoreResourceMESA(
@@ -14018,6 +14033,109 @@ mod tests {
         h.vkCmdPushConstants(&mut args);
         assert!(h.reject.is_some(), "a count with no blob behind it stops the ring");
         SAW.with_borrow(|s| assert_eq!(s.pushed.len(), 1, "and pushes nothing"));
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// mesa resets a fence by *exporting* it, and the descriptor that export leaves behind must
+    /// not outlive the command that made it.
+    ///
+    /// Both halves are checked because both have bitten. Not serving this command at all is what
+    /// a guest reports as `VK_ERROR_DEVICE_LOST` on its next submit, with nothing naming the
+    /// cause; and an fd leaked once per exported fence is a renderer that runs out of them. The
+    /// pipe is what makes the close observable -- the read end reaches EOF exactly when the write
+    /// end is closed, so a leak reads as a blocked descriptor rather than as EOF.
+    #[test]
+    fn resetting_a_fence_resource_exports_it_and_keeps_no_descriptor() {
+        use super::super::proto::types::{
+            VkDevice, VkFence, VkFenceGetFdInfoKHR, vn_command_vkResetFenceResourceMESA,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const FENCE: u64 = 9;
+
+        thread_local! {
+            static EXPORTED: RefCell<Vec<core::ffi::c_int>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn export(
+            _d: VkDevice,
+            _info: *const VkFenceGetFdInfoKHR,
+            out: *mut core::ffi::c_int,
+        ) -> VkResult {
+            let mut ends = [0 as core::ffi::c_int; 2];
+            // SAFETY: `pipe` writes two descriptors into the array it is given.
+            assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "the test needs a pipe");
+            // SAFETY: a flag on a descriptor this test owns; the read below must not block if
+            // the write end is still open, which is the failure being tested for.
+            unsafe { libc::fcntl(ends[0], libc::F_SETFL, libc::O_NONBLOCK) };
+            // SAFETY: the caller is `reset_fence_resource`, which passes a live `c_int`.
+            unsafe { *out = ends[1] };
+            EXPORTED.with_borrow_mut(|e| e.push(ends[0]));
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkGetFenceFdKHR(export);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let mut args = vn_command_vkResetFenceResourceMESA {
+            device: VkDevice(DEVICE),
+            fence: VkFence(FENCE),
+            ..Default::default()
+        };
+        h.vkResetFenceResourceMESA(&mut args);
+        assert!(h.reject.is_none(), "a served command does not stop the ring");
+
+        let read_end = EXPORTED.with_borrow(|e| {
+            assert_eq!(e.len(), 1, "the reset is an export, and it happened once");
+            e[0]
+        });
+        let mut byte = 0u8;
+        // SAFETY: a one-byte read from a descriptor this test owns, into a live byte.
+        let n = unsafe { libc::read(read_end, (&raw mut byte).cast(), 1) };
+        assert_eq!(n, 0, "the exported descriptor must not outlive the command that made it");
+        // SAFETY: the read end, which nothing else holds.
+        unsafe { libc::close(read_end) };
+
+        // A device the guest never made. The handle is the guest's, so this is a rejection and
+        // never an assert.
+        let mut args = vn_command_vkResetFenceResourceMESA {
+            device: VkDevice(DEVICE + 1),
+            fence: VkFence(FENCE),
+            ..Default::default()
+        };
+        h.vkResetFenceResourceMESA(&mut args);
+        assert!(h.reject.is_some(), "a fence on a device that does not exist stops the ring");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
