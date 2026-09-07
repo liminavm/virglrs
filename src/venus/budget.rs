@@ -51,6 +51,16 @@ const CAP_ENV: &str = "LIMINA_GPU_MEM_BUDGET_MIB";
 const SOFT_ENV: &str = "LIMINA_GPU_MEM_BUDGET_SOFT";
 /// Whether every budget answer is logged, not only a clamp transition.
 const TRACE_ENV: &str = "LIMINA_GPU_MEM_BUDGET_TRACE";
+/// How often the whole breakdown is printed anyway, in seconds.
+const CENSUS_ENV: &str = "LIMINA_GPU_MEM_BUDGET_CENSUS";
+
+/// The share of the cap that is worth a line before anything has been refused, and the share the
+/// total has to fall back below before that line is worth printing again.
+///
+/// Two thresholds and not one: a workload sitting at the mark crosses it on every other charge,
+/// and a single edge would reprint the whole breakdown each time.
+const WARN_AT: u64 = 80;
+const REARM_BELOW: u64 = 70;
 
 /// How every line about the cap begins.
 ///
@@ -79,6 +89,10 @@ pub struct Budget {
     soft: bool,
     /// Whether every `VK_EXT_memory_budget` answer is logged, and not only a clamp transition.
     trace: bool,
+    /// How often to print the breakdown regardless of what is happening, cap or no cap. This is
+    /// the instrument for telling a guest leak from ours: a host total that climbs while the
+    /// guest's own census stays flat is memory this renderer is retaining.
+    census: Option<std::time::Duration>,
     ledger: Mutex<Ledger>,
     /// What was last said about each heap, so the clamp is logged as an event and not as a
     /// sample. This is state, not configuration, and it lives here for the reason the module
@@ -111,17 +125,40 @@ struct HeapTrace {
 /// resource holds a share of and a compositor is still sampling, or a charge this renderer
 /// failed to drop -- moves to the shared bucket rather than out of the total. Those bytes are
 /// resident either way, and the cap is enforced against what is resident.
-#[derive(Default)]
 struct Ledger {
     ctxs: BTreeMap<ContextId, Slot>,
     /// What outlived the context it was charged to.
     shared: PerContext,
+    /// Whether the watermark has already been reported for the climb the total is on. See
+    /// [`watermark`] for the two thresholds this latch sits between.
+    warned: bool,
+    /// When the census last printed. Both this and `warned` are sampled on the charge path,
+    /// which already holds this lock -- which is why they live here and not beside the
+    /// configuration on [`Budget`].
+    census: std::time::Instant,
 }
 
 impl Ledger {
+    fn new() -> Ledger {
+        Ledger {
+            ctxs: BTreeMap::new(),
+            shared: PerContext::default(),
+            warned: false,
+            // From now, not from the epoch: the first census is due an interval into the run,
+            // rather than on the first allocation of a process that has nothing to say yet.
+            census: std::time::Instant::now(),
+        }
+    }
+
     /// Total live bytes, whoever holds them. This is the number the cap is enforced against.
     fn bytes(&self) -> u64 {
         self.ctxs.values().map(|s| s.live.bytes()).sum::<u64>() + self.shared.bytes()
+    }
+
+    /// What the context holding this id calls itself, for a log line. Empty for a context that
+    /// gave no name, and for one that is already gone.
+    fn name_of(&self, ctx: ContextId) -> &str {
+        self.ctxs.get(&ctx).map_or("", |s| s.name.as_str())
     }
 
     /// The slot a charge was made against, if it is still that slot.
@@ -143,6 +180,14 @@ struct Slot {
     /// this ledger counts for itself -- one fact, one owner. A second counter here would say the
     /// same thing as the key and be free to disagree with it.
     ctx: ContextKey,
+    /// What the guest called this context, as the VMM passed it to `context_create` -- `python3`,
+    /// `synoik`. A number alone names the culprit only to someone holding a process table from
+    /// the same second; this is what makes a breakdown readable after the fact.
+    ///
+    /// It is here because it belongs to the context, and it arrives as an argument from the one
+    /// place a context is stood up. The C reaches the same name through a thread-local set at
+    /// each dispatch entry, which is the ambient binding the module doc rejects.
+    name: String,
     live: PerContext,
 }
 
@@ -216,7 +261,7 @@ impl std::fmt::Debug for Charge {
     /// Never the ledger behind it: a charge is interesting for what it is, and a `Debug` that
     /// walked to the budget would print every other context's business beside it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Charge(ctx {}, {} {})", self.ctx.id().get(), mib(self.size), self.what)
+        write!(f, "Charge(ctx {}, {} {})", self.ctx.id().get(), size(self.size), self.what)
     }
 }
 
@@ -247,9 +292,11 @@ pub struct Account {
 impl Account {
     /// Open `ctx`'s slot. One at a time per id: a second opening while the first stands is not a
     /// guest's doing -- the VMM names contexts -- but this renderer holding two accounts for one.
-    pub fn open(budget: &Arc<Budget>, ctx: ContextKey) -> Account {
+    /// `name` is what the guest called this context; it is only ever a log line, so an empty one
+    /// costs nothing but a less readable breakdown.
+    pub fn open(budget: &Arc<Budget>, ctx: ContextKey, name: String) -> Account {
         let mut ledger = budget.ledger.lock().expect("the budget ledger");
-        let prev = ledger.ctxs.insert(ctx.id(), Slot { ctx, live: PerContext::default() });
+        let prev = ledger.ctxs.insert(ctx.id(), Slot { ctx, name, live: PerContext::default() });
         assert!(prev.is_none(), "ctx {} opened a second budget account", ctx.id().get());
         Account { budget: Arc::clone(budget), ctx }
     }
@@ -271,6 +318,11 @@ impl Account {
             .slot_of(self.ctx)
             .expect("an account's slot stands for as long as the account does")
             .take(what, size);
+        // Both samples are taken here rather than from a timer thread: the ledger only changes on
+        // this path, so a workload that has stopped allocating has nothing new to report, and
+        // there is no thread to own. The cost is that a context born and gone between two ticks
+        // is never seen by the census -- it is a sampler, and says so.
+        self.budget.sample_locked(&mut ledger);
         Ok(Charge { budget: Arc::clone(&self.budget), ctx: self.ctx, what, size })
     }
 
@@ -315,14 +367,27 @@ impl Account {
 
     /// Say what was refused and what the process is holding, which is the whole reason the
     /// histogram exists: one repeated call site reads as a single line naming its size and count.
+    /// Verbose on purpose. What the guest sees is a lost device or an aborted process, which is
+    /// also what a dozen unrelated venus transport failures look like -- so a refusal that did
+    /// not name itself would be read as a transport bug.
     pub fn report_refusal(&self, refused: Refused) {
+        let ledger = self.budget.ledger.lock().expect("the budget ledger");
         eprintln!(
-            "[virglrs] {GRAMMAR}: REFUSING a {} {} allocation for ctx {}",
-            mib(refused.wanted),
+            "[virglrs] {GRAMMAR}: REFUSING a {} {} allocation for {}",
+            size(refused.wanted),
             refused.what,
-            self.ctx.id().get(),
+            named(self.ctx.id(), ledger.name_of(self.ctx.id())),
         );
-        self.budget.report("at refusal");
+        eprintln!(
+            "[virglrs] {GRAMMAR}:   and {}: this is limina's host-memory cap ({CAP_ENV}), not \
+             the GPU running out of memory",
+            if self.budget.kills_context() {
+                "killing this context deliberately"
+            } else {
+                "returning an error the guest will not read"
+            },
+        );
+        self.budget.report_locked(&ledger, "at refusal");
     }
 
     /// An account on a ledger of its own, for a test with no renderer around it.
@@ -334,6 +399,7 @@ impl Account {
         Account::open(
             &Budget::with_cap(cap, false),
             ContextKey::for_test(ContextId::new(1).expect("1 is not zero")),
+            String::new(),
         )
     }
 }
@@ -402,6 +468,19 @@ impl Budget {
         };
         let soft = std::env::var(SOFT_ENV).is_ok_and(|v| v == "1");
         let trace = std::env::var(TRACE_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
+        // Read independently of the cap: the census is the leak-hunting instrument, and the run
+        // being hunted is usually the one deliberately left uncapped.
+        let census = match std::env::var(CENSUS_ENV) {
+            Err(_) => None,
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) => None,
+                Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+                Err(_) => {
+                    eprintln!("[virglrs] {CENSUS_ENV}={v:?} is not a number of seconds; no census");
+                    None
+                }
+            },
+        };
         if let Some(bytes) = cap {
             eprintln!(
                 "[virglrs] {GRAMMAR}: cap {} MiB, refusal {}",
@@ -409,24 +488,63 @@ impl Budget {
                 if soft { "returns an error the guest will not read" } else { "stops the context" }
             );
         }
-        Budget::new(cap, soft, trace)
+        if let Some(every) = census {
+            eprintln!("[virglrs] {GRAMMAR}: census every {} s", every.as_secs());
+        }
+        Budget::new(cap, soft, trace, census)
     }
 
     /// A budget with the cap given rather than the one configured. The tests' way in: reading the
     /// environment from a test would make every other test in the process depend on it.
     pub fn with_cap(cap: Option<u64>, soft: bool) -> Arc<Budget> {
-        Budget::new(cap, soft, false)
+        Budget::new(cap, soft, false, None)
     }
 
-    /// As [`Budget::with_cap`], saying also whether every budget answer is traced.
-    fn new(cap: Option<u64>, soft: bool, trace: bool) -> Arc<Budget> {
+    /// A budget that reports on a timer, for a test that wants the sampling path taken.
+    #[cfg(test)]
+    fn with_census(cap: Option<u64>, every: std::time::Duration) -> Arc<Budget> {
+        Budget::new(cap, false, false, Some(every))
+    }
+
+    /// As [`Budget::with_cap`], saying also whether every budget answer is traced and how often
+    /// the breakdown prints anyway.
+    fn new(
+        cap: Option<u64>,
+        soft: bool,
+        trace: bool,
+        census: Option<std::time::Duration>,
+    ) -> Arc<Budget> {
         Arc::new(Budget {
             cap,
             soft,
             trace,
-            ledger: Mutex::new(Ledger::default()),
+            census,
+            ledger: Mutex::new(Ledger::new()),
             heaps: Mutex::new([HeapTrace::default(); MAX_HEAPS]),
         })
+    }
+
+    /// The two things a charge is the occasion to look at: whether the total has climbed far
+    /// enough to be worth warning about, and whether the census is due.
+    ///
+    /// Takes the ledger it is to read rather than locking, because its only caller is holding
+    /// that lock already -- the charge it is reporting on is the one that just landed, and a
+    /// second acquisition here would deadlock on a mutex that does not recurse.
+    fn sample_locked(&self, ledger: &mut Ledger) {
+        if let Some(cap) = self.cap {
+            let (report, warned) = watermark(ledger.warned, ledger.bytes(), cap);
+            ledger.warned = warned;
+            if report {
+                self.report_locked(ledger, &format!("{WARN_AT}% watermark crossed"));
+            }
+        }
+        if let Some(every) = self.census {
+            let now = std::time::Instant::now();
+            if now.duration_since(ledger.census) >= every {
+                ledger.census = now;
+                self.report_locked(ledger, "census");
+            }
+        }
     }
 
     /// Explain one heap's reported budget, because what the guest finally sees is
@@ -526,14 +644,13 @@ impl Budget {
         let residual = slot.live.bytes();
         if residual != 0 {
             eprintln!(
-                "[virglrs] ctx {}: destroyed with {} still charged, now counted as shared -- \
-                 storage a resource still holds a share of, or a charge this renderer did not drop",
-                ctx.id().get(),
-                mib(residual)
+                "[virglrs] {GRAMMAR}: {} destroyed with {} still charged, now counted as shared \
+                 -- storage a resource still holds a share of, or a charge this renderer did not \
+                 drop",
+                named(ctx.id(), &slot.name),
+                size(residual),
             );
-            for (what, size, n) in slot.live.worst() {
-                eprintln!("[virglrs]   {n} x {} {what}", mib(size));
-            }
+            eprintln!("[virglrs] {GRAMMAR}:   {}", histogram(&slot.live));
         }
         slot.live.drain_into(&mut ledger.shared);
     }
@@ -541,30 +658,103 @@ impl Budget {
     /// Say what everything holds, biggest first. What makes a leak name itself.
     pub fn report(&self, reason: &str) {
         let ledger = self.ledger.lock().expect("the budget ledger");
-        let cap = self.cap.map_or(String::from("no cap"), mib);
-        eprintln!("[virglrs] {GRAMMAR}: {reason} -- {} live of {cap}", mib(ledger.bytes()));
+        self.report_locked(&ledger, reason);
+    }
+
+    /// [`Budget::report`] against a ledger the caller is already holding.
+    ///
+    /// The split exists because the watermark and the census report from inside a charge, which
+    /// holds this lock for the duration -- see [`Budget::sample_locked`].
+    fn report_locked(&self, ledger: &Ledger, reason: &str) {
+        let live = ledger.bytes();
+        let against = match self.cap {
+            Some(cap) => format!("{} cap ({}%)", size(cap), percent(live, cap)),
+            None => String::from("no cap"),
+        };
+        eprintln!("[virglrs] {GRAMMAR}: {reason} — {} live of {against}", size(live));
         for (ctx, slot) in ledger.ctxs.iter() {
-            eprintln!("[virglrs]   ctx {}: {}", ctx.get(), mib(slot.live.bytes()));
-            for (what, size, n) in slot.live.worst() {
-                eprintln!("[virglrs]     {n} x {} {what}", mib(size));
-            }
+            eprintln!(
+                "[virglrs] {GRAMMAR}:   {}: {} live — {}",
+                named(*ctx, &slot.name),
+                size(slot.live.bytes()),
+                histogram(&slot.live),
+            );
         }
         if ledger.shared.bytes() != 0 {
-            eprintln!("[virglrs]   outliving their contexts: {}", mib(ledger.shared.bytes()));
-            for (what, size, n) in ledger.shared.worst() {
-                eprintln!("[virglrs]     {n} x {} {what}", mib(size));
-            }
+            eprintln!(
+                "[virglrs] {GRAMMAR}:   outliving their contexts: {} live — {}",
+                size(ledger.shared.bytes()),
+                histogram(&ledger.shared),
+            );
         }
     }
 }
 
+/// Whether the watermark is worth a line, and what the latch becomes.
+///
+/// Split out from the reporting so it can be tested for what it decides rather than for what it
+/// prints. Returns `(report, warned)`: it arms once at [`WARN_AT`] and re-arms only once the
+/// total has fallen back below [`REARM_BELOW`], so a workload hovering at the mark says it once.
+fn watermark(warned: bool, live: u64, cap: u64) -> (bool, bool) {
+    match percent(live, cap) {
+        pct if !warned && pct >= WARN_AT => (true, true),
+        pct if warned && pct < REARM_BELOW => (false, false),
+        _ => (false, warned),
+    }
+}
+
+/// How full the cap is, in whole percent. Widened because `live` is a byte count and a cap can be
+/// tens of gigabytes: `live * 100` is not a `u64` multiplication anyone should have to think about.
+fn percent(live: u64, cap: u64) -> u64 {
+    if cap == 0 {
+        return 0;
+    }
+    (u128::from(live) * 100 / u128::from(cap)) as u64
+}
+
+/// A context as a log line names it: the id, and what it called itself if it said.
+fn named(ctx: ContextId, name: &str) -> String {
+    match name {
+        "" => format!("ctx {}", ctx.get()),
+        name => format!("ctx {} [{name}]", ctx.get()),
+    }
+}
+
+/// The live allocations on one line, biggest bucket first -- `4 x 14.1 MiB (IOSurface)`.
+///
+/// One line rather than one per bucket because this is what a leak looks like when it is read:
+/// `767 x 31.6 MiB (device memory)` is a repeated call site named outright, and it should not need
+/// scrolling to find. Bounded, because a pathological context could otherwise put a hundred
+/// buckets into a supervisor log -- the tail is the part that never mattered.
+fn histogram(per: &PerContext) -> String {
+    /// Enough to see the shape; anything past this is noise beside the buckets above it.
+    const MOST: usize = 6;
+    let worst = per.worst();
+    if worst.is_empty() {
+        return String::from("nothing live");
+    }
+    let mut line = worst
+        .iter()
+        .take(MOST)
+        .map(|(what, bytes, n)| format!("{n} x {} ({what})", size(*bytes)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if worst.len() > MOST {
+        line.push_str(&format!(", and {} smaller", worst.len() - MOST));
+    }
+    line
+}
+
 /// Bytes as a human reads them. A budget line is read while something is on fire.
-fn mib(bytes: u64) -> String {
+fn size(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
     if bytes < 1024 * 1024 {
         format!("{bytes} B")
-    } else {
+    } else if (bytes as f64) < GIB {
         format!("{:.1} MiB", bytes as f64 / MIB)
+    } else {
+        format!("{:.1} GiB", bytes as f64 / GIB)
     }
 }
 
@@ -591,7 +781,7 @@ mod tests {
     #[test]
     fn a_charge_that_outlives_its_context_stays_counted() {
         let budget = Budget::with_cap(Some(8192), false);
-        let account = Account::open(&budget, key(1));
+        let account = Account::open(&budget, key(1), String::new());
         let charge = account.try_charge("IOSurface", 4096).expect("under the cap");
         assert_eq!(budget.live_for(ctx(1)), 4096, "the context's own, for as long as it lives");
         assert_eq!(budget.shared(), 0);
@@ -601,7 +791,7 @@ mod tests {
         assert_eq!(budget.live_for(ctx(1)), 0, "the slot is gone with the context");
         assert_eq!(budget.shared(), 4096, "what it held is nobody's now, and still resident");
         assert_eq!(budget.live(), 4096, "a context's destroy does not uncount what outlives it");
-        let other = Account::open(&budget, key(2));
+        let other = Account::open(&budget, key(2), String::new());
         let _at_cap = other.try_charge("device memory", 4096).expect("exactly at the cap");
         assert!(
             other.try_charge("device memory", 1).is_err(),
@@ -619,12 +809,12 @@ mod tests {
     #[test]
     fn a_late_credit_never_lands_on_the_next_context_with_the_same_id() {
         let budget = Budget::with_cap(None, false);
-        let first = Account::open(&budget, key(8));
+        let first = Account::open(&budget, key(8), String::new());
         let held = first.try_charge("IOSurface", 600).expect("no cap");
         drop(first);
         assert_eq!(budget.shared(), 600);
 
-        let second = Account::open(&budget, key(8));
+        let second = Account::open(&budget, key(8), String::new());
         let _own = second.try_charge("device memory", 900).expect("no cap");
         assert_eq!(budget.live_for(ctx(8)), 900, "the next generation starts clean");
 
@@ -642,7 +832,7 @@ mod tests {
         let budget = Budget::with_cap(None, false);
         assert_eq!(budget.live(), 0);
 
-        let account = Account::open(&budget, key(1));
+        let account = Account::open(&budget, key(1), String::new());
         let a = account.try_charge("device memory", 4096).expect("no cap");
         let b = account.try_charge("device memory", 4096).expect("no cap");
         assert_eq!(budget.live(), 8192, "two of the same size are two, not one");
@@ -658,8 +848,8 @@ mod tests {
     #[test]
     fn the_cap_is_what_every_context_holds_together() {
         let budget = Budget::with_cap(Some(1000), false);
-        let one = Account::open(&budget, key(1));
-        let two = Account::open(&budget, key(2));
+        let one = Account::open(&budget, key(1), String::new());
+        let two = Account::open(&budget, key(2), String::new());
         let held = one.try_charge("device memory", 800).expect("fits");
 
         let refused = two.try_charge("device memory", 300).expect_err("does not fit");
@@ -684,13 +874,13 @@ mod tests {
     #[test]
     fn retiring_a_context_takes_its_slot_and_not_its_bytes() {
         let budget = Budget::with_cap(Some(1000), false);
-        let first = Account::open(&budget, key(8));
+        let first = Account::open(&budget, key(8), String::new());
         let charge = first.try_charge("device memory", 600).expect("fits");
 
         drop(first);
         assert_eq!(budget.live_for(ctx(8)), 0, "the slot is gone with the context");
         assert_eq!(budget.live(), 600, "the bytes are not: something still holds them");
-        let next = Account::open(&budget, key(8));
+        let next = Account::open(&budget, key(8), String::new());
         assert!(
             next.try_charge("device memory", 900).is_err(),
             "the room is what is actually free, not what the new context alone is using"
@@ -706,8 +896,8 @@ mod tests {
     fn the_budget_answered_is_what_is_left_for_this_context() {
         const HEAP: u64 = 64 * 1024;
         let budget = Budget::with_cap(Some(1000), false);
-        let mine = Account::open(&budget, key(1));
-        let other = Account::open(&budget, key(2));
+        let mine = Account::open(&budget, key(1), String::new());
+        let other = Account::open(&budget, key(2), String::new());
 
         let st = mine.standing().expect("a cap is configured");
         assert_eq!(st, Standing { own: 0, others: 0, cap: 1000 });
@@ -735,7 +925,7 @@ mod tests {
     fn the_drivers_answer_clamps_ours_and_the_spec_floors_both() {
         const HEAP: u64 = 1 << 40;
         let budget = Budget::with_cap(Some(1000), false);
-        let mine = Account::open(&budget, key(1));
+        let mine = Account::open(&budget, key(1), String::new());
         let _held = mine.try_charge("device memory", 200).expect("fits");
         let st = mine.standing().expect("a cap is configured");
 
@@ -753,13 +943,129 @@ mod tests {
         assert_eq!((answer, usage), (1, 1), "budget floored at one, and usage never above it");
     }
 
+    /// The watermark says it once on the way up, and again only after the total has come back
+    /// down. A workload that sits at the mark -- which is exactly what a leaking one does, one
+    /// allocation at a time -- would otherwise reprint the whole breakdown on every charge.
+    #[test]
+    fn the_watermark_fires_on_the_climb_and_re_arms_only_after_a_fall() {
+        const CAP: u64 = 1000;
+        // Below the mark, nothing is said and nothing is armed.
+        assert_eq!(watermark(false, 700, CAP), (false, false));
+        assert_eq!(watermark(false, 799, CAP), (false, false));
+
+        // Crossing it reports, once.
+        assert_eq!(watermark(false, 800, CAP), (true, true), "80% is the mark, and it is crossed");
+        assert_eq!(watermark(true, 850, CAP), (false, true), "climbing further says nothing more");
+        assert_eq!(watermark(true, 999, CAP), (false, true), "nor does approaching the cap");
+
+        // Falling back to just under the mark is not a fall: it is the hovering the second
+        // threshold exists for.
+        assert_eq!(watermark(true, 750, CAP), (false, true), "still latched between the marks");
+        assert_eq!(watermark(true, 699, CAP), (false, false), "below 70% it re-arms");
+        assert_eq!(watermark(false, 800, CAP), (true, true), "and the next climb reports again");
+
+        // A cap of zero is no cap at all; the caller does not reach here, but the arithmetic
+        // must not divide by it.
+        assert_eq!(watermark(false, 800, 0), (false, false));
+    }
+
+    /// Both reports are printed from inside the charge that occasioned them, which is holding the
+    /// ledger lock -- so both have to read the ledger they were handed rather than take it again.
+    /// A `Mutex` does not recurse, so getting this wrong is not a wrong number but a worker that
+    /// stops: this test hangs rather than fails if the reporting path ever locks for itself.
+    #[test]
+    fn reporting_from_inside_a_charge_does_not_take_the_lock_it_is_already_holding() {
+        // Due on the first charge, so the census path is taken rather than merely available.
+        let budget = Budget::with_census(Some(1000), std::time::Duration::ZERO);
+        let account = Account::open(&budget, key(1), String::from("python3"));
+
+        // Under the mark: census only.
+        let small = account.try_charge("device memory", 100).expect("fits");
+        // Over it: the watermark reports too, from the same held lock.
+        let _crossing = account.try_charge("device memory", 800).expect("fits");
+        assert_eq!(budget.live(), 900, "and the charges landed, both of them");
+
+        // The refusal path reports twice more while holding it once.
+        let refused = account.try_charge("device memory", 200).expect_err("over the cap");
+        account.report_refusal(refused);
+
+        // Falling back below the re-arm mark and climbing again takes the same path a second
+        // time, which a latch left set by a report that unwound would not.
+        drop(small);
+        let _again = account.try_charge("device memory", 100).expect("fits under the cap");
+        assert_eq!(budget.live(), 900);
+    }
+
+    /// The name is what makes a breakdown readable an hour later, and it is an argument the whole
+    /// way down -- from the VMM's `context_create`, through the account, into the slot. Nothing
+    /// consults a thread to find out who is being charged.
+    #[test]
+    fn a_context_is_named_in_the_ledger_by_the_name_it_was_opened_with() {
+        let budget = Budget::with_cap(None, false);
+        let named_ctx = Account::open(&budget, key(1), String::from("synoik"));
+        let anonymous = Account::open(&budget, key(2), String::new());
+        let _theirs = named_ctx.try_charge("IOSurface", 4096).expect("no cap");
+
+        {
+            let ledger = budget.ledger.lock().expect("the budget ledger");
+            assert_eq!(ledger.name_of(ctx(1)), "synoik");
+            assert_eq!(ledger.name_of(ctx(2)), "", "a context that gave no name has none");
+            assert_eq!(ledger.name_of(ctx(3)), "", "and neither has one that does not exist");
+        }
+        assert_eq!(named(ctx(1), "synoik"), "ctx 1 [synoik]");
+        assert_eq!(named(ctx(2), ""), "ctx 2", "no name is no brackets, not empty ones");
+
+        // The name goes with the context: a slot retired into the shared bucket keeps no
+        // claim on it, because the bytes there are nobody's by then.
+        drop(named_ctx);
+        let ledger = budget.ledger.lock().expect("the budget ledger");
+        assert_eq!(ledger.name_of(ctx(1)), "");
+        drop(ledger);
+        drop(anonymous);
+    }
+
+    /// The breakdown is one line per context, biggest bucket first, and bounded: a context with a
+    /// hundred distinct sizes must not put a hundred lines into a supervisor log.
+    #[test]
+    fn the_breakdown_names_the_biggest_bucket_first_and_stays_one_line() {
+        let mut per = PerContext::default();
+        assert_eq!(histogram(&per), "nothing live");
+
+        per.take("device memory", 4 * 1024 * 1024);
+        per.take("device memory", 4 * 1024 * 1024);
+        per.take("IOSurface", 1024 * 1024);
+        assert_eq!(
+            histogram(&per),
+            "2 x 4.0 MiB (device memory), 1 x 1.0 MiB (IOSurface)",
+            "by total bytes held, which is what names a leak"
+        );
+
+        for n in 1..20u64 {
+            per.take("device memory", n * 1024);
+        }
+        let line = histogram(&per);
+        assert_eq!(line.matches(" x ").count(), 6, "bounded at the buckets worth reading");
+        assert!(line.ends_with("and 15 smaller"), "and the tail is counted, not dropped: {line}");
+    }
+
+    /// Sizes are read while something is on fire, and a cap is quoted in the units it was set in.
+    #[test]
+    fn a_size_is_printed_in_the_unit_a_reader_expects() {
+        assert_eq!(size(4096), "4096 B", "below a MiB, exact bytes: a page is a page");
+        assert_eq!(size(33_177_600), "31.6 MiB", "the backdrop that named the 2026-08-06 leak");
+        assert_eq!(size(2048 * 1024 * 1024), "2.0 GiB", "and a cap in the units it was set in");
+        assert_eq!(percent(1800, 2048), 87);
+        assert_eq!(percent(0, 2048), 0);
+        assert_eq!(percent(5, 0), 0, "an absent cap is never divided by");
+    }
+
     /// Accounting is always on and enforcement is not. Without a cap nothing is ever refused --
     /// which is what a bare virglrenderer and every replay run as, and why the corpora do not
     /// move when this lands.
     #[test]
     fn without_a_cap_nothing_is_refused_and_everything_is_counted() {
         let budget = Budget::with_cap(None, false);
-        let account = Account::open(&budget, key(1));
+        let account = Account::open(&budget, key(1), String::new());
         let _huge = account.try_charge("device memory", u64::MAX / 2).expect("no cap");
         let _more = account.try_charge("IOSurface", u64::MAX / 2).expect("still no cap");
         assert_eq!(budget.live(), u64::MAX - 1, "counted, both of them");

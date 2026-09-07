@@ -194,13 +194,17 @@ impl Vkr {
     /// id it already holds, so a repeat reaching here means the two maps have drifted apart.
     /// Replacing the entry would drop a live context -- its rings and every host handle in it --
     /// and return as though a context had been created.
-    pub fn context_create(&mut self, id: ContextId) {
+    ///
+    /// `name` is what the guest called this context; it goes to the budget ledger, which is the
+    /// only thing that reads it, and reaches it as an argument from here -- the one place a
+    /// context is stood up.
+    pub fn context_create(&mut self, id: ContextId, name: String) {
         // Checked before the new context is built: building it opens the id's budget account,
         // which is one per live id too.
         assert!(!self.contexts.contains_key(&id), "{id:?} already had a venus context");
         let key = ContextKey { id, generation: self.generations };
         self.generations += 1;
-        self.contexts.insert(id, Arc::new(Mutex::new(Context::new(key, &self.budget))));
+        self.contexts.insert(id, Arc::new(Mutex::new(Context::new(key, &self.budget, name))));
     }
 
     /// Tear a context down. Every host handle it still holds dies with it -- a guest that leaks is
@@ -450,7 +454,7 @@ mod tests {
         let map = Arc::new(map);
         let table: SharedResources = Arc::new(RwLock::new(OneShm(Arc::clone(&map))));
         let mut v = Vkr::new(Config::default(), table);
-        v.context_create(ctx_id());
+        v.context_create(ctx_id(), String::new());
         (v, map)
     }
 
@@ -465,7 +469,7 @@ mod tests {
     #[should_panic(expected = "already had a venus context")]
     fn a_second_context_on_a_live_id_does_not_quietly_replace_the_first() {
         let (mut v, _map) = vkr();
-        v.context_create(ctx_id());
+        v.context_create(ctx_id(), String::new());
     }
 
     fn ring_info() -> VkRingCreateInfoMESA {

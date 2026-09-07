@@ -325,12 +325,12 @@ impl Context {
         self.key.id()
     }
 
-    pub fn new(key: ContextKey, budget: &Arc<Budget>) -> Context {
+    pub fn new(key: ContextKey, budget: &Arc<Budget>, name: String) -> Context {
         Context {
             key,
             fatal: Arc::new(AtomicBool::new(false)),
             objects: Shared::new(),
-            driver: Driver::new(Account::open(budget, key)),
+            driver: Driver::new(Account::open(budget, key, name)),
             replay: false,
             dispatched: 0,
             unhandled: 0,
@@ -4818,6 +4818,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.replay_begin();
         let mut todo = Unimplemented::default();
@@ -4842,6 +4843,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         let w = header(cmd, GENERATE_REPLY);
         let mut full = w.clone();
@@ -4856,6 +4858,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.replay_begin();
         assert!(!ctx.submit(&full, &mut todo, &g, &NO_RESOURCES).ran());
@@ -4876,6 +4879,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.replay_begin();
 
@@ -4996,6 +5000,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         let inner = wire_seek(0x10, GENERATE_REPLY);
@@ -5049,6 +5054,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.objects.borrow_mut().add_ghost(ObjectId(GHOST));
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
@@ -5060,6 +5066,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.objects.borrow_mut().add_ghost(ObjectId(GHOST));
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
@@ -5108,6 +5115,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         let inner = wire_instance_version();
@@ -5158,6 +5166,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         let nowhere = super::super::proto::types::VkCommandStreamDescriptionMESA {
@@ -5172,6 +5181,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire_execute(&[nowhere], Some(&[0x101])));
@@ -5202,6 +5212,7 @@ mod tests {
             let mut ctx = Context::new(
                 ContextKey::for_test(ContextId::new(1).unwrap()),
                 &Budget::with_cap(None, false),
+                String::new(),
             );
             assert!(
                 !ctx.submit(&wire_execute(&[s], None), &mut todo, &g, &t).ran(),
@@ -5232,6 +5243,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         let innermost = wire_instance_version();
@@ -5260,6 +5272,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         assert!(!ctx.submit(&wire_execute(&[], None), &mut todo, &g, &t).ran(), "no streams");
         assert!(ctx.fatal());
@@ -5269,6 +5282,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         let w = wire_execute(&[stream_at(0x22000, 4)], Some(&[0]));
         assert!(!ctx.submit(&w, &mut todo, &g, &t).ran(), "positions with no window");
@@ -5297,6 +5311,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         // Set the window, then seek inside it and ask for a reply. The seek is what moves the
@@ -5331,6 +5346,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         // Two bytes of room for a four-byte answer.
@@ -5362,6 +5378,7 @@ mod tests {
             let mut ctx = Context::new(
                 ContextKey::for_test(ContextId::new(1).unwrap()),
                 &Budget::with_cap(None, false),
+                String::new(),
             );
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, SIZE));
@@ -5390,6 +5407,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         // Out of range, and asking for a reply: the seek fails and the answer must not land.
@@ -5411,6 +5429,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         assert!(!ctx.submit(&wire_seek(0, 0), &mut todo, &g, &t).ran(), "there is nothing to seek");
@@ -5599,6 +5618,7 @@ mod tests {
             let mut ctx = Context::new(
                 ContextKey::for_test(ContextId::new(1).unwrap()),
                 &Budget::with_cap(None, false),
+                String::new(),
             );
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
@@ -5813,6 +5833,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         let mut fns = crate::vulkan::Device::default();
@@ -5986,6 +6007,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         let mut fns = crate::vulkan::Device::default();
@@ -6135,6 +6157,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         {
             let mut table = ctx.objects.borrow_mut();
@@ -6298,6 +6321,7 @@ mod tests {
             let mut ctx = Context::new(
                 ContextKey::for_test(ContextId::new(1).unwrap()),
                 &Budget::with_cap(None, false),
+                String::new(),
             );
             let mut fns = crate::vulkan::Device::default();
             fns.plant_vkGetFenceStatus(status);
@@ -6561,6 +6585,7 @@ mod tests {
                 let mut ctx = Context::new(
                     ContextKey::for_test(ContextId::new(1).unwrap()),
                     &Budget::with_cap(None, false),
+                    String::new(),
                 );
                 let mut fns = crate::vulkan::Device::default();
                 fns.plant_vkDeviceWaitIdle(idle);
@@ -6741,6 +6766,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         let mut fns = crate::vulkan::Device::default();
@@ -6861,6 +6887,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         let mut fns = crate::vulkan::Device::default();
@@ -7459,6 +7486,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         let speaks = crate::venus::driver::renderer_extensions();
@@ -7568,6 +7596,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         let mut fns = crate::vulkan::Instance::default();
@@ -7865,6 +7894,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         let cmd = wire!(
@@ -7924,6 +7954,7 @@ mod tests {
             let mut ctx = Context::new(
                 ContextKey::for_test(ContextId::new(1).unwrap()),
                 &Budget::with_cap(None, false),
+                String::new(),
             );
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
@@ -7967,6 +7998,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
 
         assert!(
@@ -8054,6 +8086,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.replay_begin();
 
@@ -8088,6 +8121,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.replay_begin();
 
@@ -8166,6 +8200,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.replay_begin();
         assert!(
@@ -8273,6 +8308,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.replay_begin();
 
@@ -8319,6 +8355,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.replay_begin();
 
@@ -8540,6 +8577,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.replay_begin();
 
@@ -12555,6 +12593,7 @@ mod tests {
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(7).expect("7 is not zero")),
             &Budget::with_cap(None, false),
+            String::new(),
         );
         ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
         {

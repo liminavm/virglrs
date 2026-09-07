@@ -903,13 +903,14 @@ impl Renderer {
         if self.contexts.contains_key(&id) {
             return Err(Error::ContextExists);
         }
-        self.contexts.insert(id, Context { id, capset, name, last_fence: BTreeMap::new() });
+        self.contexts
+            .insert(id, Context { id, capset, name: name.clone(), last_fence: BTreeMap::new() });
         // A venus context gets venus state, a classic one vrend's; anything else gets a context
         // and nothing behind it, and finds out when it submits.
         match capset {
             CapsetId::Venus => {
                 if let Some(v) = self.venus.as_mut() {
-                    v.context_create(id);
+                    v.context_create(id, name);
                 }
             }
             CapsetId::Virgl | CapsetId::Virgl2 => {
