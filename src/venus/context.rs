@@ -24,7 +24,7 @@ use super::driver::{self, Driver, ExportError, Exported, MemoryError, NoSyncFd, 
 use super::journal::{self, Journal, Seq};
 use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
-use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
+use super::proto::serialize::{COMMAND_TYPES, Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
     VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkDeviceSize,
     VkFence, VkFlags, VkMemoryHeapFlagBits, VkMemoryResourceAllocationSizePropertiesMESA,
@@ -1406,6 +1406,31 @@ fn releases_a_create(cmd: VkCommandTypeEXT) -> bool {
 /// is. Keying on all of them together is why a `vkBindBufferMemory2` over two buffers used to be
 /// lost entirely when one of them was destroyed, taking the other buffer's binding with it -- and
 /// a binding, unlike a descriptor write, is never sent again.
+///
+/// Three served commands do write into an object they do not own and are still left off, each for
+/// a reason that is not "nobody thought about it":
+///
+/// * `vkMergePipelineCaches` writes into `dstCache`. A pipeline cache holds no state a replay has
+///   to reproduce -- a miss recompiles -- so keeping the merge would grow the journal to buy back
+///   compile time.
+/// * `vkTransitionImageLayout` writes an image's layout. Nothing else in the journal reproduces a
+///   layout either: the transitions inside command buffers are recordings, and a rebuilt image
+///   starts undefined whichever route put it there. Listing this one alone would restore one
+///   image's layout and no other's, which is a more confusing world than restoring none.
+/// * `vkImportSemaphoreResourceMESA` writes a payload into a semaphore. Sync state is not
+///   journalled at all -- it is re-established by the fence contract at restore -- and an imported
+///   payload is a signal, not a description of the semaphore.
+///
+/// The list cannot be exhaustive: `VkCommandTypeEXT` is a newtype over the wire number, not a
+/// closed enum, so this match needs a catch-all and a command that belongs here can be added to
+/// the protocol without anything saying so. The count below is what says so instead.
+const _: () = assert!(
+    COMMAND_TYPES == 326,
+    "the venus protocol's command set changed. Re-read `mutates` against the new commands -- one \
+     that writes into an object it does not own belongs in it, and a missing entry is a journal \
+     entry that outlives what it described -- then update this number."
+);
+
 fn mutates(cmd: VkCommandTypeEXT) -> Option<&'static [VkObjectType]> {
     const SET: VkObjectType = VkObjectType::VK_OBJECT_TYPE_DESCRIPTOR_SET;
     const BUFFER: VkObjectType = VkObjectType::VK_OBJECT_TYPE_BUFFER;
