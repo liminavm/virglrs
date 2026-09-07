@@ -9,7 +9,7 @@
 
 use super::*;
 
-const LOG: &str = include_str!("../../../../harness/replay/fixtures/vrend-shaders.txt");
+const LOG: &str = include_str!("../../../harness/replay/fixtures/vrend-shaders.txt");
 
 /// One shader of the log: its TGSI dump and its GLSL.
 pub struct Block {
