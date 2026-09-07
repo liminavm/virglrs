@@ -1532,9 +1532,15 @@ impl Renderer {
         height: u32,
     ) -> Option<u32> {
         if let Some(surface) = self.classic_surface(handle) {
-            return Some(surface.read_rows(dst, stride, height));
+            let rows = surface.read_rows(dst, stride, height);
+            trace_blank_readback("classic", handle, surface.id().0, dst, stride, rows);
+            return Some(rows);
         }
-        Some(self.resource_storage(handle)?.surface().ok()?.read_rows(dst, stride, height))
+        let storage = self.resource_storage(handle)?;
+        let surface = storage.surface().ok()?;
+        let rows = surface.read_rows(dst, stride, height);
+        trace_blank_readback("shared", handle, surface.id().0, dst, stride, rows);
+        Some(rows)
     }
 
     /// Complete a classic scanout's renders before the surface they landed in is presented.
@@ -1649,6 +1655,38 @@ impl Renderer {
     ) -> Result<R, Error> {
         let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
         v.with_context(ctx_id, f).ok_or(Error::NoContext)
+    }
+}
+
+/// Name the surface a scanout readback came out of, when what came out of it was blank.
+///
+/// `LIMINA_READBACK_TRACE=1`. Off by default, and self-limiting when on: it prints only for a
+/// readback whose first row is entirely zero, which is the symptom under investigation, so a
+/// healthy desktop stays silent instead of drowning the log at flip rate. Blank rather than
+/// every-flush is deliberate -- the diagnostic that logged this path at 60 Hz is what made the
+/// supervisor's retained tail useless for reading anything else.
+///
+/// The id is a diagnostic, never a decision: an IOSurface id names a surface only while that
+/// surface lives, and a released one's id is free to come back on a different surface. Two ids
+/// that match are therefore not proof that two surfaces are the same one, and nothing here may
+/// grow into a lookup by id.
+fn trace_blank_readback(
+    kind: &str,
+    handle: ResourceHandle,
+    surface_id: u32,
+    dst: &[u8],
+    stride: usize,
+    rows: u32,
+) {
+    if std::env::var_os("LIMINA_READBACK_TRACE").is_none() {
+        return;
+    }
+    let first_row = &dst[..stride.min(dst.len())];
+    if !first_row.is_empty() && first_row.iter().all(|&b| b == 0) {
+        eprintln!(
+            "[virglrs] readback: resource {handle:?} resolved a {kind} IOSurface (id \
+             {surface_id}) whose first row is blank; {rows} rows read"
+        );
     }
 }
 
