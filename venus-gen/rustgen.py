@@ -2494,7 +2494,15 @@ class RustGen:
         arm list, and an arm that is merely missing has to be a named failure rather than a silent
         pass.
         """
-        out = ['/// The name of the command, for a message a human reads. `None` is a type',
+        out = ['/// How many commands this protocol defines.',
+               '///',
+               '/// Emitted so that a classification of the command set which *cannot* be made',
+               '/// exhaustive -- `VkCommandTypeEXT` is a newtype over the wire number, not a',
+               '/// closed enum, so every match over it needs a catch-all -- can still fail the',
+               '/// build when the set it classifies changes. See `mutates` in `venus/context.rs`.',
+               'pub const COMMAND_TYPES: usize = %d;' % len(commands),
+               '']
+        out += ['/// The name of the command, for a message a human reads. `None` is a type',
                '/// no version of this protocol defines.',
                'pub fn vn_command_name(cmd: VkCommandTypeEXT) -> Option<&\'static str> {',
                '    match cmd {']
