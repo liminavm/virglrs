@@ -1,2 +1,5 @@
 /target
 /prefix
+/spikes/machmem/machmem
+/spikes/machmem/survive
+/spikes/machmem/hvmap
