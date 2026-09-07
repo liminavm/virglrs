@@ -1749,7 +1749,7 @@ mod tests {
     /// No corpus can reach this: the captures are one guest, replayed one context at a time.
     #[test]
     fn a_context_reaches_the_resources_the_guest_attached_to_it() {
-        use crate::venus::budget::Account;
+        use crate::budget::Account;
         use crate::venus::ring::ShmResources;
 
         let one = ContextId::new(1).unwrap();
@@ -1962,7 +1962,7 @@ mod tests {
 
         let surface = crate::metal::Surface::scanout(64, 8, crate::metal::PixelFormat::Bgra, 256)
             .expect("the system minted a surface");
-        let account = crate::venus::budget::Account::for_test(None);
+        let account = crate::budget::Account::for_test(None);
         let share = Storage::minted_for_test(surface, &account);
 
         let mut table = BTreeMap::new();
@@ -2167,7 +2167,7 @@ mod tests {
     /// because there is no longer an address handed out that this renderer does not own.
     #[test]
     fn a_blobs_mapping_survives_the_guest_freeing_the_allocation() {
-        use crate::venus::budget::Account;
+        use crate::budget::Account;
 
         const MEM: ObjectId = ObjectId(66);
         let mut r = renderer(Config { venus: true, ..Config::default() });
@@ -2223,7 +2223,7 @@ mod tests {
     /// simply not it.
     #[test]
     fn a_reused_context_id_does_not_inherit_the_previous_contexts_blobs() {
-        use crate::venus::budget::Account;
+        use crate::budget::Account;
 
         let mut r = renderer(Config { venus: true, ..Config::default() });
         let two = ContextId::new(2).unwrap();
@@ -2275,7 +2275,7 @@ mod tests {
     /// asking every frame gets one line and not a log of them.
     #[test]
     fn a_scanout_of_pages_has_no_surface_and_says_so_once() {
-        use crate::venus::budget::Account;
+        use crate::budget::Account;
         use crate::venus::driver::NoSurface;
 
         let mut r = renderer(Config { venus: true, ..Config::default() });

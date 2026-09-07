@@ -42,8 +42,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::ids::ContextId;
-
-use super::vkr::ContextKey;
+use crate::venus::vkr::ContextKey;
 
 /// How the cap is configured, and what it is called.
 const CAP_ENV: &str = "LIMINA_GPU_MEM_BUDGET_MIB";
@@ -277,6 +276,38 @@ impl Drop for Charge {
     }
 }
 
+/// Storage this renderer minted, and what it cost -- one value, because they have one lifetime.
+///
+/// The charge lives with the storage rather than on the record of whatever asked for it, so that
+/// it is credited when the *storage* goes and not when the request does. A venus resource holding
+/// a share keeps the storage alive past the context that made it, and a classic texture the guest
+/// has unreffed sits in `Vrend.doomed` until a GL context can delete it; those bytes are the
+/// host's to count in both cases, and a charge on the record would have been credited while the
+/// memory stood.
+pub struct Charged<T> {
+    it: T,
+    #[expect(dead_code, reason = "held for its Drop -- crediting the ledger is this going away")]
+    charge: Charge,
+}
+
+impl<T> Charged<T> {
+    pub fn new(it: T, charge: Charge) -> Charged<T> {
+        Charged { it, charge }
+    }
+
+    pub fn it(&self) -> &T {
+        &self.it
+    }
+}
+
+/// A charged thing is the thing, to whoever only wanted the thing. This is what lets an IOSurface
+/// keepalive be handed out as [`Held`](crate::metal::Held) without the holder learning that a
+/// ledger exists, or being able to separate the surface from what it cost.
+impl<T: crate::metal::Held> crate::metal::Held for Charged<T> {
+    fn surface(&self) -> &crate::metal::Surface {
+        self.it.surface()
+    }
+}
 /// One context's key to the ledger.
 ///
 /// Charges are made through this and never against the [`Budget`] directly, which is what makes
