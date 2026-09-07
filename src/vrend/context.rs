@@ -2305,7 +2305,16 @@ impl Context {
             let res_format = res.args.format;
             let supports_view = res.supports_view();
             let res_is_ds = res_format.describe().is_some_and(|d| d.is_depth_or_stencil());
+            let mut needs_view = target != tex_target;
             let view_format = if res_is_ds { res_format } else { v.format };
+            if !res_is_ds && v.format != res_format {
+                needs_view = true;
+            }
+            // A swizzle is the view's own, and GL keeps it on the texture object, so a view
+            // that carries one needs an object no other view will overwrite.
+            if gl_swizzle != IDENTITY_SWIZZLE {
+                needs_view = true;
+            }
             // A plane index, not a layer range. Sampling plane N of a planar surface, the
             // guest writes the index into the same dword the layer range is packed in
             // (`virgl_encode_sampler_view`), so it arrives as first_layer = N, last_layer = 0.
@@ -2364,6 +2373,9 @@ impl Context {
                     first_layer = 0;
                     last_layer = 0;
                 }
+                if first_layer > 0 || first_level > 0 {
+                    needs_view = true;
+                }
                 // A view whenever the host can mint one, not only when the view differs from
                 // its texture.
                 //
@@ -2379,7 +2391,7 @@ impl Context {
                 // A predicate ("...or the swizzle is non-identity") would have to grow a term
                 // for every per-view parameter anyone adds to the fallback, and the one nobody
                 // adds is the next silent corruption; a private object has no one to race.
-                if immutable && features.has(Feature::texture_view) {
+                if needs_view && immutable && features.has(Feature::texture_view) {
                     let levels = last_level.wrapping_sub(first_level).wrapping_add(1);
                     let layers = last_layer as i64 - first_layer as i64 + 1;
                     // The guest chose these. `glTextureView` refuses a range past the texture's
@@ -2553,6 +2565,10 @@ fn read_shader(text: &[u8], num_tokens: u32) -> Result<Program, Fault> {
     let tgsi = tgsi::Program::scan(shader).map_err(|error| Fault::Tgsi { cmd, error })?;
     Ok(Program { tgsi, info: shader::Info::default(), variants: Vec::new() })
 }
+
+/// The swizzle that changes nothing, and so has nothing to clash over.
+const IDENTITY_SWIZZLE: [GLint; 4] =
+    [GL_RED as GLint, GL_GREEN as GLint, GL_BLUE as GLint, GL_ALPHA as GLint];
 
 fn to_gl_swizzle(s: Swizzle) -> GLenum {
     match s {
