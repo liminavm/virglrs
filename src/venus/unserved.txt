@@ -137,7 +137,6 @@ vkGetRayTracingShaderGroupStackSizeKHR
 vkQueueBindSparse
 vkQueueSubmit2
 vkRegisterCustomBorderColorEXT
-vkResetFenceResourceMESA
 vkSetPrivateData
 vkTrimCommandPool
 vkUnmapMemory

@@ -26,13 +26,14 @@ use super::proto::types::{
     VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags, VkDependencyInfo,
     VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
     VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent,
-    VkExportMemoryAllocateInfo, VkExtensionProperties, VkExternalMemoryHandleTypeFlagBits,
-    VkExternalMemoryImageCreateInfo, VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter,
-    VkFormat, VkFramebuffer, VkFrontFace, VkHostImageLayoutTransitionInfo, VkImage,
-    VkImageAspectFlagBits, VkImageAspectFlags, VkImageBlit, VkImageCopy, VkImageCreateFlags,
-    VkImageCreateInfo, VkImageFormatProperties, VkImageLayout, VkImageMemoryBarrier,
-    VkImageSubresource, VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy, VkImageType,
-    VkImageUsageFlagBits, VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
+    VkExportMemoryAllocateInfo, VkExtensionProperties, VkExternalFenceHandleTypeFlagBits,
+    VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryImageCreateInfo,
+    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceGetFdInfoKHR, VkFilter, VkFormat,
+    VkFramebuffer, VkFrontFace, VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlagBits,
+    VkImageAspectFlags, VkImageBlit, VkImageCopy, VkImageCreateFlags, VkImageCreateInfo,
+    VkImageFormatProperties, VkImageLayout, VkImageMemoryBarrier, VkImageSubresource,
+    VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy, VkImageType, VkImageUsageFlagBits,
+    VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
     VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance,
     VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo,
     VkMemoryMapFlags, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
@@ -1131,6 +1132,16 @@ impl Driver {
 
     /// Drop a fence's record, at the same two places.
     pub fn forget_fence(&mut self, fence: VkFence) {
+        self.pending_fences.remove(&fence);
+    }
+
+    /// A reset unmakes the promise: whatever submit named this fence, the guest has said it is
+    /// done with the answer.
+    ///
+    /// Both commands that reset a fence come through here rather than reaching into the set --
+    /// `vkResetFences` and `vkResetFenceResourceMESA`, which resets by exporting. Two call sites
+    /// editing one container is how the second one comes to disagree with the first.
+    fn unpend_fence(&mut self, fence: VkFence) {
         self.pending_fences.remove(&fence);
     }
 
@@ -3360,11 +3371,9 @@ impl Driver {
         // SAFETY: `device` is a handle in this table, and the count Vulkan wants is the slice's
         // own length. The same holds for the wait below.
         let ret = unsafe { (d.fns.vkResetFences())(device, fences.len() as u32, fences.as_ptr()) };
-        // A reset unmakes the promise: whatever submit named this fence, the guest has said it is
-        // done with the answer.
         if ret == VkResult::VK_SUCCESS {
             for f in fences {
-                self.pending_fences.remove(f);
+                self.unpend_fence(*f);
             }
         }
         ret
@@ -3419,10 +3428,44 @@ impl Driver {
         // SAFETY: `device` is a handle in this table; `info` and `fd` are ours and outlive the
         // call.
         let r = unsafe { (d.vkGetSemaphoreFdKHR())(device, &info, &mut fd) };
-        if fd >= 0 {
-            // SAFETY: a descriptor this call just produced and nothing else holds. Closing it is
-            // the whole point -- the payload has already moved.
-            unsafe { libc::close(fd) };
+        // Closed when this binding goes out of scope -- see [`exported_fd`].
+        let _closed = exported_fd(fd);
+        Ok(r)
+    }
+
+    /// `vkResetFenceResourceMESA`: put a fence back to unsignalled by exporting its payload.
+    ///
+    /// The fence twin of [`Driver::export_semaphore_sync_fd`], and the same trick: a `SYNC_FD`
+    /// export *moves* the payload out, which leaves the fence unsignalled -- so the export is the
+    /// reset, and the descriptor is a by-product the guest never asked for. mesa uses this rather
+    /// than `vkResetFences` because it has already exported the fence once and needs the host's
+    /// copy to stop being signalled.
+    ///
+    /// The reset is why this cannot just be the export: the ledger's idea of which fences have a
+    /// submit outstanding has to move with it, or a later capture reports this fence as still
+    /// promised.
+    pub fn reset_fence_resource(
+        &mut self,
+        device: VkDevice,
+        fence: VkFence,
+    ) -> Result<VkResult, NoSyncFd> {
+        // Copied out so the table's borrow ends before the ledger is touched below.
+        let get_fd = self.sync_fd_device(device, |f| f.has_vkGetFenceFdKHR())?.vkGetFenceFdKHR();
+        let info = VkFenceGetFdInfoKHR {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+            pNext: core::ptr::null(),
+            fence,
+            handleType:
+                VkExternalFenceHandleTypeFlagBits::VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+        };
+        let mut fd: core::ffi::c_int = -1;
+        // SAFETY: `device` is a handle in this table; `info` and `fd` are ours and outlive the
+        // call.
+        let r = unsafe { get_fd(device, &info, &mut fd) };
+        // Closed when this binding goes out of scope -- see [`exported_fd`].
+        let _closed = exported_fd(fd);
+        if r == VkResult::VK_SUCCESS {
+            self.unpend_fence(fence);
         }
         Ok(r)
     }
@@ -4419,10 +4462,29 @@ pub struct Allocation {
 pub enum NoSyncFd {
     /// No device behind the handle.
     NoDevice,
-    /// The driver exports neither half of `VK_KHR_external_semaphore_fd`. There is nothing to
+    /// The driver exports no sync fd for the object asked about -- neither half of
+    /// `VK_KHR_external_semaphore_fd`, or no `VK_KHR_external_fence_fd`. There is nothing to
     /// substitute: a semaphore whose payload cannot be moved is one the guest's next submit waits
-    /// on forever, so saying so is better than pretending it worked.
+    /// on forever, and a fence that cannot be reset stays signalled, so saying so is better than
+    /// pretending it worked.
     Unsupported,
+}
+
+/// Take ownership of the descriptor a `SYNC_FD` export may have produced.
+///
+/// Exporting a `SYNC_FD` payload moves it out of the fence or semaphore, which is the entire
+/// effect both MESA commands want; the descriptor is a by-product, and leaking one per frame is a
+/// renderer that runs out of them. The C closes it by hand at each site, which is one early
+/// return away from a leak -- here the close is the drop, so no future path can forget it.
+///
+/// `None` for a driver that exported nothing: KosmicKrisp answers `VK_SUCCESS` with no descriptor
+/// at all, measured over the venus corpus at 71568 exports and not one non-negative fd. That is a
+/// driver free to have moved the payload somewhere that is not a file, not an error.
+fn exported_fd(fd: core::ffi::c_int) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: a descriptor the export call just produced and nothing else holds, so this is its
+    // only owner and the drop is its only close.
+    (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
 /// A share of the storage behind a published allocation, held by whoever needs those bytes.
