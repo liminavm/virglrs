@@ -16,6 +16,7 @@ use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, Text
 use super::pipe::TextureTarget;
 use super::proto::{Format, Plane};
 use super::video;
+use crate::budget::{Charged, Classic};
 use crate::guest_mem::{Iov, PixelSource};
 use crate::ids::ResourceHandle;
 use crate::metal::{Held, PixelFormat, PlanarFormat, Surface};
@@ -1237,6 +1238,7 @@ impl Resource {
         features: &Features,
         formats: &Table,
         limits: &Limits,
+        budget: &Classic,
         args: Args,
     ) -> Result<Resource, Refusal> {
         let storage = match plan(features, formats, limits, &args)? {
@@ -1246,7 +1248,7 @@ impl Resource {
                 alloc_buffer(gl, &args, gl_target, storage_flags)?
             }
             Plan::Texture { gl_target } => {
-                let planes = mint_planes(winsys, features, &args);
+                let planes = mint_planes(winsys, features, budget, &args);
                 // A resource in a format that has more than one plane, with nothing backing them,
                 // is one whose plane views would find no image and fall through to a texture view
                 // the format has no view class for -- which puts the guest's context in error for
@@ -1267,7 +1269,7 @@ impl Resource {
                     );
                     return Err(Refusal::NoPlanarStorage);
                 }
-                let image = mint_surface(winsys, features, &args);
+                let image = mint_surface(winsys, features, budget, &args);
                 alloc_texture(gl, features, formats, &args, gl_target, image, planes)?
             }
         };
@@ -1724,7 +1726,7 @@ pub fn gl_target(target: TextureTarget, nr_samples: u32) -> GLenum {
 /// `None` for every format this build cannot back, and for a surface the system or the driver
 /// refuses -- the caller turns that into a refused create rather than a resource whose planes
 /// cannot be sampled.
-fn mint_planes(winsys: &Winsys, features: &Features, a: &Args) -> Option<Planes> {
+fn mint_planes(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args) -> Option<Planes> {
     if !video::composite_target_backable(features, a.format) {
         return None;
     }
@@ -1736,7 +1738,15 @@ fn mint_planes(winsys: &Winsys, features: &Features, a: &Args) -> Option<Planes>
     // second statement of it is the pair that drifts.
     let planar = PlanarFormat::BiPlanar420;
     let surface = match Surface::planar(a.width, a.height, planar) {
-        Ok(surface) => Arc::new(surface),
+        Ok(surface) => {
+            // Charged with the surface it pays for, and with what the surface actually cost:
+            // there is no requested byte count on this path -- `Args` is an extent and a format --
+            // so the figure comes from the allocation, after it, and never from a second estimate
+            // that could disagree with it. The charge rides inside the `Arc`, so the two plane
+            // images below share one and the bytes are billed once.
+            let charge = budget.charge("planar IOSurface", surface.alloc_size());
+            Arc::new(Charged::new(surface, charge))
+        }
         Err(e) => {
             eprintln!(
                 "[virglrs] vrend: no planar IOSurface for a {}x{} {} target ({e:?})",
@@ -1768,7 +1778,7 @@ fn mint_planes(winsys: &Winsys, features: &Features, a: &Args) -> Option<Planes>
         a.width,
         a.height,
         a.format.name(),
-        surface.id().0
+        surface.it().id().0
     );
     Some(Planes { luma, chroma, planar, conversion: Mutex::default(), textures: Mutex::default() })
 }
@@ -1783,7 +1793,7 @@ fn mint_planes(winsys: &Winsys, features: &Features, a: &Args) -> Option<Planes>
 /// Only a single-level, single-sample 2D texture in a 32-bit format IOSurface and Metal both
 /// name. Anything else keeps ordinary GL storage and the CPU readback path, as does a surface
 /// the system or the driver refuses: the fallback is never removed, only reported.
-fn mint_surface(winsys: &Winsys, features: &Features, a: &Args) -> Option<Image> {
+fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args) -> Option<Image> {
     let scanout = a.bind.has(Bind::SCANOUT);
     if !scanout && !a.bind.has(Bind::SHARED) {
         return None;
@@ -1797,6 +1807,12 @@ fn mint_surface(winsys: &Winsys, features: &Features, a: &Args) -> Option<Image>
         "R8G8B8A8_UNORM" | "R8G8B8X8_UNORM" => PixelFormat::Rgba,
         _ => return None,
     };
+    if !features.adopts_iosurfaces() {
+        // Known at init and reported there; the resource keeps ordinary GL storage. Ahead of the
+        // mint, not after it: a surface minted here would be dropped unused, and its charge taken
+        // and credited on every `SHARED` create for nothing.
+        return None;
+    }
     let surface = match Surface::plain(a.width, a.height, format) {
         Ok(s) => s,
         Err(e) => {
@@ -1809,11 +1825,12 @@ fn mint_surface(winsys: &Winsys, features: &Features, a: &Args) -> Option<Image>
             return None;
         }
     };
-    if !features.adopts_iosurfaces() {
-        // Known at init and reported there; the resource keeps ordinary GL storage.
-        return None;
-    }
-    match winsys.image_from_iosurface(Arc::new(surface)) {
+    // See [`mint_planes`] on why the charge is taken from the surface rather than from `a`. The
+    // image below holds the charged share, so what credits these bytes is the last holder of the
+    // surface letting go -- a venus context that imported it, or a texture still sitting in
+    // `Vrend.doomed` after the guest unreffed its resource.
+    let charge = budget.charge("IOSurface", surface.alloc_size());
+    match winsys.image_from_iosurface(Arc::new(Charged::new(surface, charge))) {
         Ok(image) => {
             if scanout {
                 eprintln!(

@@ -450,6 +450,7 @@ impl Vrend {
             &self.features,
             &self.formats,
             &self.limits,
+            &self.budget,
             args,
         )?;
         self.resources.insert(handle, resource::Slot::Resource(res));
