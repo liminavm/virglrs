@@ -903,6 +903,11 @@ impl Renderer {
         if self.contexts.contains_key(&id) {
             return Err(Error::ContextExists);
         }
+        // The name arrives in a fixed-width guest buffer and comes padded to it -- measured
+        // through rutabaga as `python3` followed by 54 spaces. Trimmed here, at the one door
+        // every caller comes through, so no reader downstream has to know the buffer's width or
+        // remember to do it: what a log line prints in brackets is a name, not a field.
+        let name = name.trim_matches(|c: char| c.is_whitespace() || c == '\0').to_owned();
         self.contexts
             .insert(id, Context { id, capset, name: name.clone(), last_fence: BTreeMap::new() });
         // A venus context gets venus state, a classic one vrend's; anything else gets a context
@@ -2345,6 +2350,24 @@ mod tests {
     /// The shim used to print how many contexts and resources it was dropping and drop none of
     /// them, so a VMM resetting between guest boots carried the previous boot's contexts into the
     /// next one -- and the ids it had just been told were free came back `ContextExists`.
+    /// The VMM hands the guest's context name over in a fixed-width buffer, so it arrives padded
+    /// to that width -- `python3` and 54 spaces, as measured through rutabaga. Trimmed once here,
+    /// where every caller enters, rather than by each reader that prints it.
+    #[test]
+    fn a_context_name_is_trimmed_of_the_buffer_it_travelled_in() {
+        let mut r = renderer(Config::default());
+        let padded = ContextId::new(1).unwrap();
+        let empty = ContextId::new(2).unwrap();
+        let mut buffer = String::from("python3");
+        buffer.push_str(&" ".repeat(54));
+        buffer.push('\0');
+
+        r.context_create(padded, CapsetId::Virgl, buffer).expect("a fresh id");
+        r.context_create(empty, CapsetId::Virgl, "  \0\0 ".into()).expect("a fresh id");
+        assert_eq!(r.contexts[&padded].name, "python3", "a name, not a field");
+        assert_eq!(r.contexts[&empty].name, "", "and padding alone is no name at all");
+    }
+
     #[test]
     fn a_reset_frees_the_ids_and_the_memory_it_says_it_frees() {
         let fd = a_descriptor();
