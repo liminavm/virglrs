@@ -3058,6 +3058,23 @@ impl Context {
                 .view_texture(key)
                 .ok_or(Fault::IllegalResource { cmd, handle: s.resource })?,
         };
+        // Which IOSurface the guest is about to render into, under LIMINA_READBACK_TRACE. Only
+        // for a surface-backed texture, so this names the compositor's framebuffers and nothing
+        // else, and only from here -- an attachment that did not change never reaches this call.
+        //
+        // It exists to separate two readings of a blank scanout that look identical from the
+        // readback side: renders still landing in the surfaces from before a display
+        // reconfiguration (two owners of "the current scanout", only one updated) versus nothing
+        // rendering at all. "The new surfaces are empty" is consistent with both.
+        if std::env::var_os("LIMINA_READBACK_TRACE").is_some()
+            && let Some(image) = s.textures.image.as_ref()
+        {
+            eprintln!(
+                "[virglrs] render target: resource {:?} attachment {attachment} is IOSurface id {}",
+                s.resource,
+                image.surface().id().0
+            );
+        }
         transfer::attach_texture(
             host.gl,
             host.features,

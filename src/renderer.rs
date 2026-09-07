@@ -587,6 +587,13 @@ impl Renderer {
         // Before either arm, and once: a build serving only classic has a cap too, and two
         // ledgers would be two answers to the one question the cap is asked.
         let budget = crate::budget::Budget::from_env();
+        // Said at startup, not left to the first hit: a diagnostic that only ever speaks when it
+        // finds something cannot be told, from its silence, from one that was never compiled in.
+        // limina builds `third_party/virglrs`, not whichever clone the change was written in, so
+        // "the trace printed nothing" is a claim about the build before it is one about the run.
+        if std::env::var_os("LIMINA_READBACK_TRACE").is_some() {
+            eprintln!("[virglrs] readback trace armed: blank scanout readbacks will be named");
+        }
         let vrend =
             if config.vrend { Some(vrend::vrend::Vrend::new(config, &budget)?) } else { None };
         Ok(Renderer {
