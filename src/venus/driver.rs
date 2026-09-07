@@ -38,16 +38,17 @@ use super::proto::types::{
     VkMemoryMapFlags, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
     VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy, VkMemoryToImageCopyMESA,
     VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType, VkPhysicalDevice,
-    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
-    VkPipelineLayout, VkPipelineStageFlagBits, VkPipelineStageFlags, VkPrimitiveTopology,
-    VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits,
-    VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo,
-    VkRenderingInfo, VkResult, VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler,
-    VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR,
-    VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
-    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
-    VkStructureType, VkSubmitInfo, VkSubpassContents, VkSubresourceLayout,
-    VkTimelineSemaphoreSubmitInfo, VkViewport, VkWriteDescriptorSet,
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties, VkPipeline,
+    VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
+    VkPipelineStageFlags, VkPrimitiveTopology, VkQueryControlFlags, VkQueryPool,
+    VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue,
+    VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingInfo, VkResult,
+    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
+    VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
+    VkSemaphoreSignalInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitInfo,
+    VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp, VkStructureType,
+    VkSubmitInfo, VkSubpassContents, VkSubresourceLayout, VkTimelineSemaphoreSubmitInfo,
+    VkViewport, VkWriteDescriptorSet,
 };
 use std::sync::Arc;
 
@@ -490,6 +491,14 @@ fn fits(n: u32, room: Option<usize>) {
 }
 
 impl Driver {
+    /// The ledger handle every charge on this driver's behalf is made through.
+    ///
+    /// Handed out because the budget is also an *answer*: `VK_EXT_memory_budget` is served from
+    /// it, and that handler lives in `context.rs`.
+    pub fn account(&self) -> &Account {
+        &self.account
+    }
+
     pub fn new(account: Account) -> Driver {
         Driver {
             account,
@@ -4860,6 +4869,12 @@ pub fn chained_mut<T: OutStruct>(head: &mut *mut core::ffi::c_void) -> Option<&m
 unsafe impl OutStruct for VkMemoryResourceAllocationSizePropertiesMESA {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA;
+}
+
+// SAFETY: as above -- generated `repr(C)` from vk.xml for exactly this tag.
+unsafe impl OutStruct for VkPhysicalDeviceMemoryBudgetPropertiesEXT {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
 }
 
 /// The create info the driver is handed for an image, which is the guest's unless the guest

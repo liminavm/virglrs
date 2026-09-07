@@ -49,6 +49,20 @@ use super::vkr::ContextKey;
 const CAP_ENV: &str = "LIMINA_GPU_MEM_BUDGET_MIB";
 /// Whether a refusal stops at the error, instead of stopping the context.
 const SOFT_ENV: &str = "LIMINA_GPU_MEM_BUDGET_SOFT";
+/// Whether every budget answer is logged, not only a clamp transition.
+const TRACE_ENV: &str = "LIMINA_GPU_MEM_BUDGET_TRACE";
+
+/// How every line about the cap begins.
+///
+/// It says "limina" because the cap is limina's policy, named in `LIMINA_GPU_MEM_BUDGET_MIB` and
+/// documented as this grammar in limina's `docs/design/gpu-memory-budget.md` -- an operator reads
+/// these lines with that page open, and the harness parses them. This is the one place this
+/// renderer speaks a word from the layer above, and it does so because the log is that layer's
+/// interface rather than ours.
+const GRAMMAR: &str = "limina GPU budget";
+
+/// While a clamp holds, one line a minute rather than one per query.
+const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The live host memory this renderer holds on guests' behalf, and the cap on it.
 pub struct Budget {
@@ -63,7 +77,30 @@ pub struct Budget {
     /// handle to memory that does not exist, and poisons its ring on the next use anyway -- the
     /// same context death, with the reason several commands in the past.
     soft: bool,
+    /// Whether every `VK_EXT_memory_budget` answer is logged, and not only a clamp transition.
+    trace: bool,
     ledger: Mutex<Ledger>,
+    /// What was last said about each heap, so the clamp is logged as an event and not as a
+    /// sample. This is state, not configuration, and it lives here for the reason the module
+    /// exists: the C kept it in file-scope statics, which is precisely the shape this renderer
+    /// does not have.
+    heaps: Mutex<[HeapTrace; MAX_HEAPS]>,
+}
+
+/// Heaps a `VkPhysicalDeviceMemoryProperties` can describe, and so the width of the budget
+/// arrays -- `VK_MAX_MEMORY_HEAPS`, spelled here because the generated types have it as an array
+/// length rather than a constant.
+const MAX_HEAPS: usize = 16;
+
+/// The last thing said about one heap, which decides whether the next answer is worth a line.
+#[derive(Clone, Copy, Default)]
+struct HeapTrace {
+    /// The driver's figure last time, to tell a real move from jitter.
+    driver: u64,
+    /// Whether the driver's answer won last time.
+    clamped: bool,
+    /// When this heap last printed, for the heartbeat while a clamp holds.
+    logged: Option<std::time::Instant>,
 }
 
 /// Everything charged, by who is answerable for it.
@@ -228,7 +265,7 @@ impl Account {
         if let Some(cap) = self.budget.cap
             && live.saturating_add(size) > cap
         {
-            return Err(Refused { wanted: size, live, cap });
+            return Err(Refused { what, wanted: size, live, cap });
         }
         ledger
             .slot_of(self.ctx)
@@ -248,17 +285,44 @@ impl Account {
         self.budget.live_for(self.ctx.id())
     }
 
+    /// Where this context stands against the cap, read in one lock.
+    ///
+    /// `None` with no cap configured: there is no budget to answer from, and the driver's own
+    /// reply is then the only true one. The three numbers come back together because they are
+    /// one observation -- read separately they are three values that must agree, and a
+    /// concurrent charge between two of them makes them disagree.
+    pub fn standing(&self) -> Option<Standing> {
+        let cap = self.budget.cap?;
+        let ledger = self.budget.ledger.lock().expect("the budget ledger");
+        let own = ledger.ctxs.get(&self.ctx.id()).map_or(0, |s| s.live.bytes());
+        Some(Standing { own, others: ledger.bytes().saturating_sub(own), cap })
+    }
+
+    /// What to report for one heap: the budget the guest is told, and the usage beside it.
+    ///
+    /// `driver` is what the host driver already wrote there, and it gets a vote: we never promise
+    /// more than the hardware has. Zero means it declined to answer, which is not a promise of
+    /// nothing.
+    pub fn heap_answer(&self, st: Standing, heap: u32, heap_size: u64, driver: u64) -> (u64, u64) {
+        let ours = st.ours(heap_size);
+        // A budget of zero is not a legal answer for a heap that exists
+        // (`VkPhysicalDeviceMemoryBudgetPropertiesEXT`), and `usage <= budget` is the other half
+        // of the same requirement -- hence the floor here and the `min` below.
+        let answer = if driver != 0 { ours.min(driver) } else { ours }.max(1);
+        self.budget.trace_heap(self.ctx.id(), heap, st, ours, driver, answer);
+        (answer, st.own.min(answer))
+    }
+
     /// Say what was refused and what the process is holding, which is the whole reason the
     /// histogram exists: one repeated call site reads as a single line naming its size and count.
     pub fn report_refusal(&self, refused: Refused) {
         eprintln!(
-            "[virglrs] ctx {}: refused {} -- {} live of {}, and this renderer will not go over",
-            self.ctx.id().get(),
+            "[virglrs] {GRAMMAR}: REFUSING a {} {} allocation for ctx {}",
             mib(refused.wanted),
-            mib(refused.live),
-            mib(refused.cap),
+            refused.what,
+            self.ctx.id().get(),
         );
-        self.budget.report("what the host is holding");
+        self.budget.report("at refusal");
     }
 
     /// An account on a ledger of its own, for a test with no renderer around it.
@@ -280,9 +344,39 @@ impl Drop for Account {
     }
 }
 
+/// Where one context stands against the cap: what it holds, what everyone else holds, and the
+/// cap itself.
+///
+/// The split matters because the cap is global while the ledger is per-context. "What is left for
+/// me" is the cap minus what *others* hold -- excluding this context's own bytes, so a client's
+/// own allocating cannot lower the budget it is told, which is the only thing that makes the
+/// number something a client can back off against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Standing {
+    /// What this context holds.
+    pub own: u64,
+    /// What every other holder holds, including what outlived the context charged for it.
+    pub others: u64,
+    /// The configured cap, on the total of the two.
+    pub cap: u64,
+}
+
+impl Standing {
+    /// What we answer for one heap, before the driver gets a vote.
+    ///
+    /// Floored at our own usage because memory already held is inside one's budget, and because
+    /// an exhausted cap would otherwise report a budget below the usage beside it. Clamped to the
+    /// heap because no arithmetic here can conjure memory the hardware does not have.
+    pub fn ours(&self, heap_size: u64) -> u64 {
+        self.cap.saturating_sub(self.others).max(self.own).min(heap_size)
+    }
+}
+
 /// A refusal, carrying what it takes to say so.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Refused {
+    /// What the allocation was for, in the words the histogram files it under.
+    pub what: &'static str,
     pub wanted: u64,
     pub live: u64,
     pub cap: u64,
@@ -307,20 +401,89 @@ impl Budget {
             },
         };
         let soft = std::env::var(SOFT_ENV).is_ok_and(|v| v == "1");
+        let trace = std::env::var(TRACE_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
         if let Some(bytes) = cap {
             eprintln!(
-                "[virglrs] gpu memory budget: {} MiB, refusal {}",
+                "[virglrs] {GRAMMAR}: cap {} MiB, refusal {}",
                 bytes / (1024 * 1024),
                 if soft { "returns an error the guest will not read" } else { "stops the context" }
             );
         }
-        Budget::with_cap(cap, soft)
+        Budget::new(cap, soft, trace)
     }
 
     /// A budget with the cap given rather than the one configured. The tests' way in: reading the
     /// environment from a test would make every other test in the process depend on it.
     pub fn with_cap(cap: Option<u64>, soft: bool) -> Arc<Budget> {
-        Arc::new(Budget { cap, soft, ledger: Mutex::new(Ledger::default()) })
+        Budget::new(cap, soft, false)
+    }
+
+    /// As [`Budget::with_cap`], saying also whether every budget answer is traced.
+    fn new(cap: Option<u64>, soft: bool, trace: bool) -> Arc<Budget> {
+        Arc::new(Budget {
+            cap,
+            soft,
+            trace,
+            ledger: Mutex::new(Ledger::default()),
+            heaps: Mutex::new([HeapTrace::default(); MAX_HEAPS]),
+        })
+    }
+
+    /// Explain one heap's reported budget, because what the guest finally sees is
+    /// `min(our answer, the driver's)` and only the host can tell those two apart.
+    ///
+    /// That is not academic: our answer does not move as the asking client allocates, so a
+    /// guest-visible budget that *grows* across a client's own allocations can only be the
+    /// driver's number rising -- it tracks real host GPU pressure. Without this line the two are
+    /// indistinguishable from our ledger being wrong.
+    ///
+    /// Emission is deliberately asymmetric. A client may query the budget every frame, so the
+    /// full line is gated on the trace flag, while a clamp -- which changes what the guest is
+    /// told -- is logged untraced, but only on the transition plus a slow heartbeat while it
+    /// holds. Logging the sample instead of the event is what once put ten lines a second into a
+    /// supervisor log.
+    fn trace_heap(
+        &self,
+        ctx: ContextId,
+        heap: u32,
+        st: Standing,
+        ours: u64,
+        driver: u64,
+        answer: u64,
+    ) {
+        let clamped = driver != 0 && ours > driver;
+        let transition = {
+            let mut heaps = self.heaps.lock().expect("the budget heap trace");
+            // A heap index past the array is a driver describing more heaps than Vulkan allows;
+            // there is nothing to remember about it, so it only ever prints when traced.
+            match heaps.get_mut(heap as usize) {
+                None => false,
+                Some(h) => {
+                    // Only a material move counts, or the driver's jitter alone would reprint.
+                    let moved = h.driver == 0 || driver.abs_diff(h.driver) > h.driver / 8;
+                    let due = h.logged.is_none_or(|t| t.elapsed() >= HEARTBEAT);
+                    let transition = clamped != h.clamped || (clamped && moved && due);
+                    if transition {
+                        h.logged = Some(std::time::Instant::now());
+                    }
+                    h.clamped = clamped;
+                    h.driver = driver;
+                    transition
+                }
+            }
+        };
+        if !self.trace && !(clamped && transition) {
+            return;
+        }
+        eprintln!(
+            "[virglrs] {GRAMMAR}: memory_budget ctx {} heap {heap} own={} others={} cap={} \
+             ours={ours} driver={driver} final={answer} clamped={}",
+            ctx.get(),
+            st.own,
+            st.others,
+            st.cap,
+            u8::from(clamped),
+        );
     }
 
     /// Whether a refusal should stop the context. See the module doc for why it must, by default.
@@ -379,7 +542,7 @@ impl Budget {
     pub fn report(&self, reason: &str) {
         let ledger = self.ledger.lock().expect("the budget ledger");
         let cap = self.cap.map_or(String::from("no cap"), mib);
-        eprintln!("[virglrs] {reason}: {} live of {cap}", mib(ledger.bytes()));
+        eprintln!("[virglrs] {GRAMMAR}: {reason} -- {} live of {cap}", mib(ledger.bytes()));
         for (ctx, slot) in ledger.ctxs.iter() {
             eprintln!("[virglrs]   ctx {}: {}", ctx.get(), mib(slot.live.bytes()));
             for (what, size, n) in slot.live.worst() {
@@ -500,7 +663,7 @@ mod tests {
         let held = one.try_charge("device memory", 800).expect("fits");
 
         let refused = two.try_charge("device memory", 300).expect_err("does not fit");
-        assert_eq!(refused, Refused { wanted: 300, live: 800, cap: 1000 });
+        assert_eq!(refused, Refused { what: "device memory", wanted: 300, live: 800, cap: 1000 });
 
         // Bound, not dropped on the spot: a charge that goes out of scope at the end of the
         // statement that made it is credited before the next line reads the ledger.
@@ -534,6 +697,60 @@ mod tests {
         );
         drop(charge);
         let _fits = next.try_charge("device memory", 900).expect("and now it is free");
+    }
+
+    /// What a context is told it has is the cap minus what *others* hold -- so its own allocating
+    /// does not shrink the number it is backing off against, which is the only thing that makes
+    /// the number usable.
+    #[test]
+    fn the_budget_answered_is_what_is_left_for_this_context() {
+        const HEAP: u64 = 64 * 1024;
+        let budget = Budget::with_cap(Some(1000), false);
+        let mine = Account::open(&budget, key(1));
+        let other = Account::open(&budget, key(2));
+
+        let st = mine.standing().expect("a cap is configured");
+        assert_eq!(st, Standing { own: 0, others: 0, cap: 1000 });
+        assert_eq!(st.ours(HEAP), 1000, "an empty ledger offers the whole cap");
+
+        let _theirs = other.try_charge("device memory", 400).expect("fits");
+        let _mine = mine.try_charge("device memory", 200).expect("fits");
+        let st = mine.standing().expect("a cap is configured");
+        assert_eq!(st, Standing { own: 200, others: 400, cap: 1000 });
+        assert_eq!(st.ours(HEAP), 600, "what is left for me counts my own bytes as still mine");
+
+        // The heap is the ceiling no arithmetic here may exceed.
+        assert_eq!(st.ours(500), 500, "we never promise more than the hardware has");
+
+        // An exhausted cap still owes a budget at least as big as the usage beside it.
+        let _rest = other.try_charge("device memory", 400).expect("takes the cap to the line");
+        let st = mine.standing().expect("a cap is configured");
+        assert_eq!(st.others, 1000 - 200);
+        assert_eq!(st.ours(HEAP), 200, "floored at what I hold, because I do hold it");
+    }
+
+    /// The driver gets a vote and the spec gets the last word: never more than the host offers,
+    /// never zero, and never a usage above the budget printed beside it.
+    #[test]
+    fn the_drivers_answer_clamps_ours_and_the_spec_floors_both() {
+        const HEAP: u64 = 1 << 40;
+        let budget = Budget::with_cap(Some(1000), false);
+        let mine = Account::open(&budget, key(1));
+        let _held = mine.try_charge("device memory", 200).expect("fits");
+        let st = mine.standing().expect("a cap is configured");
+
+        let (answer, usage) = mine.heap_answer(st, 0, HEAP, 0);
+        assert_eq!((answer, usage), (1000, 200), "a silent driver leaves our answer standing");
+
+        let (answer, usage) = mine.heap_answer(st, 0, HEAP, 900);
+        assert_eq!((answer, usage), (900, 200), "a tighter driver wins");
+
+        let (answer, usage) = mine.heap_answer(st, 0, HEAP, 5000);
+        assert_eq!((answer, usage), (1000, 200), "a looser one does not");
+
+        // A heap index past what Vulkan allows has no trace slot; it must still answer.
+        let (answer, usage) = mine.heap_answer(st, MAX_HEAPS as u32 + 3, HEAP, 1);
+        assert_eq!((answer, usage), (1, 1), "budget floored at one, and usage never above it");
     }
 
     /// Accounting is always on and enforcement is not. Without a cap nothing is ever refused --
