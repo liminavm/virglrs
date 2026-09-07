@@ -1020,15 +1020,8 @@ impl Context {
                     if let Some(res) = res
                         && let Storage::Texture(t) = &res.storage
                     {
-                        // The object the unit will bind, which is the view's own whenever it
-                        // has one. Resetting the base texture instead would leave the swizzle
-                        // standing on what is actually sampled, and clear it on a texture no
-                        // one asked about.
-                        let (name, target) = match view.view {
-                            Some(name) => (name, view.target),
-                            None => (t.name, t.target),
-                        };
-                        gl.bind_texture(target, Some(name));
+                        let target = t.target;
+                        gl.bind_texture(target, Some(t.name));
                         for (c, sw) in [GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA].iter().enumerate() {
                             gl.tex_parameter_i(
                                 target,

@@ -2310,11 +2310,6 @@ impl Context {
             if !res_is_ds && v.format != res_format {
                 needs_view = true;
             }
-            // A swizzle is the view's own, and GL keeps it on the texture object, so a view
-            // that carries one needs an object no other view will overwrite.
-            if gl_swizzle != IDENTITY_SWIZZLE {
-                needs_view = true;
-            }
             // A plane index, not a layer range. Sampling plane N of a planar surface, the
             // guest writes the index into the same dword the layer range is packed in
             // (`virgl_encode_sampler_view`), so it arrives as first_layer = N, last_layer = 0.
@@ -2376,39 +2371,10 @@ impl Context {
                 if first_layer > 0 || first_level > 0 {
                     needs_view = true;
                 }
-                // A view whenever the host can mint one, not only when the view differs from
-                // its texture.
-                //
-                // Swizzle, mip range and depth-stencil mode belong to the *view*, but GL keeps
-                // them on the texture object, so the fallback below writes one view's answer
-                // onto an object every other view of that texture shares and the last writer
-                // wins. mesa's vl_compositor is the case that matters: it addresses the three
-                // colour planes of a packed surface as three sampler views over one texture,
-                // swizzled RRR1, GGG1 and BBB1, and every sampler then read whichever channel
-                // was bound last -- a structurally perfect picture in one colour.
-                //
-                // Minting unconditionally is what removes the clash rather than narrowing it.
-                // A predicate ("...or the swizzle is non-identity") would have to grow a term
-                // for every per-view parameter anyone adds to the fallback, and the one nobody
-                // adds is the next silent corruption; a private object has no one to race.
                 if needs_view && immutable && features.has(Feature::texture_view) {
                     let levels = last_level.wrapping_sub(first_level).wrapping_add(1);
                     let layers = last_layer as i64 - first_layer as i64 + 1;
-                    // The guest chose these. `glTextureView` refuses a range past the texture's
-                    // own and leaves the context in GL error for the rest of its life, so a
-                    // range that overruns is rejected here rather than handed to the driver.
-                    // Levels are exact for every target. Layers are only checked where the
-                    // texture's own count says what they mean -- a genuine array -- because a
-                    // cube's faces and a 3D texture's slices are counted elsewhere, and
-                    // refusing a view the guest was entitled to costs it its context just as
-                    // dearly as a driver error would.
-                    let has_levels = res.args.last_level + 1;
-                    let array = i64::from(res.args.array_size);
-                    if levels == 0
-                        || layers <= 0
-                        || first_level + levels > has_levels
-                        || (array > 1 && i64::from(first_layer) + layers > array)
-                    {
+                    if levels == 0 || layers <= 0 {
                         return Err(Fault::OutOfRange {
                             cmd,
                             what: "sampler view layers or levels",
@@ -2423,15 +2389,8 @@ impl Context {
                     // A view of an IOSurface-backed BGR* texture reads its red and blue swapped
                     // (`Resource::supports_view`); the sampler's swizzle is ours to set, so the
                     // swap is undone there. A BGR*-to-RGB* swap the guest asked for is left alone.
-                    //
-                    // Substituting the two sources, not exchanging two destinations: the texels
-                    // are what moved, so every channel that asks for red must be given blue and
-                    // the reverse, however many of them there are. The two agree whenever the
-                    // guest's swizzle is a permutation, and part ways on the swizzles that
-                    // broadcast one channel -- `RRR1` has to become `BBB1`, while exchanging
-                    // slots 0 and 2 leaves it reading red.
                     if !supports_view && resource::is_bgra(v.format) {
-                        undo_bgra_swap(&mut gl_swizzle);
+                        gl_swizzle.swap(0, 2);
                     }
                     gl.texture_view(
                         name,
@@ -2566,10 +2525,6 @@ fn read_shader(text: &[u8], num_tokens: u32) -> Result<Program, Fault> {
     Ok(Program { tgsi, info: shader::Info::default(), variants: Vec::new() })
 }
 
-/// The swizzle that changes nothing, and so has nothing to clash over.
-const IDENTITY_SWIZZLE: [GLint; 4] =
-    [GL_RED as GLint, GL_GREEN as GLint, GL_BLUE as GLint, GL_ALPHA as GLint];
-
 fn to_gl_swizzle(s: Swizzle) -> GLenum {
     match s {
         Swizzle::X => GL_RED,
@@ -2578,22 +2533,6 @@ fn to_gl_swizzle(s: Swizzle) -> GLenum {
         Swizzle::W => GL_ALPHA,
         Swizzle::Zero => GL_ZERO,
         Swizzle::One => GL_ONE,
-    }
-}
-
-/// Undo the red/blue exchange an IOSurface-backed BGR* texture reads with.
-///
-/// The texels moved, so the fix substitutes the two *sources*: a channel asking for red is
-/// given blue and the reverse, however many channels ask. Exchanging the red and blue
-/// destinations instead agrees with this on any permutation and disagrees on the swizzles that
-/// broadcast one channel, which are the ones a planar sampler is built from.
-fn undo_bgra_swap(swizzle: &mut [GLint; 4]) {
-    for s in swizzle {
-        *s = match *s as GLenum {
-            GL_RED => GL_BLUE as GLint,
-            GL_BLUE => GL_RED as GLint,
-            _ => *s,
-        };
     }
 }
 
@@ -4119,37 +4058,6 @@ fn video_result(cmd: Cmd, result: Result<(), video::Refusal>) -> Result<(), Faul
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The compensation is a substitution on the sources, so a swizzle that broadcasts one
-    /// channel follows it. This is the case a destination swap gets wrong, and the shape mesa's
-    /// vl_compositor addresses a packed surface's colour planes with.
-    #[test]
-    fn undoing_the_bgra_swap_follows_a_broadcast_swizzle() {
-        let red = GL_RED as GLint;
-        let green = GL_GREEN as GLint;
-        let blue = GL_BLUE as GLint;
-        let alpha = GL_ALPHA as GLint;
-        let one = GL_ONE as GLint;
-
-        let mut broadcast_red = [red, red, red, one];
-        undo_bgra_swap(&mut broadcast_red);
-        assert_eq!(broadcast_red, [blue, blue, blue, one]);
-
-        let mut broadcast_blue = [blue, blue, blue, one];
-        undo_bgra_swap(&mut broadcast_blue);
-        assert_eq!(broadcast_blue, [red, red, red, one]);
-
-        // Green, alpha and the constants name no channel that moved.
-        let mut untouched = [green, alpha, one, green];
-        undo_bgra_swap(&mut untouched);
-        assert_eq!(untouched, [green, alpha, one, green]);
-
-        // On a permutation it agrees with exchanging the two destinations, which is what the
-        // identity swizzle -- every desktop path -- takes.
-        let mut identity = [red, green, blue, alpha];
-        undo_bgra_swap(&mut identity);
-        assert_eq!(identity, [blue, green, red, alpha]);
-    }
 
     /// A context holding nothing, for the bookkeeping a described blob needs and no GL at all.
     fn bare() -> Context {
