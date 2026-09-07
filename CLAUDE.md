@@ -61,9 +61,11 @@ off an explicitly owned root and is reached through it. The C ABI's implicit glo
 single owned root at the shim — one place, not a habit.
 
 **The Rust API is the product; the C ABI is a translation of it.** rutabaga consumes this crate
-directly, in libkrun's limina fork. The C-ABI dylib in `ffi.rs` is a compatibility shim with an
-end date and no first-party caller. So wherever the two are in tension, the ABI takes the hit —
-in performance, in efficiency, in ergonomics. Never the other way round.
+directly, in libkrun's limina fork. The C-ABI dylib in `ffi.rs` has no first-party caller: what
+keeps it is the harness, which drives both implementations through the C ABI because that is the
+only surface the C has, so it goes when the C stops being the reference leg. Wherever the two are
+in tension, the ABI takes the hit — in performance, in efficiency, in ergonomics. Never the other
+way round.
 
 Concretely: C's idiosyncrasies stop at `ffi.rs` and never leak inward. No errno in a Rust
 signature, no bare-integer id where a newtype belongs, no `bool` standing in for a `Result`, no
