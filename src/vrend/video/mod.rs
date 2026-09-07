@@ -28,7 +28,8 @@ use super::features::Features;
 use super::formats::GlFormat;
 use super::gl::gles::GL_TEXTURE_2D;
 use super::gl::{Gl, pixel_bytes};
-use super::proto::{Format, VideoBufferHandle, VideoCodecHandle};
+use super::journal::Retained;
+use super::proto::{Format, VideoBuffer, VideoBufferHandle, VideoCodec, VideoCodecHandle};
 use super::resource::{self, Texture};
 use crate::videotoolbox::{self, Configuration, PixelFormat, Session, SessionKey};
 
@@ -344,6 +345,8 @@ pub enum Destination {
 
 /// A decode target: the picture the guest handed us to decode into.
 pub struct Buffer {
+    /// The create that made this target, kept so a rebuild can make it again. See [`Codec`].
+    retained: Retained,
     pub format: Layout,
     pub width: u32,
     pub height: u32,
@@ -740,6 +743,13 @@ impl Kind {
 }
 
 pub struct Codec {
+    /// The create that made this codec, kept so a rebuild can make it again.
+    ///
+    /// It lives on the record rather than in a map beside it: the codec's lifetime *is* the
+    /// retention's, so a destroy prunes the journal by dropping this and there is no second
+    /// container to fall out of step. Missing it is what a restored context sees as a decode
+    /// target that does not exist.
+    retained: Retained,
     kind: Kind,
     /// The extent the codec was created for, which is the fallback for a descriptor that
     /// declares none.
@@ -1122,21 +1132,20 @@ impl Video {
     /// CREATE_VIDEO_CODEC. Re-creating a live handle is a no-op, as it is in the C.
     pub fn create_codec(
         &mut self,
-        handle: VideoCodecHandle,
-        profile: u32,
-        entrypoint: u32,
-        width: u32,
-        height: u32,
+        at: Retained,
+        codec: &VideoCodec,
         support: Option<&videotoolbox::Support>,
     ) -> Result<(), Refusal> {
+        let (handle, width, height) = (codec.handle, codec.width, codec.height);
         let MapEntry::Vacant(slot) = self.codecs.entry(handle) else {
             return Ok(());
         };
-        let Some(profile) = Profile::from_wire(profile) else {
+        let Some(profile) = Profile::from_wire(codec.profile) else {
+            let profile = codec.profile;
             eprintln!("[virglrs] video codec {handle}: profile {profile} is not served");
             return Err(Refusal::Unsupported("a video profile this build does not serve"));
         };
-        match Entrypoint::from_wire(entrypoint) {
+        match Entrypoint::from_wire(codec.entrypoint) {
             Some(Entrypoint::Bitstream) => {}
             // Encode is not implemented and `fill_caps` advertises no entrypoint for it, so a
             // guest asking is asking for something it was never offered.
@@ -1163,6 +1172,7 @@ impl Video {
             },
         };
         slot.insert(Codec {
+            retained: at,
             kind,
             width,
             height,
@@ -1191,12 +1201,12 @@ impl Video {
     /// buffer that does it is never decoded into.
     pub fn create_buffer(
         &mut self,
-        handle: VideoBufferHandle,
-        format: u32,
-        width: u32,
-        height: u32,
+        at: Retained,
+        target: &VideoBuffer,
         destination: Destination,
     ) -> Result<(), Refusal> {
+        let (handle, format, width, height) =
+            (target.handle, target.format, target.width, target.height);
         // Not refused: the C takes any format here and only asks for a CoreVideo layout when a
         // frame is decoded into the target, and a guest that allocates a target it never decodes
         // into must not lose its context over it.
@@ -1224,9 +1234,22 @@ impl Video {
             }
             _ => {}
         }
-        self.buffers
-            .insert(handle, Arc::new(Buffer { format: layout, width, height, destination }));
+        self.buffers.insert(
+            handle,
+            Arc::new(Buffer { retained: at, format: layout, width, height, destination }),
+        );
         Ok(())
+    }
+
+    /// The creates a rebuild has to replay to hand this context back its codecs and targets.
+    ///
+    /// Reached through the records themselves, so what is retained is exactly what is live: a
+    /// destroyed codec has already taken its create with it.
+    pub fn retained(&self) -> impl Iterator<Item = &Retained> {
+        self.codecs
+            .values()
+            .map(|codec| &codec.retained)
+            .chain(self.buffers.values().map(|buffer| &buffer.retained))
     }
 
     /// The composite targets whose base texture is behind their planes.
@@ -1655,5 +1678,48 @@ mod tests {
         assert!(!av1.key());
         assert_eq!(av1.extent(), (640, 360));
         assert!(matches!(av1.configuration(), Configuration::Av1c(_)));
+    }
+
+    /// A codec the guest created has to survive into the journal, and stop existing when it is
+    /// destroyed.
+    ///
+    /// This is the regression a restored context died on: the creates were retained nowhere, so
+    /// a rebuilt context was asked to begin a frame on a decode target it had never been given,
+    /// poisoned itself, and never told the guest -- which went on submitting into a surface pool
+    /// the host had stopped writing.
+    #[test]
+    fn a_video_create_is_retained_until_its_destroy() {
+        let support = videotoolbox::Support::probe();
+        assert!(support.decodes(videotoolbox::Codec::H264), "the host decodes H.264 in hardware");
+
+        let mut video = Video::default();
+        let wire = [0xc0u32, 0xffee];
+        let codec = VideoCodec {
+            handle: VideoCodecHandle(9),
+            profile: Profile::H264Main as u32,
+            // Bitstream decode, the only entrypoint served.
+            entrypoint: 1,
+            chroma_format: 0,
+            level: 0,
+            width: 640,
+            height: 480,
+            max_references: None,
+        };
+        video
+            .create_codec(
+                Retained::new(crate::vrend::journal::Seq::default(), &wire),
+                &codec,
+                Some(&support),
+            )
+            .expect("an advertised profile at a sane extent");
+
+        let kept: Vec<&[u32]> =
+            video.retained().flat_map(|at| at.chunks.iter().map(Vec::as_slice)).collect();
+        assert_eq!(kept, vec![&wire[..]], "the create is what a rebuild replays");
+
+        // And the retention is the record's, not a map beside it: the destroy takes it along
+        // with no second container to remember to prune.
+        video.destroy_codec(VideoCodecHandle(9));
+        assert_eq!(video.retained().count(), 0, "a destroyed codec retains nothing");
     }
 }

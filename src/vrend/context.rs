@@ -1346,6 +1346,9 @@ impl Context {
                 c.add(at, false);
             }
         }
+        for at in self.video.retained() {
+            c.add(at, true);
+        }
         c
     }
 
@@ -1370,6 +1373,15 @@ impl Context {
             });
             create.into_iter().chain(objects).chain(state)
         });
+        // Codecs and decode targets belong to the context, not to a sub-context, so they are fed
+        // on whichever one is current -- the same one they arrived on, at this point in the
+        // order. Without them a restored context is asked to begin a frame on a decode target it
+        // does not have, and poisons itself for a command the guest was never told to stop
+        // sending.
+        let video = self.video.retained().map(|at| Entry {
+            seq: at.seq,
+            step: Step::Feed { sub: self.current.0, chunks: &at.chunks },
+        });
         // A resource's type is not a sub-context's business -- it is filed under the one the
         // command arrived on, which is the current one at that point in the order anyway.
         // Ahead of everything: a blob's type has to be set before any view or surface over it is
@@ -1379,7 +1391,7 @@ impl Context {
             seq: Seq::default(),
             step: Step::Feed { sub: self.current.0, chunks: std::slice::from_ref(wire) },
         });
-        order(subs.chain(types))
+        order(subs.chain(video).chain(types))
     }
 
     /// `vrend_renderer_pipe_resource_create`: build a resource the command stream describes and
@@ -1693,14 +1705,12 @@ impl Context {
             }
             Command::SendStringMarker { .. } => Ok(()),
             Command::LinkShader(handles) => self.link_shader(host, handles),
-            Command::CreateVideoCodec(codec) => self.create_video_codec(host, codec),
+            Command::CreateVideoCodec(codec) => self.create_video_codec(host, codec, wire),
             Command::DestroyVideoCodec(handle) => {
                 self.video.destroy_codec(handle);
                 Ok(())
             }
-            Command::CreateVideoBuffer { handle, format, width, height, planes } => {
-                self.create_video_buffer(host, handle, format, width, height, &planes)
-            }
+            Command::CreateVideoBuffer(target) => self.create_video_buffer(host, &target, wire),
             Command::DestroyVideoBuffer(handle) => {
                 self.video.destroy_buffer(handle);
                 Ok(())
@@ -3890,18 +3900,10 @@ impl Context {
         &mut self,
         host: &mut Host<'_>,
         codec: proto::VideoCodec,
+        wire: &[u32],
     ) -> Result<(), Fault> {
-        video_result(
-            Cmd::CreateVideoCodec,
-            self.video.create_codec(
-                codec.handle,
-                codec.profile,
-                codec.entrypoint,
-                codec.width,
-                codec.height,
-                host.video,
-            ),
-        )
+        let at = Retained::new(self.seq.advance(), wire);
+        video_result(Cmd::CreateVideoCodec, self.video.create_codec(at, &codec, host.video))
     }
 
     /// CREATE_VIDEO_BUFFER: resolve every plane resource into a share of its texture.
@@ -3919,13 +3921,12 @@ impl Context {
     fn create_video_buffer(
         &mut self,
         host: &mut Host<'_>,
-        handle: VideoBufferHandle,
-        format: u32,
-        width: u32,
-        height: u32,
-        planes: &[ResourceHandle],
+        target: &proto::VideoBuffer,
+        wire: &[u32],
     ) -> Result<(), Fault> {
+        let planes = &target.planes;
         let cmd = Cmd::CreateVideoBuffer;
+        let at = Retained::new(self.seq.advance(), wire);
         if let Some(&first) = planes.first()
             && host.resource(cmd, first)?.planes().is_some()
         {
@@ -3947,10 +3948,7 @@ impl Context {
                 .ok_or(Fault::UntypedResource { cmd, handle: first })?
                 .clone();
             let destination = video::Destination::Composite(texture);
-            return video_result(
-                cmd,
-                self.video.create_buffer(handle, format, width, height, destination),
-            );
+            return video_result(cmd, self.video.create_buffer(at, target, destination));
         }
 
         let mut resolved = Vec::with_capacity(planes.len());
@@ -3977,13 +3975,7 @@ impl Context {
         }
         video_result(
             cmd,
-            self.video.create_buffer(
-                handle,
-                format,
-                width,
-                height,
-                video::Destination::PerPlane(resolved),
-            ),
+            self.video.create_buffer(at, target, video::Destination::PerPlane(resolved)),
         )
     }
 

@@ -649,6 +649,17 @@ pub struct VideoCodec {
     pub max_references: Option<u32>,
 }
 
+/// A decode target as the guest described it: what it is, how big, and the resources its planes
+/// live in. One value, because the four travel together everywhere and mean nothing apart.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct VideoBuffer {
+    pub handle: VideoBufferHandle,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub planes: Vec<ResourceHandle>,
+}
+
 /// One decoded command. Borrows the wire for the bulk payloads -- shader text, inline-write
 /// bytes, constants -- and owns everything else.
 #[derive(Clone, PartialEq, Debug)]
@@ -849,13 +860,7 @@ pub enum Command<'a> {
     LinkShader([Option<ObjectHandle>; ShaderStage::COUNT]),
     CreateVideoCodec(VideoCodec),
     DestroyVideoCodec(VideoCodecHandle),
-    CreateVideoBuffer {
-        handle: VideoBufferHandle,
-        format: u32,
-        width: u32,
-        height: u32,
-        planes: Vec<ResourceHandle>,
-    },
+    CreateVideoBuffer(VideoBuffer),
     DestroyVideoBuffer(VideoBufferHandle),
     BeginFrame {
         codec: VideoCodecHandle,
@@ -955,7 +960,7 @@ impl Command<'_> {
             Command::LinkShader(_) => Cmd::LinkShader,
             Command::CreateVideoCodec(_) => Cmd::CreateVideoCodec,
             Command::DestroyVideoCodec(_) => Cmd::DestroyVideoCodec,
-            Command::CreateVideoBuffer { .. } => Cmd::CreateVideoBuffer,
+            Command::CreateVideoBuffer(_) => Cmd::CreateVideoBuffer,
             Command::DestroyVideoBuffer(_) => Cmd::DestroyVideoBuffer,
             Command::BeginFrame { .. } => Cmd::BeginFrame,
             Command::DecodeMacroblock(_) => Cmd::DecodeMacroblock,

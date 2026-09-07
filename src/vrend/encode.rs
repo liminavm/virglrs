@@ -419,12 +419,12 @@ impl Encoder<'_> {
                 }
             }
             Command::DestroyVideoCodec(h) => self.u(h.0),
-            Command::CreateVideoBuffer { handle, format, width, height, planes } => {
-                self.u(handle.0);
-                self.u(*format);
-                self.u(*width);
-                self.u(*height);
-                for p in planes {
+            Command::CreateVideoBuffer(b) => {
+                self.u(b.handle.0);
+                self.u(b.format);
+                self.u(b.width);
+                self.u(b.height);
+                for p in &b.planes {
                     self.u(p.get());
                 }
             }

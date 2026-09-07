@@ -687,13 +687,13 @@ pub fn decode<'a>(cmd: Cmd, obj: u32, words: &'a [u32]) -> Result<Command<'a>, R
             if n > MAX_VIDEO_PLANES {
                 return Err(w.refuse("plane count", n as u32));
             }
-            Command::CreateVideoBuffer {
+            Command::CreateVideoBuffer(VideoBuffer {
                 handle: VideoBufferHandle(w.u(1)),
                 format: w.u(2),
                 width: w.u(3),
                 height: w.u(4),
                 planes: (0..n).map(|p| w.resource("plane", 5 + p)).collect::<Result<_, _>>()?,
-            }
+            })
         }
         Cmd::DestroyVideoBuffer => {
             w.exact(1)?;
@@ -1658,13 +1658,13 @@ mod tests {
                 max_references: None,
             }),
             Command::DestroyVideoCodec(VideoCodecHandle(1)),
-            Command::CreateVideoBuffer {
+            Command::CreateVideoBuffer(VideoBuffer {
                 handle: VideoBufferHandle(2),
                 format: 3,
                 width: 4,
                 height: 5,
                 planes: vec![r(70), r(71)],
-            },
+            }),
             Command::DestroyVideoBuffer(VideoBufferHandle(2)),
             Command::BeginFrame { codec: VideoCodecHandle(1), target: VideoBufferHandle(2) },
             Command::DecodeMacroblock(slack),
