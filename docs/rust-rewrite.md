@@ -793,12 +793,11 @@ buildable throughout as the A-side reference.
   reference leg, not before. `crate-type` stays `["cdylib", "rlib"]` for exactly that
   reason: the `rlib` is what ships, the `cdylib` is what gets measured.
 
-  Two things left, neither of them cutover work. The replay corpora still have no permanent
-  home and are not in git, so only the ABI layer of the harness runs on a fresh clone. And
-  `symbols.txt` pins one list for two implementations that legitimately differ — virglrs
-  exports `journal_held`, which the C header has no equivalent of — so the Rust leg cannot
-  match it and re-pinning would fail the C leg. Whether that fixture becomes a subset check
-  is [open](#open-and-owed-a-decision).
+  One thing left, and it is not cutover work: the replay corpora still have no permanent home
+  and are not in git, so only the ABI layer of the harness runs on a fresh clone. That layer
+  does now score both legs — `symbols.txt` became a floor rather than an exact list, because
+  virglrs serves `journal_held` and the C header has no equivalent, so no single exact list
+  could pass both. A missing symbol fails; one above the floor is named and allowed.
 
 ## Where virglrs deliberately differs from the C
 
@@ -843,15 +842,6 @@ to have it, each because reproducing the C would mean reproducing a defect.
 
 Each of these is a question about the renderers rather than about the harness, and each is
 waiting on a call rather than on work.
-
-- **One pinned symbol list cannot describe two implementations that differ.**
-  `harness/abi/symbols.txt` pins every symbol the dylib exports and is checked against whichever
-  build `VIRGL_PREFIX` selects. virglrs exports `journal_held`, a deliberate extension the C
-  header has no equivalent of, so the Rust leg cannot match the list and re-pinning to the Rust
-  side would fail the C leg. The fixture's own rationale argues for a subset check — a *missing*
-  symbol breaks `dlopen` and an extra one harms no consumer, and the stated point is that "a port
-  that exports the whole list satisfies every consumer of it". But that changes what the gate
-  means, so it is a decision: subset check, or one fixture per implementation.
 
 - **virglrs serves no push-descriptor command.** The C dispatches `vkCmdPushDescriptorSet` and
   `vkCmdPushDescriptorSet2`; virglrs implements neither, so a guest using them lands on the
