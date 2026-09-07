@@ -1374,10 +1374,9 @@ impl Context {
             create.into_iter().chain(objects).chain(state)
         });
         // Codecs and decode targets belong to the context, not to a sub-context, so they are fed
-        // on whichever one is current -- the same one they arrived on, at this point in the
-        // order. Without them a restored context is asked to begin a frame on a decode target it
-        // does not have, and poisons itself for a command the guest was never told to stop
-        // sending.
+        // on whichever one is current -- any of them will do. Without them a restored context is
+        // asked to begin a frame on a decode target it does not have, and poisons itself for a
+        // command the guest was never told to stop sending.
         let video = self.video.retained().map(|at| Entry {
             seq: at.seq,
             step: Step::Feed { sub: self.current.0, chunks: &at.chunks },
@@ -1723,7 +1722,7 @@ impl Context {
             }
             Command::EndFrame { codec, target } => {
                 self.make_current(host);
-                video_result(kind, self.video.end_frame(host.gl, codec, target))
+                video_result(kind, self.video.end_frame(host.gl, host.features, codec, target))
             }
             // The C decodes none of its payload and does nothing with it, and reports success.
             // A guest sending one is asking for an entrypoint no capset advertises.
