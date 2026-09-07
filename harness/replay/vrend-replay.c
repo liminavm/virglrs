@@ -3,7 +3,7 @@
 //
 // Replay a captured vrend command stream through libvirglrenderer on the HOST, with no VM.
 //
-// This is harness layer 2 (docs/rust-rewrite.md): a VM-free vehicle that drives only the public
+// This is harness layer 2 (docs/design.md): a VM-free vehicle that drives only the public
 // ABI, so the same corpus runs against the C renderer and against virglrs and the outputs are
 // comparable. A replay costs seconds where a boot costs minutes, which is what makes a rewrite
 // testable at subagent speed.

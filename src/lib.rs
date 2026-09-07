@@ -3,7 +3,7 @@
 
 //! virglrs -- the Rust virglrenderer.
 //!
-//! The plan is `docs/rust-rewrite.md`; the test floor is `harness/README.md`. This crate builds a
+//! The plan is `docs/design.md`; the test floor is `harness/README.md`. This crate builds a
 //! `cdylib` exporting the same C ABI as `libvirglrenderer.1.dylib`, so it is swapped in by pointing
 //! `VIRGL_PREFIX` at its prefix.
 //!

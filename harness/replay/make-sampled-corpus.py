@@ -205,7 +205,7 @@ def build():
     #
     # So this is the one fixture in the tree whose golden is not the C: pinning the C here would
     # mean reproducing a bug in code already written correctly, and a permanently red line is a
-    # gate nobody reads. The deviation is in `docs/rust-rewrite.md`.
+    # gate nobody reads. The deviation is in `docs/design.md`.
     #
     # The observable has to be the SWIZZLE, which is a finding and not a preference. A view that
     # restricts levels is backed by a GL texture view carrying its own parameters, so the
