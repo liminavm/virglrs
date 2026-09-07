@@ -19,7 +19,70 @@ pub fn encode(cmd: &Command<'_>, out: &mut Vec<u32>) {
     let obj = match cmd {
         Command::CreateObject { object, .. } => object.kind().wire(),
         Command::BindObject { kind, .. } | Command::DestroyObject { kind, .. } => kind.wire(),
-        _ => 0,
+        // Every other command's header carries no object type. Spelled out rather than
+        // defaulted: the byte is part of the framing, and a command that grows an object type
+        // would otherwise be encoded without it and decoded as something else.
+        Command::Nop { .. }
+        | Command::SetViewportState { .. }
+        | Command::SetFramebufferState { .. }
+        | Command::SetVertexBuffers { .. }
+        | Command::Clear { .. }
+        | Command::DrawVbo { .. }
+        | Command::ResourceInlineWrite { .. }
+        | Command::SetSamplerViews { .. }
+        | Command::SetIndexBuffer { .. }
+        | Command::SetConstantBuffer { .. }
+        | Command::SetStencilRef { .. }
+        | Command::SetBlendColor { .. }
+        | Command::SetScissorState { .. }
+        | Command::Blit { .. }
+        | Command::ResourceCopyRegion { .. }
+        | Command::BindSamplerStates { .. }
+        | Command::BeginQuery { .. }
+        | Command::EndQuery { .. }
+        | Command::GetQueryResult { .. }
+        | Command::SetPolygonStipple { .. }
+        | Command::SetClipState { .. }
+        | Command::SetSampleMask { .. }
+        | Command::SetStreamoutTargets { .. }
+        | Command::SetRenderCondition { .. }
+        | Command::SetUniformBuffer { .. }
+        | Command::SetSubCtx { .. }
+        | Command::CreateSubCtx { .. }
+        | Command::DestroySubCtx { .. }
+        | Command::BindShader { .. }
+        | Command::SetTessState { .. }
+        | Command::SetMinSamples { .. }
+        | Command::SetShaderBuffers { .. }
+        | Command::SetShaderImages { .. }
+        | Command::MemoryBarrier { .. }
+        | Command::LaunchGrid { .. }
+        | Command::SetFramebufferStateNoAttach { .. }
+        | Command::TextureBarrier { .. }
+        | Command::SetAtomicBuffers { .. }
+        | Command::SetDebugFlags { .. }
+        | Command::GetQueryResultQbo { .. }
+        | Command::Transfer3d { .. }
+        | Command::EndTransfers { .. }
+        | Command::CopyTransfer3d { .. }
+        | Command::SetTweaks { .. }
+        | Command::ClearTexture { .. }
+        | Command::PipeResourceCreate { .. }
+        | Command::PipeResourceSetType { .. }
+        | Command::GetMemoryInfo { .. }
+        | Command::SendStringMarker { .. }
+        | Command::LinkShader { .. }
+        | Command::CreateVideoCodec { .. }
+        | Command::DestroyVideoCodec { .. }
+        | Command::CreateVideoBuffer { .. }
+        | Command::DestroyVideoBuffer { .. }
+        | Command::BeginFrame { .. }
+        | Command::DecodeMacroblock { .. }
+        | Command::DecodeBitstream { .. }
+        | Command::EncodeBitstream { .. }
+        | Command::EndFrame { .. }
+        | Command::ClearSurface { .. }
+        | Command::GetPipeResourceLayout { .. } => 0,
     };
     e.body(cmd);
     let len = e.out.len() - e.start - 1;
