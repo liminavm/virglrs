@@ -4592,7 +4592,9 @@ impl Storage {
     /// Lending that share -- not minting a second one over the same surface, and not passing the
     /// surface's id -- is what makes the import outlive the classic context that created it.
     ///
-    /// It carries no charge, because vrend keeps no ledger; see the plan on what that costs.
+    /// No charge is taken here: the share already carries the one vrend took when it minted the
+    /// surface, so an import counts nothing new and the bytes stay counted for exactly as long as
+    /// somebody holds them.
     pub fn lent(held: Arc<dyn Held>) -> Storage {
         Storage::Texture(held)
     }

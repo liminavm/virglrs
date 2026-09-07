@@ -16,6 +16,13 @@
 //! ledger is the renderer's rather than either arm's because the cap is on the process total, and
 //! a per-arm ledger would be blind to the half of that total the host actually kills for.
 //!
+//! **What it does not see, and should never be claimed to.** Only the allocations this process
+//! makes with its own hands: venus's device memory and exported pages, and classic's IOSurfaces.
+//! Ordinary `glTexStorage`/`glBufferData` storage is the driver's and this process cannot size
+//! it; nor are `Shadow::fresh`, `GuestPixels.staging` or the VideoToolbox output pool counted.
+//! Only a `SCANOUT` or `SHARED` bind mints a surface, so "the ledger sees what classic holds" is
+//! never going to be true -- it sees what classic holds *in IOSurfaces*.
+//!
 //! Accounting is always on and enforcement is opt-in, because the two answer different questions.
 //! The ledger alone says *which* allocation is growing -- one repeated call site reads as
 //! "767 x 31.6 MiB device memory" in a single line -- and it is also the only thing that separates
@@ -882,6 +889,66 @@ mod tests {
     /// tests are about.
     fn key(n: u32) -> ContextKey {
         ContextKey::for_test(ctx(n))
+    }
+
+    /// Classic's bucket and the shared one are different answers, and stay apart.
+    ///
+    /// They are both "bytes with no live context behind them", which is exactly why folding them
+    /// together would be easy and wrong: shared means a context held this and is gone, classic
+    /// means no context ever held it. A leak reads differently under each -- the first names a
+    /// destroy path that did not credit, the second names a resource nobody unreffed -- and the
+    /// cap counts both either way.
+    #[test]
+    fn classic_and_shared_are_two_buckets_of_one_total() {
+        let budget = Budget::with_cap(None, false);
+        let classic = Classic::open(&budget);
+        let surface = classic.charge("IOSurface", 4096);
+
+        let account = Account::open(&budget, key(1), String::from("synoik"));
+        let outliving = account.try_charge("device memory", 8192).expect("no cap");
+        drop(account);
+
+        assert_eq!(budget.classic(), 4096, "classic's, and not moved by a context retiring");
+        assert_eq!(budget.shared(), 8192, "the retired context's residue, and only that");
+        assert_eq!(budget.live(), 4096 + 8192, "the cap sees both");
+
+        drop(surface);
+        assert_eq!(budget.classic(), 0, "credited to the bucket it was taken from");
+        assert_eq!(budget.shared(), 8192, "and nothing else moved");
+        drop(outliving);
+        assert_eq!(budget.live(), 0);
+    }
+
+    /// What a classic mint builds, and what finally credits it.
+    ///
+    /// The charge rides inside the `Arc` the EGL image holds, so the thing that credits it is the
+    /// last holder of the *surface* letting go -- a venus context that imported the share, or a
+    /// texture still sitting in `Vrend.doomed` after the guest unreffed its resource. A charge
+    /// kept on the resource record instead would be credited at the unref, while the memory stood.
+    #[test]
+    fn a_charged_share_is_credited_by_its_last_holder_and_not_its_first() {
+        let budget = Budget::with_cap(None, false);
+        let classic = Classic::open(&budget);
+        let surface =
+            crate::metal::Surface::plain(64, 64, crate::metal::PixelFormat::Bgra).expect("minted");
+        let id = surface.id();
+        let bytes = surface.alloc_size();
+        assert!(bytes >= 64 * 64 * 4, "a 64x64 BGRA surface is at least its pixels");
+
+        let charge = classic.charge("IOSurface", bytes);
+        let held: Arc<dyn crate::metal::Held> = Arc::new(Charged::new(surface, charge));
+        assert_eq!(budget.classic(), bytes, "charged once, when it was minted");
+
+        // What `Storage::lent` hands a venus context: a second holder of the one share, never a
+        // second charge over the same surface.
+        let lent = Arc::clone(&held);
+        assert_eq!(budget.classic(), bytes, "an import counts nothing new");
+        assert_eq!(lent.surface().id(), id, "and reaches the same surface through the charge");
+
+        drop(held);
+        assert_eq!(budget.classic(), bytes, "the first holder letting go credits nothing");
+        drop(lent);
+        assert_eq!(budget.classic(), 0, "the last one does");
     }
 
     /// A charge outlives the context that made it, and the ledger goes on counting it for as

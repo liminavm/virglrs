@@ -1417,13 +1417,20 @@ impl Context {
     ) -> Result<(), Fault> {
         self.describable(blob_id)?;
         self.make_current(host);
-        let mut res =
-            Resource::create(host.gl, host.winsys, host.features, host.formats, host.limits, args)
-                .map_err(|why| Fault::DescribedResource {
-                    cmd: Cmd::PipeResourceCreate,
-                    blob: blob_id,
-                    why: NotDescribed::Refused(why),
-                })?;
+        let mut res = Resource::create(
+            host.gl,
+            host.winsys,
+            host.features,
+            host.formats,
+            host.limits,
+            host.budget,
+            args,
+        )
+        .map_err(|why| Fault::DescribedResource {
+            cmd: Cmd::PipeResourceCreate,
+            blob: blob_id,
+            why: NotDescribed::Refused(why),
+        })?;
         // The command travels on the resource and not beside it: a rebuild needs exactly the
         // command that made this resource, and two containers holding the halves of that is one
         // more pair that can come apart.
