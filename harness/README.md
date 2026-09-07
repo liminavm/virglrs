@@ -841,11 +841,18 @@ how we know the bar was in the wrong place rather than the port.
 
 ## Layer 0 — the ABI itself (`abi/`)
 
-`abi-fixture.sh` pins two files and checks a build against them: `symbols.txt`, every symbol the
-dylib exports, and `layout.txt`, the size, alignment and field offsets of every struct that
+`abi-fixture.sh` pins two files and checks a build against them: `symbols.txt`, the symbols a
+dylib must export, and `layout.txt`, the size, alignment and field offsets of every struct that
 crosses the ABI. `VIRGL_PREFIX` selects the build under test, so pointing it at a Rust build is
 how the port gets checked — the same variable `vrend-replay.sh`, `vkr-replay.sh` and `build.sh`
 resolve, so one setting drives every layer at once; `--pin` re-records, and is only for a change to the ABI that is meant.
+
+**The layout is exact and the symbols are a floor**, because the two implementations legitimately
+differ: virglrs serves `journal_held` and the C header has no equivalent, so one exact list could
+only ever pass one of them. A build is checked for every pinned symbol; anything beyond the floor
+is printed by name and is not a failure. `--pin` refuses to record the floor from the Rust build
+for the same reason — it would raise the bar to include the extensions, and the next run would
+name the C as the regression.
 
 **Which renderer to score is never defaulted.** Both replay wrappers refuse to run until they are
 told, by `--renderer rs|c` or by `VIRGL_PREFIX`, and each echoes the prefix it used. A default is
@@ -863,9 +870,10 @@ nowhere earlier; a wrong field offset never shows up at all — it compiles clea
 corrupts at runtime. The layout comes from the compiler (`abi-dump.c`, built against the header),
 not from a transcription anyone has to keep in step.
 
-The symbol fixture pins *everything exported*, not the subset libkrun happens to call. What the
-dylib exports is defined by this tree; who calls what is defined outside it and moves without
-warning, and a port that exports the whole list satisfies every consumer of it.
+The symbol floor is *everything the C exports*, not the subset libkrun happens to call. Who calls
+what is defined outside this tree and moves without warning, so a port that exports the whole list
+satisfies every consumer of it — which is also why a symbol beyond the list costs nothing, and why
+only a missing one fails.
 
 ## The capture rig (`vm/`)
 
