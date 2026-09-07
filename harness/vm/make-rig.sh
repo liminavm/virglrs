@@ -51,7 +51,7 @@ done
 
 case "$renderer" in
   c)    PREFIX="$ROOT/harness/vm/prefix"; APP="$RIG/Limina.app" ;;
-  rust) PREFIX="$ROOT/virglrs/prefix";    APP="$RIG/Limina-rust.app" ;;
+  rust) PREFIX="$ROOT/prefix";    APP="$RIG/Limina-rust.app" ;;
   *) echo "unknown renderer: $renderer (c|rust)" >&2; exit 2 ;;
 esac
 

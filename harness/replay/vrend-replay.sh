@@ -88,15 +88,15 @@ ICD="$MESA_PREFIX/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json"
   echo "no epoxy-with-EGL at $EPOXY_PREFIX (set EPOXY_PREFIX)" >&2; exit 1; }
 
 case "$RENDERER" in
-  rs) VIRGL_PREFIX="$ROOT/virglrs/prefix" ;;
+  rs) VIRGL_PREFIX="$ROOT/prefix" ;;
   c)  VIRGL_PREFIX="$ROOT/harness/vm/prefix" ;;
   "") [ -n "${VIRGL_PREFIX:-}" ] || usage ;;
 esac
 # Build what is about to be scored. This script builds the replayer, never the renderer, so a
 # prefix laid down by an earlier install.sh scores whatever was in the tree then -- silently, and
 # with a full plausible score. vkr-replay.sh already takes this precaution for the same reason.
-if [ "$VIRGL_PREFIX" = "$ROOT/virglrs/prefix" ]; then
-  "$ROOT/virglrs/install.sh" >/dev/null
+if [ "$VIRGL_PREFIX" = "$ROOT/prefix" ]; then
+  "$ROOT/install.sh" >/dev/null
 fi
 echo "replay: $VIRGL_PREFIX" >&2
 

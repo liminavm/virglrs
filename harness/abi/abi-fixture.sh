@@ -27,8 +27,8 @@ PREFIX="${VIRGL_PREFIX:-$ROOT/harness/vm/prefix}"
 # whatever the tree looked like when someone last installed -- and reports "symbols matches" about
 # a build that no longer exists. The replay ladder already learned this once; there is no reason
 # for the ABI gate to learn it again.
-if [ "$PREFIX" = "$ROOT/virglrs/prefix" ]; then
-  "$ROOT/virglrs/install.sh" >/dev/null
+if [ "$PREFIX" = "$ROOT/prefix" ]; then
+  "$ROOT/install.sh" >/dev/null
 fi
 
 LIB=""
@@ -39,8 +39,8 @@ done
 [ -n "$LIB" ] || { echo "no libvirglrenderer under $PREFIX" >&2; exit 1; }
 
 # Any other prefix is built by someone else, so all we can do is say when it looks stale.
-if [ "$PREFIX" != "$ROOT/virglrs/prefix" ] \
-   && find "$ROOT/src" -name '*.c' -newer "$LIB" 2>/dev/null | read -r _; then
+if [ "$PREFIX" != "$ROOT/prefix" ] \
+   && find "$ROOT/third_party/virglrenderer/src" -name '*.c' -newer "$LIB" 2>/dev/null | read -r _; then
   echo "warning: $LIB is older than the C sources it was built from -- stale build" >&2
 fi
 
@@ -52,7 +52,7 @@ trap 'rm -rf "$TMP"' EXIT
 # A port that exports the whole list satisfies every consumer of it.
 nm -gU "$LIB" | awk '$2 == "T" || $2 == "S" { print $3 }' | LC_ALL=C sort -u > "$TMP/symbols.txt"
 
-cc -O0 -o "$TMP/abi-dump" "$HERE/abi-dump.c" -I"$ROOT/src" -I"$ROOT/harness/vm/build/src"
+cc -O0 -o "$TMP/abi-dump" "$HERE/abi-dump.c" -I"$ROOT/third_party/virglrenderer/src" -I"$ROOT/harness/vm/build/src"
 "$TMP/abi-dump" > "$TMP/layout.txt"
 
 fail=0
