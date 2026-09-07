@@ -898,44 +898,12 @@ it survives the session it was found in.
   The keys elsewhere are generational; this one is not, and the fix is to make it so rather than
   to purge at the reuse site.
 
-- **The budget counts venus's allocations and none of vrend's.** The ledger under-reports the
-  host memory this renderer holds, and a classic-only configuration has no ledger and no cap at
-  all: `Budget::from_env()` is built inside `Vkr::new`, and `Renderer` holds `venus` as an
-  `Option`. The design is settled:
-
-  - **The budget belongs to `Renderer`, and the module moves to `src/budget.rs`.** It stops being
-    venus's the moment a second arm charges against it, and the cap is on the process total, so
-    one ledger has to be reachable from both. This also brings `HostShm` (`renderer.rs`) into
-    reach, the second host allocator the C bills as `"shm carrier"` and this tree does not.
-  - **Charge at the two IOSurface mints**, `mint_surface` and `mint_planes`, using the
-    `Charged<T>` that already exists in `venus/driver.rs` — moved beside `Charge`, never
-    redefined. The `Arc` refcount is what credits, so both planes of a composite target bill
-    once, an import that takes a share never re-bills, and a texture held past its resource's
-    unref in `Vrend.doomed` stays counted. `Storage::lent`'s "it carries no charge, because vrend
-    keeps no ledger" is the comment that goes.
-  - **Charge before minting**, as venus does, and move the `adopts_iosurfaces()` check above the
-    mint: today `Surface::plain` runs before it, so a charge at the mint would charge and credit
-    on every `SHARED` create on a host that adopts nothing.
-  - **One classic bucket, not a slot per vrend context.** A described texture is always
-    unmappable and is destroyed at the claim, so no vrend context ever holds a standing charge;
-    per-context attribution here would buy nothing and would drag `Vkr::generations` up to
-    `Renderer` to mint keys for it. The bucket sits beside `shared` rather than inside it: that
-    one means "outlived its owner", this one means "never had one". `Ledger::bytes()` sums it, so
-    every venus guest's `others` is right without further work.
-  - **The holder belongs to `Charge`, not to `Account`.** A classic `Account` would carry
-    `standing()`, `heap_answer()` and a retiring `Drop` that are all meaningless for it — a state
-    the types should refuse. The classic handle is opened once by `Renderer` and has none of them.
-  - **Counting only. Refusal is not on offer here**, which is why this is no longer a decision:
-    libkrun turns a refused create into `RESP_ERR` and the guest kernel has already handed out
-    the handle, so the guest uses a resource that does not exist and poisons itself on a later
-    command. That is the same blind refusal venus has, with the cause further away. Falling back
-    to GL storage instead is worse than refusing: it frees nothing and grows the process while
-    reporting success, and the cap exists to pre-empt jetsam.
-
-  What stays invisible either way, and should not be claimed otherwise: ordinary
-  `glTexStorage`/`glBufferData` storage, `Shadow::fresh`, `GuestPixels.staging`, and the
-  VideoToolbox output pool. Only `SCANOUT`/`SHARED` binds mint a surface, so "the ledger sees what
-  classic holds" is never going to be true — it sees what classic holds *in IOSurfaces*.
+- **`HostShm` is minted and never charged.** The blob carrier in `renderer.rs` is the one host
+  allocation left outside the ledger — the C bills it as `"shm carrier"` -- and it is not the
+  same shape as an IOSurface: `Resource::shm()` hands the `Arc<GuestMap>` out to venus's ring, so
+  the pages can outlive the `HostShm` that minted them and the charge has to live inside that
+  `Arc`, not beside it. That makes `ShmResources` carry a `Charged<GuestMap>`, which is why it is
+  its own piece of work rather than a line in the vrend one.
 
 - **The libkrun opaque-journal branch is parked and ready.** `limina-p5-opaque-journal` merges into
   `third_party/libkrun`'s `limina` branch with a `third_party/manifest.toml` bump. Nothing blocks
