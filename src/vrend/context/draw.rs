@@ -951,6 +951,17 @@ impl Context {
             // after a frame that rendered perfectly. The pages are the right source anyway: these
             // constants are CPU-produced and arrive by transfer, so the backing already holds
             // them, and reading it touches no GL state at all.
+            //
+            // A colour-space matrix that arrives here looking wrong is the guest's, not ours.
+            // mesa's graphics compositor uploads a matrix nothing writes after init, so every
+            // VA post-processing conversion converts with that seed rather than what the VA
+            // frontend computed -- invisible for a decode into NV12 downloaded as BGRA, which
+            // is what the seed happens to be, and plainly wrong for an RGB scale, which gets a
+            // YUV -> RGB conversion applied to RGB texels. Upstream since mesa 5bc0df5aa; only
+            // a driver setting `prefer_compute_for_multimedia` escapes it, and virgl does not.
+            // Our guest mesa carries the fix ("vl/compositor: upload the matrix the frontend
+            // set, not the init default"); a stock guest still converts with the seed, so
+            // measure a colour claim on the tier the guest is actually running.
             let mut bytes = vec![0u8; num_consts * 4 * size_of::<u32>()];
             let take = match length as usize {
                 0 => bytes.len(),
