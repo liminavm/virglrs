@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 """Break the renderer on purpose, and report which breakages the tests notice.
 
 A passing suite says nothing about what it would catch. This says it directly: each entry below

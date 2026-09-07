@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! Texture sampling and queries, and image, buffer and shared-memory access: the instructions
 //! whose translation depends on the resource they touch.

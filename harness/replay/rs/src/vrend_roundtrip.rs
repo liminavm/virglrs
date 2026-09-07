@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! The classic decoder's differential test: frame every recorded batch with the Rust decoder,
 //! decode each command, encode it straight back, and compare against the dwords the guest sent.

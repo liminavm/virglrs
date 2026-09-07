@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! A classic context: its sub-contexts, what each has bound, and every command a guest can send
 //! into one.

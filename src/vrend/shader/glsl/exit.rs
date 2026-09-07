@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! What a stage does on the way out of `main`: stream-out copies, clip and cull distance
 //! moves, the prescale, and the fragment stage's tests and fixups.

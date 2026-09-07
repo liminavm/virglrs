@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 #
 # Pin, and check, the C ABI: the symbols the dylib exports and the layout of every struct that
 # crosses it. Both are things a Rust port declares by hand on its own side, and both fail in a way

@@ -1,0 +1,43 @@
+virglrs
+Copyright © 2026 Gustavo Noronha Silva
+
+Licensed under GPL-2.0-only WITH LicenseRef-limina-exception. See LICENSES/.
+
+
+What this is, and what it was written against
+---------------------------------------------
+
+virglrs is a from-scratch Rust implementation of the virtio-gpu host renderer. It was written
+against virglrenderer (https://gitlab.freedesktop.org/virgl/virglrenderer), which is MIT-licensed
+and is itself derived from Mesa in many parts, and it is tested against it: the harness records
+its goldens by running the same corpora through both.
+
+virglrenderer's authors include Red Hat, Google, Collabora and the Mesa contributors. This
+implementation owes them the protocol, the semantics and — in the places named below — data.
+
+
+Where that reference is more than reference
+-------------------------------------------
+
+Two parts carry material from Mesa rather than only its ideas, and Mesa's MIT notice
+(LICENSES/MIT.txt) applies to them:
+
+  - src/vrend/tgsi/ — the TGSI opcode table, its dump format and its text parser follow
+    src/gallium/auxiliary/tgsi/{tgsi_info,tgsi_dump,tgsi_text,tgsi_scan}.c entry for entry.
+    Copyright © 2008 VMware, Inc. (and Tungsten Graphics).
+
+  - src/vrend/formats.rs — the format tables are generated at build time from Mesa's
+    u_format.yaml and from virglrenderer's virgl_hw.h, both in the pinned C tree.
+
+
+Build inputs
+------------
+
+  - venus-protocol (https://gitlab.freedesktop.org/virgl/venus-protocol) — MIT, Copyright 2020
+    Google LLC. Its model generates this crate's venus wire format, and its C encoder is compiled
+    into the reply oracle used by the tests.
+
+  - The Khronos registries in gl-gen/registry/ (gl.xml, egl.xml) — Apache-2.0, Copyright
+    2013-2025 The Khronos Group Inc. They keep their own headers and are not relicensed.
+
+  - vk.xml, through venus-protocol — Apache-2.0, The Khronos Group Inc.

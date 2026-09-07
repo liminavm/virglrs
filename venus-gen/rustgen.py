@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 """Rust backend for venus-protocol's model.
 
 `vkxml.py` is a language-neutral model of vk.xml; `vn_protocol.py`'s `Gen` is a C backend on top of

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! The venus decoder's differential test: decode every recorded command with the Rust decoder,
 //! encode it straight back, and compare against the bytes the guest sent.

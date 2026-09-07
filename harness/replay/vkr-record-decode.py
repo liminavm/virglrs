@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# Copyright © 2026 the limina authors
+# Copyright © 2026 Gustavo Noronha Silva
 #
 # Decode a venus full-stream capture (LIMINA_VKR_RECORD, src/venus/vkr_record.[ch]).
 #

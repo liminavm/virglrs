@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! GLES, as the driver exports it -- and the safe surface the rest of vrend calls it through.
 //!

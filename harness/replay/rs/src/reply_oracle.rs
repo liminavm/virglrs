@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! The reply encoder's differential test: encode every recorded command's reply twice -- once with
 //! the generated Rust, once with venus-protocol's own generated C -- and compare the bytes.

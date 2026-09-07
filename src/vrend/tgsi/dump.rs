@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright © 2026 the limina authors
+// Copyright © 2026 Gustavo Noronha Silva
 
 //! `tgsi_dump.c`: a program printed back as text, in the C's exact spelling.
 //!
