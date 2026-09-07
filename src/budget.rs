@@ -3,12 +3,18 @@
 
 //! What the guest has made this process hold, and the cap on it.
 //!
-//! Every allocation venus makes on the guest's behalf lands in the *renderer's* address space,
-//! where the guest's own accounting cannot see it: a guest that leaks `VkDeviceMemory` grows the
-//! host worker, not itself. On macOS that ends with the kernel picking the worker as the largest
-//! compressed process and killing it -- the whole VM, no guest backtrace, no crash report, at a
-//! moment unrelated to the allocation that caused it. Measured 2026-08-06: a Vulkan compositor
-//! re-allocated a 4K backdrop instead of reusing it, ~51 GB/hour, and jetsam took the VM at 142 GB.
+//! Every allocation this renderer makes on the guest's behalf lands in the *renderer's* address
+//! space, where the guest's own accounting cannot see it: a guest that leaks `VkDeviceMemory` or
+//! never unrefs a window buffer grows the host worker, not itself. On macOS that ends with the
+//! kernel picking the worker as the largest compressed process and killing it -- the whole VM, no
+//! guest backtrace, no crash report, at a moment unrelated to the allocation that caused it.
+//! Measured 2026-08-06: a Vulkan compositor re-allocated a 4K backdrop instead of reusing it,
+//! ~51 GB/hour, and jetsam took the VM at 142 GB.
+//!
+//! **One ledger, both arms.** venus charges through an [`Account`], which is a context's key to
+//! its own slot; classic charges through [`Classic`], which is one bucket and cannot refuse. The
+//! ledger is the renderer's rather than either arm's because the cap is on the process total, and
+//! a per-arm ledger would be blind to the half of that total the host actually kills for.
 //!
 //! Accounting is always on and enforcement is opt-in, because the two answer different questions.
 //! The ledger alone says *which* allocation is growing -- one repeated call site reads as
@@ -128,6 +134,12 @@ struct Ledger {
     ctxs: BTreeMap<ContextId, Slot>,
     /// What outlived the context it was charged to.
     shared: PerContext,
+    /// What never had a context to be charged to. Classic's IOSurfaces: a described texture is
+    /// unmappable and dies at the claim, so no vrend context ever holds a standing charge, and a
+    /// slot per vrend context would attribute nothing. Kept apart from `shared` because the two
+    /// say different things -- that one means "outlived its owner", this one means "never had
+    /// one" -- and a leak reads differently under each.
+    classic: PerContext,
     /// Whether the watermark has already been reported for the climb the total is on. See
     /// [`watermark`] for the two thresholds this latch sits between.
     warned: bool,
@@ -142,6 +154,7 @@ impl Ledger {
         Ledger {
             ctxs: BTreeMap::new(),
             shared: PerContext::default(),
+            classic: PerContext::default(),
             warned: false,
             // From now, not from the epoch: the first census is due an interval into the run,
             // rather than on the first allocation of a process that has nothing to say yet.
@@ -151,7 +164,9 @@ impl Ledger {
 
     /// Total live bytes, whoever holds them. This is the number the cap is enforced against.
     fn bytes(&self) -> u64 {
-        self.ctxs.values().map(|s| s.live.bytes()).sum::<u64>() + self.shared.bytes()
+        self.ctxs.values().map(|s| s.live.bytes()).sum::<u64>()
+            + self.shared.bytes()
+            + self.classic.bytes()
     }
 
     /// What the context holding this id calls itself, for a log line. Empty for a context that
@@ -245,9 +260,21 @@ impl PerContext {
 /// gone is the ledger's decision, not the charge's.
 pub struct Charge {
     budget: Arc<Budget>,
-    ctx: ContextKey,
+    payer: Payer,
     what: &'static str,
     size: u64,
+}
+
+/// Which bucket a charge was taken from, and so which one credits it.
+///
+/// Fixed when the charge is made and never revisited. Where the credit lands when a context is
+/// already gone is the ledger's decision, not the charge's -- see [`Budget::retire`].
+#[derive(Clone, Copy)]
+enum Payer {
+    /// The venus context that made it, by the occupant rather than the bare id.
+    Ctx(ContextKey),
+    /// Classic, which has one bucket and no per-context attribution to make.
+    Classic,
 }
 
 impl Charge {
@@ -260,7 +287,12 @@ impl std::fmt::Debug for Charge {
     /// Never the ledger behind it: a charge is interesting for what it is, and a `Debug` that
     /// walked to the budget would print every other context's business beside it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Charge(ctx {}, {} {})", self.ctx.id().get(), size(self.size), self.what)
+        match self.payer {
+            Payer::Ctx(ctx) => {
+                write!(f, "Charge(ctx {}, {} {})", ctx.id().get(), size(self.size), self.what)
+            }
+            Payer::Classic => write!(f, "Charge(classic, {} {})", size(self.size), self.what),
+        }
     }
 }
 
@@ -269,9 +301,12 @@ impl Drop for Charge {
         let mut ledger = self.budget.ledger.lock().expect("the budget ledger");
         // The slot this was taken against, or -- if that context has since retired -- the shared
         // bucket the retire drained it into. Never the slot of a later context with the same id.
-        match ledger.slot_of(self.ctx) {
-            Some(per) => per.credit(self.what, self.size),
-            None => ledger.shared.credit(self.what, self.size),
+        match self.payer {
+            Payer::Ctx(ctx) => match ledger.slot_of(ctx) {
+                Some(per) => per.credit(self.what, self.size),
+                None => ledger.shared.credit(self.what, self.size),
+            },
+            Payer::Classic => ledger.classic.credit(self.what, self.size),
         }
     }
 }
@@ -354,7 +389,7 @@ impl Account {
         // there is no thread to own. The cost is that a context born and gone between two ticks
         // is never seen by the census -- it is a sampler, and says so.
         self.budget.sample_locked(&mut ledger);
-        Ok(Charge { budget: Arc::clone(&self.budget), ctx: self.ctx, what, size })
+        Ok(Charge { budget: Arc::clone(&self.budget), payer: Payer::Ctx(self.ctx), what, size })
     }
 
     /// Whether a refusal should stop this context. See the module doc for why it must, by default.
@@ -438,6 +473,40 @@ impl Account {
 impl Drop for Account {
     fn drop(&mut self) {
         self.budget.retire(self.ctx);
+    }
+}
+
+/// Classic's handle to the ledger, which is nothing like an [`Account`].
+///
+/// It has no `standing()`, no `heap_answer()` and no retiring `Drop`, because none of the three
+/// means anything here: classic answers no `VK_EXT_memory_budget` query, and there is no context
+/// whose destroy would retire a slot. It also cannot refuse. A refused `resource_create` becomes
+/// `RESP_ERR` after the guest kernel has already handed the handle out, so the guest goes on to
+/// use a resource that was never made and poisons itself several commands later -- the same blind
+/// refusal venus has, with the cause further away. This counts, and that is the whole job.
+pub struct Classic {
+    budget: Arc<Budget>,
+}
+
+impl Classic {
+    pub fn open(budget: &Arc<Budget>) -> Classic {
+        Classic { budget: Arc::clone(budget) }
+    }
+
+    /// Take `size` bytes for classic. Infallible by design -- see the type's doc.
+    pub fn charge(&self, what: &'static str, size: u64) -> Charge {
+        let mut ledger = self.budget.ledger.lock().expect("the budget ledger");
+        ledger.classic.take(what, size);
+        // Sampled here for the reason a context's charge is: this is the only path that moves the
+        // ledger, so a renderer that has stopped allocating has nothing new to report.
+        self.budget.sample_locked(&mut ledger);
+        Charge { budget: Arc::clone(&self.budget), payer: Payer::Classic, what, size }
+    }
+
+    /// A handle on a ledger of its own, for a test with no renderer around it.
+    #[cfg(test)]
+    pub fn for_test() -> Classic {
+        Classic::open(&Budget::with_cap(None, false))
     }
 }
 
@@ -650,6 +719,11 @@ impl Budget {
         self.ledger.lock().expect("the budget ledger").shared.bytes()
     }
 
+    /// What classic holds, which is every IOSurface it has minted.
+    pub fn classic(&self) -> u64 {
+        self.ledger.lock().expect("the budget ledger").classic.bytes()
+    }
+
     /// What one context holds.
     pub fn live_for(&self, ctx: ContextId) -> u64 {
         self.ledger.lock().expect("the budget ledger").ctxs.get(&ctx).map_or(0, |s| s.live.bytes())
@@ -709,6 +783,13 @@ impl Budget {
                 named(*ctx, &slot.name),
                 size(slot.live.bytes()),
                 histogram(&slot.live),
+            );
+        }
+        if ledger.classic.bytes() != 0 {
+            eprintln!(
+                "[virglrs] {GRAMMAR}:   classic, which has no context to name: {} live — {}",
+                size(ledger.classic.bytes()),
+                histogram(&ledger.classic),
             );
         }
         if ledger.shared.bytes() != 0 {

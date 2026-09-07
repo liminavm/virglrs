@@ -79,9 +79,10 @@ pub struct Vkr {
     ///
     /// Held as the trait, not the table, so this module still never learns what a `Resource` is.
     resources: SharedResources,
-    /// What every context together has made this process hold. One ledger per renderer, because
-    /// the host kills the *process* for the total -- see [`crate::budget`]. Each context
-    /// gets a key to it and can reach nothing else, which is what makes billing structural.
+    /// What every context together has made this process hold. The renderer's ledger, not this
+    /// module's: the host kills the *process* for the total, and classic charges against the same
+    /// one -- see [`crate::budget`]. Each context gets a key to it and can reach nothing else,
+    /// which is what makes billing structural.
     budget: Arc<Budget>,
 }
 
@@ -176,7 +177,7 @@ impl Dispatch for RingDispatch {
 }
 
 impl Vkr {
-    pub fn new(config: Config, resources: SharedResources) -> Vkr {
+    pub fn new(config: Config, resources: SharedResources, budget: &Arc<Budget>) -> Vkr {
         Vkr {
             config,
             contexts: BTreeMap::new(),
@@ -184,7 +185,7 @@ impl Vkr {
             todo: Arc::new(Mutex::new(Unimplemented::default())),
             global: Arc::new(crate::vulkan::global()),
             resources,
-            budget: Budget::from_env(),
+            budget: Arc::clone(budget),
         }
     }
 
@@ -453,7 +454,7 @@ mod tests {
         drop(fd);
         let map = Arc::new(map);
         let table: SharedResources = Arc::new(RwLock::new(OneShm(Arc::clone(&map))));
-        let mut v = Vkr::new(Config::default(), table);
+        let mut v = Vkr::new(Config::default(), table, &Budget::with_cap(None, false));
         v.context_create(ctx_id(), String::new());
         (v, map)
     }

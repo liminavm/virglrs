@@ -561,6 +561,11 @@ pub struct Renderer {
     resources: Arc<RwLock<BTreeMap<ResourceHandle, Resource>>>,
     contexts: BTreeMap<ContextId, Context>,
     fences: Retirement,
+    /// The host memory both arms are answerable for, and the cap on it -- see [`crate::budget`].
+    /// It is the renderer's because the cap is on the process total: venus charges its
+    /// allocations against it and classic its IOSurfaces, and a ledger owned by either would be
+    /// blind to the other's half of the number the host kills this process for.
+    budget: Arc<crate::budget::Budget>,
     /// The venus renderer, present only when this build was initialized to serve it.
     venus: Option<venus::vkr::Vkr>,
     /// The classic renderer, likewise.
@@ -579,15 +584,30 @@ impl Renderer {
         // thread needs the table long after the call that created its ring returned, and it must
         // not need the renderer to get it.
         let resources: Arc<RwLock<BTreeMap<ResourceHandle, Resource>>> = Arc::default();
-        let vrend = if config.vrend { Some(vrend::vrend::Vrend::new(config)?) } else { None };
+        // Before either arm, and once: a build serving only classic has a cap too, and two
+        // ledgers would be two answers to the one question the cap is asked.
+        let budget = crate::budget::Budget::from_env();
+        let vrend =
+            if config.vrend { Some(vrend::vrend::Vrend::new(config, &budget)?) } else { None };
         Ok(Renderer {
             config,
             resources: Arc::clone(&resources),
             contexts: BTreeMap::new(),
             fences: Retirement::start(fences),
-            venus: config.venus.then(|| venus::vkr::Vkr::new(config, resources.clone())),
+            venus: config.venus.then(|| venus::vkr::Vkr::new(config, resources.clone(), &budget)),
+            budget,
             vrend,
         })
+    }
+
+    /// What this process holds on the guest's behalf, and the cap on it.
+    ///
+    /// The renderer's rather than either arm's, because the cap is on the total -- see
+    /// [`crate::budget`]. Reachable from outside because this is the only route to that number:
+    /// a VMM chasing a worker that is growing asks here, and gets one answer covering both arms
+    /// rather than venus's half of it.
+    pub fn budget(&self) -> &Arc<crate::budget::Budget> {
+        &self.budget
     }
 
     /// What this build advertises for a capset, or `None` for one it does not serve.

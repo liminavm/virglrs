@@ -148,6 +148,9 @@ pub struct Host<'a> {
     pub blitter: &'a mut Option<Blitter>,
     /// What this host decodes in hardware, or `None` when the caller did not ask for video.
     pub video: Option<&'a videotoolbox::Support>,
+    /// Classic's handle to the host-memory ledger, for the one path that mints host memory this
+    /// process can count: an IOSurface. See [`crate::budget`].
+    pub budget: &'a crate::budget::Classic,
 }
 
 impl Host<'_> {

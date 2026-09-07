@@ -93,6 +93,10 @@ pub struct Vrend {
     /// Batches run, ever. The unit a copy of a guest's pages is kept fresh in: within one batch
     /// the guest has had no opportunity to run, so one read serves every draw in it.
     batch: u64,
+    /// Classic's handle to the renderer's host-memory ledger -- see [`crate::budget`]. What it
+    /// charges is the IOSurfaces this arm mints and nothing else; ordinary GL storage is the
+    /// driver's and this process cannot see it.
+    budget: crate::budget::Classic,
 }
 
 /// The versions tried, newest first -- the GLES rows of the C's `gl_versions` ladder.
@@ -151,7 +155,7 @@ impl fmt::Display for ClaimRefused {
 
 impl Vrend {
     /// Open the winsys, bring ctx0 up on this thread and probe the driver.
-    pub fn new(config: Config) -> Result<Vrend, InitError> {
+    pub fn new(config: Config, budget: &Arc<crate::budget::Budget>) -> Result<Vrend, InitError> {
         let winsys = Winsys::open(Flavour::Gles)?;
         let mut ctx0 = None;
         for v in VERSIONS {
@@ -220,6 +224,7 @@ impl Vrend {
             doomed: Vec::new(),
             batch: 0,
             pixels: resource::Refresh::default(),
+            budget: crate::budget::Classic::open(budget),
         })
     }
 
@@ -274,9 +279,11 @@ impl Vrend {
             doomed: _,
             batch,
             pixels,
+            budget,
         } = self;
         let host = Host {
             batch: *batch,
+            budget,
             gl,
             winsys,
             version: *version,
@@ -729,7 +736,8 @@ mod tests {
     #[test]
     #[ignore = "needs the zink-on-KosmicKrisp environment"]
     fn the_host_table_for_the_corpus_formats() {
-        let v = Vrend::new(Config::default()).expect("vrend comes up");
+        let v = Vrend::new(Config::default(), &crate::budget::Budget::with_cap(None, false))
+            .expect("vrend comes up");
         let present: Vec<&str> = v.features.present().map(|f| f.name()).collect();
         eprintln!("features: {}", present.join(" "));
         for raw in [1, 2, 20, 48, 49, 64, 65, 67, 131, 134, 177, 227] {
