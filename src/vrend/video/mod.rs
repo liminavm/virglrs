@@ -1469,9 +1469,9 @@ impl Gate {
             // Already the picture: a target dropped twice holds it from the first time.
             Some(source) if Arc::ptr_eq(source, target) => {}
             Some(source) => {
-                if !source.replicate_into(target, gl, features) && *dropped <= 2 {
-                    // Once. The first copy is the first drop after the source was taken, and a
-                    // pair that cannot be copied now cannot be copied at frame rate either.
+                if !source.replicate_into(target, gl, features) && *dropped == 2 {
+                    // Once, on the second drop -- the first copy there is to make. A pair that
+                    // cannot be copied now cannot be copied at frame rate either.
                     eprintln!(
                         "[virglrs] video codec {codec}: the frozen picture cannot be copied into                          this target; dropped frames will show whatever their targets held"
                     );
@@ -1521,7 +1521,14 @@ impl Buffer {
                 for (source, destination) in from.iter().zip(into) {
                     let w = source.width.min(destination.width);
                     let h = source.height.min(destination.height);
-                    if w == 0 || h == 0 || source.texture.name == destination.texture.name {
+                    // Two planes of different formats are a copy `glCopyImageSubData` refuses,
+                    // and it refuses by setting an error nobody here reads. Skipped instead, the
+                    // way the composite leg skips a plane the surfaces disagree about.
+                    if w == 0
+                        || h == 0
+                        || source.gl != destination.gl
+                        || source.texture.name == destination.texture.name
+                    {
                         continue;
                     }
                     gl.copy_image_sub_data(
