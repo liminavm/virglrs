@@ -1,7 +1,13 @@
 # The renderer test harness
 
 The harness exists so the Rust rewrite (`docs/rust-rewrite.md`) has a fixed oracle: the same
-corpora, run against the C renderer and against virglrs, producing comparable output. Its one
+corpora, run against the C renderer and against virglrs, producing comparable output.
+
+The C leg is `third_party/virglrenderer`, at the rev `third_party/manifest.toml` pins:
+`scripts/vendor.sh` fetches the source and `scripts/build-reference.sh` builds it into a prefix,
+which the replay scripts take from `VIRGL_PREFIX`. Building it needs two host prefixes this
+repository does not produce — an EGL-capable epoxy and the zink-on-KosmicKrisp Mesa — and the
+script names them if they are missing. The Rust leg needs none of that. Its one
 design rule is what makes it survive the transition — **it drives only the public C ABI.**
 Nothing here may reach into renderer internals.
 
