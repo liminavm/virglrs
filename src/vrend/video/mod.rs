@@ -24,7 +24,7 @@ use std::collections::btree_map::Entry as MapEntry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use super::features::Features;
+use super::features::{Feature, Features};
 use super::formats::GlFormat;
 use super::gl::gles::GL_TEXTURE_2D;
 use super::gl::{Gl, pixel_bytes};
@@ -1396,6 +1396,7 @@ impl Video {
     pub fn end_frame(
         &mut self,
         gl: &Gl,
+        features: &Features,
         handle: VideoCodecHandle,
         target: VideoBufferHandle,
     ) -> Result<(), Refusal> {
@@ -1427,11 +1428,11 @@ impl Video {
                 );
             }
             codec.nothing_to_decode += 1;
-            codec.gate.freeze(&buffer, gl);
+            codec.gate.freeze(&buffer, gl, features, handle);
             return Ok(());
         };
         if !codec.gate.admits(shape.key(), handle) {
-            codec.gate.freeze(&buffer, gl);
+            codec.gate.freeze(&buffer, gl, features, handle);
             return Ok(());
         }
 
@@ -1453,18 +1454,94 @@ impl Gate {
     ///
     /// The first target dropped while waiting becomes the frozen picture; every later one is
     /// given a copy of it. Nothing to do once seeded.
-    fn freeze(&mut self, target: &Arc<Buffer>, _gl: &Gl) {
-        let Gate::AwaitingKey { freeze, .. } = self else {
+    fn freeze(
+        &mut self,
+        target: &Arc<Buffer>,
+        gl: &Gl,
+        features: &Features,
+        codec: VideoCodecHandle,
+    ) {
+        let Gate::AwaitingKey { freeze, dropped } = self else {
             return;
         };
         match freeze {
             None => *freeze = Some(Arc::clone(target)),
+            // Already the picture: a target dropped twice holds it from the first time.
             Some(source) if Arc::ptr_eq(source, target) => {}
-            Some(_) => {
-                // Copying one target's planes into another's needs a blit this module does not
-                // have yet; until then a dropped frame keeps whatever its target held, which is
-                // what the C did before the freeze was added.
+            Some(source) => {
+                if !source.replicate_into(target, gl, features) && *dropped <= 2 {
+                    // Once. The first copy is the first drop after the source was taken, and a
+                    // pair that cannot be copied now cannot be copied at frame rate either.
+                    eprintln!(
+                        "[virglrs] video codec {codec}: the frozen picture cannot be copied into                          this target; dropped frames will show whatever their targets held"
+                    );
+                }
             }
+        }
+    }
+}
+
+impl Buffer {
+    /// Copy this target's picture into another target, everywhere a decoded picture would land.
+    ///
+    /// The route is the one delivery takes, per shape: a composite target's pixels live in its
+    /// surface planes and are copied surface to surface with no GL at all, and a per-plane
+    /// target's live in a texture each and are copied between textures. Two targets of different
+    /// shapes have no copy that is right, and neither does a host without `GL_copy_image`.
+    ///
+    /// The guest's own storage is deliberately not written. It is the dmabuf-export path, which
+    /// the decode itself does not feed either -- see [`Video::end_frame`] -- so writing it here
+    /// would make a dropped frame more thorough than a decoded one.
+    fn replicate_into(&self, to: &Buffer, gl: &Gl, features: &Features) -> bool {
+        match (&self.destination, &to.destination) {
+            (Destination::Composite(from), Destination::Composite(into)) => {
+                let (Some(from), Some(into)) = (from.planes.as_ref(), into.planes.as_ref()) else {
+                    return false;
+                };
+                let (source, destination) = (from.surface(), into.surface());
+                let count = source.plane_count().min(destination.plane_count());
+                let mut copied = 0;
+                for plane in 0..count {
+                    if destination.copy_plane_from(source, plane) {
+                        copied += 1;
+                    }
+                }
+                // The base texture a composite view samples is now behind these planes, exactly
+                // as it is after a decode. The conversion pass is the caller's to run.
+                if copied > 0 {
+                    into.delivered();
+                }
+                copied > 0
+            }
+            (Destination::PerPlane(from), Destination::PerPlane(into)) => {
+                if !features.has(Feature::copy_image) {
+                    return false;
+                }
+                let mut copied = 0;
+                for (source, destination) in from.iter().zip(into) {
+                    let w = source.width.min(destination.width);
+                    let h = source.height.min(destination.height);
+                    if w == 0 || h == 0 || source.texture.name == destination.texture.name {
+                        continue;
+                    }
+                    gl.copy_image_sub_data(
+                        source.texture.name,
+                        GL_TEXTURE_2D,
+                        0,
+                        [0, 0, 0],
+                        destination.texture.name,
+                        GL_TEXTURE_2D,
+                        0,
+                        [0, 0, 0],
+                        [w as i32, h as i32, 1],
+                    );
+                    copied += 1;
+                }
+                copied > 0
+            }
+            // One target per plane and one for the whole picture are different pictures in
+            // different places; there is no copy between them that is right.
+            _ => false,
         }
     }
 }

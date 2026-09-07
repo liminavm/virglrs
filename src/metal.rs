@@ -663,6 +663,63 @@ impl Surface {
         true
     }
 
+    /// Copy one plane of another surface into the same plane of this one.
+    ///
+    /// This is how a picture is replicated from one decode target into another: the pixels of a
+    /// composite target live in its surface planes and nowhere else, so the copy is between two
+    /// surfaces and touches no GL. The rows and the row length are clamped to what *both* planes
+    /// hold, so a pair the caller has not matched up truncates rather than running off either.
+    ///
+    /// `false` if either plane is missing or either surface will not lock.
+    pub fn copy_plane_from(&self, src: &Surface, plane: u32) -> bool {
+        let (Some((src_shape, src_pitch)), Some((dst_shape, dst_pitch))) =
+            (src.plane(plane), self.plane(plane))
+        else {
+            return false;
+        };
+        let rows = src_shape.height.min(dst_shape.height) as usize;
+        let row_bytes = src_pitch.min(dst_pitch) as usize;
+        if rows == 0 || row_bytes == 0 {
+            return true;
+        }
+
+        // SAFETY: both surfaces are live and owned by their `Surface`s; each lock is balanced by
+        // an unlock below with the same options. The source is taken read-only and released
+        // first, so nothing is held if the destination refuses to lock.
+        if unsafe { IOSurfaceLock(src.as_ref(), LOCK_READ_ONLY, core::ptr::null_mut()) } != 0 {
+            return false;
+        }
+        // SAFETY: as above, for the destination.
+        if unsafe { IOSurfaceLock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut()) } != 0 {
+            // SAFETY: balanced against the source lock taken just above.
+            unsafe { IOSurfaceUnlock(src.as_ref(), LOCK_READ_ONLY, core::ptr::null_mut()) };
+            return false;
+        }
+        // SAFETY: the plane index was checked against both surfaces' own plane counts above. Each
+        // row moves `row_bytes` at an offset of at most `(rows - 1) * pitch` on either side, with
+        // `rows` no more than either height and `row_bytes` no more than either pitch, so every
+        // byte read and every byte written is inside the region the kernel reported for that
+        // plane. The two surfaces are distinct allocations -- the caller has already established
+        // they are not the same target -- so the regions cannot overlap.
+        unsafe {
+            let from = IOSurfaceGetBaseAddressOfPlane(src.as_ref(), plane as usize).cast::<u8>();
+            let to = IOSurfaceGetBaseAddressOfPlane(self.as_ref(), plane as usize).cast::<u8>();
+            if !from.is_null() && !to.is_null() {
+                for row in 0..rows {
+                    std::ptr::copy_nonoverlapping(
+                        from.add(row * src_pitch as usize),
+                        to.add(row * dst_pitch as usize),
+                        row_bytes,
+                    );
+                }
+            }
+            // SAFETY: both balanced against the locks above, with the same options.
+            IOSurfaceUnlock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut());
+            IOSurfaceUnlock(src.as_ref(), LOCK_READ_ONLY, core::ptr::null_mut());
+        }
+        true
+    }
+
     /// Fill one plane with a single byte.
     ///
     /// Only a test wants this, and it exists for one question that has no other answer: whether
@@ -1282,5 +1339,36 @@ mod plain_tests {
             assert_eq!(surface.bytes_per_row(), format.linear_pitch(48).expect("a device"));
             assert!(surface.alloc_size() >= u64::from(surface.bytes_per_row()) * 48);
         }
+    }
+
+    /// A picture replicated from one surface into another, which is what a dropped video frame
+    /// shows: every plane must arrive, and the plane it arrives in must be the plane it left.
+    #[test]
+    fn a_plane_is_copied_into_the_same_plane_of_another_surface() {
+        let from = Surface::planar(64, 32, PlanarFormat::BiPlanar420).expect("minted");
+        let into = Surface::planar(64, 32, PlanarFormat::BiPlanar420).expect("minted");
+        for plane in 0..from.plane_count() {
+            // A different byte per plane: a copy that crossed the planes would come back with
+            // the values swapped, and identical fills could not tell that apart.
+            assert!(from.fill_plane(plane, 0xa0 + plane as u8));
+            assert!(into.fill_plane(plane, 0x00));
+        }
+
+        for plane in 0..from.plane_count() {
+            assert!(into.copy_plane_from(&from, plane), "plane {plane}");
+        }
+        for plane in 0..from.plane_count() {
+            let (shape, _) = into.plane(plane).expect("a plane of a biplanar surface");
+            for row in [0, shape.height / 2, shape.height - 1] {
+                assert_eq!(
+                    into.read_plane_row(plane, row),
+                    from.read_plane_row(plane, row),
+                    "plane {plane} row {row}"
+                );
+            }
+        }
+
+        // A plane neither surface has is not a copy that silently succeeded.
+        assert!(!into.copy_plane_from(&from, from.plane_count()));
     }
 }
