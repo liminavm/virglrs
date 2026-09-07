@@ -26,8 +26,9 @@ use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkFence, VkFlags,
-    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType, VkPhysicalDevice, VkResult,
+    VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkDeviceSize,
+    VkFence, VkFlags, VkMemoryHeapFlagBits, VkMemoryResourceAllocationSizePropertiesMESA,
+    VkObjectType, VkPhysicalDevice, VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkResult,
     VkRingCreateInfoMESA, VkRingMonitorInfoMESA, VkSemaphore, vn_command_vkAllocateCommandBuffers,
     vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
     vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
@@ -3097,13 +3098,47 @@ impl Commands for Handlers<'_> {
         self.asked(r);
     }
 
+    /// The one query whose answer this renderer overrides, because the driver's is about the
+    /// wrong machine.
+    ///
+    /// Chained `VK_EXT_memory_budget` describes the *host GPU's* heap, which is not the limit the
+    /// guest will hit: past the cap its context is stopped. Left alone that reply actively
+    /// misleads -- a client sizing its caches against tens of GiB is killed for believing us --
+    /// and it is the only backpressure venus does not throw away, because a budget query is a
+    /// real round-trip while an allocation's result is discarded (see [`budget`]). Only
+    /// `DEVICE_LOCAL` heaps are rewritten: those are the ones our allocations land in.
     fn vkGetPhysicalDeviceMemoryProperties2(
         &mut self,
         args: &mut vn_command_vkGetPhysicalDeviceMemoryProperties2<'_>,
     ) {
+        const DEVICE_LOCAL: u32 = VkMemoryHeapFlagBits::VK_MEMORY_HEAP_DEVICE_LOCAL_BIT.0 as u32;
+
         let pd = args.physicalDevice;
         let Some(out) = self.fills(args.pMemoryProperties_mut()) else { return };
         let r = self.driver.pd_query(pd, out, |i| i.try_vkGetPhysicalDeviceMemoryProperties2());
+        {
+            let account = self.driver.account();
+            // The heaps the driver just described: what says which heap is ours to answer for and
+            // how big it is. Copied out so walking the chain is not a second borrow of `out`.
+            let heaps = out.memoryProperties;
+            // No cap is no answer to give, and the driver's reply is then the only true one.
+            if let Some(st) = account.standing()
+                && let Some(chained) =
+                    driver::chained_mut::<VkPhysicalDeviceMemoryBudgetPropertiesEXT>(&mut out.pNext)
+            {
+                let count = heaps.memoryHeapCount.min(heaps.memoryHeaps.len() as u32);
+                for i in 0..count as usize {
+                    let heap = heaps.memoryHeaps[i];
+                    if heap.flags.0 & DEVICE_LOCAL == 0 {
+                        continue;
+                    }
+                    let (budget, usage) =
+                        account.heap_answer(st, i as u32, heap.size.0, chained.heapBudget[i].0);
+                    chained.heapBudget[i] = VkDeviceSize(budget);
+                    chained.heapUsage[i] = VkDeviceSize(usage);
+                }
+            }
+        }
         self.asked(r);
     }
 
@@ -8976,6 +9011,109 @@ mod tests {
         let older = make(major, minor - 1, 3);
         assert_eq!(cap_api_version(older), older, "a driver behind us is reported as it is");
         assert_eq!(cap_api_version(VK_XML_VERSION), VK_XML_VERSION, "our own version is untouched");
+    }
+
+    /// A budget query is answered from our ledger, not forwarded to the GPU driver.
+    ///
+    /// This is the RED for a blind passthrough, which is what this handler was: the driver
+    /// describes the host GPU's heap, and a guest that believes it sizes its caches for memory we
+    /// will stop its context for taking. Driven through the handler rather than against the
+    /// arithmetic directly, because the arithmetic was never the part that was missing -- the
+    /// chain walk was.
+    #[test]
+    fn the_memory_budget_query_is_answered_from_our_ledger() {
+        use super::super::proto::types::{
+            VkMemoryHeap, VkMemoryHeapFlags, VkPhysicalDeviceMemoryProperties2, VkStructureType,
+            vn_command_vkGetPhysicalDeviceMemoryProperties2,
+        };
+
+        const CAP: u64 = 2048;
+        const HELD: u64 = 512;
+        /// What a host driver answers with: the whole Metal heap, orders of magnitude past our cap.
+        const DRIVER_SAYS: u64 = 10_961_600_512;
+
+        /// A driver that reports one device-local heap and one that is not.
+        unsafe extern "C" fn memory_properties2(
+            _pd: VkPhysicalDevice,
+            out: *mut VkPhysicalDeviceMemoryProperties2,
+        ) {
+            // SAFETY: the handler passed an exclusive borrow of a live struct.
+            let out = unsafe { &mut *out };
+            out.memoryProperties.memoryHeapCount = 2;
+            out.memoryProperties.memoryHeaps[0] =
+                VkMemoryHeap { size: VkDeviceSize(u64::MAX), flags: VkMemoryHeapFlags(1) };
+            out.memoryProperties.memoryHeaps[1] =
+                VkMemoryHeap { size: VkDeviceSize(u64::MAX), flags: VkMemoryHeapFlags(0) };
+            // The driver fills the chained struct itself; that is the answer we override.
+            let node = out.pNext.cast::<VkPhysicalDeviceMemoryBudgetPropertiesEXT>();
+            assert!(!node.is_null(), "the test chains the struct this driver is asked to fill");
+            // SAFETY: the only struct this test chains, and it outlives the call.
+            let b = unsafe { &mut *node };
+            b.heapBudget[0] = VkDeviceSize(DRIVER_SAYS);
+            b.heapBudget[1] = VkDeviceSize(DRIVER_SAYS);
+            b.heapUsage[0] = VkDeviceSize(7);
+            b.heapUsage[1] = VkDeviceSize(7);
+        }
+
+        let mut fns = crate::vulkan::Instance::default();
+        fns.plant_vkGetPhysicalDeviceMemoryProperties2(memory_properties2);
+        let mut driver = Driver::new(Account::for_test(Some(CAP)));
+        driver.plant_instance(fns);
+        let _held = driver.account().try_charge("device memory", HELD).expect("well under the cap");
+
+        let mut chained = VkPhysicalDeviceMemoryBudgetPropertiesEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT,
+            ..Default::default()
+        };
+        let mut asked = VkPhysicalDeviceMemoryProperties2 {
+            pNext: (&raw mut chained).cast(),
+            ..Default::default()
+        };
+        let mut args = vn_command_vkGetPhysicalDeviceMemoryProperties2::default();
+        args.plant_pMemoryProperties(&mut asked);
+
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        h.vkGetPhysicalDeviceMemoryProperties2(&mut args);
+        assert!(h.reject.is_none(), "answering a fair question is not a poisoned ring");
+        driver.abandon_planted();
+
+        assert_eq!(
+            chained.heapBudget[0].0, CAP,
+            "the guest is told our cap, not the host GPU's heap"
+        );
+        assert_eq!(
+            chained.heapUsage[0].0, HELD,
+            "and the usage beside it is what this context actually holds"
+        );
+        assert_eq!(
+            (chained.heapBudget[1].0, chained.heapUsage[1].0),
+            (DRIVER_SAYS, 7),
+            "a heap our allocations do not land in is left as the driver described it"
+        );
     }
 
     /// The cap is not a fact about the handler, it is a fact about the reply, so it is watched
