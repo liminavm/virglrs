@@ -88,8 +88,12 @@ What none of it touches:
   state rather than one the kernel enforces. The settle sweep's
   `mprotect(PROT_NONE)` is task-side and does not reach a renderer's mapping,
   which also means a second mapping keeps those pages resident.
-* **Signing under App Sandbox.** These spikes reflect limina as it is signed
-  today: hardened runtime, no `app-sandbox`, which is why `bootstrap_check_in` on
-  an arbitrary name is a real lane. Under App Sandbox it is not, and the lane
-  becomes an in-bundle XPC service or an app-group-prefixed name. The memory
-  entries are unaffected; only how the port travels changes.
+* **The bootstrap lane, which is the spike's and not the design's.**
+  `bootstrap_check_in` on an arbitrary name works here only because limina signs
+  with the hardened runtime and no `app-sandbox`. App Store delivery means App
+  Sandbox, where that name is refused, so the renderer is reached as an in-bundle
+  XPC service instead — which is the better shape anyway: an XPC service carries
+  mach send rights natively (`xpc_dictionary_set_mach_send`), gets its own sandbox
+  profile rather than inheriting the VMM's, and brings lifecycle and restart with
+  it. Nothing above depends on the lane: the entries travel over XPC unchanged,
+  and only the rendezvous differs from what these programs do.

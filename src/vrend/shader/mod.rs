@@ -10,7 +10,7 @@
 //! A typed intermediate form is a later change, gated on its own.
 //!
 //! Only the C's GLES leg is ported. This renderer drives a GLES 3.1 context and nothing else
-//! (`docs/rust-rewrite.md`), so the C's `use_gles`, `use_core_profile` and
+//! (`docs/design.md`), so the C's `use_gles`, `use_core_profile` and
 //! `use_explicit_locations` switches are fixed at true, true and false and do not appear in
 //! [`Config`]; the desktop branches they guarded are not here. A desktop context is its own gated
 //! change, and it brings its branches with it.

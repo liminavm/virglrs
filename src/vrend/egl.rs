@@ -93,7 +93,7 @@ impl fmt::Display for EglError {
 impl std::error::Error for EglError {}
 
 /// Which client API the winsys binds. Only GLES today; a desktop-GL flavour is a later,
-/// separately gated change (`docs/rust-rewrite.md`, P3).
+/// separately gated change (`docs/design.md`, P3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Flavour {
     Gles,

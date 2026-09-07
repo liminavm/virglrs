@@ -12,7 +12,7 @@ parameter, and the disagreement is a stack smash rather than a compile error -- 
 reason `vulkan.rs` gives for generating its tables from vk.xml, and it holds here unchanged.
 
 Which entry points exist is a decision this file makes, once, in the lists below. GLES is the
-target (`docs/rust-rewrite.md`, P3): every core command through 3.2 is in the table, so that
+target (`docs/design.md`, P3): every core command through 3.2 is in the table, so that
 "3.1 host, and these of 3.2's extensions" is a runtime census rather than a build-time guess, plus
 the extensions vrend reaches for by name. EGL is 1.0 through 1.5 plus what the surfaceless,
 image-importing, fence-exporting winsys needs.

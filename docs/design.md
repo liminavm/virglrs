@@ -1,4 +1,4 @@
-# Rewriting virglrenderer in Rust
+# The virglrs design
 
 The host renderer is the last large C dependency limina owns, and it is where our
 crashes live. This plan takes it to Rust in one multi-session pass, with no

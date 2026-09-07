@@ -1,6 +1,6 @@
 # The renderer test harness
 
-The harness exists so the Rust rewrite (`docs/rust-rewrite.md`) has a fixed oracle: the same
+The harness exists so the Rust rewrite (`docs/design.md`) has a fixed oracle: the same
 corpora, run against the C renderer and against virglrs, producing comparable output.
 
 The C leg is `third_party/virglrenderer`, at the rev `third_party/manifest.toml` pins:
@@ -654,7 +654,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   that never asked for them. Two identical draws with nothing between them have one correct
   answer, so the C is the wrong golden here; reproducing its bug to keep a fixture green is not a
   trade worth making, and a permanently red line is a gate nobody reads. The deviation is in
-  `docs/rust-rewrite.md`; every other line of this fixture, and every other fixture in the tree,
+  `docs/design.md`; every other line of this fixture, and every other fixture in the tree,
   is still pinned from the C. **A bulk re-record overwrites that line with the C's answer**, and
   it is one line in a fixture nobody rereads, so restore it deliberately afterwards -- the value
   to restore is the one `res=52` carries, because the whole point is that the two reads agree.

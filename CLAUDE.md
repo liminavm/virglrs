@@ -1,6 +1,6 @@
 # virglrs
 
-A virtio-gpu host renderer in Rust, for limina. The plan is `docs/rust-rewrite.md`; the test
+A virtio-gpu host renderer in Rust, for limina. The design is `docs/design.md`; the test
 floor is `harness/README.md`.
 
 `third_party/virglrenderer` is the C implementation this was written against, pinned by

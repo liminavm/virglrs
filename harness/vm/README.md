@@ -285,4 +285,4 @@ Two host prefixes, because reproducing them here would mean vendoring two more f
 - the zink-on-KosmicKrisp Mesa on its case-sensitive volume, `/Volumes/mesa-cs/zink-kk-prefix`.
 
 It also seeds itself from limina's built `Limina.app` and its disk images. `LIMINA_ROOT` overrides
-where it looks. Settling these is part of the P6 reconcile in `docs/rust-rewrite.md`.
+where it looks. Settling these is part of the P6 reconcile in `docs/design.md`.
