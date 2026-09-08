@@ -34,4 +34,4 @@ layers and what each can and cannot catch. The C leg needs a built virglrenderer
 
 ## Licence
 
-`GPL-2.0-only WITH LicenseRef-limina-exception` — see `LICENSES/` and `NOTICE`.
+MIT — see `LICENSES/MIT.txt` and `NOTICE`.
