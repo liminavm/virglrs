@@ -4255,10 +4255,11 @@ impl Driver {
     /// VMM maps into the guest.
     ///
     /// It touches Vulkan not at all, which is the change: every allocation the host can address
-    /// is storage this renderer minted and the driver imported, so publishing hands out what
-    /// already exists rather than asking the driver to map something. The share is what makes the
-    /// bytes outlive the allocation, the context and this call -- the VMM reads and writes them
-    /// for as long as the resource lives, and the guest is free to `vkFreeMemory` in the meantime.
+    /// was mapped once at its allocation -- minted pages the driver imported, a surface, or the
+    /// driver's own heap -- so publishing hands out an address that already exists rather than
+    /// asking the driver to map something. The share is what makes the bytes outlive the
+    /// allocation, the context and this call -- the VMM reads and writes them for as long as the
+    /// resource lives, and the guest is free to `vkFreeMemory` in the meantime.
     ///
     /// It is *not* handed out again: exporting twice would give two resources one storage, and
     /// the second holder would have no way to know.
@@ -4796,6 +4797,15 @@ pub struct DriverMemory {
     len: u64,
 }
 
+/// Dropping this can run off the venus worker: the last share of a heap is often a blob's, and
+/// the VMM unrefs that resource on its own thread, with no context lock held. That is sound, and
+/// the reasons are worth stating because they are the ones a future change would break.
+/// `vkFreeMemory` and `vkUnmapMemory` are externally synchronised on the *memory*, not the device,
+/// and the `Arc` gives the memory exactly one dropper -- so a ring thread submitting on the same
+/// device concurrently is allowed. The device underneath cannot go with it while anyone is using
+/// it, because a ring reaches a device only through the context mutex, and a context that still
+/// has the device holds a share of it. KosmicKrisp's own bookkeeping is likewise safe: the
+/// residency set it drops the heap out of is guarded by `dev->residency_set.mutex`.
 impl Drop for DriverMemory {
     fn drop(&mut self) {
         // A null handle is memory no `vkAllocateMemory` ever returned -- `vkAllocateMemory`'s own
@@ -5840,7 +5850,7 @@ mod tests {
         d.plant_allocation(ObjectId(70), 4096);
         // The third route: an allocation the guest declared nothing about, which the driver
         // allocates and this renderer maps once and owns. It is the route a desktop's images take.
-        DRIVER_MEMORY.with(|b| *b.borrow_mut() = vec![0u8; 4096]);
+        DRIVER_MEMORY.with(|b| *b.borrow_mut() = vec![0u8; 65536]);
         let plain = VkMemoryAllocateInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
             pNext: core::ptr::null(),
@@ -5848,6 +5858,17 @@ mod tests {
             memoryTypeIndex: 0,
         };
         d.allocate_memory(DEVICE, ObjectId(72), &plain, None, &|_| None).expect("no cap");
+
+        // The route is worth nothing if the census never names it: an undeclared allocation the
+        // driver owns is exactly the memory a desktop's images live in, and leaving it out would
+        // capture nothing to put back while every write below still passed.
+        let census: Vec<(u64, u64)> = d.memory_census().iter().map(|a| (a.id.0, a.size)).collect();
+        assert_eq!(
+            census,
+            vec![(66, extent as u64), (70, 4096), (72, 65536)],
+            "all three routes are reported, at the size the driver actually holds -- which for \
+             route three is `pad_for_blob`'s, not the 4096 the guest asked for"
+        );
 
         let round_trip = |d: &Driver, id: u64, len: usize| {
             let src: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
