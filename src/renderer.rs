@@ -486,10 +486,10 @@ impl Guest for BTreeMap<ResourceHandle, Resource> {
                 (!r.iov.is_empty()).then(|| PixelSource::Scattered(Iov::new(&r.iov)))
             }
             BlobStorage::Minted(h) => Some(PixelSource::Mapped(&h.map)),
-            // `pages()` is `None` for a surface, which is not a gap: a surface is adopted whole
+            // `pixels()` is `None` for a surface, which is not a gap: a surface is adopted whole
             // and the texture's storage becomes it, so reading its bytes here would mint exactly
             // the copy the adopt exists to avoid.
-            BlobStorage::Shared { storage, .. } => storage.mapping().map(PixelSource::Mapped),
+            BlobStorage::Shared { storage, .. } => storage.pixels(),
         }
     }
 }

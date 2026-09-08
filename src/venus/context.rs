@@ -8905,12 +8905,22 @@ mod tests {
             VkResult::VK_SUCCESS
         }
 
+        // The allocation that succeeds owns what the driver gave it, so it gives it back when
+        // the record goes -- which is the only `vkFreeMemory` there is, and so has to be here.
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            _m: VkDeviceMemory,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut driver = Driver::new(Account::for_test(Some(CAP)));
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkAllocateMemory(allocate);
+        fns.plant_vkFreeMemory(free);
         driver.plant_device(VkDevice(DEVICE), fns);
         // Not host-visible, so nothing is padded and the cap is measured in the guest's numbers.
         driver.plant_memory_types(VkDevice(DEVICE), &[VkMemoryPropertyFlags(0)]);
