@@ -3,3 +3,5 @@
 /spikes/machmem/machmem
 /spikes/machmem/survive
 /spikes/machmem/hvmap
+/dist
+__pycache__/

@@ -708,15 +708,33 @@ from the venus recorder (`LIMINA_VKR_RECORD=<MB>`, `src/venus/vkr_record.[ch]`) 
 dump on demand through a FIFO rather than on a timer, so asking for a capture costs the render
 path nothing until it happens.
 
-The corpora live in `vm/captures/`, beside the scores that pin them. They are NOT in git — they
-run from kilobytes to gigabytes — and `vm/.gitignore` tracks only the scripts and the README, so
-nothing there can be committed by accident. The same is true of everything else `vm/` needs: the
-guest disks in `disks/` and the two rig bundles beside them, which are self-contained and carry
-the renderer they were built with inside. All three layers run from this repository alone, against
-the C in `third_party/virglrenderer` and the build of it in `vm/build`. A permanent home for the
-corpora is still to be decided, and publishing this repository will want the harness to fetch them
-when they are missing. Recapture them with `vm/capture.sh` (see `vm/README.md`); the pinned scores
-here only regress against the corpus they were recorded from.
+The corpora live in `vm/captures/`, and they are NOT in git: `vm/.gitignore` tracks only the
+scripts and the README, so nothing there can be committed by accident. The same holds for
+everything else `vm/` needs — the guest disks in `disks/` and the two rig bundles beside them,
+which are self-contained and carry the renderer they were built with inside. All three layers run
+from this repository alone, against the C in `third_party/virglrenderer` and the build of it in
+`vm/build`.
+
+**A missing corpus fetches itself.** `replay/corpora.toml` pins every one by the sha256 of its
+uncompressed bytes — which is what a score was recorded against — and `scripts/fetch-corpora.sh`
+materializes them from a release, verifying each before it lands. Both replay scripts call it when
+a corpus under `vm/captures/` is absent, so a fresh checkout runs the suite without a manual step;
+a path anywhere else keeps the plain "no such file", because a typo should not become a download.
+`--list` and `--verify` answer what is present and whether it is still the pinned bytes.
+
+The three synthetic corpora are not hosted at all. `make-blit-corpus.py` and its two siblings are
+deterministic — measured 2026-09-08, two runs of each reproduce the stored file byte for byte — so
+the manifest records the generator and fetching one runs it.
+
+`scripts/pack-corpora.sh` prepares a release: zstd, and the manifest. The compression is what makes
+this practical rather than clever — 4.9 GB of recordings pack to 85 MB, because a command stream
+over mostly-repetitive pixel data is what they are. **One corpus generation, one new tag.** An
+asset replaced under an existing tag would leave every checkout that already fetched it holding
+different bytes under the same name, and the scores would go on passing against whichever copy a
+machine happened to have.
+
+Recapture with `vm/capture.sh` (see `vm/README.md`); the pinned scores here only regress against
+the corpus they were recorded from.
 
 **Run a leg from this tree, never from the C's copy of this harness.** That copy is older and its
 `--renderer rs` resolves the Rust prefix to the C tree's own, so it scores the reference twice and

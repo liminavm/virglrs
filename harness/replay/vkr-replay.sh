@@ -82,6 +82,15 @@ cd "$(dirname "$0")"
 HERE="$(pwd)"
 ROOT="$(cd ../.. && pwd)"
 
+# A corpus that is missing from vm/captures/ is fetched from the release corpora.toml pins, which
+# is what makes a fresh checkout able to run this at all -- the recordings are not in git. Guarded
+# to that directory on purpose: a mistyped path anywhere else keeps the plain "no such file" the
+# replayer already gives, rather than turning a typo into a download.
+if [ ! -f "$CORPUS" ] \
+   && [ "$(cd "$(dirname "$CORPUS")" 2>/dev/null && pwd)" = "$ROOT/harness/vm/captures" ]; then
+  "$ROOT/scripts/fetch-corpora.sh" "$(basename "$CORPUS")"
+fi
+
 MESA_PREFIX="${MESA_PREFIX:-/Volumes/mesa-cs/zink-kk-prefix}"
 ICD="$MESA_PREFIX/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json"
 [ -f "$ICD" ] || { echo "no KosmicKrisp ICD at $ICD (set MESA_PREFIX)" >&2; exit 1; }
