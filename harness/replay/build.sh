@@ -15,13 +15,18 @@
 set -eu
 cd "$(dirname "$0")"
 SRC="$(cd ../.. && pwd)"
+# The C headers this replayer speaks -- `virgl_hw.h` and the generated `config.h` -- come from the
+# vendored C tree and the build the harness makes of it, not from `$SRC/src`, which in this
+# repository is Rust.
+CSRC="$SRC/third_party/virglrenderer"
+CBUILD="$SRC/harness/vm/build"
 
 PREFIX="${VIRGL_PREFIX:-}"
 if [ -z "$PREFIX" ]; then
-  if [ -f "$SRC/build/src/libvirglrenderer.dylib" ]; then
-    PREFIX="$SRC/build"
+  if [ -f "$CBUILD/src/libvirglrenderer.dylib" ]; then
+    PREFIX="$CBUILD"
   else
-    PREFIX="$HOME/Projects/limina/third_party/virgl-prefix"
+    PREFIX="$SRC/harness/vm/prefix"
   fi
 fi
 
@@ -31,7 +36,7 @@ done
 [ -n "${LIBDIR:-}" ] || { echo "no libvirglrenderer.dylib under $PREFIX — build it first" >&2; exit 1; }
 
 cc -O2 -Wall -Wextra -o vrend-replay vrend-replay.c \
-   -I"$SRC/src" -I"$SRC/build/src" -I"$PREFIX/include/virgl" \
+   -I"$CSRC/src" -I"$CBUILD/src" -I"$PREFIX/include/virgl" \
    -L"$LIBDIR" -lvirglrenderer -Wl,-rpath,"$LIBDIR" \
    -framework IOSurface -framework CoreFoundation
 

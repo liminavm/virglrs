@@ -708,9 +708,18 @@ from the venus recorder (`LIMINA_VKR_RECORD=<MB>`, `src/venus/vkr_record.[ch]`) 
 dump on demand through a FIFO rather than on a timer, so asking for a capture costs the render
 path nothing until it happens.
 
-The corpora themselves are NOT in git — they run from kilobytes to tens of megabytes, and a
-permanent home for them is still to be decided. Recapture them with `vm/capture.sh` (see
-`vm/README.md`); the pinned scores here only regress against the corpus they were recorded from.
+The corpora live in `vm/captures/`, beside the scores that pin them. They are NOT in git — they
+run from kilobytes to gigabytes — and `vm/.gitignore` tracks only the scripts and the README, so
+nothing there can be committed by accident. A permanent home for them is still to be decided; what
+is settled is that both replay legs build and run from this repository alone, against the C in
+`third_party/virglrenderer` and the build of it in `vm/build`. Recapture them with `vm/capture.sh`
+(see `vm/README.md`); the pinned scores here only regress against the corpus they were recorded
+from.
+
+**Run a leg from this tree, never from the C's copy of this harness.** That copy is older and its
+`--renderer rs` resolves the Rust prefix to the C tree's own, so it scores the reference twice and
+reports a clean pass for a renderer it never ran -- the failure `vkr-replay.sh`'s header warns
+about, reached by being in the wrong directory rather than by forgetting the flag.
 
 ### The IOSurface leg
 
@@ -757,11 +766,19 @@ image hashes as N zero bytes, and says so on the capture rather than being silen
 **undeclared** host-visible allocation is the driver's own memory, mapped once and owned by this
 renderer, so the census reads whatever the driver wrote, tiled or not.
 
-That split is what the score measures. Before it, measured 2026-09-06, `synoik` scored 20 of 22
-entries as zeros and `synoik-glclient` 21 of 23, every one of the 41 an OPTIMAL image; the two
-corpora had eleven discriminating entries between them at the start of the port and two after.
-The four that always carried data are the 4 MiB scanouts, which are not read through pages at all
--- their backing is an IOSurface and `Surface::read_into` copies from the surface.
+That split is what the score measures, and it is a VM-free replay that measures it: nine census
+entries in each synoik corpus carry content that used to hash as the empty constant. Re-recorded
+2026-09-08, `synoik.score` and `synoik-glclient.score` moved on those nine and nothing else, both
+legs agree on every one of the new values, and neither corpus reports an all-zero capture any
+more. Before it, measured 2026-09-06, `synoik` scored 20 of 22 entries as zeros and
+`synoik-glclient` 21 of 23, every one of the 41 an OPTIMAL image. The four that always carried
+data are the 4 MiB scanouts, which are not read through pages at all -- their backing is an
+IOSurface and `Surface::read_into` copies from the surface.
+
+The two 4,128,768-byte framebuffers are the exception to trusting a single replay: one sample of
+`synoik-glclient` put them at a hash three later runs did not reproduce, and the pin's value is
+what the C leg gives. They are the allocations the settle discussion below is about; a lone
+deviation there is a sample, not a regression.
 
 Reaching what is left needs a census that copies out of the `VkImage` rather than out of the
 memory, which is guest image-layout tracking on both sides -- see "The census reads the memory, so
