@@ -561,6 +561,17 @@ impl Vrend {
         if self.resource_surface(handle).is_none() {
             return false;
         }
+        self.finish_all();
+        true
+    }
+
+    /// Wait for every GL context this renderer owns to have executed what was queued on it.
+    ///
+    /// The renders live on the queue of whichever sub-context drew them, and a finish waits for
+    /// one context's queue only -- so a caller that needs *the surface* whole, rather than one
+    /// context's work, has to finish them all. The C finishes ctx0, which never draws, and the
+    /// harness caught it reading the frame before last off a scanout.
+    pub fn finish_all(&mut self) {
         for (id, ctx) in &self.contexts {
             for (sub, gl_ctx) in ctx.gl_contexts() {
                 let want = Current::Sub(*id, sub);
@@ -573,7 +584,6 @@ impl Vrend {
         }
         self.switch_ctx0();
         self.gl.finish();
-        true
     }
 
     /// Delete the host side of a resource, on ctx0. A handle this renderer never held is

@@ -1061,14 +1061,46 @@ impl Renderer {
             return Err(Error::NoContext);
         };
         c.last_fence.insert(ring, fence);
-        // Nothing here submits GPU work yet, so every fence is already satisfied. It still goes
-        // through the retirement thread: the asynchrony is the contract, not an optimization.
+        // A venus fence carries its waits inside the command stream, so reaching here is already
+        // its answer. A classic one does not: see `finish_classic_for_fence`.
+        if self.is_classic(ctx) {
+            self.finish_classic_for_fence();
+        }
+        // Retirement goes through the thread whatever satisfied the fence: the asynchrony is the
+        // contract, not an optimization.
         self.fences.retire_context(ctx, ring, fence);
         Ok(())
     }
 
     pub fn create_fence(&mut self, fence: ClientFenceId) {
+        // The legacy global path is the classic renderer's -- `virgl_renderer_create_fence` has
+        // no ring to name -- so this fence answers for GL work exactly as a classic ring's does.
+        self.finish_classic_for_fence();
         self.fences.retire_global(fence);
+    }
+
+    /// Make a classic fence mean what the guest reads it to mean: the GL work it fences has run.
+    ///
+    /// A guest fences a submission and then tells someone else the buffer is ready. When that
+    /// someone else is another GL client of this renderer, the queue it reads on is one this
+    /// renderer also drives, and the fence being early costs nothing. When it is a **venus
+    /// compositor importing the surface** -- a Vulkan queue Metal does not order against ours --
+    /// an early fence hands it a buffer whose renders have not run, and it samples whatever the
+    /// buffer held before. `transfer.rs` already finishes for exactly this reason on the upload
+    /// path; a render is the same hazard and was not covered.
+    ///
+    /// `glFinish` on every classic context is the sledgehammer version of this: correct, and far
+    /// more than the fence actually needs. The shape it should take is a `glFenceSync` taken here
+    /// and waited on by the retirement thread, which needs that thread to hold a GL context.
+    /// `VIRGLRS_FENCE_FINISH=0` turns this off, which is how the two are compared on one build.
+    fn finish_classic_for_fence(&mut self) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("VIRGLRS_FENCE_FINISH").as_deref() != Ok("0")) {
+            return;
+        }
+        if let Some(v) = self.vrend.as_mut() {
+            v.finish_all();
+        }
     }
 
     // ---- venus ----
