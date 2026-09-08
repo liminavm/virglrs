@@ -2525,13 +2525,14 @@ impl Context {
                     if std::env::var_os("LIMINA_GL_TRACE").is_some() {
                         eprintln!(
                             "[virglrs] vrend: sampler view: texture_view of resource {:?} \
-                             ({}x{} {}, immutable {immutable}) as {} target {target:#x} \
-                             internalformat {ifmt:#x} levels {first_level}+{levels} layers \
-                             {first_layer}+{layers}",
+                             ({}x{} {}, immutable {immutable}, surface {}, supports_view \
+                             {supports_view}) as {} target {target:#x} internalformat {ifmt:#x} \
+                             levels {first_level}+{levels} layers {first_layer}+{layers}",
                             v.resource,
                             res.args.width,
                             res.args.height,
                             res.args.format.name(),
+                            res.surface().is_some(),
                             view_format.name(),
                         );
                     }
