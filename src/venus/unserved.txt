@@ -132,7 +132,6 @@ vkCmdTraceRaysIndirectKHR                          out-of-reach:ray-tracing-pipe
 vkCmdTraceRaysKHR                                  out-of-reach:ray-tracing-pipeline
 vkCmdUpdateBuffer                                  wanted:image-copy-core
 vkCmdWriteAccelerationStructuresPropertiesKHR      out-of-reach:acceleration-structure
-vkCmdWriteTimestamp2                               wanted:timestamps
 vkCopyAccelerationStructureKHR                     not-in-reference:acceleration-structure
 vkCreateAccelerationStructureKHR                   out-of-reach:acceleration-structure
 vkCreateDeferredOperationKHR                       not-in-reference:deferred-operation
@@ -149,7 +148,6 @@ vkEnumerateDeviceLayerProperties                   not-in-reference:layer-enumer
 vkEnumerateInstanceLayerProperties                 not-in-reference:layer-enumeration
 vkGetAccelerationStructureBuildSizesKHR            out-of-reach:acceleration-structure
 vkGetAccelerationStructureDeviceAddressKHR         out-of-reach:acceleration-structure
-vkGetCalibratedTimestampsKHR                       wanted:timestamps
 vkGetDeferredOperationMaxConcurrencyKHR            not-in-reference:deferred-operation
 vkGetDeferredOperationResultKHR                    not-in-reference:deferred-operation
 vkGetDeviceAccelerationStructureCompatibilityKHR   out-of-reach:acceleration-structure
