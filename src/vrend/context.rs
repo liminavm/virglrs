@@ -2759,8 +2759,11 @@ enum Route {
 /// context for the rest of the boot and left a desktop that could not be repainted.
 ///
 /// Importing the same EGL image into a second texture name gives an equally private object with
-/// no view class to satisfy. It needs no red/blue compensation either -- the second texture is as
-/// natively BGRA as the first, the swap being an artifact of the view and not of the storage.
+/// no view class to satisfy. It needs no red/blue compensation either: the swap is an artifact of
+/// the view, not of the storage, so a second import reads the same channels as the first.
+/// Measured on KosmicKrisp 2026-09-07, the swizzled path live -- a Vulkan client's triangle drew
+/// red at the apex and blue at the bottom left, which is what its vertices say and what an
+/// exchange of those two channels would have made unmistakable.
 ///
 /// The C reaches the same place by a shorter road: its `needs_view` has no swizzle term at all,
 /// so it never asks for the view and lives with the shared texture. That leaves `vl_compositor`
