@@ -82,8 +82,6 @@ vkCmdNextSubpass2                                  wanted:render-pass2
 vkCmdPushConstants2                                wanted:maintenance6-binding
 vkCmdPushDataEXT                                   out-of-reach:descriptor-heap
 vkCmdPushDescriptorSet2                            wanted:maintenance6-binding
-vkCmdResetEvent                                    wanted:events
-vkCmdResetEvent2                                   wanted:events
 vkCmdResolveImage                                  wanted:image-copy-core
 vkCmdResolveImage2                                 wanted:copy-commands2
 vkCmdSetAlphaToCoverageEnableEXT                   wanted:extended-dynamic-state3
@@ -102,8 +100,6 @@ vkCmdSetDepthClampRangeEXT                         out-of-reach:shader-object
 vkCmdSetDepthClipEnableEXT                         wanted:extended-dynamic-state3
 vkCmdSetDepthClipNegativeOneToOneEXT               wanted:extended-dynamic-state3
 vkCmdSetDeviceMask                                 wanted:core-dynamic-state
-vkCmdSetEvent                                      wanted:events
-vkCmdSetEvent2                                     wanted:events
 vkCmdSetExtraPrimitiveOverestimationSizeEXT        wanted:extended-dynamic-state3
 vkCmdSetFragmentShadingRateKHR                     out-of-reach:fragment-shading-rate
 vkCmdSetLineRasterizationModeEXT                   wanted:extended-dynamic-state3
@@ -127,8 +123,6 @@ vkCmdTraceRaysIndirect2KHR                         out-of-reach:ray-tracing-main
 vkCmdTraceRaysIndirectKHR                          out-of-reach:ray-tracing-pipeline
 vkCmdTraceRaysKHR                                  out-of-reach:ray-tracing-pipeline
 vkCmdUpdateBuffer                                  wanted:image-copy-core
-vkCmdWaitEvents                                    wanted:events
-vkCmdWaitEvents2                                   wanted:events
 vkCmdWriteAccelerationStructuresPropertiesKHR      out-of-reach:acceleration-structure
 vkCmdWriteTimestamp2                               wanted:timestamps
 vkCopyAccelerationStructureKHR                     not-in-reference:acceleration-structure
@@ -136,7 +130,6 @@ vkCreateAccelerationStructureKHR                   out-of-reach:acceleration-str
 vkCreateBufferView                                 wanted:buffer-view
 vkCreateDeferredOperationKHR                       not-in-reference:deferred-operation
 vkCreateDescriptorUpdateTemplate                   wanted:descriptor-update-template
-vkCreateEvent                                      wanted:events
 vkCreatePrivateDataSlot                            not-in-reference:private-data
 vkCreateRayTracingPipelinesKHR                     out-of-reach:ray-tracing-pipeline
 vkCreateRenderPass2                                wanted:render-pass2
@@ -145,7 +138,6 @@ vkDestroyAccelerationStructureKHR                  out-of-reach:acceleration-str
 vkDestroyBufferView                                wanted:buffer-view
 vkDestroyDeferredOperationKHR                      not-in-reference:deferred-operation
 vkDestroyDescriptorUpdateTemplate                  wanted:descriptor-update-template
-vkDestroyEvent                                     wanted:events
 vkDestroyPrivateDataSlot                           not-in-reference:private-data
 vkEnumerateDeviceLayerProperties                   not-in-reference:layer-enumeration
 vkEnumerateInstanceLayerProperties                 not-in-reference:layer-enumeration

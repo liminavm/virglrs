@@ -45,23 +45,24 @@ use super::proto::types::{
     vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndQuery, vn_command_vkCmdEndRenderPass,
     vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
     vn_command_vkCmdPipelineBarrier2, vn_command_vkCmdPushConstants,
-    vn_command_vkCmdPushDescriptorSet, vn_command_vkCmdResetQueryPool,
-    vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT, vn_command_vkCmdSetBlendConstants,
-    vn_command_vkCmdSetCullMode, vn_command_vkCmdSetDepthBias,
+    vn_command_vkCmdPushDescriptorSet, vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2,
+    vn_command_vkCmdResetQueryPool, vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT,
+    vn_command_vkCmdSetBlendConstants, vn_command_vkCmdSetCullMode, vn_command_vkCmdSetDepthBias,
     vn_command_vkCmdSetDepthBoundsTestEnable, vn_command_vkCmdSetDepthCompareOp,
     vn_command_vkCmdSetDepthTestEnable, vn_command_vkCmdSetDepthWriteEnable,
-    vn_command_vkCmdSetFrontFace, vn_command_vkCmdSetLineWidth,
-    vn_command_vkCmdSetPatchControlPointsEXT, vn_command_vkCmdSetPrimitiveRestartEnable,
-    vn_command_vkCmdSetPrimitiveTopology, vn_command_vkCmdSetRasterizerDiscardEnable,
-    vn_command_vkCmdSetScissor, vn_command_vkCmdSetScissorWithCount,
-    vn_command_vkCmdSetStencilCompareMask, vn_command_vkCmdSetStencilOp,
-    vn_command_vkCmdSetStencilReference, vn_command_vkCmdSetStencilTestEnable,
-    vn_command_vkCmdSetStencilWriteMask, vn_command_vkCmdSetViewport,
-    vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdWriteTimestamp,
-    vn_command_vkCopyImageToImage, vn_command_vkCopyImageToMemoryMESA,
-    vn_command_vkCopyMemoryToImageMESA, vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool,
-    vn_command_vkCreateComputePipelines, vn_command_vkCreateDescriptorPool,
-    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
+    vn_command_vkCmdSetEvent, vn_command_vkCmdSetEvent2, vn_command_vkCmdSetFrontFace,
+    vn_command_vkCmdSetLineWidth, vn_command_vkCmdSetPatchControlPointsEXT,
+    vn_command_vkCmdSetPrimitiveRestartEnable, vn_command_vkCmdSetPrimitiveTopology,
+    vn_command_vkCmdSetRasterizerDiscardEnable, vn_command_vkCmdSetScissor,
+    vn_command_vkCmdSetScissorWithCount, vn_command_vkCmdSetStencilCompareMask,
+    vn_command_vkCmdSetStencilOp, vn_command_vkCmdSetStencilReference,
+    vn_command_vkCmdSetStencilTestEnable, vn_command_vkCmdSetStencilWriteMask,
+    vn_command_vkCmdSetViewport, vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdWaitEvents,
+    vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteTimestamp, vn_command_vkCopyImageToImage,
+    vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
+    vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
+    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
+    vn_command_vkCreateDevice, vn_command_vkCreateEvent, vn_command_vkCreateFence,
     vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
     vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
@@ -69,9 +70,9 @@ use super::proto::types::{
     vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
     vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer, vn_command_vkDestroyCommandPool,
     vn_command_vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorSetLayout,
-    vn_command_vkDestroyDevice, vn_command_vkDestroyFence, vn_command_vkDestroyFramebuffer,
-    vn_command_vkDestroyImage, vn_command_vkDestroyImageView, vn_command_vkDestroyInstance,
-    vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
+    vn_command_vkDestroyDevice, vn_command_vkDestroyEvent, vn_command_vkDestroyFence,
+    vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
+    vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyQueryPool,
     vn_command_vkDestroyRenderPass, vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler,
     vn_command_vkDestroySamplerYcbcrConversion, vn_command_vkDestroySemaphore,
@@ -2201,6 +2202,17 @@ impl Commands for Handlers<'_> {
         self.driver.forget_semaphore(args.semaphore);
     }
 
+    // An event, which is simple in both halves: no host state beyond the object table, and
+    // nothing about it that Vulkan will not answer later.
+    //
+    // Its three host-side commands -- `vkGetEventStatus`, `vkSetEvent`, `vkResetEvent` -- were
+    // served long before this, against events there was no way to create. That is what made the
+    // gap invisible: the guest's venus driver answers all three from a guest-side slot without
+    // asking us, so a probe could set an event, read it back SET, and never learn that the
+    // create had been refused. Only the command-buffer side below reaches the host at all.
+    simple_create!(vkCreateEvent, vn_command_vkCreateEvent, pCreateInfo, pEvent, handle_pEvent_mut);
+    simple_destroy!(vkDestroyEvent, vn_command_vkDestroyEvent, event);
+
     pool_create!(
         vkCreateCommandPool,
         vn_command_vkCreateCommandPool,
@@ -4039,6 +4051,31 @@ impl Commands for Handlers<'_> {
         self.recorded(done);
     }
 
+    fn vkCmdSetEvent(&mut self, args: &mut vn_command_vkCmdSetEvent<'_>) {
+        let done = self.driver.cmd_set_event(args.commandBuffer, args.event, args.stageMask);
+        self.recorded(done);
+    }
+
+    fn vkCmdResetEvent(&mut self, args: &mut vn_command_vkCmdResetEvent<'_>) {
+        let done = self.driver.cmd_reset_event(args.commandBuffer, args.event, args.stageMask);
+        self.recorded(done);
+    }
+
+    fn vkCmdWaitEvents(&mut self, args: &mut vn_command_vkCmdWaitEvents<'_>) {
+        // Four independent arrays: the events, and the same three optional barrier kinds
+        // `vkCmdPipelineBarrier` above takes. Each slice carries its own count.
+        let done = self.driver.cmd_wait_events(
+            args.commandBuffer,
+            args.pEvents(),
+            args.srcStageMask,
+            args.dstStageMask,
+            args.pMemoryBarriers(),
+            args.pBufferMemoryBarriers(),
+            args.pImageMemoryBarriers(),
+        );
+        self.recorded(done);
+    }
+
     fn vkCmdBeginRenderPass(&mut self, args: &mut vn_command_vkCmdBeginRenderPass<'_>) {
         let Some(begin) = self.names(args.pRenderPassBegin) else { return };
         let done = self.driver.cmd_begin_render_pass(args.commandBuffer, begin, args.contents);
@@ -4263,6 +4300,29 @@ impl Commands for Handlers<'_> {
     fn vkCmdPipelineBarrier2(&mut self, args: &mut vn_command_vkCmdPipelineBarrier2<'_>) {
         let Some(info) = self.names(args.pDependencyInfo) else { return };
         let done = self.driver.cmd_pipeline_barrier2(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetEvent2(&mut self, args: &mut vn_command_vkCmdSetEvent2<'_>) {
+        let Some(info) = self.names(args.pDependencyInfo) else { return };
+        let done = self.driver.cmd_set_event2(args.commandBuffer, args.event, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdResetEvent2(&mut self, args: &mut vn_command_vkCmdResetEvent2<'_>) {
+        let done = self.driver.cmd_reset_event2(args.commandBuffer, args.event, args.stageMask);
+        self.recorded(done);
+    }
+
+    fn vkCmdWaitEvents2(&mut self, args: &mut vn_command_vkCmdWaitEvents2<'_>) {
+        // One dependency per event, which Vulkan states as a single `eventCount` over two
+        // arrays. Here they are two slices, and the driver refuses a pair that disagrees rather
+        // than striding the shorter one -- see `Driver::cmd_wait_events2`.
+        let done = self.driver.cmd_wait_events2(
+            args.commandBuffer,
+            args.pEvents(),
+            args.pDependencyInfos(),
+        );
         self.recorded(done);
     }
 
