@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright © 2026 Gustavo Noronha Silva
 // Spike, second half: does memory minted *inside* the renderer outlive the
 // renderer being killed, if the VMM holds a memory entry for it?
 //

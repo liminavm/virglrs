@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright © 2026 Gustavo Noronha Silva
 # Vulkan client on the stock guest. Its Vulkan goes out through venus; the classic tracer on
 # this guest records the OTHER half -- the GL shell importing and compositing the buffer the
 # Vulkan client produced. That cross-path import is the point of this corpus.

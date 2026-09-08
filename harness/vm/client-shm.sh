@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright © 2026 Gustavo Noronha Silva
 # shm-only workload: a GTK4 terminal with every GPU path switched off, so its surface reaches
 # the compositor as a wl_shm buffer. The client issues no GL at all; everything the corpus
 # records is the shell uploading and sampling that buffer.
