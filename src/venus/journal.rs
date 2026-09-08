@@ -117,6 +117,19 @@ pub struct Journal {
     /// Append-ordered. Entries are never removed on destroy — they stop being exported, which is
     /// the same thing said in the one place that can see all of them at once.
     entries: Vec<Entry>,
+    /// A command buffer's recording, held under the buffer it belongs to.
+    ///
+    /// Recordings are the one kind of entry something *discards* rather than outlives: a begin or
+    /// a reset throws away what the buffer had recorded, and no key can say so because the buffer
+    /// is still the same live object. Held here rather than in `entries` so that discarding one
+    /// buffer's recording costs a lookup instead of a walk of the whole journal — which was a
+    /// linear scan per `vkBeginCommandBuffer`, on the ring thread, in the guest's submit path, and
+    /// so grew with the session while a video decode began a buffer per frame.
+    ///
+    /// This is the buffer's recording, not a second copy of it: an entry is in `entries` or here,
+    /// never both. The export sees one stream either way, the same way it already does for
+    /// `ring_state` — the merge is `seq`, which every entry carries and no two share.
+    recordings: BTreeMap<ObjectKey, Vec<Entry>>,
     /// Ring state a later command supersedes: reply-stream set/seek, per ring and command.
     ring_state: BTreeMap<RingSlot, Entry>,
     /// What went by without being retained, counted per command type.
@@ -177,10 +190,20 @@ impl Journal {
         resets: bool,
         refs: Vec<ObjectKey>,
     ) {
+        let seq = self.seq.advance();
+        let entry = Entry {
+            seq,
+            cmd_type,
+            ring_key: 0,
+            wire: wire.to_vec(),
+            about: About::Recording(buffer),
+            refs,
+        };
+        let recording = self.recordings.entry(buffer).or_default();
         if resets {
-            self.forget_recordings(&[buffer]);
+            recording.clear();
         }
-        self.push(cmd_type, 0, wire, About::Recording(buffer), refs);
+        recording.push(entry);
     }
 
     /// Discard every recording made from a command pool, which is what `vkResetCommandPool` does.
@@ -200,11 +223,9 @@ impl Journal {
             })
             .flatten()
             .collect();
-        self.forget_recordings(&buffers);
-    }
-
-    fn forget_recordings(&mut self, buffers: &[ObjectKey]) {
-        self.entries.retain(|e| !matches!(e.about, About::Recording(b) if buffers.contains(&b)));
+        for b in buffers {
+            self.recordings.remove(&b);
+        }
     }
 
     /// Retain a command that wrote into objects it does not own.
@@ -300,10 +321,17 @@ impl Journal {
     fn retained(&self, live: &dyn Live) -> Vec<&Entry> {
         let alive = |keys: &[ObjectKey]| keys.iter().any(|k| live.holds(*k));
 
+        // One stream to reason over. Recordings are kept under their buffer so that discarding one
+        // is a lookup, but reachability is a question about the whole journal, so it is asked here
+        // over everything at once. Order does not matter: `keep` holds indices into this, and the
+        // export sorts by `seq` at the end.
+        let all: Vec<&Entry> =
+            self.entries.iter().chain(self.recordings.values().flatten()).collect();
+
         // Which entry created a given key, so a reference can be resolved to the command that
         // would rebuild it.
         let mut creator: BTreeMap<ObjectKey, usize> = BTreeMap::new();
-        for (i, e) in self.entries.iter().enumerate() {
+        for (i, e) in all.iter().enumerate() {
             if let About::Created(keys) = &e.about {
                 for k in keys {
                     creator.insert(*k, i);
@@ -313,7 +341,7 @@ impl Journal {
 
         let mut keep: BTreeSet<usize> = BTreeSet::new();
         let mut queue: Vec<usize> = Vec::new();
-        for (i, e) in self.entries.iter().enumerate() {
+        for (i, e) in all.iter().enumerate() {
             let true_still = match &e.about {
                 About::Created(keys) => alive(keys),
                 About::Recording(b) => live.holds(*b),
@@ -335,7 +363,7 @@ impl Journal {
         // than one object, and it is the right way round: rebuilding an object the guest destroyed
         // costs memory, and not rebuilding it costs the command.
         while let Some(i) = queue.pop() {
-            let e = &self.entries[i];
+            let e = all[i];
             let named = e.refs.iter().chain(match &e.about {
                 About::Created(keys) | About::Mutated(keys) => keys.iter(),
                 About::Recording(b) => std::slice::from_ref(b).iter(),
@@ -356,8 +384,7 @@ impl Journal {
         // A free replays exactly when the create it undoes does. Last, because it is the only
         // question here whose answer is another entry's -- and it adds nothing to the closure,
         // since the creates it names are the ones already being kept.
-        let undone: Vec<usize> = self
-            .entries
+        let undone: Vec<usize> = all
             .iter()
             .enumerate()
             .filter(|(_, e)| {
@@ -368,7 +395,7 @@ impl Journal {
             .collect();
         keep.extend(undone);
 
-        let mut out: Vec<&Entry> = keep.iter().map(|i| &self.entries[*i]).collect();
+        let mut out: Vec<&Entry> = keep.iter().map(|i| all[*i]).collect();
         out.extend(self.ring_state.values());
         out.sort_by_key(|e| e.seq);
         out
@@ -519,6 +546,60 @@ mod tests {
         let out = j.retained(&Some_(vec![k[1]]));
         assert_eq!(out.len(), 2, "the module's create has to replay for the pipeline's to");
         assert_eq!(out[0].seq, Seq(1), "and it has to replay first");
+    }
+
+    /// The structural fact that makes a begin cheap: what a begin discards is never in the vector
+    /// the journal walks.
+    ///
+    /// Asserted rather than timed on purpose. The bug this guards was a linear scan of every entry
+    /// per `vkBeginCommandBuffer`, on the ring thread, in the guest's submit path -- so its cost
+    /// grew with the session and a video decode, which begins a buffer per frame, drove the worker
+    /// to 161% CPU against an idle guest. A timing threshold would be a proxy for that, and one
+    /// tuned close enough to catch it is also close enough to fire on a loaded machine. The
+    /// property underneath is exact: a recording lives under its buffer, so `entries` holds none,
+    /// and a scan of `entries` cannot be how one is discarded.
+    #[test]
+    fn a_recording_is_never_in_the_vector_the_journal_walks() {
+        let k = keys(3);
+        let mut j = Journal::new();
+        j.created(1, &[1; 4], vec![k[0]], Vec::new());
+        for b in [k[1], k[2]] {
+            j.recorded(10, &[1; 4], b, true, Vec::new());
+            j.recorded(11, &[2; 4], b, false, Vec::new());
+        }
+        assert!(
+            !j.entries.iter().any(|e| matches!(e.about, About::Recording(_))),
+            "a recording in `entries` is a recording a begin would have to scan for"
+        );
+        assert_eq!(j.recordings.len(), 2, "one recording per buffer, held under it");
+        // And the export still sees them: the split is where they live, not whether they count.
+        assert_eq!(j.retained(&Some_(vec![k[0], k[1], k[2]])).len(), 5);
+    }
+
+    /// Discarding one buffer's recording leaves every other buffer's alone.
+    ///
+    /// The cheap version of this passes by accident when a begin scans everything, because a scan
+    /// that matches on the buffer key is also correct -- just slow. It is here because the map has
+    /// a failure the scan did not: a wrong key drops the wrong buffer's work, and the guest would
+    /// see a restored command buffer replay somebody else's recording.
+    #[test]
+    fn beginning_one_buffer_leaves_the_others_recorded() {
+        let k = keys(3);
+        let mut j = Journal::new();
+        for b in [k[0], k[1], k[2]] {
+            j.recorded(10, &[1; 4], b, true, Vec::new());
+            j.recorded(11, &[2; 4], b, false, Vec::new());
+        }
+        j.recorded(10, &[9; 4], k[1], true, Vec::new());
+        let out = j.retained(&Some_(vec![k[0], k[1], k[2]]));
+        assert_eq!(out.len(), 5, "k[1] is back to one entry; the other two keep both");
+        let wires: Vec<&Vec<u8>> = out.iter().map(|e| &e.wire).collect();
+        assert_eq!(wires.iter().filter(|w| ***w == vec![9; 4]).count(), 1);
+        assert_eq!(
+            wires.iter().filter(|w| ***w == vec![2; 4]).count(),
+            2,
+            "the two buffers nobody began still hold their second command"
+        );
     }
 
     #[test]
