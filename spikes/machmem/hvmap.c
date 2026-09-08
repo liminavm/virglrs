@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright © 2026 Gustavo Noronha Silva
 // Spike, third half: does a mach memory entry get along with hv_vm_map?
 //
 // Two orderings, because the split needs both and they are not the same question.

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright © 2026 Gustavo Noronha Silva
 import fcntl, struct, sys, time, os
 
 UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502

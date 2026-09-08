@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright © 2026 Gustavo Noronha Silva
 # GL client on the Vulkan-compositor guest: the mirror of vkclient.sh. The client draws through
 # classic virgl and the compositor imports the result into its Vulkan world, so the venus
 # recorder captures the import side of a cross-path buffer.

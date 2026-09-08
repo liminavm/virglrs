@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright © 2026 Gustavo Noronha Silva
 # Converted from src/vrend/vrend_formats.c (the C reference), table by table. A row is
 # (virgl format, internalformat, format, type, swizzle, view class).
 

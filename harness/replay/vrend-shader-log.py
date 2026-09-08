@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright © 2026 Gustavo Noronha Silva
 """Normalise a `VREND_DEBUG=shader` log into the shader fixture.
 
 The C prints, per shader created, "TGSI received:" followed by `tgsi_dump` of the tokens it

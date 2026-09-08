@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright © 2026 Gustavo Noronha Silva
 //! What a context would have to be told again to be rebuilt.
 //!
 //! A snapshot restores a guest's memory but not the renderer's: the GL objects a compositor built

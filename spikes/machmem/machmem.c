@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright © 2026 Gustavo Noronha Silva
 // Spike: can a mach memory entry over the VMM's anonymous guest RAM be mapped
 // coherently into a second process, with no file descriptor anywhere?
 //
