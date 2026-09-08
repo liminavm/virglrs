@@ -17,6 +17,12 @@
 //! counter for the times its "prune when ANY key dies" rule is a guess. None of that has anything
 //! to do here.
 //!
+//! Entries are dropped, but never *at* a destroy: [`Journal::compact`] asks the same question the
+//! export asks, in the one place that can see everything at once, and it runs when the journal has
+//! grown rather than when an object has died. So there is still no site to forget — a compaction
+//! that never ran would cost memory and never correctness, which is the whole difference between
+//! this and a prune.
+//!
 //! **Except in one direction, which is not liveness but reachability.** A create may name objects
 //! it does not own: a pipeline names its layout and its shader modules, and the guest may destroy
 //! a shader module the moment the pipeline exists. The pipeline's create still has to replay, so
@@ -188,6 +194,9 @@ pub struct Journal {
     /// the same way it already does for `ring_state` — the merge is `seq`, which everything here
     /// carries and no two share.
     recordings: BTreeMap<ObjectKey, Vec<Recorded>>,
+    /// How much was worth keeping at the last compaction, and the baseline the next one is due
+    /// against. See [`Journal::due`].
+    kept: usize,
     /// Ring state a later command supersedes: reply-stream set/seek, per ring and command.
     ring_state: BTreeMap<RingSlot, Entry>,
     /// What went by without being retained, counted per command type.
@@ -354,12 +363,79 @@ pub trait Live {
 }
 
 impl Journal {
+    /// How many commands this journal is holding, wherever they are filed.
+    fn len(&self) -> usize {
+        self.entries.len() + self.recordings.values().map(Vec::len).sum::<usize>()
+    }
+
+    /// Is there enough dead weight here to be worth a pass over it?
+    ///
+    /// Amortised doubling: compaction runs when the journal has grown to twice what survived the
+    /// last one, so the work is linear in what has been added and the journal stays within about
+    /// twice its live size. The floor keeps a small context from compacting over and over while
+    /// it is still being built.
+    ///
+    /// Cheap on purpose -- two lengths and no `Live` -- because it is asked after every batch and
+    /// the answer is almost always no. Finding out for real costs a walk of everything.
+    pub fn due(&self) -> bool {
+        const FLOOR: usize = 4096;
+        self.len() > 2 * self.kept + FLOOR
+    }
+
+    /// Drop everything an export would no longer carry.
+    ///
+    /// **Sound because retention only ever falls.** An [`ObjectKey`] carries a generation, so a
+    /// destroyed object's key never resolves again; no command can name an object that is gone, so
+    /// no future entry can reference a dead key and nothing can drag a currently-unreachable
+    /// create back into the closure; and a share nothing holds is never held again, because taking
+    /// one means naming a live allocation. So what is not retained now is not retained ever, and
+    /// dropping it changes no export that could still happen.
+    ///
+    /// This is the one thing that takes an entry out of the journal for a reason other than a ring
+    /// dying, and it is deliberately not a prune at a destroy site: it asks the same question the
+    /// export asks, in the one place that can see everything at once, and a pass that never ran
+    /// would cost memory and never correctness.
+    pub fn compact(&mut self, live: &dyn Live) {
+        let keep = {
+            let (_, keep) = self.keep_set(live);
+            keep
+        };
+        // `keep_set` walked `entries` and then `recordings` in this order, and a `BTreeMap` walks
+        // its keys the same way twice, so the index each item was given is the index it gets here.
+        let mut i = 0;
+        self.entries.retain(|_| {
+            let live = keep.contains(&i);
+            i += 1;
+            live
+        });
+        self.recordings.retain(|_, rs| {
+            rs.retain(|_| {
+                let live = keep.contains(&i);
+                i += 1;
+                live
+            });
+            !rs.is_empty()
+        });
+        self.kept = self.len();
+    }
+
     /// The entries a restore would replay, in seq order.
     ///
     /// Two passes, because reachability is not liveness: first every entry still true of a live
     /// object, then the creates those entries referenced — which may name objects that are gone,
     /// and must replay anyway or the entry that needs them cannot.
     fn retained(&self, live: &dyn Live) -> Vec<Out<'_>> {
+        let (all, keep) = self.keep_set(live);
+        let mut out: Vec<Out<'_>> = keep.iter().map(|i| all[*i].out()).collect();
+        out.extend(self.ring_state.values().map(|e| Item::Kept(e).out()));
+        out.sort_by_key(|e| e.seq);
+        out
+    }
+
+    /// Which commands are still worth keeping, as indices into the one stream they were asked
+    /// over. Split out from [`Journal::retained`] because [`Journal::compact`] needs the answer
+    /// as positions to drop from, and the projection to [`Out`] has thrown those away.
+    fn keep_set(&self, live: &dyn Live) -> (Vec<Item<'_>>, BTreeSet<usize>) {
         let alive = |keys: &[ObjectKey]| keys.iter().any(|k| live.holds(*k));
 
         // One stream to reason over. Recordings are kept under their buffer so that discarding one
@@ -451,10 +527,7 @@ impl Journal {
             .collect();
         keep.extend(undone);
 
-        let mut out: Vec<Out<'_>> = keep.iter().map(|i| all[*i].out()).collect();
-        out.extend(self.ring_state.values().map(|e| Item::Kept(e).out()));
-        out.sort_by_key(|e| e.seq);
-        out
+        (all, keep)
     }
 }
 
@@ -945,6 +1018,74 @@ mod tests {
             "a recording replays on the context's own decoder, and carries the 0 to say so"
         );
         assert_eq!(back[4].ring_key, 0xfeed);
+    }
+
+    /// A journal with every kind of entry in it, for the compaction tests.
+    ///
+    /// `k` is eight keys: 0-2 are objects that survive, 3-5 objects the guest destroys, 6-7 the
+    /// command buffers. What it builds hits every `About` variant, both containers, `ring_state`,
+    /// a create kept only by reference from a live entry, and a free kept only by its create.
+    fn a_journal_of_everything(k: &[ObjectKey]) -> Journal {
+        let mut j = Journal::new();
+        j.created(1, &[1; 4], vec![k[0]], Vec::new()); // plain live create
+        j.created(2, &[2; 4], vec![k[3]], Vec::new()); // dead, but referenced below
+        j.created(3, &[3; 4], vec![k[1]], vec![k[3]]); // drags the dead one in
+        j.created(4, &[4; 4], vec![k[4]], Vec::new()); // dead and referenced by nothing
+        j.created(5, &[5; 4], vec![k[6], k[7]], Vec::new()); // the buffers' allocate
+        j.mutated(6, &[6; 4], vec![k[2]], vec![k[0]]); // a bind into a live object
+        j.mutated(7, &[7; 4], vec![k[5]], Vec::new()); // a bind into a dead one
+        j.undid(8, &[8; 4], vec![k[3]], Vec::new()); // a free whose create is kept
+        j.undid(9, &[9; 4], vec![k[4]], Vec::new()); // a free whose create is not
+        j.recorded(10, &[10; 4], k[6], true, Vec::new());
+        j.recorded(11, &[11; 4], k[6], false, vec![k[0]]);
+        j.recorded(12, &[12; 4], k[7], true, Vec::new());
+        j.ring_created(13, &[13; 4], 0xaa);
+        j.ring_latest(14, &[14; 4], 0xaa, 0xaa);
+        j
+    }
+
+    /// Compaction changes nothing an export would say. The whole safety property, in one line.
+    #[test]
+    fn compacting_does_not_change_what_an_export_carries() {
+        let k = keys(8);
+        let live = Some_(vec![k[0], k[1], k[2], k[6], k[7]]);
+        let mut j = a_journal_of_everything(&k);
+
+        let before = j.export(&live).expect("something to say");
+        j.compact(&live);
+        let after = j.export(&live).expect("still something to say");
+        assert_eq!(before, after, "an export must not be able to tell that a compaction happened");
+        assert!(j.len() < 14, "and it must actually have dropped something: {}", j.len());
+    }
+
+    /// And it changes nothing a LATER export would say either.
+    ///
+    /// The first test only shows compaction is invisible right now. This one lets the world move
+    /// on afterwards -- more objects destroyed, a recording discarded, more commands recorded --
+    /// and compares against a twin that was never compacted. If compaction had dropped anything a
+    /// later export still needed, only this would catch it.
+    #[test]
+    fn a_compacted_journal_exports_what_an_uncompacted_one_would_later() {
+        let k = keys(8);
+        let at_first = Some_(vec![k[0], k[1], k[2], k[6], k[7]]);
+        let mut compacted = a_journal_of_everything(&k);
+        let mut twin = a_journal_of_everything(&k);
+
+        compacted.compact(&at_first);
+
+        // The world moves on, identically for both.
+        for j in [&mut compacted, &mut twin] {
+            j.recorded(20, &[20; 4], k[6], true, Vec::new());
+            j.mutated(21, &[21; 4], vec![k[2]], vec![k[1]]);
+        }
+
+        // ...and more of it dies: k[1] and one of the buffers are gone by the second export.
+        let later = Some_(vec![k[0], k[2], k[6]]);
+        assert_eq!(
+            compacted.export(&later),
+            twin.export(&later),
+            "a compaction must not change what a later export carries either"
+        );
     }
 
     #[test]
