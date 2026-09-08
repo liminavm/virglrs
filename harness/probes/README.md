@@ -71,3 +71,4 @@ On the host, for the positive control, the loader and headers are Homebrew's:
 |---|---|---|---|---|
 | `events.c` | `events` | 8 | 26/26 on KosmicKrisp, Apple M1 Max, Vulkan 1.4 | 26/26, no refusal (Fedora 44, 2026-09-08) |
 | `buffer_view.c` | `buffer-view` | 2 | 3/3 on KosmicKrisp, Apple M1 Max, Vulkan 1.4 | not yet run |
+| `timestamps.c` | `timestamps` | 2 | 4/4 on KosmicKrisp, Apple M1 Max, Vulkan 1.4 | not yet run |

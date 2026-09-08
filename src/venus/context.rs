@@ -58,35 +58,36 @@ use super::proto::types::{
     vn_command_vkCmdSetStencilOp, vn_command_vkCmdSetStencilReference,
     vn_command_vkCmdSetStencilTestEnable, vn_command_vkCmdSetStencilWriteMask,
     vn_command_vkCmdSetViewport, vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdWaitEvents,
-    vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteTimestamp, vn_command_vkCopyImageToImage,
-    vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
-    vn_command_vkCreateBuffer, vn_command_vkCreateBufferView, vn_command_vkCreateCommandPool,
-    vn_command_vkCreateComputePipelines, vn_command_vkCreateDescriptorPool,
-    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateEvent,
-    vn_command_vkCreateFence, vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines,
-    vn_command_vkCreateImage, vn_command_vkCreateImageView, vn_command_vkCreateInstance,
-    vn_command_vkCreatePipelineCache, vn_command_vkCreatePipelineLayout,
-    vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass, vn_command_vkCreateRingMESA,
-    vn_command_vkCreateSampler, vn_command_vkCreateSamplerYcbcrConversion,
-    vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
-    vn_command_vkDestroyBufferView, vn_command_vkDestroyCommandPool,
-    vn_command_vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorSetLayout,
-    vn_command_vkDestroyDevice, vn_command_vkDestroyEvent, vn_command_vkDestroyFence,
-    vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
-    vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
-    vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyQueryPool,
-    vn_command_vkDestroyRenderPass, vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler,
-    vn_command_vkDestroySamplerYcbcrConversion, vn_command_vkDestroySemaphore,
-    vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle, vn_command_vkEndCommandBuffer,
-    vn_command_vkEnumerateDeviceExtensionProperties,
+    vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2,
+    vn_command_vkCopyImageToImage, vn_command_vkCopyImageToMemoryMESA,
+    vn_command_vkCopyMemoryToImageMESA, vn_command_vkCreateBuffer, vn_command_vkCreateBufferView,
+    vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
+    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
+    vn_command_vkCreateDevice, vn_command_vkCreateEvent, vn_command_vkCreateFence,
+    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
+    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
+    vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
+    vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
+    vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer, vn_command_vkDestroyBufferView,
+    vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
+    vn_command_vkDestroyDescriptorSetLayout, vn_command_vkDestroyDevice, vn_command_vkDestroyEvent,
+    vn_command_vkDestroyFence, vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage,
+    vn_command_vkDestroyImageView, vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline,
+    vn_command_vkDestroyPipelineCache, vn_command_vkDestroyPipelineLayout,
+    vn_command_vkDestroyQueryPool, vn_command_vkDestroyRenderPass, vn_command_vkDestroyRingMESA,
+    vn_command_vkDestroySampler, vn_command_vkDestroySamplerYcbcrConversion,
+    vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle,
+    vn_command_vkEndCommandBuffer, vn_command_vkEnumerateDeviceExtensionProperties,
     vn_command_vkEnumerateInstanceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
     vn_command_vkEnumeratePhysicalDeviceGroups, vn_command_vkEnumeratePhysicalDevices,
     vn_command_vkExecuteCommandStreamsMESA, vn_command_vkFlushMappedMemoryRanges,
     vn_command_vkFreeCommandBuffers, vn_command_vkFreeDescriptorSets, vn_command_vkFreeMemory,
     vn_command_vkGetBufferDeviceAddress, vn_command_vkGetBufferMemoryRequirements,
     vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetBufferOpaqueCaptureAddress,
-    vn_command_vkGetDescriptorSetLayoutSupport, vn_command_vkGetDeviceBufferMemoryRequirements,
-    vn_command_vkGetDeviceGroupPeerMemoryFeatures, vn_command_vkGetDeviceImageMemoryRequirements,
+    vn_command_vkGetCalibratedTimestampsKHR, vn_command_vkGetDescriptorSetLayoutSupport,
+    vn_command_vkGetDeviceBufferMemoryRequirements, vn_command_vkGetDeviceGroupPeerMemoryFeatures,
+    vn_command_vkGetDeviceImageMemoryRequirements,
     vn_command_vkGetDeviceImageSparseMemoryRequirements,
     vn_command_vkGetDeviceImageSubresourceLayout, vn_command_vkGetDeviceMemoryCommitment,
     vn_command_vkGetDeviceMemoryOpaqueCaptureAddress, vn_command_vkGetDeviceQueue2,
@@ -4684,6 +4685,50 @@ impl Commands for Handlers<'_> {
             args.query,
         );
         self.queried(done);
+    }
+
+    fn vkCmdWriteTimestamp2(&mut self, args: &mut vn_command_vkCmdWriteTimestamp2<'_>) {
+        let done = self.driver.cmd_write_timestamp2(
+            args.commandBuffer,
+            args.stage,
+            args.queryPool,
+            args.query,
+        );
+        self.queried(done);
+    }
+
+    /// The one command that reads a clock.
+    ///
+    /// `pMaxDeviation` is required by vk.xml, so a guest that sent no room for it asked a
+    /// question with nowhere to put half the answer. Refused before the driver is asked rather
+    /// than after: a call made and then reported as a refusal is work done that the guest is
+    /// told did not happen.
+    fn vkGetCalibratedTimestampsKHR(
+        &mut self,
+        args: &mut vn_command_vkGetCalibratedTimestampsKHR<'_>,
+    ) {
+        if !args.has_pMaxDeviation() {
+            self.reject = Some("asked for calibrated timestamps with no room for the deviation");
+            return;
+        }
+        let device = args.device;
+        // Borrowed from the decoder's arena, not from `args`, so the out-slice below can be
+        // taken mutably without copying the infos anywhere.
+        let infos = args.pTimestampInfos();
+        let mut deviation = 0u64;
+        let got = self.driver.calibrated_timestamps(
+            device,
+            infos,
+            args.pTimestamps_mut(),
+            &mut deviation,
+        );
+        match got {
+            Ok(ret) => {
+                args.ret = ret;
+                *args.pMaxDeviation_mut().expect("the room for it was checked above") = deviation;
+            }
+            Err(ret) => args.ret = ret,
+        }
     }
 
     fn vkCmdCopyQueryPoolResults(&mut self, args: &mut vn_command_vkCmdCopyQueryPoolResults<'_>) {

@@ -18,36 +18,37 @@ use super::cs::{Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
 use super::objects::Doomed;
 use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBool32, VkBuffer, VkBufferCopy,
-    VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView, VkClearAttachment, VkClearColorValue,
-    VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
-    VkCommandPool, VkCompareOp, VkCopyDescriptorSet, VkCopyImageToImageInfo,
-    VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo,
-    VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags, VkDependencyInfo,
-    VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
-    VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent,
-    VkExportMemoryAllocateInfo, VkExtensionProperties, VkExternalFenceHandleTypeFlagBits,
-    VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryImageCreateInfo,
-    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceGetFdInfoKHR, VkFilter, VkFormat,
-    VkFramebuffer, VkFrontFace, VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlagBits,
-    VkImageAspectFlags, VkImageBlit, VkImageCopy, VkImageCreateFlags, VkImageCreateInfo,
-    VkImageFormatProperties, VkImageLayout, VkImageMemoryBarrier, VkImageSubresource,
-    VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy, VkImageType, VkImageUsageFlagBits,
-    VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
-    VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance,
-    VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo,
-    VkMemoryMapFlags, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
-    VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy, VkMemoryToImageCopyMESA,
-    VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType, VkPhysicalDevice,
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties, VkPipeline,
-    VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
-    VkPipelineStageFlags, VkPipelineStageFlags2, VkPrimitiveTopology, VkQueryControlFlags,
-    VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType,
-    VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingInfo, VkResult,
-    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
-    VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
-    VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
-    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
-    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassContents, VkSubresourceLayout,
+    VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView, VkCalibratedTimestampInfoKHR,
+    VkClearAttachment, VkClearColorValue, VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo,
+    VkCommandBufferResetFlags, VkCommandPool, VkCompareOp, VkCopyDescriptorSet,
+    VkCopyImageToImageInfo, VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA,
+    VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags,
+    VkDependencyInfo, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
+    VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
+    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties,
+    VkExternalFenceHandleTypeFlagBits, VkExternalMemoryHandleTypeFlagBits,
+    VkExternalMemoryImageCreateInfo, VkExternalSemaphoreHandleTypeFlagBits, VkFence,
+    VkFenceGetFdInfoKHR, VkFilter, VkFormat, VkFramebuffer, VkFrontFace,
+    VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlagBits, VkImageAspectFlags,
+    VkImageBlit, VkImageCopy, VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties,
+    VkImageLayout, VkImageMemoryBarrier, VkImageSubresource, VkImageSubresourceRange,
+    VkImageTiling, VkImageToMemoryCopy, VkImageType, VkImageUsageFlagBits, VkImageUsageFlags,
+    VkImageView, VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA,
+    VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance, VkInstanceCreateInfo,
+    VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags,
+    VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA,
+    VkMemoryToImageCopy, VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT,
+    VkObjectType, VkPhysicalDevice, VkPhysicalDeviceMemoryBudgetPropertiesEXT,
+    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
+    VkPipelineLayout, VkPipelineStageFlagBits, VkPipelineStageFlags, VkPipelineStageFlags2,
+    VkPrimitiveTopology, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
+    VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
+    VkRenderPassBeginInfo, VkRenderingInfo, VkResult, VkRingMonitorInfoMESA, VkSampleCountFlagBits,
+    VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo,
+    VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo,
+    VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitInfo,
+    VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp, VkStructureType,
+    VkSubmitInfo, VkSubmitInfo2, VkSubpassContents, VkSubresourceLayout,
     VkTimelineSemaphoreSubmitInfo, VkViewport, VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
@@ -3575,6 +3576,53 @@ impl Driver {
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdWriteTimestamp())(cb, stage, pool, query) };
         Ok(())
+    }
+
+    /// The synchronization2 spelling. Same query bookkeeping as the 1.0 one -- the only
+    /// difference on the wire is the width of the stage mask.
+    pub fn cmd_write_timestamp2(
+        &self,
+        cb: VkCommandBuffer,
+        stage: VkPipelineStageFlags2,
+        pool: VkQueryPool,
+        query: u32,
+    ) -> Result<(), QueryRefused> {
+        let (d, facts) = self.query_recorder(cb, pool)?;
+        facts.holds(query, 1)?;
+        // SAFETY: as above, and a query the pool holds.
+        unsafe { (d.vkCmdWriteTimestamp2())(cb, stage, pool, query) };
+        Ok(())
+    }
+
+    /// Correlated host and device clocks.
+    ///
+    /// The three arrays the guest sent are one length: `infos` in, `stamps` out, and vk.xml
+    /// counts both by `timestampCount`. They are reconciled by the decoder and arrive here as
+    /// slices, so this refuses a mismatch rather than trusting either length -- the same rule as
+    /// every other pair on this wire, and the reason the driver is handed one count.
+    pub fn calibrated_timestamps(
+        &self,
+        device: VkDevice,
+        infos: &[VkCalibratedTimestampInfoKHR],
+        stamps: &mut [u64],
+        deviation: &mut u64,
+    ) -> Result<VkResult, VkResult> {
+        if infos.len() != stamps.len() {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        }
+        let Some(d) = self.devices.get(&device) else {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        };
+        let Some(f) = d.fns.try_vkGetCalibratedTimestampsKHR() else {
+            return Err(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT);
+        };
+        // SAFETY: `device` is a handle in this table; `infos` and `stamps` are the decoder's
+        // arena allocations, live for this call and of the one length passed as the count; and
+        // `deviation` is a single out that the caller owns.
+        let r = unsafe {
+            f(device, infos.len() as u32, infos.as_ptr(), stamps.as_mut_ptr(), deviation)
+        };
+        Ok(r)
     }
 
     /// The GPU-side read-back: results land in a buffer of the guest's, on the device, where the
