@@ -195,9 +195,22 @@ impl RingWaiter {
             // and every fence would stop with them. The C's guard runs only in the ring thread's
             // idle branch and never sees this pair at all.
             if let Some(want) = self.park.stalled_on() {
+                // head/tail/status are here because the pair alone does not say which side is
+                // wrong. A head just short of the wanted seqno is a lost wake; a head at zero
+                // against a large wanted seqno is a counter that did not survive whatever
+                // rebuilt this ring, and the two want opposite fixes.
                 eprintln!(
-                    "[virglrs] ctx {}: {} waits for ring seqno {} while {} sleeps for virtqueue                      seqno {}, which only this stream can publish -- neither can proceed",
-                    self.ctx, self.id, self.seqno, self.id, want,
+                    "[virglrs] ctx {}: {} waits for ring seqno {} while {} sleeps for virtqueue \
+                     seqno {}, which only this stream can publish -- neither can proceed \
+                     (ring head {} tail {} status {:#x})",
+                    self.ctx,
+                    self.id,
+                    self.seqno,
+                    self.id,
+                    want,
+                    self.control.head(),
+                    self.control.tail(),
+                    self.control.status(),
                 );
                 self.die();
                 return false;
