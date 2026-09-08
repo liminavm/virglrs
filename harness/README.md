@@ -710,11 +710,13 @@ path nothing until it happens.
 
 The corpora live in `vm/captures/`, beside the scores that pin them. They are NOT in git — they
 run from kilobytes to gigabytes — and `vm/.gitignore` tracks only the scripts and the README, so
-nothing there can be committed by accident. A permanent home for them is still to be decided; what
-is settled is that both replay legs build and run from this repository alone, against the C in
-`third_party/virglrenderer` and the build of it in `vm/build`. Recapture them with `vm/capture.sh`
-(see `vm/README.md`); the pinned scores here only regress against the corpus they were recorded
-from.
+nothing there can be committed by accident. The same is true of everything else `vm/` needs: the
+guest disks in `disks/` and the two rig bundles beside them, which are self-contained and carry
+the renderer they were built with inside. All three layers run from this repository alone, against
+the C in `third_party/virglrenderer` and the build of it in `vm/build`. A permanent home for the
+corpora is still to be decided, and publishing this repository will want the harness to fetch them
+when they are missing. Recapture them with `vm/capture.sh` (see `vm/README.md`); the pinned scores
+here only regress against the corpus they were recorded from.
 
 **Run a leg from this tree, never from the C's copy of this harness.** That copy is older and its
 `--renderer rs` resolves the Rust prefix to the C tree's own, so it scores the reference twice and
