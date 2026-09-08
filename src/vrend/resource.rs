@@ -2054,7 +2054,7 @@ fn alloc_texture(
     planes: Option<Planes>,
 ) -> Result<Storage, Refusal> {
     let entry = formats.get(a.format).ok_or(Refusal::UnsupportedFormat)?;
-    let mut immutable = features.has(Feature::texture_storage) && entry.can_texture_storage;
+    let immutable = features.has(Feature::texture_storage) && entry.can_texture_storage;
     let (ifmt, glformat, gltype) = (entry.gl.internalformat, entry.gl.glformat, entry.gl.gltype);
     let levels = (a.last_level + 1) as GLsizei;
     let (w, h) = (a.width as GLsizei, a.height as GLsizei);
@@ -2062,13 +2062,14 @@ fn alloc_texture(
     gl.bind_texture(target, Some(name));
     gl.drain_errors();
     if let Some(image) = image {
-        // The surface becomes the texture's storage: immutable where the driver can make it so,
-        // else through the older entry point, which leaves the texture mutable.
+        // The surface becomes the texture's storage: through the entry point that asks for
+        // immutable storage where the driver has it, else the older one, which does not.
+        // Whether the texture came out immutable-format is read back below rather than inferred
+        // from which of the two ran.
         let bound = if immutable && features.has(Feature::egl_image_storage) {
             gl.egl_image_target_tex_storage(target, &image);
             true
         } else if features.has(Feature::egl_image) {
-            immutable = false;
             gl.egl_image_target_texture_2d(target, &image);
             true
         } else {
@@ -2088,6 +2089,14 @@ fn alloc_texture(
             a.height,
             a.format.name()
         );
+        // Ask the driver, rather than believing the entry point we chose. `glEGLImageTargetTexStorageEXT`
+        // is specified to leave the texture immutable-format, but the recorded flag decides whether
+        // `glTextureView` may be called on this texture, and `glTextureView` refuses a source that
+        // is not immutable-format by putting the context in `GL_INVALID_OPERATION` for the rest of
+        // its life. A flag we predicted and a flag the driver would report are two copies of one
+        // fact; this makes the driver the only owner of it.
+        let immutable =
+            gl.get_tex_parameter_i(target, GL_TEXTURE_IMMUTABLE_FORMAT) == GL_TRUE as GLint;
         gl.bind_texture(target, None);
         return Ok(Storage::Texture(Arc::new(Texture {
             name,
@@ -2181,6 +2190,11 @@ fn alloc_texture(
         gl.tex_parameter_i(target, GL_TEXTURE_BASE_LEVEL, 0);
         gl.tex_parameter_i(target, GL_TEXTURE_MAX_LEVEL, a.last_level as GLint);
     }
+    // As above: the local is which storage call to make, the field is what the driver says came
+    // of it. They agree by construction here -- `glTexStorage*` is specified to leave the texture
+    // immutable-format and `glTexImage*` not to -- and asking anyway is what keeps the field
+    // meaning one thing whichever branch above created the texture.
+    let immutable = gl.get_tex_parameter_i(target, GL_TEXTURE_IMMUTABLE_FORMAT) == GL_TRUE as GLint;
     gl.bind_texture(target, None);
     Ok(Storage::Texture(Arc::new(Texture {
         name,
