@@ -338,9 +338,14 @@ pub enum Fault {
         error: transfer::Error,
     },
     /// The driver raised an error while the command ran.
+    ///
+    /// `object` is what the command was making, and is only ever set for `CreateObject` -- one
+    /// command that is ten different operations, so naming it alone says almost nothing about
+    /// what the host refused.
     Gl {
         cmd: Cmd,
         error: GLenum,
+        object: Option<ObjectType>,
     },
     /// The command needs a feature this host lacks, which the capset told the guest.
     NoFeature {
@@ -405,7 +410,12 @@ impl fmt::Display for Fault {
             }
             Fault::UnsupportedTexWrap(w) => write!(f, "texture wrap {} is unsupported", w.name()),
             Fault::Transfer { cmd, error } => write!(f, "{}: {error}", cmd.name()),
-            Fault::Gl { cmd, error } => write!(f, "{}: GL error {error:#x}", cmd.name()),
+            Fault::Gl { cmd, error, object: Some(o) } => {
+                write!(f, "{}({}): GL error {error:#x}", cmd.name(), o.name())
+            }
+            Fault::Gl { cmd, error, object: None } => {
+                write!(f, "{}: GL error {error:#x}", cmd.name())
+            }
             Fault::NoFeature { cmd, feature } => {
                 write!(f, "{}: the host has no {}", cmd.name(), feature.name())
             }
@@ -1240,16 +1250,22 @@ impl Context {
                 Ok(c) => c,
                 // A journal this renderer wrote and cannot frame back is our own bug, not a
                 // stale reference, so it poisons even during a replay.
-                Err(r) => return self.poison(Fault::Wire(r)),
+                Err(r) => return self.poison(host.ctx, Fault::Wire(r)),
             };
             let kind = framed.cmd.kind();
+            // Read before the command is consumed. `CreateObject` is ten operations behind one
+            // name, so a GL error attributed to the command alone does not say what failed.
+            let object = match &framed.cmd {
+                Command::CreateObject { object, .. } => Some(object.kind()),
+                _ => None,
+            };
             // Read before the command is consumed, recorded only if it ran: the journal holds
             // what this context accepted, never what it refused.
             let slot = state_key(&framed.cmd);
             let wire = framed.wire;
             if let Err(f) = self.run(host, framed.cmd, wire) {
                 if !self.dropped_in_replay(kind, &f) {
-                    return self.poison(f);
+                    return self.poison(host.ctx, f);
                 }
                 continue;
             }
@@ -1261,9 +1277,9 @@ impl Context {
             // `vrend_check_no_error`: any GL error a command left is the context's error.
             let err = host.gl.drain_errors();
             if err != GL_NO_ERROR {
-                let f = Fault::Gl { cmd: kind, error: err };
+                let f = Fault::Gl { cmd: kind, error: err, object };
                 if !self.dropped_in_replay(kind, &f) {
-                    return self.poison(f);
+                    return self.poison(host.ctx, f);
                 }
             }
         }
@@ -1503,8 +1519,13 @@ impl Context {
         self.described.remove(&blob_id)
     }
 
-    fn poison(&mut self, f: Fault) -> Result<(), Fault> {
-        eprintln!("[virglrs] vrend: context poisoned: {f}");
+    /// Refuse everything from here on, and say so under the marker every refusal shares.
+    ///
+    /// The prefix is load-bearing: vrend and venus each poison in their own words, and a harness
+    /// grepping for one of those two spellings reads the other renderer's fatal as silence. One
+    /// marker is the difference between an oracle and a needle that is half right.
+    fn poison(&mut self, ctx: ContextId, f: Fault) -> Result<(), Fault> {
+        eprintln!("{} vrend ctx {ctx}: {f}", crate::REFUSED);
         self.fault = Some(f.clone());
         Err(f)
     }
@@ -4443,6 +4464,23 @@ mod tests {
         // And a resource handle the guest freed and reused names different storage, however
         // exactly the description of it repeats.
         assert_ne!(bound(Some(key(0)), &one), bound(Some(key(0)), &two));
+    }
+
+    #[test]
+    fn a_gl_fault_on_create_object_names_the_object_it_was_making() {
+        // `CreateObject: GL error 0x502` sat in a passing test's diagnostics while a compositor's
+        // context was dead, and it could not say which of the ten creates had failed. The kind is
+        // the whole diagnostic value of the line.
+        let f = Fault::Gl {
+            cmd: Cmd::CreateObject,
+            error: 0x502,
+            object: Some(ObjectType::SamplerView),
+        };
+        assert_eq!(f.to_string(), "CreateObject(SamplerView): GL error 0x502");
+
+        // Every other command is one operation, and gains nothing from an empty parenthesis.
+        let f = Fault::Gl { cmd: Cmd::DrawVbo, error: 0x502, object: None };
+        assert_eq!(f.to_string(), "DrawVbo: GL error 0x502");
     }
 
     #[test]

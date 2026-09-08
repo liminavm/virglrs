@@ -1534,7 +1534,7 @@ fn poison(id: ContextId, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
     let name = vn_command_name(cmd)
         .map(str::to_string)
         .unwrap_or_else(|| format!("command type {}", cmd.0));
-    eprintln!("[virglrs] ctx {id}: {name} {why}, {} bytes in", dec.pos());
+    eprintln!("{} venus ctx {id}: {name} {why}, {} bytes in", crate::REFUSED, dec.pos());
     dec.set_fatal();
 }
 
