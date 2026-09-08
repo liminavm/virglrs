@@ -240,17 +240,26 @@ impl Journal {
     }
 
     /// Retain ring state that a later command of the same kind replaces.
-    pub fn ring_latest(&mut self, cmd_type: u32, wire: &[u8], ring: u64) {
+    ///
+    /// `owner` is the ring the state belongs to and dies with; `route` is the decoder it replays
+    /// on. They are usually the same — a reply stream is set on the ring it is about — but not
+    /// always, and the pair is not interchangeable in either direction. `vkSubmitVirtqueueSeqnoMESA`
+    /// is about a ring it names in its arguments while arriving on the *context's* stream, and it
+    /// is refused outright on a ring's own stream, so replaying it with `route = owner` replays it
+    /// into that refusal and abandons the rest of the journal. Keying the slot by `owner` is what
+    /// keeps two rings' state apart, and what lets [`Self::ring_gone`] take it away with its ring.
+    /// Same split, same reason, as [`About::Ring`] against [`Entry::ring_key`].
+    pub fn ring_latest(&mut self, cmd_type: u32, wire: &[u8], owner: u64, route: u64) {
         let seq = self.seq.advance();
         let entry = Entry {
             seq,
             cmd_type,
-            ring_key: ring,
+            ring_key: route,
             wire: wire.to_vec(),
-            about: About::Ring(ring),
+            about: About::Ring(owner),
             refs: Vec::new(),
         };
-        self.ring_state.insert(RingSlot { ring, cmd_type }, entry);
+        self.ring_state.insert(RingSlot { ring: owner, cmd_type }, entry);
     }
 
     /// Forget everything a ring owned. Called when the ring is destroyed: unlike an object, a ring
@@ -709,14 +718,42 @@ mod tests {
     #[test]
     fn ring_state_is_latest_wins_and_dies_with_its_ring() {
         let mut j = Journal::new();
-        j.ring_latest(7, &[1; 4], 0xaa);
-        j.ring_latest(7, &[2; 4], 0xaa);
-        j.ring_latest(7, &[3; 4], 0xbb);
+        j.ring_latest(7, &[1; 4], 0xaa, 0xaa);
+        j.ring_latest(7, &[2; 4], 0xaa, 0xaa);
+        j.ring_latest(7, &[3; 4], 0xbb, 0xbb);
         assert_eq!(j.retained(&Some_(vec![])).len(), 2);
         j.ring_gone(0xaa);
         let out = j.retained(&Some_(vec![]));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].ring_key, 0xbb);
+    }
+
+    /// Two rings' state, both replaying on the context's decoder, must stay two slots.
+    ///
+    /// Keyed by route instead of owner they would be one slot and the last writer would take the
+    /// other ring's, which is how `vkSubmitVirtqueueSeqnoMESA` state would be lost: it names its
+    /// ring in its arguments and always routes to 0.
+    #[test]
+    fn ring_state_of_two_rings_sharing_a_route_stays_apart() {
+        let mut j = Journal::new();
+        j.ring_latest(7, &[0xaa; 4], 0xaa, 0);
+        j.ring_latest(7, &[0xbb; 4], 0xbb, 0);
+        let out = j.retained(&Some_(vec![]));
+        assert_eq!(out.len(), 2, "one slot per owner, not per route");
+        assert!(out.iter().all(|e| e.ring_key == 0), "both replay on the context: {out:?}");
+    }
+
+    /// ...and each still dies with its own ring, which is what stops a slot outliving the ring it
+    /// names and replaying into "a ring that was never created".
+    #[test]
+    fn ring_state_sharing_a_route_still_dies_with_its_own_ring() {
+        let mut j = Journal::new();
+        j.ring_latest(7, &[0xaa; 4], 0xaa, 0);
+        j.ring_latest(7, &[0xbb; 4], 0xbb, 0);
+        j.ring_gone(0xaa);
+        let out = j.retained(&Some_(vec![]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].wire, vec![0xbb; 4], "the surviving ring's own state");
     }
 
     #[test]
