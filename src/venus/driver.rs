@@ -2588,6 +2588,20 @@ impl Driver {
         self.pools.recycle(pool)
     }
 
+    /// The guest ids a pool currently holds, without disturbing it.
+    ///
+    /// [`Driver::recycle_pool`]'s read-only sibling, for the reset that *keeps* its children: a
+    /// command pool's reset returns its buffers to the initial state and they go on being named,
+    /// so nothing may be forgotten -- but their recordings are gone, and the recorder has to be
+    /// told which buffers those were. This is the only place that still knows.
+    pub fn pool_children<T: Handle>(&self, pool: T) -> Vec<ObjectId> {
+        self.pools
+            .open
+            .get(&TypedHandle::of(pool))
+            .map(|p| p.children.values().copied().collect())
+            .unwrap_or_default()
+    }
+
     // -------------------------------------------------------------------- recording
     //
     // A `vkCmd*` records into a command buffer and answers nothing: Vulkan defers every error it

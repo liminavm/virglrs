@@ -1225,15 +1225,8 @@ fn record(
             h.journal.ring_latest(cmd_type, &wire, ring, 0);
             return;
         }
-        Some(Note::PoolReset(pool)) => {
-            let key = {
-                let t = h.objects.borrow();
-                t.id_of_handle(VkObjectType::VK_OBJECT_TYPE_COMMAND_POOL, pool)
-                    .and_then(|id| t.key_of(id))
-            };
-            if let Some(key) = key {
-                h.journal.pool_reset(key);
-            }
+        Some(Note::PoolReset(buffers)) => {
+            h.journal.pool_reset(&buffers);
             // The reset itself rebuilds nothing: replaying the allocates that survive it produces
             // buffers already in the state a reset leaves them.
             h.journal.skip(cmd_type);
@@ -1633,7 +1626,7 @@ pub struct Handlers<'a> {
 }
 
 /// What a handler tells the recorder about the command it just served.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Note {
     /// It made this ring. Owned by the ring, and replayed on the context's own decoder, because
     /// when it replays the ring does not exist yet.
@@ -1654,7 +1647,13 @@ enum Note {
     /// The host handle, because that is what the decoded argument holds: a reset keeps no shadow
     /// of the guest's id, and picking the pool out of the ids the command resolved would mean
     /// knowing which argument position it sat in. The table answers by handle and type instead.
-    PoolReset(HostHandle),
+    /// A command pool's reset, and the buffers whose recordings it discarded.
+    ///
+    /// The keys are resolved by the handler, which has both the driver's pool bookkeeping and the
+    /// object table. The journal is handed the answer rather than the pool, because it may not
+    /// reach into the object table -- and because finding them itself meant scanning every entry
+    /// it had ever kept, on a command a compositor can send every frame.
+    PoolReset(Vec<ObjectKey>),
 }
 
 impl Handlers<'_> {
@@ -4795,7 +4794,10 @@ impl Commands for Handlers<'_> {
         // The journal's copy of the recycling. Every buffer this pool handed out keeps its handle
         // and its key, so nothing above can tell the recorder that their recordings are gone.
         if args.ret == VkResult::VK_SUCCESS {
-            self.note = Some(Note::PoolReset(args.commandPool.host()));
+            let ids = self.driver.pool_children(args.commandPool);
+            let t = self.objects.borrow();
+            self.note =
+                Some(Note::PoolReset(ids.into_iter().filter_map(|id| t.key_of(id)).collect()));
         }
     }
 
@@ -12654,6 +12656,117 @@ mod tests {
         // The pool itself survives a reset, which is the whole difference from a destroy: it must
         // still be open to allocate from.
         assert!(driver.pool_is_open(VkDescriptorPool(POOL)), "a reset pool goes on taking sets");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
+        driver.abandon_planted();
+    }
+
+    /// A command pool's reset names the buffers whose recordings it discarded.
+    ///
+    /// The journal cannot work this out: it may not reach into the object table, and finding the
+    /// pool's buffers by searching its own entries was a scan of everything it had ever kept, on a
+    /// command a compositor can send every frame. The driver is the only thing that knows what a
+    /// pool handed out, so the handler asks it and hands the answer down -- and this pins that,
+    /// because a wrong answer here silently keeps a stale recording that a restore would replay.
+    #[test]
+    fn resetting_a_command_pool_names_the_buffers_whose_recordings_went() {
+        use super::super::cs::{Lookup, Objects};
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandPool, VkCommandPoolResetFlags, VkDevice,
+            vn_command_vkResetCommandPool,
+        };
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const OTHER_POOL: u64 = 8;
+        /// Host handles and the guest ids they were allocated under.
+        const MINE: [(u64, u64); 2] = [(110, 11), (120, 12)];
+        const THEIRS: (u64, u64) = (130, 13);
+        const CB: VkObjectType = VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER;
+
+        unsafe extern "C" fn reset(
+            _device: VkDevice,
+            _pool: VkCommandPool,
+            _flags: VkCommandPoolResetFlags,
+        ) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkResetCommandPool(reset);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+        {
+            let mut t = objects.borrow_mut();
+            for (host, id) in MINE.iter().copied().chain([THEIRS]) {
+                t.add(ObjectId(id), CB, HostHandle(host), None).unwrap();
+            }
+        }
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkCommandPool(POOL),
+            &MINE.map(|(host, id)| (VkCommandBuffer(host), ObjectId(id))),
+        );
+        // A second pool, so the reset is shown to name its own buffers and not simply everything.
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkCommandPool(OTHER_POOL),
+            &[(VkCommandBuffer(THEIRS.0), ObjectId(THEIRS.1))],
+        );
+        let want: Vec<ObjectKey> = {
+            let t = objects.borrow();
+            MINE.iter().map(|(_, id)| t.key_of(ObjectId(*id)).expect("just added")).collect()
+        };
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let mut args = vn_command_vkResetCommandPool {
+            device: VkDevice(DEVICE),
+            commandPool: VkCommandPool(POOL),
+            ..Default::default()
+        };
+        h.vkResetCommandPool(&mut args);
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+
+        let Some(Note::PoolReset(named)) = h.note.clone() else {
+            panic!("a successful reset must tell the recorder which recordings went: {:?}", h.note)
+        };
+        assert_eq!(named, want, "its own pool's buffers, by key");
+
+        // The buffers keep their handles: a command pool's reset frees nothing, which is why the
+        // object table is deliberately untouched and the keys above still resolve.
+        for (host, id) in MINE {
+            assert_eq!(
+                objects.lookup(ObjectId(id), CB.0),
+                Lookup::Found(HostHandle(host)),
+                "buffer {id} is still named after a reset"
+            );
+        }
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
         driver.abandon_planted();
