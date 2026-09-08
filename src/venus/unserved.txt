@@ -1,4 +1,4 @@
-# The venus commands this build does not serve.
+# The venus commands this build does not serve, and why each one is here.
 #
 # The capset's extension mask is built from what the pinned vk.xml can *serialize*, which is every
 # command below as well as the ones we serve. So a guest may legally send any of these, and each
@@ -6,10 +6,23 @@
 # successful one, so there is no safe way to continue -- but it is only the right answer while the
 # set is a decision rather than an accident.
 #
-# This file is that decision. `every_command_the_protocol_defines_is_served_or_on_the_ledger`
-# holds the two sets to it: serving a command means deleting its line, and a protocol bump that
-# adds one means adding a line. Three boots found three of these one at a time before the set was
-# written down; nothing here is a promise to serve them, only a record that we know.
+# This file is that decision, and a bare list of names could not be: it says nothing about whether
+# a line is work we owe or a command nothing here can reach. So each line carries a
+# `status:group`, and `every_command_the_protocol_defines_is_served_or_on_the_ledger` holds the
+# whole file to it -- serving a command means deleting its line, and a protocol bump that adds one
+# means adding a line with a status.
+#
+#   wanted            The reference serves it, this host can run it, and a guest here can emit it.
+#                     This is the work, and `group` is the unit to do it in: one probe program per
+#                     group, RED against this build and GREEN against the C, then the handlers.
+#   out-of-reach      The guest's venus device advertises no such extension, so nothing running
+#                     here can send it. Serving it would mean a `try_` accessor that refuses by
+#                     name -- there is no test that could go green.
+#   not-in-reference  The C refuses it too. Mostly commands the venus driver answers guest-side
+#                     and never puts on the wire. Not a gap against the reference; a decision.
+#
+# The counts are measured, not estimated: `wanted` was cut against the extension list of a real
+# guest venus device on this host, not against vk.xml and not against the host driver.
 #
 # What a line here costs, when a guest reaches it: nothing guest-side names the command. Poisoning
 # is the right answer and it is still not a diagnosable one -- the guest's next call fails, its
@@ -20,137 +33,144 @@
 # The test above it saw only its own timeout. The `[virglrs] refused:` line in the worker log is
 # the ONLY place the command is named -- so read that log first, and never diagnose a guest-side
 # OOM or hang without it.
-vkCmdBeginConditionalRenderingEXT
-vkCmdBeginQueryIndexedEXT
-vkCmdBeginRenderPass2
-vkCmdBeginTransformFeedbackEXT
-vkCmdBindDescriptorSets2
-vkCmdBindIndexBuffer2
-vkCmdBindResourceHeapEXT
-vkCmdBindSamplerHeapEXT
-vkCmdBindTransformFeedbackBuffersEXT
-vkCmdBlitImage2
-vkCmdBuildAccelerationStructuresIndirectKHR
-vkCmdBuildAccelerationStructuresKHR
-vkCmdClearDepthStencilImage
-vkCmdCopyAccelerationStructureKHR
-vkCmdCopyAccelerationStructureToMemoryKHR
-vkCmdCopyBuffer2
-vkCmdCopyBufferToImage2
-vkCmdCopyImage2
-vkCmdCopyImageToBuffer2
-vkCmdCopyMemoryToAccelerationStructureKHR
-vkCmdDispatchBase
-vkCmdDispatchIndirect
-vkCmdDrawIndexed
-vkCmdDrawIndexedIndirect
-vkCmdDrawIndexedIndirectCount
-vkCmdDrawIndirect
-vkCmdDrawIndirectByteCountEXT
-vkCmdDrawIndirectCount
-vkCmdDrawMeshTasksEXT
-vkCmdDrawMeshTasksIndirectCountEXT
-vkCmdDrawMeshTasksIndirectEXT
-vkCmdEndConditionalRenderingEXT
-vkCmdEndQueryIndexedEXT
-vkCmdEndRenderPass2
-vkCmdEndRendering2KHR
-vkCmdEndTransformFeedbackEXT
-vkCmdExecuteCommands
-vkCmdNextSubpass
-vkCmdNextSubpass2
-vkCmdPushConstants2
-vkCmdPushDataEXT
-vkCmdPushDescriptorSet2
-vkCmdResetEvent
-vkCmdResetEvent2
-vkCmdResolveImage
-vkCmdResolveImage2
-vkCmdSetAlphaToCoverageEnableEXT
-vkCmdSetAlphaToOneEnableEXT
-vkCmdSetColorBlendAdvancedEXT
-vkCmdSetColorBlendEnableEXT
-vkCmdSetColorBlendEquationEXT
-vkCmdSetColorWriteEnableEXT
-vkCmdSetColorWriteMaskEXT
-vkCmdSetConservativeRasterizationModeEXT
-vkCmdSetDepthBias2EXT
-vkCmdSetDepthBiasEnable
-vkCmdSetDepthBounds
-vkCmdSetDepthClampEnableEXT
-vkCmdSetDepthClampRangeEXT
-vkCmdSetDepthClipEnableEXT
-vkCmdSetDepthClipNegativeOneToOneEXT
-vkCmdSetDeviceMask
-vkCmdSetEvent
-vkCmdSetEvent2
-vkCmdSetExtraPrimitiveOverestimationSizeEXT
-vkCmdSetFragmentShadingRateKHR
-vkCmdSetLineRasterizationModeEXT
-vkCmdSetLineStipple
-vkCmdSetLineStippleEnableEXT
-vkCmdSetLogicOpEXT
-vkCmdSetLogicOpEnableEXT
-vkCmdSetPolygonModeEXT
-vkCmdSetProvokingVertexModeEXT
-vkCmdSetRasterizationSamplesEXT
-vkCmdSetRasterizationStreamEXT
-vkCmdSetRayTracingPipelineStackSizeKHR
-vkCmdSetRenderingAttachmentLocations
-vkCmdSetRenderingInputAttachmentIndices
-vkCmdSetSampleLocationsEXT
-vkCmdSetSampleLocationsEnableEXT
-vkCmdSetSampleMaskEXT
-vkCmdSetTessellationDomainOriginEXT
-vkCmdSetVertexInputEXT
-vkCmdTraceRaysIndirect2KHR
-vkCmdTraceRaysIndirectKHR
-vkCmdTraceRaysKHR
-vkCmdUpdateBuffer
-vkCmdWaitEvents
-vkCmdWaitEvents2
-vkCmdWriteAccelerationStructuresPropertiesKHR
-vkCmdWriteTimestamp2
-vkCopyAccelerationStructureKHR
-vkCreateAccelerationStructureKHR
-vkCreateBufferView
-vkCreateDeferredOperationKHR
-vkCreateDescriptorUpdateTemplate
-vkCreateEvent
-vkCreatePrivateDataSlot
-vkCreateRayTracingPipelinesKHR
-vkCreateRenderPass2
-vkDeferredOperationJoinKHR
-vkDestroyAccelerationStructureKHR
-vkDestroyBufferView
-vkDestroyDeferredOperationKHR
-vkDestroyDescriptorUpdateTemplate
-vkDestroyEvent
-vkDestroyPrivateDataSlot
-vkEnumerateDeviceLayerProperties
-vkEnumerateInstanceLayerProperties
-vkGetAccelerationStructureBuildSizesKHR
-vkGetAccelerationStructureDeviceAddressKHR
-vkGetCalibratedTimestampsKHR
-vkGetDeferredOperationMaxConcurrencyKHR
-vkGetDeferredOperationResultKHR
-vkGetDeviceAccelerationStructureCompatibilityKHR
-vkGetDeviceQueue
-vkGetImageOpaqueCaptureDataEXT
-vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
-vkGetPhysicalDeviceDescriptorSizeEXT
-vkGetPhysicalDeviceFragmentShadingRatesKHR
-vkGetPrivateData
-vkGetRayTracingCaptureReplayShaderGroupHandlesKHR
-vkGetRayTracingShaderGroupHandlesKHR
-vkGetRayTracingShaderGroupStackSizeKHR
-vkQueueBindSparse
-vkRegisterCustomBorderColorEXT
-vkSetPrivateData
-vkTrimCommandPool
-vkUnmapMemory
-vkUnmapMemory2
-vkUnregisterCustomBorderColorEXT
-vkWriteAccelerationStructuresPropertiesKHR
-vkWriteResourceDescriptorMESA
-vkWriteSamplerDescriptorMESA
+#
+# A `wanted` line is not a promise that anything reaches it today. Measured on a seated synoik
+# session plus all 33 glmark2 scenes plus two purpose-built indexed-draw probes: zero refusals.
+# Zink emits `vkCmdDrawMultiIndexedEXT`, which this build serves, wherever the plain
+# `vkCmdDrawIndexed` below would otherwise appear. So a workload census cannot enumerate this
+# file, and it could not anyway -- the first unserved command kills the context, so a boot
+# discovers exactly one. Reach these deliberately, with a Vulkan program that names the command.
+vkCmdBeginConditionalRenderingEXT                  wanted:conditional-rendering
+vkCmdBeginQueryIndexedEXT                          wanted:transform-feedback
+vkCmdBeginRenderPass2                              wanted:render-pass2
+vkCmdBeginTransformFeedbackEXT                     wanted:transform-feedback
+vkCmdBindDescriptorSets2                           wanted:maintenance6-binding
+vkCmdBindIndexBuffer2                              wanted:indexed-and-indirect-draw
+vkCmdBindResourceHeapEXT                           out-of-reach:descriptor-heap
+vkCmdBindSamplerHeapEXT                            out-of-reach:descriptor-heap
+vkCmdBindTransformFeedbackBuffersEXT               wanted:transform-feedback
+vkCmdBlitImage2                                    wanted:copy-commands2
+vkCmdBuildAccelerationStructuresIndirectKHR        out-of-reach:acceleration-structure
+vkCmdBuildAccelerationStructuresKHR                out-of-reach:acceleration-structure
+vkCmdClearDepthStencilImage                        wanted:image-copy-core
+vkCmdCopyAccelerationStructureKHR                  out-of-reach:acceleration-structure
+vkCmdCopyAccelerationStructureToMemoryKHR          out-of-reach:acceleration-structure
+vkCmdCopyBuffer2                                   wanted:copy-commands2
+vkCmdCopyBufferToImage2                            wanted:copy-commands2
+vkCmdCopyImage2                                    wanted:copy-commands2
+vkCmdCopyImageToBuffer2                            wanted:copy-commands2
+vkCmdCopyMemoryToAccelerationStructureKHR          out-of-reach:acceleration-structure
+vkCmdDispatchBase                                  wanted:indexed-and-indirect-draw
+vkCmdDispatchIndirect                              wanted:indexed-and-indirect-draw
+vkCmdDrawIndexed                                   wanted:indexed-and-indirect-draw
+vkCmdDrawIndexedIndirect                           wanted:indexed-and-indirect-draw
+vkCmdDrawIndexedIndirectCount                      wanted:indexed-and-indirect-draw
+vkCmdDrawIndirect                                  wanted:indexed-and-indirect-draw
+vkCmdDrawIndirectByteCountEXT                      wanted:transform-feedback
+vkCmdDrawIndirectCount                             wanted:indexed-and-indirect-draw
+vkCmdDrawMeshTasksEXT                              out-of-reach:mesh-shader
+vkCmdDrawMeshTasksIndirectCountEXT                 out-of-reach:mesh-shader
+vkCmdDrawMeshTasksIndirectEXT                      out-of-reach:mesh-shader
+vkCmdEndConditionalRenderingEXT                    wanted:conditional-rendering
+vkCmdEndQueryIndexedEXT                            wanted:transform-feedback
+vkCmdEndRenderPass2                                wanted:render-pass2
+vkCmdEndRendering2KHR                              out-of-reach:maintenance10
+vkCmdEndTransformFeedbackEXT                       wanted:transform-feedback
+vkCmdExecuteCommands                               wanted:secondary-command-buffers
+vkCmdNextSubpass                                   wanted:render-pass2
+vkCmdNextSubpass2                                  wanted:render-pass2
+vkCmdPushConstants2                                wanted:maintenance6-binding
+vkCmdPushDataEXT                                   out-of-reach:descriptor-heap
+vkCmdPushDescriptorSet2                            wanted:maintenance6-binding
+vkCmdResetEvent                                    wanted:events
+vkCmdResetEvent2                                   wanted:events
+vkCmdResolveImage                                  wanted:image-copy-core
+vkCmdResolveImage2                                 wanted:copy-commands2
+vkCmdSetAlphaToCoverageEnableEXT                   wanted:extended-dynamic-state3
+vkCmdSetAlphaToOneEnableEXT                        wanted:extended-dynamic-state3
+vkCmdSetColorBlendAdvancedEXT                      wanted:extended-dynamic-state3
+vkCmdSetColorBlendEnableEXT                        wanted:extended-dynamic-state3
+vkCmdSetColorBlendEquationEXT                      wanted:extended-dynamic-state3
+vkCmdSetColorWriteEnableEXT                        out-of-reach:color-write-enable
+vkCmdSetColorWriteMaskEXT                          wanted:extended-dynamic-state3
+vkCmdSetConservativeRasterizationModeEXT           wanted:extended-dynamic-state3
+vkCmdSetDepthBias2EXT                              out-of-reach:depth-bias-control
+vkCmdSetDepthBiasEnable                            wanted:core-dynamic-state
+vkCmdSetDepthBounds                                wanted:core-dynamic-state
+vkCmdSetDepthClampEnableEXT                        wanted:extended-dynamic-state3
+vkCmdSetDepthClampRangeEXT                         out-of-reach:shader-object
+vkCmdSetDepthClipEnableEXT                         wanted:extended-dynamic-state3
+vkCmdSetDepthClipNegativeOneToOneEXT               wanted:extended-dynamic-state3
+vkCmdSetDeviceMask                                 wanted:core-dynamic-state
+vkCmdSetEvent                                      wanted:events
+vkCmdSetEvent2                                     wanted:events
+vkCmdSetExtraPrimitiveOverestimationSizeEXT        wanted:extended-dynamic-state3
+vkCmdSetFragmentShadingRateKHR                     out-of-reach:fragment-shading-rate
+vkCmdSetLineRasterizationModeEXT                   wanted:extended-dynamic-state3
+vkCmdSetLineStipple                                wanted:core-dynamic-state
+vkCmdSetLineStippleEnableEXT                       wanted:extended-dynamic-state3
+vkCmdSetLogicOpEXT                                 wanted:extended-dynamic-state2
+vkCmdSetLogicOpEnableEXT                           wanted:extended-dynamic-state3
+vkCmdSetPolygonModeEXT                             wanted:extended-dynamic-state3
+vkCmdSetProvokingVertexModeEXT                     wanted:extended-dynamic-state3
+vkCmdSetRasterizationSamplesEXT                    wanted:extended-dynamic-state3
+vkCmdSetRasterizationStreamEXT                     wanted:extended-dynamic-state3
+vkCmdSetRayTracingPipelineStackSizeKHR             out-of-reach:ray-tracing-pipeline
+vkCmdSetRenderingAttachmentLocations               wanted:dynamic-rendering-locations
+vkCmdSetRenderingInputAttachmentIndices            wanted:dynamic-rendering-locations
+vkCmdSetSampleLocationsEXT                         wanted:sample-locations
+vkCmdSetSampleLocationsEnableEXT                   wanted:extended-dynamic-state3
+vkCmdSetSampleMaskEXT                              wanted:extended-dynamic-state3
+vkCmdSetTessellationDomainOriginEXT                wanted:extended-dynamic-state3
+vkCmdSetVertexInputEXT                             out-of-reach:vertex-input-dynamic-state
+vkCmdTraceRaysIndirect2KHR                         out-of-reach:ray-tracing-maintenance1
+vkCmdTraceRaysIndirectKHR                          out-of-reach:ray-tracing-pipeline
+vkCmdTraceRaysKHR                                  out-of-reach:ray-tracing-pipeline
+vkCmdUpdateBuffer                                  wanted:image-copy-core
+vkCmdWaitEvents                                    wanted:events
+vkCmdWaitEvents2                                   wanted:events
+vkCmdWriteAccelerationStructuresPropertiesKHR      out-of-reach:acceleration-structure
+vkCmdWriteTimestamp2                               wanted:timestamps
+vkCopyAccelerationStructureKHR                     not-in-reference:acceleration-structure
+vkCreateAccelerationStructureKHR                   out-of-reach:acceleration-structure
+vkCreateBufferView                                 wanted:buffer-view
+vkCreateDeferredOperationKHR                       not-in-reference:deferred-operation
+vkCreateDescriptorUpdateTemplate                   wanted:descriptor-update-template
+vkCreateEvent                                      wanted:events
+vkCreatePrivateDataSlot                            not-in-reference:private-data
+vkCreateRayTracingPipelinesKHR                     out-of-reach:ray-tracing-pipeline
+vkCreateRenderPass2                                wanted:render-pass2
+vkDeferredOperationJoinKHR                         not-in-reference:deferred-operation
+vkDestroyAccelerationStructureKHR                  out-of-reach:acceleration-structure
+vkDestroyBufferView                                wanted:buffer-view
+vkDestroyDeferredOperationKHR                      not-in-reference:deferred-operation
+vkDestroyDescriptorUpdateTemplate                  wanted:descriptor-update-template
+vkDestroyEvent                                     wanted:events
+vkDestroyPrivateDataSlot                           not-in-reference:private-data
+vkEnumerateDeviceLayerProperties                   not-in-reference:layer-enumeration
+vkEnumerateInstanceLayerProperties                 not-in-reference:layer-enumeration
+vkGetAccelerationStructureBuildSizesKHR            out-of-reach:acceleration-structure
+vkGetAccelerationStructureDeviceAddressKHR         out-of-reach:acceleration-structure
+vkGetCalibratedTimestampsKHR                       wanted:timestamps
+vkGetDeferredOperationMaxConcurrencyKHR            not-in-reference:deferred-operation
+vkGetDeferredOperationResultKHR                    not-in-reference:deferred-operation
+vkGetDeviceAccelerationStructureCompatibilityKHR   out-of-reach:acceleration-structure
+vkGetDeviceQueue                                   wanted:device-queue
+vkGetImageOpaqueCaptureDataEXT                     out-of-reach:descriptor-heap
+vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR  out-of-reach:cooperative-matrix
+vkGetPhysicalDeviceDescriptorSizeEXT               out-of-reach:descriptor-heap
+vkGetPhysicalDeviceFragmentShadingRatesKHR         out-of-reach:fragment-shading-rate
+vkGetPrivateData                                   not-in-reference:private-data
+vkGetRayTracingCaptureReplayShaderGroupHandlesKHR  out-of-reach:ray-tracing-pipeline
+vkGetRayTracingShaderGroupHandlesKHR               out-of-reach:ray-tracing-pipeline
+vkGetRayTracingShaderGroupStackSizeKHR             out-of-reach:ray-tracing-pipeline
+vkQueueBindSparse                                  wanted:sparse-binding
+vkRegisterCustomBorderColorEXT                     out-of-reach:descriptor-heap
+vkSetPrivateData                                   not-in-reference:private-data
+vkTrimCommandPool                                  wanted:secondary-command-buffers
+vkUnmapMemory                                      not-in-reference:memory-unmap
+vkUnmapMemory2                                     not-in-reference:memory-unmap
+vkUnregisterCustomBorderColorEXT                   out-of-reach:descriptor-heap
+vkWriteAccelerationStructuresPropertiesKHR         not-in-reference:acceleration-structure
+vkWriteResourceDescriptorMESA                      out-of-reach:descriptor-heap
+vkWriteSamplerDescriptorMESA                       out-of-reach:descriptor-heap

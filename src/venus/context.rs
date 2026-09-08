@@ -13252,10 +13252,28 @@ mod tests {
         }
 
         const LEDGER: &str = include_str!("unserved.txt");
+        // Each line is a command and a `status:group`. The status is what makes the file a
+        // decision rather than a list -- work we owe, versus a command nothing here can send --
+        // so a line without one is not written down, it is only mentioned.
+        const STATUSES: [&str; 3] = ["wanted", "out-of-reach", "not-in-reference"];
         let listed: Vec<&str> = LEDGER
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let (name, rest) = l.split_once(char::is_whitespace).unwrap_or_else(|| {
+                    panic!("ledger line has no status, so it says nothing about why: {l:?}")
+                });
+                let (status, group) = rest.trim().split_once(':').unwrap_or_else(|| {
+                    panic!("a status is `status:group`, and this one names no group: {l:?}")
+                });
+                assert!(
+                    STATUSES.contains(&status),
+                    "unknown status {status:?} on {name}; the three are {STATUSES:?}"
+                );
+                assert!(!group.is_empty(), "an empty group on {name}");
+                name
+            })
             .collect();
         let ledger: BTreeSet<&str> = listed.iter().copied().collect();
         assert_eq!(listed.len(), ledger.len(), "the ledger lists a command twice");
