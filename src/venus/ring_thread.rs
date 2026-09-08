@@ -302,10 +302,17 @@ impl RingThread {
     /// Only ever raises it. A guest that submits seqnos out of order is describing a past it has
     /// already passed, and lowering the value would un-satisfy a wait this ring may already have
     /// been released from.
-    pub fn submit_virtqueue_seqno(&self, seqno: u64) {
+    ///
+    /// Returns whether the value actually rose, which is what decides if the journal keeps the
+    /// command: a submit that raised nothing changed no state, and recording it would let a
+    /// later, lower seqno supersede the higher one a restore must reproduce. Answered under the
+    /// lock this already takes, so the answer cannot be raced by a concurrent submit.
+    pub fn submit_virtqueue_seqno(&self, seqno: u64) -> bool {
         let mut state = self.park.state.lock().expect("the park lock is never poisoned");
+        let rose = seqno > state.vq_seqno;
         state.vq_seqno = state.vq_seqno.max(seqno);
         self.park.wake.notify_one();
+        rose
     }
 
     /// The virtqueue seqno this ring is asleep on, if it is asleep on one.

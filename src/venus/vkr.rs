@@ -1063,6 +1063,51 @@ mod tests {
         v.context_destroy(ctx_id());
     }
 
+    /// A restored ring honours a wait for a seqno the guest published *before* the snapshot.
+    ///
+    /// This is the synoik restore, in miniature, and the deadlock it produced. The guest publishes
+    /// a virtqueue seqno once and never repeats it; its ring buffer lives in guest RAM and comes
+    /// back verbatim, still holding the `vkWaitVirtqueueSeqnoMESA` it had not been released from.
+    /// While the recorder dropped the submit as transient, the ring came back at seqno 0, parked
+    /// in that wait, and never consumed another byte -- so the compositor's own
+    /// `vkWaitRingSeqnoMESA` never returned, the self-deadlock guard poisoned the context, and
+    /// the desktop died. Measured on a real restore: head 232476, wanted 232956, tail 233020 --
+    /// the ring sat on 544 bytes of work it would not read.
+    ///
+    /// The wait is written into the buffer BEFORE `replay_end`, because that is the ordering the
+    /// bug needs: a restored ring meets an already-waiting stream the moment it starts.
+    #[test]
+    fn a_restored_ring_honours_a_wait_for_a_seqno_published_before_the_snapshot() {
+        let (mut v, map) = vkr();
+        v.replay_begin(ctx_id()).expect("replay began");
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+        // The journal's half: the seqno the guest published before the snapshot, replayed on the
+        // context's own stream exactly as the recorder stored it.
+        assert!(
+            v.submit(ctx_id(), &wire_submit_vq(7, 1)).expect("submitted").ran(),
+            "the restored seqno is accepted"
+        );
+
+        // The guest's half: the wait it was already blocked in, restored with its RAM.
+        let wait = wire_wait_vq(1);
+        guest_writes(&map, &wait);
+        v.replay_end(ctx_id()).expect("replay ended");
+
+        // A ring that came back at seqno 0 parks here forever and the head never moves.
+        until("the restored ring to consume the wait it was already released from", || {
+            head(&map) as usize == wait.len()
+        });
+        assert!(
+            !v.with_context(ctx_id(), Context::fatal).expect("the context is here"),
+            "the ring deadlocked and poisoned the context"
+        );
+
+        v.context_destroy(ctx_id());
+    }
+
     /// Replay builds rings idle and starts them at `replay_end`, never before.
     ///
     /// This is the C's `if (!ctx->replaying) vkr_ring_start(ring)` plus the loop that starts the

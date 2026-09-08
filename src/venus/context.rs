@@ -1215,6 +1215,12 @@ fn record(
             h.journal.skip(cmd_type);
             return;
         }
+        Some(Note::RingSeqno(ring)) => {
+            // Owned by the ring it names, routed to the context's decoder -- the stream it came
+            // in on, and the only one that will accept it. See `Journal::ring_latest`.
+            h.journal.ring_latest(cmd_type, &wire, ring, 0);
+            return;
+        }
         Some(Note::PoolReset(pool)) => {
             let key = {
                 let t = h.objects.borrow();
@@ -1243,7 +1249,10 @@ fn record(
         VkCommandTypeEXT::VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT
             | VkCommandTypeEXT::VK_COMMAND_TYPE_vkSeekReplyCommandStreamMESA_EXT
     ) {
-        h.journal.ring_latest(cmd_type, &wire, route);
+        // Owner and route are the same ring here: a reply stream is set on the ring it is about,
+        // and is legal on either stream. `vkSubmitVirtqueueSeqnoMESA` is the case where they
+        // differ, and it comes through `Note::RingSeqno` above.
+        h.journal.ring_latest(cmd_type, &wire, route, route);
         return;
     }
 
@@ -1315,10 +1324,18 @@ fn record(
         return;
     }
 
-    // Everything else. Not a hole by assumption -- the census counts these by type, so what we
-    // drop is a list someone can read rather than a number to be reassured by. A submission, a
-    // wait, a query, a doorbell: state the guest reproduces itself, or transport that has already
-    // happened.
+    // Everything else. The census counts these by type, so what we drop is a list someone can read
+    // rather than a number to be reassured by -- but a name in that list is only as good as
+    // somebody reading it. `vkSubmitVirtqueueSeqnoMESA` sat here being counted while it was the
+    // one thing a restored ring could not do without: the guest publishes a virtqueue seqno once
+    // and never repeats it, so a rebuilt ring came back at 0 under a guest still waiting on the
+    // old value, parked forever in a wait nothing could satisfy. It is kept now, above.
+    //
+    // What stays, and why each is genuinely an edge rather than state: `vkNotifyRingMESA` (a
+    // promoted ring reads the tail itself), `vkWriteRingExtraMESA` (the word it writes lives in
+    // guest RAM, which the snapshot carries), and `vkWaitRingSeqnoMESA` (a wait, satisfied or not
+    // by the time anything replays). A new command landing here deserves the same question asked
+    // out loud: does the guest send it again after a restore?
     h.journal.skip(cmd_type);
 }
 
@@ -1619,6 +1636,14 @@ enum Note {
     RingCreated(u64),
     /// It destroyed this ring, and everything the ring owned goes with it.
     RingGone(u64),
+    /// It raised this ring's published virtqueue seqno.
+    ///
+    /// The ring is named here because the recorder cannot find it any other way: this command
+    /// carries its ring as an argument rather than arriving on it, so `current_ring` is None and
+    /// the route is the context's own decoder. Only sent when the value actually rose -- a submit
+    /// that raised nothing is state the guest already had, and keeping it would let a lower seqno
+    /// supersede the higher one in the latest-wins slot.
+    RingSeqno(u64),
     /// It reset this command pool, discarding every recording made from it without invalidating a
     /// single buffer -- so no key changes and only the journal can be told.
     ///
@@ -2827,8 +2852,17 @@ impl Commands for Handlers<'_> {
             None => {
                 self.reject = Some("submitted a virtqueue seqno for a ring that was never created")
             }
-            Some(RingSlot::Idle(r)) => r.virtqueue_seqno = r.virtqueue_seqno.max(args.seqno),
-            Some(RingSlot::Running(t)) => t.submit_virtqueue_seqno(args.seqno),
+            Some(RingSlot::Idle(r)) => {
+                if args.seqno > r.virtqueue_seqno {
+                    r.virtqueue_seqno = args.seqno;
+                    self.note = Some(Note::RingSeqno(args.ring));
+                }
+            }
+            Some(RingSlot::Running(t)) => {
+                if t.submit_virtqueue_seqno(args.seqno) {
+                    self.note = Some(Note::RingSeqno(args.ring));
+                }
+            }
         }
     }
 
@@ -8381,6 +8415,94 @@ mod tests {
         assert!(
             ctx.reply.is_none(),
             "nothing arrived on the context's own stream, so it has no reply window"
+        );
+    }
+
+    /// Each ring's published virtqueue seqno survives an export/restore, and it is *its own*.
+    ///
+    /// The bug this pins: the seqno was dropped by the recorder as transient, so a rebuilt ring
+    /// came back at 0 while the guest's restored ring buffer still held a wait for the old value.
+    /// The ring parked in a wait nothing could satisfy, the self-deadlock guard poisoned the
+    /// context, and the guest compositor died -- on every restore.
+    ///
+    /// Two rings, because one ring cannot tell an owner-keyed slot from a route-keyed one: this
+    /// command names its ring in its arguments and always routes to the context's decoder, so
+    /// keying the slot by route would collapse both rings into one.
+    #[test]
+    fn each_rings_virtqueue_seqno_survives_a_restore() {
+        let t = ring_table();
+        let info = ring_info();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(
+            ContextKey::for_test(ContextId::new(1).unwrap()),
+            &Budget::with_cap(None, false),
+            String::new(),
+        );
+        ctx.replay_begin();
+        for ring in [7u64, 9] {
+            assert!(ctx.submit(&wire_create_ring(ring, &info), &mut todo, &g, &t).ran());
+        }
+        for (ring, seqno) in [(7u64, 40u64), (9, 55)] {
+            assert!(
+                ctx.submit(&wire_submit_vq(ring, seqno), &mut todo, &g, &t).ran(),
+                "ring {ring}'s seqno is accepted on the context's own stream"
+            );
+        }
+
+        let blob = ctx.journal_export(&BTreeSet::new()).expect("the journal has rings to rebuild");
+
+        let mut back = Context::new(
+            ContextKey::for_test(ContextId::new(1).unwrap()),
+            &Budget::with_cap(None, false),
+            String::new(),
+        );
+        back.replay_begin();
+        back.journal_restore(&blob).expect("the blob parses");
+        // The whole journal must replay. Routing the seqno to its own ring instead of the
+        // context's decoder fails HERE, because the handler refuses it on a ring's own stream and
+        // one refused entry abandons every entry after it.
+        assert!(back.replay_upto(Seq(u64::MAX), &mut todo, &g, &t), "every journal entry replayed");
+
+        let seqno = |c: &Context, ring: u64| c.rings[&RingId(ring)].idle().virtqueue_seqno;
+        assert_eq!(seqno(&back, 7), 40, "ring 7 came back with ring 7's seqno");
+        assert_eq!(seqno(&back, 9), 55, "ring 9 came back with ring 9's seqno");
+    }
+
+    /// A submit that raises nothing is not recorded, so it cannot supersede the higher value in
+    /// the latest-wins slot. Without this a guest replaying an older seqno would restore the ring
+    /// below where it actually stood.
+    #[test]
+    fn a_seqno_that_did_not_rise_cannot_lower_what_a_restore_reproduces() {
+        let t = ring_table();
+        let info = ring_info();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(
+            ContextKey::for_test(ContextId::new(1).unwrap()),
+            &Budget::with_cap(None, false),
+            String::new(),
+        );
+        ctx.replay_begin();
+        assert!(ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t).ran());
+        for seqno in [40u64, 12] {
+            assert!(ctx.submit(&wire_submit_vq(7, seqno), &mut todo, &g, &t).ran());
+        }
+        assert_eq!(ctx.rings[&RingId(7)].idle().virtqueue_seqno, 40, "live value only rises");
+
+        let blob = ctx.journal_export(&BTreeSet::new()).expect("something to rebuild");
+        let mut back = Context::new(
+            ContextKey::for_test(ContextId::new(1).unwrap()),
+            &Budget::with_cap(None, false),
+            String::new(),
+        );
+        back.replay_begin();
+        back.journal_restore(&blob).expect("the blob parses");
+        back.replay_upto(Seq(u64::MAX), &mut todo, &g, &t);
+        assert_eq!(
+            back.rings[&RingId(7)].idle().virtqueue_seqno,
+            40,
+            "the restore reproduces the high-water mark, not the last thing said"
         );
     }
 
