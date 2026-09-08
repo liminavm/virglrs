@@ -672,6 +672,15 @@ impl Gl {
         unsafe { self.t.glTexParameteri()(target, name, value) };
     }
 
+    /// `glGetTexParameteriv` for a parameter with one integer answer, on the bound texture.
+    pub fn get_tex_parameter_i(&self, target: GLenum, name: GLenum) -> GLint {
+        let mut value: GLint = 0;
+        // SAFETY: every parameter this is called with has exactly one integer answer, so the
+        // driver writes one `GLint` through the pointer, and it points at one.
+        unsafe { self.t.glGetTexParameteriv()(target, name, &raw mut value) };
+        value
+    }
+
     pub fn pixel_store_i(&self, name: GLenum, value: GLint) {
         // SAFETY: plain scalars.
         unsafe { self.t.glPixelStorei()(name, value) };
