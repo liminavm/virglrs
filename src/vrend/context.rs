@@ -2319,6 +2319,18 @@ impl Context {
     fn create_sampler_view(&mut self, host: &mut Host<'_>, v: SamplerView) -> Result<View, Fault> {
         let cmd = Cmd::CreateObject;
         let gl = host.gl;
+        // `LIMINA_GL_TRACE` names which call in here left the error, which the fault cannot: the
+        // check that poisons runs once the whole command is done, so it knows the command and not
+        // the call. NOTE that draining here CONSUMES the error, so a traced run does not poison
+        // on it -- the trace is for finding the call, never for deciding whether there was one.
+        let probe = |what: &str| {
+            if std::env::var_os("LIMINA_GL_TRACE").is_some() {
+                let e = gl.drain_errors();
+                if e != GL_NO_ERROR {
+                    eprintln!("[virglrs] vrend: sampler view: {what} left GL error {e:#x}");
+                }
+            }
+        };
         let features = host.features;
         let formats = host.formats;
         let res = host.resource(cmd, v.resource)?;
@@ -2400,6 +2412,7 @@ impl Context {
                 let name = gl.gen_texture();
                 gl.bind_texture(target, Some(name));
                 gl.egl_image_target_texture_2d(target, image);
+                probe("egl_image_target_texture_2d");
                 // The plane is a one- or two-component texture and the guest's view says which
                 // of its channels land where. Dropping the swizzle would silently zero whatever
                 // the shader reads past the components the plane has.
@@ -2509,6 +2522,20 @@ impl Context {
                         first_layer,
                         layers as GLuint,
                     );
+                    if std::env::var_os("LIMINA_GL_TRACE").is_some() {
+                        eprintln!(
+                            "[virglrs] vrend: sampler view: texture_view of resource {:?} \
+                             ({}x{} {}, immutable {immutable}) as {} target {target:#x} \
+                             internalformat {ifmt:#x} levels {first_level}+{levels} layers \
+                             {first_layer}+{layers}",
+                            v.resource,
+                            res.args.width,
+                            res.args.height,
+                            res.args.format.name(),
+                            view_format.name(),
+                        );
+                    }
+                    probe("texture_view");
                     gl.bind_texture(target, Some(name));
                     if desc.is_some_and(|d| d.is_depth_or_stencil())
                         && features.has(Feature::stencil_texturing)
@@ -2535,6 +2562,24 @@ impl Context {
                     gl.bind_texture(target, None);
                     view = Some(name);
                 }
+            }
+        }
+        // Catch-all: an error the two probes above did not claim came from one of the other calls
+        // on this path, and the description is what says which resource provoked it.
+        if std::env::var_os("LIMINA_GL_TRACE").is_some() {
+            let e = gl.drain_errors();
+            if e != GL_NO_ERROR {
+                let res = host.resource(cmd, v.resource)?;
+                eprintln!(
+                    "[virglrs] vrend: sampler view: GL error {e:#x} left elsewhere on resource \
+                     {:?} ({}x{} {} as {}, bind {:#x}, target {target:#x}, buffer {is_buffer})",
+                    v.resource,
+                    res.args.width,
+                    res.args.height,
+                    res.args.format.name(),
+                    v.format.name(),
+                    res.args.bind.0,
+                );
             }
         }
         Ok(View {
