@@ -19,7 +19,9 @@ use crate::ids::{ContextId, ResourceHandle, RingId};
 use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
-use super::driver::{self, Driver, ExportError, Exported, MemoryError, NoSyncFd, NotATimeline};
+use super::driver::{
+    self, Driver, ExportError, Exported, MemoryError, NoSubmit2, NoSyncFd, NotATimeline,
+};
 use super::journal::{self, Journal, Seq};
 use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
@@ -113,10 +115,11 @@ use super::proto::types::{
     vn_command_vkGetRenderingAreaGranularity, vn_command_vkGetSemaphoreCounterValue,
     vn_command_vkImportSemaphoreResourceMESA, vn_command_vkInvalidateMappedMemoryRanges,
     vn_command_vkMergePipelineCaches, vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit,
-    vn_command_vkQueueWaitIdle, vn_command_vkResetCommandBuffer, vn_command_vkResetCommandPool,
-    vn_command_vkResetDescriptorPool, vn_command_vkResetEvent, vn_command_vkResetFenceResourceMESA,
-    vn_command_vkResetFences, vn_command_vkResetQueryPool, vn_command_vkSeekReplyCommandStreamMESA,
-    vn_command_vkSetEvent, vn_command_vkSetReplyCommandStreamMESA, vn_command_vkSignalSemaphore,
+    vn_command_vkQueueSubmit2, vn_command_vkQueueWaitIdle, vn_command_vkResetCommandBuffer,
+    vn_command_vkResetCommandPool, vn_command_vkResetDescriptorPool, vn_command_vkResetEvent,
+    vn_command_vkResetFenceResourceMESA, vn_command_vkResetFences, vn_command_vkResetQueryPool,
+    vn_command_vkSeekReplyCommandStreamMESA, vn_command_vkSetEvent,
+    vn_command_vkSetReplyCommandStreamMESA, vn_command_vkSignalSemaphore,
     vn_command_vkSubmitVirtqueueSeqnoMESA, vn_command_vkTransitionImageLayout,
     vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences, vn_command_vkWaitRingSeqnoMESA,
     vn_command_vkWaitSemaphoreResourceMESA, vn_command_vkWaitSemaphores,
@@ -4579,6 +4582,22 @@ impl Commands for Handlers<'_> {
             return;
         };
         args.ret = ret;
+    }
+
+    /// `vkQueueSubmit2`, the synchronization2 form of the submit above. Submitting nothing is
+    /// legal here for the same reason, so the empty slice goes through rather than being turned
+    /// away.
+    fn vkQueueSubmit2(&mut self, args: &mut vn_command_vkQueueSubmit2<'_>) {
+        let submits = args.pSubmits();
+        match self.driver.queue_submit2(args.queue, submits, args.fence) {
+            Ok(ret) => args.ret = ret,
+            Err(NoSubmit2::Queue) => {
+                self.reject = Some("submitted to a queue with no device behind it")
+            }
+            Err(NoSubmit2::EntryPoint) => {
+                self.reject = Some("submitted with vkQueueSubmit2 to a device that has none")
+            }
+        }
     }
 
     fn vkResetFences(&mut self, args: &mut vn_command_vkResetFences<'_>) {
@@ -14295,6 +14314,158 @@ mod tests {
         assert!(h.reject.is_some(), "a fence on a device that does not exist stops the ring");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The synchronization2 submit: what reaches the driver, what raises a timeline, and what
+    /// happens on a device that never enabled it.
+    ///
+    /// The third case is the one worth the test. The capset's extension mask is built from what
+    /// the pinned vk.xml can *serialize*, which is wider than what any single device enables at
+    /// `vkCreateDevice` -- so a guest can legally send this command to a device whose driver
+    /// exports no entry point for it, and that is guest input, not a host fault. Reaching for the
+    /// panicking accessor would turn it into a process abort, which is a guest taking down the
+    /// worker. It must be a rejection, and one that names itself apart from a bad queue.
+    ///
+    /// The timeline case covers `note_submit2`, which is where v2 differs from v1: the signal's
+    /// value rides inside `VkSemaphoreSubmitInfo` beside its semaphore instead of in a
+    /// `VkTimelineSemaphoreSubmitInfo` chained off `pNext` and counted separately, so there is no
+    /// pair to reconcile and the walk is over the one array.
+    #[test]
+    fn a_synchronization2_submit_reaches_the_driver_or_is_refused_by_name() {
+        use super::super::proto::types::{
+            VkDevice, VkFence, VkQueue, VkSemaphore, VkSemaphoreSubmitInfo, VkSubmitInfo2,
+            vn_command_vkQueueSubmit2,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const QUEUE: u64 = 21;
+        const TIMELINE: u64 = 44;
+        const FENCE: u64 = 99;
+
+        thread_local! {
+            static SAW: RefCell<Vec<(u64, u32, u64)>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn submit2(
+            queue: VkQueue,
+            count: u32,
+            _p: *const VkSubmitInfo2,
+            fence: VkFence,
+        ) -> VkResult {
+            SAW.with_borrow_mut(|s| s.push((queue.0, count, fence.0)));
+            VkResult::VK_SUCCESS
+        }
+
+        /// Stand up a context over a device whose table has `vkQueueSubmit2` or does not.
+        fn driver_with(entry_point: bool) -> Driver {
+            let mut fns = crate::vulkan::Device::default();
+            if entry_point {
+                fns.plant_vkQueueSubmit2(submit2);
+            }
+            let mut driver = Driver::new(Account::for_test(None));
+            driver.plant_device(VkDevice(DEVICE), fns);
+            driver.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
+            driver.plant_semaphore(VkSemaphore(TIMELINE), driver::SemaphoreKind::Timeline);
+            driver
+        }
+
+        let objects = Shared::new();
+        let global = crate::vulkan::global();
+
+        macro_rules! handlers {
+            ($driver:expr, $todo:expr, $rings:expr, $reply:expr, $monitor:expr, $jrnl:expr) => {
+                Handlers {
+                    objects: &objects,
+                    todo: $todo,
+                    driver: $driver,
+                    global: &global,
+                    ctx: ContextId::new(1).expect("1 is not zero"),
+                    reject: None,
+                    resources: &NO_RESOURCES,
+                    rings: $rings,
+                    monitor: $monitor,
+                    wait: None,
+                    execute: None,
+                    replaying: false,
+                    current_ring: None,
+                    reply: $reply,
+                    note: None,
+                    journal: $jrnl,
+                }
+            };
+        }
+
+        let mut driver = driver_with(true);
+        let (mut todo, mut rings, mut reply, mut monitor, mut jrnl) =
+            (Unimplemented::default(), BTreeMap::new(), None, None, Journal::new());
+        let mut h =
+            handlers!(&mut driver, &mut todo, &mut rings, &mut reply, &mut monitor, &mut jrnl);
+
+        // One submit signalling the timeline to 7, and a fence beside it. Both halves are the
+        // guest's and both have to arrive: the fence is what every later wait in the frame is
+        // keyed by, and the value is what a `vkGetSemaphoreCounterValue` will be checked against.
+        let signal = [VkSemaphoreSubmitInfo {
+            semaphore: VkSemaphore(TIMELINE),
+            value: 7,
+            ..Default::default()
+        }];
+        let submits = [VkSubmitInfo2 {
+            signalSemaphoreInfoCount: 1,
+            pSignalSemaphoreInfos: signal.as_ptr(),
+            ..Default::default()
+        }];
+        let mut args = vn_command_vkQueueSubmit2::default();
+        args.queue = VkQueue(QUEUE);
+        args.fence = VkFence(FENCE);
+        args.plant_pSubmits(&submits);
+        h.vkQueueSubmit2(&mut args);
+        assert!(h.reject.is_none(), "a well-formed submit is not a refusal");
+        assert_eq!(args.ret, VkResult::VK_SUCCESS, "the driver's answer is the guest's");
+        SAW.with_borrow(|s| assert_eq!(*s, [(QUEUE, 1, FENCE)]));
+        assert_eq!(
+            h.driver.semaphore_requested(VkSemaphore(TIMELINE)),
+            7,
+            "the signal inside the submit info is what raises the timeline"
+        );
+
+        // Submitting no work is how a guest signals a fence with nothing to do, so the empty
+        // slice goes through as a submit of zero rather than being turned away.
+        SAW.with_borrow_mut(Vec::clear);
+        let mut args = vn_command_vkQueueSubmit2::default();
+        args.queue = VkQueue(QUEUE);
+        args.fence = VkFence(FENCE);
+        args.plant_pSubmits(&[]);
+        h.vkQueueSubmit2(&mut args);
+        assert!(h.reject.is_none(), "submitting nothing is legal");
+        SAW.with_borrow(|s| assert_eq!(*s, [(QUEUE, 0, FENCE)]));
+        h.driver.abandon_planted();
+
+        // The same command to a device that exports no `vkQueueSubmit2`: a rejection naming
+        // itself, and NOT the one a bad queue gets -- the two are different guest mistakes.
+        let mut driver = driver_with(false);
+        let (mut todo, mut rings, mut reply, mut monitor, mut jrnl) =
+            (Unimplemented::default(), BTreeMap::new(), None, None, Journal::new());
+        let mut h =
+            handlers!(&mut driver, &mut todo, &mut rings, &mut reply, &mut monitor, &mut jrnl);
+        let mut args = vn_command_vkQueueSubmit2::default();
+        args.queue = VkQueue(QUEUE);
+        args.plant_pSubmits(&submits);
+        h.vkQueueSubmit2(&mut args);
+        assert_eq!(
+            h.reject,
+            Some("submitted with vkQueueSubmit2 to a device that has none"),
+            "a device narrower than the capset is guest input, and must not abort the worker"
+        );
+
+        // And a queue this context never retrieved, which is the other refusal.
+        let mut args = vn_command_vkQueueSubmit2::default();
+        args.queue = VkQueue(QUEUE + 1);
+        args.plant_pSubmits(&submits);
+        h.reject = None;
+        h.vkQueueSubmit2(&mut args);
+        assert_eq!(h.reject, Some("submitted to a queue with no device behind it"));
         h.driver.abandon_planted();
     }
 
