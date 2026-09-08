@@ -635,14 +635,15 @@ impl Driver {
             self.queues.retain(|_, owner| *owner != handle);
         }
         // A fallback, not the path that retires the census: `empty_device` does that, per device,
-        // as it frees. What can be left here is an allocation the table could name no device for,
-        // which was never freed above because there was no device to free it on. Nothing a guest
-        // sends reaches this today -- an allocate is refused before it is recorded unless its
-        // device resolved -- so it is said out loud and the record dropped, rather than left to
-        // abort a teardown that is already unwinding.
+        // as it frees. What can be left here is an allocation the object table could name no
+        // device for, so no per-device pass reached it. Dropping the record still frees it --
+        // every record holds a share of the device it was allocated on, so there is no such thing
+        // as an allocation with no device to free it on any more -- but it is said out loud,
+        // because reaching here at all means the table and this map disagree. Nothing a guest
+        // sends does: an allocate is refused before it is recorded unless its device resolved.
         if !self.memory.is_empty() {
             eprintln!(
-                "[virglrs] teardown: {} allocation(s) with no device to free them on",
+                "[virglrs] teardown: {} allocation(s) the object table named no device for",
                 self.memory.len()
             );
             self.memory.clear();
@@ -2296,7 +2297,7 @@ impl Driver {
     /// Its device carries no instance, which is what tells both drops to call nothing -- the same
     /// rule `plant_device` relies on, asked here of the memory rather than of the device.
     #[cfg(test)]
-    fn planted_memory(size: u64) -> DriverMemory {
+    fn planted_memory(size: u64) -> Arc<DriverMemory> {
         unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
         let mut fns = crate::vulkan::Device::default();
         // The device is this memory's alone and dies with it, so the one entry point it can ever
@@ -2304,7 +2305,7 @@ impl Driver {
         // drop is not, and a drop that aborts a test is worse than the test it was hiding.
         fns.plant_vkDestroyDevice(destroy_device);
         let device = Arc::new(LiveDevice { handle: VkDevice(0), fns, instance: None });
-        DriverMemory { device, memory: VkDeviceMemory(0), mapped: None, len: size }
+        Arc::new(DriverMemory { device, memory: VkDeviceMemory(0), mapped: None, len: size })
     }
 
     /// Plant a live allocation from a memory type with the given properties.
@@ -2329,10 +2330,17 @@ impl Driver {
         } else {
             let charge =
                 self.account.try_charge("device memory", size).expect("a test ledger has no cap");
-            Backing::Driver { memory: Charged::new(Self::planted_memory(size), charge) }
+            Backing::Driver { charge }
         };
-        self.memory
-            .insert(id, Allocated { size, backing, props: VkMemoryPropertyFlags(props as _) });
+        self.memory.insert(
+            id,
+            Allocated {
+                size,
+                memory: Self::planted_memory(size),
+                backing,
+                props: VkMemoryPropertyFlags(props as _),
+            },
+        );
     }
 
     /// Plant an allocation that owns real driver memory on a planted device.
@@ -2350,15 +2358,20 @@ impl Driver {
         size: u64,
     ) {
         let d = self.devices.get(&device).expect("a planted device");
-        let mem =
-            DriverMemory { device: Arc::clone(&d.fns), memory: handle, mapped: None, len: size };
+        let mem = Arc::new(DriverMemory {
+            device: Arc::clone(&d.fns),
+            memory: handle,
+            mapped: None,
+            len: size,
+        });
         let charge =
             self.account.try_charge("device memory", size).expect("a test ledger has no cap");
         self.memory.insert(
             id,
             Allocated {
                 size,
-                backing: Backing::Driver { memory: Charged::new(mem, charge) },
+                memory: mem,
+                backing: Backing::Driver { charge },
                 props: VkMemoryPropertyFlags(0),
             },
         );
@@ -2373,6 +2386,7 @@ impl Driver {
             id,
             Allocated {
                 size,
+                memory: Self::planted_memory(size),
                 backing: Backing::Imported(of),
                 props: VkMemoryPropertyFlags(
                     (HOST_VISIBLE_BIT | HOST_COHERENT_BIT | HOST_CACHED_BIT) as _,
@@ -2394,6 +2408,7 @@ impl Driver {
             id,
             Allocated {
                 size: surface.alloc_size(),
+                memory: Self::planted_memory(surface.alloc_size()),
                 backing: Backing::Owned {
                     storage: Storage::Texture(Arc::new(Charged::new(surface, charge))),
                     published: false,
@@ -3996,64 +4011,68 @@ impl Driver {
             return Err(NoMemory::Driver(r));
         }
         assert!(out.0 != 0, "vkAllocateMemory succeeded and returned a null handle");
-        // Owned from the moment it exists, and before anything else can fail: the handle is put
-        // into the value whose drop frees it, so every path out of this function from here on
-        // gives the memory back without naming it again.
+        // Owned before anything else can fail, and for every backing: what the driver handed
+        // back is a Vulkan resource whatever this renderer decides to put behind it, so the value
+        // that frees it is built here once rather than in the arms that happen to keep it.
+        let mut mem = DriverMemory {
+            device: Arc::clone(&d.fns),
+            memory: out,
+            mapped: None,
+            len: info.allocationSize.0,
+        };
+        // The heap arm is the one whose storage IS this mapping, so the map happens before the
+        // `Arc` is made and a failure drops `mem`, which frees the allocation.
+        let heap_why = match &planned {
+            Planned::Deferred { why: Some(why), .. } => Some(*why),
+            _ => None,
+        };
+        if heap_why.is_some() {
+            let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+            // SAFETY: the allocation this call just made, on the device it was made on, mapped
+            // whole; `ptr` is a local.
+            let r = unsafe {
+                (d.fns.vkMapMemory())(
+                    device,
+                    out,
+                    VkDeviceSize(0),
+                    VK_WHOLE_SIZE,
+                    VkMemoryMapFlags(0),
+                    &mut ptr,
+                )
+            };
+            if r != VkResult::VK_SUCCESS || ptr.is_null() {
+                // Host-visible memory the host cannot map is a driver contradicting itself, and
+                // there is no honest second answer: leaving it unmapped would mean an export with
+                // no address and a capture with no bytes, discovered much later. `mem` drops
+                // here, which frees it.
+                eprintln!(
+                    "[virglrs] vkMapMemory of {size} bytes of host-visible memory: VkResult {}",
+                    r.0
+                );
+                return Err(NoMemory::Driver(if r == VkResult::VK_SUCCESS {
+                    VkResult::VK_ERROR_MEMORY_MAP_FAILED
+                } else {
+                    r
+                }));
+            }
+            mem.mapped = Some(ptr as usize);
+        }
+        let mem = Arc::new(mem);
         let backing = match planned {
             Planned::Ready(backing) => backing,
-            Planned::Deferred { charge, why } => {
-                let mut mem = DriverMemory {
-                    device: Arc::clone(&d.fns),
-                    memory: out,
-                    mapped: None,
-                    len: info.allocationSize.0,
-                };
-                match why {
-                    None => Backing::Driver { memory: Charged::new(mem, charge) },
-                    Some(why) => {
-                        let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
-                        // SAFETY: the allocation this call just made, on the device it was made
-                        // on, mapped whole; `ptr` is a local.
-                        let r = unsafe {
-                            (d.fns.vkMapMemory())(
-                                device,
-                                out,
-                                VkDeviceSize(0),
-                                VK_WHOLE_SIZE,
-                                VkMemoryMapFlags(0),
-                                &mut ptr,
-                            )
-                        };
-                        if r != VkResult::VK_SUCCESS || ptr.is_null() {
-                            // Host-visible memory the host cannot map is a driver contradicting
-                            // itself, and there is no honest second answer: leaving it unmapped
-                            // would mean an export with no address and a capture with no bytes,
-                            // discovered much later. `mem` drops here, which frees it.
-                            eprintln!(
-                                "[virglrs] vkMapMemory of {size} bytes of host-visible memory: \
-                                 VkResult {}",
-                                r.0
-                            );
-                            return Err(NoMemory::Driver(if r == VkResult::VK_SUCCESS {
-                                VkResult::VK_ERROR_MEMORY_MAP_FAILED
-                            } else {
-                                r
-                            }));
-                        }
-                        mem.mapped = Some(ptr as usize);
-                        Backing::Owned {
-                            storage: Storage::heap(mem, charge, why),
-                            published: false,
-                        }
-                    }
-                }
-            }
+            Planned::Deferred { charge, why } => match why {
+                None => Backing::Driver { charge },
+                Some(why) => Backing::Owned {
+                    storage: Storage::heap(Arc::clone(&mem), charge, why),
+                    published: false,
+                },
+            },
         };
         // A type index the device does not have is one `vkAllocateMemory` would have refused, so
         // the fallback describes memory that cannot exist -- and describes it as addressable by
         // nothing, which is the safe reading.
         let props = props.unwrap_or(VkMemoryPropertyFlags(0));
-        self.memory.insert(id, Allocated { size, backing, props });
+        self.memory.insert(id, Allocated { size, memory: mem, backing, props });
         Ok(out)
     }
 
@@ -4227,9 +4246,11 @@ impl Driver {
         let Some(record) = self.memory.remove(&id) else {
             return;
         };
-        if let Some(owned) = record.driver_memory().filter(|m| m.memory.0 != 0) {
+        // A planted record carries a null handle and names no device; a real one always names
+        // both, and they are the same memory the table resolved.
+        if record.memory.memory.0 != 0 {
             assert!(
-                owned.device.handle == device && owned.memory == memory,
+                record.memory.device.handle == device && record.memory.memory == memory,
                 "the object table and the record disagree about which memory {id:?} names"
             );
         }
@@ -4447,6 +4468,20 @@ impl Driver {
 struct Allocated {
     /// Its size, padded to the blob the guest may map it as -- see [`pad_for_blob`].
     size: u64,
+    /// What `vkAllocateMemory` returned, owned here whatever the bytes turn out to be.
+    ///
+    /// Every backing has one of these: the allocation is a Vulkan resource in its own right, and
+    /// the storage behind it -- a surface, minted pages, the exporter's bytes -- is a separate
+    /// question from the handle that must be given back. Keeping the two apart is what stopped a
+    /// backing from silently having no free: whichever arm [`Backing`] takes, this field is the
+    /// one value whose drop frees, and there is no arm for it to be missing from.
+    ///
+    /// **Declared before `backing`, and that is not cosmetic.** KosmicKrisp backs a host-pointer
+    /// import with `newBufferWithBytesNoCopy`, so Metal holds *our* pages for the buffer's life
+    /// and we must free the buffer before the pages. When this record is the last holder of the
+    /// storage, dropping `backing` is what releases those pages -- so the memory has to go first.
+    /// Rust drops fields in declaration order, which is the only thing enforcing it.
+    memory: Arc<DriverMemory>,
     /// What the bytes actually are, what they cost, and whether they have been published. See
     /// [`Backing`].
     backing: Backing,
@@ -4468,15 +4503,16 @@ struct Allocated {
 enum Backing {
     /// Memory the driver allocated that the host cannot address, and what it cost.
     ///
-    /// Only memory with no `HOST_VISIBLE` bit reaches this arm. There is no address to publish
-    /// and no mapping to hold, so nothing can name these bytes but the allocation itself -- which
-    /// is why this arm needs no share and no `Arc`: when the record goes, the last thing that
-    /// could have reached the memory goes with it.
+    /// Only memory with no `HOST_VISIBLE` bit reaches this arm. There is no address to publish,
+    /// no mapping to hold and no storage to share: nothing can name these bytes but the record,
+    /// so the charge is all this arm carries and the record's own `memory` does the freeing.
     ///
-    /// It is never read, and that is the design: it is a value whose only job is to be dropped
-    /// with the record, freeing the memory and crediting the ledger. There is no release call for
-    /// a future destroy path to forget.
-    Driver { memory: Charged<DriverMemory> },
+    /// The charge is never read, and that is the design: a value whose only job is to be dropped
+    /// with the record, crediting the ledger. There is no release call to forget.
+    Driver {
+        #[expect(dead_code, reason = "credited by its drop, never read")]
+        charge: Charge,
+    },
     /// Storage this renderer owns: an IOSurface or pages the allocation is a host-pointer import
     /// of, or the driver's own allocation held by [`Storage::Heap`]. Either way the memory *is*
     /// the storage and outlives this record. The storage carries its own
@@ -4612,20 +4648,6 @@ impl Allocated {
         match &self.backing {
             Backing::Driver { .. } | Backing::Imported(_) => false,
             Backing::Owned { published, .. } => *published,
-        }
-    }
-
-    /// The driver's own memory behind it, for the two backings that own some.
-    ///
-    /// `None` is not a gap: minted pages and a surface are this renderer's own storage, and an
-    /// import's bytes are the exporter's. Only these two hold a `VkDeviceMemory` whose handle
-    /// could be checked against the one the object table resolved.
-    fn driver_memory(&self) -> Option<&DriverMemory> {
-        match &self.backing {
-            Backing::Driver { memory } => Some(memory.it()),
-            Backing::Owned { storage: Storage::Heap(h), .. } => Some(&h.it().mem),
-            Backing::Owned { storage: Storage::Texture(_) | Storage::Linear(_), .. }
-            | Backing::Imported(_) => None,
         }
     }
 
@@ -4837,7 +4859,10 @@ impl Drop for DriverMemory {
 /// It carries the same refusal a [`Pages`] does, for the same reader: a compositor handed a share
 /// of this and asked to present from it has no surface, and the reason is worth saying once.
 pub struct Heap {
-    mem: DriverMemory,
+    /// A share of the allocation's own [`DriverMemory`], never a second one: the address this
+    /// storage publishes IS that mapping, so it has to outlive the record when a blob still holds
+    /// the storage. One owner, and this is a key to it.
+    mem: Arc<DriverMemory>,
     why: NoSurface,
     /// Whether the refusal has been said -- see [`Pages::said`], which this mirrors.
     said: std::sync::atomic::AtomicBool,
@@ -4931,7 +4956,7 @@ impl Storage {
     }
 
     /// A share over the driver's own memory, carrying why it is not a surface.
-    fn heap(mem: DriverMemory, charge: Charge, why: NoSurface) -> Storage {
+    fn heap(mem: Arc<DriverMemory>, charge: Charge, why: NoSurface) -> Storage {
         let it = Heap { mem, why, said: std::sync::atomic::AtomicBool::new(false) };
         Storage::Heap(Arc::new(Charged::new(it, charge)))
     }
@@ -5993,12 +6018,24 @@ mod tests {
             unsafe { *out = VkDeviceMemory(0x9000) };
             VkResult::VK_SUCCESS
         }
+        thread_local! {
+            static FREED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            m: VkDeviceMemory,
+            _a: *const VkAllocationCallbacks,
+        ) {
+            FREED.with(|f| f.set(m.0));
+        }
 
         let mut d = Driver::new(Account::for_test(None));
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkAllocateMemory(allocate);
+        fns.plant_vkFreeMemory(free);
         d.plant_device(DEVICE, fns);
         d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(HOST_VISIBLE_BIT as _)]);
+        FREED.with(|f| f.set(0));
 
         let storage = Storage::pages_for_test(LEN as usize, &d.account);
         assert_eq!(d.account.live(), LEN, "the pages are charged from the mint");
@@ -6024,6 +6061,13 @@ mod tests {
         // The importer frees its memory: nothing holds them any more.
         drop(d.memory.remove(&ObjectId(80)));
         assert_eq!(d.account.live(), 0, "and the last holder going is what releases them");
+        // An import's *bytes* are the exporter's; the `VkDeviceMemory` it was given is not, and
+        // letting it go unfreed leaks one allocation per imported window on a live desktop.
+        assert_eq!(
+            FREED.with(std::cell::Cell::get),
+            0x9000,
+            "and the import gave its own allocation back, whoever owned the bytes"
+        );
 
         d.abandon_planted();
     }
@@ -6467,8 +6511,14 @@ mod tests {
         // The allocation goes; the share keeps the pages, and the ledger keeps counting them.
         d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(1));
         assert_eq!(budget.live(), span.1, "the share is what keeps the pages counted now");
+        // The pages are kept by the share; the `VkDeviceMemory` over them is NOT. It is a
+        // host-pointer import the driver made of our pages, and a share of the pages is not a
+        // claim on it -- so it goes back with the record, and only the pages wait for the share.
+        // Conflating the two is how every backing but Heap and Driver stopped being freed at all.
+        assert_eq!(FREED.with(Cell::get), 1, "minted pages give the allocation back at the record");
         drop(share);
         assert_eq!(budget.live(), 0, "and the last share going is what credits them");
+        assert_eq!(FREED.with(Cell::get), 1, "and the share going frees nothing a second time");
 
         // And plain host-visible memory, with no export info at all, does *not* take that path.
         // Substituting pages for it is what lost a desktop's contents across a snapshot: Metal
@@ -6504,14 +6554,286 @@ mod tests {
         // retires the record while the share keeps the memory -- and the address the VMM holds --
         // alive, so nothing is unmapped under the hypervisor's mapping.
         d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(2));
-        assert_eq!(FREED.with(Cell::get), 0, "the free is the last share going, not the record");
+        assert_eq!(
+            FREED.with(Cell::get),
+            1,
+            "a heap's free is the last share going, not the record -- so the count is still the \
+             one the minted allocation above contributed"
+        );
         assert_eq!(budget.live_for(one), padded, "and the charge stands while the share does");
         drop(plain_share);
-        assert_eq!(FREED.with(Cell::get), 1, "the last share going is the free");
+        assert_eq!(FREED.with(Cell::get), 2, "the last share going is the free");
         assert_eq!(UNMAPPED.with(Cell::get), 1, "and the unmap, once, before it");
         assert_eq!(budget.live(), 0, "and the ledger is credited with it");
 
         d.abandon_planted();
+    }
+
+    /// Every backing gives its `VkDeviceMemory` back, whatever it does with the bytes.
+    ///
+    /// The regression guard for the class that cost us a whole framebuffer per frame. An
+    /// allocation is two things at once: a Vulkan handle this renderer must return, and storage
+    /// this renderer decides the shape of. `a403f1f` moved the return into an owner that only two
+    /// of the five backings had, and the other three stopped being freed at all -- an undetected
+    /// 4 MiB per imported window and per scanout, which limina's scanout-churn guard caught two
+    /// repositories away and nothing here noticed.
+    ///
+    /// Why nothing here noticed is the lesson: every `plant_*_allocation` helper builds a record
+    /// whose handle is null, and a null handle is the one case the drop deliberately skips -- so
+    /// "the planted shape frees nothing" and "the real shape frees nothing" were the same
+    /// observation. This test therefore goes through the real [`Driver::allocate_memory`] for all
+    /// five shapes, with `vkAllocateMemory` handing out a DISTINCT handle each time so that the
+    /// freed set can be compared as a set, and not merely counted.
+    ///
+    /// Both routes out are checked, because they are different code: the guest's own
+    /// `vkFreeMemory`, and a device going away under allocations the guest never freed.
+    #[test]
+    fn every_backing_gives_its_allocation_back() {
+        use super::super::proto::types::{
+            VkExportMemoryAllocateInfo, VkExtent3D, VkExternalMemoryHandleTypeFlags, VkFormat,
+            VkImageCreateInfo, VkImageTiling, VkImportMemoryResourceInfoMESA,
+            VkMemoryDedicatedAllocateInfo, VkSubresourceLayout,
+        };
+        use std::cell::{Cell, RefCell};
+
+        const DEVICE: VkDevice = VkDevice(3);
+        const IMAGE: VkImage = VkImage(0x4100);
+        const W: u32 = 64;
+        const H: u32 = 8;
+        const PITCH: u64 = (W * 4) as u64;
+
+        thread_local! {
+            /// Handles handed out, in order, and handles freed. Compared as multisets: the order
+            /// a teardown releases records in is not a promise, but the set is.
+            static HANDED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+            static FREED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+            static NEXT: Cell<u64> = const { Cell::new(0x9000) };
+            /// What the heap arm's `vkMapMemory` hands back. 64 KiB because `pad_for_blob` rounds
+            /// a host-visible allocation up to the blob unit, and the mapping must cover it.
+            static HEAP: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn allocate(
+            _d: VkDevice,
+            _info: *const VkMemoryAllocateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            let h = NEXT.with(|n| {
+                let h = n.get();
+                n.set(h + 0x100);
+                h
+            });
+            HANDED.with(|v| v.borrow_mut().push(h));
+            // SAFETY: the caller's local.
+            unsafe { *out = VkDeviceMemory(h) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            m: VkDeviceMemory,
+            _a: *const VkAllocationCallbacks,
+        ) {
+            FREED.with(|v| v.borrow_mut().push(m.0));
+        }
+        unsafe extern "C" fn map(
+            _d: VkDevice,
+            _m: VkDeviceMemory,
+            _o: VkDeviceSize,
+            _s: VkDeviceSize,
+            _f: VkMemoryMapFlags,
+            out: *mut *mut core::ffi::c_void,
+        ) -> VkResult {
+            let at = HEAP.with(|b| b.borrow_mut().as_mut_ptr());
+            // SAFETY: the driver's out parameter. `HEAP` is a thread-local sized before the
+            // allocations below and never resized after, so the pointer outlives every use.
+            unsafe { *out = at.cast() };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn unmap(_d: VkDevice, _m: VkDeviceMemory) {}
+        unsafe extern "C" fn layout(
+            _d: VkDevice,
+            _i: VkImage,
+            _s: *const VkImageSubresource,
+            out: *mut VkSubresourceLayout,
+        ) {
+            // SAFETY: the caller's local.
+            unsafe {
+                *out = VkSubresourceLayout {
+                    rowPitch: VkDeviceSize(PITCH),
+                    size: VkDeviceSize(PITCH * H as u64),
+                    ..Default::default()
+                }
+            };
+        }
+
+        /// Stand up a driver with all five shapes allocated through the real path, and say which
+        /// backing each id got so the premise is evidence rather than a comment.
+        fn five(d: &mut Driver) {
+            let dedicated = VkMemoryDedicatedAllocateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+                pNext: core::ptr::null(),
+                image: IMAGE,
+                buffer: VkBuffer(0),
+            };
+            let export = VkExportMemoryAllocateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+                pNext: (&raw const dedicated).cast(),
+                handleTypes: VkExternalMemoryHandleTypeFlags(0),
+            };
+            let base = VkMemoryAllocateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                pNext: core::ptr::null(),
+                allocationSize: VkDeviceSize(PITCH * H as u64),
+                memoryTypeIndex: 1,
+            };
+
+            // 1. A scanout: exported and dedicated to a LINEAR image, which is the one shape a
+            //    window buffer has.
+            let scanout = VkMemoryAllocateInfo { pNext: (&raw const export).cast(), ..base };
+            d.allocate_memory(DEVICE, ObjectId(1), &scanout, None, &|_| None).expect("no cap");
+
+            // 2. Declared for export but dedicated to nothing, so there is no surface to mint and
+            //    the bytes are pages this renderer mints instead.
+            let bare_export = VkExportMemoryAllocateInfo { pNext: core::ptr::null(), ..export };
+            let linear = VkMemoryAllocateInfo {
+                pNext: (&raw const bare_export).cast(),
+                memoryTypeIndex: 0,
+                ..base
+            };
+            d.allocate_memory(DEVICE, ObjectId(2), &linear, None, &|_| None).expect("no cap");
+
+            // 3. Host-visible and undeclared: the driver's own memory, mapped once and owned.
+            let heap = VkMemoryAllocateInfo { memoryTypeIndex: 0, ..base };
+            d.allocate_memory(DEVICE, ObjectId(3), &heap, None, &|_| None).expect("no cap");
+
+            // 4. Memory the host cannot address at all.
+            d.allocate_memory(DEVICE, ObjectId(4), &base, None, &|_| None).expect("no cap");
+
+            // 5. An import: the bytes are another allocation's, the handle is this one's.
+            let lent = Storage::pages_for_test(4096, &Account::for_test(None));
+            let import = VkImportMemoryResourceInfoMESA {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+                pNext: core::ptr::null(),
+                resourceId: 7,
+            };
+            let imported = VkMemoryAllocateInfo {
+                pNext: (&raw const import).cast(),
+                memoryTypeIndex: 0,
+                ..base
+            };
+            let resolve = |_| Some(ResourceBytes::Shared(lent.clone()));
+            d.allocate_memory(DEVICE, ObjectId(5), &imported, None, &resolve).expect("no cap");
+
+            // The premise, asserted: five allocations, five different backings. A shape that
+            // stopped reaching the backing it is named for would otherwise quietly test nothing.
+            let kind = |id: u64| match &d.memory.get(&ObjectId(id)).expect("allocated").backing {
+                Backing::Owned { storage: Storage::Texture(_), .. } => "texture",
+                Backing::Owned { storage: Storage::Linear(_), .. } => "linear",
+                Backing::Owned { storage: Storage::Heap(_), .. } => "heap",
+                Backing::Driver { .. } => "driver",
+                Backing::Imported(_) => "imported",
+            };
+            assert_eq!(
+                (kind(1), kind(2), kind(3), kind(4), kind(5)),
+                ("texture", "linear", "heap", "driver", "imported"),
+                "the five shapes reach the five backings"
+            );
+        }
+
+        unsafe extern "C" fn gone(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+        /// A device destroy waits for the device to go idle first, so route two needs this too.
+        unsafe extern "C" fn idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+
+        fn stand_up() -> Driver {
+            HANDED.with(|v| v.borrow_mut().clear());
+            FREED.with(|v| v.borrow_mut().clear());
+            NEXT.with(|n| n.set(0x9000));
+            HEAP.with(|b| *b.borrow_mut() = vec![0u8; 65536]);
+
+            let mut d = Driver::new(Account::for_test(None));
+            let mut fns = crate::vulkan::Device::default();
+            fns.plant_vkAllocateMemory(allocate);
+            fns.plant_vkFreeMemory(free);
+            fns.plant_vkMapMemory(map);
+            fns.plant_vkUnmapMemory(unmap);
+            fns.plant_vkGetImageSubresourceLayout(layout);
+            fns.plant_vkDestroyDevice(gone);
+            fns.plant_vkDeviceWaitIdle(idle);
+            d.plant_device(DEVICE, fns);
+            d.plant_memory_types(
+                DEVICE,
+                &[
+                    VkMemoryPropertyFlags(HOST_VISIBLE_BIT | HOST_COHERENT_BIT | HOST_CACHED_BIT),
+                    VkMemoryPropertyFlags(0),
+                ],
+            );
+            d.note_image(
+                IMAGE,
+                &VkImageCreateInfo {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                    format: VkFormat::VK_FORMAT_B8G8R8A8_UNORM,
+                    extent: VkExtent3D { width: W, height: H, depth: 1 },
+                    tiling: VkImageTiling::VK_IMAGE_TILING_LINEAR,
+                    ..Default::default()
+                },
+            );
+            d
+        }
+
+        let sorted = |v: &RefCell<Vec<u64>>| {
+            let mut out = v.borrow().clone();
+            out.sort_unstable();
+            out
+        };
+
+        // Route one: the guest frees each allocation itself.
+        {
+            let mut d = stand_up();
+            five(&mut d);
+            let handed = HANDED.with(sorted);
+            assert_eq!(handed.len(), 5, "five allocations, five distinct handles");
+            for id in 1..=5 {
+                let h = d.memory.get(&ObjectId(id)).expect("allocated").memory.memory;
+                d.free_memory(DEVICE, h, ObjectId(id));
+            }
+            assert_eq!(
+                FREED.with(sorted),
+                handed,
+                "every backing gave its allocation back on the guest's own free"
+            );
+            d.abandon_planted();
+        }
+
+        // Route two: the guest frees nothing and the device goes away under it.
+        {
+            let mut d = stand_up();
+            five(&mut d);
+            let handed = HANDED.with(sorted);
+            // What the object table would hand a real `vkDestroyDevice`: the five allocations it
+            // is still holding, named by the ids the records are keyed on. `destroy_device` frees
+            // what the table says died on this device, so an empty list destroys nothing -- which
+            // is the table's contract, not a gap.
+            let doomed: Vec<Doomed> = (1..=5)
+                .map(|id| Doomed {
+                    id: ObjectId(id),
+                    ty: VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY,
+                    handle: HostHandle(
+                        d.memory.get(&ObjectId(id)).expect("allocated").memory.memory.0,
+                    ),
+                    device: Some(DEVICE),
+                })
+                .collect();
+            d.destroy_device(DEVICE, &doomed);
+            assert_eq!(
+                FREED.with(sorted),
+                handed,
+                "and gave it back when the device went away under it instead"
+            );
+            d.abandon_planted();
+        }
     }
 
     /// A scanout is charged at the surface's own extent, not at the number in the request.
@@ -6670,9 +6992,20 @@ mod tests {
             VkResult::VK_SUCCESS
         }
 
+        // Planted because an import owns the `VkDeviceMemory` it was given even though it owns
+        // none of the bytes, so the teardown below gives it back. What that freeing has to be is
+        // `an_import_holds_the_storage_it_resolved`'s to assert; here it only has to not abort.
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            _m: VkDeviceMemory,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+
         let mut d = Driver::new(Account::for_test(Some(1000)));
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkAllocateMemory(allocate);
+        fns.plant_vkFreeMemory(free);
         d.plant_device(DEVICE, fns);
         d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(0)]);
 
