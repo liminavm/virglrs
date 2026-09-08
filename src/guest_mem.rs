@@ -517,6 +517,84 @@ impl std::fmt::Debug for GuestMap {
     }
 }
 
+/// A mapping some other owner holds, borrowed for as long as that owner is borrowed.
+///
+/// The address alone would be exactly the stale reference this tree refuses to make
+/// representable, so the lifetime is carried in the type and tied at construction to whatever
+/// keeps the mapping alive. Read by copy, like every other source here, because the memory is a
+/// GPU driver's and may be written while it is read.
+pub struct HostMapping<'a> {
+    addr: usize,
+    len: u64,
+    owner: core::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> HostMapping<'a> {
+    /// Describe a mapping at `addr` running `len` bytes.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must name a readable mapping of at least `len` bytes that stays mapped for the
+    /// whole of `'a`. Tie `'a` to the value that owns the mapping -- not to the caller's
+    /// convenience -- so that the borrow ending is the mapping ending.
+    pub unsafe fn new(addr: usize, len: u64) -> HostMapping<'a> {
+        HostMapping { addr, len, owner: core::marker::PhantomData }
+    }
+
+    /// How far the mapping runs.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Fill `dst` from `at`, or `false` with `dst` untouched if that range is not wholly inside
+    /// the mapping. The bounds check is here because this is the only place that knows the size.
+    #[must_use]
+    pub fn copy_out(&self, at: u64, dst: &mut [u8]) -> bool {
+        let Ok(at) = usize::try_from(at) else {
+            return false;
+        };
+        if !at.checked_add(dst.len()).is_some_and(|end| end as u64 <= self.len) {
+            return false;
+        }
+        // SAFETY: the check above proved `at + dst.len()` is inside the mapping, and the
+        // constructor's contract is that the mapping is live for `'a`, which this borrow is
+        // within. `dst` is a live host slice of exactly that length; the two cannot overlap
+        // because one is a driver's mapping and the other a buffer the caller brought.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (self.addr as *const u8).add(at),
+                dst.as_mut_ptr(),
+                dst.len(),
+            )
+        };
+        true
+    }
+
+    /// Copy `src` into the mapping at `at`, or `false` with nothing written if it would not fit.
+    ///
+    /// The counterpart to `copy_out`, for the restore that has to put a capture back by the same
+    /// route it was read: a snapshot written somewhere the driver does not look is a restore that
+    /// silently does nothing.
+    #[must_use]
+    pub fn copy_in(&self, at: u64, src: &[u8]) -> bool {
+        let Ok(at) = usize::try_from(at) else {
+            return false;
+        };
+        if !at.checked_add(src.len()).is_some_and(|end| end as u64 <= self.len) {
+            return false;
+        }
+        // SAFETY: as `copy_out`, with the direction reversed and the same bound proved.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), (self.addr as *mut u8).add(at), src.len())
+        };
+        true
+    }
+}
+
 /// Where a blob's pixels are, for the one caller that has to read them without caring which.
 ///
 /// A blob's bytes reach the host by one of two routes -- the guest's own scatter list, or a
@@ -533,6 +611,9 @@ pub enum PixelSource<'a> {
     /// A mapping this process holds: minted shm, or the linear pages a venus allocation was
     /// published from.
     Mapped(&'a GuestMap),
+    /// A mapping this process holds but did not make -- a Vulkan driver's own allocation, mapped
+    /// once by whoever owns it. The bytes are read the same way; only the owner differs.
+    Foreign(HostMapping<'a>),
 }
 
 impl PixelSource<'_> {
@@ -541,6 +622,7 @@ impl PixelSource<'_> {
         match self {
             PixelSource::Scattered(iov) => iov.len(),
             PixelSource::Mapped(map) => map.len() as u64,
+            PixelSource::Foreign(m) => m.len(),
         }
     }
 
@@ -555,6 +637,7 @@ impl PixelSource<'_> {
         match self {
             PixelSource::Scattered(iov) => iov.copy_out(at, dst),
             PixelSource::Mapped(map) => usize::try_from(at).is_ok_and(|at| map.copy_out(at, dst)),
+            PixelSource::Foreign(m) => m.copy_out(at, dst),
         }
     }
 }
