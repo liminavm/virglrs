@@ -10,6 +10,16 @@
 # holds the two sets to it: serving a command means deleting its line, and a protocol bump that
 # adds one means adding a line. Three boots found three of these one at a time before the set was
 # written down; nothing here is a promise to serve them, only a record that we know.
+#
+# What a line here costs, when a guest reaches it: nothing guest-side names the command. Poisoning
+# is the right answer and it is still not a diagnosable one -- the guest's next call fails, its
+# driver reports that failure in its own vocabulary, and the shape of that is a resource error.
+# `vkQueueSubmit2` was measured: zink reported VK_ERROR_OUT_OF_HOST_MEMORY from
+# vkEndCommandBuffer, then "couldn't allocate memory", then GL_OUT_OF_MEMORY in glReadPixels, and
+# then deadlocked with every thread in futex_wait on a fence the dead context would never signal.
+# The test above it saw only its own timeout. The `[virglrs] refused:` line in the worker log is
+# the ONLY place the command is named -- so read that log first, and never diagnose a guest-side
+# OOM or hang without it.
 vkCmdBeginConditionalRenderingEXT
 vkCmdBeginQueryIndexedEXT
 vkCmdBeginRenderPass2
