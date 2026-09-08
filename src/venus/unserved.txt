@@ -34,12 +34,20 @@
 # the ONLY place the command is named -- so read that log first, and never diagnose a guest-side
 # OOM or hang without it.
 #
-# A `wanted` line is not a promise that anything reaches it today. Measured on a seated synoik
-# session plus all 33 glmark2 scenes plus two purpose-built indexed-draw probes: zero refusals.
-# Zink emits `vkCmdDrawMultiIndexedEXT`, which this build serves, wherever the plain
-# `vkCmdDrawIndexed` below would otherwise appear. So a workload census cannot enumerate this
-# file, and it could not anyway -- the first unserved command kills the context, so a boot
-# discovers exactly one. Reach these deliberately, with a Vulkan program that names the command.
+# A `wanted` line is not a promise that anything reaches it today, and not a promise that nothing
+# does. A seated synoik session plus all 33 glmark2 scenes plus two indexed-draw probes refused
+# nothing, because zink emits `vkCmdDrawMultiIndexedEXT` -- which this build serves -- wherever
+# the plain `vkCmdDrawIndexed` below would appear. A stock Fedora 44 desktop, measured
+# 2026-09-08, refuses `vkCreateBufferView` repeatedly while it is merely running.
+#
+# So a workload census cannot enumerate this file: the first unserved command kills the context,
+# so a boot discovers exactly one and says nothing about the rest. Reach these deliberately, with
+# a program that names the command -- `harness/probes/` is one per group.
+#
+# And read the worker log, not the program. A guest reads a zeroed reply as success, and venus
+# answers some commands guest-side without asking the host at all, so a probe can report `ok` for
+# a command that was refused: measured on the events group, where vkCreateEvent was refused and
+# the next four checks still passed. `[virglrs] refused:` is the oracle. The program is not.
 vkCmdBeginConditionalRenderingEXT                  wanted:conditional-rendering
 vkCmdBeginQueryIndexedEXT                          wanted:transform-feedback
 vkCmdBeginRenderPass2                              wanted:render-pass2
