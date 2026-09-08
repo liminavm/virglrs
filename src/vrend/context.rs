@@ -2383,16 +2383,29 @@ impl Context {
             let res_format = res.args.format;
             let supports_view = res.supports_view();
             let res_is_ds = res_format.describe().is_some_and(|d| d.is_depth_or_stencil());
-            let mut needs_view = target != tex_target;
+            // Two separate needs, and only one of them is a need for a *view*.
+            //
+            // `reinterprets` is the view reading the texture as something it is not: another
+            // target, another format, a slice of its levels or layers. Nothing but a real
+            // texture view does that.
+            //
+            // `private` is the view needing only an object of its own. Swizzle, mip range and
+            // depth-stencil mode belong to the view, but GL keeps them on the texture object,
+            // so a view sharing its texture writes its answer onto an object every other view
+            // of that texture reads, and the last writer wins. mesa's `vl_compositor` is the
+            // case that matters: it addresses the three colour planes of a packed surface as
+            // three sampler views over one texture, swizzled `RRR1`, `GGG1` and `BBB1`, and
+            // every sampler then read whichever channel was bound last -- a structurally
+            // perfect picture in one colour. Any private object settles that; it does not have
+            // to be a view.
+            //
+            // Keeping them apart is what lets the second be served where the first cannot be.
+            let mut reinterprets = target != tex_target;
             let view_format = if res_is_ds { res_format } else { v.format };
             if !res_is_ds && v.format != res_format {
-                needs_view = true;
+                reinterprets = true;
             }
-            // A swizzle is the view's own, and GL keeps it on the texture object, so a view
-            // that carries one needs an object no other view will overwrite.
-            if gl_swizzle != IDENTITY_SWIZZLE {
-                needs_view = true;
-            }
+            let private = gl_swizzle != IDENTITY_SWIZZLE;
             // A plane index, not a layer range. Sampling plane N of a planar surface, the
             // guest writes the index into the same dword the layer range is packed in
             // (`virgl_encode_sampler_view`), so it arrives as first_layer = N, last_layer = 0.
@@ -2453,91 +2466,100 @@ impl Context {
                     last_layer = 0;
                 }
                 if first_layer > 0 || first_level > 0 {
-                    needs_view = true;
+                    reinterprets = true;
                 }
-                // A view whenever the host can mint one, not only when the view differs from
-                // its texture.
-                //
-                // Swizzle, mip range and depth-stencil mode belong to the *view*, but GL keeps
-                // them on the texture object, so the fallback below writes one view's answer
-                // onto an object every other view of that texture shares and the last writer
-                // wins. mesa's vl_compositor is the case that matters: it addresses the three
-                // colour planes of a packed surface as three sampler views over one texture,
-                // swizzled RRR1, GGG1 and BBB1, and every sampler then read whichever channel
-                // was bound last -- a structurally perfect picture in one colour.
-                //
-                // Minting unconditionally is what removes the clash rather than narrowing it.
-                // A predicate ("...or the swizzle is non-identity") would have to grow a term
-                // for every per-view parameter anyone adds to the fallback, and the one nobody
-                // adds is the next silent corruption; a private object has no one to race.
-                if needs_view && immutable && features.has(Feature::texture_view) {
-                    let levels = last_level.wrapping_sub(first_level).wrapping_add(1);
-                    let layers = last_layer as i64 - first_layer as i64 + 1;
-                    // The guest chose these. `glTextureView` refuses a range past the texture's
-                    // own and leaves the context in GL error for the rest of its life, so a
-                    // range that overruns is rejected here rather than handed to the driver.
-                    // Levels are exact for every target. Layers are only checked where the
-                    // texture's own count says what they mean -- a genuine array -- because a
-                    // cube's faces and a 3D texture's slices are counted elsewhere, and
-                    // refusing a view the guest was entitled to costs it its context just as
-                    // dearly as a driver error would.
-                    let has_levels = res.args.last_level + 1;
-                    let array = i64::from(res.args.array_size);
-                    if levels == 0
-                        || layers <= 0
-                        || first_level + levels > has_levels
-                        || (array > 1 && i64::from(first_layer) + layers > array)
-                    {
-                        return Err(Fault::OutOfRange {
-                            cmd,
-                            what: "sampler view layers or levels",
-                        });
+                let image = res.texture().and_then(|t| t.image.as_ref());
+                let minted = match view_route(ViewNeed {
+                    reinterprets,
+                    private,
+                    supports_view,
+                    has_image: image.is_some(),
+                    can_view: immutable && features.has(Feature::texture_view),
+                }) {
+                    Route::Shared => None,
+                    Route::Reimport => {
+                        let image = image
+                            .expect("a reimport is only routed to for a texture with an image");
+                        let name = gl.gen_texture();
+                        gl.bind_texture(target, Some(name));
+                        gl.egl_image_target_texture_2d(target, image);
+                        probe("egl_image_target_texture_2d for a private sampler view");
+                        Some(name)
                     }
-                    let ifmt = formats
-                        .get(view_format)
-                        .ok_or(Fault::IllegalFormat { cmd, format: view_format })?
-                        .gl
-                        .internalformat;
-                    let name = gl.gen_texture();
-                    // A view of an IOSurface-backed BGR* texture reads its red and blue swapped
-                    // (`Resource::supports_view`); the sampler's swizzle is ours to set, so the
-                    // swap is undone there. A BGR*-to-RGB* swap the guest asked for is left alone.
-                    //
-                    // Substituting the two sources, not exchanging two destinations: the texels
-                    // are what moved, so every channel that asks for red must be given blue and
-                    // the reverse, however many of them there are. The two agree whenever the
-                    // guest's swizzle is a permutation, and part ways on the swizzles that
-                    // broadcast one channel -- `RRR1` has to become `BBB1`, while exchanging
-                    // slots 0 and 2 leaves it reading red.
-                    if !supports_view && resource::is_bgra(v.format) {
-                        undo_bgra_swap(&mut gl_swizzle);
-                    }
-                    gl.texture_view(
-                        name,
-                        target,
-                        tex,
-                        ifmt,
-                        first_level,
-                        levels,
-                        first_layer,
-                        layers as GLuint,
-                    );
-                    if std::env::var_os("LIMINA_GL_TRACE").is_some() {
-                        eprintln!(
-                            "[virglrs] vrend: sampler view: texture_view of resource {:?} \
+                    Route::View => {
+                        let levels = last_level.wrapping_sub(first_level).wrapping_add(1);
+                        let layers = last_layer as i64 - first_layer as i64 + 1;
+                        // The guest chose these. `glTextureView` refuses a range past the texture's
+                        // own and leaves the context in GL error for the rest of its life, so a
+                        // range that overruns is rejected here rather than handed to the driver.
+                        // Levels are exact for every target. Layers are only checked where the
+                        // texture's own count says what they mean -- a genuine array -- because a
+                        // cube's faces and a 3D texture's slices are counted elsewhere, and
+                        // refusing a view the guest was entitled to costs it its context just as
+                        // dearly as a driver error would.
+                        let has_levels = res.args.last_level + 1;
+                        let array = i64::from(res.args.array_size);
+                        if levels == 0
+                            || layers <= 0
+                            || first_level + levels > has_levels
+                            || (array > 1 && i64::from(first_layer) + layers > array)
+                        {
+                            return Err(Fault::OutOfRange {
+                                cmd,
+                                what: "sampler view layers or levels",
+                            });
+                        }
+                        let ifmt = formats
+                            .get(view_format)
+                            .ok_or(Fault::IllegalFormat { cmd, format: view_format })?
+                            .gl
+                            .internalformat;
+                        let name = gl.gen_texture();
+                        // A view of an IOSurface-backed BGR* texture reads its red and blue swapped
+                        // (`Resource::supports_view`); the sampler's swizzle is ours to set, so the
+                        // swap is undone there. A BGR*-to-RGB* swap the guest asked for is left alone.
+                        //
+                        // Substituting the two sources, not exchanging two destinations: the texels
+                        // are what moved, so every channel that asks for red must be given blue and
+                        // the reverse, however many of them there are. The two agree whenever the
+                        // guest's swizzle is a permutation, and part ways on the swizzles that
+                        // broadcast one channel -- `RRR1` has to become `BBB1`, while exchanging
+                        // slots 0 and 2 leaves it reading red.
+                        if !supports_view && resource::is_bgra(v.format) {
+                            undo_bgra_swap(&mut gl_swizzle);
+                        }
+                        gl.texture_view(
+                            name,
+                            target,
+                            tex,
+                            ifmt,
+                            first_level,
+                            levels,
+                            first_layer,
+                            layers as GLuint,
+                        );
+                        if std::env::var_os("LIMINA_GL_TRACE").is_some() {
+                            eprintln!(
+                                "[virglrs] vrend: sampler view: texture_view of resource {:?} \
                              ({}x{} {}, immutable {immutable}, surface {}, supports_view \
                              {supports_view}) as {} target {target:#x} internalformat {ifmt:#x} \
                              levels {first_level}+{levels} layers {first_layer}+{layers}",
-                            v.resource,
-                            res.args.width,
-                            res.args.height,
-                            res.args.format.name(),
-                            res.surface().is_some(),
-                            view_format.name(),
-                        );
+                                v.resource,
+                                res.args.width,
+                                res.args.height,
+                                res.args.format.name(),
+                                res.surface().is_some(),
+                                view_format.name(),
+                            );
+                        }
+                        probe("texture_view");
+                        gl.bind_texture(target, Some(name));
+                        Some(name)
                     }
-                    probe("texture_view");
-                    gl.bind_texture(target, Some(name));
+                };
+                // The per-view state, on whichever private object was minted. This is the state
+                // that made the object worth minting, so it is set the same way by both routes.
+                if let Some(name) = minted {
                     if desc.is_some_and(|d| d.is_depth_or_stencil())
                         && features.has(Feature::stencil_texturing)
                     {
@@ -2691,6 +2713,68 @@ fn to_gl_swizzle(s: Swizzle) -> GLenum {
         Swizzle::Zero => GL_ZERO,
         Swizzle::One => GL_ONE,
     }
+}
+
+/// What is known about a sampler view and its texture when deciding how the view gets a GL
+/// texture object of its own.
+#[derive(Clone, Copy, Debug)]
+struct ViewNeed {
+    /// The view reads the texture as something it is not: another target, another format, or a
+    /// slice of its levels or layers. Only a real texture view can do that.
+    reinterprets: bool,
+    /// The view carries state GL keeps on the *texture* object rather than on the view -- a
+    /// swizzle, a mip range, a depth-stencil read mode -- so it must not share one.
+    private: bool,
+    /// A `glTextureView` of this texture would mean what it says. See `Resource::supports_view`.
+    supports_view: bool,
+    /// The texture's storage is an EGL image, so the same image can be imported a second time.
+    has_image: bool,
+    /// `glTextureView` can be called at all: the texture is immutable and the host has the entry.
+    can_view: bool,
+}
+
+/// How a sampler view gets its own object, or whether it needs one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Route {
+    /// Share the resource's texture. The view asks for nothing another view could overwrite, or
+    /// there is no way to give it an object and the shared one is better than none.
+    Shared,
+    /// `glTextureView`. The general route, and the only one that can reinterpret.
+    View,
+    /// Import the texture's EGL image a second time, into a fresh name.
+    Reimport,
+}
+
+/// Choose the route.
+///
+/// The two needs are met differently, and separating them is the whole point. `reinterprets` can
+/// only ever be served by a view. `private` wants an object nobody else writes to, and any object
+/// will do -- which matters because there is a texture no view can be taken of at all.
+///
+/// That texture is an IOSurface-backed BGR* one. Its storage is BGRA8, GL has no internalformat
+/// that names BGRA8, so the view is asked for `GL_RGBA8` over it and the driver refuses with
+/// `GL_INVALID_OPERATION`. A refused `CREATE_OBJECT` poisons the context and every later
+/// submission on it fails, which is how this was found: a Vulkan client's four swapchain buffers,
+/// sampled with the `W -> One` swizzle every alpha-less format carries, ended the compositor's
+/// context for the rest of the boot and left a desktop that could not be repainted.
+///
+/// Importing the same EGL image into a second texture name gives an equally private object with
+/// no view class to satisfy. It needs no red/blue compensation either -- the second texture is as
+/// natively BGRA as the first, the swap being an artifact of the view and not of the storage.
+///
+/// The C reaches the same place by a shorter road: its `needs_view` has no swizzle term at all,
+/// so it never asks for the view and lives with the shared texture. That leaves `vl_compositor`
+/// reading one texture through three broadcast swizzles and seeing whichever was bound last -- a
+/// structurally perfect picture in one colour. This keeps the private object and drops only the
+/// view.
+fn view_route(n: ViewNeed) -> Route {
+    if !n.reinterprets && !n.private {
+        return Route::Shared;
+    }
+    if !n.supports_view && !n.reinterprets && n.has_image {
+        return Route::Reimport;
+    }
+    if n.can_view { Route::View } else { Route::Shared }
 }
 
 /// Undo the red/blue exchange an IOSurface-backed BGR* texture reads with.
@@ -4259,6 +4343,61 @@ fn video_result(cmd: Cmd, result: Result<(), video::Refusal>) -> Result<(), Faul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ordinary immutable texture: both needs go to a view, which is what the C does for the
+    /// first and what the `vl_compositor` fix added for the second.
+    const ORDINARY: ViewNeed = ViewNeed {
+        reinterprets: false,
+        private: false,
+        supports_view: true,
+        has_image: false,
+        can_view: true,
+    };
+
+    /// An IOSurface-backed BGR* texture: `glTextureView` over it is `GL_RGBA8` over BGRA8 storage
+    /// and the driver refuses, so the only object it can have is a second import of its image.
+    const UNVIEWABLE: ViewNeed = ViewNeed { supports_view: false, has_image: true, ..ORDINARY };
+
+    #[test]
+    fn a_view_that_asks_for_nothing_shares_the_texture() {
+        assert_eq!(view_route(ORDINARY), Route::Shared);
+        assert_eq!(view_route(UNVIEWABLE), Route::Shared);
+    }
+
+    /// The regression. A swizzle is per-view state GL keeps on the texture, so the view needs an
+    /// object -- but not a *view* object, and asking for one here poisons the context for the
+    /// rest of its life. A compositor sampling a Vulkan client's alpha-less swapchain image is
+    /// exactly this, and it stopped painting.
+    #[test]
+    fn a_swizzle_over_an_unviewable_texture_reimports_rather_than_viewing() {
+        let n = ViewNeed { private: true, ..UNVIEWABLE };
+        assert_eq!(view_route(n), Route::Reimport);
+    }
+
+    /// And the counter-pressure the reimport exists to preserve: on a texture that can be viewed,
+    /// a swizzle still gets its own object. Sharing one is what let `vl_compositor`'s three
+    /// broadcast swizzles overwrite each other into a picture in a single colour.
+    #[test]
+    fn a_swizzle_over_an_ordinary_texture_still_gets_an_object_of_its_own() {
+        let n = ViewNeed { private: true, ..ORDINARY };
+        assert_eq!(view_route(n), Route::View);
+    }
+
+    /// Reinterpreting is the one need a second import cannot serve -- it hands back the whole
+    /// surface in its own format -- so it goes to a view even where a view is a poor bet.
+    #[test]
+    fn reinterpreting_always_asks_for_a_view() {
+        assert_eq!(view_route(ViewNeed { reinterprets: true, ..ORDINARY }), Route::View);
+        assert_eq!(view_route(ViewNeed { reinterprets: true, ..UNVIEWABLE }), Route::View);
+    }
+
+    /// A host with no `glTextureView`, or a mutable texture, has no object to give: the shared
+    /// texture is worse than a private one and far better than a refusal.
+    #[test]
+    fn a_host_that_cannot_view_falls_back_rather_than_refusing() {
+        let n = ViewNeed { private: true, reinterprets: true, can_view: false, ..ORDINARY };
+        assert_eq!(view_route(n), Route::Shared);
+    }
 
     /// The compensation is a substitution on the sources, so a swizzle that broadcasts one
     /// channel follows it. This is the case a destination swap gets wrong, and the shape mesa's
