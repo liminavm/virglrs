@@ -263,19 +263,9 @@ impl Journal {
     /// reset recycles every buffer it handed out *without invalidating any of them*, so not one
     /// key changes and the arena has nothing to say. The pool is found the way the closure finds
     /// anything — a buffer's allocate is the entry that named the pool.
-    pub fn pool_reset(&mut self, pool: ObjectKey) {
-        let buffers: Vec<ObjectKey> = self
-            .entries
-            .iter()
-            .filter(|e| e.refs.contains(&pool))
-            .filter_map(|e| match &e.about {
-                About::Created(keys) => Some(keys.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
+    pub fn pool_reset(&mut self, buffers: &[ObjectKey]) {
         for b in buffers {
-            self.recordings.remove(&b);
+            self.recordings.remove(b);
         }
     }
 
@@ -747,8 +737,13 @@ mod tests {
 
     /// A pool reset recycles every buffer without invalidating one, so no key changes and only
     /// this can answer.
+    /// A pool reset discards exactly the recordings of the buffers it is given, and nothing else.
+    ///
+    /// Which buffers those are is no longer this file's question: the handler asks the driver,
+    /// which is the only thing that knows what a pool handed out, and hands the answer down. That
+    /// moved a scan of every entry ever kept off a command a compositor can send every frame.
     #[test]
-    fn resetting_a_pool_discards_every_recording_made_from_it() {
+    fn resetting_a_pool_discards_the_recordings_it_names() {
         let k = keys(4);
         let (pool, other_pool, mine, theirs) = (k[0], k[1], k[2], k[3]);
         let mut j = Journal::new();
@@ -759,13 +754,13 @@ mod tests {
         j.recorded(5, &[5; 4], mine, true, Vec::new());
         j.recorded(6, &[6; 4], theirs, true, Vec::new());
 
-        j.pool_reset(pool);
+        j.pool_reset(&[mine]);
 
         let live = Some_(vec![pool, other_pool, mine, theirs]);
         let out = j.retained(&live);
         let wires: Vec<&[u8]> = out.iter().map(|e| e.wire).collect();
-        assert!(!wires.contains(&&[5; 4][..]), "the reset pool's recording is gone");
-        assert!(wires.contains(&&[6; 4][..]), "and the other pool's is untouched");
+        assert!(!wires.contains(&&[5; 4][..]), "the named buffer's recording is gone");
+        assert!(wires.contains(&&[6; 4][..]), "and a buffer it did not name is untouched");
         assert_eq!(out.len(), 5, "every allocate survives -- a reset frees nothing");
     }
 
