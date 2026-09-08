@@ -978,6 +978,20 @@ no push-descriptor command at all — so a guest that pushes descriptors is unme
 diverges. `vkUpdateDescriptorSetWithTemplate` needs no coverage: the C dispatches it to NULL, which
 means the guest expands templates before encoding and the plain path is the only path.
 
+**Nothing here scores venus for cost, so a renderer can get quadratically slower and stay green.**
+Performance is a trend ledger and never a gate (below), and the ledger has no venus row at all.
+What that let through, found on the dogfood and not here: discarding a command buffer's recording
+was a linear scan of the whole snapshot journal, run on every `vkBeginCommandBuffer`, on the ring
+thread inside the guest's submit path — so it grew with the session and a video decode, which
+begins a buffer per frame, drove the worker to 161% CPU against an idle guest. Every correctness
+oracle passed throughout, because the renderer was right and only slow.
+
+A unit timing test is not the fix: a threshold tuned tightly enough to catch this is tight enough
+to fire on a loaded machine, and the property under test is cost per command, not wall time. What
+is owed is a venus row in the ledger — user CPU of `vkr-replay` over a video-shaped corpus, which
+is the one that begins buffers in a loop — read as a trend against the pinned corpora the scores
+already use.
+
 **`vrend-av1.score` is stale.** It predates scoring at the format's own bytes per texel and cannot
 be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
 
