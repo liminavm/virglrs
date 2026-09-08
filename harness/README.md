@@ -988,9 +988,12 @@ oracle passed throughout, because the renderer was right and only slow.
 
 A unit timing test is not the fix: a threshold tuned tightly enough to catch this is tight enough
 to fire on a loaded machine, and the property under test is cost per command, not wall time. What
-is owed is a venus row in the ledger — user CPU of `vkr-replay` over a video-shaped corpus, which
-is the one that begins buffers in a loop — read as a trend against the pinned corpora the scores
-already use.
+is owed is a venus row in the ledger — user CPU of `vkr-replay`, read as a trend against the
+pinned corpora the scores already use. No new corpus is needed for it: measured 2026-09-08,
+`synoik-vkcube` begins 4,568 command buffers over 74,829 commands and `synoik-glclient` 4,426 over
+61,260, which is the shape that makes a per-begin scan of a growing journal visible. Read it from
+those two and not from `venus.vkrc`, which is much the largest corpus at 578,868 commands and
+begins only 436 buffers.
 
 **`vrend-av1.score` is stale.** It predates scoring at the format's own bytes per texel and cannot
 be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
