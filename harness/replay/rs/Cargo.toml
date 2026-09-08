@@ -28,7 +28,7 @@ reply-oracle = ["virglrenderer/reply-oracle"]
 [dependencies]
 bumpalo = "3.20"
 libc = "0.2"
-virglrenderer = { package = "virglrs", path = "../../../virglrs" }
+virglrenderer = { package = "virglrs", path = "../../.." }
 
 [profile.release]
 panic = "abort"
