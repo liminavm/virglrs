@@ -744,21 +744,29 @@ and memory bindings wrong long before it gets a colour space wrong. The census d
 excludes map_ptr-exported blobs — those are the VMM's mapped-blob capture and are already
 host-mapped — so what gets hashed is GPU-produced state plus allocations nothing has written.
 
-**A zero hash is a fact about the driver, not a failed read.** Every host-visible allocation this
-renderer makes is pages it minted and handed the driver as a host-pointer import, so that a blob
-over one can outlive the guest's `vkFreeMemory`. KosmicKrisp honours such an import for a buffer
-and for a LINEAR image, but keeps an OPTIMAL image's texels in a private texture -- the image
-renders correctly and the imported pages stay blank, and `vkMapMemory` does not reach the texels
-either. So an allocation whose only content is an OPTIMAL image hashes as N zero bytes here.
+**A zero hash is a fact about the driver, not a failed read.** Metal cannot back a tiled image
+with imported host memory: KosmicKrisp's own allocations are MTLHeaps with a whole-span buffer, a
+host-pointer import can make no heap, and a tiled plane over heap-less memory is given a separate
+private bo. So an OPTIMAL image bound to memory this renderer minted renders correctly while the
+imported pages stay blank, and `vkMapMemory` does not reach the texels either.
 
-Measured 2026-09-06, joining every censused id to the object bound to its memory: `synoik` scores
-20 of 22 entries as zeros and `synoik-glclient` 21 of 23, and **every one of the 41 is an OPTIMAL
-image**. No buffer and no LINEAR image is among them -- those the census reads correctly. The four
-that carry data are the 4 MiB scanouts, and they discriminate because they are not read through the
-pages at all: their backing is an IOSurface and `Surface::read_into` copies from the surface.
-Reaching the rest needs a census that copies out of the `VkImage` rather than out of the memory;
-until it exists, the venus score is a weak oracle for these two corpora and the pixel gate is the
-one that matters.
+Which allocations that can still happen to is decided at `vkAllocateMemory`. An allocation the
+guest **declared** for export is minted pages -- that is where cross-context import is measured,
+a compositor sampling a client's window through them -- so a declared export over an OPTIMAL
+image hashes as N zero bytes, and says so on the capture rather than being silent. An
+**undeclared** host-visible allocation is the driver's own memory, mapped once and owned by this
+renderer, so the census reads whatever the driver wrote, tiled or not.
+
+That split is what the score measures. Before it, measured 2026-09-06, `synoik` scored 20 of 22
+entries as zeros and `synoik-glclient` 21 of 23, every one of the 41 an OPTIMAL image; the two
+corpora had eleven discriminating entries between them at the start of the port and two after.
+The four that always carried data are the 4 MiB scanouts, which are not read through pages at all
+-- their backing is an IOSurface and `Surface::read_into` copies from the surface.
+
+Reaching what is left needs a census that copies out of the `VkImage` rather than out of the
+memory, which is guest image-layout tracking on both sides -- see "The census reads the memory, so
+an image's texels can escape it" below. Until it exists the pixel gate is the one that settles a
+claim about content.
 
 Each context is scored when it is destroyed, and once more at the end if it is still alive. A
 workload that exits cleanly frees everything, so scoring only at the end would score nothing.
@@ -771,9 +779,9 @@ Same sampler, same stability rule, one line per blob: `blob ctx=<c> res=<h> size
 hash=<h>`, where `size` is the extent the renderer maps rather than the size the blob was created
 for, because a resource that maps short is the divergence worth catching.
 
-It is also the only read that survives the allocation. A host-visible venus allocation is minted
-pages the blob holds a *share* of, so `vkFreeMemory` retires the record and leaves the mapping
-good — and every venus corpus reaches that state: measured 2026-09-06, `venus` frees all 26 of its
+It is also the only read that survives the allocation. A host-visible venus allocation owns its
+bytes -- minted pages, or the driver's memory and the one mapping over it -- and the blob holds a
+*share*, so `vkFreeMemory` retires the record and leaves the mapping good — and every venus corpus reaches that state: measured 2026-09-06, `venus` frees all 26 of its
 exported allocations and still has five blobs alive to read at scoring, `synoik-lifecycle` frees
 nine. The minted pages are an `mmap` whose last holder `munmap`s them (`GuestMap::drop`), so a
 resource that kept the published address without the share would take the replayer down with a
@@ -790,10 +798,10 @@ renderer is perfectly deterministic.
 A fixture is recorded from the C, so the gate ladder compares Rust to Rust and a fixture mismatch
 means a regression. Reading a Rust score against the *C's* score is a different question, and the
 answer is agreement on every census id and size, on every `iosurface backed` count, and on the
-hash of everything the paragraph above does not cover. The C leaves host-visible memory to the
-driver and publishes the driver's own pointer, so where this tree reads zeros for an OPTIMAL
-image the C reads the driver's linear backing. Comparing those entries across the two trees
-compares two different allocation models, not two ports.
+hash of everything the paragraph above does not cover. The C leaves *all* host-visible memory to
+the driver and publishes the driver's own pointer -- including the declared exports this tree
+mints for -- so those entries still compare two allocation models rather than two ports. The
+undeclared ones no longer do: both trees read the driver's own memory there.
 
 Equal totals are not agreement. These two censuses once read 22 against 22 while sharing only
 twenty entries, because a missing export and a missing import cancelled. Compare the ids, never
