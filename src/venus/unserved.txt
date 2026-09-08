@@ -135,7 +135,6 @@ vkGetRayTracingCaptureReplayShaderGroupHandlesKHR
 vkGetRayTracingShaderGroupHandlesKHR
 vkGetRayTracingShaderGroupStackSizeKHR
 vkQueueBindSparse
-vkQueueSubmit2
 vkRegisterCustomBorderColorEXT
 vkSetPrivateData
 vkTrimCommandPool

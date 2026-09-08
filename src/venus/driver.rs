@@ -45,10 +45,10 @@ use super::proto::types::{
     VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingInfo, VkResult,
     VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
     VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
-    VkSemaphoreSignalInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitInfo,
-    VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp, VkStructureType,
-    VkSubmitInfo, VkSubpassContents, VkSubresourceLayout, VkTimelineSemaphoreSubmitInfo,
-    VkViewport, VkWriteDescriptorSet,
+    VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
+    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
+    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassContents, VkSubresourceLayout,
+    VkTimelineSemaphoreSubmitInfo, VkViewport, VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::Arc;
@@ -1338,6 +1338,38 @@ impl Driver {
             for (sem, value) in sems.iter().zip(values) {
                 if let Some(f) = self.semaphores.get_mut(sem) {
                     f.requested = f.requested.max(*value);
+                }
+            }
+        }
+    }
+
+    /// The same bookkeeping for `vkQueueSubmit2`, where the wire got the pairing right.
+    ///
+    /// v1 splits a signal into three places -- the semaphore in `pSignalSemaphores`, its value in
+    /// a `VkTimelineSemaphoreSubmitInfo` hung off `pNext`, and the two counted separately with
+    /// Vulkan allowing the value array to be the shorter -- so `note_submit` has to reconcile a
+    /// pair before it can read either half. `VkSemaphoreSubmitInfo` carries the semaphore and its
+    /// value as one struct, so there is no pair here to disagree and no chain to walk.
+    fn note_submit2(&mut self, submits: &[VkSubmitInfo2], fence: VkFence) {
+        if fence != VkFence(0) {
+            self.pending_fences.insert(fence);
+        }
+        for s in submits {
+            // SAFETY: the decoder allocated this array from the batch arena, sized to the count
+            // beside it, and it outlives this call. `wire_array` is the same reconciliation the
+            // generated accessors use.
+            let signals = unsafe {
+                crate::venus::cs::wire_array::<VkSemaphoreSubmitInfo>(
+                    s.signalSemaphoreInfoCount as usize,
+                    s.pSignalSemaphoreInfos,
+                )
+            };
+            let Some(signals) = signals else { continue };
+            for info in signals {
+                if let Some(f) = self.semaphores.get_mut(&info.semaphore) {
+                    // A binary semaphore's `value` is ignored by Vulkan and is zero here, which
+                    // raises nothing -- so the kind needs no test.
+                    f.requested = f.requested.max(info.value);
                 }
             }
         }
@@ -3480,6 +3512,29 @@ impl Driver {
         Some(unsafe { (d.vkQueueSubmit())(queue, submits.len() as u32, submits.as_ptr(), fence) })
     }
 
+    /// `vkQueueSubmit2`, the synchronization2 form of the submit above.
+    ///
+    /// The two refusals are different guest mistakes and the caller names them apart -- see
+    /// [`NoSubmit2`].
+    pub fn queue_submit2(
+        &mut self,
+        queue: VkQueue,
+        submits: &[VkSubmitInfo2],
+        fence: VkFence,
+    ) -> Result<VkResult, NoSubmit2> {
+        let f = self
+            .submitter(queue)
+            .ok_or(NoSubmit2::Queue)?
+            .try_vkQueueSubmit2()
+            .ok_or(NoSubmit2::EntryPoint)?;
+        self.note_submit2(submits, fence);
+        // Submitting no work to signal a fence is as normal here as it is for v1, and Vulkan takes
+        // a null array for it -- so the slice's own pointer is passed either way.
+        // SAFETY: a queue this context retrieved, and `submits` is an arena allocation live for
+        // the call whose count is its own length.
+        Ok(unsafe { f(queue, submits.len() as u32, submits.as_ptr(), fence) })
+    }
+
     /// `vkResetFences`.
     pub fn reset_fences(&mut self, device: VkDevice, fences: &[VkFence]) -> VkResult {
         let Some(d) = self.devices.get(&device) else {
@@ -5232,6 +5287,23 @@ pub enum NotATimeline {
     /// pair -- and refused here rather than treated as an empty wait, which would report a wait
     /// that never happened.
     Malformed,
+}
+
+/// Why a `vkQueueSubmit2` was refused without being forwarded.
+///
+/// Both are the guest's own doing and neither is a `VkResult`, so the caller poisons the context
+/// rather than answering. Kept apart because they are different mistakes and a log that says which
+/// is the difference between "this guest named a queue it does not have" and "this build
+/// advertises a command this device does not export".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NoSubmit2 {
+    /// A queue this context never retrieved.
+    Queue,
+    /// The device exports no `vkQueueSubmit2`. Ordinary guest input, not a host fault: the capset's
+    /// extension mask is what the pinned vk.xml can serialize, which is wider than what any one
+    /// device enables -- so the panicking accessor would turn a guest's choice at
+    /// `vkCreateDevice` into a process abort.
+    EntryPoint,
 }
 
 /// What a live semaphore is, and what it has been asked to do.
