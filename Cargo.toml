@@ -13,6 +13,13 @@ crate-type = ["cdylib", "rlib"]
 # abort is the behaviour we want from a violated host invariant anyway -- see CLAUDE.md.
 [profile.dev]
 panic = "abort"
+# The renderer is compiled into whatever boots it, so a dev build of the *consumer* gets a dev
+# build of this crate -- and an unoptimized renderer is not slow the way debug code is usually
+# slow, it is slow per guest command, which is the axis a workload scales on. A dev-profile
+# renderer measured against an optimized one reads as a tenfold regression in the renderer, with
+# nothing in either tree to find. Consumers must say the same thing about this crate in their own
+# profile: `[profile.dev.package.virglrs] opt-level = 3`.
+opt-level = 3
 
 [profile.release]
 panic = "abort"
