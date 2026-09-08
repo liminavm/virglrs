@@ -604,10 +604,33 @@ impl Context {
         if self.fatal.load(Ordering::Acquire) {
             return Submitted::Poisoned;
         }
+        // Here and nowhere inside the loop: measuring what is still live reads the object table,
+        // and a handler may be holding it. The batch is over, so nothing is.
+        self.collect_journal();
         match suspended {
             Some((consumed, on)) => Submitted::Waiting { consumed, on },
             None => Submitted::Done,
         }
+    }
+
+    /// Drop what the journal and the export record are holding on behalf of things that are gone.
+    ///
+    /// Between batches, because both questions read the object table and a handler may be holding
+    /// it -- and after one, because a batch is what makes the dead weight.
+    ///
+    /// Costs two lengths on the batches where nothing is due, which is nearly all of them. When it
+    /// does run it is a walk of everything, paid for by the doubling rule that triggered it.
+    fn collect_journal(&mut self) {
+        if !self.journal.due() {
+            return;
+        }
+        // Disjoint fields rather than `self.live()`: the journal is taken mutably here.
+        let live = LiveObjects { objects: &self.objects, exports: &self.exports };
+        self.journal.compact(&live);
+        // The export record is the same kind of pile. An entry whose key is gone and whose share
+        // nobody holds can never answer anything again, for the reason `compact` documents.
+        let objects = &self.objects;
+        self.exports.retain(|k, w| w.held() || objects.borrow().holds(*k));
     }
 
     /// A submission that arrived on one ring's stream.
