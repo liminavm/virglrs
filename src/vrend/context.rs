@@ -2751,31 +2751,49 @@ enum Route {
 /// only ever be served by a view. `private` wants an object nobody else writes to, and any object
 /// will do -- which matters because there is a texture no view can be taken of at all.
 ///
-/// That texture is an IOSurface-backed BGR* one. Its storage is BGRA8, GL has no internalformat
-/// that names BGRA8, so the view is asked for `GL_RGBA8` over it and the driver refuses with
-/// `GL_INVALID_OPERATION`. A refused `CREATE_OBJECT` poisons the context and every later
-/// submission on it fails, which is how this was found: a Vulkan client's four swapchain buffers,
-/// sampled with the `W -> One` swizzle every alpha-less format carries, ended the compositor's
-/// context for the rest of the boot and left a desktop that could not be repainted.
+/// A view can only be taken of ordinary GL storage. Two textures are not that, and both must be
+/// kept away from `glTextureView`, because a refused `CREATE_OBJECT` poisons the context and every
+/// later submission on it fails -- a desktop that cannot be repainted for the rest of the boot,
+/// paid for one sampler view.
+///
+/// The first is any texture whose storage is an imported EGL image. `glTextureView` over one is
+/// `GL_INVALID_OPERATION` however the image was imported and whatever the texture reports about
+/// itself. Measured on KosmicKrisp 2026-09-08, `EXT_EGL_image_storage` in use and
+/// `GL_TEXTURE_IMMUTABLE_FORMAT` read back from the driver as true: four 1280x720
+/// `R8G8B8X8_UNORM` swapchain images, viewed at their own format, own target and full range, all
+/// four refused; the 658 views of ordinary textures in the same session all succeeded. Neither
+/// immutability nor the format is what decides it -- the storage is.
+///
+/// The second is an IOSurface-backed BGR* one, which is a special case of the first and named
+/// separately by `Resource::supports_view` because the conversion helpers beside it need the
+/// distinction.
 ///
 /// Importing the same EGL image into a second texture name gives an equally private object with
-/// no view class to satisfy. It needs no red/blue compensation either: the swap is an artifact of
-/// the view, not of the storage, so a second import reads the same channels as the first.
-/// Measured on KosmicKrisp 2026-09-07, the swizzled path live -- a Vulkan client's triangle drew
-/// red at the apex and blue at the bottom left, which is what its vertices say and what an
-/// exchange of those two channels would have made unmistakable.
+/// no view class to satisfy, aliasing the same storage rather than copying it. It needs no
+/// red/blue compensation: the swap is an artifact of the view, not of the storage, so a second
+/// import reads the same channels as the first. Measured on KosmicKrisp 2026-09-07, the swizzled
+/// path live -- a Vulkan client's triangle drew red at the apex and blue at the bottom left,
+/// which is what its vertices say and what an exchange of those two channels would have made
+/// unmistakable.
 ///
-/// The C reaches the same place by a shorter road: its `needs_view` has no swizzle term at all,
-/// so it never asks for the view and lives with the shared texture. That leaves `vl_compositor`
-/// reading one texture through three broadcast swizzles and seeing whichever was bound last -- a
-/// structurally perfect picture in one colour. This keeps the private object and drops only the
-/// view.
+/// What a second import cannot do is reinterpret: it hands back the whole surface in its own
+/// format. So a view that reinterprets storage no view can be taken of is served unreinterpreted,
+/// on the same terms as a host with no `glTextureView` at all. A wrong sample costs one draw and
+/// a refused view costs the context its life.
+///
+/// The C reaches the private object by a shorter road: its `needs_view` has no swizzle term at
+/// all, so it never asks for the view and lives with the shared texture. That leaves
+/// `vl_compositor` reading one texture through three broadcast swizzles and seeing whichever was
+/// bound last -- a structurally perfect picture in one colour. This keeps the private object and
+/// drops only the view.
 fn view_route(n: ViewNeed) -> Route {
     if !n.reinterprets && !n.private {
         return Route::Shared;
     }
-    if !n.supports_view && !n.reinterprets && n.has_image {
-        return Route::Reimport;
+    if n.has_image || !n.supports_view {
+        // The private object is still available, as a second import. The reinterpretation is not
+        // available at all, and goes unserved rather than refused.
+        return if n.private && n.has_image { Route::Reimport } else { Route::Shared };
     }
     if n.can_view { Route::View } else { Route::Shared }
 }
@@ -4361,6 +4379,11 @@ mod tests {
     /// and the driver refuses, so the only object it can have is a second import of its image.
     const UNVIEWABLE: ViewNeed = ViewNeed { supports_view: false, has_image: true, ..ORDINARY };
 
+    /// A texture whose storage is an imported EGL image, in a format GL can name. It reports
+    /// itself viewable and is immutable-format by the driver's own answer, and `glTextureView`
+    /// over it is refused all the same: the storage is what decides.
+    const IMPORTED: ViewNeed = ViewNeed { has_image: true, ..ORDINARY };
+
     #[test]
     fn a_view_that_asks_for_nothing_shares_the_texture() {
         assert_eq!(view_route(ORDINARY), Route::Shared);
@@ -4386,12 +4409,28 @@ mod tests {
         assert_eq!(view_route(n), Route::View);
     }
 
-    /// Reinterpreting is the one need a second import cannot serve -- it hands back the whole
-    /// surface in its own format -- so it goes to a view even where a view is a poor bet.
+    /// The regression, and the shape a compositor sampling a Vulkan client's window takes: an
+    /// imported swapchain image at its own format, own target and full range, with only the
+    /// `W -> One` swizzle every alpha-less format carries to serve. Nothing reinterprets, so the
+    /// whole need is a private object -- and taking that as a view is refused, which ends the
+    /// compositor's context rather than one draw.
     #[test]
-    fn reinterpreting_always_asks_for_a_view() {
+    fn a_swizzle_over_an_imported_texture_reimports_rather_than_viewing() {
+        let n = ViewNeed { private: true, ..IMPORTED };
+        assert_eq!(view_route(n), Route::Reimport);
+    }
+
+    /// Reinterpreting is the one need a second import cannot serve -- it hands back the whole
+    /// surface in its own format. Where a view can be taken it gets one; where it cannot, the
+    /// reinterpretation goes unserved, and the private need is still met by an import when there
+    /// is an image to import.
+    #[test]
+    fn reinterpreting_asks_for_a_view_only_where_one_can_be_taken() {
         assert_eq!(view_route(ViewNeed { reinterprets: true, ..ORDINARY }), Route::View);
-        assert_eq!(view_route(ViewNeed { reinterprets: true, ..UNVIEWABLE }), Route::View);
+        assert_eq!(view_route(ViewNeed { reinterprets: true, ..UNVIEWABLE }), Route::Shared);
+        assert_eq!(view_route(ViewNeed { reinterprets: true, ..IMPORTED }), Route::Shared);
+        let n = ViewNeed { reinterprets: true, private: true, ..IMPORTED };
+        assert_eq!(view_route(n), Route::Reimport);
     }
 
     /// A host with no `glTextureView`, or a mutable texture, has no object to give: the shared
