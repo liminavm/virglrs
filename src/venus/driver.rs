@@ -40,9 +40,9 @@ use super::proto::types::{
     VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType, VkPhysicalDevice,
     VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties, VkPipeline,
     VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
-    VkPipelineStageFlags, VkPrimitiveTopology, VkQueryControlFlags, VkQueryPool,
-    VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue,
-    VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingInfo, VkResult,
+    VkPipelineStageFlags, VkPipelineStageFlags2, VkPrimitiveTopology, VkQueryControlFlags,
+    VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType,
+    VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingInfo, VkResult,
     VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
     VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
     VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
@@ -2669,6 +2669,117 @@ impl Driver {
                 images.as_ptr(),
             )
         };
+        Some(())
+    }
+
+    /// The four command-buffer sides of an event, and their `synchronization2` twins.
+    ///
+    /// An event is the one synchronisation primitive whose state the guest can read back at any
+    /// time (`vkGetEventStatus`), so unlike a barrier these have an observable consequence and
+    /// the probe reads it. What they do NOT have is any state here: the host object is the whole
+    /// of it, and the object table already knows how to destroy one.
+    pub fn cmd_set_event(
+        &self,
+        cb: VkCommandBuffer,
+        event: VkEvent,
+        stage: VkPipelineStageFlags,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; a recorder is a command buffer in the recording state, and the event
+        // is a handle the object table resolved.
+        unsafe { (d.vkCmdSetEvent())(cb, event, stage) };
+        Some(())
+    }
+
+    pub fn cmd_reset_event(
+        &self,
+        cb: VkCommandBuffer,
+        event: VkEvent,
+        stage: VkPipelineStageFlags,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdResetEvent())(cb, event, stage) };
+        Some(())
+    }
+
+    /// A wait names several events and three independent barrier arrays, each optional.
+    ///
+    /// Every count below is its own slice's length, so the events the driver waits on and the
+    /// number it is told are one value. A guest that sent a count disagreeing with its array was
+    /// already rejected by the decoder that built these slices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cmd_wait_events(
+        &self,
+        cb: VkCommandBuffer,
+        events: &[VkEvent],
+        src: VkPipelineStageFlags,
+        dst: VkPipelineStageFlags,
+        memory: &[VkMemoryBarrier],
+        buffers: &[VkBufferMemoryBarrier],
+        images: &[VkImageMemoryBarrier],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; every count is its own slice's length.
+        unsafe {
+            (d.vkCmdWaitEvents())(
+                cb,
+                events.len() as u32,
+                events.as_ptr(),
+                src,
+                dst,
+                memory.len() as u32,
+                memory.as_ptr(),
+                buffers.len() as u32,
+                buffers.as_ptr(),
+                images.len() as u32,
+                images.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    pub fn cmd_set_event2(
+        &self,
+        cb: VkCommandBuffer,
+        event: VkEvent,
+        dependency: &VkDependencyInfo,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetEvent2()?;
+        // SAFETY: as above.
+        unsafe { f(cb, event, dependency) };
+        Some(())
+    }
+
+    pub fn cmd_reset_event2(
+        &self,
+        cb: VkCommandBuffer,
+        event: VkEvent,
+        stage: VkPipelineStageFlags2,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdResetEvent2()?;
+        // SAFETY: as above.
+        unsafe { f(cb, event, stage) };
+        Some(())
+    }
+
+    /// The `synchronization2` wait: one dependency per event, so the two arrays share a count.
+    ///
+    /// Vulkan requires `eventCount` to describe both, and here they are two slices that could
+    /// disagree. Reconciled at the one place that can: a mismatch is refused rather than passed
+    /// on as the shorter of the two, because the driver would read the other array past its end.
+    pub fn cmd_wait_events2(
+        &self,
+        cb: VkCommandBuffer,
+        events: &[VkEvent],
+        dependencies: &[VkDependencyInfo],
+    ) -> Option<()> {
+        if events.len() != dependencies.len() {
+            return None;
+        }
+        let f = self.recorder(cb)?.try_vkCmdWaitEvents2()?;
+        // SAFETY: as above; the two arrays were just shown to share the count passed here.
+        unsafe { f(cb, events.len() as u32, events.as_ptr(), dependencies.as_ptr()) };
         Some(())
     }
 
