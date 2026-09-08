@@ -10,7 +10,7 @@
 //! ends the loop.
 
 use bumpalo::Bump;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -151,6 +151,20 @@ pub struct Context {
     /// flag with many keys to it, never a copy per holder.
     fatal: Arc<AtomicBool>,
     objects: Shared,
+    /// A witness per allocation this context has exported, by the key it was exported under.
+    ///
+    /// Liveness the object table cannot see, and the second half of the same rule the `refs`
+    /// closure serves: the guest may free an allocation it exported, and a resource holding a
+    /// share of that storage goes on working. Its create has to survive the guest's free or a
+    /// restore rebuilds a dead blob where the original had a live one -- which is every Xwayland
+    /// window buffer the compositor is still holding, and every swapchain resize it is still
+    /// presenting the old frame of.
+    ///
+    /// Recorded here, where the key is minted and under the lock a dispatch already holds, rather
+    /// than read back later from the resource table. See [`driver::ShareWitness`]: the table
+    /// learns about a blob in a second step, and between the two there is a window in which it
+    /// would answer that a freed allocation is held by nobody.
+    exports: BTreeMap<ObjectKey, driver::ShareWitness>,
     /// The driver objects this context has stood up. Per context, because a context owns its
     /// instance tree and shares nothing with another guest.
     driver: Driver,
@@ -201,20 +215,15 @@ pub struct Context {
 /// hold across a command.
 struct LiveObjects<'a> {
     objects: &'a Shared,
-    /// Allocations a blob resource still holds a share of.
-    ///
-    /// Reachability the object table cannot see, and the second half of the same rule the `refs`
-    /// closure serves: the guest may free an allocation it exported, and the resource holding a
-    /// share of that storage goes on working. Its create has to survive the guest's free or a
-    /// restore rebuilds a dead blob where the original had a live one -- which is every Xwayland
-    /// window buffer the compositor is still holding, and every swapchain resize it is still
-    /// presenting the old frame of.
-    held: &'a BTreeSet<ObjectKey>,
+    /// See [`Context::exports`]. Asked second, because the table answers for everything the guest
+    /// still holds and this is only about what it has let go of.
+    exports: &'a BTreeMap<ObjectKey, driver::ShareWitness>,
 }
 
 impl journal::Live for LiveObjects<'_> {
     fn holds(&self, key: ObjectKey) -> bool {
-        self.objects.borrow().holds(key) || self.held.contains(&key)
+        self.objects.borrow().holds(key)
+            || self.exports.get(&key).is_some_and(driver::ShareWitness::held)
     }
 }
 
@@ -334,6 +343,7 @@ impl Context {
             key,
             fatal: Arc::new(AtomicBool::new(false)),
             objects: Shared::new(),
+            exports: BTreeMap::new(),
             driver: Driver::new(Account::open(budget, key, name)),
             replay: false,
             dispatched: 0,
@@ -413,8 +423,32 @@ impl Context {
     /// `None` when there is nothing to say, which is not the same as an empty blob: a caller that
     /// stored zero bytes and later restored them would have rebuilt nothing and been told it
     /// succeeded.
-    pub fn journal_export(&self, held: &BTreeSet<ObjectKey>) -> Option<Vec<u8>> {
-        self.journal.export(&LiveObjects { objects: &self.objects, held })
+    pub fn journal_export(&self) -> Option<Vec<u8>> {
+        self.journal.export(&self.live())
+    }
+
+    /// What is still true of this context, for the journal to measure its entries against.
+    fn live(&self) -> LiveObjects<'_> {
+        LiveObjects { objects: &self.objects, exports: &self.exports }
+    }
+
+    /// Plant an export witness without going through Vulkan.
+    ///
+    /// Test scaffolding, beside [`Driver::plant_pool`](driver::Driver::plant_pool) for the same
+    /// reason: the real path needs a device and a real allocation, and what is under test is what
+    /// the record answers afterwards, not how it was made.
+    #[cfg(test)]
+    pub(crate) fn plant_export(&mut self, key: ObjectKey, storage: &driver::Storage) {
+        self.exports.insert(key, storage.witness());
+    }
+
+    /// How many of this context's exported allocations a share is still held of.
+    ///
+    /// The same source the retention uses, deliberately: the harness's rebuild gate declines a
+    /// comparison while this is non-zero, and a gate answered from one place while the export
+    /// retains from another is two answers to one question.
+    pub fn held_allocations(&self) -> usize {
+        self.exports.values().filter(|w| w.held()).count()
     }
 
     /// How far this context's journal has been written, for the VMM's cross-layer fence.
@@ -880,6 +914,10 @@ impl Context {
             objects.key_of(id).ok_or(ExportError::NoSuchAllocation)?
         };
         let (exported, share) = self.driver.memory_export(id, blob_size)?;
+        // Before the caller gets the share, and under the lock it is holding: from here on the
+        // allocate that made this survives the guest's free for as long as anyone holds a share,
+        // and there is no instant at which it does not.
+        self.exports.insert(key, share.witness());
         Ok((exported, share, key))
     }
 
@@ -5049,10 +5087,7 @@ mod tests {
         assert_eq!(ctx.journal_seq(), Seq(1), "the recorder saw the command the dispatcher did");
         // It created nothing, so it is retained as nothing -- and named, not merely counted.
         assert_eq!(ctx.journal_transient(), vec![("vkDestroyInstance", 1)]);
-        assert!(
-            ctx.journal_export(&BTreeSet::new()).is_none(),
-            "a journal of nothing exports nothing"
-        );
+        assert!(ctx.journal_export().is_none(), "a journal of nothing exports nothing");
     }
 
     /// A window in the ring resource, for the reply-stream tests.
@@ -8531,7 +8566,7 @@ mod tests {
             );
         }
 
-        let blob = ctx.journal_export(&BTreeSet::new()).expect("the journal has rings to rebuild");
+        let blob = ctx.journal_export().expect("the journal has rings to rebuild");
 
         let mut back = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
@@ -8571,7 +8606,7 @@ mod tests {
         }
         assert_eq!(ctx.rings[&RingId(7)].idle().virtqueue_seqno, 40, "live value only rises");
 
-        let blob = ctx.journal_export(&BTreeSet::new()).expect("something to rebuild");
+        let blob = ctx.journal_export().expect("something to rebuild");
         let mut back = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -12659,6 +12694,64 @@ mod tests {
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
         driver.abandon_planted();
+    }
+
+    /// An exported allocation stays live while anything holds a share, even with nothing in the
+    /// resource table naming it.
+    ///
+    /// This is the case that decides whether the journal may drop an entry. A blob is published to
+    /// the resource table in two steps -- the export releases the context lock, the insert takes
+    /// the resource lock -- and between them neither is held, so a ring thread can dispatch the
+    /// `vkFreeMemory` for that very allocation. At that instant the object table says the key is
+    /// dead and the resource table has never heard of the blob, and the only thing in the world
+    /// that knows the storage is alive is the share sitting on the caller's stack.
+    ///
+    /// Anything that reads the resource table to answer this gets "held by nobody" in that window
+    /// and would drop the allocate; the blob then lands and the next export names a key with no
+    /// create to rebuild it. Asking the share itself has no such window, because the caller's own
+    /// share is what keeps the count up across it.
+    #[test]
+    fn a_share_nothing_has_registered_yet_still_keeps_its_allocation_live() {
+        use super::driver::Storage;
+        use crate::budget::Account;
+
+        let mut ctx = Context::new(
+            ContextKey::for_test(ContextId::new(1).unwrap()),
+            &Budget::with_cap(None, false),
+            String::new(),
+        );
+
+        // A key the object table does not hold: exactly what a freed allocation leaves behind.
+        let key = {
+            let mut t = ctx.objects.borrow_mut();
+            t.add(
+                ObjectId(1),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY,
+                HostHandle(0x1000),
+                None,
+            )
+            .expect("add");
+            let key = t.key_of(ObjectId(1)).expect("just added");
+            t.remove(ObjectId(1));
+            key
+        };
+        assert!(!ctx.objects.borrow().holds(key), "the premise: the guest freed it");
+
+        let share = Storage::pages_for_test(4096, &Account::for_test(None));
+        ctx.plant_export(key, &share);
+
+        assert!(
+            journal::Live::holds(&ctx.live(), key),
+            "a share is held, so the allocate that made it must still be exported"
+        );
+        assert_eq!(ctx.held_allocations(), 1);
+
+        drop(share);
+        assert!(
+            !journal::Live::holds(&ctx.live(), key),
+            "and once the last share goes, nothing is keeping it"
+        );
+        assert_eq!(ctx.held_allocations(), 0);
     }
 
     /// A command pool's reset names the buffers whose recordings it discarded.

@@ -493,7 +493,7 @@ impl Journal {
             out.extend_from_slice(&[0; 3]);
             out.extend_from_slice(&e.ring_key.to_le_bytes());
             out.extend_from_slice(&(e.wire.len() as u32).to_le_bytes());
-            out.extend_from_slice(&e.wire);
+            out.extend_from_slice(e.wire);
             out.resize(out.len() + (4 - (e.wire.len() % 4)) % 4, 0);
         }
         Some(out)

@@ -51,7 +51,7 @@ use super::proto::types::{
     VkTimelineSemaphoreSubmitInfo, VkViewport, VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::ring::ResourceBytes;
 use crate::guest_mem::{GuestMap, HostMapping, PixelSource};
@@ -4948,6 +4948,50 @@ pub enum Storage {
     /// through. It is what an allocation the guest did *not* declare for export gets, which is
     /// most host-visible memory and every image whose texels a snapshot has to carry.
     Heap(Arc<Charged<Heap>>),
+}
+
+/// Whether anything still holds a share of an exported allocation's storage.
+///
+/// The question `Live` asks about an allocation the guest has freed: a resource may still hold a
+/// share of its storage, and that resource goes on working, so the allocate that made it has to
+/// survive the free or a restore rebuilds a dead blob where the original had a live one.
+///
+/// A `Weak`, because the fact is the strong count and this must not be a second copy of it. The
+/// count is the one place that already knows, and it is exact at every instant -- unlike walking
+/// the resource table for blobs that name the allocation, which is the same fact observed later
+/// and from further away. A blob is published to that table in two steps with no lock held
+/// between them, so for the length of that window the table says a freed allocation is held by
+/// nobody while the storage is very much alive on the caller's stack. Downgrading here cannot
+/// have that window: the caller's own share is what keeps the count above zero across it.
+pub enum ShareWitness {
+    Texture(Weak<dyn Held>),
+    Linear(Weak<Charged<Pages>>),
+    Heap(Weak<Charged<Heap>>),
+}
+
+impl Storage {
+    /// A witness that answers for this storage without keeping it alive.
+    pub fn witness(&self) -> ShareWitness {
+        match self {
+            Storage::Texture(a) => ShareWitness::Texture(Arc::downgrade(a)),
+            Storage::Linear(a) => ShareWitness::Linear(Arc::downgrade(a)),
+            Storage::Heap(a) => ShareWitness::Heap(Arc::downgrade(a)),
+        }
+    }
+}
+
+impl ShareWitness {
+    /// Does anything still hold the share?
+    ///
+    /// `strong_count` rather than `upgrade`, because the answer is wanted and the storage is not:
+    /// upgrading would take a share of its own for as long as the answer lived.
+    pub fn held(&self) -> bool {
+        match self {
+            ShareWitness::Texture(w) => w.strong_count() > 0,
+            ShareWitness::Linear(w) => w.strong_count() > 0,
+            ShareWitness::Heap(w) => w.strong_count() > 0,
+        }
+    }
 }
 
 /// Minted pages, and why they are pages rather than a surface.

@@ -28,7 +28,7 @@ use crate::vrend::proto::Box3;
 use crate::vrend::resource::{Args as ClassicArgs, Refusal};
 use crate::vrend::transfer;
 use crate::vrend::vrend::ClaimRefused;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(test)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
@@ -1356,8 +1356,7 @@ impl Renderer {
     /// that did not rebuild the allocation would produce a dead blob where the original had a live
     /// one. Collected here because this is the only layer that can see both tables at once.
     pub fn venus_journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
-        let held = self.exported_allocations(id);
-        self.venus.as_ref()?.journal_export(id, &held)
+        self.venus.as_ref()?.journal_export(id)
     }
 
     /// How many of `ctx`'s allocations a resource still holds a share of.
@@ -1369,37 +1368,7 @@ impl Renderer {
     /// exercise. Better to decline the comparison and say why than to report a difference that is
     /// the gate's own gap.
     pub fn venus_held_allocations(&self, ctx: ContextId) -> usize {
-        self.exported_allocations(ctx).len()
-    }
-
-    /// The allocations of `ctx` that a resource still holds a share of.
-    ///
-    /// Only `BlobStorage::Shared` holds one; a blob over the guest's own pages or over memory this
-    /// renderer minted for it borrows nothing from a venus context and has no allocation to name.
-    ///
-    /// The context is resolved to its key first, and everything is matched on that. A resource
-    /// outlives the context it was exported from, so the table can hold blobs of a context that is
-    /// gone -- and if the VMM has since made a new context under the same id, matching on the id
-    /// would hand the newcomer a set of keys into a dead guest's arena. An unknown id answers with
-    /// the empty set, which is the truth: no live context, no allocations of one.
-    fn exported_allocations(&self, ctx: ContextId) -> BTreeSet<ObjectKey> {
-        // Its own scope: the context lock and the resource lock are taken one after the other and
-        // never nested, which is the order the ring threads take them in too.
-        let Some(key) = self.venus.as_ref().and_then(|v| v.with_context(ctx, |c| c.key())) else {
-            return BTreeSet::new();
-        };
-        let table = self.resources.read().expect("the resource lock is never poisoned");
-        table
-            .values()
-            .filter_map(|res| match &res.backing {
-                Backing::Blob { storage: BlobStorage::Shared { from, .. }, .. }
-                    if from.ctx == key =>
-                {
-                    Some(from.key)
-                }
-                _ => None,
-            })
-            .collect()
+        self.venus.as_ref().map_or(0, |v| v.held_allocations(ctx))
     }
 
     /// How far a venus context's journal has been written, for the VMM's fence.
@@ -2362,6 +2331,14 @@ mod tests {
 
         let blob = ResourceHandle::new(5).unwrap();
         let pages = Storage::pages_for_test(4096, &Account::for_test(None));
+        // The export as the context recorded it, which is where the answer now comes from: a
+        // resource in the table is a share of that storage, not a second record of the export.
+        let key = any_key();
+        r.venus
+            .as_ref()
+            .expect("venus is configured")
+            .with_context_mut(two, |c| c.plant_export(key, &pages))
+            .expect("the context was just created");
         r.insert(
             blob,
             Backing::Blob {
@@ -2374,7 +2351,7 @@ mod tests {
                 storage: BlobStorage::Shared {
                     storage: pages,
                     caching: Caching::Cached,
-                    from: Exporter { ctx: first, key: any_key() },
+                    from: Exporter { ctx: first, key },
                 },
             },
             Vec::new(),
