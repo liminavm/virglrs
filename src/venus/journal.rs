@@ -53,9 +53,6 @@ enum About {
     /// It created these. It is true while any of them lives — a batch allocation whose ids died
     /// one at a time is still the command that made the survivors.
     Created(Vec<ObjectKey>),
-    /// It is part of this command buffer's recording. True while the buffer lives, and dropped
-    /// wholesale when the buffer is begun or reset, which is what discards a recording.
-    Recording(ObjectKey),
     /// It wrote into these and owns none of them — a bind, a descriptor-set update. True while
     /// *any* of them lives, for the same reason a batch create is: one command may write into
     /// several objects, and it goes on describing the ones that are still there.
@@ -103,6 +100,63 @@ struct Entry {
     refs: Vec<ObjectKey>,
 }
 
+/// One command of a command buffer's recording.
+///
+/// Deliberately not an [`Entry`]. An entry carries what it is about, and a recording's subject is
+/// the buffer it is filed under — so an `Entry` here would state the buffer twice, once as the map
+/// key and once inside itself, and the two would be free to disagree. It carries no `ring_key`
+/// either: a recording always replays on the context's own decoder, so there is no route to store
+/// and the export writes the 0 it would have held.
+#[derive(Clone, Debug)]
+struct Recorded {
+    seq: Seq,
+    cmd_type: u32,
+    wire: Vec<u8>,
+    /// Objects the command named but does not own, exactly as on an [`Entry`]: a recorded
+    /// `vkCmdBindPipeline` names a pipeline the guest may destroy while the buffer still holds
+    /// the recording, and the pipeline's create has to replay for this to.
+    refs: Vec<ObjectKey>,
+}
+
+/// One retained command, wherever it is filed, as the export writes it.
+#[derive(Clone, Copy, Debug)]
+struct Out<'a> {
+    seq: Seq,
+    cmd_type: u32,
+    ring_key: u64,
+    wire: &'a [u8],
+}
+
+/// What [`Journal::retained`] reasons over: the two places a command can live, behind one set of
+/// questions. It exists so that reachability is asked once over everything, while the storage
+/// stays split by what can discard it.
+enum Item<'a> {
+    Kept(&'a Entry),
+    /// A recording, and the buffer it is filed under — which is its subject, so it is read from
+    /// the map rather than from the command.
+    Recording(ObjectKey, &'a Recorded),
+}
+
+impl<'a> Item<'a> {
+    fn refs(&self) -> &'a [ObjectKey] {
+        match self {
+            Item::Kept(e) => &e.refs,
+            Item::Recording(_, r) => &r.refs,
+        }
+    }
+
+    fn out(&self) -> Out<'a> {
+        match self {
+            Item::Kept(e) => {
+                Out { seq: e.seq, cmd_type: e.cmd_type, ring_key: e.ring_key, wire: &e.wire }
+            }
+            Item::Recording(_, r) => {
+                Out { seq: r.seq, cmd_type: r.cmd_type, ring_key: 0, wire: &r.wire }
+            }
+        }
+    }
+}
+
 /// A latest-wins slot: state a later command replaces rather than adds to.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct RingSlot {
@@ -114,8 +168,10 @@ pub struct RingSlot {
 #[derive(Default)]
 pub struct Journal {
     seq: Seq,
-    /// Append-ordered. Entries are never removed on destroy — they stop being exported, which is
-    /// the same thing said in the one place that can see all of them at once.
+    /// Append-ordered. Nothing an *object* destroy does removes an entry from here — it stops
+    /// being exported, which is the same thing said in the one place that can see all of them at
+    /// once. A ring is the exception, and only because it has no key to stop resolving: see
+    /// [`Journal::ring_gone`], the sole line that takes anything out of this vector.
     entries: Vec<Entry>,
     /// A command buffer's recording, held under the buffer it belongs to.
     ///
@@ -126,10 +182,12 @@ pub struct Journal {
     /// linear scan per `vkBeginCommandBuffer`, on the ring thread, in the guest's submit path, and
     /// so grew with the session while a video decode began a buffer per frame.
     ///
-    /// This is the buffer's recording, not a second copy of it: an entry is in `entries` or here,
-    /// never both. The export sees one stream either way, the same way it already does for
-    /// `ring_state` — the merge is `seq`, which every entry carries and no two share.
-    recordings: BTreeMap<ObjectKey, Vec<Entry>>,
+    /// The buffer is named once, by the key it is filed under: a [`Recorded`] carries no subject
+    /// of its own, so a recording cannot claim to belong to a buffer other than the one holding
+    /// it, and a recording in `entries` does not typecheck. The export sees one stream either way,
+    /// the same way it already does for `ring_state` — the merge is `seq`, which everything here
+    /// carries and no two share.
+    recordings: BTreeMap<ObjectKey, Vec<Recorded>>,
     /// Ring state a later command supersedes: reply-stream set/seek, per ring and command.
     ring_state: BTreeMap<RingSlot, Entry>,
     /// What went by without being retained, counted per command type.
@@ -191,14 +249,7 @@ impl Journal {
         refs: Vec<ObjectKey>,
     ) {
         let seq = self.seq.advance();
-        let entry = Entry {
-            seq,
-            cmd_type,
-            ring_key: 0,
-            wire: wire.to_vec(),
-            about: About::Recording(buffer),
-            refs,
-        };
+        let entry = Recorded { seq, cmd_type, wire: wire.to_vec(), refs };
         let recording = self.recordings.entry(buffer).or_default();
         if resets {
             recording.clear();
@@ -318,21 +369,31 @@ impl Journal {
     /// Two passes, because reachability is not liveness: first every entry still true of a live
     /// object, then the creates those entries referenced — which may name objects that are gone,
     /// and must replay anyway or the entry that needs them cannot.
-    fn retained(&self, live: &dyn Live) -> Vec<&Entry> {
+    fn retained(&self, live: &dyn Live) -> Vec<Out<'_>> {
         let alive = |keys: &[ObjectKey]| keys.iter().any(|k| live.holds(*k));
 
         // One stream to reason over. Recordings are kept under their buffer so that discarding one
         // is a lookup, but reachability is a question about the whole journal, so it is asked here
         // over everything at once. Order does not matter: `keep` holds indices into this, and the
         // export sorts by `seq` at the end.
-        let all: Vec<&Entry> =
-            self.entries.iter().chain(self.recordings.values().flatten()).collect();
+        let all: Vec<Item<'_>> = self
+            .entries
+            .iter()
+            .map(Item::Kept)
+            .chain(
+                self.recordings
+                    .iter()
+                    .flat_map(|(b, rs)| rs.iter().map(move |r| Item::Recording(*b, r))),
+            )
+            .collect();
 
         // Which entry created a given key, so a reference can be resolved to the command that
-        // would rebuild it.
+        // would rebuild it. Only a `Created` ever answers, and a recording is never one.
         let mut creator: BTreeMap<ObjectKey, usize> = BTreeMap::new();
-        for (i, e) in all.iter().enumerate() {
-            if let About::Created(keys) = &e.about {
+        for (i, it) in all.iter().enumerate() {
+            if let Item::Kept(e) = it
+                && let About::Created(keys) = &e.about
+            {
                 for k in keys {
                     creator.insert(*k, i);
                 }
@@ -341,14 +402,17 @@ impl Journal {
 
         let mut keep: BTreeSet<usize> = BTreeSet::new();
         let mut queue: Vec<usize> = Vec::new();
-        for (i, e) in all.iter().enumerate() {
-            let true_still = match &e.about {
-                About::Created(keys) => alive(keys),
-                About::Recording(b) => live.holds(*b),
-                About::Mutated(keys) => alive(keys),
-                About::Ring(_) => true,
-                // Decided below, once it is known which creates survived.
-                About::Undoes(_) => false,
+        for (i, it) in all.iter().enumerate() {
+            let true_still = match it {
+                // A recording is true while the buffer it is filed under lives -- read from the
+                // key, because that is the only place the buffer is written down.
+                Item::Recording(b, _) => live.holds(*b),
+                Item::Kept(e) => match &e.about {
+                    About::Created(keys) | About::Mutated(keys) => alive(keys),
+                    About::Ring(_) => true,
+                    // Decided below, once it is known which creates survived.
+                    About::Undoes(_) => false,
+                },
             };
             if true_still && keep.insert(i) {
                 queue.push(i);
@@ -363,16 +427,18 @@ impl Journal {
         // than one object, and it is the right way round: rebuilding an object the guest destroyed
         // costs memory, and not rebuilding it costs the command.
         while let Some(i) = queue.pop() {
-            let e = all[i];
-            let named = e.refs.iter().chain(match &e.about {
-                About::Created(keys) | About::Mutated(keys) => keys.iter(),
-                About::Recording(b) => std::slice::from_ref(b).iter(),
-                // A free names only objects that are gone; the creates that would remake them are
-                // exactly the ones it depends on, and they are kept on their own account or the
-                // free is not kept at all.
-                About::Undoes(_) | About::Ring(_) => [].iter(),
-            });
-            for r in named {
+            let it = &all[i];
+            let subject: &[ObjectKey] = match it {
+                Item::Recording(b, _) => std::slice::from_ref(b),
+                Item::Kept(e) => match &e.about {
+                    About::Created(keys) | About::Mutated(keys) => keys,
+                    // A free names only objects that are gone; the creates that would remake them
+                    // are exactly the ones it depends on, and they are kept on their own account
+                    // or the free is not kept at all.
+                    About::Undoes(_) | About::Ring(_) => &[],
+                },
+            };
+            for r in it.refs().iter().chain(subject) {
                 if let Some(&c) = creator.get(r)
                     && keep.insert(c)
                 {
@@ -387,16 +453,16 @@ impl Journal {
         let undone: Vec<usize> = all
             .iter()
             .enumerate()
-            .filter(|(_, e)| {
-                matches!(&e.about, About::Undoes(freed)
-                    if freed.iter().any(|k| creator.get(k).is_some_and(|c| keep.contains(c))))
+            .filter(|(_, it)| {
+                matches!(it, Item::Kept(e) if matches!(&e.about, About::Undoes(freed)
+                    if freed.iter().any(|k| creator.get(k).is_some_and(|c| keep.contains(c)))))
             })
             .map(|(i, _)| i)
             .collect();
         keep.extend(undone);
 
-        let mut out: Vec<&Entry> = keep.iter().map(|i| all[*i]).collect();
-        out.extend(self.ring_state.values());
+        let mut out: Vec<Out<'_>> = keep.iter().map(|i| all[*i].out()).collect();
+        out.extend(self.ring_state.values().map(|e| Item::Kept(e).out()));
         out.sort_by_key(|e| e.seq);
         out
     }
@@ -548,18 +614,20 @@ mod tests {
         assert_eq!(out[0].seq, Seq(1), "and it has to replay first");
     }
 
-    /// The structural fact that makes a begin cheap: what a begin discards is never in the vector
-    /// the journal walks.
+    /// The structural fact that makes a begin cheap: a begin does not touch the vector at all.
     ///
-    /// Asserted rather than timed on purpose. The bug this guards was a linear scan of every entry
-    /// per `vkBeginCommandBuffer`, on the ring thread, in the guest's submit path -- so its cost
-    /// grew with the session and a video decode, which begins a buffer per frame, drove the worker
-    /// to 161% CPU against an idle guest. A timing threshold would be a proxy for that, and one
-    /// tuned close enough to catch it is also close enough to fire on a loaded machine. The
-    /// property underneath is exact: a recording lives under its buffer, so `entries` holds none,
-    /// and a scan of `entries` cannot be how one is discarded.
+    /// Asserted rather than timed on purpose. The bug this guards was a linear scan and compaction
+    /// of every entry per `vkBeginCommandBuffer`, on the ring thread, inside the guest's submit
+    /// path -- so its cost grew with the session, and a video decode, which begins a buffer per
+    /// frame, drove the worker to 161% CPU against an idle guest. A timing threshold would be a
+    /// proxy for that, and one tuned close enough to catch it is also close enough to fire on a
+    /// loaded machine.
+    ///
+    /// Half of the property is now the type system's: a [`Recorded`] has no `about`, so a
+    /// recording cannot be in `entries` and no scan of `entries` can be how one is discarded.
+    /// What is left to assert is the other half -- that a begin leaves the vector alone.
     #[test]
-    fn a_recording_is_never_in_the_vector_the_journal_walks() {
+    fn beginning_a_buffer_does_not_touch_the_vector() {
         let k = keys(3);
         let mut j = Journal::new();
         j.created(1, &[1; 4], vec![k[0]], Vec::new());
@@ -567,13 +635,13 @@ mod tests {
             j.recorded(10, &[1; 4], b, true, Vec::new());
             j.recorded(11, &[2; 4], b, false, Vec::new());
         }
-        assert!(
-            !j.entries.iter().any(|e| matches!(e.about, About::Recording(_))),
-            "a recording in `entries` is a recording a begin would have to scan for"
-        );
+        let before = j.entries.len();
+        j.recorded(10, &[7; 4], k[1], true, Vec::new());
+        assert_eq!(j.entries.len(), before, "a begin that grew or shrank the vector walked it");
+        assert_eq!(before, 1, "and the vector holds only the create; recordings are not in it");
         assert_eq!(j.recordings.len(), 2, "one recording per buffer, held under it");
-        // And the export still sees them: the split is where they live, not whether they count.
-        assert_eq!(j.retained(&Some_(vec![k[0], k[1], k[2]])).len(), 5);
+        // The export still sees them: the split is where they live, not whether they count.
+        assert_eq!(j.retained(&Some_(vec![k[0], k[1], k[2]])).len(), 4);
     }
 
     /// Discarding one buffer's recording leaves every other buffer's alone.
@@ -593,10 +661,10 @@ mod tests {
         j.recorded(10, &[9; 4], k[1], true, Vec::new());
         let out = j.retained(&Some_(vec![k[0], k[1], k[2]]));
         assert_eq!(out.len(), 5, "k[1] is back to one entry; the other two keep both");
-        let wires: Vec<&Vec<u8>> = out.iter().map(|e| &e.wire).collect();
-        assert_eq!(wires.iter().filter(|w| ***w == vec![9; 4]).count(), 1);
+        let wires: Vec<&[u8]> = out.iter().map(|e| e.wire).collect();
+        assert_eq!(wires.iter().filter(|w| **w == [9; 4]).count(), 1);
         assert_eq!(
-            wires.iter().filter(|w| ***w == vec![2; 4]).count(),
+            wires.iter().filter(|w| **w == [2; 4]).count(),
             2,
             "the two buffers nobody began still hold their second command"
         );
@@ -695,9 +763,9 @@ mod tests {
 
         let live = Some_(vec![pool, other_pool, mine, theirs]);
         let out = j.retained(&live);
-        let wires: Vec<&Vec<u8>> = out.iter().map(|e| &e.wire).collect();
-        assert!(!wires.contains(&&vec![5; 4]), "the reset pool's recording is gone");
-        assert!(wires.contains(&&vec![6; 4]), "and the other pool's is untouched");
+        let wires: Vec<&[u8]> = out.iter().map(|e| e.wire).collect();
+        assert!(!wires.contains(&&[5; 4][..]), "the reset pool's recording is gone");
+        assert!(wires.contains(&&[6; 4][..]), "and the other pool's is untouched");
         assert_eq!(out.len(), 5, "every allocate survives -- a reset frees nothing");
     }
 
@@ -849,6 +917,39 @@ mod tests {
         assert_eq!(back[0].wire, vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(back[0].ring_key, 0);
         assert_eq!(back[1].ring_key, 0xdead_beef);
+    }
+
+    /// The exported stream is in `seq` order whichever container an entry came out of.
+    ///
+    /// This is the one thing the split could have broken. Recordings live under their buffer,
+    /// creates in the vector and reply-stream state in `ring_state`, so the export reads three
+    /// containers and the guest must still be told things in the order it said them — a restore
+    /// replays this stream. `seq` is one counter advanced once per command, so no two entries
+    /// share one and the sort is a total order; this asserts that rather than trusting it.
+    #[test]
+    fn the_export_is_in_seq_order_across_all_three_containers() {
+        let k = keys(3);
+        let (buf_a, buf_b) = (k[1], k[2]);
+        let mut j = Journal::new();
+        // Interleaved on purpose: buffer A, a create, buffer B, A again, then ring state. Held
+        // apart by container, these come back out in none of their storage orders.
+        j.recorded(10, &[1; 4], buf_a, true, Vec::new()); // seq 1
+        j.created(20, &[2; 4], vec![k[0]], Vec::new()); // seq 2
+        j.recorded(11, &[3; 4], buf_b, true, Vec::new()); // seq 3
+        j.recorded(12, &[4; 4], buf_a, false, Vec::new()); // seq 4
+        j.ring(30, &[5; 4], 0xfeed); // seq 5
+
+        let back = parse(&j.export(&Some_(vec![k[0], buf_a, buf_b])).expect("something to say"))
+            .expect("parses");
+        let seqs: Vec<u64> = back.iter().map(|p| p.seq.0).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5], "the stream is in the order the guest spoke");
+        let wires: Vec<&[u8]> = back.iter().map(|p| &p.wire[..]).collect();
+        assert_eq!(wires, vec![&[1; 4][..], &[2; 4], &[3; 4], &[4; 4], &[5; 4]]);
+        assert_eq!(
+            back[0].ring_key, 0,
+            "a recording replays on the context's own decoder, and carries the 0 to say so"
+        );
+        assert_eq!(back[4].ring_key, 0xfeed);
     }
 
     #[test]
