@@ -58,7 +58,11 @@ esac
 if [ "$want_disks" = 1 ]; then
   mkdir -p "$DISKS"
   for src in "${SRC_DISKS[@]}"; do
-    [ -f "$src" ] || { echo "missing source disk: $src" >&2; exit 1; }
+    [ -f "$src" ] || {
+      echo "missing source disk: $src" >&2
+      echo "The rig only clones images; limina/docs/images.md is how they are built." >&2
+      exit 1
+    }
     dst="$DISKS/$(basename "$src")"
     if [ -f "$dst" ]; then
       echo "==> keeping existing $(basename "$dst") (delete it to re-clone)"

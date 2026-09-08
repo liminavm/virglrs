@@ -1,0 +1,130 @@
+# The recorded corpora, pinned.
+#
+# A corpus is a recording of a real guest, and the scores in fixtures/ only mean anything against
+# the corpus they were recorded from — so this file pins both halves of that pair. It is written
+# by scripts/pack-corpora.sh; do not edit it by hand.
+#
+# Bumping = pack, create a NEW tag, upload, and commit the regenerated manifest together with any
+# score the new corpora move. Never replace an asset under an existing tag: a checkout that
+# already fetched it would keep different bytes under the same name and go on passing.
+#
+# `sha256` and `size` are of the UNCOMPRESSED corpus, which is what a score was recorded
+# against. An entry with `generated` is not hosted at all — the script reproduces it byte for
+# byte, so fetching it is running that script.
+
+tag = "corpora-2026-09-08"
+base = "https://github.com/liminavm/virglrs/releases/download"
+
+[[corpus]]
+name = "blit.bin"
+sha256 = "04156d022fef4b28d22d6316862068fbe12d84b763b25ca76883f1ad4108a2d1"
+size = 84156
+generated = "harness/replay/make-blit-corpus.py"
+
+[[corpus]]
+name = "sampled.bin"
+sha256 = "925b5b98d3fde111b021ffecf683d37aed237e90bdf4788b9055ae64faad9ff7"
+size = 255328
+generated = "harness/replay/make-sampled-corpus.py"
+
+[[corpus]]
+name = "surface.bin"
+sha256 = "553dc965a760df48a9a1e6b532f65fa641b4a6c4bf9f7fd806d49e644d7b0a7c"
+size = 67568
+generated = "harness/replay/make-surface-corpus.py"
+
+[[corpus]]
+name = "vrend-av1.bin"
+sha256 = "6217130591b58a688f25fe6c2ab9373d1a845f5e39d1a2d57fda2c230a4a574a"
+size = 296629848
+asset = "vrend-av1.bin.zst"
+
+[[corpus]]
+name = "vrend-composite.bin"
+sha256 = "7767524ab2dec19f1974aebb0b83ff0ff54d60feee2a75f20bd8779260dd8503"
+size = 1202693360
+asset = "vrend-composite.bin.zst"
+
+[[corpus]]
+name = "vrend-h264.bin"
+sha256 = "1d6eaacdb1c1929d71f8057558b821c3210e62c5285cdddd761748fd1dd595d7"
+size = 639527072
+asset = "vrend-h264.bin.zst"
+
+[[corpus]]
+name = "vrend-hevc.bin"
+sha256 = "c023ed76107742ebbaeae75229bcc992c8177cea89d403547faddd6401ef9a32"
+size = 639339632
+asset = "vrend-hevc.bin.zst"
+
+[[corpus]]
+name = "vrend-overview.bin"
+sha256 = "feae65fd494ed3988045bef61f00312152db5d1b5a115b38067a55603604222b"
+size = 98334952
+asset = "vrend-overview.bin.zst"
+
+[[corpus]]
+name = "vrend-shm.bin"
+sha256 = "228fa87d376d0891050278fd5dadc4c5a63d29902e98f0bc77b6a12e51a0d11a"
+size = 731906760
+asset = "vrend-shm.bin.zst"
+
+[[corpus]]
+name = "vrend-vkclient.bin"
+sha256 = "143d344ac059f8869d7afa4284749c74faff206f5c4812bbabea95f5a560250a"
+size = 167522576
+asset = "vrend-vkclient.bin.zst"
+
+[[corpus]]
+name = "vrend-vp9stock.bin"
+sha256 = "1c23b550e92337e2bd840f1c3918e9ba295035937eea74315774eb33c07eef25"
+size = 267337400
+asset = "vrend-vp9stock.bin.zst"
+
+[[corpus]]
+name = "vrend-webgl.bin"
+sha256 = "bc4d887d35a53eeba537ce9f0dd8bccd416084e8d6125d13bbbead2d23b59cff"
+size = 1052815704
+asset = "vrend-webgl.bin.zst"
+
+[[corpus]]
+name = "vrend.bin"
+sha256 = "0c30ca9da1740bae1cf4346646b9245949536d2b1ff078809ea9b3e1ea727e45"
+size = 71769448
+asset = "vrend.bin.zst"
+
+[[corpus]]
+name = "synoik-glclient.vkrc"
+sha256 = "49a2f73d8beb6c7fdd506ab3585ad9591ef75d035ed764b53e2caccc9f196a38"
+size = 7083968
+asset = "synoik-glclient.vkrc.zst"
+
+[[corpus]]
+name = "synoik-lifecycle.vkrc"
+sha256 = "c9a64dc937fa0b516d8a161fe1c9f942862f17cf52d0608ca90b7800866ac220"
+size = 798764
+asset = "synoik-lifecycle.vkrc.zst"
+
+[[corpus]]
+name = "synoik-ptyxis.vkrc"
+sha256 = "dc31f463dc0ea12f58ec9a9ca7e878e77c34cd1de955aab6b90f09aca3562a20"
+size = 1453352
+asset = "synoik-ptyxis.vkrc.zst"
+
+[[corpus]]
+name = "synoik-vkcube.vkrc"
+sha256 = "9f5d59e7bd60ef7097ecccbb4711dfd121cd0729595baaf0f8db1b5ce78e64d4"
+size = 8291012
+asset = "synoik-vkcube.vkrc.zst"
+
+[[corpus]]
+name = "synoik.vkrc"
+sha256 = "cfeb07afb94cff14d5850d9702a60f32ce51a21cced8be9a1a8a66ee65bde581"
+size = 312292
+asset = "synoik.vkrc.zst"
+
+[[corpus]]
+name = "venus.vkrc"
+sha256 = "2a38340924c1d89da52211bfbc81e7e83b0df40eaa17b438c2b1b79961553cf3"
+size = 60874924
+asset = "venus.vkrc.zst"

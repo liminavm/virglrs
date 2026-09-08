@@ -38,6 +38,11 @@ in all three.
   adds no foundational graphics capability over stock.
 - **synoik** — enhanced, with a Vulkan compositor in place of GNOME.
 
+How the three are built, refreshed and brought forward is limina's to say, not this tree's: see
+**`limina/docs/images.md`**, whose "The virglrs harness rig" section names which canonical image
+each rig disk is a clone of. `make-rig.sh --disks-only` clones them; nothing here builds one.
+Only recording a corpus needs them — every pinned score replays with no guest at all.
+
 So a difference in what a workload does between stock and enhanced is a guest-mesa behaviour
 difference or a workload difference, never "that tier can't". When a capture on one tier shows a
 command the other's corpus lacks, the question to ask is what the two sessions *did* differently.
