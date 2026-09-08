@@ -1204,11 +1204,15 @@ impl Resource {
 
     /// `vrend_resource_supports_view`: whether a texture view may be made of this resource.
     ///
-    /// Not of an IOSurface-backed BGR* one. Its storage is natively BGRA8, where a texture this
-    /// renderer allocates for a BGR* format is RGBA8 with the bytes swapped on the way through,
-    /// and GL has no internal format to name the difference to `glTextureView` -- a view of one
-    /// reads its channels in the wrong order. Such a resource is sampled and rendered as itself,
-    /// with a swizzle where a view would have converted.
+    /// Not of an IOSurface-backed BGR* one. Its storage is an imported EGL image, and
+    /// `glTextureView` over imported storage is refused outright, whatever the format --
+    /// `view_route` in `context.rs` carries the measurement and what it costs to ignore it.
+    ///
+    /// BGR* is named apart from the general imported case because the two helpers below need the
+    /// distinction, not because GL treats it differently. Such a storage is natively BGRA8, where
+    /// a texture this renderer allocates for a BGR* format is RGBA8 with the bytes swapped on the
+    /// way through; the resource is therefore sampled and rendered as itself, with a swizzle
+    /// wherever a view would have done the converting.
     pub fn supports_view(&self) -> bool {
         !(self.is_bgra() && self.surface().is_some())
     }
