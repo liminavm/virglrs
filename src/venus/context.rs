@@ -60,15 +60,16 @@ use super::proto::types::{
     vn_command_vkCmdSetViewport, vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdWaitEvents,
     vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteTimestamp, vn_command_vkCopyImageToImage,
     vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
-    vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
-    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
-    vn_command_vkCreateDevice, vn_command_vkCreateEvent, vn_command_vkCreateFence,
-    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
-    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
-    vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
-    vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
-    vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
-    vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer, vn_command_vkDestroyCommandPool,
+    vn_command_vkCreateBuffer, vn_command_vkCreateBufferView, vn_command_vkCreateCommandPool,
+    vn_command_vkCreateComputePipelines, vn_command_vkCreateDescriptorPool,
+    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateEvent,
+    vn_command_vkCreateFence, vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines,
+    vn_command_vkCreateImage, vn_command_vkCreateImageView, vn_command_vkCreateInstance,
+    vn_command_vkCreatePipelineCache, vn_command_vkCreatePipelineLayout,
+    vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass, vn_command_vkCreateRingMESA,
+    vn_command_vkCreateSampler, vn_command_vkCreateSamplerYcbcrConversion,
+    vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
+    vn_command_vkDestroyBufferView, vn_command_vkDestroyCommandPool,
     vn_command_vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorSetLayout,
     vn_command_vkDestroyDevice, vn_command_vkDestroyEvent, vn_command_vkDestroyFence,
     vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
@@ -2290,6 +2291,18 @@ impl Commands for Handlers<'_> {
         handle_pBuffer_mut
     );
     simple_destroy!(vkDestroyBuffer, vn_command_vkDestroyBuffer, buffer);
+
+    // A texel view of a buffer. Same shape as an image view -- the decoder resolves the `buffer`
+    // in the create-info to its host handle before this runs, so there is nothing to translate
+    // here. A stock Fedora 44 desktop asks for these while it is merely running.
+    simple_create!(
+        vkCreateBufferView,
+        vn_command_vkCreateBufferView,
+        pCreateInfo,
+        pView,
+        handle_pView_mut
+    );
+    simple_destroy!(vkDestroyBufferView, vn_command_vkDestroyBufferView, bufferView);
 
     /// Not [`simple_create`]: an image's extent and format cannot be asked for afterwards, and a
     /// scanout surface has to be minted at exactly them.
