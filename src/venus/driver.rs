@@ -4150,6 +4150,26 @@ impl Driver {
                 p.it().map.copy_out(0, &mut buf[..n]),
                 "the census reads within pages it minted"
             );
+            // A read that succeeds is not a read that found the pixels. An image the driver keeps
+            // in a layout of its own writes no byte into pages minted here, so this copy returns
+            // zeros and reports success -- a captured allocation whose restore puts nothing back,
+            // with nothing anywhere saying so. The C has no such arm: its `vkMapMemory` is refused
+            // for these and it logs "these pixels are in NO snapshot", which is the behaviour worth
+            // matching. Said once per storage, because the census asks per allocation and a
+            // compositor asks every frame.
+            // The latch is taken only once there IS something to say: consuming it on a read that
+            // found data would silence the zero read that came after it.
+            let all_zero = n != 0 && buf[..n].iter().all(|&b| b == 0);
+            if all_zero && !p.it().zeros_said.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[virglrs] capture: allocation {id:?} read {n} of {size} bytes and ALL are \
+                     zero -- no surface because {}. The driver was handed pages minted here \
+                     instead of allocating its own, and keeps this image's texels somewhere \
+                     these pages are not, so the capture succeeds and the restore puts nothing \
+                     back.",
+                    p.it().why
+                );
+            }
             return Ok(n);
         }
         let Some(d) = self.devices.get(&device) else {
@@ -4530,6 +4550,12 @@ pub struct Pages {
     /// Whether the refusal has been said. A compositor asks every frame and the answer does not
     /// change, so it is said once per storage rather than sixty times a second.
     said: std::sync::atomic::AtomicBool,
+    /// Whether a capture that came back all zeros has been said, latched separately from
+    /// [`Pages::said`]. The two are different claims made to different readers -- one that a
+    /// present has no surface, one that a snapshot holds nothing -- and a shared latch would let
+    /// whichever fired first swallow the other, which is the failure this renderer keeps finding
+    /// in its own diagnostics.
+    zeros_said: std::sync::atomic::AtomicBool,
 }
 
 /// Why an exported allocation was given pages and not a surface.
@@ -4538,8 +4564,13 @@ pub struct Pages {
 /// because a black window is otherwise the only symptom and it says nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NoSurface {
-    /// The guest did not ask to export it, so nothing outside the guest was ever going to see
-    /// it. Never the reason behind minted pages, which are minted only for an export.
+    /// The guest did not ask to export it, so nothing outside the guest was ever going to see it.
+    ///
+    /// This *is* a reason behind minted pages, and the commonest one: pages are minted for every
+    /// host-visible allocation, "whether or not the guest said it meant to export it" (see
+    /// `allocate_memory`), so an allocation the guest never exported still gets them and still
+    /// records this as why it has no surface. Measured on a synoik desktop 2026-09-08: all 25
+    /// allocations whose capture read back all-zero said exactly this.
     NotExported,
     /// Not dedicated to one image: a buffer, or an image allocation the guest left undedicated.
     NotDedicated,
@@ -4616,7 +4647,12 @@ impl Storage {
 
     /// A share over minted pages, carrying why they are not a surface.
     fn pages(map: GuestMap, charge: Charge, why: NoSurface) -> Storage {
-        let it = Pages { map, why, said: std::sync::atomic::AtomicBool::new(false) };
+        let it = Pages {
+            map,
+            why,
+            said: std::sync::atomic::AtomicBool::new(false),
+            zeros_said: std::sync::atomic::AtomicBool::new(false),
+        };
         Storage::Linear(Arc::new(Charged::new(it, charge)))
     }
 }
