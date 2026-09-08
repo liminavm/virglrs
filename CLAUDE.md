@@ -133,8 +133,12 @@ it. Fix the template.
 
 ## Licensing
 
-`GPL-2.0-only WITH LicenseRef-limina-exception`, the same as limina; the exception's linking
-permission is what lets rutabaga compile this crate into Apache-2.0 libkrun. `NOTICE` records
-what this was written against and the two places that carry Mesa's data rather than only its
-ideas. New files take the same header; the Khronos registries under `gl-gen/registry/` keep
-theirs.
+MIT, which is virglrenderer's licence and Mesa's — this was written against both, and taking a
+different one would have been the odd choice. It also removes the question a linking exception
+only answered: rutabaga compiles this crate into Apache-2.0 libkrun, which MIT permits outright.
+limina itself stays GPL-2.0-only with its exception, and consumes this happily.
+
+`NOTICE` records what this was written against, and the two parts that carry Mesa's material
+rather than only its ideas — still worth naming under a shared licence, because attribution is
+not the same claim as permission. New files take the MIT header; the Khronos registries under
+`gl-gen/registry/` are Apache-2.0 and keep theirs.

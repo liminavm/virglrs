@@ -1,7 +1,7 @@
 virglrs
 Copyright © 2026 Gustavo Noronha Silva
 
-Licensed under GPL-2.0-only WITH LicenseRef-limina-exception. See LICENSES/.
+Licensed under MIT. See LICENSES/MIT.txt.
 
 
 What this is, and what it was written against
@@ -19,8 +19,9 @@ implementation owes them the protocol, the semantics and — in the places named
 Where that reference is more than reference
 -------------------------------------------
 
-Two parts carry material from Mesa rather than only its ideas, and Mesa's MIT notice
-(LICENSES/MIT.txt) applies to them:
+The whole crate is MIT, so nothing below is a licensing exception. It is an attribution: two
+parts carry material from Mesa rather than only its ideas, and Mesa's copyright holders are
+named here because a shared licence does not make the provenance disappear.
 
   - src/vrend/tgsi/ — the TGSI opcode table, its dump format and its text parser follow
     src/gallium/auxiliary/tgsi/{tgsi_info,tgsi_dump,tgsi_text,tgsi_scan}.c entry for entry.
