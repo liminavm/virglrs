@@ -18,9 +18,9 @@ poisons the context, and the poison surfaces somewhere else entirely. Each comma
 observable effect — a state read back, a buffer's contents, a query's answer. Where the API
 offers no way to observe one (a destroy), say so in a comment and score what can be scored.
 
-**Be its own oracle.** Exit 0 when every check passed, 1 when one failed with the failing line
-above it, 2 when the device could not be brought up at all — which is not a verdict on the group
-and must not be counted as one.
+**Report cleanly.** Exit 0 when every check passed, 1 when one failed with the failing line above
+it, 2 when the device could not be brought up at all — which is not a verdict on the group and
+must not be counted as one.
 
 **Run headless.** No surface, no swapchain, no window: a probe runs over ssh, and a probe that
 needs a seated session can only run where a seated session already is.
@@ -34,11 +34,25 @@ nothing. Satisfy it from the host before the submit, so a miss is a failed check
    (`VK_ICD_FILENAMES=…kosmickrisp…`). It must pass. This proves the program is right and that
    the host really serves the group — which is what `wanted` claims, and is otherwise only an
    assertion. A probe that has never passed anywhere cannot produce a meaningful RED.
-2. **RED against this build**, in a guest, through venus. Read the worker log: `[virglrs]
-   refused:` is the only place the command is named.
+2. **RED against this build**, in a guest, through venus — scored on the worker log, not on the
+   probe. See below.
 3. **Serve the commands**, and delete their lines from the ledger — the test
    `every_command_the_protocol_defines_is_served_or_on_the_ledger` holds the file to it.
-4. **GREEN**, same probe, same guest.
+4. **GREEN**: the probe passes *and* the log shows no refusal from the group.
+
+## The probe is not the oracle
+
+**A probe can print `ok` for a command that was refused.** A zeroed reply is shaped exactly like a
+successful one, so the guest driver reads a refusal as success; and venus answers some commands
+from a guest-side slot without asking the host at all. Both were measured on the events group:
+`vkCreateEvent` was refused, and the probe reported it `ok` along with the next four checks —
+`vkSetEvent` and `vkGetEventStatus` among them, which never left the guest. The abort came three
+commands later and named nothing.
+
+So a green probe is half a result. The other half is `[virglrs] refused:` in the worker log, which
+is the only place a command is named — and it needs its own positive control, because a log with
+no `[virglrs]` line at all reads exactly like a log with no refusals. Grep for the prefix first,
+then for the refusal.
 
 ## Building
 
@@ -53,6 +67,6 @@ On the host, for the positive control, the loader and headers are Homebrew's:
 
 ## The probes
 
-| Probe | Group | Commands | Positive control |
-|---|---|---|---|
-| `events.c` | `events` | 8 | 26/26 on KosmicKrisp, Apple M1 Max, Vulkan 1.4 |
+| Probe | Group | Commands | Positive control | Through venus |
+|---|---|---|---|---|
+| `events.c` | `events` | 8 | 26/26 on KosmicKrisp, Apple M1 Max, Vulkan 1.4 | 26/26, no refusal (Fedora 44, 2026-09-08) |
