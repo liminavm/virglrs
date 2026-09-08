@@ -893,18 +893,6 @@ waiting on a call rather than on work.
 These are not decisions. Each is settled in shape and unwritten in code, and each is here so that
 it survives the session it was found in.
 
-- **A blob is published in two steps with neither lock held between them.**
-  `Renderer::resource_create_blob` exports the allocation — taking and releasing the context lock
-  inside `with_context_mut` — and only then inserts the resource, taking the resource lock
-  separately. That pair is exactly what a ring thread's `try_dispatch` needs, so the guest can free
-  the allocation in the gap: for that window the object table says the key is dead and the resource
-  table has never heard of the blob. Liveness no longer reads across it (a `ShareWitness` is
-  recorded where the key is minted, and the caller's own share holds the count up), so nothing acts
-  on the wrong answer today — but the window is still there for the next thing that reads both
-  tables, and a concurrent `journal_export` in it would carry a blob's storage with no create.
-  The fix is to hold the resource write lock across both steps, in the `resources` then `ctx` order
-  `on_context` already takes; what it costs is that the export runs under it.
-
 - **`HostShm` is minted and never charged.** The blob carrier in `renderer.rs` is the one host
   allocation left outside the ledger — the C bills it as `"shm carrier"` -- and it is not the
   same shape as an IOSurface: `Resource::shm()` hands the `Arc<GuestMap>` out to venus's ring, so
