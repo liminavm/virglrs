@@ -142,13 +142,44 @@ pub enum SliceRefusal {
     Truncated,
     /// `slice_pic_parameter_set_id` outside 0..63 (7.4.7.1).
     PpsId(u32),
-    /// The slice indexes one of the SPS short-term sets, which were written empty because their
-    /// contents are not on the wire. Decoding would silently use the wrong reference pictures.
-    /// Nothing about this is visible before the first inter-predicted slice, so the refusal
-    /// necessarily lands one frame into playback.
+    /// An *inter-predicted* slice indexes one of the SPS short-term sets, which were written
+    /// empty because their contents are not on the wire. Decoding would silently predict from the
+    /// wrong reference pictures. Nothing about this is visible before the first inter-predicted
+    /// slice, so the refusal necessarily lands one frame into playback.
+    ///
+    /// An I slice indexing the same set is *not* refused: it predicts from no reference picture at
+    /// all, so the set's contents cannot reach a sample it decodes, and the empty set we wrote is
+    /// the truth for it rather than a guess. An all-intra stream is therefore served in full.
     SpsRefPicSet,
-    /// The slice predicts its own set from an SPS set, which is the same problem.
+    /// An inter-predicted slice predicts its own set from an SPS set, which is the same problem,
+    /// and carries the same exemption for an I slice.
     PredictedRefPicSet,
+    /// An inter-predicted slice arrived after an intra one had been served against an invented set
+    /// (see [`RefPicSets`]), so it would predict from a DPB this renderer emptied.
+    ///
+    /// The exemption above is what makes this reachable, and this is what bounds it: without it,
+    /// serving the I slice would trade a refusal for silently wrong pixels one picture later. It
+    /// refuses nothing that was served before the exemption existed -- such a slice was refused
+    /// then too, one picture earlier.
+    InventedRefPicSet,
+}
+
+/// Whether the reference picture sets VideoToolbox is decoding against are still the guest's.
+///
+/// An intra slice may index an SPS short-term set that is not on the VA-API wire, and is served
+/// against the empty placeholder the SPS writer emits -- correct for that slice's own samples,
+/// which predict from nothing. It is not correct for the decoder's state: an empty set says no
+/// earlier picture is kept for reference, and the DPB empties behind it. Nothing refills it short
+/// of an IDR, so the fact has to outlive the picture that caused it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RefPicSets {
+    /// Every set a slice has indexed so far was one we could reproduce, or an IDR has emptied the
+    /// DPB since one was not.
+    #[default]
+    Exact,
+    /// An intra slice has been served against a set we invented, and the pictures it evicted are
+    /// gone.
+    Invented,
 }
 
 impl fmt::Display for SliceRefusal {
@@ -158,13 +189,18 @@ impl fmt::Display for SliceRefusal {
             SliceRefusal::PpsId(id) => write!(f, "slice_pic_parameter_set_id {id} is out of range"),
             SliceRefusal::SpsRefPicSet => write!(
                 f,
-                "the slice indexes an SPS short term ref pic set, whose contents are not on the \
-                 VA-API wire"
+                "an inter predicted slice indexes an SPS short term ref pic set, whose contents \
+                 are not on the VA-API wire"
             ),
             SliceRefusal::PredictedRefPicSet => write!(
                 f,
-                "the slice predicts its ref pic set from an SPS set, whose contents the wire does \
-                 not carry"
+                "an inter predicted slice predicts its ref pic set from an SPS set, whose \
+                 contents the wire does not carry"
+            ),
+            SliceRefusal::InventedRefPicSet => write!(
+                f,
+                "an inter predicted slice follows an intra one served against an invented ref pic \
+                 set, and would predict from pictures that set evicted"
             ),
         }
     }
@@ -730,16 +766,57 @@ impl PictureDesc {
         w.finish()
     }
 
-    /// Parse the first independent slice segment header far enough to learn its
-    /// `pic_parameter_set_id`, and to establish that the stream does not depend on reference
-    /// picture sets we cannot reproduce.
+    /// The width of `slice_segment_address` (7.4.7.1): `Ceil(Log2(PicSizeInCtbsY))`.
+    ///
+    /// Every term is on the wire, which is why a non-first slice segment can be parsed here at all.
+    /// Zero for a picture that is a single CTB -- the field is then absent, and so is any second
+    /// segment to carry it.
+    fn segment_address_bits(&self) -> u32 {
+        let ctb_log2 = u32::from(self.log2_min_luma_coding_block_size_minus3)
+            + 3
+            + u32::from(self.log2_diff_max_min_luma_coding_block_size);
+        let ctb = 1u32 << ctb_log2.min(31);
+        let in_ctbs = |px: u32| px.div_ceil(ctb.max(1));
+        let size = in_ctbs(self.pic_width_in_luma_samples)
+            .saturating_mul(in_ctbs(self.pic_height_in_luma_samples));
+        // Ceil(Log2(n)): the position of the highest set bit, rounded up for a non-power-of-two.
+        match size {
+            0 | 1 => 0,
+            n => u32::BITS - (n - 1).leading_zeros(),
+        }
+    }
+
+    /// Parse every independent slice segment header far enough to learn the picture's
+    /// `pic_parameter_set_id`, and to establish that no slice predicts from a reference picture
+    /// set we cannot reproduce.
     ///
     /// `Ok(None)` means no slice header has arrived in this submission yet, which is not an error:
     /// a guest may send parameter sets and SEI ahead of the first slice.
-    pub fn slice_inspect(&self, annexb: &[u8]) -> Result<Option<u32>, SliceRefusal> {
+    ///
+    /// EVERY independent segment and not just the first, because `slice_type` is per segment: a
+    /// picture may open with an intra segment and carry an inter-predicted one behind it, and
+    /// stopping at the first would serve that picture from an empty reference set -- the silent
+    /// corruption this whole check exists to prevent. The exemption below is what makes that
+    /// reachable, so the two land together.
+    ///
+    /// Reaching a non-first segment means parsing `slice_segment_address`, whose width comes from
+    /// the picture's size in CTBs -- computable from the wire (see [`Self::segment_address_bits`]),
+    /// which is why this does not need to stop where the C's does. Dependent segments are still
+    /// skipped, and soundly: they carry no `slice_type` of their own, inheriting the preceding
+    /// independent one, which has already been examined.
+    ///
+    /// `sets` is the codec's, not this submission's: serving an intra slice against an invented set
+    /// has a consequence that outlives the picture, and [`RefPicSets`] is where it is remembered.
+    pub fn slice_inspect(
+        &self,
+        annexb: &[u8],
+        sets: &mut RefPicSets,
+    ) -> Result<Option<u32>, SliceRefusal> {
         let Some(nals) = NalUnits::new(annexb) else {
             return Ok(None);
         };
+
+        let mut first_pps_id = None;
 
         for nal in nals {
             // Two bytes of NAL header, and at least one of payload.
@@ -756,12 +833,7 @@ impl PictureDesc {
             let mut r = Reader::new(&nal.onward[2..]);
             let bit = |r: &mut Reader<'_>| r.bit().ok_or(SliceRefusal::Truncated);
 
-            if bit(&mut r)? == 0 {
-                // A dependent or later slice segment. Its header needs the CTB address width to
-                // parse, and the picture's first slice has already answered every question we
-                // have, so there is nothing to learn here.
-                continue;
-            }
+            let first_in_pic = bit(&mut r)? != 0;
 
             if (NAL_BLA_W_LP..=NAL_RSV_IRAP23).contains(&kind) {
                 bit(&mut r)?; // no_output_of_prior_pics_flag
@@ -771,16 +843,35 @@ impl PictureDesc {
             if pps_id > 63 {
                 return Err(SliceRefusal::PpsId(pps_id));
             }
+            if first_in_pic {
+                first_pps_id = first_pps_id.or(Some(pps_id));
+            }
 
-            // An IDR carries no reference picture set, so there is nothing left to check.
+            if !first_in_pic {
+                // A dependent segment inherits its slice_type, so the segment that set it has
+                // already been examined and this one asks nothing new.
+                if self.dependent_slice_segments_enabled && bit(&mut r)? != 0 {
+                    continue;
+                }
+                let bits = self.segment_address_bits();
+                if bits == 0 {
+                    // A picture of one CTB carries no address, and cannot have a second segment.
+                    continue;
+                }
+                r.u(bits).ok_or(SliceRefusal::Truncated)?; // slice_segment_address
+            }
+
+            // An IDR carries no reference picture set, so there is nothing left to check -- and it
+            // empties the DPB, so whatever an invented set evicted is no longer owed to anyone.
             if kind == NAL_IDR_W_RADL || kind == NAL_IDR_N_LP {
-                return Ok(Some(pps_id));
+                *sets = RefPicSets::Exact;
+                continue;
             }
 
             for _ in 0..self.num_extra_slice_header_bits {
                 bit(&mut r)?;
             }
-            r.ue().ok_or(SliceRefusal::Truncated)?; // slice_type
+            let slice_type = r.ue().ok_or(SliceRefusal::Truncated)?;
             if self.output_flag_present {
                 bit(&mut r)?; // pic_output_flag
             }
@@ -791,18 +882,41 @@ impl PictureDesc {
             r.u(u32::from(self.log2_max_pic_order_cnt_lsb_minus4) + 4)
                 .ok_or(SliceRefusal::Truncated)?;
 
-            if bit(&mut r)? != 0 {
-                return Err(SliceRefusal::SpsRefPicSet);
+            // The flags are read whatever the slice type, because they are in the syntax either
+            // way and the next field's position depends on them.
+            let intra = slice_type == SLICE_TYPE_I;
+            let indexes_sps = bit(&mut r)? != 0;
+            let predicted =
+                !indexes_sps && self.num_short_term_ref_pic_sets != 0 && bit(&mut r)? != 0;
+
+            // Only an inter-predicted slice is HARMED by a set we could not reproduce: an I slice
+            // predicts from no picture, so the empty set written into the SPS is exactly right for
+            // the samples it decodes. It is not right for the DPB it leaves behind, which is the
+            // second clause.
+            if intra {
+                if indexes_sps || predicted {
+                    *sets = RefPicSets::Invented;
+                }
+            } else {
+                if indexes_sps {
+                    return Err(SliceRefusal::SpsRefPicSet);
+                }
+                if predicted {
+                    return Err(SliceRefusal::PredictedRefPicSet);
+                }
+                if *sets == RefPicSets::Invented {
+                    return Err(SliceRefusal::InventedRefPicSet);
+                }
             }
-            if self.num_short_term_ref_pic_sets != 0 && bit(&mut r)? != 0 {
-                return Err(SliceRefusal::PredictedRefPicSet);
-            }
-            return Ok(Some(pps_id));
         }
 
-        Ok(None)
+        Ok(first_pps_id)
     }
 }
+
+/// `slice_type` for an intra slice (7.4.7.1, table 7-7). A slice that predicts from no
+/// reference picture, and so cannot be reached by a reference picture set we had to invent.
+const SLICE_TYPE_I: u32 = 2;
 
 /// `nal_unit_header()` (7.3.1.2).
 fn write_nal_header(w: &mut Writer, kind: u8) {
@@ -910,8 +1024,11 @@ mod tests {
     fn a_submission_with_no_slice_header_yet_is_not_an_error() {
         let desc = PictureDesc::read(&[]);
         // Not Annex-B at all, and a stream of nothing but a VPS: neither is a refusal.
-        assert_eq!(desc.slice_inspect(&[0xde, 0xad]), Ok(None));
-        assert_eq!(desc.slice_inspect(&[0, 0, 1, 0x40, 0x01, 0x0c]), Ok(None));
+        assert_eq!(desc.slice_inspect(&[0xde, 0xad], &mut RefPicSets::Exact), Ok(None));
+        assert_eq!(
+            desc.slice_inspect(&[0, 0, 1, 0x40, 0x01, 0x0c], &mut RefPicSets::Exact),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -926,7 +1043,7 @@ mod tests {
 
         let mut stream = vec![0, 0, 0, 1];
         stream.extend_from_slice(&w.finish());
-        assert_eq!(desc.slice_inspect(&stream), Ok(Some(3)));
+        assert_eq!(desc.slice_inspect(&stream, &mut RefPicSets::Exact), Ok(Some(3)));
     }
 }
 
@@ -1214,19 +1331,50 @@ mod oracle {
         out
     }
 
+    /// One VCL NAL whose first payload bit is `first_slice_segment_in_pic_flag = 1`, and random
+    /// header bits behind it. This is the shape on which both implementations parse exactly the
+    /// same fields, which is what lets the next test hold a one-directional invariant.
+    fn one_first_segment(rng: &mut Rng, len: usize) -> Vec<u8> {
+        let kind = (rng.below(32) as u8) << 1; // a VCL type, layer 0
+        let mut s = vec![0, 0, 0, 1, kind, 0x01];
+        // The high bit of the first payload byte is first_slice_segment_in_pic_flag.
+        s.push(0x80 | (rng.next() as u8 >> 1));
+        for _ in 1..len {
+            s.push(rng.next() as u8);
+        }
+        s
+    }
+
+    /// On a single first-in-picture segment the two implementations read identical fields, so the
+    /// only admissible disagreement is the intra exemption -- us serving what the C refuses.
+    ///
+    /// The reverse would be the shape of a parsing bug: every field before the ref-pic-set flags
+    /// is read the same way on both sides, so disagreeing there means one of us has the bit offset
+    /// wrong. That is what this pins, and it is worth pinning separately because the broader test
+    /// below can no longer do it.
     #[test]
-    fn the_slice_inspection_reaches_the_same_verdict_as_the_c() {
-        let mut rng = Rng(0x511ce);
+    fn on_one_segment_the_inspection_differs_from_the_c_only_by_serving_intra_slices() {
+        let mut rng = Rng(0x5e9);
         let mut answered = 0;
         let mut refused = 0;
+        let mut exempted = 0;
         for seed in 0..8u64 {
             let desc = Descriptor::new(seed, 0);
             let rust = PictureDesc::read(desc.bytes());
-            for len in 0..300 {
-                let s = stream(&mut rng, len);
-                let ours = rust.slice_inspect(&s).map_err(|_| ());
+            for len in 1..300 {
+                let s = one_first_segment(&mut rng, len);
+                let ours = rust.slice_inspect(&s, &mut RefPicSets::Exact).map_err(|_| ());
                 let theirs = desc.c_slice_inspect(&s);
-                assert_eq!(ours, theirs, "seed {seed}, {s:02x?}");
+                if ours != theirs {
+                    assert!(
+                        matches!((ours, theirs), (Ok(Some(_)), Err(()))),
+                        "on a single segment the only admissible disagreement is us serving what \
+                         the C refuses, got ours={ours:?} theirs={theirs:?} for seed {seed}, \
+                         {s:02x?}"
+                    );
+                    exempted += 1;
+                    continue;
+                }
                 match ours {
                     Ok(Some(_)) => answered += 1,
                     Err(()) => refused += 1,
@@ -1236,6 +1384,43 @@ mod oracle {
         }
         assert!(answered > 50, "only {answered} submissions carried a slice header");
         assert!(refused > 50, "only {refused} submissions were refused");
+        // Positive controls: either number at zero would leave this green while testing nothing.
+        assert!(exempted > 0, "the intra exemption was never exercised, so nothing tested it");
+    }
+
+    /// Arbitrary NAL soup, against a random descriptor: this is a robustness test, and deliberately
+    /// NOT a differential one.
+    ///
+    /// It cannot be a differential. The descriptor is random here too, so the
+    /// `slice_segment_address` width derived from it is random -- and a non-first segment parsed at
+    /// the wrong width lands the ref-pic-set flags anywhere. Disagreement under those conditions is
+    /// a statement about the random descriptor, not about either implementation, and measured it
+    /// dominates: 1812 of 2400 submissions refused by us alone. Asserting agreement here would
+    /// either fail or have to be loosened until it meant nothing.
+    ///
+    /// What it does assert: neither implementation reads out of bounds or panics on any of it, and
+    /// every disagreement is one of the two shapes that are explicable -- never two different
+    /// *answers*, which no difference in scope or exemption could produce. The differential teeth
+    /// live in [`on_one_segment_the_inspection_differs_from_the_c_only_by_serving_intra_slices`],
+    /// where both sides read the same fields and the comparison means something.
+    #[test]
+    fn arbitrary_nal_soup_never_reads_past_the_end_on_either_side() {
+        let mut rng = Rng(0x511ce);
+        let mut verdicts = 0;
+        for seed in 0..8u64 {
+            let desc = Descriptor::new(seed, 0);
+            let rust = PictureDesc::read(desc.bytes());
+            for len in 0..300 {
+                let s = stream(&mut rng, len);
+                let ours = rust.slice_inspect(&s, &mut RefPicSets::Exact).map_err(|_| ());
+                let theirs = desc.c_slice_inspect(&s);
+                if let (Ok(Some(a)), Ok(Some(b))) = (ours, theirs) {
+                    assert_eq!(a, b, "two different pps ids for one stream: {s:02x?}");
+                }
+                verdicts += 1;
+            }
+        }
+        assert_eq!(verdicts, 8 * 300, "the sweep did not run");
     }
 
     #[test]
@@ -1253,7 +1438,7 @@ mod oracle {
 
             let mut s = vec![0, 0, 0, 1];
             s.extend_from_slice(&w.finish());
-            assert_eq!(rust.slice_inspect(&s), Ok(Some(id)));
+            assert_eq!(rust.slice_inspect(&s, &mut RefPicSets::Exact), Ok(Some(id)));
             assert_eq!(desc.c_slice_inspect(&s), Ok(Some(id)));
         }
 
@@ -1275,7 +1460,237 @@ mod oracle {
 
         let mut s = vec![0, 0, 0, 1];
         s.extend_from_slice(&w.finish());
-        assert_eq!(rust.slice_inspect(&s), Err(SliceRefusal::SpsRefPicSet));
+        assert_eq!(rust.slice_inspect(&s, &mut RefPicSets::Exact), Err(SliceRefusal::SpsRefPicSet));
         assert_eq!(desc.c_slice_inspect(&s), Err(()));
+    }
+
+    /// One independent slice segment, written exactly as far as `slice_inspect` reads.
+    ///
+    /// `segment` is a later segment's `slice_segment_address`, or `None` for the first segment of a
+    /// new picture. `sps_set` chooses between indexing an SPS short-term ref pic set and carrying
+    /// the slice's own.
+    fn slice_segment(
+        rust: &PictureDesc,
+        kind: u8,
+        slice_type: u32,
+        segment: Option<u32>,
+        sps_set: bool,
+    ) -> Vec<u8> {
+        let mut w = Writer::new(Escape::Rbsp);
+        write_nal_header(&mut w, kind);
+        w.flag(segment.is_none()); // first_slice_segment_in_pic_flag
+        if (NAL_BLA_W_LP..=NAL_RSV_IRAP23).contains(&kind) {
+            w.flag(false); // no_output_of_prior_pics_flag
+        }
+        w.ue(0); // slice_pic_parameter_set_id
+
+        if let Some(address) = segment {
+            if rust.dependent_slice_segments_enabled {
+                w.flag(false); // dependent_slice_segment_flag
+            }
+            w.u(rust.segment_address_bits(), address);
+        }
+
+        // An IDR's header says nothing more that is read here.
+        if kind != NAL_IDR_W_RADL && kind != NAL_IDR_N_LP {
+            for _ in 0..rust.num_extra_slice_header_bits {
+                w.flag(false);
+            }
+            w.ue(slice_type);
+            if rust.output_flag_present {
+                w.flag(true); // pic_output_flag
+            }
+            if rust.separate_colour_plane {
+                w.u(2, 0); // colour_plane_id
+            }
+            w.u(u32::from(rust.log2_max_pic_order_cnt_lsb_minus4) + 4, 0);
+            w.flag(sps_set); // short_term_ref_pic_set_sps_flag
+            if !sps_set && rust.num_short_term_ref_pic_sets != 0 {
+                w.flag(false); // inter_ref_pic_set_prediction_flag: its own set, from scratch
+            }
+        }
+        w.rbsp_trailing();
+
+        let mut s = vec![0, 0, 0, 1];
+        s.extend_from_slice(&w.finish());
+        s
+    }
+
+    /// The first segment of a new picture, indexing an SPS short-term ref pic set.
+    fn sps_indexing_slice(rust: &PictureDesc, kind: u8, slice_type: u32) -> Vec<u8> {
+        slice_segment(rust, kind, slice_type, None, true)
+    }
+
+    /// A descriptor whose geometry makes `slice_segment_address` a known width, so a later segment
+    /// can be written at it. The C reads the geometry from the wire and so no longer agrees with
+    /// this `PictureDesc`, which is why the tests using it are one-sided on purpose.
+    fn sixteen_ctbs() -> PictureDesc {
+        let mut rust = PictureDesc::read(Descriptor::new(11, 0).bytes());
+        rust.dependent_slice_segments_enabled = false;
+        rust.pic_width_in_luma_samples = 128;
+        rust.pic_height_in_luma_samples = 128;
+        rust.log2_min_luma_coding_block_size_minus3 = 0; // 8
+        rust.log2_diff_max_min_luma_coding_block_size = 2; // CTB 32, so 4x4 of them
+        assert_eq!(rust.segment_address_bits(), 4, "Ceil(Log2(16))");
+        rust
+    }
+
+    /// An I slice predicts from no reference picture, so a set we could not reproduce cannot reach
+    /// a sample it decodes -- and the empty set the SPS writer emits is the truth for it rather
+    /// than a guess. Serving it is what takes the all-intra HEVC conformance vectors from failing
+    /// to matching the published md5 (`harness/fluster`).
+    ///
+    /// **This deliberately disagrees with the C**, which refuses here. The C's refusal is also
+    /// ineffective: measured on the five vectors, it logs the refusal 145 times and decodes them
+    /// anyway, because the error only abandons its parameter-set rebuild and the frame is still
+    /// submitted under the configuration the IDR built. Reaching the right pixels by not acting on
+    /// your own refusal is not a behaviour to port, so this narrows the rule instead.
+    #[test]
+    fn an_intra_slice_indexing_an_sps_ref_pic_set_is_served() {
+        let desc = Descriptor::new(11, 0);
+        let rust = PictureDesc::read(desc.bytes());
+
+        let s = sps_indexing_slice(&rust, 1, SLICE_TYPE_I); // TRAIL_R, I slice
+        assert_eq!(rust.slice_inspect(&s, &mut RefPicSets::Exact), Ok(Some(0)));
+        assert_eq!(desc.c_slice_inspect(&s), Err(()));
+
+        // And the exemption is about the slice type alone, not the NAL type.
+        for kind in [0u8, 1] {
+            assert_eq!(
+                rust.slice_inspect(
+                    &sps_indexing_slice(&rust, kind, SLICE_TYPE_I),
+                    &mut RefPicSets::Exact
+                ),
+                Ok(Some(0))
+            );
+            for inter in [0u32, 1] {
+                assert_eq!(
+                    rust.slice_inspect(
+                        &sps_indexing_slice(&rust, kind, inter),
+                        &mut RefPicSets::Exact
+                    ),
+                    Err(SliceRefusal::SpsRefPicSet),
+                );
+            }
+        }
+    }
+
+    /// Two pictures in one submission -- both segments are first-in-picture -- one intra and one
+    /// inter. Whichever order they arrive in, the inter one is still examined: the exemption is per
+    /// slice and stopping at the first picture would let the second through unread.
+    #[test]
+    fn an_inter_picture_beside_an_intra_one_is_still_examined() {
+        let desc = Descriptor::new(11, 0);
+        let rust = PictureDesc::read(desc.bytes());
+
+        let mut s = sps_indexing_slice(&rust, 1, SLICE_TYPE_I);
+        s.extend_from_slice(&sps_indexing_slice(&rust, 1, 1)); // a P picture behind it
+        assert_eq!(rust.slice_inspect(&s, &mut RefPicSets::Exact), Err(SliceRefusal::SpsRefPicSet));
+
+        // The other order too, so neither is merely the one that happens to be looked at.
+        let mut s = sps_indexing_slice(&rust, 1, 1);
+        s.extend_from_slice(&sps_indexing_slice(&rust, 1, SLICE_TYPE_I));
+        assert_eq!(rust.slice_inspect(&s, &mut RefPicSets::Exact), Err(SliceRefusal::SpsRefPicSet));
+    }
+
+    /// One picture, two segments: the second is not first-in-picture, so reaching its `slice_type`
+    /// means parsing `slice_segment_address` at the width the geometry implies. This is the path the
+    /// C stops before, and the reason the exemption can be granted per slice rather than per
+    /// picture -- an intra first segment says nothing about an inter one behind it.
+    #[test]
+    fn a_later_segment_of_the_same_picture_is_read_at_the_address_width() {
+        let rust = sixteen_ctbs();
+
+        // Intra, then an inter segment of the same picture: refused, at the segment the C never
+        // reaches.
+        let mut s = slice_segment(&rust, 1, SLICE_TYPE_I, None, true);
+        s.extend_from_slice(&slice_segment(&rust, 1, 1, Some(5), true));
+        assert_eq!(rust.slice_inspect(&s, &mut RefPicSets::Exact), Err(SliceRefusal::SpsRefPicSet));
+
+        // Both intra: served, and the address was read at the right width -- had it not been, the
+        // ref-pic-set flag would have been taken from the wrong bit and this would be a coin toss.
+        // Every address in range, so no single one is the one that happens to line up.
+        for address in 1..16 {
+            let mut s = slice_segment(&rust, 1, SLICE_TYPE_I, None, true);
+            s.extend_from_slice(&slice_segment(&rust, 1, SLICE_TYPE_I, Some(address), true));
+            assert_eq!(
+                rust.slice_inspect(&s, &mut RefPicSets::Exact),
+                Ok(Some(0)),
+                "address {address}"
+            );
+        }
+    }
+
+    /// The debt the exemption takes on. An invented set tells VideoToolbox that no earlier picture
+    /// is kept for reference, so the DPB empties behind the intra slice that was served -- and an
+    /// inter slice arriving afterwards is refused even though its OWN set is one we could
+    /// reproduce, because the pictures it names are gone. An IDR empties the DPB by itself, which
+    /// is what settles the debt.
+    ///
+    /// Nothing is refused here that was served before the exemption existed: the blanket rule
+    /// refused that picture's intra slice one frame earlier.
+    #[test]
+    fn an_inter_slice_is_refused_until_an_idr_refills_the_dpb() {
+        let rust = PictureDesc::read(Descriptor::new(11, 0).bytes());
+        // A P slice carrying its own explicit set: admissible on its own terms, which is the point.
+        let plain_inter = slice_segment(&rust, 1, 1, None, false);
+
+        let mut sets = RefPicSets::Exact;
+        assert_eq!(rust.slice_inspect(&plain_inter, &mut sets), Ok(Some(0)));
+        assert_eq!(sets, RefPicSets::Exact, "nothing was invented for it");
+
+        assert_eq!(
+            rust.slice_inspect(&sps_indexing_slice(&rust, 1, SLICE_TYPE_I), &mut sets),
+            Ok(Some(0))
+        );
+        assert_eq!(sets, RefPicSets::Invented);
+
+        // The same slice that was served a moment ago, now refused -- and for the state, not for
+        // anything in its own header.
+        assert_eq!(
+            rust.slice_inspect(&plain_inter, &mut sets),
+            Err(SliceRefusal::InventedRefPicSet)
+        );
+
+        let idr = slice_segment(&rust, NAL_IDR_W_RADL, SLICE_TYPE_I, None, true);
+        assert_eq!(rust.slice_inspect(&idr, &mut sets), Ok(Some(0)));
+        assert_eq!(sets, RefPicSets::Exact, "the IDR emptied the DPB");
+        assert_eq!(rust.slice_inspect(&plain_inter, &mut sets), Ok(Some(0)));
+    }
+
+    /// An intra slice whose set is predicted from an SPS set is served on the same grounds, and
+    /// takes on the same debt: the set it predicted from is the empty placeholder.
+    #[test]
+    fn a_predicted_set_on_an_intra_slice_is_invented_too() {
+        let rust = PictureDesc::read(Descriptor::new(11, 0).bytes());
+        assert_ne!(
+            rust.num_short_term_ref_pic_sets, 0,
+            "the flag is only present if there are sets"
+        );
+
+        let mut w = Writer::new(Escape::Rbsp);
+        write_nal_header(&mut w, 1);
+        w.flag(true); // first_slice_segment_in_pic_flag
+        w.ue(0);
+        for _ in 0..rust.num_extra_slice_header_bits {
+            w.flag(false);
+        }
+        w.ue(SLICE_TYPE_I);
+        if rust.output_flag_present {
+            w.flag(true);
+        }
+        if rust.separate_colour_plane {
+            w.u(2, 0);
+        }
+        w.u(u32::from(rust.log2_max_pic_order_cnt_lsb_minus4) + 4, 0);
+        w.flag(false); // short_term_ref_pic_set_sps_flag: its own set ...
+        w.flag(true); // ... predicted from one of the SPS's
+        w.rbsp_trailing();
+        let mut s = vec![0, 0, 0, 1];
+        s.extend_from_slice(&w.finish());
+
+        let mut sets = RefPicSets::Exact;
+        assert_eq!(rust.slice_inspect(&s, &mut sets), Ok(Some(0)));
+        assert_eq!(sets, RefPicSets::Invented);
     }
 }
