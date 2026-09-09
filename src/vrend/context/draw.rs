@@ -12,14 +12,36 @@
 
 use super::*;
 
-/// Where the current program sits in a sub-context's program list.
+/// Which program a sub-context has bound, and where it sits in the program list.
 ///
-/// Resolving it is a linear scan for a serial, and the six binders below each asked for the
-/// program once per stage -- around thirty scans per draw, all answering a question settled before
-/// the first of them ran. The pass resolves one of these and hands it down. It is deliberately not
-/// a bare `usize`: [`SubContext::program_at`] is the only way to spend one, and it checks.
+/// The two travel together because they must agree: an index alone goes stale the moment
+/// [`SubContext::forget_programs_of`] shifts the list under it, and would then bind another
+/// program's uniform locations and draw rather than fail. Carried as one value there is nothing to
+/// keep in step -- [`SubContext::program_at`] is the only way to spend one, and it checks the
+/// serial against the program the index landed on.
+///
+/// This is also what removes the scans: the six binders below each asked for the program once per
+/// stage, around thirty scans per draw for a question settled before the first of them ran.
 #[derive(Clone, Copy, Debug)]
-pub struct ProgramSlot(usize);
+pub struct ProgramSlot {
+    at: usize,
+    serial: ProgramSerial,
+}
+
+impl ProgramSlot {
+    /// Where this slot lands once the program at `removed`, named `gone`, leaves the list.
+    ///
+    /// `None` when the program removed is the one this slot named: there is nothing left for it
+    /// to name, and the next draw selects again.
+    fn after_removing(self, removed: usize, gone: ProgramSerial) -> Option<ProgramSlot> {
+        if self.serial == gone {
+            return None;
+        }
+        // Everything after the hole shifts down one; everything before it does not move.
+        let at = if self.at > removed { self.at - 1 } else { self.at };
+        Some(ProgramSlot { at, ..self })
+    }
+}
 
 /// `sysval_uniform_block`: what the shaders read through the `VirglBlock` uniform block, laid
 /// out as std140 lays it out -- every array element on sixteen bytes.
@@ -421,14 +443,12 @@ impl SubContext {
     }
 
     fn program(&self) -> Option<&LinkedProgram> {
-        let serial = self.prog?;
-        self.programs.iter().find(|p| p.serial == serial)
+        Some(self.program_at(self.prog?))
     }
 
-    /// Where the current program sits, resolved once for a whole bind pass.
+    /// The current program, to hand to a whole bind pass.
     fn program_slot(&self) -> Option<ProgramSlot> {
-        let serial = self.prog?;
-        self.programs.iter().position(|p| p.serial == serial).map(ProgramSlot)
+        self.prog
     }
 
     /// The program a slot names.
@@ -439,15 +459,15 @@ impl SubContext {
     /// a host invariant, so it aborts here rather than reaching the screen; the cost is one integer
     /// compare against the scan it replaces.
     fn program_at(&self, at: ProgramSlot) -> &LinkedProgram {
-        let prog = &self.programs[at.0];
-        assert_eq!(Some(prog.serial), self.prog, "a program slot outlived the program it named");
+        let prog = &self.programs[at.at];
+        assert_eq!(prog.serial, at.serial, "a program slot outlived the program it named");
         prog
     }
 
     /// The program a slot names, to write to. Checked as [`SubContext::program_at`] is.
     fn program_at_mut(&mut self, at: ProgramSlot) -> &mut LinkedProgram {
-        let prog = &mut self.programs[at.0];
-        assert_eq!(Some(prog.serial), self.prog, "a program slot outlived the program it named");
+        let prog = &mut self.programs[at.at];
+        assert_eq!(prog.serial, at.serial, "a program slot outlived the program it named");
         prog
     }
 
@@ -480,9 +500,7 @@ impl SubContext {
         while i < self.programs.len() {
             if self.programs[i].links(variant) {
                 let p = self.programs.remove(i);
-                if self.prog == Some(p.serial) {
-                    self.prog = None;
-                }
+                self.prog = self.prog.and_then(|slot| slot.after_removing(i, p.serial));
                 if let Some(b) = p.sysval_buffer {
                     gl.delete_buffer(b);
                 }
@@ -784,20 +802,21 @@ impl Context {
         let found = sub
             .programs
             .iter()
-            .find(|p| p.stages == ids && p.dual_src_linked == dual_src)
-            .map(|p| p.serial);
-        let serial = match found {
+            .position(|p| p.stages == ids && p.dual_src_linked == dual_src)
+            .map(|at| ProgramSlot { at, serial: sub.programs[at].serial });
+        let slot = match found {
             Some(s) => s,
             None => {
                 let serial = sub.mint_program_serial();
                 let prog = add_shader_program(host, cmd, serial, &linked, dual_src)?;
-                self.sub_mut().programs.push(prog);
-                serial
+                let sub = self.sub_mut();
+                sub.programs.push(prog);
+                ProgramSlot { at: sub.programs.len() - 1, serial }
             }
         };
         let sub = self.sub_mut();
-        let changed = sub.prog != Some(serial);
-        sub.prog = Some(serial);
+        let changed = sub.prog.map(|s| s.serial) != Some(slot.serial);
+        sub.prog = Some(slot);
         if changed {
             // Every constant buffer and view is re-bound for a new program.
             for stage in [ShaderStage::Vertex, ShaderStage::Fragment] {
@@ -1754,6 +1773,26 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hazard the slot's serial exists to answer: the program list shifts under a bound slot
+    /// whenever a variant is destroyed, and an index that did not move with it would name a
+    /// different program -- which draws with the wrong uniform locations rather than failing.
+    #[test]
+    fn a_slot_follows_its_program_through_a_removal() {
+        let bound = ProgramSlot { at: 3, serial: ProgramSerial(70) };
+
+        // Removed before it: the program is now one place earlier, and it is the same program.
+        let after = bound.after_removing(1, ProgramSerial(11)).expect("it still names a program");
+        assert_eq!(after.at, 2);
+        assert_eq!(after.serial, ProgramSerial(70));
+
+        // Removed after it: nothing before the hole moves.
+        let after = bound.after_removing(5, ProgramSerial(90)).expect("it still names a program");
+        assert_eq!(after.at, 3);
+
+        // Removed *is* it: nothing left to name.
+        assert!(bound.after_removing(3, ProgramSerial(70)).is_none());
+    }
 
     #[test]
     fn a_set_that_never_reached_a_draw_still_leaves_its_buffers_unbound() {

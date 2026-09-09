@@ -54,7 +54,7 @@ mod draw;
 #[path = "context/select.rs"]
 mod select;
 
-pub use draw::{HwBlend, LinkedProgram, ProgramSerial, Sysval, Tracked, Xfb};
+pub use draw::{HwBlend, LinkedProgram, ProgramSerial, ProgramSlot, Sysval, Tracked, Xfb};
 pub use select::{Bound, Program, Variant, VariantId};
 
 const PIPE_CLEAR_DEPTH: u32 = 1 << 0;
@@ -882,7 +882,7 @@ pub struct SubContext {
     prim_mode: PrimType,
     /// Every program linked for this sub-context, and the one the draws run.
     programs: Vec<LinkedProgram>,
-    prog: Option<ProgramSerial>,
+    prog: Option<ProgramSlot>,
     next_program_serial: Cell<u64>,
     next_variant_id: u64,
     /// The `VirglBlock` contents. Each program remembers the block it last uploaded and
