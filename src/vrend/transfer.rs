@@ -263,12 +263,20 @@ fn flip_rows(data: &mut [u8], l: &Layout) {
     let row = l.row() as usize;
     let layer = l.layer() as usize;
     for d in 0..l.depth as usize {
-        let rows = &mut data[d * layer..(d + 1) * layer];
-        let n = l.blocks_high as usize;
-        for r in 0..n / 2 {
-            let (a, b) = rows.split_at_mut((n - 1 - r) * row);
-            a[r * row..(r + 1) * row].swap_with_slice(&mut b[..row]);
-        }
+        reverse_rows(&mut data[d * layer..(d + 1) * layer], row, l.blocks_high as usize);
+    }
+}
+
+/// Reverse the order of `n` rows of `row` bytes, in place.
+///
+/// `data` may be longer than the image: only the first `n` rows are part of the picture and only
+/// they move. The two halves meet exactly at the largest `r`, and `split_at_mut` is what makes
+/// the compiler check that rather than a comment -- the low row and the high row it swaps with
+/// cannot be the same borrow.
+fn reverse_rows(data: &mut [u8], row: usize, n: usize) {
+    for r in 0..n / 2 {
+        let (a, b) = data.split_at_mut((n - 1 - r) * row);
+        a[r * row..(r + 1) * row].swap_with_slice(&mut b[..row]);
     }
 }
 
@@ -653,11 +661,7 @@ pub fn read_whole_2d(
     }
     read_layer(gl, features, formats, res, 0, 0, 0, 0, w as GLsizei, h as GLsizei, dst)?;
     if res.y_0_top() {
-        let n = desc.blocks_high(h) as usize;
-        for r in 0..n / 2 {
-            let (a, b) = dst.split_at_mut((n - 1 - r) * stride);
-            a[r * stride..(r + 1) * stride].swap_with_slice(&mut b[..stride]);
-        }
+        reverse_rows(dst, stride, desc.blocks_high(h) as usize);
     }
     Ok(())
 }
@@ -783,6 +787,41 @@ pub fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row reversal both readback paths share.
+    ///
+    /// Pure index arithmetic, and the subtlest code in either path: an off-by-one here mirrors an
+    /// image or drops a row silently rather than failing, so nothing downstream reports it. It is
+    /// also the only part of the cursor readback reachable without a display, which is why it is
+    /// pinned here rather than left to a guest to notice.
+    #[test]
+    fn reversing_rows_mirrors_the_image_and_nothing_else() {
+        // Even count: every row moves.
+        let mut even = vec![0u8, 0, 1, 1, 2, 2, 3, 3];
+        reverse_rows(&mut even, 2, 4);
+        assert_eq!(even, vec![3, 3, 2, 2, 1, 1, 0, 0]);
+
+        // Odd count: the middle row stays put, and the loop must stop rather than swap it with
+        // itself through two overlapping borrows.
+        let mut odd = vec![0u8, 0, 1, 1, 2, 2];
+        reverse_rows(&mut odd, 2, 3);
+        assert_eq!(odd, vec![2, 2, 1, 1, 0, 0]);
+
+        // Degenerate counts are no-ops, not panics: a one-row image is a legal image.
+        let mut one = vec![7u8, 8];
+        reverse_rows(&mut one, 2, 1);
+        assert_eq!(one, vec![7, 8]);
+        let mut empty: Vec<u8> = Vec::new();
+        reverse_rows(&mut empty, 2, 0);
+        assert!(empty.is_empty());
+
+        // A buffer longer than the image it holds: the tail is not part of the picture. The
+        // readback sizes `dst` from the format, and a guard that only checks it is big *enough*
+        // admits a longer one.
+        let mut tail = vec![0u8, 0, 1, 1, 9, 9];
+        reverse_rows(&mut tail, 2, 2);
+        assert_eq!(tail, vec![1, 1, 0, 0, 9, 9], "the row past the image is untouched");
+    }
 
     #[test]
     fn rows_flip_within_each_layer() {
