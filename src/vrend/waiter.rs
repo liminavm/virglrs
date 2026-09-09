@@ -234,8 +234,8 @@ mod tests {
     /// to conclude anything unless that read is stale -- the needle has to be shown live before
     /// the assertion means anything.
     #[test]
-    #[ignore = "needs the zink-on-KosmicKrisp environment"]
     fn a_cpu_reader_sees_the_render_the_fence_waited_for() {
+        let _display = crate::vrend::one_display_at_a_time();
         let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
         let ctx = winsys
             .create_context(Version { major: 3, minor: 1 }, None)
