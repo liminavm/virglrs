@@ -84,9 +84,17 @@ jobs:
         run: |
           # llvm and bison are keg-only and both are required: KosmicKrisp pulls in CLC and so
           # LLVM, and Mesa's glcpp grammar needs bison > 2.3 where Apple ships 2.3 from 2008.
-          time brew install meson ninja bison llvm expat molten-vk glslang \
-                            spirv-tools vulkan-loader vulkan-tools check pkgconf
-          brew list --versions llvm bison molten-vk glslang spirv-tools vulkan-loader
+          #
+          # libclc and spirv-llvm-translator (which provides LLVMSPIRVLib) are separate formulae,
+          # not part of llvm. The list is not guesswork: it is the six external dependencies the
+          # working local build's meson-log.txt resolved, mapped back to the formula that owns
+          # each .pc file. Their versions track llvm's major, so pinning llvm would mean pinning
+          # all three together.
+          time brew install meson ninja bison llvm libclc spirv-llvm-translator expat \
+                            molten-vk glslang spirv-tools vulkan-loader vulkan-tools \
+                            check pkgconf
+          brew list --versions llvm libclc spirv-llvm-translator bison molten-vk \
+                               glslang spirv-tools vulkan-loader
 
       - name: Set up Mesa's codegen environment
         run: |
