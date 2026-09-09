@@ -953,12 +953,18 @@ impl Context {
         let gl = host.gl;
         let s = stage.index();
         let mut mask = sub.program_at(at).ubo_used_mask[s];
+        let mut dirty = sub.ubos_dirty[s];
+        // Nothing dirty is nothing to rebind, whatever is bound. The walk below only narrows this
+        // answer, so reaching it first spends a BTree walk per stage per draw to be told what the
+        // mask already said.
+        if dirty.is_empty() {
+            return next_ubo_id.plus(mask.count_ones());
+        }
         // The decoder refuses an index past the mask, so every key is a slot it holds.
         let mut used = Dirty::none();
         for slot in sub.ubos[s].keys() {
             used.mark(*slot);
         }
-        let mut dirty = sub.ubos_dirty[s];
         let update = dirty.intersect(used);
         if update.is_empty() {
             return next_ubo_id.plus(mask.count_ones());
