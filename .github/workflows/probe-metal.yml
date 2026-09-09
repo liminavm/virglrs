@@ -1,0 +1,212 @@
+# SPDX-License-Identifier: MIT
+# Copyright © 2026 Gustavo Noronha Silva
+#
+# THROWAWAY. This workflow exists to answer one question and then be deleted: does a
+# GitHub-hosted macOS runner have a GPU that actually executes work?
+#
+# It is load-bearing for where the test suites live. Everything from the C tree's own
+# `tests/` upward needs `virgl_renderer_init`, which here means an EGL context through
+# zink -> KosmicKrisp -> Metal. If a hosted runner cannot rasterize, that whole lane is
+# self-hosted from the start and there is no point designing around the alternative.
+#
+# The public signals disagree, which is why this is measured rather than looked up:
+# GitHub's M1/M2 runner changelogs claim GPU acceleration is on by default, while
+# actions/runner-images#7085 is an open request for exactly that. A changelog and an open
+# issue are both statements about the runner; neither is a pixel.
+#
+# So the probe does not ask a status field. It renders and reads the texture back.
+# `MTLCreateSystemDefaultDevice()` returning a handle is the proxy that would lie towards
+# success here: a device can enumerate in a VM and still execute nothing.
+#
+# Delete this file, and the row it fills in, once it has answered.
+name: Probe — Metal on a hosted runner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  metal:
+    name: Does a hosted runner rasterize?
+    runs-on: macos-26
+    timeout-minutes: 15
+
+    steps:
+      - name: What the OS says it has
+        run: |
+          sw_vers
+          uname -m
+          system_profiler SPDisplaysDataType || echo "(no SPDisplaysDataType)"
+          system_profiler SPHardwareDataType || true
+
+      # Compute and rasterization are separate capabilities and a headless VM may expose
+      # one without the other. The renderer needs the second, so both are measured and
+      # only the render half decides the job.
+      - name: Write the probe
+        run: |
+          cat > /tmp/metal-probe.swift <<'SWIFT'
+          import Metal
+
+          // Exits non-zero on any failure; every check prints what it saw, because "the
+          // probe passed" is worth less than the values it passed on.
+          func die(_ why: String) -> Never {
+              print("FAIL: \(why)")
+              exit(1)
+          }
+
+          guard let device = MTLCreateSystemDefaultDevice() else {
+              die("MTLCreateSystemDefaultDevice() returned nil — no Metal device at all")
+          }
+
+          print("device:            \(device.name)")
+          print("registryID:        \(device.registryID)")
+          print("lowPower:          \(device.isLowPower)")
+          print("headless:          \(device.isHeadless)")
+          print("unifiedMemory:     \(device.hasUnifiedMemory)")
+          print("maxWorkingSet:     \(device.recommendedMaxWorkingSetSize) bytes")
+          print("allDevices:        \(MTLCopyAllDevices().count)")
+
+          guard let queue = device.makeCommandQueue() else { die("makeCommandQueue() returned nil") }
+
+          let source = """
+          #include <metal_stdlib>
+          using namespace metal;
+
+          kernel void fill(device uint *out [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+              out[i] = i * 3 + 1;
+          }
+
+          struct VSOut { float4 pos [[position]]; };
+
+          // Lower-left half of clip space, so the readback carries both the cleared
+          // colour and the drawn one. Two values present is the check; it needs no
+          // assumption about which way up the texture is.
+          vertex VSOut vs(uint vid [[vertex_id]]) {
+              float2 p[3] = { float2(-1, -1), float2(1, -1), float2(-1, 1) };
+              VSOut o;
+              o.pos = float4(p[vid], 0, 1);
+              return o;
+          }
+
+          fragment float4 fs() { return float4(0, 1, 0, 1); }
+          """
+
+          let library: MTLLibrary
+          do {
+              library = try device.makeLibrary(source: source, options: nil)
+          } catch {
+              die("makeLibrary() failed: \(error)")
+          }
+
+          // --- compute -----------------------------------------------------------------
+          let count = 256
+          guard let fill = library.makeFunction(name: "fill") else { die("no kernel 'fill'") }
+          guard let buffer = device.makeBuffer(length: count * MemoryLayout<UInt32>.size,
+                                               options: .storageModeShared)
+          else { die("makeBuffer() returned nil") }
+
+          do {
+              let pipeline = try device.makeComputePipelineState(function: fill)
+              guard let cb = queue.makeCommandBuffer(),
+                    let enc = cb.makeComputeCommandEncoder() else { die("no compute encoder") }
+              enc.setComputePipelineState(pipeline)
+              enc.setBuffer(buffer, offset: 0, index: 0)
+              enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                                  threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+              enc.endEncoding()
+              cb.commit()
+              cb.waitUntilCompleted()
+              if let error = cb.error { die("compute command buffer: \(error)") }
+          } catch {
+              die("compute pipeline: \(error)")
+          }
+
+          let written = buffer.contents().bindMemory(to: UInt32.self, capacity: count)
+          for i in 0..<count where written[i] != UInt32(i * 3 + 1) {
+              die("compute wrote \(written[i]) at \(i), expected \(i * 3 + 1)")
+          }
+          print("compute:           256/256 values correct")
+
+          // --- rasterization -----------------------------------------------------------
+          // This is the half the renderer needs. A device that dispatches compute in a
+          // headless VM and cannot rasterize would pass everything above.
+          let side = 64
+          let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+                                                             width: side, height: side,
+                                                             mipmapped: false)
+          desc.usage = [.renderTarget, .shaderRead]
+          desc.storageMode = .shared
+          guard let target = device.makeTexture(descriptor: desc) else { die("makeTexture() returned nil") }
+
+          let pass = MTLRenderPassDescriptor()
+          pass.colorAttachments[0].texture = target
+          pass.colorAttachments[0].loadAction = .clear
+          pass.colorAttachments[0].storeAction = .store
+          // Both colours are exact in 8-bit unorm, so the readback can be compared to
+          // literal bytes rather than to a rounding tolerance.
+          pass.colorAttachments[0].clearColor = MTLClearColor(red: 1, green: 0, blue: 0, alpha: 1)
+
+          let pipeDesc = MTLRenderPipelineDescriptor()
+          pipeDesc.vertexFunction = library.makeFunction(name: "vs")
+          pipeDesc.fragmentFunction = library.makeFunction(name: "fs")
+          pipeDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+
+          do {
+              let pipeline = try device.makeRenderPipelineState(descriptor: pipeDesc)
+              guard let cb = queue.makeCommandBuffer(),
+                    let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { die("no render encoder") }
+              enc.setRenderPipelineState(pipeline)
+              enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+              enc.endEncoding()
+              cb.commit()
+              cb.waitUntilCompleted()
+              if let error = cb.error { die("render command buffer: \(error)") }
+          } catch {
+              die("render pipeline: \(error)")
+          }
+
+          var pixels = [UInt8](repeating: 0, count: side * side * 4)
+          pixels.withUnsafeMutableBytes { raw in
+              target.getBytes(raw.baseAddress!, bytesPerRow: side * 4,
+                              from: MTLRegionMake2D(0, 0, side, side), mipmapLevel: 0)
+          }
+
+          var histogram: [UInt32: Int] = [:]
+          for i in stride(from: 0, to: pixels.count, by: 4) {
+              let px = UInt32(pixels[i]) | UInt32(pixels[i + 1]) << 8
+                     | UInt32(pixels[i + 2]) << 16 | UInt32(pixels[i + 3]) << 24
+              histogram[px, default: 0] += 1
+          }
+          for (px, n) in histogram.sorted(by: { $0.value > $1.value }) {
+              print(String(format: "pixel:             %08x  x%d", px, n))
+          }
+
+          // BGRA8Unorm little-endian: cleared red is 00 00 ff ff, drawn green 00 ff 00 ff.
+          let cleared: UInt32 = 0xffff_0000
+          let drawn: UInt32 = 0xff00_ff00
+          guard histogram.count == 2,
+                let clearedCount = histogram[cleared],
+                let drawnCount = histogram[drawn]
+          else { die("readback is not the two expected colours — the render did not land") }
+
+          print("render:            \(clearedCount) cleared + \(drawnCount) drawn = \(side * side)")
+          print("PASS: this runner rasterizes")
+          SWIFT
+          wc -l /tmp/metal-probe.swift
+
+      - name: Build and run it
+        run: |
+          swiftc -O /tmp/metal-probe.swift -o /tmp/metal-probe
+          /tmp/metal-probe
+
+      # Secondary and non-blocking: KosmicKrisp is Vulkan layered over Metal, so whether
+      # any layered driver enumerates here is the closer analogue. MoltenVK is not KK and
+      # a result either way settles nothing on its own — it is a second data point next
+      # to the Metal one, which is why it cannot fail the job.
+      - name: Does a layered Vulkan enumerate?
+        continue-on-error: true
+        run: |
+          brew install molten-vk vulkan-tools
+          vulkaninfo --summary
