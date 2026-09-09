@@ -528,6 +528,11 @@ impl Context {
     /// Called after every command in a batch. A target only per-plane consumers ever read never
     /// owes a fill and so costs nothing but the walk.
     pub(super) fn fill_composites(&mut self, host: &mut Host<'_>) {
+        // Asked before anything is built, because this runs after every command and the answer is
+        // no for every command of a workload that never decodes a frame.
+        if self.owed.is_empty() && !self.video.owes_fill() {
+            return;
+        }
         // Two ways in, because neither reaches every target: the live video buffers cover
         // everything delivery touches, and `owed` covers a target sampled whole after its
         // buffer is gone. A target on both lists is visited once; the state on it is what
