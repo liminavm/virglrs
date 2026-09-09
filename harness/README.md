@@ -1068,6 +1068,16 @@ and refuses a post-cutover bundle: a swap into a bundle that loads nothing would
 while reporting as C, and re-sign afterwards so it looked fresh. `harness/vm/Limina.app` is that
 pre-cutover bundle, and limina HEAD can no longer produce another.
 
+**So the C leg is a saved artifact, and that is a debt, not a design.** It works — every boot gate
+here is scored against it — but it cannot be rebuilt, so it cannot follow a limina fix, and the
+day it stops booting there is nothing to regenerate it from.
+
+**The candidate is to move the boot rig to QEMU**, which loads the renderer as a dylib and can
+therefore hold *both* implementations without a fork of the VMM between them — the thing limina
+structurally cannot do now that it compiles virglrs in. There is already a QEMU control rig on
+goiaba, so the shape is known. **Deliberately deferred**: the C leg boots today, and rebuilding
+the rig is a larger change than anything currently waiting on it.
+
 ## Layer 0 — the ABI itself (`abi/`)
 
 `abi-fixture.sh` pins two files and checks a build against them: `symbols.txt`, the symbols a
