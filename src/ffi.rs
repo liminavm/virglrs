@@ -1544,13 +1544,46 @@ pub extern "C" fn virgl_renderer_get_rect(
 ) {
 }
 
+/// The pixels behind the guest's cursor resource, so the VMM can draw the pointer.
+///
+/// The buffer becomes the caller's to `free`, which is the ABI's contract and the whole reason
+/// this hands back a raw pointer rather than the `Cursor` the Rust API answers with.
+///
+/// `NULL` is not an error here, and the C says so the same way: it means there is no cursor image
+/// to be had this time, and a VMM reads it as "leave the pointer as it was". Every refusal --
+/// no such resource, not a 2D texture, larger than a cursor plane, a readback the driver would
+/// not do -- arrives as that one answer.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_get_cursor_data(
-    _resource_id: u32,
-    _width: *mut u32,
-    _height: *mut u32,
+    resource_id: u32,
+    width: *mut u32,
+    height: *mut u32,
 ) -> *mut c_void {
-    std::ptr::null_mut()
+    if width.is_null() || height.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(handle) = ResourceHandle::new(resource_id) else {
+        return std::ptr::null_mut();
+    };
+    with(std::ptr::null_mut(), |r| {
+        let Some(cursor) = r.classic_cursor(handle) else {
+            return std::ptr::null_mut();
+        };
+        let Some(p) = malloc_bytes(&cursor.pixels) else {
+            return std::ptr::null_mut();
+        };
+        // The extent is written only once there is a buffer to describe. A caller told a size
+        // over a null pointer would be reading whatever its own variables held before the call
+        // and believing this put it there.
+        //
+        // SAFETY: both were checked non-null above, and the VMM's contract is that they are
+        // writable for the length of the call.
+        unsafe {
+            *width = cursor.width;
+            *height = cursor.height;
+        }
+        p
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -2641,6 +2674,27 @@ mod tests {
             "rutabaga reads this as `no handle`, which is the truth"
         );
         assert_eq!((fd_type, fd), (0xdead_beef, 7), "and a refusal writes neither out-parameter");
+
+        // A cursor read before any renderer exists. `NULL` is the C's answer too, and a VMM reads
+        // it as "no cursor image", never as an error worth reporting.
+        let mut w = 0xdead_beefu32;
+        let mut h = 0xfeedu32;
+        assert!(
+            virgl_renderer_get_cursor_data(1, &raw mut w, &raw mut h).is_null(),
+            "no renderer, so no cursor"
+        );
+        assert_eq!((w, h), (0xdead_beef, 0xfeed), "and a refusal writes neither extent");
+
+        // The out-parameters are the caller's promise, and the C checks them before anything
+        // else. A null one here must not become a write through it.
+        assert!(
+            virgl_renderer_get_cursor_data(1, std::ptr::null_mut(), &raw mut h).is_null(),
+            "no width to write to"
+        );
+        assert!(
+            virgl_renderer_get_cursor_data(1, &raw mut w, std::ptr::null_mut()).is_null(),
+            "no height to write to"
+        );
     }
 
     /// A guest picks this byte, and picking a wrong one must not be mistaken for picking venus.
