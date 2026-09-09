@@ -125,6 +125,24 @@ unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
 impl Shared {
+    /// Bind `ctx` on the calling thread, with no surface.
+    fn make_current(&self, ctx: EGLContext) -> Result<(), EglError> {
+        // SAFETY: the display is initialised, the context alive on it, and surfaceless contexts
+        // are made current with `EGL_NO_SURFACE` twice.
+        let ok = unsafe {
+            self.egl.eglMakeCurrent()(
+                self.display,
+                proc::EGL_NO_SURFACE,
+                proc::EGL_NO_SURFACE,
+                ctx,
+            )
+        };
+        if ok == proc::EGL_FALSE {
+            return Err(self.error("eglMakeCurrent"));
+        }
+        Ok(())
+    }
+
     fn error(&self, call: &'static str) -> EglError {
         // SAFETY: `eglGetError` takes nothing and is defined on any thread.
         EglError { call, code: unsafe { self.egl.eglGetError()() } }
@@ -162,6 +180,28 @@ impl Drop for Context {
         // SAFETY: `ctx` was returned by `eglCreateContext` on this display and has not been
         // destroyed, because only this drop destroys it.
         unsafe { self.shared.egl.eglDestroyContext()(self.shared.display, self.ctx) };
+    }
+}
+
+/// The display, for a thread that owns a [`Context`] and only needs to bind it.
+///
+/// Handed out by [`Winsys::thread_display`]. It keeps the display alive for as long as the thread
+/// holds it, and can do exactly two things -- bind and unbind -- so it cannot become a second
+/// owner of anything on the display.
+pub struct ThreadDisplay {
+    shared: Arc<Shared>,
+}
+
+impl ThreadDisplay {
+    /// Bind `ctx` on the calling thread, with no surface.
+    pub fn make_current(&self, ctx: &Context) -> Result<(), EglError> {
+        assert!(Arc::ptr_eq(&ctx.shared, &self.shared), "a context from another display");
+        self.shared.make_current(ctx.ctx)
+    }
+
+    /// Release whatever context is current on the calling thread.
+    pub fn release_current(&self) -> Result<(), EglError> {
+        self.shared.make_current(proc::EGL_NO_CONTEXT)
     }
 }
 
@@ -420,39 +460,25 @@ impl Winsys {
     /// Make `ctx` current on this thread, with no surface.
     pub fn make_current(&self, ctx: &Context) -> Result<(), EglError> {
         assert!(Arc::ptr_eq(&ctx.shared, &self.shared), "a context from another display");
-        let egl = &self.shared.egl;
-        // SAFETY: the display is initialised, the context alive on it, and surfaceless contexts
-        // are made current with `EGL_NO_SURFACE` twice.
-        let ok = unsafe {
-            egl.eglMakeCurrent()(
-                self.shared.display,
-                proc::EGL_NO_SURFACE,
-                proc::EGL_NO_SURFACE,
-                ctx.ctx,
-            )
-        };
-        if ok == proc::EGL_FALSE {
-            return Err(self.shared.error("eglMakeCurrent"));
-        }
-        Ok(())
+        self.shared.make_current(ctx.ctx)
+    }
+
+    /// A handle to this display for another thread, which can bind a context it owns and nothing
+    /// else.
+    ///
+    /// Currency is per thread and EGL's own bookkeeping, so a second thread binding its own
+    /// context says nothing about what is current here -- which is what lets the fence waiter hold
+    /// a context of the share group and wait on it while this thread carries on. It deliberately
+    /// cannot create or destroy anything: a thread that could would be a second owner of the
+    /// display's objects.
+    pub fn thread_display(&self) -> ThreadDisplay {
+        ThreadDisplay { shared: Arc::clone(&self.shared) }
     }
 
     /// Release whatever context is current on this thread.
     pub fn release_current(&self) -> Result<(), EglError> {
-        let egl = &self.shared.egl;
-        // SAFETY: `EGL_NO_CONTEXT` with no surfaces is the documented way to release.
-        let ok = unsafe {
-            egl.eglMakeCurrent()(
-                self.shared.display,
-                proc::EGL_NO_SURFACE,
-                proc::EGL_NO_SURFACE,
-                proc::EGL_NO_CONTEXT,
-            )
-        };
-        if ok == proc::EGL_FALSE {
-            return Err(self.shared.error("eglMakeCurrent"));
-        }
-        Ok(())
+        // `EGL_NO_CONTEXT` with no surfaces is the documented way to release.
+        self.shared.make_current(proc::EGL_NO_CONTEXT)
     }
 
     /// An EGL image whose pixels are `surface`'s, for a texture to take as its storage.
