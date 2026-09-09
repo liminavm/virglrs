@@ -144,6 +144,8 @@ pub struct Host<'a> {
     pub ctx: ContextId,
     pub current: &'a mut Current,
     pub todo: &'a mut Todo,
+    /// Per-command cost accounting, inert unless armed.
+    pub tally: &'a mut super::tally::Tally,
     /// The shader blitter, built on the first blit that needs it.
     pub blitter: &'a mut Option<Blitter>,
     /// What this host decodes in hardware, or `None` when the caller did not ask for video.
@@ -1258,6 +1260,7 @@ impl Context {
                 // stale reference, so it poisons even during a replay.
                 Err(r) => return self.poison(host.ctx, Fault::Wire(r)),
             };
+            host.tally.command();
             let kind = framed.cmd.kind();
             // Read before the command is consumed. `CreateObject` is ten operations behind one
             // name, so a GL error attributed to the command alone does not say what failed.

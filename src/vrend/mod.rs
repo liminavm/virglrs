@@ -32,6 +32,7 @@ pub mod pipe;
 pub mod proto;
 pub mod resource;
 pub mod shader;
+pub mod tally;
 pub mod tgsi;
 pub mod transfer;
 pub mod video;
