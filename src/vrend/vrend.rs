@@ -212,13 +212,19 @@ impl Vrend {
         let caps = caps::CapsV2::probe(&gl, &features, &limits, &formats, video.as_ref());
         eprintln!(
             "[virglrs] vrend: {version_string} (gles {gles_version}), {} formats, {} features, \
-             iosurface storage {}",
+             {}",
             formats.entries().count(),
             features.present().count(),
-            if features.adopts_iosurfaces() {
-                "available"
+            if !cfg!(target_os = "macos") {
+                // Not a shortfall here: this host hands the VMM a texture name and it scans out
+                // from that, so there is no surface to import and nothing is copied for want of
+                // one.
+                "storage: GL textures, scanned out by name"
+            } else if features.adopts_iosurfaces() {
+                "iosurface storage available"
             } else {
-                "UNAVAILABLE -- no scanout              or shared buffer can be imported without a copy, and every one will be blank"
+                "iosurface storage UNAVAILABLE -- no scanout or shared buffer can be imported \
+                 without a copy, and every one will be blank"
             },
         );
         // The waiter gets a context of ctx0's share group, made current on its own thread. A
