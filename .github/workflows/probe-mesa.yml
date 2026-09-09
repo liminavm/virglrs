@@ -154,7 +154,20 @@ jobs:
           export DYLD_LIBRARY_PATH="$MESA_PREFIX/vulkan-rpath"
           mkdir -p "$MESA_PREFIX/vulkan-rpath"
           ln -sf "$(brew --prefix)/lib/libvulkan.1.dylib" "$MESA_PREFIX/vulkan-rpath/"
-          vulkaninfo --summary
+
+          # "Failed to detect any valid GPUs" has two causes that read identically: the ICD
+          # loaded and enumerated nothing, or the ICD never loaded. Those are opposite answers
+          # -- the first is KK declining the paravirtual device and settles the roadmap, the
+          # second is a dylib path this probe got wrong. So establish which before reporting.
+          echo "=== ICD manifest ==="
+          cat "$VK_DRIVER_FILES"
+          KK_LIB="$(python3 -c "import json,os; p=os.environ['VK_DRIVER_FILES']; l=json.load(open(p))['ICD']['library_path']; print(l if os.path.isabs(l) else os.path.join(os.path.dirname(p), l))")"
+          echo "=== KK library: $KK_LIB ==="
+          ls -la "$KK_LIB"
+          # If this names an @rpath entry nothing resolves, the failure is loading, not Metal.
+          otool -L "$KK_LIB"
+          echo "=== loader trace ==="
+          VK_LOADER_DEBUG=all vulkaninfo --summary
 
       - name: Clone limina's probes
         run: |
