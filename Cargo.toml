@@ -19,6 +19,15 @@ panic = "abort"
 # renderer measured against an optimized one reads as a tenfold regression in the renderer, with
 # nothing in either tree to find. Consumers must say the same thing about this crate in their own
 # profile: `[profile.dev.package.virglrs] opt-level = 3`.
+#
+# That line alone is NOT enough, and saying only that here cost a day's measurement. A package
+# override does not reach the package's dependencies, so the command path keeps calling into
+# unoptimized library code. Measured 2026-09-08: `rustc-hash` at opt-level 0 left
+# `FxBuildHasher::build_hasher` and `FxHasher::default` as two out-of-line calls per hash lookup,
+# 4.8% of the whole classic command path -- and only on the arm that had just been changed to use
+# hash tables, so it read as the new code being slower than it is. Consumers must raise the
+# dependencies this crate reaches per command as well (`rustc-hash`, `bumpalo`, `bytemuck`), or
+# raise the whole graph and accept the compile time.
 opt-level = 3
 
 [profile.release]
