@@ -8,7 +8,9 @@
 //! mean anything. Here the backing is an enum, so a transfer or a destroy is one match with no
 //! flag to consult, and a buffer cannot be mistaken for a texture.
 
-use super::egl::{self, Image, Winsys};
+#[cfg(target_os = "macos")]
+use super::egl;
+use super::egl::{Image, Winsys};
 use super::features::{Feature, Features};
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
@@ -16,10 +18,14 @@ use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, Text
 use super::pipe::TextureTarget;
 use super::proto::{Format, Plane};
 use super::video;
-use crate::budget::{Charged, Classic};
+#[cfg(target_os = "macos")]
+use crate::budget::Charged;
+use crate::budget::Classic;
 use crate::guest_mem::{Iov, PixelSource};
 use crate::ids::ResourceHandle;
-use crate::metal::{Held, PixelFormat, PlanarFormat, Surface};
+#[cfg(target_os = "macos")]
+use crate::surface::PixelFormat;
+use crate::surface::{Held, PlanarFormat, Surface};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -1730,6 +1736,19 @@ pub fn gl_target(target: TextureTarget, nr_samples: u32) -> GLenum {
 /// `None` for every format this build cannot back, and for a surface the system or the driver
 /// refuses -- the caller turns that into a refused create rather than a resource whose planes
 /// cannot be sampled.
+/// No composite target is backable where there is no storage to cut into planes, which is the
+/// same answer this returns on a host that has the currency and declines the format.
+#[cfg(not(target_os = "macos"))]
+fn mint_planes(
+    _winsys: &Winsys,
+    _features: &Features,
+    _budget: &Classic,
+    _a: &Args,
+) -> Option<Planes> {
+    None
+}
+
+#[cfg(target_os = "macos")]
 fn mint_planes(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args) -> Option<Planes> {
     if !video::composite_target_backable(features, a.format) {
         return None;
@@ -1797,6 +1816,19 @@ fn mint_planes(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args)
 /// Only a single-level, single-sample 2D texture in a 32-bit format IOSurface and Metal both
 /// name. Anything else keeps ordinary GL storage and the CPU readback path, as does a surface
 /// the system or the driver refuses: the fallback is never removed, only reported.
+/// The resource keeps ordinary GL storage, which is what `Features::adopts_iosurfaces` already
+/// reports here and what the overwhelming majority of classic resources take on every host.
+#[cfg(not(target_os = "macos"))]
+fn mint_surface(
+    _winsys: &Winsys,
+    _features: &Features,
+    _budget: &Classic,
+    _a: &Args,
+) -> Option<Image> {
+    None
+}
+
+#[cfg(target_os = "macos")]
 fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args) -> Option<Image> {
     let scanout = a.bind.has(Bind::SCANOUT);
     if !scanout && !a.bind.has(Bind::SHARED) {

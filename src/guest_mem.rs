@@ -456,7 +456,7 @@ fn anonymous_fd(debug_name: &str) -> io::Result<OwnedFd> {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: memfd_create returned a fresh descriptor that nothing else owns.
-        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
     #[cfg(not(target_os = "linux"))]
     {

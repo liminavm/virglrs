@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 pub(crate) use super::gl::types;
 use super::gl::{Gles, ProcAddr};
-use crate::metal::{Held, Surface};
+use crate::surface::{Held, Surface};
 
 #[allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code, clippy::all)]
 pub mod proc {
@@ -202,12 +202,15 @@ impl ThreadDisplay {
 
 /// `EGL_IOSURFACE_LIMINA`: the `eglCreateImageKHR` target limina's Mesa accepts an `IOSurfaceRef`
 /// as the client buffer of. The value is the one `egl_dri2.c` defines, and must stay so.
+#[cfg(target_os = "macos")]
 const EGL_IOSURFACE_LIMINA: EGLenum = 0x3B9A;
 
 /// `EGL_IOSURFACE_PLANE_LIMINA` and `EGL_IOSURFACE_FOURCC_LIMINA`: which plane of a planar
 /// surface an image is over, and how that plane's bytes are laid out. Same source as the target
 /// above, and the same requirement that the values match.
+#[cfg(target_os = "macos")]
 const EGL_IOSURFACE_PLANE_LIMINA: EGLint = 0x3B9B;
+#[cfg(target_os = "macos")]
 const EGL_IOSURFACE_FOURCC_LIMINA: EGLint = 0x3B9C;
 
 /// How one plane of a planar surface is read: the DRM FourCC limina's Mesa names it by.
@@ -226,6 +229,7 @@ pub enum Plane {
     ChromaPair,
 }
 
+#[cfg(target_os = "macos")]
 impl Plane {
     /// The plane's index within the surface.
     fn index(self) -> EGLint {
@@ -499,6 +503,18 @@ impl Winsys {
         self.image_of_iosurface(held, Some(plane))
     }
 
+    /// No surface can exist on a host that mints none, so this is total rather than refusing:
+    /// the caller had to produce one to get here, and the type says it could not have.
+    #[cfg(not(target_os = "macos"))]
+    fn image_of_iosurface(
+        &self,
+        held: Arc<dyn Held>,
+        _plane: Option<Plane>,
+    ) -> Result<Image, EglError> {
+        match *held.surface() {}
+    }
+
+    #[cfg(target_os = "macos")]
     fn image_of_iosurface(
         &self,
         held: Arc<dyn Held>,
@@ -608,7 +624,7 @@ mod tests {
     #[test]
     #[ignore = "needs the zink-on-KosmicKrisp environment"]
     fn each_plane_of_a_planar_surface_imports_as_its_own_image() {
-        use crate::metal::{PlanarFormat, Surface};
+        use crate::surface::{PlanarFormat, Surface};
 
         let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
         let surface: Arc<dyn Held> =
@@ -651,7 +667,7 @@ mod tests {
             GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_RED, GL_RG,
             GL_TEXTURE_2D, GL_UNSIGNED_BYTE,
         };
-        use crate::metal::{PlanarFormat, Surface};
+        use crate::surface::{PlanarFormat, Surface};
 
         const LUMA_BYTE: u8 = 0x10;
         const CHROMA_BYTE: u8 = 0x80;

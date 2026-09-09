@@ -180,7 +180,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::metal::{self, PixelFormat};
+    use crate::surface::{self, PixelFormat};
     use crate::vrend::egl::{Flavour, Version, Winsys};
     use crate::vrend::gl::gles::*;
     use crate::vrend::gl::types::GLsizei;
@@ -206,7 +206,7 @@ mod tests {
     ///
     /// This is the foreign consumer the fence exists for: `IOSurfaceLock` and a load, ordered
     /// against our GL queue by nothing at all.
-    fn first_pixel_blue(s: &metal::Surface) -> u8 {
+    fn first_pixel_blue(s: &surface::Surface) -> u8 {
         // `read_rows`, not `read_plane_row`: a plain surface has no *planes*, so its plane count
         // is zero and the per-plane accessor answers `None` for every index.
         let stride = s.bytes_per_row() as usize;
@@ -238,9 +238,9 @@ mod tests {
         let gl = Gl::new(winsys.gles());
 
         let surface =
-            Arc::new(metal::Surface::plain(W, H, PixelFormat::Bgra).expect("an IOSurface"));
+            Arc::new(surface::Surface::plain(W, H, PixelFormat::Bgra).expect("an IOSurface"));
         let image = winsys
-            .image_from_iosurface(Arc::clone(&surface) as Arc<dyn metal::Held>)
+            .image_from_iosurface(Arc::clone(&surface) as Arc<dyn surface::Held>)
             .expect("an EGL image over the surface");
 
         let tex = gl.gen_texture();

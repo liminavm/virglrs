@@ -21,7 +21,7 @@ use super::pipe::{PrimType, ShaderStage};
 use super::proto::{FORMAT_MAX, Format};
 use super::resource::Limits;
 use super::video;
-use crate::videotoolbox;
+use crate::decode;
 
 /// `virgl_supported_format_mask`: one bit per wire format, 512 of them.
 #[repr(C)]
@@ -309,7 +309,7 @@ impl CapsV2 {
         features: &Features,
         limits: &Limits,
         formats: &Table,
-        video_support: Option<&videotoolbox::Support>,
+        video_support: Option<&decode::Support>,
     ) -> CapsV2 {
         let has = |f: Feature| features.has(f);
         let get = |name: GLenum| gl.get_integer(name);
