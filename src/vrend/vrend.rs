@@ -24,6 +24,7 @@ use super::gl::{self, Gl};
 use super::journal::{Census, Seq};
 use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::shader;
+use super::tally;
 use super::transfer::{self, Info};
 use super::waiter;
 use crate::config::Config;
@@ -79,6 +80,9 @@ pub struct Vrend {
     resources: crate::Map<ResourceHandle, resource::Slot>,
     contexts: crate::Map<ContextId, Context>,
     pub todo: Todo,
+    /// What the command path costs per guest command. Inert unless armed -- see
+    /// [`tally::Tally`], which says why a profiler cannot answer this.
+    tally: tally::Tally,
     /// The shader blitter and its GL context, built on the first blit that needs one. A renderer
     /// that never takes the blitter's path never pays for it.
     blitter: Option<blitter::Blitter>,
@@ -252,6 +256,7 @@ impl Vrend {
             resources: crate::Map::default(),
             contexts: crate::Map::default(),
             todo: Todo::default(),
+            tally: tally::Tally::from_env(),
             blitter: None,
             waiter,
             fences,
@@ -309,6 +314,7 @@ impl Vrend {
             resources,
             contexts,
             todo,
+            tally,
             blitter,
             doomed: _,
             batch,
@@ -321,6 +327,7 @@ impl Vrend {
         } = self;
         let host = Host {
             batch: *batch,
+            tally,
             budget,
             gl,
             winsys,
@@ -472,8 +479,13 @@ impl Vrend {
         // opportunity to rewrite its pages since a copy of them was taken -- see
         // [`resource::GuestPixels`] -- so it must move exactly when that stops being true.
         self.batch += 1;
+        // Read before `split` borrows the tally into the `Host`, and closed after it is given
+        // back: one clock pair for the whole batch, never one per command.
+        let began = self.tally.batch_began();
         let (mut host, contexts) = self.split(id, guest);
-        contexts.get_mut(&id).map(|c| c.submit(&mut host, words))
+        let ran = contexts.get_mut(&id).map(|c| c.submit(&mut host, words));
+        self.tally.batch_ended(began, words.len());
+        ran
     }
 
     // ---- resources ----
