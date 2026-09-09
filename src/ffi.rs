@@ -400,7 +400,13 @@ pub extern "C" fn virgl_renderer_reset() {
     with((), |r| r.reset());
 }
 
-/// The C's implicit current context. Nothing here has one, so there is nothing to force.
+/// The C's implicit current context.
+///
+/// A caller says this when it has made its own GL context current on this thread and the
+/// renderer's idea of what is current is therefore stale. The C answers by clearing that idea and
+/// re-binding ctx0. Nothing here keeps such an idea to clear -- [`egl::Shared::make_current`] asks
+/// EGL every time rather than remembering -- so a caller that never calls this is served exactly
+/// as well as one that does, and there is nothing to do here.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_force_ctx_0() {}
 

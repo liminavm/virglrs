@@ -88,27 +88,30 @@ fn bindable(attached: bool, slot: Option<&resource::Slot>) -> Option<&Resource> 
     slot?.resource()
 }
 
-/// Which GL context the thread has current, by name, so a switch is one compare.
+/// Which GL context a shadow of GL state belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GlContext {
     Ctx0,
     Sub(ContextId, SubContextId),
     /// The blitter's own GL context, for the length of one blit. It is a state of this enum and
-    /// not a flag beside it because it is the same fact: a switch back that consulted a stale
-    /// `Sub` would decide it had nothing to do, and every GL call after the blit -- the rest of
-    /// the batch, which does not ask -- would land in the blitter's context.
+    /// not a flag beside it because it is the same fact: the blitter's context is one more
+    /// context whose bound program is its own.
     Blitter,
 }
 
-/// The GL context the thread has current, and what this renderer shadows of its state rather than
-/// ask GL for it.
+/// What this renderer shadows of the current GL context's state rather than ask GL for it, and
+/// the name of the context that shadow describes.
 ///
-/// The shadow lives inside this rather than beside it, for the reason [`GlContext::Blitter`] gives
-/// about the name: it is one fact about one context, and two places holding it would drift the
-/// moment a switch updated one of them. So a switch clears it -- what is shadowed is never another
-/// context's, a context destroyed takes its shadow with the switch away from it, and a program
-/// deleted in one context cannot leave a sibling in the share group believing it bound. The price
-/// is one redundant bind after each switch, which no draw pays.
+/// The name is the shadow's key and never a reason to skip work. Which context the thread has
+/// current is EGL's to answer and a belief about it is falsifiable: the VMM makes its own
+/// contexts current between our calls, so every `make_current` here is unconditional. What the
+/// VMM cannot reach is the state *inside* our contexts -- a program bound in one of ours is
+/// still bound when we come back to it, which is what makes the shadow worth keeping.
+///
+/// A switch clears it, so what is shadowed is never another context's: a context destroyed takes
+/// its shadow with the switch away from it, and a program deleted in one context cannot leave a
+/// sibling in the share group believing it bound. The price is one redundant bind after each
+/// switch, which no draw pays.
 #[derive(Debug)]
 pub struct Current {
     on: GlContext,
@@ -119,10 +122,6 @@ impl Current {
     /// Ctx0 with nothing bound, as [`Vrend::new`](super::vrend::Vrend) leaves the thread.
     pub fn ctx0() -> Current {
         Current { on: GlContext::Ctx0, program: BoundProgram::default() }
-    }
-
-    pub fn is(&self, on: GlContext) -> bool {
-        self.on == on
     }
 
     /// Record that `on`'s GL context is the one the thread now has current.
@@ -197,13 +196,8 @@ pub struct Host<'a> {
 
 impl Host<'_> {
     fn make_current(&mut self, sub: SubContextId, gl_ctx: &egl::Context) {
-        let want = GlContext::Sub(self.ctx, sub);
-        if !self.current.is(want) {
-            self.winsys
-                .make_current(gl_ctx)
-                .expect("a sub-context's GL context can be made current");
-            self.current.switched_to(want);
-        }
+        self.winsys.make_current(gl_ctx).expect("a sub-context's GL context can be made current");
+        self.current.switched_to(GlContext::Sub(self.ctx, sub));
     }
 
     /// A resource the context may reach, with vrend's side of it.
@@ -1328,7 +1322,7 @@ impl Context {
         self.fault.as_ref()
     }
 
-    /// Whether this context's GL contexts are `GlContext::Sub(self, ...)`.
+    /// Which sub-context this context's commands are running against.
     pub fn current_sub(&self) -> SubContextId {
         self.subs.id()
     }
@@ -4532,10 +4526,7 @@ mod tests {
         let a = GlContext::Sub(ctx, SubContextId(0));
         let b = GlContext::Sub(ctx, SubContextId(1));
         let mut current = Current::ctx0();
-        assert!(current.is(GlContext::Ctx0));
-
         current.switched_to(a);
-        assert!(current.is(a));
         let bound = *current.program();
 
         // Being told about the context already current changes nothing: a `make_current` that did

@@ -290,12 +290,10 @@ impl Vrend {
         &self.gl
     }
 
-    /// Make ctx0 current, if it is not already.
+    /// Make ctx0 current.
     fn switch_ctx0(&mut self) {
-        if !self.current.is(GlContext::Ctx0) {
-            self.winsys.make_current(&self.ctx0).expect("ctx0 was current once and still exists");
-            self.current.switched_to(GlContext::Ctx0);
-        }
+        self.winsys.make_current(&self.ctx0).expect("ctx0 was current once and still exists");
+        self.current.switched_to(GlContext::Ctx0);
     }
 
     /// The host a context's commands run against, and the contexts beside it: two disjoint
@@ -746,11 +744,8 @@ impl Vrend {
         for id in which {
             let Some(ctx) = self.contexts.get(id) else { continue };
             for (sub, gl_ctx) in ctx.gl_contexts() {
-                let want = GlContext::Sub(*id, sub);
-                if !self.current.is(want) {
-                    self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
-                    self.current.switched_to(want);
-                }
+                self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
+                self.current.switched_to(GlContext::Sub(*id, sub));
                 self.gl.finish();
             }
         }
@@ -775,11 +770,8 @@ impl Vrend {
     pub fn finish_all(&mut self) {
         for (id, ctx) in &self.contexts {
             for (sub, gl_ctx) in ctx.gl_contexts() {
-                let want = GlContext::Sub(*id, sub);
-                if !self.current.is(want) {
-                    self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
-                    self.current.switched_to(want);
-                }
+                self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
+                self.current.switched_to(GlContext::Sub(*id, sub));
                 self.gl.finish();
             }
         }
