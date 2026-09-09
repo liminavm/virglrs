@@ -968,7 +968,7 @@ impl SubContext {
 
     /// `vrend_destroy_sub_context`'s GL side: every object's GL side and the sub-context's own,
     /// on its context, which the caller made current.
-    fn destroy(mut self, gl: &Gl) -> egl::Context {
+    fn destroy(mut self, gl: &Gl, bound: &mut BoundProgram) -> egl::Context {
         gl.delete_framebuffer(self.fb);
         for fb in self.blit_fbs {
             gl.delete_framebuffer(fb);
@@ -986,18 +986,18 @@ impl SubContext {
             if let Some(b) = p.sysval_buffer {
                 gl.delete_buffer(b);
             }
-            gl.delete_program(p.id);
+            gl.delete_program(bound, p.id);
         }
         let objects: Vec<Object> = self.objects.drain().collect();
         for obj in objects {
             match obj {
-                Object::Shader(s) => draw::release_shader(&mut self, gl, s),
+                Object::Shader(s) => draw::release_shader(&mut self, gl, bound, s),
                 other => release(gl, other),
             }
         }
         for b in std::mem::take(&mut self.shaders) {
             if let Some(Bound::Owned(s)) = b {
-                draw::release_shader(&mut self, gl, s);
+                draw::release_shader(&mut self, gl, bound, s);
             }
         }
         self.gl_ctx
@@ -1289,7 +1289,7 @@ impl Context {
         for id in ids {
             let sub = self.subs.remove(&id).expect("listed");
             host.make_current(id, &sub.gl_ctx);
-            let gl_ctx = sub.destroy(host.gl);
+            let gl_ctx = sub.destroy(host.gl, host.current.program());
             drop(gl_ctx);
         }
         host.current.switched_to(GlContext::Ctx0);
@@ -1917,7 +1917,7 @@ impl Context {
             return;
         };
         host.make_current(id, &sub.gl_ctx);
-        drop(sub.destroy(host.gl));
+        drop(sub.destroy(host.gl, host.current.program()));
         if self.current == id {
             self.current = SubContextId(0);
         }
@@ -2071,7 +2071,7 @@ impl Context {
                     return;
                 }
                 let Object::Shader(shader) = old else { unreachable!() };
-                draw::release_shader(sub, gl, shader);
+                draw::release_shader(sub, gl, host.current.program(), shader);
                 return;
             }
             _ => {}
@@ -2291,7 +2291,7 @@ impl Context {
             sub.shader_dirty = true;
         }
         if let Some(Bound::Owned(s)) = std::mem::replace(&mut sub.shaders[stage.index()], bound) {
-            draw::release_shader(sub, host.gl, s);
+            draw::release_shader(sub, host.gl, host.current.program(), s);
         }
     }
 

@@ -331,7 +331,7 @@ impl Blitter {
             src_format: job.src_format,
             swizzle: job.swizzle,
         };
-        let prog = self.program(gl, key).ok_or(Unserved::NoProgram)?;
+        let prog = self.program(gl, bound, key).ok_or(Unserved::NoProgram)?;
         let (src0, src1, dst0, dst1) =
             bounded_points(job.src_w, job.src_h, job.src_box, job.dst_box);
         gl.use_program(bound, Some(prog));
@@ -526,7 +526,7 @@ impl Blitter {
         gl.delete_shader(fs);
         if let Err(log) = linked {
             eprintln!("[virglrs] vrend: the YUV program failed to link: {log}");
-            gl.delete_program(prog);
+            gl.delete_program(bound, prog);
             return None;
         }
         // The sampler uniforms name texture units, and the units never change, so they are set
@@ -544,7 +544,12 @@ impl Blitter {
 
     /// The program for this key, built and cached on first use. `None` when the shader would not
     /// compile or the program would not link, which is reported once by the caller.
-    fn program(&mut self, gl: &Gl, key: ProgramKey) -> Option<ProgramName> {
+    fn program(
+        &mut self,
+        gl: &Gl,
+        bound: &mut BoundProgram,
+        key: ProgramKey,
+    ) -> Option<ProgramName> {
         if let Some(p) = self.programs.get(&key) {
             return Some(*p);
         }
@@ -563,7 +568,7 @@ impl Blitter {
         gl.delete_shader(fs);
         if let Err(log) = linked {
             eprintln!("[virglrs] vrend: the blitter's program failed to link: {log}");
-            gl.delete_program(prog);
+            gl.delete_program(bound, prog);
             return None;
         }
         self.programs.insert(key, prog);
