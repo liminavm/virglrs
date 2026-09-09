@@ -186,7 +186,7 @@ impl Context {
     fn in_blit_context<T>(
         &mut self,
         host: &mut Host<'_>,
-        run: impl FnOnce(&mut blitter::Blitter, &Gl, &Features) -> T,
+        run: impl FnOnce(&mut blitter::Blitter, &Gl, &Features, &mut BoundProgram) -> T,
     ) -> Option<T> {
         let (gl, winsys, features) = (host.gl, host.winsys, host.features);
         if host.blitter.is_none() {
@@ -199,12 +199,12 @@ impl Context {
                 }
             }
             // `Blitter::open` left its own context current.
-            *host.current = Current::Blitter;
+            host.current.switched_to(GlContext::Blitter);
         }
         let blitter = host.blitter.as_mut().expect("just built");
         winsys.make_current(blitter.context()).expect("the blitter's context can be made current");
-        *host.current = Current::Blitter;
-        let outcome = run(blitter, gl, features);
+        host.current.switched_to(GlContext::Blitter);
+        let outcome = run(blitter, gl, features, host.current.program());
         self.make_current(host);
         Some(outcome)
     }
@@ -502,9 +502,9 @@ impl Context {
                 ]
             }),
         };
-        let Some(outcome) =
-            self.in_blit_context(host, |blitter, gl, features| blitter.run(gl, features, &job))
-        else {
+        let Some(outcome) = self.in_blit_context(host, |blitter, gl, features, bound| {
+            blitter.run(gl, features, bound, &job)
+        }) else {
             return Ok(());
         };
         match outcome {
@@ -549,9 +549,16 @@ impl Context {
             let Some(geometry) = planes.geometry(0) else {
                 continue;
             };
-            let outcome = self.in_blit_context(host, |blitter, gl, _| {
+            let outcome = self.in_blit_context(host, |blitter, gl, _, bound| {
                 let names = planes.textures(gl);
-                blitter.convert_planes(gl, texture.name, geometry.width, geometry.height, names)
+                blitter.convert_planes(
+                    gl,
+                    bound,
+                    texture.name,
+                    geometry.width,
+                    geometry.height,
+                    names,
+                )
             });
             // Only a pass that ran and succeeded clears the debt. A failure has already said so,
             // and leaving it owed is what makes the next command retry -- where claiming success

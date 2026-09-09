@@ -24,9 +24,9 @@ use super::features::{Feature, Features};
 use super::formats::{Description, Table};
 use super::gl::gles::*;
 use super::gl::{
-    BindingPoint, BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl,
-    ImageUnit, ProgramName, QueryName, SamplerName, ShaderName, TextureName, TextureUnit,
-    TransformFeedbackName, UniformLocation, VertexArrayName,
+    BindingPoint, BoundProgram, BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei,
+    GLuint, Gl, ImageUnit, ProgramName, QueryName, SamplerName, ShaderName, TextureName,
+    TextureUnit, TransformFeedbackName, UniformLocation, VertexArrayName,
 };
 use super::journal::{self, Census, Entry, Retained, Seq, StateKey, Step, order, state_key};
 use super::pipe::slots::{
@@ -90,7 +90,7 @@ fn bindable(attached: bool, slot: Option<&resource::Slot>) -> Option<&Resource> 
 
 /// Which GL context the thread has current, by name, so a switch is one compare.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Current {
+pub enum GlContext {
     Ctx0,
     Sub(ContextId, SubContextId),
     /// The blitter's own GL context, for the length of one blit. It is a state of this enum and
@@ -98,6 +98,46 @@ pub enum Current {
     /// `Sub` would decide it had nothing to do, and every GL call after the blit -- the rest of
     /// the batch, which does not ask -- would land in the blitter's context.
     Blitter,
+}
+
+/// The GL context the thread has current, and what this renderer shadows of its state rather than
+/// ask GL for it.
+///
+/// The shadow lives inside this rather than beside it, for the reason [`GlContext::Blitter`] gives
+/// about the name: it is one fact about one context, and two places holding it would drift the
+/// moment a switch updated one of them. So a switch clears it -- what is shadowed is never another
+/// context's, a context destroyed takes its shadow with the switch away from it, and a program
+/// deleted in one context cannot leave a sibling in the share group believing it bound. The price
+/// is one redundant bind after each switch, which no draw pays.
+#[derive(Debug)]
+pub struct Current {
+    on: GlContext,
+    program: BoundProgram,
+}
+
+impl Current {
+    /// Ctx0 with nothing bound, as [`Vrend::new`](super::vrend::Vrend) leaves the thread.
+    pub fn ctx0() -> Current {
+        Current { on: GlContext::Ctx0, program: BoundProgram::default() }
+    }
+
+    pub fn is(&self, on: GlContext) -> bool {
+        self.on == on
+    }
+
+    /// Record that `on`'s GL context is the one the thread now has current.
+    pub fn switched_to(&mut self, on: GlContext) {
+        if self.on != on {
+            self.on = on;
+            self.program = BoundProgram::default();
+        }
+    }
+
+    /// The program bound on the current context, which is what [`Gl::use_program`] needs to skip a
+    /// bind that would change nothing.
+    pub fn program(&mut self) -> &mut BoundProgram {
+        &mut self.program
+    }
 }
 
 /// Commands this build could not serve, counted by shape. Printed once each as they are first
@@ -157,12 +197,12 @@ pub struct Host<'a> {
 
 impl Host<'_> {
     fn make_current(&mut self, sub: SubContextId, gl_ctx: &egl::Context) {
-        let want = Current::Sub(self.ctx, sub);
-        if *self.current != want {
+        let want = GlContext::Sub(self.ctx, sub);
+        if !self.current.is(want) {
             self.winsys
                 .make_current(gl_ctx)
                 .expect("a sub-context's GL context can be made current");
-            *self.current = want;
+            self.current.switched_to(want);
         }
     }
 
@@ -241,6 +281,28 @@ impl Host<'_> {
             .ok_or(Fault::IllegalResource { cmd, handle })?
             .resource_mut()
             .ok_or(Fault::UntypedResource { cmd, handle })
+    }
+
+    /// A resource to transfer, with the current context's program binding.
+    ///
+    /// A transfer unbinds the program (the C's `vrend_use_program(NULL)`), so it needs both -- and
+    /// two separate borrows of the host cannot overlap. They are disjoint fields, so one borrow
+    /// hands out both.
+    fn resource_to_transfer(
+        &mut self,
+        cmd: Cmd,
+        handle: ResourceHandle,
+    ) -> Result<(&mut Resource, &mut BoundProgram), Fault> {
+        if !self.guest.attached(self.ctx, handle) {
+            return Err(Fault::IllegalResource { cmd, handle });
+        }
+        let res = self
+            .resources
+            .get_mut(&handle)
+            .ok_or(Fault::IllegalResource { cmd, handle })?
+            .resource_mut()
+            .ok_or(Fault::UntypedResource { cmd, handle })?;
+        Ok((res, self.current.program()))
     }
 
     fn has(&self, f: Feature) -> bool {
@@ -1179,7 +1241,7 @@ impl Context {
         self.fault.as_ref()
     }
 
-    /// Whether this context's GL contexts are `Current::Sub(self, ...)`.
+    /// Whether this context's GL contexts are `GlContext::Sub(self, ...)`.
     pub fn current_sub(&self) -> SubContextId {
         self.current
     }
@@ -1230,7 +1292,7 @@ impl Context {
             let gl_ctx = sub.destroy(host.gl);
             drop(gl_ctx);
         }
-        *host.current = Current::Ctx0;
+        host.current.switched_to(GlContext::Ctx0);
     }
 
     fn create_sub(&mut self, host: &mut Host<'_>, id: SubContextId) -> Result<(), EglError> {
@@ -3878,7 +3940,7 @@ impl Context {
         if host.has(Feature::separate_shader_objects) {
             gl.bind_program_pipeline_none();
         }
-        gl.use_program_none();
+        gl.use_program(host.current.program(), None);
         gl.disable(GL_SCISSOR_TEST);
         let colorf = color.map(f32::from_bits);
         // What attachment 0 needs done to the colour, decided when it was bound. The C asks its
@@ -4141,14 +4203,14 @@ impl Context {
         let Some(pages) = guest.pages(ctx, t.resource) else {
             return Err(Fault::IllegalResource { cmd, handle: t.resource });
         };
-        let res = host.resource_mut(cmd, t.resource)?;
+        let (res, bound) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, offset as u64, false);
         let r = match direction {
             TransferDirection::ToHost => {
-                transfer::write(gl, formats, res, Some(&pages), &pages, &info)
+                transfer::write(gl, bound, formats, res, Some(&pages), &pages, &info)
             }
             TransferDirection::FromHost => {
-                transfer::read(gl, features, formats, res, Some(&pages), &pages, &info)
+                transfer::read(gl, bound, features, formats, res, Some(&pages), &pages, &info)
             }
         };
         r.map_err(|error| Fault::Transfer { cmd, error })
@@ -4174,15 +4236,22 @@ impl Context {
             return Err(Fault::IllegalResource { cmd, handle: staging });
         };
         let own = guest.pages(ctx, t.resource);
-        let res = host.resource_mut(cmd, t.resource)?;
+        let (res, bound) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, staging_offset as u64, synchronized);
         let r = match direction {
             CopyDirection::ToHost => {
-                transfer::write(gl, formats, res, own.as_ref(), &staging_pages, &info)
+                transfer::write(gl, bound, formats, res, own.as_ref(), &staging_pages, &info)
             }
-            CopyDirection::FromHost => {
-                transfer::read(gl, features, formats, res, own.as_ref(), &staging_pages, &info)
-            }
+            CopyDirection::FromHost => transfer::read(
+                gl,
+                bound,
+                features,
+                formats,
+                res,
+                own.as_ref(),
+                &staging_pages,
+                &info,
+            ),
         };
         r.map_err(|error| Fault::Transfer { cmd, error })
     }
@@ -4202,9 +4271,9 @@ impl Context {
         let bytes: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
         let span = HostSpan::new(&bytes);
         let own = guest.pages(ctx, t.resource);
-        let res = host.resource_mut(cmd, t.resource)?;
+        let (res, bound) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, 0, false);
-        transfer::write(gl, formats, res, own.as_ref(), &span.iov(), &info)
+        transfer::write(gl, bound, formats, res, own.as_ref(), &span.iov(), &info)
             .map_err(|error| Fault::Transfer { cmd, error })
     }
 }
@@ -4379,6 +4448,33 @@ fn video_result(cmd: Cmd, result: Result<(), video::Refusal>) -> Result<(), Faul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_switch_forgets_the_program_the_other_context_had_bound() {
+        let ctx = ContextId::new(1).expect("a context id is non-zero");
+        let a = GlContext::Sub(ctx, SubContextId(0));
+        let b = GlContext::Sub(ctx, SubContextId(1));
+        let mut current = Current::ctx0();
+        assert!(current.is(GlContext::Ctx0));
+
+        current.switched_to(a);
+        assert!(current.is(a));
+        let bound = *current.program();
+
+        // Being told about the context already current changes nothing: a `make_current` that did
+        // not switch must not throw away a shadow that is still true, or every one of them would.
+        current.switched_to(a);
+        assert_eq!(*current.program(), bound);
+
+        // A real switch does. GL's current program is per-context, so what was bound on `a` says
+        // nothing about `b` -- and `b` may be a context this thread has never had current, or a
+        // brand new one that happens to reuse a name.
+        current.switched_to(b);
+        assert_eq!(*current.program(), BoundProgram::default());
+
+        current.switched_to(GlContext::Blitter);
+        assert_eq!(*current.program(), BoundProgram::default());
+    }
 
     /// An ordinary immutable texture: both needs go to a view, which is what the C does for the
     /// first and what the `vl_compositor` fix added for the second.

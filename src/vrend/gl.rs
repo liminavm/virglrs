@@ -33,6 +33,16 @@ pub mod gles {
 
 use core::ffi::CStr;
 
+/// What `glUseProgram` last left bound on a GL context.
+///
+/// [`Gl::use_program`] takes one and there is nothing else to do with it, so a call site cannot
+/// bind a program without recording what it bound -- which is what makes skipping a redundant bind
+/// safe rather than a bet on every present and future caller. GL's current program is per-context
+/// state, so exactly one of these is ever the right one: the current context's, which
+/// [`super::context::Current`] owns and clears on a switch.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct BoundProgram(Option<ProgramName>);
+
 use super::egl::Image;
 use super::features::Feature;
 
@@ -1830,9 +1840,19 @@ impl Gl {
         Err(String::from_utf8_lossy(&log).into_owned())
     }
 
-    pub fn use_program(&self, program: Option<ProgramName>) {
+    /// `glUseProgram`, skipped when `bound` says GL already has that program.
+    ///
+    /// A bind GL already has is a wasted entry point -- two TLS lookups through Mesa's dispatch
+    /// before the driver gets to decide it has nothing to do -- and the draw path re-binds the
+    /// same program on most draws. The C re-binds unconditionally (`vrend_use_program`); this does
+    /// not, which is only sound because `bound` cannot go stale: see [`BoundProgram`].
+    pub fn use_program(&self, bound: &mut BoundProgram, program: Option<ProgramName>) {
+        if bound.0 == program {
+            return;
+        }
         // SAFETY: plain scalar; zero is "no program".
         unsafe { self.t.glUseProgram()(program.map_or(0, |p| p.0)) };
+        bound.0 = program;
     }
 
     /// `glGetUniformLocation`; `None` when the program has no such uniform.
@@ -2298,11 +2318,6 @@ impl Gl {
     }
 
     // ---- misc ----
-
-    pub fn use_program_none(&self) {
-        // SAFETY: zero is "no program".
-        unsafe { self.t.glUseProgram()(0) };
-    }
 
     /// `glBindProgramPipeline(0)`.
     pub fn bind_program_pipeline_none(&self) {
