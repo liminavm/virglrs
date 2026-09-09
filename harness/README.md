@@ -734,6 +734,52 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).
 
+## The C tree's own tests (`ctests/`)
+
+The C carries a `check`-based unit suite in `third_party/virglrenderer/tests/`, and it reaches the
+one thing nothing else here does: **the ABI's error contract.** Every corpus in this tree is a
+recording of a well-behaved guest, so no fixture passes a null pointer, an out-of-range callbacks
+version or a second `virgl_renderer_init`. Those tests do almost nothing else, and both
+implementations serve the same ABI, so the same binaries score both legs.
+
+`build.sh` builds them and `ctests.sh [c|rs|diff]` runs them. `diff` is the gate.
+
+**Neither leg passes, and a green is not the goal.** The C fails 45 assertions here for reasons
+that belong to the host: zink-on-KosmicKrisp advertises no cube map arrays, and multisample
+targets are refused. So the oracle is agreement with the C, the same rule every fixture follows.
+
+Four things about the setup are not guessable, and each one silently produces a wrong answer:
+
+**The rs leg is a rewritten load command, not an environment variable.** `DYLD_LIBRARY_PATH` does
+not redirect these binaries -- they load `@rpath/libvirglrenderer.1.dylib` and dyld resolves it
+from their own `LC_RPATH` whatever the environment says. Measured: a deliberately corrupt
+`libvirglrenderer.1.dylib` placed on `DYLD_LIBRARY_PATH` is ignored and the test still passes. A
+differential built on that env var runs the C on both legs and agrees perfectly while measuring
+nothing -- which is what it looked like the first time. `build.sh` uses `install_name_tool` and
+asserts the rewrite landed.
+
+**Two of the seven tests cannot score virglrs.** `test_virgl_strbuf` and `test_virgl_journal` load
+no `libvirglrenderer` at all -- 0 dylib loads, 0 imported `virgl_renderer_*` symbols -- and
+exercise static code from the C tree. They run on the C leg only, because counting them would pad
+the score with two tests that cannot disagree.
+
+**`CK_FORK=no` is required, and it costs isolation.** `check` forks a child per test case;
+MTLCompilerService is an XPC service and an XPC connection does not survive `fork()`, so every GPU
+test dies at `MTLLibrary` creation with "Unable to reach MTLCompilerService" -- which reads like a
+driver fault and is not one. Without the fork, state leaks between cases in one process, so a case
+that leaves the renderer initialized fails every case after it. **Read a divergence from the first
+differing case**; the rest are consequences.
+
+**`test_virgl_gbm_resources` is excluded permanently.** It references `gbm`, the minigbm
+allocation path, which does not exist on macOS -- it fails to link, not to pass. It also does not
+compile without help: `tests/meson.build` gives it `test_depends`, which carries no epoxy, while
+`fuzzytest_depends` beside it does. Linux masks that by keeping epoxy in `/usr/include`.
+
+Tests are built into `harness/vm/build-tests` and never into `harness/vm/build`: `-Dtests=true`
+sets `ENABLE_TESTS`, which reaches the library, and `harness/vm/build` is the C leg every golden
+in `fixtures/` was recorded from.
+
+
 **Replay cannot reach the ring transport, so a seated boot is not a redundant gate.** The transport
 commands drive a ring rather than travel on one, and every one of them is out of replay's reach --
 by two distinct mechanisms, neither of which more replayer work would close.
