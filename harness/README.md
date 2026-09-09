@@ -748,6 +748,23 @@ implementations serve the same ABI, so the same binaries score both legs.
 that belong to the host: zink-on-KosmicKrisp advertises no cube map arrays, and multisample
 targets are refused. So the oracle is agreement with the C, the same rule every fixture follows.
 
+**The gate is ONE entry, not the whole diff** — `fixtures/first-divergence.txt`, the first place
+the two ordered failure lists differ, recorded with `ctests.sh diff --record`. Under `CK_FORK=no`
+(below) a divergence cascades: the case that diverges leaves the process in a state every later
+case inherits, so one cause prints as hundreds of differing lines. Pinning all of them would pin
+the consequences, and touching the cause would rewrite the whole fixture into a diff nobody could
+read. The first entry is the only line that is a finding, and it moves for exactly two reasons: a
+new divergence before the known one, or the known one going away. Both want a human.
+
+What it currently holds is the deviation this renderer chose: `virgl_init_egl` hands
+`virgl_renderer_init` a v1 callbacks struct, and virglrs requires v3, where the C accepts v1. v3
+introduced `write_context_fence`, without which venus fences never retire, and serving a caller
+whose fences can never retire is worse than refusing it at the door. Everything after that line in
+the full lists is that one refusal cascading.
+
+Armed by reintroducing the bug the suite found — dropping the upper bound on the callbacks version
+in `ffi.rs` — which moves the pin back to `virgl_init_cbs_wrong_ver` and fails the gate.
+
 Four things about the setup are not guessable, and each one silently produces a wrong answer:
 
 **The rs leg is a rewritten load command, not an environment variable.** `DYLD_LIBRARY_PATH` does
