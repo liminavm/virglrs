@@ -198,8 +198,6 @@ impl Context {
                     return None;
                 }
             }
-            // `Blitter::open` left its own context current.
-            host.current.switched_to(GlContext::Blitter);
         }
         let blitter = host.blitter.as_mut().expect("just built");
         winsys.make_current(blitter.context()).expect("the blitter's context can be made current");

@@ -125,8 +125,22 @@ unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
 impl Shared {
-    /// Bind `ctx` on the calling thread, with no surface.
+    /// Bind `ctx` on the calling thread, with no surface. Binding what is already bound is
+    /// nothing, and is asked of EGL rather than remembered.
+    ///
+    /// Which context a thread has current is EGL's state, not this renderer's, and this process
+    /// is not its only writer: a VMM embedding the renderer makes its own context current on this
+    /// thread between commands -- QEMU's `-display gtk,gl=on` does it on every scanout -- which
+    /// no bookkeeping here can see. A cached answer is therefore a belief a foreign caller can
+    /// falsify, and the failure it buys is silent: GL issued into someone else's share group,
+    /// where a fresh texture name collides with a live one and the bindings the other context was
+    /// relying on are trampled. `eglGetCurrentContext` is a thread-local read and costs far less
+    /// than the `eglMakeCurrent` it saves, so the truth is cheaper here than the copy of it.
     fn make_current(&self, ctx: EGLContext) -> Result<(), EglError> {
+        // SAFETY: `eglGetCurrentContext` takes nothing and is defined on any thread.
+        if unsafe { self.egl.eglGetCurrentContext()() } == ctx {
+            return Ok(());
+        }
         // SAFETY: the display is initialised, the context alive on it, and surfaceless contexts
         // are made current with `EGL_NO_SURFACE` twice.
         let ok = unsafe {
