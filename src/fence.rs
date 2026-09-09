@@ -70,27 +70,60 @@ impl Retirement {
     }
 
     pub fn retire_context(&self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
-        self.push(Job::Context(ctx, ring, fence));
+        push(&self.q, Job::Context(ctx, ring, fence));
     }
 
     pub fn retire_global(&self, fence: ClientFenceId) {
-        self.push(Job::Global(fence));
+        push(&self.q, Job::Global(fence));
     }
 
-    fn push(&self, job: Job) {
-        let (m, cv) = &*self.q;
-        let mut g = m.lock().expect("the fence queue lock is never held across a panic");
-        if g.stopped {
-            return;
-        }
-        g.jobs.push_back(job);
-        cv.notify_one();
+    /// A handle for another thread to retire through.
+    ///
+    /// The classic fence waiter holds one: it decides *when* a fence has been answered, and this
+    /// is how it says so, without owning the thread that delivers or the sink it delivers to.
+    /// Whoever holds one must be gone before this `Retirement` drops -- see [`Retirement::drop`].
+    pub fn handle(&self) -> Handle {
+        Handle { q: Arc::clone(&self.q) }
     }
+}
+
+/// A way to retire a fence, for a thread that is not the one that owns [`Retirement`].
+#[derive(Clone)]
+pub struct Handle {
+    q: Arc<(Mutex<Queue>, Condvar)>,
+}
+
+impl Handle {
+    pub fn retire_context(&self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
+        push(&self.q, Job::Context(ctx, ring, fence));
+    }
+
+    pub fn retire_global(&self, fence: ClientFenceId) {
+        push(&self.q, Job::Global(fence));
+    }
+}
+
+fn push(q: &Arc<(Mutex<Queue>, Condvar)>, job: Job) {
+    let (m, cv) = &**q;
+    let mut g = m.lock().expect("the fence queue lock is never held across a panic");
+    if g.stopped {
+        // Stopping twice is nothing; a *fence* arriving after the thread has gone is one the guest
+        // may still be waiting on, and returning quietly here is how it would be lost. Whoever can
+        // still push must drop before the `Retirement` does, which is what the field order in
+        // `Renderer` is for, so this cannot fire without that order being wrong.
+        assert!(
+            matches!(job, Job::Stop),
+            "a fence was queued for retirement after the retirement thread stopped"
+        );
+        return;
+    }
+    g.jobs.push_back(job);
+    cv.notify_one();
 }
 
 impl Drop for Retirement {
     fn drop(&mut self) {
-        self.push(Job::Stop);
+        push(&self.q, Job::Stop);
         if let Some(t) = self.thread.take() {
             // A fence the VMM is still waiting on must not be dropped on the floor: the thread
             // drains what is queued before it stops, and cleanup waits for that to finish.
