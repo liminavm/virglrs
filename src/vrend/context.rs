@@ -136,7 +136,7 @@ pub struct Host<'a> {
     pub formats: &'a Table,
     pub limits: &'a Limits,
     pub shader_cfg: &'a shader::Config,
-    pub resources: &'a mut BTreeMap<ResourceHandle, resource::Slot>,
+    pub resources: &'a mut crate::Map<ResourceHandle, resource::Slot>,
     /// Which of those copy guest pages this batch, worked out once and read by every sampler
     /// bind. See [`resource::Refresh`].
     pub pixels: &'a mut resource::Refresh,
@@ -566,7 +566,7 @@ struct Replay {
 /// let it drift -- the journal reads it through [`retained`](Objects::retained) alone.
 #[derive(Default)]
 pub struct Objects {
-    live: BTreeMap<ObjectHandle, (Retained, Object)>,
+    live: crate::Map<ObjectHandle, (Retained, Object)>,
 }
 
 impl Objects {
@@ -752,7 +752,7 @@ pub struct SubContext {
     /// Latest-wins per slot, and it lives here rather than in a per-context log so that
     /// `DESTROY_SUB_CTX` takes it away with everything else the sub-context owned. Only what the
     /// current state *is* survives; how it got there is not worth keeping.
-    state: BTreeMap<StateKey, Retained>,
+    state: crate::Map<StateKey, Retained>,
     long_shader: [Option<ObjectHandle>; ShaderStage::COUNT],
 
     blend: Option<BlendState>,
@@ -847,7 +847,7 @@ impl SubContext {
             vao,
             objects: Objects::default(),
             created_at: Seq::default(),
-            state: BTreeMap::new(),
+            state: crate::Map::default(),
             long_shader: [None; ShaderStage::COUNT],
             blend: None,
             hw_blend: HwBlend::default(),
@@ -1120,7 +1120,7 @@ const ZERO_RS: RasterizerState = RasterizerState {
 // ---- the context ----
 
 pub struct Context {
-    subs: BTreeMap<SubContextId, SubContext>,
+    subs: crate::Map<SubContextId, SubContext>,
     current: SubContextId,
     fault: Option<Fault>,
     /// The codecs and decode targets this context owns. Context-global: the video handles are
@@ -1153,21 +1153,21 @@ pub struct Context {
     ///
     /// Owned rather than registered, so an id the guest describes and never claims dies with the
     /// context and no destroy path has to remember it exists.
-    described: BTreeMap<BlobId, Resource>,
+    described: crate::Map<BlobId, Resource>,
 }
 
 impl Context {
     /// `vrend_create_context`: a context with sub-context 0, current on this thread.
     pub fn new(host: &mut Host<'_>) -> Result<Context, EglError> {
         let mut ctx = Context {
-            subs: BTreeMap::new(),
+            subs: crate::Map::default(),
             current: SubContextId(0),
             fault: None,
             video: video::Video::default(),
             owed: Vec::new(),
             replay: None,
             seq: Seq::default(),
-            described: BTreeMap::new(),
+            described: crate::Map::default(),
         };
         ctx.create_sub(host, SubContextId(0))?;
         Ok(ctx)
@@ -1215,7 +1215,13 @@ impl Context {
                 "a resource with no handle is attached to nothing"
             );
         }
-        let ids: Vec<SubContextId> = self.subs.keys().rev().copied().collect();
+        // Highest id first, and sorted here rather than inherited from the table's iteration
+        // order: sub-context 0 is the one a fresh context already owns and the one the others were
+        // created against, so it goes last. The table is hashed now (`crate::Map`), and a reverse
+        // walk of it would be an arbitrary order that happened to pass.
+        let mut ids: Vec<SubContextId> = self.subs.keys().copied().collect();
+        ids.sort_unstable();
+        ids.reverse();
         for id in ids {
             let sub = self.subs.remove(&id).expect("listed");
             host.make_current(id, &sub.gl_ctx);
@@ -4475,14 +4481,14 @@ mod tests {
     /// A context holding nothing, for the bookkeeping a described blob needs and no GL at all.
     fn bare() -> Context {
         Context {
-            subs: BTreeMap::new(),
+            subs: crate::Map::default(),
             current: SubContextId(0),
             fault: None,
             video: video::Video::default(),
             owed: Vec::new(),
             replay: None,
             seq: Seq::default(),
-            described: BTreeMap::new(),
+            described: crate::Map::default(),
         }
     }
 

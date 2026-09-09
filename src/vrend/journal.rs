@@ -92,7 +92,7 @@ impl Retained {
 /// Taken from the decoded command rather than from dword offsets, so the discriminator is the
 /// field the protocol names -- not a position that has to be kept in step with the encoder by
 /// hand.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct StateKey {
     cmd: Cmd,
     slot: (u32, u32),
