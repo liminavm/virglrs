@@ -23,6 +23,27 @@
 /// names is finished. Do not print it for anything a guest can recover from.
 pub const REFUSED: &str = "[virglrs] refused:";
 
+/// A lookup table keyed by a handle, hashed rather than ordered.
+///
+/// These are the tables the command path walks -- a resource handle, an object handle, a
+/// sub-context id -- and they are looked up several times per guest command. A `BTreeMap` answers
+/// each one with a tree descent and a chain of key comparisons; measured under a live desktop
+/// (15 000-fish aquarium, GNOME, vkmark) `BTreeMap` operations were **23.9%** of all time spent
+/// processing guest GL commands, against 14% for the GL driver those commands exist to drive. The
+/// C reaches for `_mesa_hash_table` for exactly these tables, and the choice of container is the
+/// whole difference.
+///
+/// `FxHasher` and not the default: these keys are small integers, and SipHash's DoS resistance
+/// buys nothing for a table whose keys never leave this process. Nothing outside the renderer
+/// chooses them, so there is no adversary to be resistant to.
+///
+/// **Use this only where iteration order cannot be observed.** A `BTreeMap` here was also an
+/// implicit sort, and two places leaned on it: the snapshot journal (which now sorts by `Seq`
+/// explicitly in `vrend::journal::order`, as it always should have) and sub-context teardown
+/// (which names its reverse-id order at the site). A table that must be walked in key order keeps
+/// its `BTreeMap`, and says why.
+pub type Map<K, V> = rustc_hash::FxHashMap<K, V>;
+
 pub mod abi;
 pub mod budget;
 pub mod config;

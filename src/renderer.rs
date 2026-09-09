@@ -379,7 +379,7 @@ pub struct Resource {
 // appearing anywhere under `Resource` names itself here instead of at the refactor that assumed it.
 const _: () = {
     const fn is_send_sync<T: Send + Sync>() {}
-    is_send_sync::<BTreeMap<ResourceHandle, Resource>>();
+    is_send_sync::<crate::Map<ResourceHandle, Resource>>();
 };
 
 /// The resource table answering the only question venus asks of it.
@@ -388,7 +388,7 @@ const _: () = {
 /// state mutably and its resources shared at the same time. Those are sibling fields, so the
 /// borrow is only disjoint if each is named separately -- a trait on the whole struct would make
 /// every submission borrow all of it.
-impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
+impl venus::ring::ShmResources for crate::Map<ResourceHandle, Resource> {
     fn shm(&self, handle: ResourceHandle) -> Option<Arc<GuestMap>> {
         self.get(&handle)?.shm().map(Arc::clone)
     }
@@ -457,7 +457,7 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
 /// The resource table answering what vrend asks of the guest side: whether a context may reach
 /// a resource, and the pages behind it. Attachment is the gate here for the reason it is in
 /// `ShmResources`: it is the decision virtio-gpu already made.
-impl Guest for BTreeMap<ResourceHandle, Resource> {
+impl Guest for crate::Map<ResourceHandle, Resource> {
     fn attached(&self, ctx: ContextId, handle: ResourceHandle) -> bool {
         self.get(&handle).is_some_and(|r| r.attached.contains(&ctx))
     }
@@ -558,8 +558,8 @@ pub struct Renderer {
     /// the caller's thread may be creating another. A read-write lock rather than a mutex because
     /// that is the actual access pattern: many readers looking up a handle, one writer when the
     /// VMM creates or unrefs. See the lock order in `venus::vkr`.
-    resources: Arc<RwLock<BTreeMap<ResourceHandle, Resource>>>,
-    contexts: BTreeMap<ContextId, Context>,
+    resources: Arc<RwLock<crate::Map<ResourceHandle, Resource>>>,
+    contexts: crate::Map<ContextId, Context>,
     /// The host memory both arms are answerable for, and the cap on it -- see [`crate::budget`].
     /// It is the renderer's because the cap is on the process total: venus charges its
     /// allocations against it and classic its IOSurfaces, and a ledger owned by either would be
@@ -586,7 +586,7 @@ impl Renderer {
         // Built here and shared into venus, rather than reached through the renderer: a ring
         // thread needs the table long after the call that created its ring returned, and it must
         // not need the renderer to get it.
-        let resources: Arc<RwLock<BTreeMap<ResourceHandle, Resource>>> = Arc::default();
+        let resources: Arc<RwLock<crate::Map<ResourceHandle, Resource>>> = Arc::default();
         // Before either arm, and once: a build serving only classic has a cap too, and two
         // ledgers would be two answers to the one question the cap is asked.
         let budget = crate::budget::Budget::from_env();
@@ -606,7 +606,7 @@ impl Renderer {
         Ok(Renderer {
             config,
             resources: Arc::clone(&resources),
-            contexts: BTreeMap::new(),
+            contexts: crate::Map::default(),
             venus: config.venus.then(|| venus::vkr::Vkr::new(config, resources.clone(), &budget)),
             budget,
             vrend,
@@ -1880,7 +1880,7 @@ mod tests {
             attached,
         };
 
-        let mut table = BTreeMap::new();
+        let mut table = crate::Map::default();
         table.insert(blob, exported(vec![one]));
         assert!(
             matches!(table.bytes(one, blob), Some(ResourceBytes::Shared(s)) if s == pages),
@@ -2010,7 +2010,7 @@ mod tests {
             attached,
         };
 
-        let mut table = BTreeMap::new();
+        let mut table = crate::Map::default();
         table.insert(window, classic(window, Some(Arc::clone(&held)), vec![one, two]));
         table.insert(plain, classic(plain, None, vec![one, two]));
 
@@ -2056,7 +2056,7 @@ mod tests {
         let account = crate::budget::Account::for_test(None);
         let share = Storage::minted_for_test(surface, &account);
 
-        let mut table = BTreeMap::new();
+        let mut table = crate::Map::default();
         table.insert(
             blob,
             Resource {

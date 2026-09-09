@@ -1068,7 +1068,7 @@ impl Refresh {
         &mut self,
         batch: u64,
         handle: ResourceHandle,
-        resources: &BTreeMap<ResourceHandle, Slot>,
+        resources: &crate::Map<ResourceHandle, Slot>,
     ) -> bool {
         if self.resolved_in != batch {
             self.resolved_in = batch;

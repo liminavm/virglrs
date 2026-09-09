@@ -31,7 +31,6 @@ use crate::guest_mem::{Iov, PixelSource};
 use crate::ids::{BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, RingIdx};
 use crate::metal;
 use crate::videotoolbox;
-use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -77,8 +76,8 @@ pub struct Vrend {
     /// The version guest contexts are made with: the newest the driver gave ctx0.
     version: Version,
     current: Current,
-    resources: BTreeMap<ResourceHandle, resource::Slot>,
-    contexts: BTreeMap<ContextId, Context>,
+    resources: crate::Map<ResourceHandle, resource::Slot>,
+    contexts: crate::Map<ContextId, Context>,
     pub todo: Todo,
     /// The shader blitter and its GL context, built on the first blit that needs one. A renderer
     /// that never takes the blitter's path never pays for it.
@@ -250,8 +249,8 @@ impl Vrend {
             ctx0,
             version,
             current: Current::Ctx0,
-            resources: BTreeMap::new(),
-            contexts: BTreeMap::new(),
+            resources: crate::Map::default(),
+            contexts: crate::Map::default(),
             todo: Todo::default(),
             blitter: None,
             waiter,
@@ -294,7 +293,7 @@ impl Vrend {
         &'a mut self,
         ctx: ContextId,
         guest: &'a dyn Guest,
-    ) -> (Host<'a>, &'a mut BTreeMap<ContextId, Context>) {
+    ) -> (Host<'a>, &'a mut crate::Map<ContextId, Context>) {
         let Vrend {
             winsys,
             gl,
