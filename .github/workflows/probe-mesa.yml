@@ -47,8 +47,11 @@ env:
   # problem, not this probe's, but the path choice is made here.
   MESA_CS: /Volumes/mesa-cs
   MESA_PREFIX: /Volumes/mesa-cs/zink-kk-prefix
-  MESA_REV: 5e99e7c1763
-  EPOXY_REV: d1f952c
+  # Full 40-char SHAs: `git fetch <url> <sha>` refuses an abbreviation, and the SHA must be
+  # one the remote has. The first attempt pinned the local working tree's head, which is one
+  # unpushed commit ahead of liminavm/mesa's limina-kk -- CI could never have fetched it.
+  MESA_REV: 8640d3ff744462a47cd3d6c174d02faa2b003f0f
+  EPOXY_REV: d1f952c4565c389d82fd1657153e84e050f35b27
 
 jobs:
   stack:
