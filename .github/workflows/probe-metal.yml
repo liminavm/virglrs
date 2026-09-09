@@ -201,6 +201,43 @@ jobs:
           swiftc -O /tmp/metal-probe.swift -o /tmp/metal-probe
           /tmp/metal-probe
 
+      # KosmicKrisp enumerates zero physical devices here, and its device selection
+      # (src/kosmickrisp/bridge/mtl_device.m) takes the first device supporting
+      # MTLGPUFamilyMetal4 and returns nil otherwise. That makes "which families does this
+      # device support" the question that separates a hard hardware limit from a requirement
+      # KK could revisit. Reported, not asserted: this step states what the device offers and
+      # draws no conclusion about what KK ought to require.
+      - name: Which MTLGPUFamily does the paravirtual device support?
+        run: |
+          cat > /tmp/families.swift <<'SWIFT'
+          import Metal
+
+          guard let device = MTLCreateSystemDefaultDevice() else {
+              print("no Metal device")
+              exit(1)
+          }
+          print("device: \(device.name)")
+
+          let families: [(String, MTLGPUFamily)] = [
+              ("apple1", .apple1), ("apple2", .apple2), ("apple3", .apple3),
+              ("apple4", .apple4), ("apple5", .apple5), ("apple6", .apple6),
+              ("apple7", .apple7), ("apple8", .apple8), ("apple9", .apple9),
+              ("mac2", .mac2),
+              ("common1", .common1), ("common2", .common2), ("common3", .common3),
+              ("metal3", .metal3), ("metal4", .metal4),
+          ]
+          for (name, family) in families {
+              print(String(format: "  %-8s %@", (name as NSString).utf8String!,
+                           device.supportsFamily(family) ? "yes" : "no"))
+          }
+          // The two KosmicKrisp's device selection turns on, called out by name.
+          print("")
+          print("metal4 (KK requires this): \(device.supportsFamily(.metal4))")
+          print("argumentBuffersSupport:    \(device.argumentBuffersSupport.rawValue)")
+          SWIFT
+          swiftc -O /tmp/families.swift -o /tmp/families
+          /tmp/families
+
       # Secondary and non-blocking: KosmicKrisp is Vulkan layered over Metal, so whether
       # any layered driver enumerates here is the closer analogue. MoltenVK is not KK and
       # a result either way settles nothing on its own — it is a second data point next
