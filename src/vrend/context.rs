@@ -38,10 +38,10 @@ use super::proto::{self, *};
 use super::resource::{self, Limits, Resource, Storage, Texture, ViewKey};
 use super::transfer::{self, Info};
 use super::{debug, shader, tgsi, video};
+use crate::decode;
 use crate::guest_mem::{HostSpan, Iov, PixelSource};
 use crate::ids::BlobId;
 use crate::ids::{ContextId, ResourceHandle};
-use crate::videotoolbox;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -189,7 +189,7 @@ pub struct Host<'a> {
     /// The shader blitter, built on the first blit that needs it.
     pub blitter: &'a mut Option<Blitter>,
     /// What this host decodes in hardware, or `None` when the caller did not ask for video.
-    pub video: Option<&'a videotoolbox::Support>,
+    pub video: Option<&'a decode::Support>,
     /// Classic's handle to the host-memory ledger, for the one path that mints host memory this
     /// process can count: an IOSurface. See [`crate::budget`].
     pub budget: &'a crate::budget::Classic,

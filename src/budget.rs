@@ -343,10 +343,10 @@ impl<T> Charged<T> {
 }
 
 /// A charged thing is the thing, to whoever only wanted the thing. This is what lets an IOSurface
-/// keepalive be handed out as [`Held`](crate::metal::Held) without the holder learning that a
+/// keepalive be handed out as [`Held`](crate::surface::Held) without the holder learning that a
 /// ledger exists, or being able to separate the surface from what it cost.
-impl<T: crate::metal::Held> crate::metal::Held for Charged<T> {
-    fn surface(&self) -> &crate::metal::Surface {
+impl<T: crate::surface::Held> crate::surface::Held for Charged<T> {
+    fn surface(&self) -> &crate::surface::Surface {
         self.it.surface()
     }
 }
@@ -929,14 +929,14 @@ mod tests {
     fn a_charged_share_is_credited_by_its_last_holder_and_not_its_first() {
         let budget = Budget::with_cap(None, false);
         let classic = Classic::open(&budget);
-        let surface =
-            crate::metal::Surface::plain(64, 64, crate::metal::PixelFormat::Bgra).expect("minted");
+        let surface = crate::surface::Surface::plain(64, 64, crate::surface::PixelFormat::Bgra)
+            .expect("minted");
         let id = surface.id();
         let bytes = surface.alloc_size();
         assert!(bytes >= 64 * 64 * 4, "a 64x64 BGRA surface is at least its pixels");
 
         let charge = classic.charge("IOSurface", bytes);
-        let held: Arc<dyn crate::metal::Held> = Arc::new(Charged::new(surface, charge));
+        let held: Arc<dyn crate::surface::Held> = Arc::new(Charged::new(surface, charge));
         assert_eq!(budget.classic(), bytes, "charged once, when it was minted");
 
         // What `Storage::lent` hands a venus context: a second holder of the one share, never a

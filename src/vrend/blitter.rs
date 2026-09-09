@@ -882,8 +882,8 @@ mod tests {
             GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_RGBA, GL_RGBA8,
             GL_TEXTURE_2D, GL_UNSIGNED_BYTE,
         };
-        use crate::metal::Held;
-        use crate::metal::{PlanarFormat, Surface};
+        use crate::surface::Held;
+        use crate::surface::{PlanarFormat, Surface};
         use crate::vrend::egl::Plane;
         use std::sync::Arc;
 

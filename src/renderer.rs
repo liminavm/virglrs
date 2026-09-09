@@ -347,7 +347,7 @@ pub enum Backing {
     /// appears. It is what a venus context imports the resource by: a share held here resolves
     /// without asking vrend's table, which is what lets a compositor keep a client's last frame
     /// after the client's context is gone.
-    Classic { args: ClassicArgs, surface: Option<Arc<dyn crate::metal::Held>> },
+    Classic { args: ClassicArgs, surface: Option<Arc<dyn crate::surface::Held>> },
     /// Created from `virgl_renderer_resource_create_blob`. `desc` is what the guest asked for;
     /// `storage` is what it got, settled once at the create -- see [`BlobStorage`].
     Blob { desc: BlobDesc, storage: BlobStorage },
@@ -1512,7 +1512,7 @@ impl Renderer {
     /// The surface a classic resource is presented from, when vrend gave it one. Asked of vrend,
     /// which owns the resource's host side, rather than mirrored in the table: the surface lives
     /// and dies with the texture whose storage it is.
-    fn classic_surface(&self, handle: ResourceHandle) -> Option<&crate::metal::Surface> {
+    fn classic_surface(&self, handle: ResourceHandle) -> Option<&crate::surface::Surface> {
         self.vrend.as_ref()?.resource_surface(handle)
     }
 
@@ -1975,7 +1975,7 @@ mod tests {
     /// that is what the driver is handed as a host pointer.
     #[test]
     fn a_classic_resource_lends_the_surface_its_storage_is() {
-        use crate::metal::{Held, PixelFormat, Surface};
+        use crate::surface::{Held, PixelFormat, Surface};
         use crate::venus::driver::Storage;
         use crate::venus::ring::ShmResources;
 
@@ -2051,8 +2051,9 @@ mod tests {
         let three = ContextId::new(3).unwrap();
         let blob = ResourceHandle::new(1).unwrap();
 
-        let surface = crate::metal::Surface::scanout(64, 8, crate::metal::PixelFormat::Bgra, 256)
-            .expect("the system minted a surface");
+        let surface =
+            crate::surface::Surface::scanout(64, 8, crate::surface::PixelFormat::Bgra, 256)
+                .expect("the system minted a surface");
         let account = crate::budget::Account::for_test(None);
         let share = Storage::minted_for_test(surface, &account);
 

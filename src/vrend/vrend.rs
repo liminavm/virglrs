@@ -28,10 +28,10 @@ use super::tally;
 use super::transfer::{self, Info};
 use super::waiter;
 use crate::config::Config;
+use crate::decode;
 use crate::guest_mem::{Iov, PixelSource};
 use crate::ids::{BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, RingIdx};
-use crate::metal;
-use crate::videotoolbox;
+use crate::surface;
 use std::fmt;
 use std::sync::Arc;
 
@@ -72,7 +72,7 @@ pub struct Vrend {
     ///
     /// Probing is what registers the supplemental decoders, so this is also the record that
     /// registration happened: nothing can ask this host about a codec without holding one.
-    video: Option<videotoolbox::Support>,
+    video: Option<decode::Support>,
     ctx0: egl::Context,
     /// The version guest contexts are made with: the newest the driver gave ctx0.
     version: Version,
@@ -193,9 +193,9 @@ impl Vrend {
         let limits = Limits::query(&gl, &features);
         let shader_cfg = shader::Config::probe(&gl, &features, &limits);
         let formats = Table::probe(&gl, &features);
-        let video = config.video.then(videotoolbox::Support::probe);
+        let video = config.video.then(decode::Support::probe);
         if let Some(support) = video {
-            let names: Vec<&str> = videotoolbox::Codec::ALL
+            let names: Vec<&str> = decode::Codec::ALL
                 .iter()
                 .filter(|c| support.decodes(**c))
                 .map(|c| c.name())
@@ -276,7 +276,7 @@ impl Vrend {
     ///
     /// `None` and a support that decodes nothing are different answers and stay different: the
     /// first is a configuration, the second is this machine's silicon.
-    pub fn video(&self) -> Option<&videotoolbox::Support> {
+    pub fn video(&self) -> Option<&decode::Support> {
         self.video.as_ref()
     }
 
@@ -577,7 +577,7 @@ impl Vrend {
     pub fn resource_attach_blob(
         &mut self,
         handle: ResourceHandle,
-        surface: Option<Arc<dyn metal::Held>>,
+        surface: Option<Arc<dyn surface::Held>>,
     ) {
         self.resources
             .entry(handle)
@@ -586,14 +586,14 @@ impl Vrend {
 
     /// The IOSurface a resource is presented from, if its storage is one. Asked of the resource
     /// every time: the surface goes with the resource, and there is no other place to hold one.
-    pub fn resource_surface(&self, handle: ResourceHandle) -> Option<&metal::Surface> {
+    pub fn resource_surface(&self, handle: ResourceHandle) -> Option<&surface::Surface> {
         self.resources.get(&handle)?.resource()?.surface()
     }
 
     /// A share of that surface, for a holder outside vrend -- a venus context importing this
     /// resource, which must keep the surface alive rather than name it. See
     /// [`resource::Resource::surface_share`].
-    pub fn resource_surface_share(&self, handle: ResourceHandle) -> Option<Arc<dyn metal::Held>> {
+    pub fn resource_surface_share(&self, handle: ResourceHandle) -> Option<Arc<dyn surface::Held>> {
         self.resources.get(&handle)?.resource()?.surface_share()
     }
 

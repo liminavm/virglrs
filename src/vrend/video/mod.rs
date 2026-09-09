@@ -4,7 +4,7 @@
 //! Hardware video decode: the codecs and decode targets a context owns, and the frames they
 //! decode.
 //!
-//! Safe throughout. The VideoToolbox calls live in [`crate::videotoolbox`]; what is here is the
+//! Safe throughout. The VideoToolbox calls live in [`crate::decode`]; what is here is the
 //! protocol's own vocabulary -- profiles, targets, the accumulate-then-decode frame -- and the
 //! copy of a decoded picture into the textures the guest samples.
 //!
@@ -31,7 +31,7 @@ use super::gl::{Gl, pixel_bytes};
 use super::journal::Retained;
 use super::proto::{Format, VideoBuffer, VideoBufferHandle, VideoCodec, VideoCodecHandle};
 use super::resource::{self, Texture};
-use crate::videotoolbox::{self, Configuration, PixelFormat, Session, SessionKey};
+use crate::decode::{self, Configuration, PixelFormat, Session, SessionKey};
 
 /// `enum pipe_video_profile`, as virglrenderer numbers it.
 ///
@@ -71,15 +71,15 @@ impl Profile {
     }
 
     /// Which VideoToolbox codec decodes this profile.
-    pub fn codec(self) -> videotoolbox::Codec {
+    pub fn codec(self) -> decode::Codec {
         match self {
             Profile::H264Baseline
             | Profile::H264ConstrainedBaseline
             | Profile::H264Main
-            | Profile::H264High => videotoolbox::Codec::H264,
-            Profile::HevcMain => videotoolbox::Codec::Hevc,
-            Profile::Vp9Profile0 => videotoolbox::Codec::Vp9,
-            Profile::Av1Main => videotoolbox::Codec::Av1,
+            | Profile::H264High => decode::Codec::H264,
+            Profile::HevcMain => decode::Codec::Hevc,
+            Profile::Vp9Profile0 => decode::Codec::Vp9,
+            Profile::Av1Main => decode::Codec::Av1,
         }
     }
 
@@ -359,7 +359,7 @@ impl Buffer {
     /// Returns how many planes were written, which is the smaller of what the picture has and
     /// what the target has -- a target with fewer planes than the picture is the guest's own
     /// choice of layout, not an error.
-    fn deliver(&self, gl: &Gl, layout: TargetFormat, picture: &videotoolbox::Locked<'_>) -> usize {
+    fn deliver(&self, gl: &Gl, layout: TargetFormat, picture: &decode::Locked<'_>) -> usize {
         match &self.destination {
             Destination::PerPlane(planes) => Self::deliver_per_plane(gl, planes, layout, picture),
             Destination::Composite(texture) => Self::deliver_composite(texture, layout, picture),
@@ -378,7 +378,7 @@ impl Buffer {
     fn deliver_composite(
         texture: &Texture,
         layout: TargetFormat,
-        picture: &videotoolbox::Locked<'_>,
+        picture: &decode::Locked<'_>,
     ) -> usize {
         // A composite target without planes cannot be built -- `create_buffer` refuses it -- so
         // reaching this with none is a host bug and not a guest one.
@@ -439,7 +439,7 @@ impl Buffer {
         gl: &Gl,
         planes: &[Plane],
         layout: TargetFormat,
-        picture: &videotoolbox::Locked<'_>,
+        picture: &decode::Locked<'_>,
     ) -> usize {
         let count = picture.plane_count();
         let mut written = 0;
@@ -1094,7 +1094,7 @@ pub fn composite_target_backable(features: &Features, format: Format) -> bool {
 /// and having its context poisoned by the first frame, which is strictly worse for it than never
 /// having been offered the choice. So the list grows as the legs land, and the capset and the
 /// handler read it from here rather than each keeping their own idea of what is served.
-pub fn advertised(support: Option<&videotoolbox::Support>) -> Vec<Profile> {
+pub fn advertised(support: Option<&decode::Support>) -> Vec<Profile> {
     let Some(support) = support else {
         return Vec::new();
     };
@@ -1140,7 +1140,7 @@ impl Video {
         &mut self,
         at: Retained,
         codec: &VideoCodec,
-        support: Option<&videotoolbox::Support>,
+        support: Option<&decode::Support>,
     ) -> Result<(), Refusal> {
         let (handle, width, height) = (codec.handle, codec.width, codec.height);
         let MapEntry::Vacant(slot) = self.codecs.entry(handle) else {
@@ -1708,7 +1708,7 @@ mod tests {
     #[test]
     fn nothing_is_advertised_without_a_probe() {
         assert!(advertised(None).is_empty());
-        let support = crate::videotoolbox::Support::probe();
+        let support = crate::decode::Support::probe();
         let list = advertised(Some(&support));
 
         assert!(list.iter().all(|profile| support.decodes(profile.codec())));
@@ -1792,8 +1792,8 @@ mod tests {
     /// the host had stopped writing.
     #[test]
     fn a_video_create_is_retained_until_its_destroy() {
-        let support = videotoolbox::Support::probe();
-        assert!(support.decodes(videotoolbox::Codec::H264), "the host decodes H.264 in hardware");
+        let support = decode::Support::probe();
+        assert!(support.decodes(decode::Codec::H264), "the host decodes H.264 in hardware");
 
         let mut video = Video::default();
         let wire = [0xc0u32, 0xffee];

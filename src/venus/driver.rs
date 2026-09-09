@@ -29,36 +29,39 @@ use super::proto::types::{
     VkExternalFenceHandleTypeFlagBits, VkExternalMemoryHandleTypeFlagBits,
     VkExternalMemoryImageCreateInfo, VkExternalSemaphoreHandleTypeFlagBits, VkFence,
     VkFenceGetFdInfoKHR, VkFilter, VkFormat, VkFramebuffer, VkFrontFace,
-    VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlagBits, VkImageAspectFlags,
-    VkImageBlit, VkImageCopy, VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties,
-    VkImageLayout, VkImageMemoryBarrier, VkImageSubresource, VkImageSubresourceRange,
-    VkImageTiling, VkImageToMemoryCopy, VkImageType, VkImageUsageFlagBits, VkImageUsageFlags,
-    VkImageView, VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA,
-    VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance, VkInstanceCreateInfo,
-    VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags,
-    VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA,
-    VkMemoryToImageCopy, VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT,
-    VkObjectType, VkPhysicalDevice, VkPhysicalDeviceMemoryBudgetPropertiesEXT,
-    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
-    VkPipelineLayout, VkPipelineStageFlagBits, VkPipelineStageFlags, VkPipelineStageFlags2,
-    VkPrimitiveTopology, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
-    VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
-    VkRenderPassBeginInfo, VkRenderingInfo, VkResult, VkRingMonitorInfoMESA, VkSampleCountFlagBits,
-    VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo,
-    VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo,
-    VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitInfo,
-    VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp, VkStructureType,
-    VkSubmitInfo, VkSubmitInfo2, VkSubpassContents, VkSubresourceLayout,
-    VkTimelineSemaphoreSubmitInfo, VkViewport, VkWriteDescriptorSet,
+    VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlags, VkImageBlit, VkImageCopy,
+    VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties, VkImageLayout,
+    VkImageMemoryBarrier, VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy, VkImageType,
+    VkImageUsageFlagBits, VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
+    VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance,
+    VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo,
+    VkMemoryMapFlags, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
+    VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy, VkMemoryToImageCopyMESA,
+    VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType, VkPhysicalDevice,
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties, VkPipeline,
+    VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
+    VkPipelineStageFlags, VkPipelineStageFlags2, VkPrimitiveTopology, VkQueryControlFlags,
+    VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType,
+    VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingInfo, VkResult,
+    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
+    VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
+    VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
+    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
+    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassContents, VkTimelineSemaphoreSubmitInfo,
+    VkViewport, VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
 
+#[cfg(target_os = "macos")]
+use super::proto::types::{VkImageAspectFlagBits, VkImageSubresource, VkSubresourceLayout};
 use super::ring::ResourceBytes;
 use crate::guest_mem::{GuestMap, HostMapping, PixelSource};
 use crate::ids::ResourceHandle;
 use crate::ids::SurfaceId;
-use crate::metal::{Held, PixelFormat, Surface};
+#[cfg(target_os = "macos")]
+use crate::surface::PixelFormat;
+use crate::surface::{Held, Surface};
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
 /// A slice the guest may or may not have sent, as the pointer Vulkan reads it as.
@@ -4374,6 +4377,19 @@ impl Driver {
     /// asks them for a surface can say which question the image failed. A surface whose rows
     /// sit somewhere other than where the driver will write them is worse than no surface: it
     /// displays, and it displays sheared.
+    /// Nothing here can be exported as a surface, because this host has no surface to export it
+    /// as. The Linux route is a dma-buf the driver's own allocation is exported to, and it
+    /// replaces this rather than filling it in.
+    #[cfg(not(target_os = "macos"))]
+    fn scanout_surface(
+        &mut self,
+        _device: VkDevice,
+        _info: &VkMemoryAllocateInfo,
+    ) -> Result<Surface, NoSurface> {
+        Err(NoSurface::Unbacked)
+    }
+
+    #[cfg(target_os = "macos")]
     fn scanout_surface(
         &mut self,
         device: VkDevice,
@@ -4749,7 +4765,7 @@ enum Backing {
     ///
     /// Publishing hands out the storage's own address -- there is nothing to unmap, and the last
     /// holder going is what releases it -- so the mark is all that `published` has to carry. A
-    /// surface is read through [`crate::metal::Surface::read_into`], because a surface read
+    /// surface is read through [`crate::surface::Surface::read_into`], because a surface read
     /// without its lock sees whatever the CPU's view last held rather than what the GPU wrote.
     Owned { storage: Storage, published: bool },
     /// Storage another context owns, which this allocation only aliases -- held, so that the
@@ -5160,6 +5176,8 @@ pub enum NoSurface {
     UnknownImage,
     /// A pixel format IOSurface has no equivalent of.
     Format(VkFormat),
+    /// This host mints no storage of its own to export an allocation as.
+    Unbacked,
     /// An opaque layout: the driver keeps its storage in a layout of its own, and would never
     /// write a byte into pages minted here.
     Tiling(VkImageTiling),
@@ -5179,6 +5197,7 @@ impl core::fmt::Display for NoSurface {
             NoSurface::Layout => {
                 f.write_str("the driver's row layout is not one a surface could alias")
             }
+            NoSurface::Unbacked => f.write_str("this host mints no surface to export it as"),
         }
     }
 }
@@ -5189,8 +5208,8 @@ impl Storage {
     /// `None` when the storage is pages: there is no surface to image, and the reason is the
     /// storage's own to give. Handing out the `Charged` share rather than a fresh one over the
     /// same surface is what keeps this allocation's charge standing for as long as the image
-    /// does -- see [`crate::metal::Held`].
-    pub fn held(&self) -> Option<Arc<dyn crate::metal::Held>> {
+    /// does -- see [`crate::surface::Held`].
+    pub fn held(&self) -> Option<Arc<dyn crate::surface::Held>> {
         match self {
             Storage::Texture(t) => Some(Arc::clone(t)),
             Storage::Linear(_) | Storage::Heap(_) => None,
@@ -5678,6 +5697,7 @@ fn exports_memory(node: *const core::ffi::c_void) -> bool {
 /// A dedicated allocation backs exactly one image, which is what makes it the image whose layout
 /// a scanout surface must match. `VK_NULL_HANDLE` is the legal way to say "a buffer, not an
 /// image", and reads as no image rather than as image zero.
+#[cfg(target_os = "macos")]
 fn dedicated_image(node: *const core::ffi::c_void) -> Option<VkImage> {
     chain_find::<VkMemoryDedicatedAllocateInfo>(node)
         .and_then(|d| (d.image.0 != 0).then_some(d.image))
@@ -5690,6 +5710,7 @@ fn dedicated_image(node: *const core::ffi::c_void) -> Option<VkImage> {
 /// the rest would mint surfaces whose bytes mean something other than what they say. sRGB and
 /// UNORM are the same bytes under different reading rules, which is the image view's business
 /// and not the surface's.
+#[cfg(target_os = "macos")]
 fn pixel_format(format: VkFormat) -> Option<PixelFormat> {
     match format {
         VkFormat::VK_FORMAT_B8G8R8A8_UNORM | VkFormat::VK_FORMAT_B8G8R8A8_SRGB => {
