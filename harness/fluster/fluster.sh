@@ -80,6 +80,13 @@ SUITES=($COMPLETE)
 # GStreamer-AV1-VA is absent because `vaav1dec` is not an element on a host without AV1 silicon.
 DECODERS=(GStreamer-H.264-VA GStreamer-H.265-VA GStreamer-VP9-VA)
 
+# FLUSTER_VECTORS narrows the run to named vectors, for reading a single stream's renderer log
+# rather than a whole suite's. It makes the run unpinnable on purpose -- a score over a subset is
+# not the fixture -- so `diff` refuses to --record while it is set.
+VECTORS=${FLUSTER_VECTORS:-}
+TV=
+[ -n "$VECTORS" ] && TV="-tv $VECTORS"
+
 # Boot the stock guest -- the tier the video path lives on, and the one the three video corpora
 # were recorded from -- run every complete suite in it, and bring it down.
 #
@@ -129,7 +136,7 @@ run_leg() {
         mountpoint -q /media/fluster || sudo mount -t virtiofs limina-fluster /media/fluster
         python3 /media/fluster/upstream/fluster.py \
             -r /media/fluster/resources -o /tmp/fluster-out -ne \
-            run -ts ${SUITES[*]} -d ${DECODERS[*]} -j 1 -q -t 120 \
+            run -ts ${SUITES[*]} -d ${DECODERS[*]} $TV -j 1 -q -t 120 \
                 -so /tmp/summary.json -f json
     " > "$OUT/$leg-run.log" 2>&1
     local rc=$?
@@ -182,6 +189,7 @@ case "${1:-diff}" in
     fi
 
     if [ "${2:-}" = "--record" ]; then
+        [ -z "$VECTORS" ] || { echo "refusing to record a pin from a FLUSTER_VECTORS subset" >&2; exit 1; }
         mkdir -p "$(dirname "$PIN")"
         cp "$OUT/c.txt" "$PIN"
         echo "recorded $PIN"
