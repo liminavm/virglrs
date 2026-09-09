@@ -226,7 +226,12 @@ impl Features {
     /// a host that has neither entry point has them for no surface, and asking again at each
     /// import would find that out at the first client window instead of at startup.
     pub fn adopts_iosurfaces(&self) -> bool {
-        self.has(Feature::egl_image) || self.has(Feature::egl_image_storage)
+        // The extensions are necessary and not sufficient: they are Mesa's own, present on any
+        // host with EGLImage at all, and answering from them alone reads true on a host that has
+        // no IOSurfaces to adopt. Where nothing can mint one the answer is no, and it is no
+        // before the driver is asked -- see `crate::surface`.
+        cfg!(target_os = "macos")
+            && (self.has(Feature::egl_image) || self.has(Feature::egl_image_storage))
     }
 
     /// Decide every feature from a context's version and the extensions it advertises.
