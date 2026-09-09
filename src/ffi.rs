@@ -375,17 +375,19 @@ pub extern "C" fn virgl_renderer_init(
         let create = (&raw const (*cb).create_gl_context).read();
         let destroy = (&raw const (*cb).destroy_gl_context).read();
         let make_current = (&raw const (*cb).make_current).read();
+        // `get_egl_display` is v4 and optional even there, so it does not gate the factory: the C
+        // selects on the three context callbacks alone, and a VMM that has no display to name is
+        // still a VMM whose contexts are the only ones its scanout can reach. Requiring it cost us
+        // QEMU's SDL console, which reports v3 and renders on the C.
         let display = (version >= 4).then(|| (&raw const (*cb).get_egl_display).read()).flatten();
-        match (flags & (abi::USE_EGL | abi::USE_GLX), create, destroy, make_current, display) {
-            (0, Some(create), Some(destroy), Some(make_current), Some(display)) => {
-                Some(Box::new(VmmContexts {
-                    cookie: VmmPtr(cookie),
-                    create,
-                    destroy,
-                    make_current,
-                    display,
-                }))
-            }
+        match (flags & (abi::USE_EGL | abi::USE_GLX), create, destroy, make_current) {
+            (0, Some(create), Some(destroy), Some(make_current)) => Some(Box::new(VmmContexts {
+                cookie: VmmPtr(cookie),
+                create,
+                destroy,
+                make_current,
+                display,
+            })),
             _ => None,
         }
     };
@@ -438,12 +440,16 @@ struct VmmContexts {
     create: extern "C" fn(*mut c_void, c_int, *mut abi::GlCtxParam) -> *mut c_void,
     destroy: extern "C" fn(*mut c_void, *mut c_void),
     make_current: extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int,
-    display: extern "C" fn(*mut c_void) -> *mut c_void,
+    /// `get_egl_display`, which is v4 and which a VMM whose toolkit owns the EGL stack does not
+    /// have to offer. Its absence is not a missing capability: the display is read off the first
+    /// context instead. See [`GlContexts::display`].
+    display: Option<extern "C" fn(*mut c_void) -> *mut c_void>,
 }
 
 impl GlContexts for VmmContexts {
-    fn display(&self) -> *mut c_void {
-        (self.display)(self.cookie.0)
+    fn display(&self) -> Option<*mut c_void> {
+        let display = (self.display?)(self.cookie.0);
+        (!display.is_null()).then_some(display)
     }
 
     fn create(&self, version: egl::Version, shared: bool) -> Option<*mut c_void> {
