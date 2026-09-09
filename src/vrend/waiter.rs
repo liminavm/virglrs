@@ -181,7 +181,7 @@ fn wait_out(gl: &Gl, fence: &Fence) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use std::sync::Arc;
 

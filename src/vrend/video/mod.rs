@@ -1672,27 +1672,38 @@ mod tests {
     /// making one backable without the path behind it is what this test is here to catch.
     #[test]
     fn no_planar_layout_is_offered_before_it_can_be_backed() {
-        let host = Features::probe(300, ["GL_OES_EGL_image".to_string()]);
-        assert!(host.adopts_iosurfaces(), "the surface entry point is what backing needs");
-        // A host without it backs nothing, whatever the format -- the capset asks one question
-        // and this is the half that is not about the layout.
+        // A host that adopts no surfaces backs nothing, whatever the format -- the capset asks
+        // one question and this is the half that is not about the layout. Where nothing can mint
+        // storage every host is this one, so it is the half that carries the test there.
         let bare = Features::probe(300, []);
         for raw in [163, 165, 166, 167] {
             let format = Format::from_wire(raw).expect("a planar format is on the wire");
             assert!(guest_planes(format) > 1, "format {raw} is planar");
             assert!(!composite_target_backable(&bare, format), "no surface, no composite target");
-            // Backable exactly where the surface's own layout is the format's. The surface is
-            // two 4:2:0 planes; the other three layouts are not that, and offering one would
-            // hand the guest a shape create then refuses.
-            let backable = composite_target_backable(&host, format);
-            assert_eq!(backable, raw == 166, "format {raw}");
-            assert_eq!(
-                backable,
-                TargetFormat::from_wire(raw).is_some_and(|t| t.pixels().is_some())
-                    && guest_planes(format) == 2,
-                "format {raw} is offered as a composite target without a picture to fill it"
-            );
         }
+
+        // The other half needs a host that *can* adopt one, and only Darwin has surfaces to
+        // adopt -- `adopts_iosurfaces` answers no elsewhere before any extension is consulted.
+        #[cfg(target_os = "macos")]
+        {
+            let host = Features::probe(300, ["GL_OES_EGL_image".to_string()]);
+            assert!(host.adopts_iosurfaces(), "the surface entry point is what backing needs");
+            for raw in [163, 165, 166, 167] {
+                let format = Format::from_wire(raw).expect("a planar format is on the wire");
+                // Backable exactly where the surface's own layout is the format's. The surface
+                // is two 4:2:0 planes; the other three layouts are not that, and offering one
+                // would hand the guest a shape create then refuses.
+                let backable = composite_target_backable(&host, format);
+                assert_eq!(backable, raw == 166, "format {raw}");
+                assert_eq!(
+                    backable,
+                    TargetFormat::from_wire(raw).is_some_and(|t| t.pixels().is_some())
+                        && guest_planes(format) == 2,
+                    "format {raw} is offered as a composite target without a picture to fill it"
+                );
+            }
+        }
+
         // Everything else is one plane, and so is offered on its own merits.
         for raw in [1, 64, 65, 134, 314] {
             let format = Format::from_wire(raw).expect("on the wire");
@@ -1780,6 +1791,10 @@ mod tests {
         };
         assert!(!av1.key());
         assert_eq!(av1.extent(), (640, 360));
+        // What an av1C box is called belongs to the platform's decoder -- VideoToolbox names a
+        // variant, and a host with no decoder has nothing to name -- so only the naming is gated.
+        // Everything above is the reshaping, which is every host's.
+        #[cfg(target_os = "macos")]
         assert!(matches!(av1.configuration(), Configuration::Av1c(_)));
     }
 
@@ -1791,6 +1806,7 @@ mod tests {
     /// poisoned itself, and never told the guest -- which went on submitting into a surface pool
     /// the host had stopped writing.
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_video_create_is_retained_until_its_destroy() {
         let support = decode::Support::probe();
         assert!(support.decodes(decode::Codec::H264), "the host decodes H.264 in hardware");

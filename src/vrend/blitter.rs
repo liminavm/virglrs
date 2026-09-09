@@ -859,6 +859,7 @@ pub fn quad_texcoords(coord: [f32; 4]) -> [[f32; 2]; 4] {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     /// A composite target's planes become the picture a composite view samples.
     ///
     /// The end-to-end oracle for the conversion: bytes into the surface's two planes, the pass

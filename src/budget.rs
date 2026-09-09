@@ -919,6 +919,7 @@ mod tests {
         assert_eq!(budget.live(), 0);
     }
 
+    #[cfg(target_os = "macos")]
     /// What a classic mint builds, and what finally credits it.
     ///
     /// The charge rides inside the `Arc` the EGL image holds, so the thing that credits it is the

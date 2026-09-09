@@ -903,12 +903,22 @@ mod tests {
         assert!(egl.has_all_of("EGL_KHR_image_base"));
     }
 
+    /// `OpenGL ES <major>.<minor> ...` as the two numbers, for a comparison against a floor.
+    fn parse_gl_version(s: &str) -> (u32, u32) {
+        let mut it = s.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty());
+        let major = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let minor = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        (major, minor)
+    }
+
     /// A GLES 3.1 context on the surfaceless display, and the whole 3.1 core resolved through
-    /// it. Needs the zink-on-KosmicKrisp stack: `VK_ICD_FILENAMES` at the KK ICD and
-    /// `MESA_LOADER_DRIVER_OVERRIDE=zink`, the way `harness/replay/vkr-replay.sh` sets them --
-    /// so it is opted into rather than run by `cargo test`, which has no GPU.
+    /// it. What it needs is a GPU with a surfaceless EGL: on Darwin that is the
+    /// zink-on-KosmicKrisp stack, with `VK_ICD_FILENAMES` at the KK ICD and
+    /// `MESA_LOADER_DRIVER_OVERRIDE=zink` the way `harness/replay/vkr-replay.sh` sets them; on a
+    /// Linux host with Mesa it is nothing at all. Opted into either way, because `cargo test`
+    /// is not promised a GPU.
     #[test]
-    #[ignore = "needs the zink-on-KosmicKrisp environment"]
+    #[ignore = "needs a GPU with surfaceless EGL"]
     fn a_gles_31_context_comes_up_surfaceless() {
         let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
         assert!(winsys.version() >= Version { major: 1, minor: 4 });
@@ -929,7 +939,11 @@ mod tests {
             c_str_to_string(
                 unsafe { gl.glGetString()(super::super::gl::gles::GL_VERSION) } as *const c_char
             );
-        assert!(version.starts_with("OpenGL ES 3.1"), "{version}");
+        // A version is a floor, not a request: `EGL_CONTEXT_MINOR_VERSION` asks for a context
+        // that can do 3.1, and a driver is free to hand back one that can do more. Mesa answers
+        // 3.2 here. What is being pinned is that 3.1 arrived, so read the number.
+        let (major, minor) = parse_gl_version(&version);
+        assert!((major, minor) >= (3, 1), "{version}");
         let second = winsys
             .create_context(Version { major: 3, minor: 1 }, Some(&ctx))
             .expect("a shared context");
@@ -937,6 +951,7 @@ mod tests {
         winsys.release_current().expect("released");
     }
 
+    #[cfg(target_os = "macos")]
     /// The two planes of one planar surface import as two images, each in its own layout.
     ///
     /// This is the whole storage model behind a composite decode target: the planes share an
@@ -973,6 +988,7 @@ mod tests {
         assert_eq!(chroma.surface().id(), id);
     }
 
+    #[cfg(target_os = "macos")]
     /// A plane image samples the plane it asked for, asked by content.
     ///
     /// The import succeeding proves only that the driver took the attributes, and the image's

@@ -1991,6 +1991,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     /// A classic resource whose storage is an IOSurface lends a share of it to a venus context,
     /// and one whose storage is an ordinary GL texture lends nothing.
     ///
@@ -2060,6 +2061,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     /// Storage a resource holds a *share* of resolves for every context the guest attached it to,
     /// and resolves to the same bytes for each.
     ///
