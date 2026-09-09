@@ -17,30 +17,41 @@ PREFIX="${VIRGL_PREFIX:-$ROOT/third_party/virgl-prefix}"
 
 [ -f "$SRC/meson.build" ] || { echo "the C tree is not vendored: run scripts/vendor.sh" >&2; exit 1; }
 
-# Two host prefixes this build needs and does not produce. Both come from the limina tree's
-# spikes (build-epoxy-egl.sh, build-mesa-zink-kk.sh); override either if yours live elsewhere.
+# This build needs an epoxy carrying EGL, and a Mesa whose egl.pc pkg-config can see -- epoxy.pc's
+# `Requires.private: egl` means a missing one fails the configure with "Could not generate cflags
+# for epoxy".
 #
-# Homebrew's epoxy is CGL-only, and virglrenderer's EGL platform silently builds without EGL
-# against it — which is a renderer that cannot bring up host GL at all, discovered at run time.
-EPOXY_PREFIX="${EPOXY_PREFIX:-$ROOT/third_party/epoxy-egl-prefix}"
-grep -qi epoxy_has_egl=1 "$EPOXY_PREFIX/lib/pkgconfig/epoxy.pc" 2>/dev/null || {
-    echo "epoxy-with-EGL missing at $EPOXY_PREFIX (set EPOXY_PREFIX)" >&2; exit 1; }
+# Where they come from is the only part that differs by host. A Linux distribution ships both, so
+# nothing is named and no prefix is invented. On macOS neither is a system package and both come
+# from the limina tree's spikes (build-epoxy-egl.sh, build-mesa-zink-kk.sh) -- Homebrew's epoxy is
+# CGL-only, and virglrenderer's EGL platform silently builds *without* EGL against it, which is a
+# renderer that cannot bring up host GL at all, discovered at run time. Set EPOXY_PREFIX or
+# MESA_PREFIX to override on either host.
+if [ "$(uname -s)" = Darwin ]; then
+    EPOXY_PREFIX="${EPOXY_PREFIX:-$ROOT/third_party/epoxy-egl-prefix}"
+    MESA_PREFIX="${MESA_PREFIX:-/Volumes/mesa-cs/zink-kk-prefix}"
+    BREW="$(brew --prefix)"
+    PKG_CONFIG_PATH="$BREW/opt/molten-vk/lib/pkgconfig:$BREW/lib/pkgconfig:$BREW/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+fi
+for prefix in "${MESA_PREFIX:-}" "${EPOXY_PREFIX:-}"; do
+    [ -n "$prefix" ] && PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+done
+export PKG_CONFIG_PATH
 
-# epoxy.pc's `Requires.private: egl` means pkg-config must see the zink-on-KK Mesa too, or the
-# configure fails with "Could not generate cflags for epoxy".
-MESA_PREFIX="${MESA_PREFIX:-/Volumes/mesa-cs/zink-kk-prefix}"
-[ -f "$MESA_PREFIX/lib/pkgconfig/egl.pc" ] || {
-    echo "zink-on-KK Mesa egl.pc missing at $MESA_PREFIX (set MESA_PREFIX)" >&2; exit 1; }
-
-export PKG_CONFIG_PATH="$EPOXY_PREFIX/lib/pkgconfig:$MESA_PREFIX/lib/pkgconfig:$(brew --prefix)/opt/molten-vk/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig:$(brew --prefix)/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+# Asked of pkg-config rather than grepped out of a .pc at a path we reconstructed: this is the
+# same pkg-config meson is about to run, so its answer is the one the build will get.
+[ "$(pkg-config --variable=epoxy_has_egl epoxy 2>/dev/null)" = 1 ] || {
+    echo "epoxy is missing, or was built without EGL (set EPOXY_PREFIX)" >&2; exit 1; }
+pkg-config --exists egl || {
+    echo "no egl.pc on the pkg-config path (set MESA_PREFIX)" >&2; exit 1; }
 
 # The same configuration limina ran the C renderer under, so the goldens are recorded from the
 # renderer that shipped rather than from a differently-built one: venus and vrend in one process
 # (render-server-mode=thread), EGL platform, the VideoToolbox-backed video path, and the Vulkan
 # library linked rather than dlopened by bare soname.
 # Unquoted on purpose: empty must expand to no argument at all. Quoted, a first build passes
-# meson an empty string, which it takes for the build directory and then rejects the source
-# tree as an extra -- so this only ever worked where a build directory already existed.
+# meson an empty string, which it takes for the build directory and then rejects the source tree
+# as an extra -- so the script only ever worked where a build directory already existed.
 RECONFIGURE=
 if [ -d "$BUILD" ]; then
     RECONFIGURE=--reconfigure
