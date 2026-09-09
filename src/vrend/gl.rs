@@ -40,6 +40,34 @@ pub use gles::Gles;
 use gles::*;
 pub use types::*;
 
+/// A fence sync object, owned.
+///
+/// Unlike every other name in this module this is not a `GLuint` the driver hands out but an
+/// opaque pointer, and it owns a driver allocation: dropping it without [`Gl::wait_fence`] leaks
+/// that allocation, so `Drop` aborts rather than letting the leak pass. There is exactly one way
+/// to make one ([`Gl::fence`]) and one way to spend it ([`Gl::wait_fence`], which consumes it).
+///
+/// **`Send`, and that is the point.** A sync object belongs to the share group, not to the context
+/// that created it, so the spec allows any context of that group -- on any thread -- to wait on it
+/// and delete it. That is what lets the fence waiter own a context of its own and wait there,
+/// while the thread that took the sync carries on without the renderer lock.
+pub struct Fence(GLsync);
+
+// SAFETY: a sync object is a share-group object, not context state: the spec lets any context in
+// the share group wait on and delete it, from any thread. The token is opaque and never
+// dereferenced here -- it is only ever handed back to the driver -- and `Fence` is neither `Clone`
+// nor `Copy`, so exactly one owner can spend it.
+unsafe impl Send for Fence {}
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        // A sync object dropped on the floor is a driver allocation nothing will ever free, and
+        // the fence it stood for is one the guest may still be waiting on. Both are bugs at the
+        // site that dropped it, so say so there rather than leaking quietly.
+        panic!("a Fence was dropped instead of being spent on Gl::wait_fence");
+    }
+}
+
 /// A texture name the driver handed out. Never zero: zero is "no texture", and is spelled `None`
 /// wherever a binding allows it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -2295,5 +2323,49 @@ impl Gl {
     pub fn flush(&self) {
         // SAFETY: takes nothing.
         unsafe { self.t.glFlush()() };
+    }
+
+    /// Take a fence for the work queued on the current context, and flush so it can complete.
+    ///
+    /// **The flush is not separable from the sync**, which is why this is one call and not two.
+    /// A sync object signals when the commands issued before it on its context complete, but a
+    /// command that is still sitting in the client-side buffer has not been issued to the GPU at
+    /// all: without the flush the sync may never be reached, and whoever waits on it waits
+    /// forever. The waiting thread cannot repair this later -- `GL_SYNC_FLUSH_COMMANDS_BIT`
+    /// flushes the *waiter's* context, which is not the one holding the work.
+    ///
+    /// `None` if the driver refused to make one, which is the caller's cue that this fence cannot
+    /// be answered by waiting and must be answered some other way.
+    pub fn fence(&self) -> Option<Fence> {
+        // SAFETY: the condition and flags are the only pair the spec defines for this call.
+        let sync = unsafe { self.t.glFenceSync()(GL_SYNC_GPU_COMMANDS_COMPLETE, 0) };
+        if sync.is_null() {
+            return None;
+        }
+        self.flush();
+        Some(Fence(sync))
+    }
+
+    /// Wait for a fence's work to have run, then delete it. Consumes the fence: it is spent.
+    ///
+    /// `true` if the work completed, `false` if the wait timed out or the driver failed it -- a
+    /// caller that must not retire early treats both the same way. The sync is deleted either
+    /// way, because a fence that timed out is no more reusable than one that signalled.
+    ///
+    /// Call this on a context of the share group the fence was taken in; it need not be, and
+    /// normally is not, the context that took it.
+    pub fn wait_fence(&self, fence: Fence, timeout_ns: u64) -> bool {
+        // `Fence` aborts on drop, so take the token out without letting the destructor run: this
+        // call is what spending it means.
+        let fence = core::mem::ManuallyDrop::new(fence);
+        let sync = fence.0;
+        // SAFETY: `sync` came from `glFenceSync` on a context of this share group and has not been
+        // deleted -- `Fence` is not `Copy` and this is the only place that deletes one, so no other
+        // owner can have spent it. Zero flags: the flush this fence was created with is what makes
+        // the work reachable, and `GL_SYNC_FLUSH_COMMANDS_BIT` would flush the wrong context.
+        let got = unsafe { self.t.glClientWaitSync()(sync, 0, timeout_ns) };
+        // SAFETY: as above, and nothing reads `sync` after this.
+        unsafe { self.t.glDeleteSync()(sync) };
+        got == GL_ALREADY_SIGNALED || got == GL_CONDITION_SATISFIED
     }
 }
