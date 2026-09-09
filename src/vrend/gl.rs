@@ -1804,7 +1804,18 @@ impl Gl {
         (id != 0).then_some(ProgramName(id))
     }
 
-    pub fn delete_program(&self, program: ProgramName) {
+    /// `glDeleteProgram`, unbinding the program first if it is the one GL has.
+    ///
+    /// A delete invalidates the name at once, while the object itself lives on as current state,
+    /// and Mesa hands out the lowest free name (`util_idalloc_sparse_alloc_range`) -- so the next
+    /// `glCreateProgram` can return the name just deleted. A shadow still naming it would then
+    /// match the new program and skip its bind, and the uniforms set after it would land on the
+    /// deleted one. Unbinding here is what keeps [`BoundProgram`] unable to name something gone,
+    /// and taking it by `&mut` is what makes every delete site say so.
+    pub fn delete_program(&self, bound: &mut BoundProgram, program: ProgramName) {
+        if bound.0 == Some(program) {
+            self.use_program(bound, None);
+        }
         // SAFETY: plain scalar.
         unsafe { self.t.glDeleteProgram()(program.0) };
     }

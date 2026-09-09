@@ -445,7 +445,7 @@ impl SubContext {
 
     /// `vrend_destroy_program` for every program linking `variant`, as the C destroys them
     /// with the variant.
-    fn forget_programs_of(&mut self, gl: &Gl, variant: VariantId) {
+    fn forget_programs_of(&mut self, gl: &Gl, bound: &mut BoundProgram, variant: VariantId) {
         let mut i = 0;
         while i < self.programs.len() {
             if self.programs[i].links(variant) {
@@ -456,7 +456,7 @@ impl SubContext {
                 if let Some(b) = p.sysval_buffer {
                     gl.delete_buffer(b);
                 }
-                gl.delete_program(p.id);
+                gl.delete_program(bound, p.id);
             } else {
                 i += 1;
             }
@@ -466,10 +466,15 @@ impl SubContext {
 
 /// The C's `vrend_shader_destroy`, and the one place a shader leaves a sub-context: the
 /// programs linking each variant, then the variant's GL shader.
-pub(super) fn release_shader(sub: &mut SubContext, gl: &Gl, shader: Shader) {
+pub(super) fn release_shader(
+    sub: &mut SubContext,
+    gl: &Gl,
+    bound: &mut BoundProgram,
+    shader: Shader,
+) {
     if let ShaderText::Whole(p) = shader.text {
         for v in p.variants {
-            sub.forget_programs_of(gl, v.id);
+            sub.forget_programs_of(gl, bound, v.id);
             if let Some(name) = v.gl {
                 gl.delete_shader(name);
             }
@@ -529,7 +534,7 @@ fn add_shader_program(
     }
 
     if let Err(log) = gl.link_program(id) {
-        gl.delete_program(id);
+        gl.delete_program(host.current.program(), id);
         eprintln!("[virglrs] vrend: error linking program:\n{log}");
         for l in linked {
             eprintln!("{}: GLSL:\n{}", stage_prefix(l.stage), l.variant.strings.source());
@@ -1499,7 +1504,13 @@ impl Context {
 
         if features.has(Feature::draw_parameters) && reads_drawid {
             let drawid = draw.tess.map_or(0, |t| t.drawid) as i32;
-            self.sub_mut().sysval.drawid_base = drawid;
+            // Read through `Deref` and write only on a change: a write bumps the generation, and
+            // bumping it every draw would re-upload the whole block for every drawid-reading
+            // program, which is the upload the generation exists to skip.
+            let sub = self.sub_mut();
+            if sub.sysval.drawid_base != drawid {
+                sub.sysval.drawid_base = drawid;
+            }
         }
 
         self.draw_bind_objects(host, new_program);
