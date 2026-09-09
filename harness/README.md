@@ -1010,10 +1010,20 @@ vectors host-side; `fluster.sh [c|rs|diff]` scores them; `diff` is the gate.
 
 It does not replace the differential, because absolute is not the same as achievable here. This
 host advertises HEVC Main and no Main10, and VP9 Profile 0 and nothing else, so streams fail for
-reasons that belong to VideoToolbox. **Measured on the C leg: 212 of 305 VP9 vectors match the
-published md5**, and the 93 that do not include every `vp90-2-21-resize_inter_*` — mid-stream
-resolution changes — and the 8-pixel-wide `vp90-2-02-size-08x*`. So the gate is two claims kept
-apart: the legs decode the same set (ours), and the C leg's own set has not moved (the host's).
+reasons that belong to VideoToolbox. **Measured on the C leg: 295 of 587 vectors match the
+published md5** — 212/305 VP9, 71/135 H.264, 12/147 HEVC. The ones that do not are dominated by
+what this host cannot decode at all: every `vp90-2-21-resize_inter_*` (mid-stream resolution
+change), the 8-pixel-wide `vp90-2-02-size-08x*`, the interlaced half of H.264 (`*_mot_fld*`,
+`*mbaff*`, `Sharp_MP_Field_*`, the `CAMA*`/`CVMA*` families), and the Main10 bulk of HEVC. So the
+gate is two claims kept apart: the legs decode the same set (ours), and the C leg's own set has
+not moved (the host's).
+
+**Both legs are deterministic** — measured twice each, byte-identical result lists (C 295, rs
+290). That is what makes a single divergence worth reading as a defect rather than as noise.
+
+`-t 120` rather than fluster's default 30 seconds, because a `Timeout` is a verdict about the
+clock and a verdict about the clock cannot be pinned. `MR4_TANDBERG_C` and `MR5_TANDBERG_C` time
+out at 120 too, so they are reliably too slow rather than borderline, and *that* is stable.
 
 Unlike `ctests.sh` there is no cascade — each vector is its own process — so the pin is the whole
 result list, not its first entry.
@@ -1041,10 +1051,29 @@ A leg is a whole boot — stock guest, all complete suites, poweroff — and cos
 for the 305 VP9 vectors, so this is per-commit work rather than nightly.
 
 **The gate is armed**: inverting the VP9 key-frame flag in `src/vrend/video/mod.rs` takes the rs
-leg from 212/305 to **1/305**, and reverting brings it back. The pin currently covers
-VP9-TEST-VECTORS alone, because the ITU suites were still downloading when it was recorded —
-a whole suite appearing in the pin diff is that, and wants a re-record rather than an
-investigation.
+leg from 212/305 to **1/305**, and reverting brings it back.
+
+### What it found: five HEVC vectors the C decodes and we refuse
+
+The first run of the full three suites put the legs 5 apart, reproducibly — `ENTP_A_QUALCOMM_1`,
+`IPRED_A_docomo_2`, `IPRED_C_Mitsubishi_3`, `MAXBINS_A_TI_5`, `OPFLAG_B_Qualcomm_1`. Every one is
+`Success` on the C leg and `Fail` on ours, and the renderer says why itself:
+
+```
+HEVC slice refused (the slice indexes an SPS short term ref pic set,
+                    whose contents are not on the VA-API wire)
+HEVC slice refused (the slice predicts its ref pic set from an SPS set,
+                    whose contents the wire does not carry)
+no HEVC parameter set (the stream carries custom scaling lists, whose scan order
+                       on the VA-API wire is not established)
+```
+
+These are our own deliberate refusals — chosen over decoding something wrong. **The C leg reaching
+the published md5 on the same streams is the evidence they are too conservative**: the information
+is recoverable, so the premise each refusal rests on is false for at least these streams. This is
+the differential and the absolute oracle agreeing, which is the strongest form the claim comes in.
+
+Nothing here is a host limitation, so nothing here belongs in the pin.
 
 ### The rig's two legs are built differently, and not by choice
 

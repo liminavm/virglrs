@@ -68,6 +68,12 @@ COMPLETE_PY
 SUITES=($COMPLETE)
 [ -n "$COMPLETE" ] || { echo "no complete suite in $RESOURCES -- run setup.sh" >&2; exit 1; }
 
+# -t 120 and not fluster's default 30: a Timeout is a verdict about the clock, and a verdict about
+# the clock cannot be pinned -- it flaps with host load and would make the gate red for reasons
+# that are nobody's. Typical decodes here are well under a second (305 VP9 vectors in 56 s), so
+# 120 is ample headroom; what still times out at 120 is reliably too slow rather than borderline,
+# and THAT is a stable thing to pin.
+
 # Every VA decoder we have an element for. fluster matches a decoder to a suite by codec, so
 # naming all of them runs each suite with the one that fits it and nothing else.
 #
@@ -123,7 +129,8 @@ run_leg() {
         mountpoint -q /media/fluster || sudo mount -t virtiofs limina-fluster /media/fluster
         python3 /media/fluster/upstream/fluster.py \
             -r /media/fluster/resources -o /tmp/fluster-out -ne \
-            run -ts ${SUITES[*]} -d ${DECODERS[*]} -j 1 -q -so /tmp/summary.json -f json
+            run -ts ${SUITES[*]} -d ${DECODERS[*]} -j 1 -q -t 120 \
+                -so /tmp/summary.json -f json
     " > "$OUT/$leg-run.log" 2>&1
     local rc=$?
 
