@@ -590,6 +590,14 @@ impl Vrend {
         self.resources.get(&handle)?.resource()?.surface()
     }
 
+    /// The GL texture a resource's storage is, when its storage is one.
+    ///
+    /// Asked of the resource every time rather than mirrored anywhere: the name is the texture's
+    /// and dies with it, and a copy kept elsewhere would outlive the object it names.
+    pub fn resource_texture(&self, handle: ResourceHandle) -> Option<gl::TextureName> {
+        Some(self.resources.get(&handle)?.resource()?.texture()?.name)
+    }
+
     /// A share of that surface, for a holder outside vrend -- a venus context importing this
     /// resource, which must keep the surface alive rather than name it. See
     /// [`resource::Resource::surface_share`].
