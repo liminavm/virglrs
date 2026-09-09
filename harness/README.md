@@ -1047,8 +1047,11 @@ VP9-TEST-VECTORS is on `storage.googleapis.com` and has none of this.
 **AV1 is not scored here**, for the reason `vrend-av1.score` is not: without M3-or-later silicon
 `vaav1dec` is not even an element. It belongs on the AV1 machine.
 
-A leg is a whole boot — stock guest, all complete suites, poweroff — and costs about 75 seconds
-for the 305 VP9 vectors, so this is per-commit work rather than nightly.
+A leg is a whole boot — stock guest, all three suites, poweroff. Measured: about **6 minutes of
+decode** (VP9 55 s, HEVC 37 s, H.264 277 s — H.264 dominates, and 240 s of it is the two
+`MR*_TANDBERG` vectors burning the 120 s timeout), plus a boot either side. `diff` is two of those.
+That makes the full gate pre-merge work rather than per-commit; a single suite (`-ts` in
+`fluster.sh`) is the quick form.
 
 **The gate is armed**: inverting the VP9 key-frame flag in `src/vrend/video/mod.rs` takes the rs
 leg from 212/305 to **1/305**, and reverting brings it back.
