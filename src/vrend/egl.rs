@@ -115,9 +115,15 @@ pub enum Flavour {
 /// thread, so nothing here may be reached from a worker. [`Winsys::thread_display`] answers `None`
 /// for a winsys backed by this, which is what stops a second thread from existing to try.
 pub trait GlContexts: Send + Sync {
-    /// The EGL display the contexts belong to, for the queries and images that need one. It is the
-    /// embedder's: already initialised, and not ours to terminate.
-    fn display(&self) -> EGLDisplay;
+    /// The EGL display the contexts belong to, for the queries and images that need one. It is
+    /// the embedder's: already initialised, and not ours to terminate.
+    ///
+    /// `None` when the embedder cannot name it -- which is not the same as having none. A VMM
+    /// whose window toolkit owns the EGL stack may hold no display handle of its own to pass on:
+    /// QEMU advertises `get_egl_display` only when it opened an EGL display itself, so its GTK
+    /// console offers one and its SDL console does not. The display is then read off the first
+    /// context this mints, which is the same display by construction.
+    fn display(&self) -> Option<EGLDisplay>;
 
     /// Mint a context of `version`, in the share group of the ones already minted when `shared`.
     fn create(&self, version: Version, shared: bool) -> Option<EGLContext>;
@@ -494,31 +500,58 @@ impl Winsys {
     /// The flavour is the embedder's choice too, and is not knowable until a context exists and is
     /// current, so this records what was asked for; [`Winsys::gles`]'s caller is what finds out
     /// what arrived.
-    pub fn embedded(flavour: Flavour, contexts: Box<dyn GlContexts>) -> Result<Winsys, EglError> {
+    pub fn embedded(
+        flavour: Flavour,
+        contexts: Box<dyn GlContexts>,
+        versions: &[Version],
+    ) -> Result<(Winsys, Context, Version), EglError> {
         let egl = table();
-        let display = contexts.display();
-        if display == proc::EGL_NO_DISPLAY {
-            return Err(EglError {
-                call: "get_egl_display",
-                code: proc::EGL_BAD_DISPLAY as EGLint,
-            });
+        // The first context is minted before the winsys exists because on an embedder that cannot
+        // name its display the context is *how* the display is found: bind one, and
+        // `eglGetCurrentDisplay` answers with the display it lives on. So a winsys over an
+        // embedder never exists without a context of its own, and the return type says that rather
+        // than leaving the order to a caller to get right.
+        let mut first = None;
+        for &v in versions {
+            if let Some(ctx) = contexts.create(v, false) {
+                first = Some((ctx, v));
+                break;
+            }
         }
-        let extensions: BTreeSet<String> = {
+        let (ctx, version_made) = first
+            .ok_or(EglError { call: "create_gl_context", code: proc::EGL_BAD_CONTEXT as EGLint })?;
+        if let Err(e) = contexts.make_current(ctx) {
+            contexts.destroy(ctx);
+            return Err(e);
+        }
+        // An embedder that names no display may still be on EGL, in which case the context just
+        // bound is standing on the display we want. It may equally be on GLX, and then there is no
+        // EGL display to find and none is needed: this mode runs on the embedder's contexts and
+        // its GL, and the C -- which builds no winsys here either -- renders on GLX exactly so.
+        let display = match contexts.display() {
+            Some(display) => display,
+            // SAFETY: `eglGetCurrentDisplay` takes nothing and is defined on any thread. A context
+            // the embedder minted is current on this one, so this answers with that context's
+            // display, or `EGL_NO_DISPLAY` if it is not an EGL context at all.
+            None => unsafe { egl.eglGetCurrentDisplay()() },
+        };
+        let extensions: BTreeSet<String> = if display == proc::EGL_NO_DISPLAY {
+            BTreeSet::new()
+        } else {
             // SAFETY: the embedder initialised this display before handing it over.
             let p = unsafe { egl.eglQueryString()(display, proc::EGL_EXTENSIONS as EGLint) };
             c_str_to_string(p).split(' ').filter(|s| !s.is_empty()).map(str::to_string).collect()
         };
-        let version = {
+        let version = if display == proc::EGL_NO_DISPLAY {
+            Version { major: 0, minor: 0 }
+        } else {
             // SAFETY: as above.
             let p = unsafe { egl.eglQueryString()(display, proc::EGL_VERSION as EGLint) };
             parse_egl_version(&c_str_to_string(p))
         };
-        Ok(Winsys {
-            shared: Arc::new(Shared { egl, display, backing: Backing::Embedder(contexts) }),
-            flavour,
-            version,
-            extensions,
-        })
+        let shared = Arc::new(Shared { egl, display, backing: Backing::Embedder(contexts) });
+        let ctx0 = Context { shared: Arc::clone(&shared), ctx };
+        Ok((Winsys { shared, flavour, version, extensions }, ctx0, version_made))
     }
 
     pub fn flavour(&self) -> Flavour {
@@ -533,6 +566,17 @@ impl Winsys {
     /// Whether the display advertises an extension, by its `EGL_*` name.
     pub fn has_extension(&self, name: &str) -> bool {
         self.extensions.contains(name)
+    }
+
+    /// Whether an sRGB drawable can be asked for -- `vrend_winsys_has_gl_colorspace`.
+    ///
+    /// On a display of ours it is the EGL extension. On an embedder's it is the extension when
+    /// there is a display to have asked, and otherwise yes: a winsys with no EGL display is one
+    /// whose contexts were configured by someone else, and the C answers the same way for the same
+    /// reason (`use_context == CONTEXT_NONE`). Answering no instead would quietly drop
+    /// `srgb_write_control` from a host that has it.
+    pub fn has_gl_colorspace(&self) -> bool {
+        self.shared.display == proc::EGL_NO_DISPLAY || self.has_extension("EGL_KHR_gl_colorspace")
     }
 
     pub fn extensions(&self) -> impl Iterator<Item = &str> {
@@ -715,6 +759,9 @@ mod tests {
     /// not know.
     #[derive(Default)]
     struct FakeEmbedder {
+        /// Whether this embedder can name its display, which is what decides between the two
+        /// ways a winsys finds one. See [`GlContexts::display`].
+        nameless: bool,
         minted: std::sync::Mutex<Vec<usize>>,
         destroyed: std::sync::Mutex<Vec<usize>>,
         bound: std::sync::Mutex<Vec<usize>>,
@@ -722,9 +769,9 @@ mod tests {
     }
 
     impl GlContexts for FakeEmbedder {
-        fn display(&self) -> EGLDisplay {
+        fn display(&self) -> Option<EGLDisplay> {
             // Not null, so the winsys accepts it; never dereferenced.
-            core::ptr::dangling_mut()
+            (!self.nameless).then(core::ptr::dangling_mut)
         }
 
         fn create(&self, _version: Version, shared: bool) -> Option<EGLContext> {
@@ -759,7 +806,7 @@ mod tests {
 
         struct Lent(Arc<FakeEmbedder>);
         impl GlContexts for Lent {
-            fn display(&self) -> EGLDisplay {
+            fn display(&self) -> Option<EGLDisplay> {
                 self.0.display()
             }
             fn create(&self, version: Version, shared: bool) -> Option<EGLContext> {
@@ -773,16 +820,17 @@ mod tests {
             }
         }
 
-        let winsys = Winsys::embedded(Flavour::Gles, Box::new(Lent(fake)))
+        let v = Version { major: 3, minor: 2 };
+        // ctx0 comes back with the winsys: it is minted and bound to find the display, so it
+        // cannot be left for the caller to remember.
+        let (winsys, ctx0, made) = Winsys::embedded(Flavour::Gles, Box::new(Lent(fake)), &[v])
             .expect("a display the embedder vouched for");
+        assert_eq!(made, v);
 
         // No second thread can reach a factory that is only callable on this one.
         assert!(winsys.thread_display().is_none());
 
-        let v = Version { major: 3, minor: 2 };
-        let ctx0 = winsys.create_context(v, None).expect("the embedder mints ctx0");
         let sub = winsys.create_context(v, Some(&ctx0)).expect("and every context beside it");
-        winsys.make_current(&ctx0).expect("bound through the embedder");
         winsys.make_current(&sub).expect("bound through the embedder");
 
         assert_eq!(*counts.minted.lock().expect("test"), vec![0x1000, 0x1001]);
@@ -794,6 +842,52 @@ mod tests {
         drop(sub);
         drop(ctx0);
         assert_eq!(*counts.destroyed.lock().expect("test"), vec![0x1001, 0x1000]);
+    }
+
+    /// An embedder that can name no EGL display still gets a winsys, and it is not a lesser one.
+    ///
+    /// This is the shape QEMU's SDL console has: contexts on GLX, and so nothing for
+    /// `get_egl_display` or `eglGetCurrentDisplay` to answer with. The renderer runs on the
+    /// embedder's contexts and its GL, which is what this mode is; the C builds no winsys here
+    /// either and renders. What must not happen is the display's absence being read as a host
+    /// that cannot do sRGB -- `has_gl_colorspace` follows the C and says yes.
+    ///
+    /// Nothing is current on this thread and the fake's tokens are not EGL contexts, so
+    /// `eglGetCurrentDisplay` answers `EGL_NO_DISPLAY` by specification. That is the case under
+    /// test, not a shortcoming of the fake.
+    #[test]
+    fn an_embedder_that_names_no_display_still_gets_a_winsys() {
+        let fake = Arc::new(FakeEmbedder { nameless: true, ..FakeEmbedder::default() });
+        let counts = Arc::clone(&fake);
+
+        struct Lent(Arc<FakeEmbedder>);
+        impl GlContexts for Lent {
+            fn display(&self) -> Option<EGLDisplay> {
+                self.0.display()
+            }
+            fn create(&self, version: Version, shared: bool) -> Option<EGLContext> {
+                self.0.create(version, shared)
+            }
+            fn make_current(&self, ctx: EGLContext) -> Result<(), EglError> {
+                self.0.make_current(ctx)
+            }
+            fn destroy(&self, ctx: EGLContext) {
+                self.0.destroy(ctx);
+            }
+        }
+
+        let v = Version { major: 3, minor: 2 };
+        let (winsys, ctx0, _) = Winsys::embedded(Flavour::Gles, Box::new(Lent(fake)), &[v])
+            .expect("an embedder with no display to name is still an embedder");
+
+        assert!(winsys.has_gl_colorspace(), "the C says yes with no winsys, and so must this");
+        assert_eq!(winsys.extensions().count(), 0, "there was no display to ask");
+        // The context minted to look for a display is ctx0, not a probe to be thrown away.
+        assert_eq!(*counts.minted.lock().expect("test"), vec![0x1000]);
+        assert!(counts.destroyed.lock().expect("test").is_empty());
+
+        drop(ctx0);
+        assert_eq!(*counts.destroyed.lock().expect("test"), vec![0x1000]);
     }
 
     /// libEGL has to be there and answer for every core EGL command through

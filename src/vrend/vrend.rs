@@ -184,19 +184,24 @@ impl Vrend {
         contexts: Option<Box<dyn GlContexts>>,
     ) -> Result<Vrend, InitError> {
         let fences_for_inline = fences.clone();
-        let winsys = match contexts {
-            Some(contexts) => Winsys::embedded(Flavour::Gles, contexts)?,
-            None => Winsys::open(Flavour::Gles)?,
-        };
-        let mut ctx0 = None;
-        for v in VERSIONS {
-            if let Ok(c) = winsys.create_context(v, None) {
-                ctx0 = Some((c, v));
-                break;
+        // An embedder's winsys arrives with ctx0 already made and current, because its display is
+        // discovered through that context; ours is opened first and asked for one.
+        let (winsys, ctx0, version) = match contexts {
+            Some(contexts) => Winsys::embedded(Flavour::Gles, contexts, &VERSIONS)?,
+            None => {
+                let winsys = Winsys::open(Flavour::Gles)?;
+                let mut made = None;
+                for v in VERSIONS {
+                    if let Ok(c) = winsys.create_context(v, None) {
+                        made = Some((c, v));
+                        break;
+                    }
+                }
+                let (ctx0, version) = made.ok_or(InitError::NoContext)?;
+                winsys.make_current(&ctx0)?;
+                (winsys, ctx0, version)
             }
-        }
-        let (ctx0, version) = ctx0.ok_or(InitError::NoContext)?;
-        winsys.make_current(&ctx0)?;
+        };
         let gl = Gl::new(winsys.gles());
         let version_string = gl.get_string(GL_VERSION);
         // Whose choice the client API was depends on who minted the context, so it is read back
@@ -208,7 +213,7 @@ impl Vrend {
         }
         let gles_version = parse_gles_version(&version_string);
         let mut features = Features::probe(gles_version, gl.extensions());
-        if !winsys.has_extension("EGL_KHR_gl_colorspace") {
+        if !winsys.has_gl_colorspace() {
             features.clear(Feature::srgb_write_control);
         }
         features.reconcile(&gl);
