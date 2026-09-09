@@ -39,27 +39,80 @@ impl Default for Sysval {
 }
 
 impl Sysval {
-    /// The block's bytes, in the layout the shader declares.
-    fn bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Sysval::SIZE);
-        for p in &self.clip_planes {
-            for c in p {
-                out.extend_from_slice(&c.to_ne_bytes());
+    /// The block's bytes, in the layout the shader declares, written into the caller's buffer.
+    ///
+    /// Every byte of `out` is written, padding included, so a reused buffer carries nothing over.
+    fn write_to(&self, out: &mut [u8; Sysval::SIZE]) {
+        let mut at = 0;
+        {
+            let mut put = |bytes: &[u8]| {
+                out[at..at + bytes.len()].copy_from_slice(bytes);
+                at += bytes.len();
+            };
+            for p in &self.clip_planes {
+                for c in p {
+                    put(&c.to_ne_bytes());
+                }
             }
+            for s in &self.stipple {
+                put(&s.to_ne_bytes());
+                put(&[0; 12]);
+            }
+            put(&self.winsys_adjust_y.to_ne_bytes());
+            put(&self.alpha_ref_val.to_ne_bytes());
+            put(&self.clip_plane_enabled.to_ne_bytes());
+            put(&self.drawid_base.to_ne_bytes());
         }
-        for s in &self.stipple {
-            out.extend_from_slice(&s.to_ne_bytes());
-            out.extend_from_slice(&[0; 12]);
-        }
-        out.extend_from_slice(&self.winsys_adjust_y.to_ne_bytes());
-        out.extend_from_slice(&self.alpha_ref_val.to_ne_bytes());
-        out.extend_from_slice(&self.clip_plane_enabled.to_ne_bytes());
-        out.extend_from_slice(&self.drawid_base.to_ne_bytes());
-        debug_assert_eq!(out.len(), Sysval::SIZE);
-        out
+        debug_assert_eq!(at, Sysval::SIZE);
     }
 
     const SIZE: usize = shader::NUM_CLIP_PLANES * 16 + shader::POLYGON_STIPPLE_SIZE * 16 + 16;
+}
+
+/// How many times a [`Tracked`] value has been reached mutably. Monotonic, so a value changed and
+/// changed back still counts as moved -- the comparison is conservative in the safe direction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Generation(u64);
+
+/// A value that counts the times it was handed out mutably, so a cache of it can be checked
+/// against a word instead of against the value.
+///
+/// The C compares a cookie (`vrend_renderer.c`'s `sysvalue_data_cookie`) where comparing the
+/// sysval block itself costs a copy of it and a compare of it on every draw. A cookie someone has
+/// to remember to bump would be the bug this renderer is written to avoid, so there is nothing to
+/// remember: [`DerefMut`] is the only way to the value, and it bumps. A write that changes nothing
+/// still bumps, which costs one redundant upload -- never a stale one.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Tracked<T> {
+    value: T,
+    moved: u64,
+}
+
+impl<T> Tracked<T> {
+    pub fn new(value: T) -> Tracked<T> {
+        Tracked { value, moved: 0 }
+    }
+
+    /// Which version of the value this is. Equal generations mean the value has not been reached
+    /// mutably since; they do not mean it is unchanged by some other route, because there is none.
+    pub fn generation(&self) -> Generation {
+        Generation(self.moved)
+    }
+}
+
+impl<T> std::ops::Deref for Tracked<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for Tracked<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.moved += 1;
+        &mut self.value
+    }
 }
 
 /// What `vrend_hw_emit_blend` last told GL, for what it only emits on change.
@@ -123,7 +176,7 @@ pub struct LinkedProgram {
     pub virgl_block_bind: Option<BindingPoint>,
     pub sysval_buffer: Option<BufferName>,
     /// The block the buffer holds, so a draw uploads only a block that changed.
-    pub sysval_uploaded: Option<Sysval>,
+    pub sysval_uploaded: Option<Generation>,
     pub reads_drawid: bool,
     pub fs_blend_equation_advanced: u32,
 }
@@ -1269,20 +1322,22 @@ impl Context {
     fn fill_sysval_uniform_block(&mut self, host: &mut Host<'_>) {
         let gl = host.gl;
         let sub = self.sub_mut();
-        let sysval = sub.sysval;
-        let Some(prog) = sub.program_mut() else {
+        let generation = sub.sysval.generation();
+        let Some(prog) = sub.program() else {
             return;
         };
-        if prog.virgl_block_bind.is_none() {
+        if prog.virgl_block_bind.is_none() || prog.sysval_uploaded == Some(generation) {
             return;
         }
-        if prog.sysval_uploaded != Some(sysval) {
-            let buf = prog.sysval_buffer.expect("a bound block has its buffer");
-            gl.bind_buffer(GL_UNIFORM_BUFFER, Some(buf));
-            gl.buffer_sub_data(GL_UNIFORM_BUFFER, 0, &sysval.bytes());
-            gl.bind_buffer(GL_UNIFORM_BUFFER, None);
-            prog.sysval_uploaded = Some(sysval);
-        }
+        let buf = prog.sysval_buffer.expect("a bound block has its buffer");
+        let mut bytes = [0; Sysval::SIZE];
+        sub.sysval.write_to(&mut bytes);
+        gl.bind_buffer(GL_UNIFORM_BUFFER, Some(buf));
+        gl.buffer_sub_data(GL_UNIFORM_BUFFER, 0, &bytes);
+        gl.bind_buffer(GL_UNIFORM_BUFFER, None);
+        sub.program_mut()
+            .expect("the program that was just bound is still bound")
+            .sysval_uploaded = Some(generation);
     }
 
     /// `vrend_draw_bind_objects`.
@@ -1667,5 +1722,50 @@ mod tests {
         assert_eq!(stale_vbo_slots(1, 4), 1..4);
         assert_eq!(stale_vbo_slots(4, 4), 4..4);
         assert_eq!(stale_vbo_slots(6, 4), 6..6);
+    }
+
+    #[test]
+    fn only_a_mutable_reach_moves_the_generation() {
+        let mut sysval = Tracked::new(Sysval::default());
+        let fresh = sysval.generation();
+
+        // Reading the block is not a change, however much of it is read.
+        assert_eq!(sysval.clip_planes[0][0], 0.0);
+        assert_eq!(sysval.drawid_base, 0);
+        assert_eq!(sysval.generation(), fresh);
+
+        sysval.drawid_base = 7;
+        let moved = sysval.generation();
+        assert_ne!(moved, fresh);
+
+        // Changed back is still changed: the generation only ever advances, so a program that
+        // uploaded the old bytes uploads again rather than trusting a value that matches by luck.
+        sysval.drawid_base = 0;
+        assert_eq!(*sysval, Sysval::default());
+        assert_ne!(sysval.generation(), moved);
+        assert_ne!(sysval.generation(), fresh);
+    }
+
+    #[test]
+    fn write_to_lays_the_block_out_as_std140_declares_it() {
+        let mut sysval = Sysval::default();
+        sysval.clip_planes[1] = [1.0, 2.0, 3.0, 4.0];
+        sysval.stipple[2] = 0xdead_beef;
+        sysval.drawid_base = -3;
+
+        // A buffer carrying someone else's bytes: every byte of the block is written, so the
+        // padding std140 leaves between stipple rows cannot carry them into the shader.
+        let mut bytes = [0xabu8; Sysval::SIZE];
+        sysval.write_to(&mut bytes);
+
+        let word = |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!(f32::from_bits(word(16)), 1.0);
+        assert_eq!(f32::from_bits(word(28)), 4.0);
+        let stipple = shader::NUM_CLIP_PLANES * 16;
+        assert_eq!(word(stipple + 2 * 16), 0xdead_beef);
+        assert_eq!(word(stipple + 2 * 16 + 4), 0, "std140 pads each row to sixteen bytes");
+        let tail = stipple + shader::POLYGON_STIPPLE_SIZE * 16;
+        assert_eq!(f32::from_bits(word(tail)), 1.0, "winsys_adjust_y");
+        assert_eq!(word(tail + 12) as i32, -3, "drawid_base");
     }
 }
