@@ -59,6 +59,7 @@ impl std::fmt::Display for Seq {
 ///
 /// The seq is the *first* chunk's, so that an object created early and completed late still sorts
 /// before whatever was bound against it in between.
+#[derive(PartialEq, Eq, Debug)]
 pub struct Retained {
     pub seq: Seq,
     pub chunks: Vec<Vec<u32>>,
@@ -73,6 +74,27 @@ impl Retained {
     /// Retain a continuation of the same create -- another chunk of a shader's text.
     pub fn extend(&mut self, wire: &[u32]) {
         self.chunks.push(wire.to_vec());
+    }
+
+    /// Re-retain a slot's command in place, keeping the buffer the slot already holds.
+    ///
+    /// Gallium re-emits a set whenever it changes, so a state slot is overwritten on most draws.
+    /// Building a fresh [`Retained`] for it meant two allocations (the outer `Vec` and the wire)
+    /// and, as the old value dropped, two frees -- per command, at millions of commands a second.
+    /// The result is identical; only the allocator traffic is gone.
+    pub fn reuse(&mut self, seq: Seq, wire: &[u32]) {
+        self.seq = seq;
+        // A re-retain replaces the whole command, so any continuation chunks go with it.
+        self.chunks.truncate(1);
+        match self.chunks.first_mut() {
+            Some(first) => {
+                first.clear();
+                first.extend_from_slice(wire);
+            }
+            // `new` always leaves one chunk, so this is unreachable in practice -- but a
+            // `Retained` with no chunks must still come out of this holding exactly `wire`.
+            None => self.chunks.push(wire.to_vec()),
+        }
     }
 
     /// Dwords retained, for the census.
@@ -397,6 +419,36 @@ mod tests {
 
     fn feed(seq: u64, sub: u32, chunks: &[Vec<u32>]) -> Entry<'_> {
         Entry { seq: Seq(seq), step: Step::Feed { sub, chunks } }
+    }
+
+    /// `reuse` is an allocation optimization and nothing else: whatever it leaves behind must be
+    /// what `new` would have built. That includes dropping a continuation the old command had --
+    /// a re-retain replaces the command, it does not append to it.
+    #[test]
+    fn reuse_leaves_what_new_would_have_built() {
+        for old in [vec![7u32], vec![7, 8, 9, 10], vec![]] {
+            for fresh in [vec![1u32, 2, 3], vec![4], vec![]] {
+                let mut at = Retained::new(Seq(1), &old);
+                // A continuation, to prove a re-retain does not keep it.
+                at.extend(&[99, 98]);
+                at.reuse(Seq(5), &fresh);
+                assert_eq!(at, Retained::new(Seq(5), &fresh), "old {old:?} -> fresh {fresh:?}");
+                assert_eq!(at.dwords(), fresh.len());
+            }
+        }
+    }
+
+    /// The buffer is refilled, not reallocated -- that is the whole point. Growing past it is
+    /// still correct, it just reallocates once like any `Vec`.
+    #[test]
+    fn reuse_keeps_the_slots_capacity() {
+        let mut at = Retained::new(Seq(1), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let cap = at.chunks[0].capacity();
+        let ptr = at.chunks[0].as_ptr();
+        at.reuse(Seq(2), &[9, 10]);
+        assert_eq!(at.chunks[0].capacity(), cap, "a shorter command reuses the buffer");
+        assert!(std::ptr::eq(at.chunks[0].as_ptr(), ptr), "and does not move it");
+        assert_eq!(at.chunks[0], vec![9, 10]);
     }
 
     #[test]

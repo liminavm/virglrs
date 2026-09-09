@@ -1279,8 +1279,14 @@ impl Context {
                 continue;
             }
             if let Some(slot) = slot {
-                let at = Retained::new(self.seq.advance(), wire);
-                self.sub_mut().state.insert(slot, at);
+                let seq = self.seq.advance();
+                // One lookup, and the slot's existing buffer is refilled rather than replaced:
+                // see `Retained::reuse`. This runs on most draws.
+                self.sub_mut()
+                    .state
+                    .entry(slot)
+                    .and_modify(|at| at.reuse(seq, wire))
+                    .or_insert_with(|| Retained::new(seq, wire));
             }
             self.fill_composites(host);
             // `vrend_check_no_error`: any GL error a command left is the context's error.
