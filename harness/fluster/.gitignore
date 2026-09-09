@@ -1,0 +1,8 @@
+# The upstream checkout and the conformance vectors are large local artifacts: setup.sh
+# materializes both. Only the scripts, the pinned results and the README are tracked.
+*
+!.gitignore
+!README.md
+!*.sh
+!fixtures/
+!fixtures/*
