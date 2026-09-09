@@ -1346,9 +1346,22 @@ pub extern "C" fn virgl_renderer_get_fd_for_texture2(
 
 // ---------------------------------------------------------------- caps
 
+/// The layout of a capset: a version to ask for and a size to allocate.
+///
+/// Answered without the renderer, deliberately. The C documents this entry point as callable
+/// before `virgl_renderer_init`, and its callers rely on it: QEMU decides how many capsets to
+/// expose to its guest while realizing the device, which happens before the first guest command
+/// initializes the renderer. A renderer that answered 0 there told QEMU it had no VIRGL2, and the
+/// guest was offered the v1 capset for the life of the machine -- no `renderer` string, none of
+/// the v2 limits, and a driver that configured itself down to GL 3.3 against a host that could
+/// serve 4.3.
+///
+/// So this reports what the struct is, not what the renderer turned out to be. Whether a capset
+/// is served is a real question with a different answer, and `fill_caps` is where it is asked --
+/// there, and at context create, which are the two places a wrong answer could reach a guest.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_get_cap_set(set: u32, max_ver: *mut u32, max_size: *mut u32) {
-    let (v, s) = with((0, 0), |r| r.capset_max(capset_of(set)).unwrap_or((0, 0)));
+    let (v, s) = renderer::Capset::layout(capset_of(set)).unwrap_or((0, 0));
     if !max_ver.is_null() {
         // SAFETY: caller-provided out-pointer, checked non-null.
         unsafe { *max_ver = v };
@@ -1361,25 +1374,46 @@ pub extern "C" fn virgl_renderer_get_cap_set(set: u32, max_ver: *mut u32, max_si
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_fill_caps(set: u32, version: u32, caps: *mut c_void) {
-    // A capset this build does not advertise fills nothing: the caller sized its buffer from
-    // `get_cap_set`, so writing into one we reported as absent corrupts the caller's stack.
     if caps.is_null() {
         return;
     }
-    let Some(capset) = with(None, |r| r.capset(capset_of(set))) else {
+    let set = capset_of(set);
+    // An id with no layout is one `get_cap_set` reported as 0, so the caller has no buffer for it
+    // and writing anything would be writing off the end of whatever it does have.
+    let Some((newest, size)) = renderer::Capset::layout(set) else {
         return;
     };
     // The version is the C caller's request, and only this side has one: `get_cap_set` told it
     // the newest version to ask for, and a newer number names a layout we never described. An
     // older one is served the newest layout, as the C serves it -- every version is a prefix of
     // the next.
-    if version > capset.version() {
+    if version > newest {
         return;
     }
-    let bytes = capset.as_bytes();
-    // SAFETY: `caps` is the caller's buffer, which it sized from `virgl_renderer_get_cap_set` for
-    // this same set -- and that reported exactly `bytes.len()`, the size of the capset struct.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), caps.cast::<u8>(), bytes.len()) };
+    let size = size as usize;
+    match with(None, |r| r.capset(set)) {
+        Some(capset) => {
+            let bytes = capset.as_bytes();
+            debug_assert_eq!(bytes.len(), size, "the fill must write what the layout promised");
+            // SAFETY: `caps` is the caller's buffer, sized from `virgl_renderer_get_cap_set` for
+            // this same set -- which reported this capset's layout size, asserted above to be
+            // exactly `bytes.len()`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), caps.cast::<u8>(), bytes.len())
+            };
+        }
+        None => {
+            // A capset with a layout and no renderer behind it: before `init`, or a build this one
+            // was not configured to serve. The buffer holds whatever the VMM last left in it, and
+            // returning without writing hands the guest that as a capset -- a driver configuring
+            // itself from noise. Zeroing promises nothing instead, which is the safe direction:
+            // a guest that reads no capability asks for no path we do not have.
+            //
+            // SAFETY: as above -- the caller sized this buffer from the same layout, so `size`
+            // bytes of it are the caller's to write.
+            unsafe { std::ptr::write_bytes(caps.cast::<u8>(), 0, size) };
+        }
+    }
 }
 
 // ---------------------------------------------------------------- fences
@@ -2098,6 +2132,41 @@ mod tests {
 
         // `with` answers with its error only while the root is empty.
         assert_eq!(with(EINVAL, |_| 0), EINVAL, "a refused init must not have initialized");
+    }
+
+    /// `get_cap_set` answers before `virgl_renderer_init`, because its callers ask before then.
+    ///
+    /// QEMU decides how many capsets to expose to its guest while realizing the device, which is
+    /// before any guest command has initialized the renderer. Answering 0 there told it there was
+    /// no VIRGL2, and the guest took the v1 capset for the life of the machine -- reporting GL 3.3
+    /// and no renderer string against a host serving 4.3. The C's own comment on this entry point
+    /// is "this may be called before virgl_renderer_init".
+    ///
+    /// This test does not arrange for an uninitialized renderer and does not need to: the sizes
+    /// come from [`renderer::Capset::layout`], an associated function with no `self`, so there is
+    /// no renderer for it to consult whatever order the tests run in. That is the fix -- the
+    /// answer cannot depend on init state, rather than being remembered not to.
+    ///
+    /// Ground truth: `virgl_renderer_get_cap_set` in `src/virglrenderer.c`, and the sizes the C
+    /// reports on the same host -- 308 for VIRGL, 1408 for VIRGL2.
+    #[test]
+    fn get_cap_set_reports_a_layout_and_not_a_renderer() {
+        let mut ver = 0xdead_beef_u32;
+        let mut size = 0xdead_beef_u32;
+
+        virgl_renderer_get_cap_set(1, &mut ver, &mut size);
+        assert_eq!((ver, size), (1, 308), "VIRGL, as the C reports it");
+
+        virgl_renderer_get_cap_set(2, &mut ver, &mut size);
+        assert_eq!((ver, size), (2, 1408), "VIRGL2, as the C reports it");
+
+        // An id we have no name for is reported as absent, so a caller allocates nothing for it
+        // and `fill_caps` has no buffer to write into.
+        virgl_renderer_get_cap_set(9, &mut ver, &mut size);
+        assert_eq!((ver, size), (0, 0), "an unnamed capset is not advertised");
+
+        // Null out-pointers are the caller's business, not a crash.
+        virgl_renderer_get_cap_set(2, std::ptr::null_mut(), std::ptr::null_mut());
     }
 
     /// Import accepts exactly the `blob_mem` and `fd_type` values the C accepts, and no others.

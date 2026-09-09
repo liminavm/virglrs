@@ -533,14 +533,40 @@ pub enum Capset {
 }
 
 impl Capset {
-    /// The newest version of this capset the build fills: what `get_cap_set` reports, and the
-    /// most a `fill_caps` may ask for.
-    pub fn version(&self) -> u32 {
+    /// Which capset this is.
+    pub fn id(&self) -> CapsetId {
         match self {
-            Capset::Venus(_) => venus::capset::VERSION,
-            Capset::Virgl(_) => vrend::caps::VIRGL_VERSION,
-            Capset::Virgl2(_) => vrend::caps::VIRGL2_VERSION,
+            Capset::Venus(_) => CapsetId::Venus,
+            Capset::Virgl(_) => CapsetId::Virgl,
+            Capset::Virgl2(_) => CapsetId::Virgl2,
         }
+    }
+
+    /// The newest version of a capset and the size of its struct -- what a caller sizes its
+    /// buffer from, and the most a `fill_caps` may ask for.
+    ///
+    /// A layout, and only a layout: `size_of` of a struct and the newest version we describe, both
+    /// compile-time facts. Neither depends on what the host GL turned out to support, and neither
+    /// depends on a renderer existing -- which is what lets the shim answer before `init`, as the
+    /// C ABI's callers require. Whether a capset is SERVED is a different question with a
+    /// different answer, and [`Renderer::capset`] is the one that answers it.
+    pub fn layout(set: CapsetId) -> Option<(u32, u32)> {
+        let (version, size) = match set {
+            CapsetId::Venus => (venus::capset::VERSION, venus::capset::size()),
+            CapsetId::Virgl => {
+                (vrend::caps::VIRGL_VERSION, size_of::<vrend::caps::CapsV1>() as u32)
+            }
+            CapsetId::Virgl2 => {
+                (vrend::caps::VIRGL2_VERSION, size_of::<vrend::caps::CapsV2>() as u32)
+            }
+            CapsetId::Unknown(_) => return None,
+        };
+        Some((version, size))
+    }
+
+    /// The newest version a caller may ask `fill_caps` for.
+    pub fn version(&self) -> u32 {
+        Capset::layout(self.id()).expect("a capset that exists has a layout").0
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -643,16 +669,6 @@ impl Renderer {
             CapsetId::Virgl2 => self.vrend.as_ref().map(|v| Capset::Virgl2(*v.caps())),
             CapsetId::Unknown(_) => None,
         }
-    }
-
-    /// The version and size a caller sizes its buffer from, for a capset this build serves.
-    ///
-    /// Asks [`Renderer::capset`] rather than testing a flag of its own. Advertising a capset and
-    /// filling one were two answers to "does this build serve venus" -- one read the config, the
-    /// other read whether the renderer existed -- and a VMM that sized a buffer from the first and
-    /// got nothing from the second would hand its guest an uninitialised capset.
-    pub fn capset_max(&self, set: CapsetId) -> Option<(u32, u32)> {
-        self.capset(set).map(|c| (c.version(), c.as_bytes().len() as u32))
     }
 
     // ---- resources ----
@@ -2413,29 +2429,38 @@ mod tests {
         assert!(!pages.first_refusal(), "and it is not said again");
     }
 
-    /// a VMM would size a buffer from the first and get nothing back from the second, handing its
-    /// guest whatever was already in that memory as a capset.
+    /// A layout is a compile-time fact and being served is a runtime one, and the size a caller
+    /// was given has to be the size the fill writes -- otherwise a VMM sizes a buffer from the
+    /// first answer and takes a shorter one from the second.
     #[test]
-    fn a_capset_is_advertised_by_whatever_would_fill_it() {
+    fn a_capset_fills_exactly_the_size_its_layout_promised() {
         let venus = Config { venus: true, ..Config::default() };
         let r = renderer(venus);
-        assert!(r.capset(CapsetId::Venus).is_some(), "this build serves venus");
+        let served = r.capset(CapsetId::Venus).expect("this build serves venus");
         assert_eq!(
-            r.capset_max(CapsetId::Venus),
+            Capset::layout(CapsetId::Venus),
             Some((venus::capset::VERSION, venus::capset::size())),
-            "and says so at exactly the size the fill will write"
+            "the layout is the struct's, not the renderer's"
+        );
+        assert_eq!(
+            served.as_bytes().len(),
+            Capset::layout(served.id()).expect("a served capset has a layout").1 as usize,
+            "the fill writes exactly what the layout promised"
         );
 
-        // Nothing else is served, by either answer.
+        // Being served is the runtime question, and this build answers no to the rest.
         for set in [CapsetId::Virgl, CapsetId::Virgl2, CapsetId::from_raw(9)] {
             assert!(r.capset(set).is_none(), "{set:?} has no renderer behind it");
-            assert!(r.capset_max(set).is_none(), "{set:?} must not be advertised either");
         }
 
-        // And a build without venus advertises nothing at all, rather than a size it cannot fill.
+        // A build without venus serves no venus capset -- while the layout, being the struct's,
+        // is the same either way. The shim is what keeps that from reaching a guest as noise.
         let bare = renderer(Config::default());
         assert!(bare.capset(CapsetId::Venus).is_none());
-        assert!(bare.capset_max(CapsetId::Venus).is_none());
+        assert!(Capset::layout(CapsetId::Venus).is_some());
+
+        // An id we have no name for has no layout, so a caller is never told a size for it.
+        assert_eq!(Capset::layout(CapsetId::from_raw(9)), None);
     }
 
     /// What the guest reads is the configuration it was given, through the struct the Rust API
