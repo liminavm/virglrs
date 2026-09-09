@@ -1261,12 +1261,23 @@ impl Video {
     ///
     /// The caller runs the pass: it needs the blitter, which is a layer up.
     pub fn owed_fills(&self) -> Vec<Arc<Texture>> {
+        self.owing().cloned().collect()
+    }
+
+    /// Whether [`Video::owed_fills`] would name anything.
+    ///
+    /// Asked once per command, where the answer is almost always no and a workload with no video
+    /// has nothing to walk. It is the same walk, not a flag beside it, so it cannot fall out of
+    /// step with what `owed_fills` goes on to return.
+    pub fn owes_fill(&self) -> bool {
+        self.owing().next().is_some()
+    }
+
+    fn owing(&self) -> impl Iterator<Item = &Arc<Texture>> {
         self.buffers
             .values()
             .filter_map(|buffer| buffer.composite())
             .filter(|texture| texture.planes.as_ref().is_some_and(resource::Planes::needs_fill))
-            .cloned()
-            .collect()
     }
 
     /// DESTROY_VIDEO_BUFFER.
