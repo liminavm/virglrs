@@ -80,6 +80,32 @@ SWIZZLES = {
 }
 
 
+# `conversions` in `vrend_winsys_gbm.c`: the DRM fourcc a scanout of each wire format would
+# carry. A format absent from this table is one no display controller has a name for, which is
+# what makes "can be scanned out" a short list rather than every format in the table.
+#
+# Two of the C's rows name gallium aliases the wire header assigns no number to (NV12, YV12) and
+# so drop out here, with a note -- a guest cannot ask for a format it cannot spell.
+SCANOUT_FOURCC = [
+    ('B5G6R5_UNORM', 'RG16'),
+    ('B8G8R8A8_UNORM', 'AR24'),
+    ('B8G8R8X8_UNORM', 'XR24'),
+    ('R10G10B10A2_UNORM', 'AB30'),
+    ('R10G10B10X2_UNORM', 'XB30'),
+    ('B10G10R10A2_UNORM', 'AR30'),
+    ('B10G10R10X2_UNORM', 'XR30'),
+    ('R16G16B16A16_FLOAT', 'AB4H'),
+    ('R16G16B16X16_FLOAT', 'XB4H'),
+    ('R16G16B16X16_UNORM', 'XB48'),
+    ('R16G16B16A16_UNORM', 'AB48'),
+    ('NV12', 'NV12'),
+    ('R8G8B8A8_UNORM', 'AB24'),
+    ('R8G8B8X8_UNORM', 'XB24'),
+    ('R8_UNORM', 'R8  '),
+    ('YV12', 'YV12'),
+]
+
+
 def virgl_enum(path):
     """name -> value for `enum virgl_formats`, explicit values honoured."""
     src = Path(path).read_text()
@@ -205,6 +231,18 @@ def main():
                              view_class(vc)))
         lines.append('    ] },')
     lines += ['];', '']
+    lines += ['/// The DRM fourcc a scanout of each format would carry, for the formats a display',
+              '/// controller has a name for at all.',
+              'pub static SCANOUT_FOURCCS: &[(Format, DrmFourcc)] = &[']
+    for name, code in SCANOUT_FOURCC:
+        if name not in numbering:
+            print('scanout: %s has no wire number, dropped' % name, file=sys.stderr)
+            continue
+        assert len(code) == 4, '%s: a fourcc is four characters' % name
+        lines.append('    (Format::table(%d), DrmFourcc::new(*b"%s")), // %s' % (
+            numbering[name], code, name))
+    lines += ['];', '']
+
     (out / 'formats.rs').write_text('\n'.join(lines))
     print('%d of %d formats described' % (described, count), file=sys.stderr)
 

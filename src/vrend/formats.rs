@@ -350,6 +350,36 @@ pub struct Bindings {
     pub depth_stencil: bool,
 }
 
+/// A DRM fourcc: the four characters a display controller names a pixel layout by.
+///
+/// A newtype rather than the `u32`, because the number is only meaningful as those four bytes --
+/// `drm_fourcc.h` builds it little-endian from them, and a fourcc compared against a format
+/// number or a GL enum is a bug the type prevents rather than a review catches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DrmFourcc(u32);
+
+impl DrmFourcc {
+    /// `fourcc_code`: the four characters, least significant first.
+    pub const fn new(code: [u8; 4]) -> DrmFourcc {
+        DrmFourcc(u32::from_le_bytes(code))
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// The fourcc a scanout of this format would carry, or `None` for a format no display controller
+/// has a name for.
+///
+/// This is the first half of the C's `vrend_format_can_scanout`, which maps the format to a GBM
+/// format and then asks the device about it. The mapping alone is most of the answer: there is no
+/// fourcc for a depth/stencil format, a compressed one, or a 64-bit float, so none of them can
+/// back a scanout on any device.
+pub fn scanout_fourcc(format: Format) -> Option<DrmFourcc> {
+    generated::SCANOUT_FOURCCS.iter().find(|(f, _)| *f == format).map(|&(_, code)| code)
+}
+
 /// A format's host-side entry: the GL triple, and what the driver answered when asked to make a
 /// texture of it -- `vrend_format_table`'s `bindings` and `flags`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -570,6 +600,57 @@ fn multisample_works(gl: &Gl, internalformat: GLenum) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scanout format is one a display controller has a fourcc for, and nothing else.
+    ///
+    /// The C reaches this list by mapping to a GBM format and asking the device; the mapping is
+    /// the half that holds without a device, and it is what keeps a depth, compressed or
+    /// double-precision format -- none of which any display controller can scan out -- from being
+    /// advertised as a scanout target. Advertising one is not a cosmetic error: the capset is the
+    /// whole of what the guest's driver configures itself from.
+    ///
+    /// Ground truth: `conversions` in `vrend_winsys_gbm.c`, and `drm_fourcc.h` for the codes.
+    #[test]
+    fn only_formats_a_display_controller_names_can_be_scanned_out() {
+        // The fourcc is those four characters, least significant first -- the layout
+        // `drm_fourcc.h` builds. Get the order wrong and every code is silently a different one.
+        assert_eq!(DrmFourcc::new(*b"AR24").get(), 0x3432_5241, "fourcc_code('A','R','2','4')");
+
+        // Spot the ones the guest's compositor actually asks for.
+        for (name, code) in [("B8G8R8A8_UNORM", *b"AR24"), ("B8G8R8X8_UNORM", *b"XR24")] {
+            let format = DESCRIPTIONS
+                .iter()
+                .position(|d| d.as_ref().is_some_and(|d| d.name == name))
+                .map(|i| Format::table(i as u32))
+                .unwrap_or_else(|| panic!("{name} is a wire format"));
+            assert_eq!(scanout_fourcc(format), Some(DrmFourcc::new(code)), "{name}");
+        }
+
+        // Nothing that cannot be a scanout carries one. A fourcc names a packed colour layout, so
+        // a depth format, a compressed block and a 64-bit float each have none.
+        for (i, d) in DESCRIPTIONS.iter().enumerate() {
+            let Some(d) = d else { continue };
+            let format = Format::table(i as u32);
+            if scanout_fourcc(format).is_none() {
+                continue;
+            }
+            assert_eq!(d.layout, Layout::Plain, "{}: only a plain layout scans out", d.name);
+            assert_ne!(
+                d.colorspace,
+                Colorspace::Zs,
+                "{}: a depth/stencil format cannot be scanned out",
+                d.name
+            );
+            assert!(d.block.bits <= 64, "{}: too wide for a scanout", d.name);
+        }
+
+        // And the table names every format exactly once.
+        let mut seen: Vec<Format> = generated::SCANOUT_FOURCCS.iter().map(|&(f, _)| f).collect();
+        let before = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "a format is named twice");
+    }
 
     fn by_name(name: &str) -> (Format, &'static Description) {
         let n = DESCRIPTIONS
