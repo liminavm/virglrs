@@ -146,9 +146,15 @@ fn run(
                 g = cv.wait(g).expect("the waiter queue lock is never held across a panic");
             }
         };
+        if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
+            eprintln!("[virglrs] fence: waiter woke, sync={}", job.fence.is_some());
+        }
         if let Some(fence) = job.fence {
             wait_out(&gl, &fence);
             gl.fence_delete(fence);
+        }
+        if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
+            eprintln!("[virglrs] fence: waiter done waiting, retiring");
         }
         match job.retire {
             Retire::Context(ctx, ring, id) => sink.retire_context(ctx, ring, id),
