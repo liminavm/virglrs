@@ -871,18 +871,15 @@ mod tests {
     /// The anchors are the conversion's own: Y=16 with neutral chroma is black, because 16 is
     /// where limited range starts; Y=235 is white, because that is where it ends; and Y=128 is
     /// the grey in between, which a full-range matrix would put at 128 rather than 130.
-    ///
-    /// Run it on its own (`--lib a_composite_target -- --ignored`) under the zink-on-KosmicKrisp
-    /// environment, for the reason the plane-import tests give: two displays opened in one
-    /// process leave this driver unable to make a shared context.
     #[test]
-    #[ignore = "needs the zink-on-KosmicKrisp environment"]
     fn a_composite_target_reads_as_the_picture_its_planes_hold() {
         use super::super::egl::{Flavour, Winsys};
         use super::super::gl::gles::{
             GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_RGBA, GL_RGBA8,
             GL_TEXTURE_2D, GL_UNSIGNED_BYTE,
         };
+
+        let _display = crate::vrend::one_display_at_a_time();
         use crate::surface::Held;
         use crate::surface::{PlanarFormat, Surface};
         use crate::vrend::egl::Plane;

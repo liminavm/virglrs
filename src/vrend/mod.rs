@@ -39,3 +39,19 @@ pub mod video;
 #[allow(clippy::module_inception)]
 pub mod vrend;
 pub mod waiter;
+
+/// Serialises the tests that open a display of their own.
+///
+/// They are ordinary tests and run with the rest, but they cannot run *beside* each other: two
+/// displays open at once in one process leave KosmicKrisp unable to make a shared context, and
+/// the tests then fail each other rather than the thing they are about. `cargo test` gives every
+/// test its own thread, so the constraint has to be held here -- a note telling a reader to pass
+/// a filter is not one, and was how these sat unrun long enough for one of them to rot.
+///
+/// It orders them; it does not make them cheap. Each still opens and terminates a display.
+#[cfg(test)]
+pub(crate) fn one_display_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static DISPLAY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // No poisoning to recover from: this crate aborts on panic rather than unwinding.
+    DISPLAY.lock().expect("the display lock is never held across a panic")
+}

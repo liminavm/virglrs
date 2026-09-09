@@ -975,11 +975,11 @@ mod tests {
         );
     }
 
-    /// The probed table on the live host, for the formats the classic corpus creates. Needs the
-    /// zink-on-KosmicKrisp environment, so it is opted into.
+    /// The probed table on the live host, for the formats the classic corpus creates. Needs a
+    /// GPU: the zink-on-KosmicKrisp environment on Darwin, Mesa's own on Linux.
     #[test]
-    #[ignore = "needs the zink-on-KosmicKrisp environment"]
     fn the_host_table_for_the_corpus_formats() {
+        let _display = crate::vrend::one_display_at_a_time();
         struct Discard;
         impl crate::fence::FenceSink for Discard {
             fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}

@@ -912,14 +912,12 @@ mod tests {
     }
 
     /// A GLES 3.1 context on the surfaceless display, and the whole 3.1 core resolved through
-    /// it. What it needs is a GPU with a surfaceless EGL: on Darwin that is the
-    /// zink-on-KosmicKrisp stack, with `VK_ICD_FILENAMES` at the KK ICD and
-    /// `MESA_LOADER_DRIVER_OVERRIDE=zink` the way `harness/replay/vkr-replay.sh` sets them; on a
-    /// Linux host with Mesa it is nothing at all. Opted into either way, because `cargo test`
-    /// is not promised a GPU.
+    /// it. Needs a GPU with a surfaceless EGL: on Darwin that is the zink-on-KosmicKrisp stack,
+    /// with `VK_ICD_FILENAMES` at the KK ICD and `MESA_LOADER_DRIVER_OVERRIDE=zink` the way
+    /// `harness/replay/vkr-replay.sh` sets them; on a Linux host with Mesa it is nothing at all.
     #[test]
-    #[ignore = "needs a GPU with surfaceless EGL"]
     fn a_gles_31_context_comes_up_surfaceless() {
+        let _display = crate::vrend::one_display_at_a_time();
         let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
         assert!(winsys.version() >= Version { major: 1, minor: 4 });
         assert!(
@@ -958,15 +956,11 @@ mod tests {
     /// allocation and are reached separately, so if the driver will not take the plane
     /// attributes there is nothing above this that can work. It asks the driver rather than
     /// asserting the attribute values, because the values are only right if Mesa agrees.
-    ///
-    /// Run it on its own (`--lib each_plane_of -- --ignored`): two displays opened in one
-    /// process leave this driver unable to make a shared context, so the ignored tests in this
-    /// module fail each other when run together.
     #[test]
-    #[ignore = "needs the zink-on-KosmicKrisp environment"]
     fn each_plane_of_a_planar_surface_imports_as_its_own_image() {
         use crate::surface::{PlanarFormat, Surface};
 
+        let _display = crate::vrend::one_display_at_a_time();
         let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
         let surface: Arc<dyn Held> =
             Arc::new(Surface::planar(64, 64, PlanarFormat::BiPlanar420).expect("a planar surface"));
@@ -1002,7 +996,6 @@ mod tests {
     /// between EGL and Metal, both images are plane 0 and the chroma read returns the luma
     /// pattern.
     #[test]
-    #[ignore = "needs the zink-on-KosmicKrisp environment"]
     fn a_plane_image_samples_the_plane_it_asked_for() {
         use super::super::gl::Gl;
         use super::super::gl::gles::{
@@ -1010,6 +1003,8 @@ mod tests {
             GL_TEXTURE_2D, GL_UNSIGNED_BYTE,
         };
         use crate::surface::{PlanarFormat, Surface};
+
+        let _display = crate::vrend::one_display_at_a_time();
 
         const LUMA_BYTE: u8 = 0x10;
         const CHROMA_BYTE: u8 = 0x80;
