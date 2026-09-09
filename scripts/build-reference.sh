@@ -38,7 +38,15 @@ export PKG_CONFIG_PATH="$EPOXY_PREFIX/lib/pkgconfig:$MESA_PREFIX/lib/pkgconfig:$
 # renderer that shipped rather than from a differently-built one: venus and vrend in one process
 # (render-server-mode=thread), EGL platform, the VideoToolbox-backed video path, and the Vulkan
 # library linked rather than dlopened by bare soname.
-meson setup "$([ -d "$BUILD" ] && echo --reconfigure)" "$BUILD" "$SRC" \
+# Unquoted on purpose: empty must expand to no argument at all. Quoted, a first build passes
+# meson an empty string, which it takes for the build directory and then rejects the source
+# tree as an extra -- so this only ever worked where a build directory already existed.
+RECONFIGURE=
+if [ -d "$BUILD" ]; then
+    RECONFIGURE=--reconfigure
+fi
+# shellcheck disable=SC2086
+meson setup $RECONFIGURE "$BUILD" "$SRC" \
     -Dvenus=true \
     -Dvideo=true \
     -Dvulkan-dload=false \
