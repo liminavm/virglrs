@@ -120,33 +120,66 @@ fn vrend_formats(manifest: &std::path::Path) {
 /// through epoxy's bare-soname dlopen, which is what costs the worker its
 /// `DYLD_FALLBACK_LIBRARY_PATH` and the entitlement to keep it.
 ///
-/// Found through pkg-config (`egl`), or `EGL_LIB_DIR`, or the zink-on-KosmicKrisp prefix limina
+/// Found through `EGL_LIB_DIR`, or pkg-config (`egl`), or the zink-on-KosmicKrisp prefix limina
 /// itself defaults to (`MESA_PREFIX`), in that order.
 fn link_egl() {
     println!("cargo::rerun-if-env-changed=EGL_LIB_DIR");
     println!("cargo::rerun-if-env-changed=MESA_PREFIX");
 
-    let dir = if let Ok(dir) = std::env::var("EGL_LIB_DIR") {
-        Some(dir)
-    } else {
-        let out = Command::new("pkg-config").args(["--libs-only-L", "egl"]).output();
-        out.ok().filter(|o| o.status.success()).and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .split_whitespace()
-                .find_map(|f| f.strip_prefix("-L").map(str::to_string))
-        })
-    };
-    let dir = dir.unwrap_or_else(|| {
-        let prefix = std::env::var("MESA_PREFIX")
-            .unwrap_or_else(|_| "/Volumes/mesa-cs/zink-kk-prefix".to_string());
-        format!("{prefix}/lib")
-    });
-    assert!(
-        std::path::Path::new(&dir).join("libEGL.dylib").exists(),
-        "no libEGL.dylib under {dir}; point EGL_LIB_DIR or MESA_PREFIX at a Mesa prefix"
-    );
-    println!("cargo::rustc-link-search=native={dir}");
+    match egl_search() {
+        EglSearch::Dir(dir) => {
+            let lib = egl_lib_name();
+            assert!(
+                std::path::Path::new(&dir).join(&lib).exists(),
+                "no {lib} under {dir}; point EGL_LIB_DIR or MESA_PREFIX at a Mesa prefix"
+            );
+            println!("cargo::rustc-link-search=native={dir}");
+        }
+        EglSearch::LinkerDefault => {}
+    }
     println!("cargo::rustc-link-lib=dylib=EGL");
+}
+
+/// What the linker has to be told in order to find libEGL.
+///
+/// The two answers are not a directory and the absence of one: "it is already on the linker's
+/// path" is a positive answer, and collapsing it into `None` is what made a distro install
+/// indistinguishable from a missing Mesa. A prefix build says `Dir`, a distro install says
+/// `LinkerDefault`, and only the first has a path worth checking.
+enum EglSearch {
+    /// A directory that must hold the library, and goes on the link search path.
+    Dir(String),
+    /// pkg-config knows the package and named no `-L`: the library sits where the linker already
+    /// looks. Naming a directory here would be inventing one.
+    LinkerDefault,
+}
+
+/// The link-time filename of libEGL for the *target*, which is not necessarily this host.
+///
+/// `-lEGL` resolves through the development symlink, so this is the name the linker will open --
+/// checking for the versioned `.so.1` would pass on a host that cannot actually link.
+fn egl_lib_name() -> String {
+    // Set by cargo for the target being built; a build script's own `cfg!` describes the host.
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let ext = if os == "macos" { "dylib" } else { "so" };
+    format!("libEGL.{ext}")
+}
+
+fn egl_search() -> EglSearch {
+    if let Ok(dir) = std::env::var("EGL_LIB_DIR") {
+        return EglSearch::Dir(dir);
+    }
+    let out = Command::new("pkg-config").args(["--libs-only-L", "egl"]).output();
+    if let Some(out) = out.ok().filter(|o| o.status.success()) {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return match stdout.split_whitespace().find_map(|f| f.strip_prefix("-L")) {
+            Some(dir) => EglSearch::Dir(dir.to_string()),
+            None => EglSearch::LinkerDefault,
+        };
+    }
+    let prefix = std::env::var("MESA_PREFIX")
+        .unwrap_or_else(|_| "/Volumes/mesa-cs/zink-kk-prefix".to_string());
+    EglSearch::Dir(format!("{prefix}/lib"))
 }
 
 /// Link the Khronos loader.
