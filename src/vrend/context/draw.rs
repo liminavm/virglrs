@@ -12,6 +12,15 @@
 
 use super::*;
 
+/// Where the current program sits in a sub-context's program list.
+///
+/// Resolving it is a linear scan for a serial, and the six binders below each asked for the
+/// program once per stage -- around thirty scans per draw, all answering a question settled before
+/// the first of them ran. The pass resolves one of these and hands it down. It is deliberately not
+/// a bare `usize`: [`SubContext::program_at`] is the only way to spend one, and it checks.
+#[derive(Clone, Copy, Debug)]
+pub struct ProgramSlot(usize);
+
 /// `sysval_uniform_block`: what the shaders read through the `VirglBlock` uniform block, laid
 /// out as std140 lays it out -- every array element on sixteen bytes.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -416,9 +425,30 @@ impl SubContext {
         self.programs.iter().find(|p| p.serial == serial)
     }
 
-    fn program_mut(&mut self) -> Option<&mut LinkedProgram> {
+    /// Where the current program sits, resolved once for a whole bind pass.
+    fn program_slot(&self) -> Option<ProgramSlot> {
         let serial = self.prog?;
-        self.programs.iter_mut().find(|p| p.serial == serial)
+        self.programs.iter().position(|p| p.serial == serial).map(ProgramSlot)
+    }
+
+    /// The program a slot names.
+    ///
+    /// The assert is the point of the type. A slot is resolved once and handed to every binder in
+    /// the pass, which is what removes the scans -- and a slot that has stopped naming the current
+    /// program would not fail, it would bind another program's uniform locations and draw. That is
+    /// a host invariant, so it aborts here rather than reaching the screen; the cost is one integer
+    /// compare against the scan it replaces.
+    fn program_at(&self, at: ProgramSlot) -> &LinkedProgram {
+        let prog = &self.programs[at.0];
+        assert_eq!(Some(prog.serial), self.prog, "a program slot outlived the program it named");
+        prog
+    }
+
+    /// The program a slot names, to write to. Checked as [`SubContext::program_at`] is.
+    fn program_at_mut(&mut self, at: ProgramSlot) -> &mut LinkedProgram {
+        let prog = &mut self.programs[at.0];
+        assert_eq!(Some(prog.serial), self.prog, "a program slot outlived the program it named");
+        prog
     }
 
     /// The current variant of each bound graphics stage, compiled -- `None` for a stage that
@@ -914,18 +944,15 @@ impl Context {
 
     /// `vrend_draw_bind_ubo_shader`.
     fn draw_bind_ubo(
-        &mut self,
+        sub: &mut SubContext,
         host: &mut Host<'_>,
+        at: ProgramSlot,
         stage: ShaderStage,
         mut next_ubo_id: BindingPoint,
     ) -> BindingPoint {
         let gl = host.gl;
         let s = stage.index();
-        let sub = self.sub_mut();
-        let Some(prog) = sub.program() else {
-            return next_ubo_id;
-        };
-        let mut mask = prog.ubo_used_mask[s];
+        let mut mask = sub.program_at(at).ubo_used_mask[s];
         // The decoder refuses an index past the mask, so every key is a slot it holds.
         let mut used = Dirty::none();
         for slot in sub.ubos[s].keys() {
@@ -968,15 +995,19 @@ impl Context {
     const MAX_BRIDGED_CONSTS: usize = 64;
 
     /// `vrend_draw_bind_const_shader`: the inline constants, as one `uvec4` array uniform.
-    fn draw_bind_const(&mut self, host: &mut Host<'_>, stage: ShaderStage, new_program: bool) {
+    fn draw_bind_const(
+        sub: &mut SubContext,
+        host: &mut Host<'_>,
+        at: ProgramSlot,
+        stage: ShaderStage,
+        new_program: bool,
+    ) {
         let gl = host.gl;
         let s = stage.index();
-        let sub = self.sub_mut();
-        let Some(prog) = sub.program() else {
-            return;
-        };
+        let prog = sub.program_at(at);
         let num_consts = prog.num_consts[s];
-        if let Some(loc) = prog.const_location[s]
+        let const_location = prog.const_location[s];
+        if let Some(loc) = const_location
             && !sub.consts[s].is_empty()
             && sub.shaders[s].is_some()
             && (sub.const_dirty[s] || new_program)
@@ -987,7 +1018,7 @@ impl Context {
         } else if sub.consts[s].is_empty()
             && let Some(loc) = prog.const_location[s]
             && sub.shaders[s].is_some()
-            && (1..=Self::MAX_BRIDGED_CONSTS).contains(&num_consts)
+            && (1..=Context::MAX_BRIDGED_CONSTS).contains(&num_consts)
             && let Some(&Ubo { resource, offset, length }) = sub.ubos[s].get(&0)
         {
             // Constant buffer 0 delivered as a resource, feeding a shader that reads plain
@@ -1041,8 +1072,9 @@ impl Context {
 
     /// `vrend_draw_bind_samplers_shader`.
     fn draw_bind_samplers(
-        &mut self,
+        sub: &mut SubContext,
         host: &mut Host<'_>,
+        at: ProgramSlot,
         stage: ShaderStage,
         mut next_sampler_id: TextureUnit,
     ) -> TextureUnit {
@@ -1056,10 +1088,7 @@ impl Context {
         // desktop: the single largest avoidable cost in it, and all of it paid to satisfy a borrow
         // that was never in conflict. The C reaches its equivalents through a pointer
         // (`vrend_renderer.c:5795,5816`) for the same reason.
-        let sub = self.sub();
-        let Some(prog) = sub.program() else {
-            return next_sampler_id;
-        };
+        let prog = sub.program_at(at);
         let dirty = sub.views_dirty[s];
         let mut mask = prog.samplers_used_mask[s];
         let shadow_mask = prog.shadow_samp_mask[s];
@@ -1165,7 +1194,6 @@ impl Context {
             sampler_index += 1;
             next_sampler_id = next_sampler_id.next();
         }
-        let sub = self.sub_mut();
         let tl = &mut sub.texture_levels[s];
         if tl.len() < sampler_index {
             tl.resize(sampler_index, 0);
@@ -1183,16 +1211,13 @@ impl Context {
     }
 
     /// `vrend_draw_bind_ssbo_shader`.
-    fn draw_bind_ssbo(&mut self, host: &mut Host<'_>, stage: ShaderStage) {
+    fn draw_bind_ssbo(sub: &SubContext, host: &mut Host<'_>, at: ProgramSlot, stage: ShaderStage) {
         let gl = host.gl;
         if !host.has(Feature::ssbo) {
             return;
         }
         let s = stage.index();
-        let sub = self.sub();
-        let Some(prog) = sub.program() else {
-            return;
-        };
+        let prog = sub.program_at(at);
         let offset = prog.ssbo_binding_offset[s];
         let prog_mask = prog.ssbo_used_mask[s];
         for (&i, ssbo) in &sub.ssbos[s] {
@@ -1214,12 +1239,12 @@ impl Context {
     }
 
     /// `vrend_draw_bind_abo_shader`.
-    fn draw_bind_abo(&mut self, host: &mut Host<'_>) {
+    fn draw_bind_abo(sub: &SubContext, host: &mut Host<'_>) {
         let gl = host.gl;
         if !host.has(Feature::atomic_counters) {
             return;
         }
-        for (&i, abo) in &self.sub().abos {
+        for (&i, abo) in &sub.abos {
             if let Some(res) = host.bound_resource(abo.resource)
                 && let Storage::Buffer { name, .. } = res.storage
             {
@@ -1235,15 +1260,17 @@ impl Context {
     }
 
     /// `vrend_draw_bind_images_shader`.
-    fn draw_bind_images(&mut self, host: &mut Host<'_>, stage: ShaderStage) {
+    fn draw_bind_images(
+        sub: &SubContext,
+        host: &mut Host<'_>,
+        at: ProgramSlot,
+        stage: ShaderStage,
+    ) {
         let gl = host.gl;
         let features = host.features;
         let formats = host.formats;
         let s = stage.index();
-        let sub = self.sub();
-        let Some(prog) = sub.program() else {
-            return;
-        };
+        let prog = sub.program_at(at);
         if sub.images[s].is_empty() || prog.img_locs[s].is_empty() || !features.has(Feature::images)
         {
             return;
@@ -1324,13 +1351,11 @@ impl Context {
     }
 
     /// `vrend_fill_sysval_uniform_block`.
-    fn fill_sysval_uniform_block(&mut self, host: &mut Host<'_>) {
+    fn fill_sysval_uniform_block(&mut self, host: &mut Host<'_>, at: ProgramSlot) {
         let gl = host.gl;
         let sub = self.sub_mut();
         let generation = sub.sysval.generation();
-        let Some(prog) = sub.program() else {
-            return;
-        };
+        let prog = sub.program_at(at);
         if prog.virgl_block_bind.is_none() || prog.sysval_uploaded == Some(generation) {
             return;
         }
@@ -1340,44 +1365,38 @@ impl Context {
         gl.bind_buffer(GL_UNIFORM_BUFFER, Some(buf));
         gl.buffer_sub_data(GL_UNIFORM_BUFFER, 0, &bytes);
         gl.bind_buffer(GL_UNIFORM_BUFFER, None);
-        sub.program_mut()
-            .expect("the program that was just bound is still bound")
-            .sysval_uploaded = Some(generation);
+        sub.program_at_mut(at).sysval_uploaded = Some(generation);
     }
 
     /// `vrend_draw_bind_objects`.
-    fn draw_bind_objects(&mut self, host: &mut Host<'_>, new_program: bool) {
+    fn draw_bind_objects(&mut self, host: &mut Host<'_>, at: ProgramSlot, new_program: bool) {
         let gl = host.gl;
-        let Some(prog) = self.sub().program() else {
-            return;
-        };
-        let last = prog.last_stage;
+        // The pass's other question -- which sub-context -- is answered once here too. Each binder
+        // used to ask both again, per stage.
+        let sub = self.sub_mut();
+        let last = sub.program_at(at).last_stage;
         let mut next_ubo_id = BindingPoint::FIRST;
         let mut next_sampler_id = TextureUnit::FIRST;
         for stage in C_STAGE_ORDER {
             if stage.index() > last.index() {
                 continue;
             }
-            next_ubo_id = self.draw_bind_ubo(host, stage, next_ubo_id);
-            self.draw_bind_const(host, stage, new_program);
-            next_sampler_id = self.draw_bind_samplers(host, stage, next_sampler_id);
-            self.draw_bind_images(host, stage);
-            self.draw_bind_ssbo(host, stage);
-            let sub = self.sub();
-            if let Some(prog) = sub.program()
-                && let Some(loc) = prog.tex_levels_uniform_id[stage.index()]
-            {
+            next_ubo_id = Self::draw_bind_ubo(sub, host, at, stage, next_ubo_id);
+            Self::draw_bind_const(sub, host, at, stage, new_program);
+            next_sampler_id = Self::draw_bind_samplers(sub, host, at, stage, next_sampler_id);
+            Self::draw_bind_images(sub, host, at, stage);
+            Self::draw_bind_ssbo(sub, host, at, stage);
+            if let Some(loc) = sub.program_at(at).tex_levels_uniform_id[stage.index()] {
                 gl.uniform_1iv(loc, &sub.texture_levels[stage.index()]);
             }
         }
-        let sub = self.sub();
-        if let Some(prog) = sub.program()
-            && let Some(bind) = prog.virgl_block_bind
+        let prog = sub.program_at(at);
+        if let Some(bind) = prog.virgl_block_bind
             && let Some(buf) = prog.sysval_buffer
         {
             gl.bind_buffer_range(GL_UNIFORM_BUFFER, bind, buf, 0, Sysval::SIZE);
         }
-        self.draw_bind_abo(host);
+        Self::draw_bind_abo(sub, host);
     }
 
     /// `vrend_draw_bind_vertex_binding`: the bound layout's VAO, and the vertex buffers when
@@ -1494,9 +1513,14 @@ impl Context {
             new_program = self.select_linked_program(host, cmd)?;
         }
         // The C drops the draw with a warning; a draw with nothing to run it is a fault here.
-        let Some(prog) = self.sub().program() else {
+        // Resolved once for the whole draw: `select_linked_program` above is the last thing that
+        // can move the program list, and everything below is handed the slot rather than asking
+        // again.
+        let sub = self.sub();
+        let Some(at) = sub.program_slot() else {
             return Err(Fault::Shader { cmd, what: "a draw with no program" });
         };
+        let prog = sub.program_at(at);
         let prog_id = prog.id;
         let reads_drawid = prog.reads_drawid;
         let fs_blend_advanced = prog.fs_blend_equation_advanced;
@@ -1513,8 +1537,8 @@ impl Context {
             }
         }
 
-        self.draw_bind_objects(host, new_program);
-        self.fill_sysval_uniform_block(host);
+        self.draw_bind_objects(host, at, new_program);
+        self.fill_sysval_uniform_block(host, at);
         self.draw_bind_vertex_binding(host);
 
         let mut index_type = GL_UNSIGNED_INT;
