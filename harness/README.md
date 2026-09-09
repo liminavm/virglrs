@@ -96,6 +96,9 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   back; it scores them through a draw (see `fixtures/sampled.score` below).
 - `make-surface-corpus.py` — writes a synthetic classic corpus that destroys a surface the
   framebuffer is still drawing through (see `fixtures/surface.score` below).
+- `make-teardown-corpus.py` — writes a synthetic classic corpus that destroys a program and a
+  sub-context while the renderer still holds them (see `fixtures/teardown.score` below).
+  `--no-destroy` writes the arming control.
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
   then the whole stream in execution order through the limina replay ABI, and scores the result.
@@ -681,6 +684,52 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   it, and a clear must already know its colour fixup rather than ask a resource that is no longer
   there. Still unmeasured: *re-binding* a surface whose resource was freed, which the C serves from
   its refcount and this tree refuses.
+
+  `teardown.score` gates two lifetimes a real guest reaches constantly and no oracle here was
+  watching: a program destroyed out from under the one that is bound, and a sub-context destroyed
+  while it is current. Mesa gives every `pipe_context` its own sub-context and destroys it on
+  teardown, and every shader state deletion encodes `DESTROY_OBJECT`/`SHADER`, so every recorded
+  corpus and every boot test drives both paths — many times over. **Reaching a path is not
+  exercising its invariant.** What none of them selects for is the ORDERING that makes a wrong
+  answer visible, and without it a renderer that mishandles either one draws something plausible.
+
+  So the corpus builds the ordering deliberately. Three programs are linked in stream order by
+  drawing once through each of three fragment shaders, each writing its own constant colour; the
+  MIDDLE one is then bound, and the FIRST one's shader destroyed. Destroying a program shifts
+  every program after it down one, so a renderer holding a bare index now names the program that
+  was *after* the bound one — `res=13` is the draw that follows, with nothing rebound, and it must
+  carry the middle colour. The middle slot is the whole design: with two programs a stale index
+  runs off the end and crashes, and a crash is the easy half to get right. A bound shader would
+  not do either — its slot takes ownership and the programs are never released, so the corpus
+  destroys an unbound one.
+
+  Its second case makes a second sub-context current, gives it its own shaders (objects are
+  per-sub, so it shares nothing), and destroys it while it is current. `res=15` is drawn
+  afterwards with nothing bound at all, so what it carries is whatever sub-context 0 still held —
+  which says both that 0 came back and that its state came back with it.
+
+  **The corpus is armed, and that is recorded here because a corpus that stops covering its gate
+  reads exactly like one that passes.** `--no-destroy` establishes the property the score leans
+  on: the three programs' colours land as three distinct hashes (`res=10`, `11`, `12`), so
+  "drew the wrong program" is a different hash and not an invisible one. It is not a differential
+  — a correct renderer scores both arms identically, because the draw after the destroy carries
+  the middle colour either way. What proves the gate live is removing the two fixes and watching
+  it fail: without the index shift the replay aborts on `a program slot outlived the program it
+  named`, and without the sub-context retire `res=15` comes back carrying the second
+  sub-context's colour, **exit 0 and no error line** — a silent wrong answer, which is the class
+  this corpus exists for.
+
+  Replay it as `./vrend-replay.sh ../vm/captures/teardown.bin --renderer rs --ctx 1 --expect
+  fixtures/teardown.score --rebuild-expect fixtures/teardown.rebuild`. The corpus holds one
+  context, so `--ctx 1` is what it would pick anyway; it is written out because a score recorded
+  under a different selection is not this gate.
+
+  `teardown.score` is the C's, recorded from `--renderer c` and byte-identical to the Rust leg's
+  — so unlike `sampled.score` this one carries no deviation. Its `.rebuild` pin is necessarily
+  the Rust leg's, because the snapshot-journal gate runs only under `--renderer rs`. That pin
+  holds a rebuild that loses nothing, which is not why the other two exist: it is here because
+  the journal walks the sub-contexts, so a corpus that creates and destroys one is where a
+  wrong walk would show.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).
@@ -722,7 +771,7 @@ a corpus under `vm/captures/` is absent, so a fresh checkout runs the suite with
 a path anywhere else keeps the plain "no such file", because a typo should not become a download.
 `--list` and `--verify` answer what is present and whether it is still the pinned bytes.
 
-The three synthetic corpora are not hosted at all. `make-blit-corpus.py` and its two siblings are
+The four synthetic corpora are not hosted at all. `make-blit-corpus.py` and its three siblings are
 deterministic — measured 2026-09-08, two runs of each reproduce the stored file byte for byte — so
 the manifest records the generator and fetching one runs it.
 
