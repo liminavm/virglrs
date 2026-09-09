@@ -129,9 +129,37 @@ fn errno(e: renderer::Error) -> c_int {
     }
 }
 
+/// What `virgl_renderer_init` was called with, kept only to answer a second call.
+///
+/// Addresses, not pointers. The C compares these three for identity and never reads through them
+/// on the second call, and storing them as integers is how this says so -- there is no lifetime
+/// here to get wrong, because there is nothing to dereference.
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct InitArgs {
+    cookie: usize,
+    flags: c_int,
+    cbs: usize,
+}
+
+impl InitArgs {
+    fn new(cookie: *mut c_void, flags: c_int, cbs: *mut Callbacks) -> Self {
+        InitArgs { cookie: cookie as usize, flags, cbs: cbs as usize }
+    }
+}
+
+/// The initialized renderer and the arguments that produced it.
+///
+/// One value, not two: the ABI's answer to a second `virgl_renderer_init` is a comparison against
+/// what the first one was given, so the renderer's existence and those arguments' existence are
+/// the same fact. Kept in separate containers they could disagree.
+struct Client {
+    renderer: Renderer,
+    init: InitArgs,
+}
+
 /// THE global. See the module docs -- one static, one owned root, nothing else.
-fn root() -> &'static Mutex<Option<Renderer>> {
-    static ROOT: OnceLock<Mutex<Option<Renderer>>> = OnceLock::new();
+fn root() -> &'static Mutex<Option<Client>> {
+    static ROOT: OnceLock<Mutex<Option<Client>>> = OnceLock::new();
     ROOT.get_or_init(|| Mutex::new(None))
 }
 
@@ -139,7 +167,7 @@ fn root() -> &'static Mutex<Option<Renderer>> {
 fn with<T>(err: T, f: impl FnOnce(&mut Renderer) -> T) -> T {
     let mut g = root().lock().expect("the renderer lock is never held across a panic");
     match g.as_mut() {
-        Some(r) => f(r),
+        Some(c) => f(&mut c.renderer),
         None => err,
     }
 }
@@ -153,6 +181,15 @@ const ENOMEM: c_int = -libc::ENOMEM;
 /// No such thing here -- distinct from `EINVAL`, which says the caller asked wrongly. A context
 /// this renderer does not serve is a fair question with a negative answer.
 const ENOENT: c_int = -libc::ENOENT;
+/// A second `virgl_renderer_init` asking for something other than what the first one got.
+const EBUSY: c_int = -libc::EBUSY;
+
+/// `virgl_renderer_init`'s answer to callbacks it will not accept.
+///
+/// A bare -1 and deliberately not an errno: the C returns this literal, a VMM tests against it,
+/// and the ABI's job here is to be the C's answer rather than a tidier one. It is the single
+/// exception in this file, which is why it is named rather than written inline.
+const EBADCALLBACKS: c_int = -1;
 
 /// A symbol that belongs to a phase this build has not reached.
 ///
@@ -174,8 +211,19 @@ pub extern "C" fn virgl_renderer_init(
     flags: c_int,
     cb: *mut Callbacks,
 ) -> c_int {
+    let mut g = root().lock().expect("the renderer lock is never held across a panic");
+
+    // A second init is answered by comparing what the first one was given, and that comparison
+    // comes before the callbacks are looked at, as in the C. The ABI has no renderer handle, so
+    // "initialize again" is the only way a caller can ask whether it already did: the same three
+    // arguments mean it is asking for the renderer it already has, and get it. Anything else is
+    // two callers disagreeing about one global, which is EBUSY and not a validation failure.
+    if let Some(client) = g.as_ref() {
+        return if client.init == InitArgs::new(cookie, flags, cb) { 0 } else { EBUSY };
+    }
+
     if cb.is_null() {
-        return EINVAL;
+        return EBADCALLBACKS;
     }
     // `Callbacks` is size-versioned: the VMM allocates only the prefix its `version` names, so the
     // struct in front of us is shorter than ours whenever it was built against an older header --
@@ -188,13 +236,20 @@ pub extern "C" fn virgl_renderer_init(
     // is initialised and whose allocation covers that version's prefix, for the duration of the
     // call. `version` is at offset 0, inside every version.
     let version = unsafe { (&raw const (*cb).version).read() };
-    if version < 3 {
-        // v3 introduced write_context_fence, without which venus fences cannot retire at all.
-        return EINVAL;
-    }
-    let mut g = root().lock().expect("the renderer lock is never held across a panic");
-    if g.is_some() {
-        return EINVAL;
+    // Both ends of the range, and they are refused for opposite reasons.
+    //
+    // Below 3 is this renderer's own floor: v3 introduced write_context_fence, without which
+    // venus fences cannot retire at all. The C accepts v1, so this is a deliberate deviation --
+    // serving a caller whose fences can never retire is worse than refusing it at the door.
+    //
+    // Above `CALLBACKS_VERSION` is a contract this build has never seen. Reading it is
+    // memory-safe, since a newer caller's struct is longer and not shorter -- but every field
+    // below is read on the assumption that a version we recognise says what those fields mean,
+    // and a version we do not recognise makes that an assumption about a header we have not
+    // read. Accepting it claims an understanding we do not have, and the failure would surface
+    // as a fence delivered to the wrong callback rather than as a refusal here.
+    if !(3..=abi::CALLBACKS_VERSION).contains(&version) {
+        return EBADCALLBACKS;
     }
     eprintln!(
         "[virglrs] init flags={flags:#x} -- {}",
@@ -213,8 +268,8 @@ pub extern "C" fn virgl_renderer_init(
         }
     };
     match Renderer::new(Box::new(sink), config_of(flags)) {
-        Ok(r) => {
-            *g = Some(r);
+        Ok(renderer) => {
+            *g = Some(Client { renderer, init: InitArgs::new(cookie, flags, cb) });
             0
         }
         Err(e) => {
@@ -615,7 +670,7 @@ pub extern "C" fn virgl_renderer_resource_import_blob(args: *const ImportBlobArg
     // value constructed before the call and dropped after it -- and dropping this one would close
     // a descriptor the caller still owns.
     let mut g = root().lock().expect("the renderer lock is never held across a panic");
-    let Some(r) = g.as_mut() else {
+    let Some(r) = g.as_mut().map(|c| &mut c.renderer) else {
         return_fd(fd, a.fd);
         return EINVAL;
     };
@@ -1897,6 +1952,75 @@ const _ABI_ANCHORS: c_int = abi::CALLBACKS_VERSION;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn callbacks(version: c_int) -> Callbacks {
+        Callbacks {
+            version,
+            write_fence: None,
+            create_gl_context: None,
+            destroy_gl_context: None,
+            make_current: None,
+            get_drm_fd: None,
+            write_context_fence: None,
+            get_server_fd: None,
+            get_egl_display: None,
+        }
+    }
+
+    /// `virgl_renderer_init` refuses a callbacks version outside the window it can read, at BOTH
+    /// ends, and says so the way the C header does.
+    ///
+    /// The upper bound is the one that was missing, and its absence was not a wrong error code:
+    /// a caller declaring a version this build has never seen was ACCEPTED and the renderer
+    /// initialized, because the only check was a floor. Every field read afterwards assumes a
+    /// recognised version says what those fields mean.
+    ///
+    /// Reachable without a GPU precisely because every case here returns before the renderer is
+    /// built -- which is also why none of them leaves an initialized renderer behind for the
+    /// other tests in this process.
+    ///
+    /// The C's tests reach the same three cases (`virgl_init_no_cbs`, `virgl_init_no_cookie`,
+    /// `virgl_init_cbs_wrong_ver` in `harness/ctests`) and stop there: everything after them
+    /// hands init a v1 struct, which this renderer deviates from the C by refusing.
+    #[test]
+    fn init_refuses_a_callbacks_version_it_cannot_read() {
+        let mut cookie = 0u32;
+        let cookie = (&raw mut cookie).cast::<c_void>();
+
+        assert_eq!(
+            virgl_renderer_init(cookie, 0, core::ptr::null_mut()),
+            EBADCALLBACKS,
+            "no callbacks at all"
+        );
+
+        // Below the floor: v3 brought write_context_fence, without which venus fences never
+        // retire. The C accepts these; refusing them is a deliberate deviation.
+        // Above the ceiling: a header this build has not read.
+        for version in [c_int::MIN, 0, 1, 2, abi::CALLBACKS_VERSION + 1, 99, c_int::MAX] {
+            let mut cbs = callbacks(version);
+            assert_eq!(
+                virgl_renderer_init(cookie, 0, &raw mut cbs),
+                EBADCALLBACKS,
+                "version {version} must be refused"
+            );
+        }
+    }
+
+    /// A rejected init leaves nothing behind, so the next caller is not told the renderer exists.
+    ///
+    /// This is the half that made one missing bound cost 200 assertions rather than one: the
+    /// refusal and the global are the same decision, and a version check that ran after the
+    /// renderer was built would refuse the caller and keep the renderer.
+    #[test]
+    fn a_refused_init_leaves_no_renderer() {
+        let mut cookie = 0u32;
+        let cookie = (&raw mut cookie).cast::<c_void>();
+        let mut cbs = callbacks(abi::CALLBACKS_VERSION + 1);
+        assert_eq!(virgl_renderer_init(cookie, 0, &raw mut cbs), EBADCALLBACKS);
+
+        // `with` answers with its error only while the root is empty.
+        assert_eq!(with(EINVAL, |_| 0), EINVAL, "a refused init must not have initialized");
+    }
 
     /// Import accepts exactly the `blob_mem` and `fd_type` values the C accepts, and no others.
     ///
