@@ -1040,6 +1040,12 @@ VP9-TEST-VECTORS is on `storage.googleapis.com` and has none of this.
 A leg is a whole boot — stock guest, all complete suites, poweroff — and costs about 75 seconds
 for the 305 VP9 vectors, so this is per-commit work rather than nightly.
 
+**The gate is armed**: inverting the VP9 key-frame flag in `src/vrend/video/mod.rs` takes the rs
+leg from 212/305 to **1/305**, and reverting brings it back. The pin currently covers
+VP9-TEST-VECTORS alone, because the ITU suites were still downloading when it was recorded —
+a whole suite appearing in the pin diff is that, and wants a re-record rather than an
+investigation.
+
 ### The rig's two legs are built differently, and not by choice
 
 **limina compiles virglrs in.** rutabaga names it as a cargo *path* dependency
