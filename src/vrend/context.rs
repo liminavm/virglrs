@@ -54,7 +54,7 @@ mod draw;
 #[path = "context/select.rs"]
 mod select;
 
-pub use draw::{HwBlend, LinkedProgram, ProgramSerial, Sysval, Xfb};
+pub use draw::{HwBlend, LinkedProgram, ProgramSerial, Sysval, Tracked, Xfb};
 pub use select::{Bound, Program, Variant, VariantId};
 
 const PIPE_CLEAR_DEPTH: u32 = 1 << 0;
@@ -825,7 +825,7 @@ pub struct SubContext {
     next_variant_id: u64,
     /// The `VirglBlock` contents. Each program remembers the block it last uploaded and
     /// compares by value, so there is no second record of whether this changed.
-    sysval: Sysval,
+    sysval: Tracked<Sysval>,
     ssbos: [BTreeMap<u32, Ssbo>; ShaderStage::COUNT],
     images: [BTreeMap<u32, ImageView>; ShaderStage::COUNT],
     abos: BTreeMap<u32, Ssbo>,
@@ -894,7 +894,7 @@ impl SubContext {
             prog: None,
             next_program_serial: Cell::new(0),
             next_variant_id: 0,
-            sysval: Sysval::default(),
+            sysval: Tracked::new(Sysval::default()),
             ssbos: Default::default(),
             images: Default::default(),
             abos: BTreeMap::new(),
