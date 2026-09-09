@@ -516,6 +516,18 @@ buildable throughout as the A-side reference.
   because that is the leg the goldens were recorded on: a differential against a
   different host profile would be comparing two renderers *and* two drivers. A
   desktop-GL context is its own gated change afterwards, one differential at a time.
+  **It has a second caller now.** On Linux the embedder picks the client API, and QEMU's
+  default `-display gtk,gl=on` goes through GDK, which hands out GL 4.6 core; `gl=es`
+  does not reach it, and only `GDK_GL=gles` in the environment changes it. So the
+  default QEMU configuration on a Wayland desktop needs the desktop-GL leg, and until
+  it exists the renderer refuses a non-GLES context by name rather than reading
+  `4.6 (Core Profile)` as a plausible GLES 4.6. `-display sdl,gl=es` serves GLES with
+  no environment variable and is the out-of-the-box path that works today. Sizing, from
+  the C: 181 `use_gles` branches (90 in `vrend_renderer.c`, 72 in `vrend_shader.c`, 17
+  in `vrend_blitter.c`), a second version column on all 109 rows of `features.rs`, a
+  desktop proc table out of `gl-gen`, and the GL/GLES split in the format table. The
+  first question is how the flavour is *represented*: a `bool` threaded through 181
+  sites is the C's design and would undo what this port bought.
   **Where P3 stands.** Decode, resources, transfers, the context layer and the IOSurface
   scanout are in: sub-contexts with a GL context each, object tables, every state
   command recorded, the immediate GL the C emits on a bind, framebuffer state, clears,
