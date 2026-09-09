@@ -207,7 +207,12 @@ mod tests {
     /// This is the foreign consumer the fence exists for: `IOSurfaceLock` and a load, ordered
     /// against our GL queue by nothing at all.
     fn first_pixel_blue(s: &metal::Surface) -> u8 {
-        s.read_plane_row(0, 0).expect("the surface has a row 0")[0]
+        // `read_rows`, not `read_plane_row`: a plain surface has no *planes*, so its plane count
+        // is zero and the per-plane accessor answers `None` for every index.
+        let stride = s.bytes_per_row() as usize;
+        let mut row = vec![0u8; stride];
+        assert_eq!(s.read_rows(&mut row, stride, 1), 1, "the surface's first row reads back");
+        row[0]
     }
 
     /// A CPU reader must see the render a classic fence waited for.
@@ -251,31 +256,50 @@ mod tests {
         );
         gl.viewport(0, 0, W as GLsizei, H as GLsizei);
 
-        // A second context of the same share group, on another thread, is where the wait happens --
-        // exactly as the waiter does it.
+        // The reader thread is started and made current BEFORE any of this is timed, and it
+        // answers over a channel. That is the whole experiment: spawning a thread and binding a
+        // context costs milliseconds, which is longer than the render, so a reader that does that
+        // work after the flush finds the GPU idle whether or not it waited -- and the test would
+        // pass with the wait deleted. The only difference between the two reads below is the wait.
         let display = winsys.thread_display();
         let wait_ctx = winsys
             .create_context(Version { major: 3, minor: 1 }, Some(&ctx))
-            .expect("a shared ctx");
+            .expect("a shared context");
         let wait_gl = Gl::new(winsys.gles());
+        let seen = Arc::clone(&surface);
+        let (ask, asked) = std::sync::mpsc::channel::<(Fence, bool)>();
+        let (told, answer) = std::sync::mpsc::channel::<u8>();
+        let reader = std::thread::spawn(move || {
+            display.make_current(&wait_ctx).expect("the reader's context is current");
+            while let Ok((fence, wait)) = asked.recv() {
+                if wait {
+                    wait_out(&wait_gl, &fence);
+                }
+                wait_gl.fence_delete(fence);
+                told.send(first_pixel_blue(&seen)).expect("the asker is still listening");
+            }
+        });
 
         // Settle on black, so "stale" has a value and is not whatever the allocation held.
-        gl.clear_color([0.0, 0.0, 0.0, 1.0]);
-        gl.clear(GL_COLOR_BUFFER_BIT);
-        gl.finish();
-        assert_eq!(first_pixel_blue(&surface), 0, "the surface starts black");
-
-        // Arm the control: queue work ending in full blue and look before waiting. If the reader
-        // already sees blue the workload is too small to expose anything, so make it bigger.
-        let mut passes = FIRST_PASSES;
-        let mut unwaited = 0xff;
-        for _ in 0..5 {
+        let black = |gl: &Gl| {
             gl.clear_color([0.0, 0.0, 0.0, 1.0]);
             gl.clear(GL_COLOR_BUFFER_BIT);
             gl.finish();
+        };
+        black(&gl);
+        assert_eq!(first_pixel_blue(&surface), 0, "the surface starts black");
+
+        // Arm the control at the same point the assertion is made: the reader is told not to
+        // wait, and must come back stale. If it does not, the render is finishing before the
+        // channel round trip and this test cannot tell a wait from no wait -- so grow it.
+        let mut passes = FIRST_PASSES;
+        let mut unwaited = 0xff;
+        for _ in 0..6 {
+            black(&gl);
             queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
-            gl.flush();
-            unwaited = first_pixel_blue(&surface);
+            let fence = gl.fence().expect("the driver gives a sync object");
+            ask.send((fence, false)).expect("the reader is listening");
+            unwaited = answer.recv().expect("the reader answers");
             if unwaited != 0xff {
                 break;
             }
@@ -284,26 +308,26 @@ mod tests {
         }
         assert_ne!(
             unwaited, 0xff,
-            "could not build a render slow enough for an unwaited read to be stale, so this test \
-             cannot tell a working wait from a deleted one -- it proves nothing as written"
+            "an unwaited read came back complete at every size tried, so this test cannot tell a \
+             working wait from a deleted one -- it proves nothing as written"
         );
 
-        // Now the fence, waited the way the waiter waits it: a sync taken on the rendering
-        // context, and a wait on a different context on a different thread.
+        // Now the same thing, waited. Same thread, same context, same round trip.
+        black(&gl);
         queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
         let fence = gl.fence().expect("the driver gives a sync object");
-        // Moved, not borrowed: a GL context is `Send` and not `Sync`, because being current is a
-        // property of one thread. That is the same reason the waiter owns its context outright.
-        let seen = Arc::clone(&surface);
-        let waited = std::thread::spawn(move || {
-            display.make_current(&wait_ctx).expect("the waiter's context is current");
-            wait_out(&wait_gl, &fence);
-            wait_gl.fence_delete(fence);
-            first_pixel_blue(&seen)
-        })
-        .join()
-        .expect("the waiting thread does not panic");
+        ask.send((fence, true)).expect("the reader is listening");
+        let waited = answer.recv().expect("the reader answers");
 
+        drop(ask);
+        reader.join().expect("the reading thread does not panic");
+
+        // Printed, not judged: what the control cost to arm, so a later reader can see whether it
+        // armed easily or barely, and on what size of render.
+        eprintln!(
+            "[leg] passes={passes} unwaited=0x{unwaited:02x} waited=0x{waited:02x} \
+             (0xff is the render this fence stands for)"
+        );
         assert_eq!(
             waited, 0xff,
             "a CPU reader saw {waited:#04x} where the fence said the render had run -- the same \
