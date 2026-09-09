@@ -74,12 +74,7 @@ impl Waiter {
     ///
     /// The context is created here, on the caller's thread, and made current on the waiter's --
     /// currency is per thread, so the two never contend for it.
-    pub fn start(
-        display: ThreadDisplay,
-        ctx: egl::Context,
-        gl: Gl,
-        sink: fence::Handle,
-    ) -> Waiter {
+    pub fn start(display: ThreadDisplay, ctx: egl::Context, gl: Gl, sink: fence::Handle) -> Waiter {
         let q =
             Arc::new((Mutex::new(Queue { jobs: VecDeque::new(), stopped: false }), Condvar::new()));
         let qt = Arc::clone(&q);
@@ -91,13 +86,7 @@ impl Waiter {
     }
 
     /// Queue a fence to retire once `fence`'s work has run.
-    pub fn retire_context(
-        &self,
-        fence: Option<Fence>,
-        ctx: ContextId,
-        ring: RingIdx,
-        id: FenceId,
-    ) {
+    pub fn retire_context(&self, fence: Option<Fence>, ctx: ContextId, ring: RingIdx, id: FenceId) {
         self.push(Job { fence, retire: Retire::Context(ctx, ring, id) });
     }
 

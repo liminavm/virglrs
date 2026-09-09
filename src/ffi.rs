@@ -1252,9 +1252,16 @@ pub extern "C" fn virgl_renderer_fill_caps(set: u32, version: u32, caps: *mut c_
 // ---------------------------------------------------------------- fences
 
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_create_fence(client_fence_id: c_int, _ctx_id: u32) -> c_int {
+pub extern "C" fn virgl_renderer_create_fence(client_fence_id: c_int, ctx_id: u32) -> c_int {
+    // The C marks this argument UNUSED and syncs on whatever context is current. It is the
+    // context whose work the fence is for, and naming it is what lets the fence be answered by
+    // waiting on that context rather than by finishing every one of them.
+    let on = match AbiCtx::new(ctx_id) {
+        AbiCtx::Context(id) => Some(id),
+        _ => None,
+    };
     with(EINVAL, |r| {
-        r.create_fence(ClientFenceId(client_fence_id as u32));
+        r.create_fence(ClientFenceId(client_fence_id as u32), on);
         0
     })
 }

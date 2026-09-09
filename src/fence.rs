@@ -52,9 +52,30 @@ struct Queue {
     stopped: bool,
 }
 
-pub struct Retirement {
+/// The queue and the thread draining it, kept alive by everyone who can still retire through it.
+///
+/// The thread is stopped and joined when the last of them goes, which is what makes it impossible
+/// to stop retirement while something can still queue a fence: a `Handle` held by the classic
+/// fence waiter keeps this alive until the waiter itself is gone, whatever order anything is
+/// declared or dropped in.
+struct Inner {
     q: Arc<(Mutex<Queue>, Condvar)>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        push(&self.q, Job::Stop);
+        if let Some(t) = self.thread.lock().expect("the thread slot is never poisoned").take() {
+            // A fence the VMM is still waiting on must not be dropped on the floor: the thread
+            // drains what is queued before it stops, and cleanup waits for that to finish.
+            let _ = t.join();
+        }
+    }
+}
+
+pub struct Retirement {
+    inner: Arc<Inner>,
 }
 
 impl Retirement {
@@ -66,40 +87,42 @@ impl Retirement {
             .name("virglrs-fence".into())
             .spawn(move || run(sink, qt))
             .expect("spawning the fence retirement thread");
-        Retirement { q, thread: Some(thread) }
+        Retirement { inner: Arc::new(Inner { q, thread: Mutex::new(Some(thread)) }) }
     }
 
     pub fn retire_context(&self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
-        push(&self.q, Job::Context(ctx, ring, fence));
+        push(&self.inner.q, Job::Context(ctx, ring, fence));
     }
 
     pub fn retire_global(&self, fence: ClientFenceId) {
-        push(&self.q, Job::Global(fence));
+        push(&self.inner.q, Job::Global(fence));
     }
 
     /// A handle for another thread to retire through.
     ///
     /// The classic fence waiter holds one: it decides *when* a fence has been answered, and this
     /// is how it says so, without owning the thread that delivers or the sink it delivers to.
-    /// Whoever holds one must be gone before this `Retirement` drops -- see [`Retirement::drop`].
+    ///
+    /// A handle keeps the retirement thread alive, so holding one is enough -- there is no order
+    /// to get right and no destroy site to remember.
     pub fn handle(&self) -> Handle {
-        Handle { q: Arc::clone(&self.q) }
+        Handle { inner: Arc::clone(&self.inner) }
     }
 }
 
 /// A way to retire a fence, for a thread that is not the one that owns [`Retirement`].
 #[derive(Clone)]
 pub struct Handle {
-    q: Arc<(Mutex<Queue>, Condvar)>,
+    inner: Arc<Inner>,
 }
 
 impl Handle {
     pub fn retire_context(&self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
-        push(&self.q, Job::Context(ctx, ring, fence));
+        push(&self.inner.q, Job::Context(ctx, ring, fence));
     }
 
     pub fn retire_global(&self, fence: ClientFenceId) {
-        push(&self.q, Job::Global(fence));
+        push(&self.inner.q, Job::Global(fence));
     }
 }
 
@@ -108,9 +131,9 @@ fn push(q: &Arc<(Mutex<Queue>, Condvar)>, job: Job) {
     let mut g = m.lock().expect("the fence queue lock is never held across a panic");
     if g.stopped {
         // Stopping twice is nothing; a *fence* arriving after the thread has gone is one the guest
-        // may still be waiting on, and returning quietly here is how it would be lost. Whoever can
-        // still push must drop before the `Retirement` does, which is what the field order in
-        // `Renderer` is for, so this cannot fire without that order being wrong.
+        // may still be waiting on, and returning quietly here is how it would be lost. Nothing can
+        // push after the stop, because the stop happens when the last thing that could push is
+        // dropped -- so this asserts that, rather than guarding against it.
         assert!(
             matches!(job, Job::Stop),
             "a fence was queued for retirement after the retirement thread stopped"
@@ -119,17 +142,6 @@ fn push(q: &Arc<(Mutex<Queue>, Condvar)>, job: Job) {
     }
     g.jobs.push_back(job);
     cv.notify_one();
-}
-
-impl Drop for Retirement {
-    fn drop(&mut self) {
-        push(&self.q, Job::Stop);
-        if let Some(t) = self.thread.take() {
-            // A fence the VMM is still waiting on must not be dropped on the floor: the thread
-            // drains what is queued before it stops, and cleanup waits for that to finish.
-            let _ = t.join();
-        }
-    }
 }
 
 fn run(mut sink: Box<dyn FenceSink>, q: Arc<(Mutex<Queue>, Condvar)>) {
@@ -173,6 +185,25 @@ mod tests {
         fn global_fence(&mut self, fence: ClientFenceId) {
             let _ = self.0.send((0, 0, fence.0 as u64));
         }
+    }
+
+    /// A holder of a `Handle` can still retire after the `Retirement` it came from is dropped.
+    ///
+    /// This is what makes the classic fence waiter safe to own from anywhere: it drains and
+    /// retires while it is being dropped, and nothing has to arrange for that to happen before
+    /// retirement stops. Written as the negative of the bug it prevents -- with the thread stopped
+    /// early, `push` asserts and this fence is never delivered.
+    #[test]
+    fn a_handle_outliving_its_retirement_still_delivers() {
+        let (tx, rx) = channel();
+        let r = Retirement::start(Box::new(Recorder(tx)));
+        let h = r.handle();
+        drop(r);
+        h.retire_global(ClientFenceId(7));
+        drop(h);
+
+        let got: Vec<_> = rx.try_iter().collect();
+        assert_eq!(got, vec![(0, 0, 7)], "a fence queued after its Retirement dropped was lost");
     }
 
     /// Dropping the renderer must not drop fences the VMM is still waiting on.

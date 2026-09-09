@@ -560,7 +560,6 @@ pub struct Renderer {
     /// VMM creates or unrefs. See the lock order in `venus::vkr`.
     resources: Arc<RwLock<BTreeMap<ResourceHandle, Resource>>>,
     contexts: BTreeMap<ContextId, Context>,
-    fences: Retirement,
     /// The host memory both arms are answerable for, and the cap on it -- see [`crate::budget`].
     /// It is the renderer's because the cap is on the process total: venus charges its
     /// allocations against it and classic its IOSurfaces, and a ledger owned by either would be
@@ -570,6 +569,10 @@ pub struct Renderer {
     venus: Option<venus::vkr::Vkr>,
     /// The classic renderer, likewise.
     vrend: Option<vrend::vrend::Vrend>,
+    /// Retirement outlives whoever can still retire through it, including the classic fence waiter
+    /// `vrend` owns -- a `fence::Handle` keeps the thread alive, so the order these fields are
+    /// declared or dropped in does not decide whether a fence in flight is delivered.
+    fences: Retirement,
 }
 
 impl Renderer {
@@ -594,16 +597,20 @@ impl Renderer {
         if std::env::var_os("LIMINA_READBACK_TRACE").is_some() {
             eprintln!("[virglrs] readback trace armed: blank scanout readbacks will be named");
         }
-        let vrend =
-            if config.vrend { Some(vrend::vrend::Vrend::new(config, &budget)?) } else { None };
+        let fences = Retirement::start(fences);
+        let vrend = if config.vrend {
+            Some(vrend::vrend::Vrend::new(config, &budget, fences.handle())?)
+        } else {
+            None
+        };
         Ok(Renderer {
             config,
             resources: Arc::clone(&resources),
             contexts: BTreeMap::new(),
-            fences: Retirement::start(fences),
             venus: config.venus.then(|| venus::vkr::Vkr::new(config, resources.clone(), &budget)),
             budget,
             vrend,
+            fences,
         })
     }
 
@@ -1062,44 +1069,28 @@ impl Renderer {
         };
         c.last_fence.insert(ring, fence);
         // A venus fence carries its waits inside the command stream, so reaching here is already
-        // its answer. A classic one does not: see `finish_classic_for_fence`.
-        if self.is_classic(ctx) {
-            self.finish_classic_for_fence();
+        // its answer, and it retires straight away. A classic one does not: `Vrend` takes a sync
+        // for the work and retires the fence behind it, off this thread.
+        let classic = self.is_classic(ctx);
+        match self.vrend.as_mut().filter(|_| classic) {
+            Some(v) => v.fence_context(ctx, ring, fence),
+            // Retirement goes through the thread whatever satisfied the fence: the asynchrony is
+            // the contract, not an optimization.
+            None => self.fences.retire_context(ctx, ring, fence),
         }
-        // Retirement goes through the thread whatever satisfied the fence: the asynchrony is the
-        // contract, not an optimization.
-        self.fences.retire_context(ctx, ring, fence);
         Ok(())
     }
 
-    pub fn create_fence(&mut self, fence: ClientFenceId) {
-        // The legacy global path is the classic renderer's -- `virgl_renderer_create_fence` has
-        // no ring to name -- so this fence answers for GL work exactly as a classic ring's does.
-        self.finish_classic_for_fence();
-        self.fences.retire_global(fence);
-    }
-
-    /// Make a classic fence mean what the guest reads it to mean: the GL work it fences has run.
+    /// A fence on the legacy global ring, which names the context it is for from outside.
     ///
-    /// A guest fences a submission and then tells someone else the buffer is ready. When that
-    /// someone else is another GL client of this renderer, the queue it reads on is one this
-    /// renderer also drives, and the fence being early costs nothing. When it is a **venus
-    /// compositor importing the surface** -- a Vulkan queue Metal does not order against ours --
-    /// an early fence hands it a buffer whose renders have not run, and it samples whatever the
-    /// buffer held before. `transfer.rs` already finishes for exactly this reason on the upload
-    /// path; a render is the same hazard and was not covered.
-    ///
-    /// `glFinish` on every classic context is the sledgehammer version of this: correct, and far
-    /// more than the fence actually needs. The shape it should take is a `glFenceSync` taken here
-    /// and waited on by the retirement thread, which needs that thread to hold a GL context.
-    /// `VIRGLRS_FENCE_FINISH=0` turns this off, which is how the two are compared on one build.
-    fn finish_classic_for_fence(&mut self) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("VIRGLRS_FENCE_FINISH").as_deref() != Ok("0")) {
-            return;
-        }
-        if let Some(v) = self.vrend.as_mut() {
-            v.finish_all();
+    /// `on` is that context. It is not decoration: the sync that answers this fence is taken on
+    /// one context, so a fence that cannot name its own is answered by finishing everything
+    /// instead. The C ignores this argument and syncs on whatever context happens to be current,
+    /// which is the implicit-global habit this renderer exists to be rid of.
+    pub fn create_fence(&mut self, fence: ClientFenceId, on: Option<ContextId>) {
+        match self.vrend.as_mut() {
+            Some(v) => v.fence_global(on, fence),
+            None => self.fences.retire_global(fence),
         }
     }
 

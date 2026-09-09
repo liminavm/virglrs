@@ -19,15 +19,16 @@ use super::context::{Context, Current, Fault, Guest, Host, Todo};
 use super::egl::{self, EglError, Flavour, Version, Winsys};
 use super::features::{Feature, Features};
 use super::formats::Table;
-use super::gl::Gl;
 use super::gl::gles::GL_VERSION;
+use super::gl::{self, Gl};
 use super::journal::{Census, Seq};
 use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::shader;
 use super::transfer::{self, Info};
+use super::waiter;
 use crate::config::Config;
 use crate::guest_mem::{Iov, PixelSource};
-use crate::ids::{BlobId, ContextId, ResourceHandle};
+use crate::ids::{BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, RingIdx};
 use crate::metal;
 use crate::videotoolbox;
 use std::collections::BTreeMap;
@@ -82,6 +83,13 @@ pub struct Vrend {
     /// The shader blitter and its GL context, built on the first blit that needs one. A renderer
     /// that never takes the blitter's path never pays for it.
     blitter: Option<blitter::Blitter>,
+    /// The thread classic fences are waited on, and `None` where the driver would not give it a
+    /// context of its own -- in which case the fence path falls back to finishing inline, which is
+    /// correct and merely slow. The C does the same when its sync context fails to come up.
+    waiter: Option<waiter::Waiter>,
+    /// Where a fence goes once it is answered. Held here as well as by the waiter, because a
+    /// renderer with no waiter answers its fences inline and still has to retire them.
+    fences: crate::fence::Handle,
     /// Texture storage the guest has freed that something else still holds a share of.
     ///
     /// The share cannot delete itself when the last holder lets go, because deleting needs a
@@ -155,7 +163,12 @@ impl fmt::Display for ClaimRefused {
 
 impl Vrend {
     /// Open the winsys, bring ctx0 up on this thread and probe the driver.
-    pub fn new(config: Config, budget: &Arc<crate::budget::Budget>) -> Result<Vrend, InitError> {
+    pub fn new(
+        config: Config,
+        budget: &Arc<crate::budget::Budget>,
+        fences: crate::fence::Handle,
+    ) -> Result<Vrend, InitError> {
+        let fences_for_inline = fences.clone();
         let winsys = Winsys::open(Flavour::Gles)?;
         let mut ctx0 = None;
         for v in VERSIONS {
@@ -205,6 +218,26 @@ impl Vrend {
                 "UNAVAILABLE -- no scanout              or shared buffer can be imported without a copy, and every one will be blank"
             },
         );
+        // The waiter gets a context of ctx0's share group, made current on its own thread. A
+        // driver that will not give a second context is not a reason to refuse to start: the fence
+        // path falls back to finishing inline, which is what this renderer did before there was a
+        // waiter at all. The C makes the same choice when its sync context fails.
+        let waiter = match winsys.create_context(version, Some(&ctx0)) {
+            Ok(wait_ctx) => Some(waiter::Waiter::start(
+                winsys.thread_display(),
+                wait_ctx,
+                Gl::new(winsys.gles()),
+                fences,
+            )),
+            Err(e) => {
+                eprintln!(
+                    "[virglrs] vrend: no context for the fence waiter ({e}); \
+                     classic fences will finish inline"
+                );
+                None
+            }
+        };
+        let fences = fences_for_inline;
         Ok(Vrend {
             winsys,
             gl,
@@ -221,6 +254,8 @@ impl Vrend {
             contexts: BTreeMap::new(),
             todo: Todo::default(),
             blitter: None,
+            waiter,
+            fences,
             doomed: Vec::new(),
             batch: 0,
             pixels: resource::Refresh::default(),
@@ -280,6 +315,10 @@ impl Vrend {
             batch,
             pixels,
             budget,
+            // Neither belongs to a context's commands: the waiter is a thread, and the handle is
+            // where a fence goes once answered.
+            waiter: _,
+            fences: _,
         } = self;
         let host = Host {
             batch: *batch,
@@ -547,6 +586,66 @@ impl Vrend {
         self.resources.get(&handle)?.resource()?.surface_share()
     }
 
+    /// Answer a classic context fence: make it true that the GL work has run, and retire it.
+    ///
+    /// Retirement is queued behind the work rather than taken here, so this returns as soon as the
+    /// fence is *taken* -- the caller is holding the renderer, and waiting under it is what made
+    /// one heavy client slow down every other context.
+    pub fn fence_context(&mut self, ctx: ContextId, ring: RingIdx, id: FenceId) {
+        let fence = self.take_fence(Some(ctx));
+        match &self.waiter {
+            Some(w) => w.retire_context(fence, ctx, ring, id),
+            None => self.fences.retire_context(ctx, ring, id),
+        }
+    }
+
+    /// Answer a fence on the legacy global ring, which names its context from outside.
+    ///
+    /// `on` is the context whose work the fence is for. `None` -- or a context this renderer does
+    /// not have -- means it cannot be attributed, and the fence is answered the old way, by
+    /// finishing everything.
+    pub fn fence_global(&mut self, on: Option<ContextId>, id: ClientFenceId) {
+        let fence = self.take_fence(on);
+        match &self.waiter {
+            Some(w) => w.retire_global(fence, id),
+            None => self.fences.retire_global(id),
+        }
+    }
+
+    /// A sync object for the work `on` has queued, taken on the sub-context that queued it.
+    ///
+    /// `None` is not "nothing to wait for": it means this fence could not be answered by waiting
+    /// on one context, and has been answered inline instead, by finishing every context the way
+    /// this renderer used to for all of them. A caller must still queue the retirement, so that it
+    /// cannot overtake a fence ahead of it that is still in flight.
+    fn take_fence(&mut self, on: Option<ContextId>) -> Option<gl::Fence> {
+        // `VIRGLRS_FENCE_FINISH=1` puts the old behaviour back -- every context finished inline,
+        // on this thread -- so the two can be compared on one build the way the cost of the finish
+        // was measured in the first place. Retirement still goes through the waiter's queue, so
+        // the comparison changes what the fence costs and not what it means.
+        static FORCE_FINISH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let forced = *FORCE_FINISH
+            .get_or_init(|| std::env::var("VIRGLRS_FENCE_FINISH").as_deref() == Ok("1"));
+        let taken = match on {
+            _ if forced => None,
+            Some(id) if self.contexts.contains_key(&id) => {
+                // The context's current sub-context is the one that queued the work, and a sync
+                // covers the context it is taken on.
+                let (mut host, contexts) = self.split(id, &NoGuest);
+                contexts[&id].make_current(&mut host);
+                self.gl.fence()
+            }
+            _ => None,
+        };
+        if taken.is_none() {
+            // Either nothing named a context we have, or the driver would not give a sync. Both
+            // leave the fence unanswerable by waiting, so answer it the expensive way rather than
+            // early: an early classic fence hands a venus compositor the frame before.
+            self.finish_all();
+        }
+        taken
+    }
+
     /// `vrend_renderer_resource_sync_iosurface`: make a surface-backed resource's contents whole
     /// before the surface is presented. The texture's storage *is* the surface, so there is
     /// nothing to copy -- only the renders queued into it to complete, since the present that
@@ -747,8 +846,20 @@ mod tests {
     #[test]
     #[ignore = "needs the zink-on-KosmicKrisp environment"]
     fn the_host_table_for_the_corpus_formats() {
-        let v = Vrend::new(Config::default(), &crate::budget::Budget::with_cap(None, false))
-            .expect("vrend comes up");
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        // Declared first so it outlives the renderer: the fence waiter retires through this as it
+        // drains, which happens while `v` is dropping.
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+        )
+        .expect("vrend comes up");
         let present: Vec<&str> = v.features.present().map(|f| f.name()).collect();
         eprintln!("features: {}", present.join(" "));
         for raw in [1, 2, 20, 48, 49, 64, 65, 67, 131, 134, 177, 227] {
