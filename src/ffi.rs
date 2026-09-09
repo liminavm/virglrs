@@ -550,6 +550,8 @@ pub extern "C" fn virgl_renderer_context_get_poll_fd(_ctx_id: u32) -> c_int {
 /// ignores this one -- meets the consequence commands later, as a set_scanout naming a handle
 /// nothing has ever heard of. The field is carried so the refusal is legible where it happens
 /// rather than reconstructed from where it is felt.
+// Debug so a test may .expect() on the Result this is the error of.
+#[derive(Debug)]
 enum NoDesc {
     /// Handle zero, which names no resource.
     Handle,
