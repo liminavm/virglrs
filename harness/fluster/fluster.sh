@@ -192,6 +192,8 @@ case "${1:-diff}" in
         echo
         echo "the C leg's own verdicts moved. That is the host underneath both legs changing," \
              "not a renderer difference; re-record only once you know which."
+        echo "A whole suite appearing here is the benign case: the pin was recorded before that" \
+             "suite had finished downloading. Re-record."
         exit 1
     fi
     diff -q "$OUT/c.txt" "$OUT/rs.txt" > /dev/null || exit 1
