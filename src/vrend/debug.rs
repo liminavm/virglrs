@@ -13,10 +13,17 @@ pub enum Switch {
     /// Every shader as it is created: the TGSI parsed from the guest's text, printed back, and
     /// the GLSL it became -- the C's `shader` switch, in the C's format, so the two logs diff.
     Shader,
+    /// Every resource as it comes and goes at the C ABI, and every miss when one is asked for.
+    ///
+    /// A create the VMM ignores the return of is a resource that silently never exists, and the
+    /// first anyone hears of it is a later command naming a handle nothing holds. This switch is
+    /// what turns that into two lines next to each other instead of an archaeology exercise.
+    Resource,
 }
 
 impl Switch {
-    const ALL: &'static [(Switch, &'static str)] = &[(Switch::Shader, "shader")];
+    const ALL: &'static [(Switch, &'static str)] =
+        &[(Switch::Shader, "shader"), (Switch::Resource, "resource")];
 }
 
 fn switches() -> &'static [Switch] {

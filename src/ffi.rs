@@ -542,10 +542,38 @@ pub extern "C" fn virgl_renderer_context_get_poll_fd(_ctx_id: u32) -> c_int {
 /// ABI module -- and the whole point of the split is that neither knows the other.
 /// The classic resource the ABI's create args describe, or `None` for a handle, target or format
 /// the wire has no name for.
-fn classic_desc(a: &ResourceCreateArgs) -> Option<(ResourceHandle, ClassicArgs)> {
+/// Why create arguments do not describe a resource.
+///
+/// Each variant is a name this build does not have, and each is an EINVAL exactly as it is in
+/// the C. What is not as it is in the C is that this one says which: a refused create is a
+/// resource that never comes into existence, and the caller that ignores the return -- QEMU
+/// ignores this one -- meets the consequence commands later, as a set_scanout naming a handle
+/// nothing has ever heard of. The field is carried so the refusal is legible where it happens
+/// rather than reconstructed from where it is felt.
+enum NoDesc {
+    /// Handle zero, which names no resource.
+    Handle,
+    /// A texture target the wire has no name for.
+    Target(u32),
+    /// A pixel format the wire has no name for, or one this build does not serve.
+    Format(u32),
+}
+
+impl core::fmt::Display for NoDesc {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            NoDesc::Handle => f.write_str("a handle of zero names no resource"),
+            NoDesc::Target(t) => write!(f, "no texture target {t}"),
+            NoDesc::Format(v) => write!(f, "no pixel format {v}"),
+        }
+    }
+}
+
+fn classic_desc(a: &ResourceCreateArgs) -> Result<(ResourceHandle, ClassicArgs), NoDesc> {
+    let handle = ResourceHandle::new(a.handle).ok_or(NoDesc::Handle)?;
     let desc = ClassicArgs {
-        target: TextureTarget::from_wire(a.target)?,
-        format: Format::from_wire(a.format)?,
+        target: TextureTarget::from_wire(a.target).ok_or(NoDesc::Target(a.target))?,
+        format: Format::from_wire(a.format).ok_or(NoDesc::Format(a.format))?,
         bind: Bind(a.bind),
         width: a.width,
         height: a.height,
@@ -555,7 +583,7 @@ fn classic_desc(a: &ResourceCreateArgs) -> Option<(ResourceHandle, ClassicArgs)>
         nr_samples: a.nr_samples,
         flags: ResourceFlags(a.flags),
     };
-    Some((ResourceHandle::new(a.handle)?, desc))
+    Ok((handle, desc))
 }
 
 /// The blob the ABI's create args describe.
@@ -600,10 +628,23 @@ pub extern "C" fn virgl_renderer_resource_create(
     let a = unsafe { &*args };
     // A handle of zero, a target or a format the wire has no name for: each is the parse
     // failing, and each is EINVAL, as in the C.
-    let Some((handle, desc)) = classic_desc(a) else {
-        return EINVAL;
+    let (handle, desc) = match classic_desc(a) {
+        Ok(parsed) => parsed,
+        Err(why) => {
+            eprintln!(
+                "[virglrs] resource {} refused at create: {why}; nothing will hold this handle",
+                a.handle
+            );
+            return EINVAL;
+        }
     };
     let iov = read_iov(iov, num_iovs);
+    if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Resource) {
+        eprintln!(
+            "[virglrs] resource {} create: target {} format {} {}x{}x{} bind {:#x}",
+            a.handle, a.target, a.format, a.width, a.height, a.depth, a.bind
+        );
+    }
     with(EINVAL, |r| match r.resource_create(handle, desc, iov) {
         Ok(()) => 0,
         Err(e) => {
@@ -809,7 +850,14 @@ pub extern "C" fn virgl_renderer_resource_get_info(
             _ => None,
         });
         match filled {
-            None => EINVAL,
+            None => {
+                if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Resource) {
+                    eprintln!(
+                        "[virglrs] resource {res_handle} get_info: nothing holds this handle"
+                    );
+                }
+                EINVAL
+            }
             Some(None) => 0,
             Some(Some((format, width, height, depth, flags, stride))) => {
                 // SAFETY: caller-provided out-pointer, checked non-null; only the C's first
@@ -2291,8 +2339,8 @@ mod tests {
             }
         );
         // A target or a format the wire has no name for is the parse failing, not a resource.
-        assert!(classic_desc(&ResourceCreateArgs { target: 9, ..a }).is_none());
-        assert!(classic_desc(&ResourceCreateArgs { format: 482, ..a }).is_none());
+        assert!(classic_desc(&ResourceCreateArgs { target: 9, ..a }).is_err());
+        assert!(classic_desc(&ResourceCreateArgs { format: 482, ..a }).is_err());
     }
 
     /// A handle of zero never becomes one.
@@ -2317,7 +2365,7 @@ mod tests {
             nr_samples: 10,
             flags: 11,
         };
-        assert!(classic_desc(&a).is_none());
+        assert!(classic_desc(&a).is_err());
         assert_eq!(ResourceHandle::new(0), None);
     }
 
