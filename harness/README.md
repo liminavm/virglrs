@@ -1018,12 +1018,16 @@ change), the 8-pixel-wide `vp90-2-02-size-08x*`, the interlaced half of H.264 (`
 gate is two claims kept apart: the legs decode the same set (ours), and the C leg's own set has
 not moved (the host's).
 
-**Both legs are deterministic** — measured twice each, byte-identical result lists (C 295, rs
-290). That is what makes a single divergence worth reading as a defect rather than as noise.
+**Both legs are deterministic** — measured twice each, byte-identical result lists. That is what
+makes a single divergence worth reading as a defect rather than as noise. On the current build they
+agree on all 587, which is one run against the pin rather than a repeated measurement.
 
 `-t 120` rather than fluster's default 30 seconds, because a `Timeout` is a verdict about the
 clock and a verdict about the clock cannot be pinned. `MR4_TANDBERG_C` and `MR5_TANDBERG_C` time
 out at 120 too, so they are reliably too slow rather than borderline, and *that* is stable.
+
+`FLUSTER_VECTORS` narrows a run to named vectors, for reading one stream's renderer log instead of
+a whole suite's. A score over a subset is not the fixture, so `--record` refuses while it is set.
 
 Unlike `ctests.sh` there is no cascade — each vector is its own process — so the pin is the whole
 result list, not its first entry.
@@ -1056,27 +1060,35 @@ That makes the full gate pre-merge work rather than per-commit; a single suite (
 **The gate is armed**: inverting the VP9 key-frame flag in `src/vrend/video/mod.rs` takes the rs
 leg from 212/305 to **1/305**, and reverting brings it back.
 
-### What it found: five HEVC vectors the C decodes and we refuse
+### What it found: a refusal that was right about the wrong thing
 
 The first run of the full three suites put the legs 5 apart, reproducibly — `ENTP_A_QUALCOMM_1`,
-`IPRED_A_docomo_2`, `IPRED_C_Mitsubishi_3`, `MAXBINS_A_TI_5`, `OPFLAG_B_Qualcomm_1`. Every one is
-`Success` on the C leg and `Fail` on ours, and the renderer says why itself:
+`IPRED_A_docomo_2`, `IPRED_C_Mitsubishi_3`, `MAXBINS_A_TI_5`, `OPFLAG_B_Qualcomm_1`, every one
+`Success` on the C leg and `Fail` on ours. Each indexes a short-term reference picture set declared
+in the SPS, whose contents VA-API does not carry, and the renderer refused the stream rather than
+decode against the empty placeholder both implementations write there.
 
-```
-HEVC slice refused (the slice indexes an SPS short term ref pic set,
-                    whose contents are not on the VA-API wire)
-HEVC slice refused (the slice predicts its ref pic set from an SPS set,
-                    whose contents the wire does not carry)
-no HEVC parameter set (the stream carries custom scaling lists, whose scan order
-                       on the VA-API wire is not established)
-```
+The absolute oracle is what made that indefensible: a refusal rests on the premise that the
+information is unrecoverable, and a C leg reaching the published md5 on the same stream says the
+premise is false. It was — but not in the way a blanket refusal could express. An I slice predicts
+from no reference picture, so a set it indexes cannot reach a sample it decodes, and the empty
+placeholder is the truth for it rather than a guess. The rule was right about inter-predicted
+slices and wrong to be blanket. Narrowed to that, the legs agree on all 587.
 
-These are our own deliberate refusals — chosen over decoding something wrong. **The C leg reaching
-the published md5 on the same streams is the evidence they are too conservative**: the information
-is recoverable, so the premise each refusal rests on is false for at least these streams. This is
-the differential and the absolute oracle agreeing, which is the strongest form the claim comes in.
+**The narrowing is not a weakening, and the run is what says so**: 6873 HEVC slice refusals still
+fire across the suite, and every one of them lands on a vector the C also fails. The same holds for
+the two refusals that are about parameter sets rather than slices — custom scaling lists, and more
+long-term reference pictures than the wire carries. They still fire, on vectors both legs fail, so
+nothing here indicts them. The oracle only ever indicted the one.
 
-Nothing here is a host limitation, so nothing here belongs in the pin.
+One clause it cannot reach at all. Serving an intra slice against an invented set tells
+VideoToolbox that no earlier picture is kept for reference, so the DPB empties behind it, and an
+inter slice arriving afterwards is refused even when its own set is reproducible. That clause fired
+**zero** times across 587 vectors. A unit test is the only gate it has, which is the general shape:
+a conformance suite scores the streams it contains, and says nothing about the ones it does not.
+
+Nothing here was a host limitation, so nothing here changed the pin — it is the C's list, and the C
+did not move.
 
 ### The rig's two legs are built differently, and not by choice
 

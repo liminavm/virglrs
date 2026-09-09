@@ -7,9 +7,11 @@
 //! things are invented rather than copied: the whole VPS, the tier and level, and the
 //! `short_term_ref_pic_set` structures. The first two are free -- nothing downstream reads more of
 //! a VPS than its `profile_tier_level`, and the level is ours to over-declare. The sets are not:
-//! they are absent from VA-API by design, and a slice that indexes one cannot be served.
-//! [`slice_inspect`] exists to catch exactly that, which is the condition under which the empty
-//! sets written here are sound.
+//! they are absent from VA-API by design, so what is written for them is empty, and an
+//! *inter-predicted* slice that indexes one would predict from the wrong pictures. An intra slice
+//! would not -- it predicts from no picture at all, which makes the empty set the truth for it.
+//! [`slice_inspect`] draws that line, and is the condition under which the sets written here are
+//! sound.
 
 use std::fmt;
 
@@ -662,10 +664,10 @@ impl PictureDesc {
         }
 
         // The sets themselves are not on the wire and cannot be. Only the count matters to a slice
-        // header, which reads an index whose width derives from it; the contents are read only by
-        // a slice that indexes one, and `slice_inspect` refuses those. `st_ref_pic_set(i)` carries
-        // inter_ref_pic_set_prediction_flag for every i != 0 -- omitting it desyncs the parse of
-        // this SPS.
+        // header, which reads an index whose width derives from it; the contents can only reach the
+        // samples of an inter-predicted slice, and `slice_inspect` refuses those.
+        // `st_ref_pic_set(i)` carries inter_ref_pic_set_prediction_flag for every i != 0 --
+        // omitting it desyncs the parse of this SPS.
         w.ue(u32::from(self.num_short_term_ref_pic_sets));
         for i in 0..u32::from(self.num_short_term_ref_pic_sets) {
             if i != 0 {
@@ -1537,14 +1539,14 @@ mod oracle {
 
     /// An I slice predicts from no reference picture, so a set we could not reproduce cannot reach
     /// a sample it decodes -- and the empty set the SPS writer emits is the truth for it rather
-    /// than a guess. Serving it is what takes the all-intra HEVC conformance vectors from failing
-    /// to matching the published md5 (`harness/fluster`).
+    /// than a guess. Serving it is what takes five HEVC conformance vectors from failing to
+    /// matching the published md5 (`harness/fluster`).
     ///
-    /// **This deliberately disagrees with the C**, which refuses here. The C's refusal is also
-    /// ineffective: measured on the five vectors, it logs the refusal 145 times and decodes them
-    /// anyway, because the error only abandons its parameter-set rebuild and the frame is still
-    /// submitted under the configuration the IDR built. Reaching the right pixels by not acting on
-    /// your own refusal is not a behaviour to port, so this narrows the rule instead.
+    /// **This deliberately disagrees with the C**, which refuses here -- and whose refusal is also
+    /// ineffective, because its error only abandons the parameter-set rebuild while the frame goes
+    /// out under the configuration the IDR built. It refuses those vectors and decodes them to the
+    /// published md5 regardless. Reaching the right pixels by not acting on your own refusal is not
+    /// a behaviour to port, so this narrows the rule instead.
     #[test]
     fn an_intra_slice_indexing_an_sps_ref_pic_set_is_served() {
         let desc = Descriptor::new(11, 0);
