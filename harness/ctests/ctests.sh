@@ -78,20 +78,57 @@ case "${1:-diff}" in
     grep SUMMARY "$OUT/rs.txt" | sed 's/SUMMARY //'
     ;;
   diff)
-    # Only the ABI tests on both legs; the static two cannot disagree and would pad the diff
-    # with lines that are the C's on either side.
+    # Only the ABI tests on both legs; the static two cannot disagree and would pad the
+    # comparison with lines that are the C's on either side.
     run_leg c  "$BUILD/tests"    "${ABI_TESTS[@]}"
     run_leg rs "$BUILD/tests-rs" "${ABI_TESTS[@]}"
     echo "=== per-test totals (c | rs) ==="
     paste <(grep SUMMARY "$OUT/c.txt") <(grep SUMMARY "$OUT/rs.txt") | sed 's/SUMMARY //g'
-    echo "=== assertions the legs disagree about ==="
-    if diff <(grep ':[FES]:' "$OUT/c.txt") <(grep ':[FES]:' "$OUT/rs.txt"); then
-        echo "(identical -- virglrs answers this suite exactly as the C does)"
+
+    # THE GATE, and it is one entry rather than the whole diff.
+    #
+    # Under CK_FORK=no a divergence cascades: the case that diverges leaves the process in a
+    # state every later case inherits, so a single cause prints as hundreds of differing lines.
+    # Pinning all of them would pin the consequences, and any change to the cause would rewrite
+    # the whole fixture -- a diff nobody could read and nobody would trust.
+    #
+    # So the pin is the FIRST entry at which the two ordered failure lists differ. It is the only
+    # line that is a finding rather than a consequence, and it moves for exactly two reasons: a
+    # new divergence earlier than the known one, or the known one being fixed. Both want a human.
+    first_divergence() {
+        awk '
+            NR == FNR { c[FNR] = $0; nc = FNR; next }
+            { r[FNR] = $0; nr = FNR }
+            END {
+                n = (nc > nr) ? nc : nr
+                for (i = 1; i <= n; i++)
+                    if (c[i] != r[i]) {
+                        printf "diverges at entry %d\n", i
+                        printf "c  %s\n", (i <= nc ? c[i] : "(no more failures)")
+                        printf "rs %s\n", (i <= nr ? r[i] : "(no more failures)")
+                        exit
+                    }
+                print "no divergence"
+            }
+        ' <(grep ':[FES]:' "$OUT/c.txt") <(grep ':[FES]:' "$OUT/rs.txt")
+    }
+
+    echo "=== first divergence ==="
+    first_divergence | tee "$OUT/first.txt"
+    PIN="$(dirname "$0")/fixtures/first-divergence.txt"
+    if [ "${1:-}" = "--record" ] || [ "${2:-}" = "--record" ]; then
+        mkdir -p "$(dirname "$PIN")"
+        cp "$OUT/first.txt" "$PIN"
+        echo "recorded $PIN"
+        exit 0
+    fi
+    [ -f "$PIN" ] || { echo "no pin at $PIN -- record one with: ctests.sh diff --record" >&2; exit 1; }
+    if diff -u "$PIN" "$OUT/first.txt"; then
+        echo "matches $PIN"
     else
-        # A divergence cascades under CK_FORK=no, so the first line is the one to read.
         echo
-        echo "read the FIRST differing case: a leg that leaves the renderer initialized"
-        echo "fails every case after it, and those are consequences, not findings."
+        echo "the first divergence moved. Either a new one appeared before the pinned one, or"
+        echo "the pinned one is gone. Everything after it in the full lists is a consequence."
         exit 1
     fi
     ;;
