@@ -653,9 +653,17 @@ impl Vrend {
     /// is the caller's cue to read the pixels back instead.
     ///
     /// The renders live on the queue of whichever sub-context drew them, and a finish waits for
-    /// one context's queue only -- so this finishes the contexts the guest kernel attached this
-    /// resource to, which is the set that is allowed to have rendered into it, and then ctx0,
-    /// which is where this renderer's own blits and transfers run.
+    /// one context's queue only -- so this finishes the contexts the guest kernel has this
+    /// resource attached to, and then ctx0, where this renderer's own blits and transfers run.
+    ///
+    /// **`attached` is who may reach the resource, not who has written it**, and the difference is
+    /// real: `virtio_gpu_gem_object_close` sends CONTEXT_DETACH_RESOURCE with no fence wait, so a
+    /// client that renders, hands the buffer on and closes its handle is gone from the set while
+    /// its draws are still queued. What makes the present sound is not this finish but the guest:
+    /// `virtio_gpu_plane_prepare_fb` calls `drm_gem_plane_helper_prepare_fb`, so the atomic commit
+    /// that sends the flush has already waited the scanout's fences -- and since `create_fence`
+    /// those retire only once the render they name has run. This is belt to that guest's braces,
+    /// for a consumer that skips them.
     ///
     /// **It must not finish anything else, because this is the present path.** It runs on every
     /// page-flip, so finishing every context would make each repaint of the desktop wait for the
@@ -675,6 +683,14 @@ impl Vrend {
             return false;
         }
         if attached.is_empty() {
+            // Reachable when the last context holding it was destroyed and the VMM flushes it
+            // anyway -- a compositor that died. Said out loud because the same branch is where a
+            // bookkeeping regression would land, and falling back to the slow path is a thing that
+            // reads green.
+            eprintln!(
+                "[virglrs] vrend: {handle:?} is presented but attached to no context; \
+                 finishing every context for it"
+            );
             self.finish_all();
         } else {
             self.finish_contexts(attached);
@@ -710,6 +726,11 @@ impl Vrend {
     ///
     /// Finishing ctx0 alone is not a substitute, whatever it costs: ctx0 never draws, and the
     /// harness caught that reading the frame before last off a scanout.
+    ///
+    /// "Every context" means every *guest* context and ctx0. The blitter holds a GL context of its
+    /// own ([`blitter::Blitter`]) and is in neither this nor [`Vrend::finish_contexts`], so a blit
+    /// into a surface-backed destination is waited for by neither -- which predates the bounding
+    /// and is not fixed by it.
     pub fn finish_all(&mut self) {
         for (id, ctx) in &self.contexts {
             for (sub, gl_ctx) in ctx.gl_contexts() {
