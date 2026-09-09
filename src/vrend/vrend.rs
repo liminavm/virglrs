@@ -618,6 +618,14 @@ impl Vrend {
     /// one heavy client slow down every other context.
     pub fn fence_context(&mut self, ctx: ContextId, ring: RingIdx, id: FenceId) {
         let fence = self.take_fence(Some(ctx));
+        if super::debug::enabled(super::debug::Switch::Fence) {
+            eprintln!(
+                "[virglrs] fence: context ctx={ctx:?} ring={ring:?} id={} sync={} waiter={}",
+                id.0,
+                fence.is_some(),
+                self.waiter.is_some()
+            );
+        }
         match &self.waiter {
             Some(w) => w.retire_context(fence, ctx, ring, id),
             None => self.fences.retire_context(ctx, ring, id),
@@ -631,6 +639,14 @@ impl Vrend {
     /// finishing everything.
     pub fn fence_global(&mut self, on: Option<ContextId>, id: ClientFenceId) {
         let fence = self.take_fence(on);
+        if super::debug::enabled(super::debug::Switch::Fence) {
+            eprintln!(
+                "[virglrs] fence: global id={} on={on:?} sync={} waiter={}",
+                id.0,
+                fence.is_some(),
+                self.waiter.is_some()
+            );
+        }
         match &self.waiter {
             Some(w) => w.retire_global(fence, id),
             None => self.fences.retire_global(id),

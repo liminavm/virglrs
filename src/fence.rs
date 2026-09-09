@@ -158,6 +158,16 @@ fn run(mut sink: Box<dyn FenceSink>, q: Arc<(Mutex<Queue>, Condvar)>) {
                 }
             }
         };
+        if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
+            let what = match &job {
+                Job::Context(ctx, ring, fence) => {
+                    format!("context ctx={ctx:?} ring={ring:?} id={}", fence.0)
+                }
+                Job::Global(id) => format!("global id={}", id.0),
+                Job::Stop => "stop".to_string(),
+            };
+            eprintln!("[virglrs] fence: delivering {what} to the VMM");
+        }
         match job {
             Job::Context(ctx, ring, fence) => sink.context_fence(ctx, ring, fence),
             Job::Global(id) => sink.global_fence(id),

@@ -19,11 +19,17 @@ pub enum Switch {
     /// first anyone hears of it is a later command naming a handle nothing holds. This switch is
     /// what turns that into two lines next to each other instead of an archaeology exercise.
     Resource,
+    /// Every fence, from the ABI call that asks for one to the callback that retires it.
+    ///
+    /// A fence that is never retired hangs the guest forever and looks exactly like a slow
+    /// renderer from outside. This is what tells the two apart: a create with no matching retire
+    /// names the step that dropped it.
+    Fence,
 }
 
 impl Switch {
     const ALL: &'static [(Switch, &'static str)] =
-        &[(Switch::Shader, "shader"), (Switch::Resource, "resource")];
+        &[(Switch::Shader, "shader"), (Switch::Resource, "resource"), (Switch::Fence, "fence")];
 }
 
 fn switches() -> &'static [Switch] {

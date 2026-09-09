@@ -19,9 +19,10 @@
 //! The caller is the VMM, which owns every pointer it passes for the duration of the call.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::abi::{
     self, Box3, Callbacks, CreateBlobArgs, DebugCallback, FreeDataCallback, GlCtxParam, GuestIov,
@@ -74,24 +75,120 @@ fn config_of(flags: c_int) -> Config {
 ///
 /// No `unsafe impl Send` is needed: [`VmmPtr`] already carries that justification in the module
 /// that owns the boundary, and an `extern "C" fn` is `Send` on its own.
-struct VmmFences {
+enum Retired {
+    Context(ContextId, RingIdx, FenceId),
+    Global(ClientFenceId),
+}
+
+/// The VMM's callback table, and *when* it has agreed to be called through it.
+///
+/// The ABI has two delivery contracts and `VIRGL_RENDERER_ASYNC_FENCE_CB` is how a VMM chooses
+/// between them. With it, a fence may be handed over the moment it retires, on whatever thread
+/// retired it. Without it, the VMM has promised nothing about being called from another thread,
+/// and the C hands fences over only from inside `virgl_renderer_poll` -- `virglrenderer.c` gates
+/// its retirement on exactly that flag, and vrend only takes the asynchronous path when
+/// `THREAD_SYNC | ASYNC_FENCE_CB` are both set.
+///
+/// Calling early is not merely impolite. QEMU records the command a fence answers *after*
+/// `create_fence` returns, so a callback that arrives first finds an empty fence queue, matches
+/// nothing, and leaves the command to sit there forever; the guest then waits on a fence that as
+/// far as it can tell was never signalled, and the first page flip hangs the machine. That is a
+/// contract this shim has to keep, not a QEMU quirk to work around.
+///
+/// The renderer goes on retiring asynchronously either way -- that is the Rust API's contract and
+/// venus deadlocks without it. This is the shim absorbing the difference, which is where a C
+/// idiosyncrasy belongs.
+struct Sink {
     cookie: VmmPtr,
     write_fence: Option<extern "C" fn(*mut c_void, u32)>,
     write_context_fence: Option<extern "C" fn(*mut c_void, u32, u32, u64)>,
+    /// Retired fences the VMM has not been told of yet, or `None` when it asked to be told at once.
+    deferred: Option<Mutex<VecDeque<Retired>>>,
 }
+
+impl Sink {
+    /// Call the VMM. Only ever from a thread the VMM has agreed to be called on.
+    fn hand_over(&self, retired: Retired) {
+        if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
+            let what = match &retired {
+                Retired::Context(ctx, ring, fence) => {
+                    format!("context ctx={ctx:?} ring={ring:?} id={}", fence.0)
+                }
+                Retired::Global(fence) => format!("global id={}", fence.0),
+            };
+            let how = if self.deferred.is_some() { "from poll" } else { "at once" };
+            eprintln!("[virglrs] fence: handing {what} to the VMM, {how}");
+        }
+        match retired {
+            Retired::Context(ctx, ring, fence) => {
+                if let Some(f) = self.write_context_fence {
+                    f(self.cookie.0, ctx.get(), ring.0, fence.0);
+                }
+            }
+            Retired::Global(fence) => {
+                if let Some(f) = self.write_fence {
+                    f(self.cookie.0, fence.0);
+                }
+            }
+        }
+    }
+
+    fn retire(&self, retired: Retired) {
+        match &self.deferred {
+            None => self.hand_over(retired),
+            Some(q) => q
+                .lock()
+                .expect("the deferred fence queue is never held across a panic")
+                .push_back(retired),
+        }
+    }
+
+    /// Hand over everything that has retired since the last drain, on the caller's thread.
+    ///
+    /// One at a time, with the lock released around each call: the VMM is free to re-enter the
+    /// ABI from its own callback, and a drain holding the queue would deadlock the moment it did.
+    fn drain(&self) {
+        let Some(q) = &self.deferred else {
+            return;
+        };
+        loop {
+            let next = q
+                .lock()
+                .expect("the deferred fence queue is never held across a panic")
+                .pop_front();
+            match next {
+                Some(retired) => self.hand_over(retired),
+                None => return,
+            }
+        }
+    }
+}
+
+/// The retirement thread's end of the sink.
+struct VmmFences(Arc<Sink>);
 
 impl fence::FenceSink for VmmFences {
     fn context_fence(&mut self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
-        if let Some(f) = self.write_context_fence {
-            f(self.cookie.0, ctx.get(), ring.0, fence.0);
-        }
+        self.0.retire(Retired::Context(ctx, ring, fence));
     }
 
     fn global_fence(&mut self, fence: ClientFenceId) {
-        if let Some(f) = self.write_fence {
-            f(self.cookie.0, fence.0);
-        }
+        self.0.retire(Retired::Global(fence));
     }
+}
+
+/// The sink the renderer retires through, reachable from `poll` without the renderer lock.
+///
+/// Separate from [`root`] on purpose: a poll must be able to hand fences over while another
+/// thread is inside a long call holding the renderer, which is the case it exists to serve.
+fn sink() -> &'static Mutex<Option<Arc<Sink>>> {
+    static SINK: OnceLock<Mutex<Option<Arc<Sink>>>> = OnceLock::new();
+    SINK.get_or_init(|| Mutex::new(None))
+}
+
+/// The sink as it stands, if there is one. The lock is not held across the drain.
+fn current_sink() -> Option<Arc<Sink>> {
+    sink().lock().expect("the sink slot is never held across a panic").clone()
 }
 
 /// Translate a renderer failure into the errno the C ABI answers with.
@@ -260,20 +357,24 @@ pub extern "C" fn virgl_renderer_init(
     //
     // SAFETY: both fields are within the v3 prefix, which the check above proved the caller
     // allocated. `callbacks_offsets_match_the_c_header` pins that claim to the header's layout.
-    let sink = unsafe {
-        VmmFences {
+    let shared = unsafe {
+        Arc::new(Sink {
             cookie: VmmPtr(cookie),
             write_fence: (&raw const (*cb).write_fence).read(),
             write_context_fence: (&raw const (*cb).write_context_fence).read(),
-        }
+            // The VMM that did not ask to be called out of band is told through `poll` instead.
+            deferred: (flags & abi::ASYNC_FENCE_CB == 0).then(|| Mutex::new(VecDeque::new())),
+        })
     };
-    match Renderer::new(Box::new(sink), config_of(flags)) {
+    *sink().lock().expect("the sink slot is never held across a panic") = Some(Arc::clone(&shared));
+    match Renderer::new(Box::new(VmmFences(shared)), config_of(flags)) {
         Ok(renderer) => {
             *g = Some(Client { renderer, init: InitArgs::new(cookie, flags, cb) });
             0
         }
         Err(e) => {
             eprintln!("[virglrs] init: {e}");
+            *sink().lock().expect("the sink slot is never held across a panic") = None;
             EINVAL
         }
     }
@@ -285,6 +386,13 @@ pub extern "C" fn virgl_renderer_cleanup(_cookie: *mut c_void) {
     // delivered before cleanup returns rather than being lost with the queue.
     let taken = root().lock().expect("the renderer lock is never held across a panic").take();
     drop(taken);
+    // Dropping the renderer joined the retirement thread, so everything owed is now in the queue.
+    // A VMM still waiting on one of those fences is not woken by anything else, so it is handed
+    // over here rather than freed with the sink.
+    let s = sink().lock().expect("the sink slot is never held across a panic").take();
+    if let Some(s) = s {
+        s.drain();
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -302,7 +410,11 @@ pub extern "C" fn virgl_renderer_get_poll_fd() -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_poll() {}
+pub extern "C" fn virgl_renderer_poll() {
+    if let Some(s) = current_sink() {
+        s.drain();
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_get_dev_fd(_ctx_id: c_int) -> c_int {
@@ -526,7 +638,14 @@ pub extern "C" fn virgl_renderer_ctx_detach_resource(ctx_id: c_int, res_handle: 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_context_poll(_ctx_id: u32) {}
+pub extern "C" fn virgl_renderer_context_poll(_ctx_id: u32) {
+    // The C drains one context's fences; draining every context's is a superset of that and needs
+    // no per-context queue. A fence in here has already retired, so handing it over is never
+    // early -- the id is what the VMM filters on, and it filters the same either way.
+    if let Some(s) = current_sink() {
+        s.drain();
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_context_get_poll_fd(_ctx_id: u32) -> c_int {
@@ -1427,6 +1546,9 @@ pub extern "C" fn virgl_renderer_create_fence(client_fence_id: c_int, ctx_id: u3
         AbiCtx::Context(id) => Some(id),
         _ => None,
     };
+    if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
+        eprintln!("[virglrs] fence: create_fence id={client_fence_id} ctx={ctx_id} on={on:?}");
+    }
     with(EINVAL, |r| {
         r.create_fence(ClientFenceId(client_fence_id as u32), on);
         0
@@ -1441,6 +1563,11 @@ pub extern "C" fn virgl_renderer_context_create_fence(
     fence_id: u64,
 ) -> c_int {
     // The global has no per-context ring to fence; `virgl_renderer_create_fence` is its path.
+    if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
+        eprintln!(
+            "[virglrs] fence: context_create_fence ctx={ctx_id} ring={ring_idx} id={fence_id}"
+        );
+    }
     let AbiCtx::Context(id) = AbiCtx::new(ctx_id) else {
         return EINVAL;
     };
@@ -2132,6 +2259,65 @@ mod tests {
 
         // `with` answers with its error only while the root is empty.
         assert_eq!(with(EINVAL, |_| 0), EINVAL, "a refused init must not have initialized");
+    }
+
+    /// A fence reaches the VMM only on a thread the VMM agreed to be called on.
+    ///
+    /// `VIRGL_RENDERER_ASYNC_FENCE_CB` is the whole of that agreement. Without it the C hands
+    /// fences over from inside `virgl_renderer_poll` and nowhere else, and the reason is not
+    /// politeness: QEMU records the command a fence answers *after* `create_fence` returns, so a
+    /// callback that arrives first matches nothing in its fence queue and the command is never
+    /// completed. The guest waits on a fence it never sees signalled and the first page flip hangs
+    /// the machine -- measured, and fixed by this.
+    ///
+    /// Ground truth: `virgl_renderer_poll` in `src/virglrenderer.c`, which retires only when the
+    /// flag is clear, and `vrend_renderer.c` taking the async path only for
+    /// `THREAD_SYNC | ASYNC_FENCE_CB`.
+    #[test]
+    fn a_deferred_fence_reaches_the_vmm_only_from_poll() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // The count has to be reachable from an `extern "C"` callback, which takes no captures.
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static LAST: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn count(_cookie: *mut c_void, fence: u32) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            LAST.store(fence, Ordering::SeqCst);
+        }
+
+        let deferring = Sink {
+            cookie: VmmPtr::NULL,
+            write_fence: Some(count),
+            write_context_fence: None,
+            deferred: Some(Mutex::new(VecDeque::new())),
+        };
+
+        CALLS.store(0, Ordering::SeqCst);
+        deferring.retire(Retired::Global(ClientFenceId(7)));
+        deferring.retire(Retired::Global(ClientFenceId(8)));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0, "retiring must not call the VMM");
+
+        deferring.drain();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2, "the drain hands over everything owed");
+        assert_eq!(LAST.load(Ordering::SeqCst), 8, "in the order they retired");
+
+        // A second drain owes nothing: a fence handed over twice would complete a command the VMM
+        // has already freed.
+        deferring.drain();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2, "a drained queue hands over nothing");
+
+        // With the flag, the VMM asked to be called at once, and `poll` has nothing to do.
+        let at_once = Sink {
+            cookie: VmmPtr::NULL,
+            write_fence: Some(count),
+            write_context_fence: None,
+            deferred: None,
+        };
+        CALLS.store(0, Ordering::SeqCst);
+        at_once.retire(Retired::Global(ClientFenceId(9)));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "an async VMM is called as the fence retires");
+        at_once.drain();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "and poll then owes it nothing");
     }
 
     /// `get_cap_set` answers before `virgl_renderer_init`, because its callers ask before then.
