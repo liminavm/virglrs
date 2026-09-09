@@ -107,6 +107,8 @@ build_rust_app() {
   # which is a symlink: cargo normalizes that lexically and lands on the worktree's own virglrs,
   # but a resolver that walked the symlink physically would land in limina's clone instead and
   # every score after it would be of the wrong source, silently.
+  [ "$(readlink "$WT/third_party/virglrs")" = "$ROOT" ] || {
+    echo "$WT/third_party/virglrs does not point at $ROOT" >&2; exit 1; }
   resolved="$(cd "$WT" && cargo metadata --format-version 1 2>/dev/null | python3 -c '
 import json, sys
 for pkg in json.load(sys.stdin)["packages"]:
@@ -155,6 +157,21 @@ else
   DYLIB="$PREFIX/lib/libvirglrenderer.1.dylib"
   [ -f "$DYLIB" ] || { echo "build it first: harness/vm/build-renderer.sh" >&2; exit 1; }
   SRC_APP="$LIMINA/target/Limina.app"
+  [ -d "$SRC_APP" ] || { echo "missing source bundle: $SRC_APP (cargo xtask app in limina)" >&2; exit 1; }
+  # A bundle with no libvirglrenderer load command loads no dylib, so swapping one in changes
+  # nothing and re-signing hides that it changed nothing. limina past its cutover builds exactly
+  # such a bundle -- it compiles virglrs in -- so the C leg needs one from BEFORE the cutover.
+  #
+  # CHECKED ON THE SOURCE, and before anything is deleted: $APP is that pre-cutover bundle, limina
+  # HEAD cannot build another, and a check that ran after the clone would have destroyed the only
+  # copy and then advised keeping it.
+  otool -L "$SRC_APP/Contents/MacOS/limina-vmm" | grep -q libvirglrenderer || {
+    echo "$SRC_APP does not link libvirglrenderer: it compiles the renderer in, so this bundle" >&2
+    echo "would boot virglrs while claiming to be the C leg. The C leg needs a PRE-CUTOVER limina" >&2
+    echo "bundle -- $APP is one, and is left untouched. Build another from a limina revision" >&2
+    echo "before the cutover if you need to replace it." >&2
+    exit 1
+  }
 fi
 [ -d "$SRC_APP" ] || { echo "missing source bundle: $SRC_APP (cargo xtask app in limina)" >&2; exit 1; }
 
@@ -173,17 +190,6 @@ if [ "$renderer" = rust ]; then
   echo "    limina $(cut -c1-12 < "$RIG/Limina-rust.rev"), renderer compiled from $ROOT"
   exit 0
 fi
-
-# A bundle with no libvirglrenderer load command loads no dylib, so swapping one in changes
-# nothing and re-signing hides that it changed nothing. limina past its cutover builds exactly
-# such a bundle -- it compiles virglrs in -- so the C leg needs a bundle from BEFORE it, and this
-# is where that stops being silent.
-otool -L "$MACOS/limina-vmm" | grep -q libvirglrenderer || {
-  echo "$SRC_APP does not link libvirglrenderer: it compiles the renderer in, so this bundle" >&2
-  echo "would boot virglrs while claiming to be the C leg. The C leg needs a PRE-CUTOVER limina" >&2
-  echo "bundle -- keep the existing $APP, or build one from a limina revision before it." >&2
-  exit 1
-}
 
 echo "==> swapping in $(basename "$DYLIB")"
 cp "$DYLIB" "$FW/libvirglrenderer.1.dylib"
