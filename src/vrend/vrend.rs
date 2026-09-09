@@ -653,23 +653,63 @@ impl Vrend {
     /// is the caller's cue to read the pixels back instead.
     ///
     /// The renders live on the queue of whichever sub-context drew them, and a finish waits for
-    /// one context's queue only. The C finishes ctx0, which never draws, and the harness caught
-    /// it reading the frame before last off a scanout: every GL context this renderer owns is
-    /// finished, so the surface is whole whoever rendered into it.
-    pub fn resource_sync_iosurface(&mut self, handle: ResourceHandle) -> bool {
+    /// one context's queue only -- so this finishes the contexts the guest kernel attached this
+    /// resource to, which is the set that is allowed to have rendered into it, and then ctx0,
+    /// which is where this renderer's own blits and transfers run.
+    ///
+    /// **It must not finish anything else, because this is the present path.** It runs on every
+    /// page-flip, so finishing every context would make each repaint of the desktop wait for the
+    /// heaviest client's frame -- a compositor's cursor update paying for an unrelated WebGL
+    /// canvas. The pinned C finishes the context that last rendered and then ctx0, for the same
+    /// reason and by a shorter road: it reads whichever context happens to be current, which is
+    /// the implicit-global habit this renderer does not keep.
+    ///
+    /// A resource attached to nothing has no such set, and is finished the old way rather than
+    /// early: presenting a frame that has not been rendered is worse than presenting it late.
+    pub fn resource_sync_iosurface(
+        &mut self,
+        handle: ResourceHandle,
+        attached: &[ContextId],
+    ) -> bool {
         if self.resource_surface(handle).is_none() {
             return false;
         }
-        self.finish_all();
+        if attached.is_empty() {
+            self.finish_all();
+        } else {
+            self.finish_contexts(attached);
+        }
         true
+    }
+
+    /// Wait for `which` and ctx0 to have executed what was queued on them.
+    ///
+    /// The bounded form of [`Vrend::finish_all`], for a caller that knows whose work it needs.
+    fn finish_contexts(&mut self, which: &[ContextId]) {
+        for id in which {
+            let Some(ctx) = self.contexts.get(id) else { continue };
+            for (sub, gl_ctx) in ctx.gl_contexts() {
+                let want = Current::Sub(*id, sub);
+                if self.current != want {
+                    self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
+                    self.current = want;
+                }
+                self.gl.finish();
+            }
+        }
+        self.switch_ctx0();
+        self.gl.finish();
     }
 
     /// Wait for every GL context this renderer owns to have executed what was queued on it.
     ///
     /// The renders live on the queue of whichever sub-context drew them, and a finish waits for
-    /// one context's queue only -- so a caller that needs *the surface* whole, rather than one
-    /// context's work, has to finish them all. The C finishes ctx0, which never draws, and the
-    /// harness caught it reading the frame before last off a scanout.
+    /// one context's queue only -- so a caller that cannot say whose work it needs has to finish
+    /// them all. A caller that *can* say wants [`Vrend::finish_contexts`]: this one is the
+    /// fallback, and it is far too expensive to sit on a path that runs per frame.
+    ///
+    /// Finishing ctx0 alone is not a substitute, whatever it costs: ctx0 never draws, and the
+    /// harness caught that reading the frame before last off a scanout.
     pub fn finish_all(&mut self) {
         for (id, ctx) in &self.contexts {
             for (sub, gl_ctx) in ctx.gl_contexts() {

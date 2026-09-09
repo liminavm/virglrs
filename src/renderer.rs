@@ -1563,7 +1563,12 @@ impl Renderer {
     /// must never be synced from here. `false` for a resource that has no surface -- the VMM's
     /// cue to read its pixels back the slow way.
     pub fn resource_sync_iosurface(&mut self, handle: ResourceHandle) -> bool {
-        self.vrend.as_mut().is_some_and(|v| v.resource_sync_iosurface(handle))
+        // Who the guest kernel attached it to is who is allowed to have rendered into it, so it
+        // is also the set whose work has to be complete. Delegating to that decision beats
+        // inventing a second one here, and it is what keeps a page-flip from waiting on contexts
+        // that never touched the surface.
+        let attached = self.with_resource(handle, |r| r.attached.clone()).unwrap_or_default();
+        self.vrend.as_mut().is_some_and(|v| v.resource_sync_iosurface(handle, &attached))
     }
 
     /// Where a blob resource lives in this process, for a VMM about to publish it to the guest.
