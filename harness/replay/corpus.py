@@ -30,6 +30,9 @@ CCMD_SET_SAMPLER_VIEWS = 10
 CCMD_BLIT = 16
 CCMD_BIND_SAMPLER_STATES = 18
 CCMD_BIND_SHADER = 31
+CCMD_SET_SUB_CTX = 28
+CCMD_CREATE_SUB_CTX = 29
+CCMD_DESTROY_SUB_CTX = 30
 
 # virgl_object_type
 OBJ_BLEND, OBJ_RASTERIZER, OBJ_DSA, OBJ_SHADER = 1, 2, 3, 4
@@ -229,6 +232,22 @@ class Corpus:
 
     def draw(self, count, mode=PRIM_TRIANGLE_STRIP):
         self.emit(CCMD_DRAW_VBO, 0, [0, count, mode, 0, 1, 0, 0, 0, 0, 0, count - 1, 0])
+
+    # ---- sub-contexts ----
+    #
+    # A sub-context is the guest's per-`pipe_context` GL state: its own shaders, programs,
+    # framebuffer and bindings, sharing the context's resources. Mesa mints one per context from
+    # a screen-wide counter (`p_atomic_inc_return`), so a guest never names 0 and every context
+    # it creates is one it later destroys.
+
+    def create_sub_ctx(self, sub_id):
+        self.emit(CCMD_CREATE_SUB_CTX, 0, [sub_id])
+
+    def set_sub_ctx(self, sub_id):
+        self.emit(CCMD_SET_SUB_CTX, 0, [sub_id])
+
+    def destroy_sub_ctx(self, sub_id):
+        self.emit(CCMD_DESTROY_SUB_CTX, 0, [sub_id])
 
     # ---- output ----
 

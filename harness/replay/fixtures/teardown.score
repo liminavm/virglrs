@@ -1,0 +1,8 @@
+loop 0 created 8 failed 0 unrefs 6 submits 3 cmds 81 xfers 0 copy-fed 0 copy-unmatched 0 submit-errors 0 iosurface-backed 0
+probe transfer-of-unknown-resource answered=22
+res=10 64x64 hash=064901b481e0c383 ink=4096/4096
+res=11 64x64 hash=423d2c6d5eaa2383 ink=4096/4096
+res=12 64x64 hash=16749c00a3a72383 ink=4096/4096
+res=13 64x64 hash=423d2c6d5eaa2383 ink=4096/4096
+res=14 64x64 hash=ffe1b002d6aea383 ink=4096/4096
+res=15 64x64 hash=423d2c6d5eaa2383 ink=4096/4096
