@@ -841,7 +841,7 @@ pub extern "C" fn virgl_renderer_resource_get_info(
     with(EINVAL, |r| {
         // The C fills what it knows and reports success for any resource it holds; the shim
         // reads the classic half, which is the only kind with a format and a size.
-        let filled = r.with_resource(handle, |res| match &res.backing {
+        let described = r.with_resource(handle, |res| match &res.backing {
             renderer::Backing::Classic { args: a, .. } => {
                 let desc = a.format.describe();
                 let stride = desc.map_or(0, |d| d.stride(a.width));
@@ -849,42 +849,70 @@ pub extern "C" fn virgl_renderer_resource_get_info(
             }
             _ => None,
         });
-        match filled {
-            None => {
-                if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Resource) {
-                    eprintln!(
-                        "[virglrs] resource {res_handle} get_info: nothing holds this handle"
-                    );
-                }
-                EINVAL
+        let Some(described) = described else {
+            if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Resource) {
+                eprintln!("[virglrs] resource {res_handle} get_info: nothing holds this handle");
             }
-            Some(None) => 0,
-            Some(Some((format, width, height, depth, flags, stride))) => {
-                // SAFETY: caller-provided out-pointer, checked non-null; only the C's first
-                // eight fields are written, which every version of the struct has.
-                unsafe {
-                    (*info).handle = res_handle as u32;
-                    (*info).virgl_format = format;
-                    (*info).width = width;
-                    (*info).height = height;
-                    (*info).depth = depth;
-                    (*info).flags = flags & ResourceFlags::Y_0_TOP.0;
-                    (*info).tex_id = 0;
-                    (*info).stride = stride;
-                }
-                0
-            }
+            return EINVAL;
+        };
+        // The texture is asked for outside `with_resource`: it lives in vrend's table, not the
+        // resource record, and the borrow above ends before this one starts.
+        let tex_id = r.classic_texture(handle).map_or(0, |name| name.raw());
+        // Written on every path that reports success, including the one that could describe
+        // nothing. Reporting success over memory this never touched would leave the caller
+        // reading whatever was in its struct before the call and believing this put it there.
+        let (virgl_format, width, height, depth, flags, stride) =
+            described.unwrap_or((0, 0, 0, 0, 0, 0));
+        // SAFETY: caller-provided out-pointer, checked non-null; only the C's first eight
+        // fields are written, which every version of the struct has.
+        unsafe {
+            (*info).handle = res_handle as u32;
+            (*info).virgl_format = virgl_format;
+            (*info).width = width;
+            (*info).height = height;
+            (*info).depth = depth;
+            (*info).flags = flags & ResourceFlags::Y_0_TOP.0;
+            (*info).tex_id = tex_id;
+            (*info).stride = stride;
         }
+        0
     })
 }
 
+/// The C's `virgl_renderer_resource_get_info_ext`, which is what a VMM built against
+/// virglrenderer 1.x actually calls -- QEMU's classic scanout asks this one and never the plain
+/// form, so a renderer that serves only the plain form has no scanout at all.
+///
+/// The extended half describes a dma-buf export of the texture, and this build has none: no
+/// export, one plane, no modifier. Those are answers, not placeholders -- a caller that reads
+/// `has_dmabuf_export` false and takes the texture route gets exactly what is here.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_get_info_ext(
-    _res_handle: c_int,
-    _info: *mut ResourceInfoExt,
+    res_handle: c_int,
+    info: *mut ResourceInfoExt,
 ) -> c_int {
-    todo_phase!("P3: resource info needs the pipe resource")
+    if info.is_null() {
+        return EINVAL;
+    }
+    // SAFETY: caller-provided out-pointer, checked non-null. `base` is a field of it, so the
+    // pointer handed on is valid for exactly as long and is written by the same rules.
+    let rc = virgl_renderer_resource_get_info(res_handle, unsafe { &raw mut (*info).base });
+    if rc != 0 {
+        return rc;
+    }
+    // SAFETY: as above.
+    unsafe {
+        (*info).version = RESOURCE_INFO_EXT_VERSION;
+        (*info).has_dmabuf_export = false;
+        (*info).planes = 1;
+        (*info).modifiers = 0;
+        (*info).d3d_tex2d = core::ptr::null_mut();
+    }
+    0
 }
+
+/// `VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION`, which the C's header pins at zero.
+const RESOURCE_INFO_EXT_VERSION: c_int = 0;
 
 /// Hand a resource's storage to another process as a file descriptor.
 ///

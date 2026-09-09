@@ -1516,6 +1516,11 @@ impl Renderer {
         self.vrend.as_ref()?.resource_surface(handle)
     }
 
+    /// The GL texture a classic resource's storage is. Asked of vrend, which owns it.
+    pub fn classic_texture(&self, handle: ResourceHandle) -> Option<crate::vrend::gl::TextureName> {
+        self.vrend.as_ref()?.resource_texture(handle)
+    }
+
     /// The share of storage a resource holds, for the paths that act on the bytes themselves.
     ///
     /// One resolution, so the id a frame is published under and the pixels read out of it cannot
