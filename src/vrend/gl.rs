@@ -2346,26 +2346,44 @@ impl Gl {
         Some(Fence(sync))
     }
 
-    /// Wait for a fence's work to have run, then delete it. Consumes the fence: it is spent.
+    /// Wait once for a fence's work to have run, up to `timeout_ns`.
     ///
-    /// `true` if the work completed, `false` if the wait timed out or the driver failed it -- a
-    /// caller that must not retire early treats both the same way. The sync is deleted either
-    /// way, because a fence that timed out is no more reusable than one that signalled.
+    /// Borrows rather than consumes, because one wait is not an answer: `glClientWaitSync` may
+    /// report a timeout at an implementation's own cap rather than at the one asked for, so a
+    /// caller that means "wait until it is done" has to come back. Spend the fence with
+    /// [`Gl::fence_delete`] once the answer is one it will act on.
     ///
     /// Call this on a context of the share group the fence was taken in; it need not be, and
     /// normally is not, the context that took it.
-    pub fn wait_fence(&self, fence: Fence, timeout_ns: u64) -> bool {
-        // `Fence` aborts on drop, so take the token out without letting the destructor run: this
-        // call is what spending it means.
-        let fence = core::mem::ManuallyDrop::new(fence);
-        let sync = fence.0;
-        // SAFETY: `sync` came from `glFenceSync` on a context of this share group and has not been
-        // deleted -- `Fence` is not `Copy` and this is the only place that deletes one, so no other
-        // owner can have spent it. Zero flags: the flush this fence was created with is what makes
-        // the work reachable, and `GL_SYNC_FLUSH_COMMANDS_BIT` would flush the wrong context.
-        let got = unsafe { self.t.glClientWaitSync()(sync, 0, timeout_ns) };
-        // SAFETY: as above, and nothing reads `sync` after this.
-        unsafe { self.t.glDeleteSync()(sync) };
-        got == GL_ALREADY_SIGNALED || got == GL_CONDITION_SATISFIED
+    pub fn fence_wait(&self, fence: &Fence, timeout_ns: u64) -> FenceWait {
+        // SAFETY: `sync` came from `glFenceSync` on a context of this share group and is alive --
+        // only `fence_delete` deletes one, and it consumes the `Fence`, which is not `Copy`. Zero
+        // flags: the flush the fence was created with is what makes the work reachable, and
+        // `GL_SYNC_FLUSH_COMMANDS_BIT` would flush this thread's context, not the one holding it.
+        let got = unsafe { self.t.glClientWaitSync()(fence.0, 0, timeout_ns) };
+        match got {
+            GL_ALREADY_SIGNALED | GL_CONDITION_SATISFIED => FenceWait::Signalled,
+            GL_TIMEOUT_EXPIRED => FenceWait::Timeout,
+            _ => FenceWait::Failed,
+        }
     }
+
+    /// Delete a fence. Consumes it: this is what spending one means.
+    pub fn fence_delete(&self, fence: Fence) {
+        // `Fence` aborts on drop, so take the token out without letting the destructor run.
+        let fence = core::mem::ManuallyDrop::new(fence);
+        // SAFETY: as `fence_wait` -- alive, of this share group, and nothing reads it after this.
+        unsafe { self.t.glDeleteSync()(fence.0) };
+    }
+}
+
+/// What one [`Gl::fence_wait`] found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FenceWait {
+    /// The work has run.
+    Signalled,
+    /// Not yet. Says nothing about whether it ever will: come back.
+    Timeout,
+    /// The driver refused the wait. Not a fence anyone should keep waiting on.
+    Failed,
 }
