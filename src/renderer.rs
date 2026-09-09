@@ -1542,6 +1542,18 @@ impl Renderer {
         self.vrend.as_ref()?.resource_texture(handle)
     }
 
+    /// The pixels behind a classic cursor resource, for a VMM that draws the pointer itself.
+    ///
+    /// Asked of vrend, which owns the texture the cursor lives in. `None` when nothing holds the
+    /// handle, when the resource is not shaped like a cursor, or when the driver would not read
+    /// it back -- all of which a VMM reads the same way: no pointer this frame.
+    pub fn classic_cursor(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> Option<crate::vrend::vrend::Cursor> {
+        self.vrend.as_mut()?.cursor_contents(handle)
+    }
+
     /// The share of storage a resource holds, for the paths that act on the bytes themselves.
     ///
     /// One resolution, so the id a frame is published under and the pixels read out of it cannot

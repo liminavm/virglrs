@@ -623,6 +623,45 @@ fn read_layer(
     Ok(())
 }
 
+/// Read the whole of level 0 out of a 2D texture, rows in the order the resource stores them.
+///
+/// The readback half of `vrend_renderer_get_cursor_contents`. It differs from [`read`] in having
+/// no guest pages and no box: the caller wants the image, so there is no region to validate and
+/// nothing to scatter into an iov.
+///
+/// The flip belongs here rather than at the call site because the convention does: GL hands rows
+/// back bottom-up, and a `y_0_top` resource stores them the other way up. A caller that had to
+/// remember that would be a caller that can forget it.
+pub fn read_whole_2d(
+    gl: &Gl,
+    features: &Features,
+    formats: &Table,
+    res: &Resource,
+    dst: &mut [u8],
+) -> Result<(), Error> {
+    let desc = res.args.format.describe().ok_or(Error::Unsupported)?;
+    let (w, h) = (res.args.width, res.args.height);
+    let stride = desc.stride(w) as usize;
+    // Widened deliberately. `size_2d` is `blocks_high * stride` in u32, and a resource large
+    // enough to wrap that product would pass a guard computed from it while GL still wrote the
+    // real number of rows -- past the end of a `dst` this function had just called big enough.
+    // Today's only caller refuses anything over 128x128 before it gets here, so nothing reaches
+    // that; the guard is this function's own contract rather than its caller's, and a public
+    // helper should not depend on who happens to call it.
+    if (dst.len() as u64) < desc.blocks_high(h) as u64 * stride as u64 {
+        return Err(Error::Unsupported);
+    }
+    read_layer(gl, features, formats, res, 0, 0, 0, 0, w as GLsizei, h as GLsizei, dst)?;
+    if res.y_0_top() {
+        let n = desc.blocks_high(h) as usize;
+        for r in 0..n / 2 {
+            let (a, b) = dst.split_at_mut((n - 1 - r) * stride);
+            a[r * stride..(r + 1) * stride].swap_with_slice(&mut b[..stride]);
+        }
+    }
+    Ok(())
+}
+
 /// Copy the box from the resource into the pages: `vrend_renderer_transfer_send_iov`.
 #[allow(clippy::too_many_arguments)]
 pub fn read(

@@ -22,6 +22,7 @@ use super::formats::Table;
 use super::gl::gles::GL_VERSION;
 use super::gl::{self, Gl};
 use super::journal::{Census, Seq};
+use super::pipe::TextureTarget;
 use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::shader;
 use super::tally;
@@ -170,6 +171,18 @@ impl fmt::Display for ClaimRefused {
             ClaimRefused::Unmappable => write!(f, "the buffer's pages cannot be mapped"),
         }
     }
+}
+
+/// A cursor image, as read back from the resource the guest set it from.
+///
+/// The extent travels with the pixels because neither means anything alone: a caller told a size
+/// separately from the buffer it measures is a caller that can be told the wrong shape for the
+/// bytes it has.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Cursor {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
 }
 
 impl Vrend {
@@ -633,6 +646,41 @@ impl Vrend {
         Some(self.resources.get(&handle)?.resource()?.texture()?.name)
     }
 
+    /// The pixels behind a cursor resource: `vrend_renderer_get_cursor_contents`.
+    ///
+    /// For a VMM that draws the pointer itself. QEMU does: the guest puts its cursor on a plane,
+    /// virtio-gpu turns that into cursor-queue commands, and the VMM then needs the *image* --
+    /// which lives in a host texture it cannot read. Motion and clicks travel elsewhere entirely,
+    /// so a renderer that answers nothing here costs a visible pointer and nothing else, which is
+    /// exactly how it goes unnoticed.
+    ///
+    /// `None` for anything that cannot be a cursor. The size ceiling and the 2D-only rule are the
+    /// C's, and they are what keep this from being a general readback of any resource by a caller
+    /// that only has a handle.
+    pub fn cursor_contents(&mut self, handle: ResourceHandle) -> Option<Cursor> {
+        // ctx0 first, as the C does: the readback binds a framebuffer, and doing that in
+        // whichever context ran last would change a binding the guest still expects to be its
+        // own. It also has to happen before the resource is borrowed, since it needs `&mut self`.
+        self.switch_ctx0();
+        let res = self.resources.get(&handle)?.resource()?;
+        // Multisampled is refused here rather than left to fail downstream. It would: attaching
+        // one and reading it back is an error GL reports, so the answer is already `None`. But
+        // this is the C's guard set and the refusals are supposed to be the readable half of it
+        // -- `resource.rs` spells the same trio out wherever it asks this question -- and a
+        // refusal named here costs no framebuffer to discover.
+        if res.args.target != TextureTarget::Texture2d || res.args.nr_samples > 1 {
+            return None;
+        }
+        if res.args.width > 128 || res.args.height > 128 {
+            return None;
+        }
+        let desc = res.args.format.describe()?;
+        let mut pixels =
+            vec![0u8; desc.size_2d(desc.stride(res.args.width), res.args.height) as usize];
+        transfer::read_whole_2d(&self.gl, &self.features, &self.formats, res, &mut pixels).ok()?;
+        Some(Cursor { width: res.args.width, height: res.args.height, pixels })
+    }
+
     /// A share of that surface, for a holder outside vrend -- a venus context importing this
     /// resource, which must keep the surface alive rather than name it. See
     /// [`resource::Resource::surface_share`].
@@ -1001,6 +1049,60 @@ mod tests {
             let f = super::super::proto::Format::from_wire(raw).unwrap();
             eprintln!("{raw:>4} {:<24} {:?}", f.name(), v.formats.get(f));
         }
+    }
+
+    /// What a cursor readback will and will not answer for, against a live driver.
+    ///
+    /// The refusals are the interesting half: this is reached with nothing but a resource handle,
+    /// so without the ceiling and the 2D rule it would be a way to read any resource back through
+    /// a call that is supposed to be about a pointer. The pixels themselves are scored by a guest
+    /// -- a desktop with a visible pointer -- because that is what the answer is for.
+    #[test]
+    fn only_a_cursor_shaped_resource_reads_back_as_one() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+        )
+        .expect("vrend comes up");
+
+        // B8G8R8A8_UNORM, which is what a cursor plane is everywhere it exists.
+        let bgra = super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM");
+        let tex = |w: u32, h: u32| resource::Args {
+            target: TextureTarget::Texture2d,
+            format: bgra,
+            bind: resource::Bind(1 << 1),
+            width: w,
+            height: h,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags(0),
+        };
+        let handle = |n: u32| ResourceHandle::new(n).expect("a resource handle is non-zero");
+
+        v.resource_create(handle(1), tex(64, 64)).expect("a cursor-sized texture");
+        let cursor = v.cursor_contents(handle(1)).expect("reads back");
+        assert_eq!((cursor.width, cursor.height), (64, 64));
+        // The buffer is the image's size and not a row short of it: the extent and the bytes are
+        // handed over together precisely so a caller cannot be told the wrong shape for them.
+        assert_eq!(cursor.pixels.len(), 64 * 64 * 4, "four bytes a pixel, every row present");
+
+        // Past the ceiling. A scanout is this shape, and it is not a cursor.
+        v.resource_create(handle(2), tex(256, 256)).expect("an ordinary texture");
+        assert!(v.cursor_contents(handle(2)).is_none(), "larger than any cursor plane");
+
+        // A handle nothing holds. Not an error to a VMM -- it means no pointer this frame.
+        assert!(v.cursor_contents(handle(3)).is_none(), "nothing holds this handle");
     }
 
     #[test]
