@@ -954,6 +954,13 @@ impl Gl {
     }
 
     /// Pin the pack state to tightly packed rows, which is what every readback here assumes.
+    ///
+    /// `GL_PACK_ALIGNMENT` is the load-bearing one and its default is 4, not 1. Readbacks compute
+    /// their offsets from the format's own stride, so a row that is not a multiple of four bytes
+    /// -- a 127-wide R8 image, say -- would come back padded to a stride nothing else here knows
+    /// about: the rows would be read at the wrong offsets, and the last one would be written past
+    /// the end of a buffer sized from the unpadded number. Every caller of `read_pixels` depends
+    /// on this having run, and none of them can see it from where they are.
     pub fn pack_tight(&self) {
         self.pixel_store_i(GL_PACK_ROW_LENGTH, 0);
         self.pixel_store_i(GL_PACK_SKIP_PIXELS, 0);
