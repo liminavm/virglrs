@@ -571,7 +571,7 @@ fn add_shader_program(
         fs_blend_equation_advanced: fs.info.fs_blend_equation_advanced,
     };
 
-    gl.use_program(Some(id));
+    gl.use_program(host.current.program(), Some(id));
 
     // Stage order as the C walks it, vertex through the last stage.
     let walk: Vec<&Linked<'_>> = C_STAGE_ORDER
@@ -1495,7 +1495,7 @@ impl Context {
         let prog_id = prog.id;
         let reads_drawid = prog.reads_drawid;
         let fs_blend_advanced = prog.fs_blend_equation_advanced;
-        gl.use_program(Some(prog_id));
+        gl.use_program(host.current.program(), Some(prog_id));
 
         if features.has(Feature::draw_parameters) && reads_drawid {
             let drawid = draw.tess.map_or(0, |t| t.drawid) as i32;

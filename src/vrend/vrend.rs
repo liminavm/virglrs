@@ -15,7 +15,7 @@
 
 use super::blitter;
 use super::caps;
-use super::context::{Context, Current, Fault, Guest, Host, Todo};
+use super::context::{Context, Current, Fault, GlContext, Guest, Host, Todo};
 use super::egl::{self, EglError, Flavour, Version, Winsys};
 use super::features::{Feature, Features};
 use super::formats::Table;
@@ -252,7 +252,7 @@ impl Vrend {
             video,
             ctx0,
             version,
-            current: Current::Ctx0,
+            current: Current::ctx0(),
             resources: crate::Map::default(),
             contexts: crate::Map::default(),
             todo: Todo::default(),
@@ -286,9 +286,9 @@ impl Vrend {
 
     /// Make ctx0 current, if it is not already.
     fn switch_ctx0(&mut self) {
-        if self.current != Current::Ctx0 {
+        if !self.current.is(GlContext::Ctx0) {
             self.winsys.make_current(&self.ctx0).expect("ctx0 was current once and still exists");
-            self.current = Current::Ctx0;
+            self.current.switched_to(GlContext::Ctx0);
         }
     }
 
@@ -716,10 +716,10 @@ impl Vrend {
         for id in which {
             let Some(ctx) = self.contexts.get(id) else { continue };
             for (sub, gl_ctx) in ctx.gl_contexts() {
-                let want = Current::Sub(*id, sub);
-                if self.current != want {
+                let want = GlContext::Sub(*id, sub);
+                if !self.current.is(want) {
                     self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
-                    self.current = want;
+                    self.current.switched_to(want);
                 }
                 self.gl.finish();
             }
@@ -745,10 +745,10 @@ impl Vrend {
     pub fn finish_all(&mut self) {
         for (id, ctx) in &self.contexts {
             for (sub, gl_ctx) in ctx.gl_contexts() {
-                let want = Current::Sub(*id, sub);
-                if self.current != want {
+                let want = GlContext::Sub(*id, sub);
+                if !self.current.is(want) {
                     self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
-                    self.current = want;
+                    self.current.switched_to(want);
                 }
                 self.gl.finish();
             }
@@ -858,9 +858,18 @@ impl Vrend {
             .and_then(resource::Slot::resource_mut)
             .ok_or(transfer::Error::NoPages)?;
         if to_host {
-            transfer::write(&self.gl, &self.formats, res, own, pages, info)
+            transfer::write(&self.gl, self.current.program(), &self.formats, res, own, pages, info)
         } else {
-            transfer::read(&self.gl, &self.features, &self.formats, res, own, pages, info)
+            transfer::read(
+                &self.gl,
+                self.current.program(),
+                &self.features,
+                &self.formats,
+                res,
+                own,
+                pages,
+                info,
+            )
         }
     }
 }

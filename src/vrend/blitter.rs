@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use super::features::{Feature, Features};
 use super::gl::gles::*;
 use super::gl::{
-    BufferName, FramebufferName, GLenum, GLint, GLsizei, Gl, ProgramName, ShaderName, TextureName,
-    TextureUnit, VertexArrayName,
+    BoundProgram, BufferName, FramebufferName, GLenum, GLint, GLsizei, Gl, ProgramName, ShaderName,
+    TextureName, TextureUnit, VertexArrayName,
 };
 use super::pipe::{Swizzle, TexFilter, TextureTarget};
 use super::proto::Format;
@@ -315,7 +315,13 @@ impl Blitter {
     ///
     /// The caller has made this blitter's context current and resolved every end of the blit into
     /// [`Job`]; this touches nothing the caller owns but the two textures the job names.
-    pub fn run(&mut self, gl: &Gl, features: &Features, job: &Job) -> Result<(), Unserved> {
+    pub fn run(
+        &mut self,
+        gl: &Gl,
+        features: &Features,
+        bound: &mut BoundProgram,
+        job: &Job,
+    ) -> Result<(), Unserved> {
         let key = ProgramKey {
             color: job.color,
             manual_srgb_decode: job.manual_srgb_decode,
@@ -328,7 +334,7 @@ impl Blitter {
         let prog = self.program(gl, key).ok_or(Unserved::NoProgram)?;
         let (src0, src1, dst0, dst1) =
             bounded_points(job.src_w, job.src_h, job.src_box, job.dst_box);
-        gl.use_program(Some(prog));
+        gl.use_program(bound, Some(prog));
         gl.bind_vertex_array(Some(self.vao));
         gl.bind_framebuffer(GL_FRAMEBUFFER, Some(self.fbo));
         gl.draw_buffers(&[GL_COLOR_ATTACHMENT0]);
@@ -411,7 +417,7 @@ impl Blitter {
             gl.buffer_data(GL_ARRAY_BUFFER, &vertex_bytes(&vertices), GL_STATIC_DRAW);
             gl.draw_arrays(GL_TRIANGLE_FAN, 0, VERTICES as GLsizei);
         }
-        gl.use_program(None);
+        gl.use_program(bound, None);
         gl.framebuffer_texture_2d(GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, None, 0);
         gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, None, 0);
         gl.bind_texture(job.src_gl_target, None);
@@ -432,13 +438,14 @@ impl Blitter {
     pub fn convert_planes(
         &mut self,
         gl: &Gl,
+        bound: &mut BoundProgram,
         dst: TextureName,
         dst_w: u32,
         dst_h: u32,
         planes: [TextureName; 2],
     ) -> Result<(), Unserved> {
-        let prog = self.yuv_program(gl).ok_or(Unserved::NoProgram)?;
-        gl.use_program(Some(prog));
+        let prog = self.yuv_program(gl, bound).ok_or(Unserved::NoProgram)?;
+        gl.use_program(bound, Some(prog));
         gl.bind_vertex_array(Some(self.vao));
         gl.bind_framebuffer(GL_FRAMEBUFFER, Some(self.fbo));
         gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(dst), 0);
@@ -452,7 +459,7 @@ impl Blitter {
                  framebuffer (0x{status:x}); its planes stay unconverted"
             );
             gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, None, 0);
-            gl.use_program(None);
+            gl.use_program(bound, None);
             return Err(Unserved::NoProgram);
         }
 
@@ -496,13 +503,13 @@ impl Blitter {
             gl.active_texture(TextureUnit::at(unit as u32));
             gl.bind_texture(GL_TEXTURE_2D, None);
         }
-        gl.use_program(None);
+        gl.use_program(bound, None);
         gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, None, 0);
         Ok(())
     }
 
     /// The YUV program, built and cached on first use.
-    fn yuv_program(&mut self, gl: &Gl) -> Option<ProgramName> {
+    fn yuv_program(&mut self, gl: &Gl, bound: &mut BoundProgram) -> Option<ProgramName> {
         if let Some(p) = self.yuv {
             return Some(p);
         }
@@ -524,13 +531,13 @@ impl Blitter {
         }
         // The sampler uniforms name texture units, and the units never change, so they are set
         // once here rather than per pass.
-        gl.use_program(Some(prog));
+        gl.use_program(bound, Some(prog));
         for (name, unit) in [("luma", 0u32), ("chroma", 1)] {
             if let Some(loc) = gl.get_uniform_location(prog, name) {
                 gl.uniform_1i(loc, TextureUnit::at(unit).uniform_value());
             }
         }
-        gl.use_program(None);
+        gl.use_program(bound, None);
         self.yuv = Some(prog);
         Some(prog)
     }
@@ -913,7 +920,14 @@ mod tests {
                 (name, image)
             });
             blitter
-                .convert_planes(&gl, base, W, H, [planes[0].0, planes[1].0])
+                .convert_planes(
+                    &gl,
+                    &mut BoundProgram::default(),
+                    base,
+                    W,
+                    H,
+                    [planes[0].0, planes[1].0],
+                )
                 .expect("the conversion runs");
 
             let fb = gl.gen_framebuffer();

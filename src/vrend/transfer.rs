@@ -17,7 +17,7 @@
 use super::features::{Feature, Features};
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
-use super::gl::{GLenum, GLint, GLsizei, Gl, TextureName, pixel_bytes};
+use super::gl::{BoundProgram, GLenum, GLint, GLsizei, Gl, TextureName, pixel_bytes};
 use super::proto::Box3;
 use super::resource::{Resource, Storage};
 use crate::guest_mem::Iov;
@@ -310,6 +310,7 @@ fn upload_y(res: &Resource, b: &Box3, invert: bool) -> GLint {
 /// buffer mirrors.
 pub fn write(
     gl: &Gl,
+    bound: &mut BoundProgram,
     formats: &Table,
     res: &mut Resource,
     own: Option<&Iov<'_>>,
@@ -416,7 +417,7 @@ pub fn write(
             }
             let (x, y) = (b.x, upload_y(res, &b, invert));
             let (w, h, d) = (b.width, b.height, b.depth);
-            gl.use_program_none();
+            gl.use_program(bound, None);
             gl.bind_texture(target, Some(name));
             gl.unpack_tight();
             gl.drain_errors();
@@ -623,8 +624,10 @@ fn read_layer(
 }
 
 /// Copy the box from the resource into the pages: `vrend_renderer_transfer_send_iov`.
+#[allow(clippy::too_many_arguments)]
 pub fn read(
     gl: &Gl,
+    bound: &mut BoundProgram,
     features: &Features,
     formats: &Table,
     res: &Resource,
@@ -697,7 +700,7 @@ pub fn read(
             let mut data = vec![0u8; total];
             let layer = l.layer() as usize;
             let y = if invert { res.height_at(info.level) as GLint - b.y - b.height } else { b.y };
-            gl.use_program_none();
+            gl.use_program(bound, None);
             gl.pack_tight();
             for d in 0..l.depth as usize {
                 let dst = &mut data[d * layer..(d + 1) * layer];
