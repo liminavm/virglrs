@@ -16,7 +16,7 @@
 use super::blitter;
 use super::caps;
 use super::context::{Context, Current, Fault, GlContext, Guest, Host, Todo};
-use super::egl::{self, EglError, Flavour, Version, Winsys};
+use super::egl::{self, EglError, Flavour, GlContexts, Version, Winsys};
 use super::features::{Feature, Features};
 use super::formats::Table;
 use super::gl::gles::GL_VERSION;
@@ -41,6 +41,10 @@ pub enum InitError {
     Egl(EglError),
     /// No GLES 3.x context could be made.
     NoContext,
+    /// The context that was made is not GLES, carrying its `GL_VERSION`. Only reachable when
+    /// something else minted it: this renderer asks its own display for GLES and gets it or
+    /// nothing.
+    NotGles(String),
 }
 
 impl fmt::Display for InitError {
@@ -48,6 +52,10 @@ impl fmt::Display for InitError {
         match self {
             InitError::Egl(e) => write!(f, "{e}"),
             InitError::NoContext => f.write_str("no GLES 3.x context could be created"),
+            InitError::NotGles(v) => write!(
+                f,
+                "the embedder's GL context is {v}, and this renderer translates for GLES only"
+            ),
         }
     }
 }
@@ -166,13 +174,20 @@ impl fmt::Display for ClaimRefused {
 
 impl Vrend {
     /// Open the winsys, bring ctx0 up on this thread and probe the driver.
+    ///
+    /// `contexts` is an embedder's context factory, when there is one; without it the winsys is
+    /// this renderer's own surfaceless display. See [`GlContexts`].
     pub fn new(
         config: Config,
         budget: &Arc<crate::budget::Budget>,
         fences: crate::fence::Handle,
+        contexts: Option<Box<dyn GlContexts>>,
     ) -> Result<Vrend, InitError> {
         let fences_for_inline = fences.clone();
-        let winsys = Winsys::open(Flavour::Gles)?;
+        let winsys = match contexts {
+            Some(contexts) => Winsys::embedded(Flavour::Gles, contexts)?,
+            None => Winsys::open(Flavour::Gles)?,
+        };
         let mut ctx0 = None;
         for v in VERSIONS {
             if let Ok(c) = winsys.create_context(v, None) {
@@ -184,6 +199,13 @@ impl Vrend {
         winsys.make_current(&ctx0)?;
         let gl = Gl::new(winsys.gles());
         let version_string = gl.get_string(GL_VERSION);
+        // Whose choice the client API was depends on who minted the context, so it is read back
+        // rather than assumed. A desktop-GL context parses as a plausible GLES number and serves
+        // nothing: `4.6 (Core Profile)` would be read as "GLES 4.6", and every probe below it
+        // would answer about an API this renderer does not translate for.
+        if !version_string.starts_with("OpenGL ES ") {
+            return Err(InitError::NotGles(version_string));
+        }
         let gles_version = parse_gles_version(&version_string);
         let mut features = Features::probe(gles_version, gl.extensions());
         if !winsys.has_extension("EGL_KHR_gl_colorspace") {
@@ -231,20 +253,24 @@ impl Vrend {
         // driver that will not give a second context is not a reason to refuse to start: the fence
         // path falls back to finishing inline, which is what this renderer did before there was a
         // waiter at all. The C makes the same choice when its sync context fails.
-        let waiter = match winsys.create_context(version, Some(&ctx0)) {
-            Ok(wait_ctx) => Some(waiter::Waiter::start(
-                winsys.thread_display(),
-                wait_ctx,
-                Gl::new(winsys.gles()),
-                fences,
-            )),
-            Err(e) => {
-                eprintln!(
-                    "[virglrs] vrend: no context for the fence waiter ({e}); \
-                     classic fences will finish inline"
-                );
-                None
-            }
+        // An embedder's contexts belong to the renderer's thread, so there is no display handle
+        // for a waiter to hold and no waiter to start -- which is also what the C does here: a VMM
+        // that asked for neither THREAD_SYNC nor ASYNC_FENCE_CB has no sync thread either, and
+        // checks its fences when it polls.
+        let waiter = match winsys.thread_display() {
+            None => None,
+            Some(display) => match winsys.create_context(version, Some(&ctx0)) {
+                Ok(wait_ctx) => {
+                    Some(waiter::Waiter::start(display, wait_ctx, Gl::new(winsys.gles()), fences))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[virglrs] vrend: no context for the fence waiter ({e}); \
+                         classic fences will finish inline"
+                    );
+                    None
+                }
+            },
         };
         let fences = fences_for_inline;
         Ok(Vrend {
@@ -961,6 +987,7 @@ mod tests {
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
             retire.handle(),
+            None,
         )
         .expect("vrend comes up");
         let present: Vec<&str> = v.features.present().map(|f| f.name()).collect();

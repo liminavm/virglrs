@@ -14,6 +14,7 @@ pub const CALLBACKS_VERSION: c_int = 4;
 // virgl_renderer_init flags.
 pub const USE_EGL: c_int = 1;
 pub const THREAD_SYNC: c_int = 2;
+pub const USE_GLX: c_int = 1 << 2;
 pub const USE_SURFACELESS: c_int = 1 << 3;
 pub const USE_GLES: c_int = 1 << 4;
 pub const VENUS: c_int = 1 << 6;
@@ -44,12 +45,19 @@ pub const BLOB_FD_TYPE_SHM: u32 = 0x0003;
 pub const MAP_CACHE_CACHED: u32 = 0x01;
 pub const MAP_CACHE_WC: u32 = 0x03;
 
+/// `virgl_renderer_gl_ctx_param`: what the renderer asks the VMM to mint a GL context with.
+///
+/// Field order is the header's, which is not the order the fields are used in: `shared` sits
+/// between the struct's version and the API version it asks for.
 #[repr(C)]
 pub struct GlCtxParam {
+    /// The struct's own version, not the client API's. The C passes 2 and nothing reads it.
+    pub version: c_int,
+    pub shared: bool,
     pub major_ver: c_int,
     pub minor_ver: c_int,
-    pub shared: bool,
-    pub compat_ctx: bool,
+    /// An `int` in the header, beside a `bool`; kept as it is written there.
+    pub compat_ctx: c_int,
 }
 
 #[repr(C)]
@@ -255,6 +263,22 @@ mod tests {
         assert_eq!(offset_of!(Callbacks, get_server_fd), 56);
         assert_eq!(offset_of!(Callbacks, get_egl_display), 64);
         assert_eq!(size_of::<Callbacks>(), 72);
+    }
+
+    /// The renderer fills one of these and the VMM reads it, so a field in the wrong place is a
+    /// context created to the wrong description -- or, for `shared`, one that shares with nothing
+    /// and quietly renders into a namespace of its own.
+    ///
+    /// Ground truth: `offsetof` under `cc` on `src/virglrenderer.h`.
+    #[test]
+    fn the_gl_context_param_matches_the_c_header() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(GlCtxParam, version), 0);
+        assert_eq!(offset_of!(GlCtxParam, shared), 4);
+        assert_eq!(offset_of!(GlCtxParam, major_ver), 8);
+        assert_eq!(offset_of!(GlCtxParam, minor_ver), 12);
+        assert_eq!(offset_of!(GlCtxParam, compat_ctx), 16);
+        assert_eq!(size_of::<GlCtxParam>(), 20);
     }
 
     /// `virgl_renderer_execute` reads its request through these structs and writes its answer

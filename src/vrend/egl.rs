@@ -99,6 +99,37 @@ pub enum Flavour {
     Gles,
 }
 
+/// The GL contexts the renderer runs on, when something else mints them.
+///
+/// An embedder that already owns a GL stack -- a VMM drawing the guest's scanout into its own
+/// window, a compositor hosting the renderer -- cannot simply be handed a texture name from a
+/// display of ours: a name means nothing outside the share group it was created in. Implementing
+/// this puts the renderer's contexts in *its* group, which is what makes the name it is given
+/// nameable.
+///
+/// It is all of them or none. ctx0, every sub-context, the blitter's and the fence waiter's must
+/// come from one factory, or they stop sharing with each other as well.
+///
+/// **Called only on the renderer's thread.** A GDK context can be made current on the thread that
+/// created it and no other, and a windowed backend's is bound to a surface belonging to that
+/// thread, so nothing here may be reached from a worker. [`Winsys::thread_display`] answers `None`
+/// for a winsys backed by this, which is what stops a second thread from existing to try.
+pub trait GlContexts: Send + Sync {
+    /// The EGL display the contexts belong to, for the queries and images that need one. It is the
+    /// embedder's: already initialised, and not ours to terminate.
+    fn display(&self) -> EGLDisplay;
+
+    /// Mint a context of `version`, in the share group of the ones already minted when `shared`.
+    fn create(&self, version: Version, shared: bool) -> Option<EGLContext>;
+
+    /// Bind `ctx` on the calling thread. The embedder is the only thing that knows what is
+    /// current, so this is asked every time rather than cached.
+    fn make_current(&self, ctx: EGLContext) -> Result<(), EglError>;
+
+    /// Give back a context this minted.
+    fn destroy(&self, ctx: EGLContext);
+}
+
 /// A client API version to ask `eglCreateContext` for.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Version {
@@ -111,7 +142,17 @@ pub struct Version {
 struct Shared {
     egl: Egl,
     display: EGLDisplay,
-    config: EGLConfig,
+    backing: Backing,
+}
+
+/// Who owns the display and mints the contexts on it.
+///
+/// The two differ in more than how a context is made: an embedder's display was initialised by
+/// the embedder and must not be terminated here, and its context tokens are its own -- under GTK a
+/// `GdkGLContext *`, which is not an `EGLContext` and must never be passed to EGL.
+enum Backing {
+    Own { config: EGLConfig },
+    Embedder(Box<dyn GlContexts>),
 }
 
 // SAFETY: an `EGLDisplay`, `EGLConfig` or `EGLContext` is a token the library hands out, not
@@ -137,6 +178,12 @@ impl Shared {
     /// relying on are trampled. `eglGetCurrentContext` is a thread-local read and costs far less
     /// than the `eglMakeCurrent` it saves, so the truth is cheaper here than the copy of it.
     fn make_current(&self, ctx: EGLContext) -> Result<(), EglError> {
+        // The embedder's tokens are not EGL's, so there is nothing to compare them against and
+        // every bind goes through: it is the only thing that knows what its own window has
+        // current, and the backends that do this dedup a repeat bind themselves.
+        if let Backing::Embedder(contexts) = &self.backing {
+            return contexts.make_current(ctx);
+        }
         // SAFETY: `eglGetCurrentContext` takes nothing and is defined on any thread.
         if unsafe { self.egl.eglGetCurrentContext()() } == ctx {
             return Ok(());
@@ -160,6 +207,11 @@ impl Shared {
 
 impl Drop for Shared {
     fn drop(&mut self) {
+        // An embedder's display is the embedder's: it initialised it, other things of its own are
+        // on it, and terminating it here would take them with us.
+        if matches!(self.backing, Backing::Embedder(_)) {
+            return;
+        }
         // SAFETY: `display` is the initialised display this struct owns, and every context and
         // image created on it holds an `Arc` of this struct, so all of them are gone by now.
         unsafe { self.egl.eglTerminate()(self.display) };
@@ -186,6 +238,10 @@ unsafe impl Send for Context {}
 
 impl Drop for Context {
     fn drop(&mut self) {
+        if let Backing::Embedder(contexts) = &self.shared.backing {
+            contexts.destroy(self.ctx);
+            return;
+        }
         // SAFETY: `ctx` was returned by `eglCreateContext` on this display and has not been
         // destroyed, because only this drop destroys it.
         unsafe { self.shared.egl.eglDestroyContext()(self.shared.display, self.ctx) };
@@ -368,7 +424,11 @@ impl Winsys {
             return Err(EglError { call: "eglInitialize", code });
         }
         // From here the display is owned, and `Shared`'s drop terminates it on any failure.
-        let shared = Arc::new(Shared { egl, display, config: core::ptr::null_mut() });
+        let shared = Arc::new(Shared {
+            egl,
+            display,
+            backing: Backing::Own { config: core::ptr::null_mut() },
+        });
         let egl = &shared.egl;
 
         let extensions: BTreeSet<String> = {
@@ -412,12 +472,51 @@ impl Winsys {
         // The config is the one field not known at construction; `Arc::get_mut` holds because
         // nothing else has cloned the `Arc` yet.
         let mut shared = shared;
-        Arc::get_mut(&mut shared).expect("no context exists yet").config = config;
+        match &mut Arc::get_mut(&mut shared).expect("no context exists yet").backing {
+            Backing::Own { config: slot } => *slot = config,
+            Backing::Embedder(_) => unreachable!("this constructor built an owned backing"),
+        }
 
         Ok(Winsys {
             shared,
             flavour,
             version: Version { major: major as u32, minor: minor as u32 },
+            extensions,
+        })
+    }
+
+    /// A winsys over contexts the embedder mints, on the display it already owns.
+    ///
+    /// Nothing is initialised or configured here: the display is the embedder's, and the config a
+    /// context is made with is its business, not ours. What is read from it is what a display can
+    /// be asked without owning it -- its version and its extensions.
+    ///
+    /// The flavour is the embedder's choice too, and is not knowable until a context exists and is
+    /// current, so this records what was asked for; [`Winsys::gles`]'s caller is what finds out
+    /// what arrived.
+    pub fn embedded(flavour: Flavour, contexts: Box<dyn GlContexts>) -> Result<Winsys, EglError> {
+        let egl = table();
+        let display = contexts.display();
+        if display == proc::EGL_NO_DISPLAY {
+            return Err(EglError {
+                call: "get_egl_display",
+                code: proc::EGL_BAD_DISPLAY as EGLint,
+            });
+        }
+        let extensions: BTreeSet<String> = {
+            // SAFETY: the embedder initialised this display before handing it over.
+            let p = unsafe { egl.eglQueryString()(display, proc::EGL_EXTENSIONS as EGLint) };
+            c_str_to_string(p).split(' ').filter(|s| !s.is_empty()).map(str::to_string).collect()
+        };
+        let version = {
+            // SAFETY: as above.
+            let p = unsafe { egl.eglQueryString()(display, proc::EGL_VERSION as EGLint) };
+            parse_egl_version(&c_str_to_string(p))
+        };
+        Ok(Winsys {
+            shared: Arc::new(Shared { egl, display, backing: Backing::Embedder(contexts) }),
+            flavour,
+            version,
             extensions,
         })
     }
@@ -458,12 +557,25 @@ impl Winsys {
             assert!(Arc::ptr_eq(&c.shared, &self.shared), "a share context from another display");
             c.ctx
         });
+        if let Backing::Embedder(contexts) = &self.shared.backing {
+            // The embedder is told whether to share, not what with: it mints every context of this
+            // renderer into one group of its own, so naming one of them would say nothing it does
+            // not already know.
+            let ctx = contexts.create(version, shared.is_some()).ok_or(EglError {
+                call: "create_gl_context",
+                code: proc::EGL_BAD_CONTEXT as EGLint,
+            })?;
+            return Ok(Context { shared: Arc::clone(&self.shared), ctx });
+        }
+        let config = match &self.shared.backing {
+            Backing::Own { config } => *config,
+            Backing::Embedder(_) => unreachable!("returned just above"),
+        };
         let egl = &self.shared.egl;
         // SAFETY: the display is initialised and the config chosen on it; `attribs` is
         // NONE-terminated; `share` is either no context or one alive on this display.
-        let ctx = unsafe {
-            egl.eglCreateContext()(self.shared.display, self.shared.config, share, attribs.as_ptr())
-        };
+        let ctx =
+            unsafe { egl.eglCreateContext()(self.shared.display, config, share, attribs.as_ptr()) };
         if ctx == proc::EGL_NO_CONTEXT {
             return Err(self.shared.error("eglCreateContext"));
         }
@@ -484,12 +596,21 @@ impl Winsys {
     /// a context of the share group and wait on it while this thread carries on. It deliberately
     /// cannot create or destroy anything: a thread that could would be a second owner of the
     /// display's objects.
-    pub fn thread_display(&self) -> ThreadDisplay {
-        ThreadDisplay { shared: Arc::clone(&self.shared) }
+    /// `None` when the embedder mints the contexts: its factory may only be reached from the
+    /// renderer's thread, so there is no handle for another one to hold. See [`GlContexts`].
+    pub fn thread_display(&self) -> Option<ThreadDisplay> {
+        match self.shared.backing {
+            Backing::Own { .. } => Some(ThreadDisplay { shared: Arc::clone(&self.shared) }),
+            Backing::Embedder(_) => None,
+        }
     }
 
     /// Release whatever context is current on this thread.
     pub fn release_current(&self) -> Result<(), EglError> {
+        assert!(
+            matches!(self.shared.backing, Backing::Own { .. }),
+            "an embedder's contexts are released by the embedder, not through a null token"
+        );
         // `EGL_NO_CONTEXT` with no surfaces is the documented way to release.
         self.shared.make_current(proc::EGL_NO_CONTEXT)
     }
@@ -574,9 +695,106 @@ impl Winsys {
     }
 }
 
+/// The `major.minor` at the head of what `eglQueryString(EGL_VERSION)` answers, which is
+/// specified to start with it. Zero for anything unreadable: a display that will not say is one we
+/// ask nothing of by version.
+fn parse_egl_version(s: &str) -> Version {
+    let mut it = s.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty());
+    let major = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Version { major, minor }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An embedder that hands out tokens of its own and counts what it was asked for. The
+    /// display is never dereferenced by anything this exercises, only compared against
+    /// `EGL_NO_DISPLAY` and passed to `eglQueryString`, which answers null for a display it does
+    /// not know.
+    #[derive(Default)]
+    struct FakeEmbedder {
+        minted: std::sync::Mutex<Vec<usize>>,
+        destroyed: std::sync::Mutex<Vec<usize>>,
+        bound: std::sync::Mutex<Vec<usize>>,
+        shared_asked: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl GlContexts for FakeEmbedder {
+        fn display(&self) -> EGLDisplay {
+            // Not null, so the winsys accepts it; never dereferenced.
+            core::ptr::dangling_mut()
+        }
+
+        fn create(&self, _version: Version, shared: bool) -> Option<EGLContext> {
+            let mut minted = self.minted.lock().expect("test");
+            // Tokens of the embedder's own choosing, deliberately not EGL contexts.
+            let token = 0x1000 + minted.len();
+            minted.push(token);
+            self.shared_asked.lock().expect("test").push(shared);
+            Some(core::ptr::without_provenance_mut(token))
+        }
+
+        fn make_current(&self, ctx: EGLContext) -> Result<(), EglError> {
+            self.bound.lock().expect("test").push(ctx.addr());
+            Ok(())
+        }
+
+        fn destroy(&self, ctx: EGLContext) {
+            self.destroyed.lock().expect("test").push(ctx.addr());
+        }
+    }
+
+    /// Every context of an embedder-backed winsys is the embedder's, and goes back to it.
+    ///
+    /// The point is that it is all of them: a context this renderer minted for itself would be in
+    /// a share group of its own, and the texture names it created there would mean nothing to the
+    /// embedder that was handed one. Nothing here touches a GPU -- what is being pinned is which
+    /// side of the boundary each context came from, which is a fact about the wiring.
+    #[test]
+    fn an_embedders_contexts_are_all_the_embedders() {
+        let fake = Arc::new(FakeEmbedder::default());
+        let counts = Arc::clone(&fake);
+
+        struct Lent(Arc<FakeEmbedder>);
+        impl GlContexts for Lent {
+            fn display(&self) -> EGLDisplay {
+                self.0.display()
+            }
+            fn create(&self, version: Version, shared: bool) -> Option<EGLContext> {
+                self.0.create(version, shared)
+            }
+            fn make_current(&self, ctx: EGLContext) -> Result<(), EglError> {
+                self.0.make_current(ctx)
+            }
+            fn destroy(&self, ctx: EGLContext) {
+                self.0.destroy(ctx);
+            }
+        }
+
+        let winsys = Winsys::embedded(Flavour::Gles, Box::new(Lent(fake)))
+            .expect("a display the embedder vouched for");
+
+        // No second thread can reach a factory that is only callable on this one.
+        assert!(winsys.thread_display().is_none());
+
+        let v = Version { major: 3, minor: 2 };
+        let ctx0 = winsys.create_context(v, None).expect("the embedder mints ctx0");
+        let sub = winsys.create_context(v, Some(&ctx0)).expect("and every context beside it");
+        winsys.make_current(&ctx0).expect("bound through the embedder");
+        winsys.make_current(&sub).expect("bound through the embedder");
+
+        assert_eq!(*counts.minted.lock().expect("test"), vec![0x1000, 0x1001]);
+        assert_eq!(*counts.bound.lock().expect("test"), vec![0x1000, 0x1001]);
+        // The first has nothing to share with yet; everything after it says so.
+        assert_eq!(*counts.shared_asked.lock().expect("test"), vec![false, true]);
+        assert!(counts.destroyed.lock().expect("test").is_empty());
+
+        drop(sub);
+        drop(ctx0);
+        assert_eq!(*counts.destroyed.lock().expect("test"), vec![0x1001, 0x1000]);
+    }
 
     /// libEGL has to be there and answer for every core EGL command through
     /// `eglGetProcAddress`. It needs no display and no GPU: if this fails the link is wrong,
