@@ -130,12 +130,7 @@ impl Shared {
         // SAFETY: the display is initialised, the context alive on it, and surfaceless contexts
         // are made current with `EGL_NO_SURFACE` twice.
         let ok = unsafe {
-            self.egl.eglMakeCurrent()(
-                self.display,
-                proc::EGL_NO_SURFACE,
-                proc::EGL_NO_SURFACE,
-                ctx,
-            )
+            self.egl.eglMakeCurrent()(self.display, proc::EGL_NO_SURFACE, proc::EGL_NO_SURFACE, ctx)
         };
         if ok == proc::EGL_FALSE {
             return Err(self.error("eglMakeCurrent"));
