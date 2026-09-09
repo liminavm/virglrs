@@ -647,8 +647,18 @@ impl CapsV2 {
                     c.supported_multisample_formats.set(format);
                 }
             }
-            // Without GBM the C answers "scanout" for every format.
-            c.scanout.set(format);
+            // Which formats may back a scanout. The C maps the format to a GBM format and asks
+            // the device; a build with no GBM at all skips both and answers "any".
+            //
+            // macOS is that build -- the scanout there is an IOSurface and there is no GBM to
+            // ask -- so it keeps the C's answer. On Linux there is a display allocator behind the
+            // VMM, and answering "any" told the guest it could scan out a Z24S8 or a DXT5. The
+            // mapping is the half that does the work and needs no device: a format with no DRM
+            // fourcc cannot be scanned out anywhere, which takes this from every format to the
+            // fourteen the C's GBM leg arrives at on the same host.
+            if cfg!(target_os = "macos") || super::formats::scanout_fourcc(format).is_some() {
+                c.scanout.set(format);
+            }
         }
         // For framebuffer_no_attachment.
         c.supported_multisample_formats.set(Format::NONE);
