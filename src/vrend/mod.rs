@@ -52,6 +52,11 @@ pub mod waiter;
 #[cfg(test)]
 pub(crate) fn one_display_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     static DISPLAY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // No poisoning to recover from: this crate aborts on panic rather than unwinding.
-    DISPLAY.lock().expect("the display lock is never held across a panic")
+    // Take the guard back out of a poisoned lock. `panic = "abort"` does not reach here: cargo
+    // ignores the setting for the test profile, so a failing test unwinds and poisons this. And
+    // there is nothing to recover -- the guard serialises displays, it does not protect state a
+    // panicking test could have left half-written, so the next test may have it. Propagating the
+    // poison instead turned one real `eglInitialize` failure into six red tests, five of which
+    // named the lock rather than the thing they were about.
+    DISPLAY.lock().unwrap_or_else(|e| e.into_inner())
 }
