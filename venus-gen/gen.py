@@ -104,6 +104,30 @@ def handle_parents(vk_xml):
     return parents
 
 
+def check_template_engine(Template):
+    """Refuse a mako that rewrites the templates while rendering them.
+
+    Mako inherited a Myghty-style `<& ... &>` component call, and a lexer that still recognises it
+    silently swallows the `<` in Rust's `PhantomData<&'a ()>` -- turning valid generated code into
+    a syntax error a hundred lines from anything anyone edited. Mako 1.2.3 does this; 1.3.10 does
+    not.
+
+    The check renders the digraph and compares, rather than reading `mako.__version__` against a
+    floor. A version floor is a boundary guessed from the two versions that happened to be
+    measured, and it says nothing about the next lexer regression; asking the engine what it does
+    with the bytes tests the thing that actually matters. Templates therefore stay written as Rust
+    reads best, and no one has to remember which digraphs are safe.
+    """
+    probe = "PhantomData<&'a ()>"
+    got = Template(text=probe).render()
+    if got != probe:
+        import mako
+        raise SystemExit(
+            'mako %s rewrites the templates: rendered %r as %r.\n'
+            'Templates are emitted verbatim or not at all -- install mako 1.3 or newer.'
+            % (mako.__version__, probe, got))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--outdir', required=True, help='Where to write the .rs files.')
@@ -129,6 +153,8 @@ def main():
                    member_order([vn_protocol.VN_PROTOCOL_VK_XML]
                                 + list(vn_protocol.VN_PROTOCOL_PRIVATE_XMLS)),
                    handle_parents(vk_xml))
+
+    check_template_engine(Template)
 
     lookup = TemplateLookup(str(HERE / 'templates'))
     outdir = Path(args.outdir)
