@@ -996,6 +996,71 @@ Blob creates with a non-zero `blob_id` are skipped and counted: they export an o
 would have made, and smoke runs no commands. The C renderer fails them in smoke mode too, which is
 how we know the bar was in the wrong place rather than the port.
 
+## Conformance vectors (`fluster/`)
+
+Every other gate here is a **differential**: the C's answer is the oracle. That cannot see a
+stream both implementations decode wrong, and on the video path the two share a decoder — one
+VideoToolbox, reached by two renderers — so a synthesis bug that produces a plausible-but-wrong
+parameter set agrees with itself perfectly.
+
+[fluster](https://github.com/fluendo/fluster) closes that. It runs the standards bodies' own
+conformance vectors and checks each decoded stream against the **md5 the standards body
+published**, which is the only absolute oracle in this tree. `setup.sh` materializes it and the
+vectors host-side; `fluster.sh [c|rs|diff]` scores them; `diff` is the gate.
+
+It does not replace the differential, because absolute is not the same as achievable here. This
+host advertises HEVC Main and no Main10, and VP9 Profile 0 and nothing else, so streams fail for
+reasons that belong to VideoToolbox. **Measured on the C leg: 212 of 305 VP9 vectors match the
+published md5**, and the 93 that do not include every `vp90-2-21-resize_inter_*` — mid-stream
+resolution changes — and the 8-pixel-wide `vp90-2-02-size-08x*`. So the gate is two claims kept
+apart: the legs decode the same set (ours), and the C leg's own set has not moved (the host's).
+
+Unlike `ctests.sh` there is no cascade — each vector is its own process — so the pin is the whole
+result list, not its first entry.
+
+**The vectors live on the host and are shared read-only** (`--share fluster=...:ro`, mounted by
+hand because the stock guest carries no limina agent). They are several GB against a 13 GB stock
+image, and both legs must read the same bytes for a diff between them to mean anything.
+
+**A suite that is not completely downloaded is skipped, not run.** fluster reports an absent
+vector as a failure, and pinning that would record the state of a download as though it were the
+renderer's answer.
+
+**`www.itu.int` serves the H.264 and HEVC vectors from behind a WAF**, which under load answers
+HTTP 200 with a 245-byte "Request Rejected" page instead of the file. fluster stores that and
+reports a checksum mismatch — the same message a genuinely changed upstream vector produces, so
+it does not distinguish them. Two attempts giving two *different* checksums for one URL does, and
+`file` on the archive says HTML outright. The block is by IP and covers the whole host, so no
+header or User-Agent gets past it; it clears itself in minutes, and `-j 1` stays under it.
+VP9-TEST-VECTORS is on `storage.googleapis.com` and has none of this.
+
+**AV1 is not scored here**, for the reason `vrend-av1.score` is not: without M3-or-later silicon
+`vaav1dec` is not even an element. It belongs on the AV1 machine.
+
+A leg is a whole boot — stock guest, all complete suites, poweroff — and costs about 75 seconds
+for the 305 VP9 vectors, so this is per-commit work rather than nightly.
+
+**This gate is NOT yet armed, and it cannot be until the rig stops lying about the rs leg.** See
+below.
+
+### The rig's rust bundle does not carry this tree
+
+`make-rig.sh --renderer rust` copies limina's app bundle and swaps
+`prefix/lib/libvirglrenderer.1.dylib` into `Contents/Frameworks`. **Nothing loads it.**
+`limina-vmm` has no `libvirglrenderer` load command at all: rutabaga takes virglrs as a *path
+dependency* (`third_party/libkrun/src/rutabaga_gfx/Cargo.toml`) and the renderer is compiled into
+the worker. The path it names is `limina/third_party/virglrs` — **a second clone of this
+repository**, and not this working tree.
+
+So every boot-based rs measurement scores whatever that clone held when limina was last built,
+and `install.sh` here cannot change it. Found by arming this gate: inverting the VP9 key-frame
+flag in `src/vrend/video/mod.rs`, rebuilding, and re-running the rs leg produced a byte-identical
+result — 212/305 either way, which no working swap could give.
+
+The dylib swap is not merely inert, it is worse than nothing: it re-signs the bundle and prints
+`==> swapping in libvirglrenderer.1.dylib`, so a stale renderer reports as a fresh one. Until it
+is fixed, an rs boot answers a question about `limina/third_party/virglrs`, not about this tree.
+
 ## Layer 0 — the ABI itself (`abi/`)
 
 `abi-fixture.sh` pins two files and checks a build against them: `symbols.txt`, the symbols a
