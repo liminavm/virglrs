@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright © 2026 Gustavo Noronha Silva
 #
-# Build a self-contained VM rig under harness/vm: limina's app bundle with THIS tree's
-# virglrenderer swapped in, plus APFS clones of a couple of guest disks.
+# Build a self-contained VM rig under harness/vm: a limina app bundle carrying THIS tree's
+# renderer, plus APFS clones of a couple of guest disks.
 #
 # WHY A COPY AND NOT limina's OWN BUNDLE. Capturing a corpus means booting a real guest against a
 # renderer we are actively changing. Doing that in limina's tree would make every capture a
@@ -15,7 +15,14 @@
 #
 # Two renderers are under test in this tree, so the rig is two bundles. `--renderer` picks one,
 # and it picks the build and the bundle together: a bundle named for one tree holding the other
-# tree's dylib is a rig that lies about what it booted, and nothing downstream could tell.
+# tree's renderer is a rig that lies about what it booted, and nothing downstream could tell.
+#
+# THE TWO LEGS ARE BUILT DIFFERENTLY, and not by choice. limina compiles virglrs in, as a cargo
+# path dependency: for the rust leg there is no dylib to swap, so the bundle has to be BUILT here,
+# from a limina worktree whose third_party/virglrs is this tree. The C renderer is still a dylib,
+# and its leg is still limina's own bundle with that dylib swapped in -- but only a bundle from
+# before limina's cutover has a `libvirglrenderer` load command to swap into, which is why the C
+# path asserts on one.
 #
 # Usage: make-rig.sh [--disks-only | --bundle-only] [--renderer c|rust]
 set -euo pipefail
@@ -25,8 +32,9 @@ cd ../..
 ROOT="$(pwd)"
 
 LIMINA="${LIMINA_ROOT:-$HOME/Projects/limina}"
-SRC_APP="$LIMINA/target/Limina.app"
 DISKS="$RIG/disks"
+# The rig's own limina checkout, built against this tree. See build_rust_app.
+WT="$RIG/limina-src"
 
 # Three guests, because the corpus needs three different renderers exercised:
 #   synoik    a Vulkan compositor — the desktop workload that is venus end to end
@@ -51,9 +59,73 @@ done
 
 case "$renderer" in
   c)    PREFIX="$ROOT/harness/vm/prefix"; APP="$RIG/Limina.app" ;;
-  rust) PREFIX="$ROOT/prefix";    APP="$RIG/Limina-rust.app" ;;
+  rust) PREFIX=""; APP="$RIG/Limina-rust.app" ;;
   *) echo "unknown renderer: $renderer (c|rust)" >&2; exit 2 ;;
 esac
+
+# Build limina against THIS tree, and hand back its bundle.
+#
+# WHY THIS EXISTS. rutabaga names virglrs as a cargo path dependency, so the renderer is compiled
+# into limina-vmm — `otool -L limina-vmm` has no libvirglrenderer at all. The bundle limina builds
+# therefore carries whatever `limina/third_party/virglrs` held, which is a SECOND clone of this
+# repository. The swap that used to stand here installed a dylib nothing loads and re-signed the
+# bundle afterwards, so a stale renderer reported as a fresh one; only breaking the fix on purpose
+# and watching the score not move could have found it, and that is how it was found.
+#
+# A WORKTREE, and not limina's own tree, for the reason at the top of this file: the rig is ours to
+# break, and re-pointing limina's third_party would change what THEIR builds compile. third_party
+# is untracked there (and 14 GB), so the worktree's copy is a directory of symlinks to theirs —
+# with virglrs pointed here, which is the whole point.
+build_rust_app() {
+  [ -d "$LIMINA/.git" ] || { echo "no limina checkout at $LIMINA (set LIMINA_ROOT)" >&2; exit 1; }
+  local rev resolved
+  # limina's HEAD, not its working tree: the rig must be reproducible from a commit, and the
+  # in-flight edits in that tree are theirs. LIMINA_REV pins an older one deliberately.
+  rev="${LIMINA_REV:-$(git -C "$LIMINA" rev-parse HEAD)}"
+
+  if [ -d "$WT" ]; then
+    git -C "$WT" checkout --quiet --detach "$rev"
+  else
+    echo "==> creating the rig's limina worktree at $WT"
+    git -C "$LIMINA" worktree add --detach "$WT" "$rev"
+  fi
+
+  # third_party is gitignored in limina, so the worktree has none; it is theirs by symlink.
+  mkdir -p "$WT/third_party"
+  for e in "$LIMINA"/third_party/*; do
+    ln -sfn "$e" "$WT/third_party/$(basename "$e")"
+  done
+  ln -sfn "$ROOT" "$WT/third_party/virglrs"
+
+  # The GOP firmware is an edk2 build and not a cargo one; share limina's rather than spend an
+  # hour rebuilding a file that is an input to both legs anyway.
+  mkdir -p "$WT/target"
+  ln -sfn "$LIMINA/target/krun-efi" "$WT/target/krun-efi"
+
+  # THE check that this leg is this tree, and the only one that cannot be satisfied by a build
+  # that ran. rutabaga spells the dependency `../../../virglrs` from inside third_party/libkrun,
+  # which is a symlink: cargo normalizes that lexically and lands on the worktree's own virglrs,
+  # but a resolver that walked the symlink physically would land in limina's clone instead and
+  # every score after it would be of the wrong source, silently.
+  resolved="$(cd "$WT" && cargo metadata --format-version 1 2>/dev/null | python3 -c '
+import json, sys
+for pkg in json.load(sys.stdin)["packages"]:
+    if pkg["name"] == "virglrs":
+        print(pkg["manifest_path"])
+')"
+  [ "$resolved" = "$WT/third_party/virglrs/Cargo.toml" ] || {
+    echo "cargo resolves virglrs to: ${resolved:-<nothing>}" >&2
+    echo "expected: $WT/third_party/virglrs/Cargo.toml (a symlink to $ROOT)" >&2
+    echo "refusing to build a rig that would score a different checkout." >&2
+    exit 1
+  }
+
+  echo "==> building limina ${rev:0:12} against this tree (a cold build takes a while)"
+  (cd "$WT" && ./scripts/build-app.sh release) || exit 1
+  # Beside the bundle and not inside it: build-app.sh seals the app, and a file added afterwards
+  # breaks the signature.
+  printf '%s\n' "$rev" > "$RIG/Limina-rust.rev"
+}
 
 if [ "$want_disks" = 1 ]; then
   mkdir -p "$DISKS"
@@ -76,14 +148,14 @@ fi
 
 [ "$want_bundle" = 1 ] || exit 0
 
-DYLIB="$PREFIX/lib/libvirglrenderer.1.dylib"
-[ -f "$DYLIB" ] || {
-  case "$renderer" in
-    c)    echo "build it first: harness/vm/build-renderer.sh" >&2 ;;
-    rust) echo "build it first: virglrs/install.sh" >&2 ;;
-  esac
-  exit 1
-}
+if [ "$renderer" = rust ]; then
+  build_rust_app
+  SRC_APP="$WT/target/Limina.app"
+else
+  DYLIB="$PREFIX/lib/libvirglrenderer.1.dylib"
+  [ -f "$DYLIB" ] || { echo "build it first: harness/vm/build-renderer.sh" >&2; exit 1; }
+  SRC_APP="$LIMINA/target/Limina.app"
+fi
 [ -d "$SRC_APP" ] || { echo "missing source bundle: $SRC_APP (cargo xtask app in limina)" >&2; exit 1; }
 
 echo "==> cloning $SRC_APP"
@@ -92,6 +164,26 @@ cp -Rc "$SRC_APP" "$APP"
 
 FW="$APP/Contents/Frameworks"
 MACOS="$APP/Contents/MacOS"
+
+# The rust bundle IS the build: it was compiled against this tree, checked to have been, and
+# signed by build-app.sh. There is nothing to swap and nothing to re-sign.
+if [ "$renderer" = rust ]; then
+  codesign --verify --deep --strict "$APP" && echo "==> bundle verifies"
+  echo "==> rig ready: $APP"
+  echo "    limina $(cut -c1-12 < "$RIG/Limina-rust.rev"), renderer compiled from $ROOT"
+  exit 0
+fi
+
+# A bundle with no libvirglrenderer load command loads no dylib, so swapping one in changes
+# nothing and re-signing hides that it changed nothing. limina past its cutover builds exactly
+# such a bundle -- it compiles virglrs in -- so the C leg needs a bundle from BEFORE it, and this
+# is where that stops being silent.
+otool -L "$MACOS/limina-vmm" | grep -q libvirglrenderer || {
+  echo "$SRC_APP does not link libvirglrenderer: it compiles the renderer in, so this bundle" >&2
+  echo "would boot virglrs while claiming to be the C leg. The C leg needs a PRE-CUTOVER limina" >&2
+  echo "bundle -- keep the existing $APP, or build one from a limina revision before it." >&2
+  exit 1
+}
 
 echo "==> swapping in $(basename "$DYLIB")"
 cp "$DYLIB" "$FW/libvirglrenderer.1.dylib"

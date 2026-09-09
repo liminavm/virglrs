@@ -1040,26 +1040,27 @@ VP9-TEST-VECTORS is on `storage.googleapis.com` and has none of this.
 A leg is a whole boot — stock guest, all complete suites, poweroff — and costs about 75 seconds
 for the 305 VP9 vectors, so this is per-commit work rather than nightly.
 
-**This gate is NOT yet armed, and it cannot be until the rig stops lying about the rs leg.** See
-below.
+### The rig's two legs are built differently, and not by choice
 
-### The rig's rust bundle does not carry this tree
+**limina compiles virglrs in.** rutabaga names it as a cargo *path* dependency
+(`third_party/libkrun/src/rutabaga_gfx/Cargo.toml`), so `limina-vmm` has no `libvirglrenderer`
+load command and there is no dylib for the rs leg to swap. `make-rig.sh --renderer rust`
+therefore **builds** its bundle: a `git worktree` of limina at `harness/vm/limina-src`, whose
+`third_party/` is symlinks to limina's (it is untracked there, and 14 GB) with **`virglrs`
+pointed at this tree**. A worktree and not limina's own checkout, for the reason the rig is a
+copy at all — re-pointing theirs would change what their builds compile.
 
-`make-rig.sh --renderer rust` copies limina's app bundle and swaps
-`prefix/lib/libvirglrenderer.1.dylib` into `Contents/Frameworks`. **Nothing loads it.**
-`limina-vmm` has no `libvirglrenderer` load command at all: rutabaga takes virglrs as a *path
-dependency* (`third_party/libkrun/src/rutabaga_gfx/Cargo.toml`) and the renderer is compiled into
-the worker. The path it names is `limina/third_party/virglrs` — **a second clone of this
-repository**, and not this working tree.
+The check that makes this real is `cargo metadata`: the resolved manifest path for `virglrs` must
+be the worktree's own, and `make-rig.sh` refuses to build otherwise. A build that merely *ran* is
+not evidence — the defect this replaced was a build that ran perfectly against the wrong source.
+`harness/vm/Limina-rust.rev` records which limina commit the bundle came from, beside the app
+rather than inside it, because build-app.sh seals the bundle.
 
-So every boot-based rs measurement scores whatever that clone held when limina was last built,
-and `install.sh` here cannot change it. Found by arming this gate: inverting the VP9 key-frame
-flag in `src/vrend/video/mod.rs`, rebuilding, and re-running the rs leg produced a byte-identical
-result — 212/305 either way, which no working swap could give.
-
-The dylib swap is not merely inert, it is worse than nothing: it re-signs the bundle and prints
-`==> swapping in libvirglrenderer.1.dylib`, so a stale renderer reports as a fresh one. Until it
-is fixed, an rs boot answers a question about `limina/third_party/virglrs`, not about this tree.
+**The C leg still swaps a dylib**, because the C renderer still is one. Only a limina from
+*before* the cutover has a load command to swap into, so `make-rig.sh --renderer c` asserts on it
+and refuses a post-cutover bundle: a swap into a bundle that loads nothing would boot virglrs
+while reporting as C, and re-sign afterwards so it looked fresh. `harness/vm/Limina.app` is that
+pre-cutover bundle, and limina HEAD can no longer produce another.
 
 ## Layer 0 — the ABI itself (`abi/`)
 
