@@ -27,6 +27,10 @@ macro_rules! features {
         impl Feature {
             const ALL: &'static [Feature] = &[$(Feature::$name,)+];
 
+            /// How many features the table declares. Sizes [`FeatureSet`], so the bitset cannot
+            /// be too small for the table it indexes -- add a row and the array grows with it.
+            const COUNT: usize = Feature::ALL.len();
+
             fn core(self) -> Core {
                 match self { $(Feature::$name => $core,)+ }
             }
@@ -158,9 +162,58 @@ features! {
     storage_multisample_2d_array = (Gles(32), ["GL_OES_texture_storage_multisample_2d_array"]),
 }
 
+/// Which features a host has, as one bit each.
+///
+/// A set decided once at init and then asked on every draw -- `draw_bind_objects` alone asks it
+/// several times per stage per draw, and `draw_vbo` several more. As a `BTreeSet<Feature>` that
+/// was a tree descent per question: measured 2026-09-09 under a 15k-fish aquarium, the folded
+/// `btree::search::search_tree` for `Feature` plus its callers came to ~351 of 5971 samples on the
+/// GPU worker, ~6% of a saturated thread, to answer a question whose answer cannot change after
+/// `reconcile`. An index and an AND is the whole of it now.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct FeatureSet {
+    words: [u64; FeatureSet::WORDS],
+}
+
+impl FeatureSet {
+    const WORDS: usize = Feature::COUNT.div_ceil(64);
+
+    /// Index of `f`'s bit. The enum is fieldless, so the discriminant *is* the table row, and
+    /// the cast cannot disagree with `Feature::ALL`'s order.
+    const fn at(f: Feature) -> (usize, u64) {
+        let i = f as usize;
+        (i / 64, 1u64 << (i % 64))
+    }
+
+    fn contains(&self, f: Feature) -> bool {
+        let (w, bit) = Self::at(f);
+        self.words[w] & bit != 0
+    }
+
+    fn insert(&mut self, f: Feature) {
+        let (w, bit) = Self::at(f);
+        self.words[w] |= bit;
+    }
+
+    /// Drops `f`, reporting whether it was there -- `reconcile` only announces a withdrawal it
+    /// actually made.
+    fn remove(&mut self, f: Feature) -> bool {
+        let (w, bit) = Self::at(f);
+        let had = self.words[w] & bit != 0;
+        self.words[w] &= !bit;
+        had
+    }
+
+    /// In table order, which is what `BTreeSet<Feature>` iterated (the derived `Ord` is the
+    /// discriminant), so the startup feature line keeps its wording.
+    fn iter(&self) -> impl Iterator<Item = Feature> + '_ {
+        Feature::ALL.iter().copied().filter(move |f| self.contains(*f))
+    }
+}
+
 /// The features this host has.
 pub struct Features {
-    have: BTreeSet<Feature>,
+    have: FeatureSet,
     /// The context's GLES version as `major * 10 + minor`, the C's spelling.
     pub gles_version: u32,
     extensions: BTreeSet<String>,
@@ -179,28 +232,28 @@ impl Features {
     /// Decide every feature from a context's version and the extensions it advertises.
     pub fn probe(gles_version: u32, extensions: impl IntoIterator<Item = String>) -> Features {
         let extensions: BTreeSet<String> = extensions.into_iter().collect();
-        let have = Feature::ALL
-            .iter()
-            .copied()
-            .filter(|f| {
-                let core = match f.core() {
-                    Gles(v) => gles_version >= v,
-                    Unavail => false,
-                };
-                core || f.extensions().iter().any(|e| extensions.contains(*e))
-            })
-            .collect();
+        let mut have = FeatureSet::default();
+        for f in Feature::ALL.iter().copied() {
+            let core = match f.core() {
+                Gles(v) => gles_version >= v,
+                Unavail => false,
+            };
+            if core || f.extensions().iter().any(|e| extensions.contains(*e)) {
+                have.insert(f);
+            }
+        }
         Features { have, gles_version, extensions }
     }
 
+    #[inline]
     pub fn has(&self, f: Feature) -> bool {
-        self.have.contains(&f)
+        self.have.contains(f)
     }
 
     /// Withdraw a feature the driver advertises but the winsys cannot honour -- sRGB write
     /// control without `EGL_KHR_gl_colorspace`, as `vrend_renderer_init` withdraws it.
     pub fn clear(&mut self, f: Feature) {
-        self.have.remove(&f);
+        self.have.remove(f);
     }
 
     /// Withdraw every feature whose entry points the driver did not actually hand over: what a
@@ -208,7 +261,7 @@ impl Features {
     /// they are made one, so a `Gl` wrapper behind a feature can take its proc for granted.
     pub fn reconcile(&mut self, gl: &super::gl::Gl) {
         for (feature, proc_name) in gl.missing_procs() {
-            if self.have.remove(&feature) {
+            if self.have.remove(feature) {
                 eprintln!(
                     "[virglrs] vrend: {} advertised without {proc_name}: withdrawn",
                     feature.name()
@@ -222,13 +275,44 @@ impl Features {
     }
 
     pub fn present(&self) -> impl Iterator<Item = Feature> + '_ {
-        self.have.iter().copied()
+        self.have.iter()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every row of the table has a bit, and each bit is its own. The array is sized from
+    /// `Feature::COUNT`, so it cannot be too small; what this guards is `at` folding two rows
+    /// onto one bit, which would answer a feature question with another feature's answer.
+    #[test]
+    fn every_feature_has_a_distinct_bit() {
+        let mut seen = FeatureSet::default();
+        for (i, f) in Feature::ALL.iter().copied().enumerate() {
+            assert!(!seen.contains(f), "{} collides with an earlier row", f.name());
+            seen.insert(f);
+            assert!(seen.contains(f));
+            assert_eq!(seen.iter().count(), i + 1, "inserting {} disturbed another bit", f.name());
+        }
+        for f in Feature::ALL.iter().copied() {
+            assert!(seen.remove(f), "{} was set, so removing it reports true", f.name());
+            assert!(!seen.remove(f), "{} is gone, so removing it again reports false", f.name());
+        }
+        assert_eq!(seen, FeatureSet::default(), "removing every row empties the set");
+    }
+
+    /// `present()` keeps the table's order, which is the order `BTreeSet<Feature>` iterated --
+    /// the startup line that prints it reads the same.
+    #[test]
+    fn present_is_in_table_order() {
+        let f = Features::probe(32, ["GL_EXT_buffer_storage".to_string()]);
+        let got: Vec<Feature> = f.present().collect();
+        let mut want = got.clone();
+        want.sort_unstable();
+        assert_eq!(got, want, "present() is the derived Ord, i.e. declaration order");
+        assert!(got.iter().all(|x| f.has(*x)));
+    }
 
     #[test]
     fn a_feature_is_core_by_version_or_provided_by_an_extension() {
