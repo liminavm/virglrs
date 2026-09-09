@@ -2626,6 +2626,10 @@ mod tests {
         assert_eq!(virgl_renderer_resource_map_fixed(0, core::ptr::null_mut()), EINVAL);
         // No renderer, so no resource: still the caller naming something that is not there.
         assert_eq!(virgl_renderer_resource_map_fixed(1, core::ptr::null_mut()), EINVAL);
+        // Only Darwin can be asked this: it numbers `EOPNOTSUPP` 102 and `ENOTSUP` 45, so
+        // reaching for the wrong one is visible. Linux defines both as 95, where the claim is not
+        // false but unaskable -- any answer passes, which is not a test.
+        #[cfg(target_os = "macos")]
         assert_ne!(EOPNOTSUPP, ENOTSUP, "the header promises EOPNOTSUPP, and Darwin's differ");
 
         // An fd export is refused for every resource, existing or not: nothing here has one.

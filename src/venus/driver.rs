@@ -2434,7 +2434,7 @@ impl Driver {
     /// Plant an allocation backed by a real IOSurface, which is the only way to get one: a
     /// surface cannot be faked, and every claim about a scanout is a claim about what the system
     /// did with it.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) fn plant_scanout_allocation(&mut self, id: ObjectId, surface: Surface) {
         let charge = self
             .account
@@ -2465,7 +2465,7 @@ impl Driver {
 
     /// The same, for memory the host cannot address -- the one case an export must refuse before
     /// it ever reaches the driver.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) fn plant_device_local_allocation(&mut self, id: ObjectId, size: u64) {
         self.plant_allocation_of(id, size, 0);
     }
@@ -5232,7 +5232,7 @@ impl Storage {
     }
 
     /// A share over a real surface, charged to `account`, for a test outside this module.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn minted_for_test(surface: Surface, account: &Account) -> Storage {
         let charge = account.try_charge("IOSurface", surface.alloc_size()).expect("no cap");
         Storage::Texture(Arc::new(Charged::new(surface, charge)))
@@ -6059,6 +6059,7 @@ mod tests {
         driver.abandon_planted();
     }
 
+    #[cfg(target_os = "macos")]
     /// An import is the same storage under a second handle, so what it resolves to has to be an
     /// address that already exists -- and the length it is good for, in the same answer. The two
     /// are what the allocation is clamped against, and a length that could travel separately from
@@ -6112,6 +6113,7 @@ mod tests {
         assert_eq!(budget.live(), 0, "and the last share going is what credits it");
     }
 
+    #[cfg(target_os = "macos")]
     /// A capture goes back in by the route it came out of, whichever backing that is.
     ///
     /// The three arms are three different pieces of memory -- a surface's pages, pages this
@@ -6261,6 +6263,7 @@ mod tests {
         d.abandon_planted();
     }
 
+    #[cfg(target_os = "macos")]
     /// What each backing lends, now that every allocation the host can address owns its bytes.
     ///
     /// A scanout lends the surface. Ordinary host-visible memory lends its minted pages, from the
@@ -6805,10 +6808,17 @@ mod tests {
         assert!(published.write_back, "coherent and cached, as the type says");
         assert_eq!(MAPPED.with(Cell::get), 0, "the driver was never asked to map what it imported");
         assert!(matches!(share, Storage::Linear(_)), "and the share is the pages");
+        // Both hosts refuse, and each says the first true thing it knows. Where a surface could
+        // have been minted the answer is about this allocation -- it dedicated no image; where
+        // none can be, the host never gets as far as asking.
+        #[cfg(target_os = "macos")]
+        const WHY: NoSurface = NoSurface::NotDedicated;
+        #[cfg(not(target_os = "macos"))]
+        const WHY: NoSurface = NoSurface::Unbacked;
         assert_eq!(
             share.surface().err(),
-            Some(NoSurface::NotDedicated),
-            "which know why they are not a surface: this export dedicated no image"
+            Some(WHY),
+            "which know why they are not a surface, and say so rather than saying nothing"
         );
         assert_eq!(share.span(), span, "resolving to exactly what the driver was handed");
         assert_eq!(budget.live_for(one), span.1, "shared, and still this context's while it lives");
@@ -6849,10 +6859,17 @@ mod tests {
                 panic!("undeclared host-visible memory is the driver's own, owned here");
             };
             assert!(matches!(storage, Storage::Heap(_)));
+            // As above: where a surface could have been minted the answer is about this
+            // allocation -- the guest declared nothing for export; where none can be, that is
+            // the whole answer and the host never asks what the guest declared.
+            #[cfg(target_os = "macos")]
+            const WHY_PLAIN: NoSurface = NoSurface::NotExported;
+            #[cfg(not(target_os = "macos"))]
+            const WHY_PLAIN: NoSurface = NoSurface::Unbacked;
             assert_eq!(
                 storage.surface().err(),
-                Some(NoSurface::NotExported),
-                "which knows why it is not a surface: the guest declared nothing"
+                Some(WHY_PLAIN),
+                "which knows why it is not a surface, and says so rather than saying nothing"
             );
             storage.span()
         };
@@ -6901,7 +6918,7 @@ mod tests {
     fn every_backing_gives_its_allocation_back() {
         use super::super::proto::types::{
             VkExportMemoryAllocateInfo, VkExtent3D, VkExternalMemoryHandleTypeFlags, VkFormat,
-            VkImageCreateInfo, VkImageTiling, VkImportMemoryResourceInfoMESA,
+            VkImageCreateInfo, VkImageSubresource, VkImageTiling, VkImportMemoryResourceInfoMESA,
             VkMemoryDedicatedAllocateInfo, VkSubresourceLayout,
         };
         use std::cell::{Cell, RefCell};
@@ -7044,10 +7061,17 @@ mod tests {
                 Backing::Driver { .. } => "driver",
                 Backing::Imported(_) => "imported",
             };
+            // A host that mints no storage of its own has no texture backing to reach: the
+            // scanout shape gets no surface, and an allocation with no surface is the driver's.
+            // The other four are every host's, and are what this test is here for.
+            #[cfg(target_os = "macos")]
+            const SCANOUT: &str = "texture";
+            #[cfg(not(target_os = "macos"))]
+            const SCANOUT: &str = "driver";
             assert_eq!(
                 (kind(1), kind(2), kind(3), kind(4), kind(5)),
-                ("texture", "linear", "heap", "driver", "imported"),
-                "the five shapes reach the five backings"
+                (SCANOUT, "linear", "heap", "driver", "imported"),
+                "the five shapes reach the backings they are named for"
             );
         }
 
@@ -7146,6 +7170,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     /// A scanout is charged at the surface's own extent, not at the number in the request.
     ///
     /// The surface is the commitment: IOSurface rounds an allocation up to whole pages, and those
@@ -7352,6 +7377,7 @@ mod tests {
         d.abandon_planted();
     }
 
+    #[cfg(target_os = "macos")]
     /// bigger than what backs it, or asking to map memory the host cannot address. The second of
     /// those is the one with teeth -- two resources over one storage is a state neither holder
     /// could detect afterwards.
