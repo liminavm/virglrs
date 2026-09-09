@@ -767,7 +767,16 @@ pub extern "C" fn virgl_renderer_resource_create(
         );
     }
     with(EINVAL, |r| match r.resource_create(handle, desc, iov) {
-        Ok(()) => 0,
+        Ok(()) => {
+            if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Resource) {
+                eprintln!(
+                    "[virglrs] resource {} created: tex_id={:?}",
+                    handle.get(),
+                    r.classic_texture(handle).map(|n| n.raw())
+                );
+            }
+            0
+        }
         Err(e) => {
             eprintln!("[virglrs] resource {}: {e}", handle.get());
             errno(e)
@@ -984,6 +993,15 @@ pub extern "C" fn virgl_renderer_resource_get_info(
         // reading whatever was in its struct before the call and believing this put it there.
         let (virgl_format, width, height, depth, flags, stride) =
             described.unwrap_or((0, 0, 0, 0, 0, 0));
+        // The scanout's whole description, as the VMM will read it. `tex_id` in particular: a
+        // VMM with a GL display hands that name to its own compositor, so two live resources
+        // reporting one name is a corrupted display rather than a wrong number.
+        if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Resource) {
+            eprintln!(
+                "[virglrs] resource {res_handle} get_info: format={virgl_format} \
+                 {width}x{height}x{depth} flags={flags:#x} stride={stride} tex_id={tex_id}"
+            );
+        }
         // SAFETY: caller-provided out-pointer, checked non-null; only the C's first eight
         // fields are written, which every version of the struct has.
         unsafe {
