@@ -11,11 +11,41 @@
 # Output: third_party/virgl-prefix. Point the harness at it with VIRGL_PREFIX.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="$ROOT/third_party/virglrenderer"
-BUILD="$SRC/build"
 PREFIX="${VIRGL_PREFIX:-$ROOT/third_party/virgl-prefix}"
 
-[ -f "$SRC/meson.build" ] || { echo "the C tree is not vendored: run scripts/vendor.sh" >&2; exit 1; }
+# Which C tree is the leg differs by host, and only here.
+#
+# The limina fork is the *build input* on every host and is never swapped: `build.rs` generates
+# the wire numbering from its `virgl_hw.h`, so a per-host build input would make virglrs a
+# different renderer on each. What differs is the tree the harness *scores against*.
+#
+# On Darwin that is the fork, which is what shipped. Off Darwin it is upstream: the fork does not
+# compile there -- its IOSurface fields and five of its functions are declared under
+# `#ifdef __APPLE__` while a dozen uses are not guarded at all -- and upstream is the better
+# oracle on this host anyway, being what a distribution ships and what a Linux VMM will meet.
+# See third_party/manifest.toml for the two cap bits this costs a comparison.
+if [ "$(uname -s)" = Darwin ]; then
+    SRC="$ROOT/third_party/virglrenderer"
+    [ -f "$SRC/meson.build" ] || { echo "the C tree is not vendored: run scripts/vendor.sh" >&2; exit 1; }
+else
+    SRC="$ROOT/third_party/virglrenderer-upstream"
+    # Materialized here rather than by vendor.sh, which brings in what the crate is built from.
+    # Idempotent the same way: an existing clone is fetched and re-checked-out at the pinned rev.
+    read -r UPSTREAM_REPO UPSTREAM_REV <<EOF
+$(python3 - "$ROOT/third_party/manifest.toml" <<'PY'
+import sys, tomllib
+m = tomllib.load(open(sys.argv[1], "rb"))["virglrenderer-upstream"]
+print(m["repo"], m["rev"])
+PY
+)
+EOF
+    [ -n "$UPSTREAM_REV" ] || { echo "no upstream rev pinned in third_party/manifest.toml" >&2; exit 1; }
+    [ -d "$SRC/.git" ] || git clone --quiet "$UPSTREAM_REPO" "$SRC"
+    git -C "$SRC" fetch --quiet origin
+    git -C "$SRC" checkout --quiet --detach "$UPSTREAM_REV" || {
+        echo "the pinned rev $UPSTREAM_REV is not in $UPSTREAM_REPO" >&2; exit 1; }
+fi
+BUILD="$SRC/build"
 
 # This build needs an epoxy carrying EGL, and a Mesa whose egl.pc pkg-config can see -- epoxy.pc's
 # `Requires.private: egl` means a missing one fails the configure with "Could not generate cflags
@@ -70,4 +100,5 @@ ninja -C "$BUILD"
 meson install -C "$BUILD"
 
 echo "==> reference renderer installed to $PREFIX"
+echo "    leg: $(basename "$SRC") at $(git -C "$SRC" rev-parse --short HEAD)"
 echo "    use it: VIRGL_PREFIX=$PREFIX harness/replay/vrend-replay.sh <corpus> --renderer c"

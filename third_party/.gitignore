@@ -1,2 +1,6 @@
 # Vendored by scripts/vendor.sh; the pin is manifest.toml, not the clone.
 /virglrenderer/
+/virglrenderer-upstream/
+# Built by scripts/build-reference.sh.
+/virgl-prefix/
+/epoxy-egl-prefix/

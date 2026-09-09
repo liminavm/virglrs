@@ -15,3 +15,26 @@ repo = "https://github.com/liminavm/virglrenderer.git"
 upstream = "https://gitlab.freedesktop.org/virgl/virglrenderer.git"
 branch = "limina"
 rev = "017b7e159a651a2597daacaef6d13695cfd12c6b"
+
+# The reference leg on Linux, and only there.
+#
+# Two trees, two jobs. The fork above is the **build input** on every host: `build.rs` generates
+# the wire numbering from its `virgl_hw.h`, which carries two cap bits upstream does not
+# (VIRGL_CAP_V2_VIDEO_GUEST_PLANES, VIRGL_CAP_V2_VIDEO_PLANAR_TARGET), so swapping it per host
+# would make virglrs a different renderer on each -- which is not a thing this project has.
+#
+# This tree is the **leg the harness scores against**, needed only on Linux. The fork does not
+# compile off Darwin: its IOSurface fields and five of its functions are declared under
+# `#ifdef __APPLE__` while a dozen uses of them are not guarded at all. That is a fork bug worth
+# fixing, but it is not on the path to a Linux score, and upstream is the better oracle here
+# regardless -- it is what a distribution ships and what a Linux VMM will meet.
+#
+# What it costs, recorded rather than discovered later: virglrs advertises those two cap bits and
+# an upstream leg does not, so a caps comparison on Linux differs in exactly those two, both video
+# and both moot until a VA-API backend exists.
+#
+# Materialized by `scripts/build-reference.sh`, not `vendor.sh`: vendor.sh brings in what the
+# crate is built from, and this is not that.
+[virglrenderer-upstream]
+repo = "https://gitlab.freedesktop.org/virgl/virglrenderer.git"
+rev = "cf6c62da2a1384b194f463e6221371962fe99575"
