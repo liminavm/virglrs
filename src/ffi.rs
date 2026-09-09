@@ -349,10 +349,6 @@ pub extern "C" fn virgl_renderer_init(
     if !(3..=abi::CALLBACKS_VERSION).contains(&version) {
         return EBADCALLBACKS;
     }
-    eprintln!(
-        "[virglrs] init flags={flags:#x} -- {}",
-        crate::renderer::unsupported_renderers(config_of(flags))
-    );
     // Only the two fence callbacks are read. The other six are vrend's winsys hooks, which
     // nothing here calls; they get a trait of their own when P3 needs one.
     //
@@ -393,6 +389,11 @@ pub extern "C" fn virgl_renderer_init(
             _ => None,
         }
     };
+    eprintln!(
+        "[virglrs] init flags={flags:#x} cb v{version} -- {}, GL {}",
+        crate::renderer::unsupported_renderers(config_of(flags)),
+        if contexts.is_some() { "minted by the VMM" } else { "of our own" },
+    );
     match Renderer::new(Box::new(VmmFences(shared)), config_of(flags), contexts) {
         Ok(renderer) => {
             *g = Some(Client { renderer, init: InitArgs::new(cookie, flags, cb) });
