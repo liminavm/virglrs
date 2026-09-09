@@ -724,7 +724,13 @@ impl av1::Carried for Owed {
 enum Kind {
     Vp9,
     H264(h264::H264Profile),
-    Hevc(h265::HevcProfile),
+    /// HEVC carries the one piece of decoder state this renderer can change without the guest
+    /// asking: whether a reference picture set had to be invented for it. See
+    /// [`h265::RefPicSets`].
+    Hevc {
+        profile: h265::HevcProfile,
+        ref_pic_sets: h265::RefPicSets,
+    },
     /// Boxed: the serializer's saved reference state is two and a half kilobytes, and every
     /// other codec would carry it around as dead weight in the enum.
     Av1(Box<Av1>),
@@ -736,7 +742,7 @@ impl Kind {
         match self {
             Kind::Vp9 => "VP9",
             Kind::H264(_) => "H.264",
-            Kind::Hevc(_) => "HEVC",
+            Kind::Hevc { .. } => "HEVC",
             Kind::Av1(_) => "AV1",
         }
     }
@@ -1165,7 +1171,9 @@ impl Video {
             Profile::Av1Main => Kind::Av1(Box::new(Av1 { obu: av1::ObuState::new() })),
             _ => match (h264::H264Profile::of(profile), h265::HevcProfile::of(profile)) {
                 (Some(h264), _) => Kind::H264(h264),
-                (_, Some(hevc)) => Kind::Hevc(hevc),
+                (_, Some(hevc)) => {
+                    Kind::Hevc { profile: hevc, ref_pic_sets: h265::RefPicSets::default() }
+                }
                 // `advertised` is built from the same set, so a profile that got this far and
                 // names no codec is this build disagreeing with itself.
                 _ => unreachable!("{profile:?} is advertised and names no codec"),
@@ -1333,7 +1341,7 @@ impl Video {
         // depends on the bytes this very call carried.
         accumulated.extend_from_slice(bitstream);
 
-        match &codec.kind {
+        match &mut codec.kind {
             Kind::Vp9 => *shape = Some(Shape::Vp9(Vp9Frame::read(descriptor, width, height))),
             Kind::H264(h264_profile) => {
                 let h264_profile = *h264_profile;
@@ -1362,14 +1370,14 @@ impl Video {
                 let key = shape.as_ref().is_some_and(Shape::key) || h264::has_idr(accumulated);
                 *shape = Some(Shape::H264 { sets, key, width, height });
             }
-            Kind::Hevc(hevc_profile) => {
+            Kind::Hevc { profile: hevc_profile, ref_pic_sets } => {
                 let hevc_profile = *hevc_profile;
                 let desc = h265::PictureDesc::read(descriptor);
-                // The inspection is not only for the id: it establishes that the stream does not
-                // depend on reference picture sets declared in the SPS, which are absent from the
-                // wire and are therefore written empty. A stream that does depend on them is
-                // refused here rather than decoded into quietly wrong pixels.
-                match desc.slice_inspect(accumulated) {
+                // The inspection is not only for the id: it establishes that no slice predicts from
+                // a reference picture set declared in the SPS, whose contents are absent from the
+                // wire and are therefore written empty. A slice that does is refused here rather
+                // than decoded into quietly wrong pixels.
+                match desc.slice_inspect(accumulated, ref_pic_sets) {
                     // No slice header yet: this call carried only a fragment.
                     Ok(None) => return Ok(()),
                     Ok(Some(_id)) => {}
