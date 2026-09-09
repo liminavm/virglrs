@@ -34,6 +34,7 @@ use crate::ids::{BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, Ring
 use crate::renderer::{self, BlobMem, FdType, ImportDesc, Renderer};
 use crate::venus::context::{Submitted, Wait};
 use crate::venus::cs::ObjectId;
+use crate::vrend::egl::{self, GlContexts};
 use crate::vrend::pipe::TextureTarget;
 use crate::vrend::proto::{self, Format};
 use crate::vrend::resource::{Args as ClassicArgs, Bind, ResourceFlags};
@@ -367,7 +368,32 @@ pub extern "C" fn virgl_renderer_init(
         })
     };
     *sink().lock().expect("the sink slot is never held across a panic") = Some(Arc::clone(&shared));
-    match Renderer::new(Box::new(VmmFences(shared)), config_of(flags)) {
+    // The VMM's own GL, when it has some and did not ask us to open our own. This mirrors
+    // `virglrenderer.c`: a winsys flag means the renderer opens a display for itself, and its
+    // absence means the three context callbacks are the only way to get a context the VMM's
+    // scanout can reach.
+    //
+    // SAFETY: all four fields are within the v3 prefix but `get_egl_display`, which is read only
+    // at v4; the check above proved the caller allocated the prefix its version names.
+    let contexts: Option<Box<dyn GlContexts>> = unsafe {
+        let create = (&raw const (*cb).create_gl_context).read();
+        let destroy = (&raw const (*cb).destroy_gl_context).read();
+        let make_current = (&raw const (*cb).make_current).read();
+        let display = (version >= 4).then(|| (&raw const (*cb).get_egl_display).read()).flatten();
+        match (flags & (abi::USE_EGL | abi::USE_GLX), create, destroy, make_current, display) {
+            (0, Some(create), Some(destroy), Some(make_current), Some(display)) => {
+                Some(Box::new(VmmContexts {
+                    cookie: VmmPtr(cookie),
+                    create,
+                    destroy,
+                    make_current,
+                    display,
+                }))
+            }
+            _ => None,
+        }
+    };
+    match Renderer::new(Box::new(VmmFences(shared)), config_of(flags), contexts) {
         Ok(renderer) => {
             *g = Some(Client { renderer, init: InitArgs::new(cookie, flags, cb) });
             0
@@ -400,13 +426,61 @@ pub extern "C" fn virgl_renderer_reset() {
     with((), |r| r.reset());
 }
 
+/// The VMM's GL, as the renderer's context factory.
+///
+/// The C ABI hands these over as three bare function pointers plus an opaque cookie; the trait
+/// they implement is the renderer's own, and says what the renderer needs rather than what the
+/// header happens to declare. `scanout_idx` is one of the things that does not survive the
+/// translation: vrend has never had more than one, and the C passes 0 everywhere too.
+struct VmmContexts {
+    cookie: VmmPtr,
+    create: extern "C" fn(*mut c_void, c_int, *mut abi::GlCtxParam) -> *mut c_void,
+    destroy: extern "C" fn(*mut c_void, *mut c_void),
+    make_current: extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int,
+    display: extern "C" fn(*mut c_void) -> *mut c_void,
+}
+
+impl GlContexts for VmmContexts {
+    fn display(&self) -> *mut c_void {
+        (self.display)(self.cookie.0)
+    }
+
+    fn create(&self, version: egl::Version, shared: bool) -> Option<*mut c_void> {
+        let mut param = abi::GlCtxParam {
+            // The struct's own version, which the C pins at 2 and no VMM reads.
+            version: 2,
+            shared,
+            major_ver: version.major as c_int,
+            minor_ver: version.minor as c_int,
+            // A compatibility profile is a desktop-GL idea and this renderer asks for GLES.
+            compat_ctx: 0,
+        };
+        let ctx = (self.create)(self.cookie.0, 0, &mut param);
+        (!ctx.is_null()).then_some(ctx)
+    }
+
+    fn make_current(&self, ctx: *mut c_void) -> Result<(), egl::EglError> {
+        // Not a failure this hands back: a VMM that cannot bind a context it minted itself has
+        // broken its own contract, and every GL call after this one would land somewhere unknown.
+        // The C asserts here too, from callbacks v4 onwards.
+        let rc = (self.make_current)(self.cookie.0, 0, ctx);
+        assert_eq!(rc, 0, "the VMM could not make current a GL context it minted");
+        Ok(())
+    }
+
+    fn destroy(&self, ctx: *mut c_void) {
+        (self.destroy)(self.cookie.0, ctx);
+    }
+}
+
 /// The C's implicit current context.
 ///
 /// A caller says this when it has made its own GL context current on this thread and the
 /// renderer's idea of what is current is therefore stale. The C answers by clearing that idea and
-/// re-binding ctx0. Nothing here keeps such an idea to clear -- [`egl::Shared::make_current`] asks
-/// EGL every time rather than remembering -- so a caller that never calls this is served exactly
-/// as well as one that does, and there is nothing to do here.
+/// re-binding ctx0. Nothing here keeps such an idea to clear -- the winsys asks EGL every time
+/// rather than remembering, and where the VMM mints the contexts it asks the VMM -- so a caller
+/// that never calls this is served exactly as well as one that does, and there is nothing to do
+/// here.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_force_ctx_0() {}
 

@@ -267,7 +267,7 @@ mod tests {
         // context costs milliseconds, which is longer than the render, so a reader that does that
         // work after the flush finds the GPU idle whether or not it waited -- and the test would
         // pass with the wait deleted. The only difference between the two reads below is the wait.
-        let display = winsys.thread_display();
+        let display = winsys.thread_display().expect("a winsys of our own lends its display");
         let wait_ctx = winsys
             .create_context(Version { major: 3, minor: 1 }, Some(&ctx))
             .expect("a shared context");

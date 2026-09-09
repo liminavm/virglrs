@@ -605,9 +605,14 @@ impl Renderer {
     /// Bring up the renderers the config asks for. vrend needs a GL context on the calling
     /// thread, and a host that cannot give it one is a host this renderer cannot serve the
     /// classic protocol on -- so that is a failure to initialise, as it is in the C.
+    /// `contexts` is where vrend's GL contexts come from. `None` is this renderer's own
+    /// surfaceless display, which is what a host with no GL of its own wants; an embedder that
+    /// draws the scanout itself passes its factory, so that the names it is handed are names in
+    /// its own share group. See [`vrend::egl::GlContexts`].
     pub fn new(
         fences: Box<dyn FenceSink>,
         config: Config,
+        contexts: Option<Box<dyn vrend::egl::GlContexts>>,
     ) -> Result<Renderer, vrend::vrend::InitError> {
         // Built here and shared into venus, rather than reached through the renderer: a ring
         // thread needs the table long after the call that created its ring returned, and it must
@@ -625,7 +630,7 @@ impl Renderer {
         }
         let fences = Retirement::start(fences);
         let vrend = if config.vrend {
-            Some(vrend::vrend::Vrend::new(config, &budget, fences.handle())?)
+            Some(vrend::vrend::Vrend::new(config, &budget, fences.handle(), contexts)?)
         } else {
             None
         };
@@ -1790,7 +1795,7 @@ mod tests {
     }
 
     fn renderer(config: Config) -> Renderer {
-        Renderer::new(Box::new(NoSink), config).expect("no vrend is asked for")
+        Renderer::new(Box::new(NoSink), config, None).expect("no vrend is asked for")
     }
 
     /// The two questions `HostShm::for_blob` answers, and it answers them from the source alone.
