@@ -174,3 +174,142 @@ fn wait_out(gl: &Gl, fence: &Fence) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::metal::{self, PixelFormat};
+    use crate::vrend::egl::{Flavour, Version, Winsys};
+    use crate::vrend::gl::gles::*;
+    use crate::vrend::gl::types::GLsizei;
+
+    const W: u32 = 1024;
+    const H: u32 = 1024;
+    /// Big enough that the driver cannot have finished by the time the CPU looks, and cheap enough
+    /// that the test is not a benchmark. Raised until the control arms.
+    const FIRST_PASSES: u32 = 400;
+
+    /// Queue `passes` full-surface clears, the last one `last`, and flush without waiting.
+    fn queue(gl: &Gl, passes: u32, last: [f32; 4]) {
+        for i in 0..passes {
+            // Every pass writes the whole surface, so only the last one can be what a reader sees
+            // if the work ran to completion -- and an earlier colour is what it sees if it did not.
+            let c = if i + 1 == passes { last } else { [1.0, 0.0, 1.0, 1.0] };
+            gl.clear_color(c);
+            gl.clear(GL_COLOR_BUFFER_BIT);
+        }
+    }
+
+    /// The blue channel of the surface's first pixel, read on the CPU through IOSurface.
+    ///
+    /// This is the foreign consumer the fence exists for: `IOSurfaceLock` and a load, ordered
+    /// against our GL queue by nothing at all.
+    fn first_pixel_blue(s: &metal::Surface) -> u8 {
+        s.read_plane_row(0, 0).expect("the surface has a row 0")[0]
+    }
+
+    /// A CPU reader must see the render a classic fence waited for.
+    ///
+    /// This is the hazard the fence path exists for, in the smallest form that still has it: a
+    /// consumer with no ordering against our GL queue, reading a surface a GL context rendered
+    /// into. A venus compositor importing the surface is the real case, and this stands in for it
+    /// because `IOSurfaceLock` is just as unordered as a Vulkan queue and needs no compositor.
+    ///
+    /// **The control is the point.** Asserting only that the waited read is right would pass on a
+    /// machine where the work happened to be finished anyway, and would go on passing if the wait
+    /// were deleted. So the same sequence is read *without* the wait first, and the test refuses
+    /// to conclude anything unless that read is stale -- the needle has to be shown live before
+    /// the assertion means anything.
+    #[test]
+    #[ignore = "needs the zink-on-KosmicKrisp environment"]
+    fn a_cpu_reader_sees_the_render_the_fence_waited_for() {
+        let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
+        let ctx = winsys
+            .create_context(Version { major: 3, minor: 1 }, None)
+            .expect("a GLES 3.1 context");
+        winsys.make_current(&ctx).expect("ctx is current on this thread");
+        let gl = Gl::new(winsys.gles());
+
+        let surface =
+            Arc::new(metal::Surface::plain(W, H, PixelFormat::Bgra).expect("an IOSurface"));
+        let image = winsys
+            .image_from_iosurface(Arc::clone(&surface) as Arc<dyn metal::Held>)
+            .expect("an EGL image over the surface");
+
+        let tex = gl.gen_texture();
+        gl.bind_texture(GL_TEXTURE_2D, Some(tex));
+        gl.egl_image_target_texture_2d(GL_TEXTURE_2D, &image);
+        let fb = gl.gen_framebuffer();
+        gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
+        gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(tex), 0);
+        assert_eq!(
+            gl.check_framebuffer_status(),
+            GL_FRAMEBUFFER_COMPLETE,
+            "the IOSurface-backed texture is a complete framebuffer"
+        );
+        gl.viewport(0, 0, W as GLsizei, H as GLsizei);
+
+        // A second context of the same share group, on another thread, is where the wait happens --
+        // exactly as the waiter does it.
+        let display = winsys.thread_display();
+        let wait_ctx = winsys
+            .create_context(Version { major: 3, minor: 1 }, Some(&ctx))
+            .expect("a shared ctx");
+        let wait_gl = Gl::new(winsys.gles());
+
+        // Settle on black, so "stale" has a value and is not whatever the allocation held.
+        gl.clear_color([0.0, 0.0, 0.0, 1.0]);
+        gl.clear(GL_COLOR_BUFFER_BIT);
+        gl.finish();
+        assert_eq!(first_pixel_blue(&surface), 0, "the surface starts black");
+
+        // Arm the control: queue work ending in full blue and look before waiting. If the reader
+        // already sees blue the workload is too small to expose anything, so make it bigger.
+        let mut passes = FIRST_PASSES;
+        let mut unwaited = 0xff;
+        for _ in 0..5 {
+            gl.clear_color([0.0, 0.0, 0.0, 1.0]);
+            gl.clear(GL_COLOR_BUFFER_BIT);
+            gl.finish();
+            queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
+            gl.flush();
+            unwaited = first_pixel_blue(&surface);
+            if unwaited != 0xff {
+                break;
+            }
+            gl.finish();
+            passes *= 4;
+        }
+        assert_ne!(
+            unwaited, 0xff,
+            "could not build a render slow enough for an unwaited read to be stale, so this test \
+             cannot tell a working wait from a deleted one -- it proves nothing as written"
+        );
+
+        // Now the fence, waited the way the waiter waits it: a sync taken on the rendering
+        // context, and a wait on a different context on a different thread.
+        queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
+        let fence = gl.fence().expect("the driver gives a sync object");
+        // Moved, not borrowed: a GL context is `Send` and not `Sync`, because being current is a
+        // property of one thread. That is the same reason the waiter owns its context outright.
+        let seen = Arc::clone(&surface);
+        let waited = std::thread::spawn(move || {
+            display.make_current(&wait_ctx).expect("the waiter's context is current");
+            wait_out(&wait_gl, &fence);
+            wait_gl.fence_delete(fence);
+            first_pixel_blue(&seen)
+        })
+        .join()
+        .expect("the waiting thread does not panic");
+
+        assert_eq!(
+            waited, 0xff,
+            "a CPU reader saw {waited:#04x} where the fence said the render had run -- the same \
+             read was stale ({unwaited:#04x}) without the wait, so the wait is what makes it true"
+        );
+
+        gl.delete_framebuffer(fb);
+    }
+}
