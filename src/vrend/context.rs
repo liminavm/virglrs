@@ -1183,9 +1183,97 @@ const ZERO_RS: RasterizerState = RasterizerState {
 
 // ---- the context ----
 
+/// The sub-contexts a context owns, with the current one held out of the map.
+///
+/// Every command reaches the current sub-context, most of them several times over, and reaching it
+/// through the map means hashing its id each time to be handed the one answer that cannot have
+/// changed since the command before asked. Held out, it is a field.
+///
+/// It is still one owner. A sub-context is either the current one or parked, never both and never
+/// neither, so there is no second copy to keep in step and no id left naming storage the map no
+/// longer holds -- which is what a cached index beside the map would have been.
+#[derive(Default)]
+struct Subs {
+    /// `None` only before sub-context 0 is created, which [`Context::new`] does before it hands
+    /// the context to anyone.
+    current: Option<(SubContextId, SubContext)>,
+    parked: crate::Map<SubContextId, SubContext>,
+}
+
+impl Subs {
+    fn id(&self) -> SubContextId {
+        self.entry().0
+    }
+
+    fn entry(&self) -> &(SubContextId, SubContext) {
+        self.current.as_ref().expect("the current sub-context exists")
+    }
+
+    fn get(&self) -> &SubContext {
+        &self.entry().1
+    }
+
+    fn get_mut(&mut self) -> &mut SubContext {
+        &mut self.current.as_mut().expect("the current sub-context exists").1
+    }
+
+    fn contains(&self, id: SubContextId) -> bool {
+        self.current.as_ref().is_some_and(|(c, _)| *c == id) || self.parked.contains_key(&id)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (SubContextId, &SubContext)> {
+        self.current
+            .iter()
+            .map(|(id, sub)| (*id, sub))
+            .chain(self.parked.iter().map(|(id, sub)| (*id, sub)))
+    }
+
+    /// Take a newly created sub-context. It parks: creating one does not select it, which is what
+    /// the C does -- except for the first, which is the one a fresh context is already on.
+    fn add(&mut self, id: SubContextId, sub: SubContext) {
+        match &self.current {
+            None => self.current = Some((id, sub)),
+            Some(_) => {
+                self.parked.insert(id, sub);
+            }
+        }
+    }
+
+    /// Select `id`, parking the one that was current. False if this context does not hold it.
+    fn switch_to(&mut self, id: SubContextId) -> bool {
+        let Some(sub) = self.parked.remove(&id) else {
+            return false;
+        };
+        if let Some((was, parked)) = self.current.replace((id, sub)) {
+            self.parked.insert(was, parked);
+        }
+        true
+    }
+
+    /// Take a sub-context out. Removing the current one selects sub-context 0, which is never
+    /// destroyed -- so there is always one current afterwards.
+    fn remove(&mut self, id: SubContextId) -> Option<SubContext> {
+        if !self.current.as_ref().is_some_and(|(c, _)| *c == id) {
+            return self.parked.remove(&id);
+        }
+        let zero = SubContextId(0);
+        let back = self.parked.remove(&zero).expect("sub-context 0 is never destroyed");
+        self.current.replace((zero, back)).map(|(_, sub)| sub)
+    }
+
+    /// Every sub-context, highest id first so that sub-context 0 -- the one a fresh context
+    /// already owns, and the one the others were created against -- goes last.
+    fn drain(&mut self) -> Vec<(SubContextId, SubContext)> {
+        let mut all: Vec<(SubContextId, SubContext)> = self.parked.drain().collect();
+        all.extend(self.current.take());
+        all.sort_unstable_by_key(|(id, _)| *id);
+        all.reverse();
+        all
+    }
+}
+
 pub struct Context {
-    subs: crate::Map<SubContextId, SubContext>,
-    current: SubContextId,
+    subs: Subs,
     fault: Option<Fault>,
     /// The codecs and decode targets this context owns. Context-global: the video handles are
     /// not sub-scoped, so a sub-context switch does not change which codec a handle names.
@@ -1224,8 +1312,7 @@ impl Context {
     /// `vrend_create_context`: a context with sub-context 0, current on this thread.
     pub fn new(host: &mut Host<'_>) -> Result<Context, EglError> {
         let mut ctx = Context {
-            subs: crate::Map::default(),
-            current: SubContextId(0),
+            subs: Subs::default(),
             fault: None,
             video: video::Video::default(),
             owed: Vec::new(),
@@ -1243,26 +1330,26 @@ impl Context {
 
     /// Whether this context's GL contexts are `GlContext::Sub(self, ...)`.
     pub fn current_sub(&self) -> SubContextId {
-        self.current
+        self.subs.id()
     }
 
     fn sub(&self) -> &SubContext {
-        self.subs.get(&self.current).expect("the current sub-context exists")
+        self.subs.get()
     }
 
     fn sub_mut(&mut self) -> &mut SubContext {
-        self.subs.get_mut(&self.current).expect("the current sub-context exists")
+        self.subs.get_mut()
     }
 
     /// Make the current sub-context's GL context current.
     pub fn make_current(&self, host: &mut Host<'_>) {
-        host.make_current(self.current, &self.sub().gl_ctx);
+        host.make_current(self.subs.id(), &self.sub().gl_ctx);
     }
 
     /// Every sub-context's GL context, for the renderer to wait on. Each has its own command
     /// queue, so work one of them rendered is not covered by a finish on any other.
     pub fn gl_contexts(&self) -> impl Iterator<Item = (SubContextId, &egl::Context)> {
-        self.subs.iter().map(|(id, sub)| (*id, &sub.gl_ctx))
+        self.subs.iter().map(|(id, sub)| (id, &sub.gl_ctx))
     }
 
     /// `vrend_destroy_context`: unbind what the C unbinds, then every sub-context.
@@ -1279,15 +1366,9 @@ impl Context {
                 "a resource with no handle is attached to nothing"
             );
         }
-        // Highest id first, and sorted here rather than inherited from the table's iteration
-        // order: sub-context 0 is the one a fresh context already owns and the one the others were
-        // created against, so it goes last. The table is hashed now (`crate::Map`), and a reverse
-        // walk of it would be an arbitrary order that happened to pass.
-        let mut ids: Vec<SubContextId> = self.subs.keys().copied().collect();
-        ids.sort_unstable();
-        ids.reverse();
-        for id in ids {
-            let sub = self.subs.remove(&id).expect("listed");
+        // Highest id first, and ordered by `Subs::drain` rather than inherited from a hashed
+        // table's iteration order, which would be an arbitrary order that happened to pass.
+        for (id, sub) in self.subs.drain() {
             host.make_current(id, &sub.gl_ctx);
             let gl_ctx = sub.destroy(host.gl, host.current.program());
             drop(gl_ctx);
@@ -1296,14 +1377,14 @@ impl Context {
     }
 
     fn create_sub(&mut self, host: &mut Host<'_>, id: SubContextId) -> Result<(), EglError> {
-        if self.subs.contains_key(&id) {
+        if self.subs.contains(id) {
             return Ok(());
         }
         let gl_ctx = host.winsys.create_context(host.version, Some(host.share))?;
         host.make_current(id, &gl_ctx);
         let mut sub = SubContext::new(host.gl, gl_ctx);
         sub.created_at = self.seq.advance();
-        self.subs.insert(id, sub);
+        self.subs.add(id, sub);
         Ok(())
     }
 
@@ -1469,7 +1550,7 @@ impl Context {
     /// What this context has retained, over every sub-context it owns.
     pub fn journal_census(&self) -> Census {
         let mut c = Census::default();
-        for sub in self.subs.values() {
+        for (_, sub) in self.subs.iter() {
             for at in sub.objects.retained() {
                 c.add(at, true);
             }
@@ -1494,11 +1575,11 @@ impl Context {
             // again would be asking the rebuild to do what it has already done.
             let create = (sub.created_at != Seq::default())
                 .then_some(Entry { seq: sub.created_at, step: Step::CreateSub(id.0) });
-            let objects = sub.objects.retained().map(|at| Entry {
+            let objects = sub.objects.retained().map(move |at| Entry {
                 seq: at.seq,
                 step: Step::Feed { sub: id.0, chunks: &at.chunks },
             });
-            let state = sub.state.values().map(|at| Entry {
+            let state = sub.state.values().map(move |at| Entry {
                 seq: at.seq,
                 step: Step::Feed { sub: id.0, chunks: &at.chunks },
             });
@@ -1510,7 +1591,7 @@ impl Context {
         // command the guest was never told to stop sending.
         let video = self.video.retained().map(|at| Entry {
             seq: at.seq,
-            step: Step::Feed { sub: self.current.0, chunks: &at.chunks },
+            step: Step::Feed { sub: self.subs.id().0, chunks: &at.chunks },
         });
         // A resource's type is not a sub-context's business -- it is filed under the one the
         // command arrived on, which is the current one at that point in the order anyway.
@@ -1519,7 +1600,7 @@ impl Context {
         // recorded command, which start at one.
         let types = typed.map(|wire| Entry {
             seq: Seq::default(),
-            step: Step::Feed { sub: self.current.0, chunks: std::slice::from_ref(wire) },
+            step: Step::Feed { sub: self.subs.id().0, chunks: std::slice::from_ref(wire) },
         });
         order(subs.chain(video).chain(types))
     }
@@ -1899,12 +1980,11 @@ impl Context {
 impl Context {
     /// `vrend_renderer_set_sub_ctx`: an unknown id is ignored.
     fn set_sub_ctx(&mut self, host: &mut Host<'_>, id: SubContextId) {
-        if id == self.current {
+        if id == self.subs.id() {
             return;
         }
-        if let Some(sub) = self.subs.get(&id) {
-            host.make_current(id, &sub.gl_ctx);
-            self.current = id;
+        if self.subs.switch_to(id) {
+            host.make_current(id, &self.sub().gl_ctx);
         }
     }
 
@@ -1913,14 +1993,11 @@ impl Context {
         if id.0 == 0 {
             return;
         }
-        let Some(sub) = self.subs.remove(&id) else {
+        let Some(sub) = self.subs.remove(id) else {
             return;
         };
         host.make_current(id, &sub.gl_ctx);
         drop(sub.destroy(host.gl, host.current.program()));
-        if self.current == id {
-            self.current = SubContextId(0);
-        }
         self.make_current(host);
     }
 }
@@ -4586,8 +4663,7 @@ mod tests {
     /// A context holding nothing, for the bookkeeping a described blob needs and no GL at all.
     fn bare() -> Context {
         Context {
-            subs: crate::Map::default(),
-            current: SubContextId(0),
+            subs: Subs::default(),
             fault: None,
             video: video::Video::default(),
             owed: Vec::new(),
