@@ -468,9 +468,9 @@ mod tests {
 
     /// A second context on a live id is caught, not served.
     ///
-    /// The insert used to be bare, so a repeat would have replaced the entry: the previous
-    /// context's rings and every host handle it held would go, and the call would return as
-    /// though a context had been created. `Renderer::context_create` refuses the duplicate before
+    /// A bare insert would replace the entry instead: the previous context's rings and every
+    /// host handle it held would go, and the call would return as though a context had been
+    /// created. `Renderer::context_create` refuses the duplicate before
     /// it gets here, which is what makes this a host invariant rather than something a guest can
     /// provoke -- and exactly why it must fail loudly if the two maps ever drift apart.
     #[test]

@@ -1354,9 +1354,9 @@ impl Resource {
     /// Where this resource's presentable storage is, resolved once.
     ///
     /// Both [`Self::surface`] and [`Self::surface_share`] answer from here, because they are two
-    /// views of one fact and answering them from two matches let them disagree: a texture that
-    /// exports its own storage was reachable by reference and not by share, so the resource had a
-    /// surface to publish an id from and nothing to hand a holder.
+    /// views of one fact and answering them from two matches lets them disagree: a texture that
+    /// exports its own storage is reachable by reference and not by share, so such a resource
+    /// would have a surface to publish an id from and nothing to hand a holder.
     fn presented(&self) -> Option<Presented<'_>> {
         let Storage::Texture(t) = &self.storage else { return None };
         if let Some(image) = t.image.as_ref() {
@@ -2526,11 +2526,11 @@ mod tests {
 
     /// What the guest sends about a buffer's shape is refused by name, and never repaired.
     ///
-    /// Two numbers arrive with `PIPE_RESOURCE_SET_TYPE` and neither is this side's to fix. A
-    /// plane count above what a layout holds used to be trimmed to fit, which then checked a
-    /// buffer the guest had not described; and a format with no DRM FourCC was reported as
-    /// "fourcc 0x00000000 has no plane rule", which names neither the format nor the real
-    /// problem -- that there is nothing to tell an importer the bytes are.
+    /// Two numbers arrive with `PIPE_RESOURCE_SET_TYPE` and neither is this side's to fix.
+    /// Trimming a plane count to what a layout holds describes a buffer the guest did not send
+    /// and then checks that one; and reporting a format with no DRM FourCC as `Fourcc(0)` names
+    /// neither the format nor the real problem, which is that there is nothing to tell an
+    /// importer the bytes are.
     ///
     /// The spy is what makes the refusals mean anything: it records the layout it is handed, so
     /// the test can say that the refused cases never reached it and that the accepted one arrived

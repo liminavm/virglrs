@@ -435,9 +435,9 @@ impl Surface {
         //
         // So a plane past the first exists to be *named* in an import and not to be read as a
         // picture, and the FourCC's own rule is what says how many planes of pixels there are.
-        // `plane_rule` is that rule and this asks it rather than carrying a second copy: the
-        // copy that was here said four bytes an element for everything that is not NV12, which
-        // is wrong for R8, RG16 and the four 16-bit-float codes the rule knows.
+        // `plane_rule` is that rule and this asks it rather than carrying a second copy, which
+        // would have to know that R8 is one byte an element, RG16 two and the four 16-bit-float
+        // codes eight.
         let (pixel_planes, element) = plane_rule(self.layout.fourcc)?;
         if plane >= pixel_planes {
             return None;
@@ -905,8 +905,8 @@ mod tests {
     /// The case this exists for was measured, not imagined: an Intel scanout on this host exports
     /// with modifier `0x0100000000000001` (`I915_FORMAT_MOD_X_TILED`). The descriptor is exactly
     /// what a compositor wants -- it hands it to a GPU that knows the modifier -- and the same bytes
-    /// read in row order are not the frame. Before this, they were read, hashed, and compared
-    /// against the reference leg, where the difference would have looked like a renderer bug.
+    /// read in row order are not the frame. Read as rows they hash, and differ from the reference
+    /// leg, where the difference looks like a renderer bug.
     ///
     /// Refused, and not "read as zero": the two are told apart by the caller, which has a slow
     /// path to fall back to and needs to be sent to it.
@@ -1109,10 +1109,9 @@ mod tests {
                     format.name()
                 );
             };
-            // And what a plane says about itself is that same rule, not a second copy of it. The
-            // copy that used to live in `Surface::plane` answered four bytes an element for
-            // everything but NV12, so R8 read four times too wide and the 16-bit-float codes
-            // half.
+            // And what a plane says about itself is that same rule, not a second copy of it. A
+            // copy inside `Surface::plane` that answers four bytes an element for everything but
+            // NV12 reads R8 four times too wide and the 16-bit-float codes half.
             let one = Surface::exported(
                 memfd(4096),
                 Layout {
