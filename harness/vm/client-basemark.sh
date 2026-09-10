@@ -95,7 +95,8 @@ echo "=== one Firefox for the whole run"
 # round trip through the profile on disk. It does not, reliably: the run comes up with defaults
 # and the suite sits behind its Start button while every log line still looks right. Later URLs
 # are handed to the instance that is already running, which is what a person does.
-timeout 600 firefox --profile "$PROFILE" --new-instance "$URL_PROBE" 2>&1 | stamp | tee -a "$LOG" &
+timeout 900 firefox --profile "$PROFILE" --new-instance --marionette "$URL_PROBE" 2>&1 \
+  | stamp | tee -a "$LOG" &
 sleep 22
 
 probe=$(grep -o 'BASEMARK_PROBE renderer=.*' "$LOG" | tail -1 || true)
@@ -129,12 +130,48 @@ esac
 
 echo "=== launching the suite in that same session"
 firefox --profile "$PROFILE" "$URL_RUN" > /dev/null 2>&1
-sleep 10
+sleep 12
 
 # Framing, not motion: see tap-keys.py. The overview keeps presenting, but it composites the
 # window as a thumbnail inside the shell's UI rather than showing it at its own size.
 sudo python3 /tmp/tap-keys.py esc || echo "WARNING: could not tap esc" >&2
+sleep 2
 
-echo "=== suite launched; sample the host vmm now"
+# /run/ does not auto-start; it waits behind a Start button, and there is no URL parameter that
+# skips it. Clicked in the page rather than tapped through the focus order, because a tab-then-enter
+# guess reads as success whether or not it hit anything -- which is how a full profile once got
+# taken of a benchmark that had not started. This reports what it clicked, and refuses if nothing
+# matched.
+clicked=$(python3 /tmp/marionette.py js '
+var els = Array.from(document.querySelectorAll("button,a,input[type=button],input[type=submit],[role=button]"));
+var t = els.filter(function (e) {
+  var s = (e.innerText || e.value || "").trim();
+  return /^\s*start/i.test(s) && e.offsetParent !== null;
+})[0];
+if (!t) { return "NONE"; }
+t.click();
+return (t.tagName + " " + (t.innerText || t.value || "").trim()).slice(0, 60);
+') || clicked='"ERROR"'
+echo "start control: $clicked"
+# Best effort, not a gate: once the session is configured, /run/ starts on its own, and a run that
+# clicked nothing still runs. What settles whether the suite is going is the page itself, below.
+case "$clicked" in
+  *NONE*|*ERROR*) echo "note: no Start control matched; /run/ normally starts by itself" >&2 ;;
+esac
+
+# The page's own statement of what it is doing -- /run/tests/<n>/graphics_suite/<test_name>/ while
+# a test runs. This is the aiming signal: a sample window labelled by the pathname it was taken
+# under is attributable to one test, which is the whole reason this suite needs driving.
+python3 /tmp/marionette.py wait 'graphics_suite|Test \(test' 240 > /dev/null 2>&1 \
+  || echo "WARNING: no test page appeared; the suite may not have started" >&2
+echo "now at: $(python3 /tmp/marionette.py js 'return document.location.pathname' 2>/dev/null)"
+
+echo "=== suite running; sample the host vmm now"
 echo "=== host side: sample \$(pgrep -f '[l]imina-vmm --cpus') 10 -f prof.txt"
-wait
+
+# The scores live only in this page's DOM -- the run is never stored server-side. Waiting on the
+# result table is also what says the suite finished, which nothing else here can tell us.
+echo "=== waiting for the result table"
+python3 /tmp/marionette.py wait 'WebGL|Shader Pipeline|Geometry' 900 > /tmp/basemark-scores.txt \
+  && { echo "--- scores:"; cat /tmp/basemark-scores.txt; } \
+  || echo "WARNING: no result table appeared" >&2
