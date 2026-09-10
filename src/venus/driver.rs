@@ -5436,7 +5436,7 @@ impl Storage {
     /// does -- see [`crate::surface::Held`] and [`crate::surface::Describable`].
     pub fn adoptable(&self) -> Option<Adoptable> {
         match self {
-            Storage::Texture(t) => Some(Adoptable::Ready(Arc::clone(t))),
+            Storage::Texture(t) => Some(Adoptable::of(Arc::clone(t))),
             // The layout is not this side's to give, so what travels is the storage and the
             // obligation to describe it -- not a layout invented here to fill the hole.
             #[cfg(not(target_os = "macos"))]
@@ -6099,8 +6099,10 @@ fn export_dmabuf(
     // physical device this function is not given and a struct the wire bindings do not yet carry.
     // Until it does, an image whose modifier has an auxiliary plane is described here as having
     // one. Measured against iris on this host: a `Y_TILED_CCS` buffer declared as a single plane
-    // is refused at `eglCreateImageKHR` with `EGL_BAD_MATCH`, so such an import fails loudly at
-    // the importer rather than being read as the wrong pixels.
+    // is refused at `eglCreateImageKHR` with `EGL_BAD_MATCH` -- so such an import is refused at
+    // the importer rather than read as the wrong pixels, and the guest gets a resource it cannot
+    // create. The modifier is the guest's choice, which is why that refusal is a refusal and not
+    // an assertion; see [`crate::surface::Adoptable::Exported`].
     let plane_count = 1u32;
     let layout_query = d.try_vkGetImageSubresourceLayout().ok_or(NoSurface::Layout)?;
     let mut planes = [PlaneLayout { offset: 0, pitch: 0 }; MAX_PLANES];
@@ -7506,6 +7508,14 @@ mod tests {
         let (_, share) = d.memory_export(ObjectId(1), ASKED).expect("a scanout exports");
         assert!(matches!(share, Storage::Texture(_)), "the share is the exported storage");
         assert!(share.surface().is_ok(), "and it resolves to a surface for a compositor");
+        // Offered as the exporting driver's answer and never as a minted one. The two differ in
+        // exactly one thing -- what a refused import means -- and the minted arm asserts, so an
+        // export offered as minted is a guest that can abort the worker by choosing a modifier
+        // this host's GL will not import.
+        assert!(
+            matches!(share.adoptable(), Some(Adoptable::Exported(_))),
+            "the layout is the guest's driver's answer about a guest's image, not ours"
+        );
 
         // The descriptor outlives the allocation, which is the arrangement the whole share
         // scheme exists for: the guest frees the memory and a compositor holding the share can

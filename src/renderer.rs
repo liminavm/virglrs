@@ -2283,7 +2283,7 @@ mod tests {
             "the same storage, not a second one describing the same surface"
         );
         assert!(
-            matches!(lent.adoptable(), Some(crate::surface::Adoptable::Ready(_))),
+            matches!(lent.adoptable(), Some(crate::surface::Adoptable::Minted(_))),
             "a share, so the surface outlives the classic context that made it -- and one that \
              carries its own layout, because a minted surface knows what it is"
         );

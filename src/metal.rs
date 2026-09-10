@@ -799,6 +799,12 @@ impl Surface {
     }
 
     /// How the surface actually laid its rows out, which is not necessarily what was asked for.
+    /// Minted here, so a refusal to adopt one is this renderer's own bug. See
+    /// [`crate::surface::Layouter`].
+    pub fn layouter(&self) -> crate::surface::Layouter {
+        crate::surface::Layouter::ThisHost
+    }
+
     pub fn bytes_per_row(&self) -> u32 {
         // SAFETY: as above. A row pitch is bounded by the surface's own allocation.
         let bytes = unsafe { IOSurfaceGetBytesPerRow(self.as_ref()) };

@@ -191,9 +191,12 @@ pub enum Refusal {
     /// buffer behind it. The guest's error: it chose the layout when it filled the buffer, and
     /// this is the description it sent of what it chose.
     UndescribableStorage(crate::surface::BadLayout),
-    /// A guest-supplied description the bounds accepted and the driver would not import. Also the
-    /// guest's, and refused rather than asserted for the same reason: the numbers are its own.
-    UnimportableStorage(core::ffi::c_int),
+    /// A layout the importing driver would not take. Refused and never asserted, because it is
+    /// never this renderer's own answer that was refused: either the guest described the storage
+    /// (see above), or the guest's driver laid out an image whose modifier the guest chose and a
+    /// second driver will not import it. Two drivers disagreeing over the guest's choice is a
+    /// capability mismatch, and a guest must not be able to abort the host with one.
+    UnimportableStorage(crate::vrend::egl::EglError),
     /// A multisample 2D *array*, on a host with no `glTexStorage3DMultisample`.
     ///
     /// Split out from [`Refusal::UnsupportedMultisampleFormat`] because it cannot claim that
@@ -309,8 +312,8 @@ impl fmt::Display for Refusal {
         if let Refusal::UndescribableStorage(why) = self {
             return write!(f, "the storage cannot be read as described: {why}");
         }
-        if let Refusal::UnimportableStorage(code) = self {
-            return write!(f, "the driver would not import the storage as described ({code:#x})");
+        if let Refusal::UnimportableStorage(e) = self {
+            return write!(f, "the driver would not import the storage as described: {e}");
         }
         let s = match self {
             Refusal::UndescribableStorage(_) | Refusal::UnimportableStorage(_) => {
@@ -513,17 +516,32 @@ impl Untyped {
             // where they are.
             None => None,
             Some(_) if !winsys.adopts_shared_storage(features) => None,
-            // The layout is the exporting driver's own answer about its own image. A host that
-            // says it adopts and then refuses one is a host bug, and it crashes: degrading would
-            // hide our own defect behind a window that renders the wrong thing.
-            Some(Adoptable::Ready(held)) => match winsys.image_from_iosurface(held) {
+            // Minted here, to a layout chosen here, on a host that says it adopts what it
+            // mints. A refusal is then this renderer's own defect and it crashes: degrading would
+            // hide it behind a window that renders the wrong thing.
+            Some(Adoptable::Minted(held)) => match winsys.image_from_iosurface(held) {
                 Ok(image) => Some(image),
                 Err(e) => panic!(
-                    "the driver adopts exported storage but refused an exported {}x{} {} one: {e}",
+                    "the driver adopts minted storage but refused a minted {}x{} {} one: {e}",
                     args.width,
                     args.height,
                     args.format.name()
                 ),
+            },
+            // The exporting driver's own answer about its own image -- but the image's modifier
+            // is the *guest's* choice and the importer is a second driver, which may not support
+            // it. So this one is refused, and the share is handed back with the slot: a guest
+            // that asks for a modifier this host's GL cannot import gets a resource it cannot
+            // create, and not a dead worker.
+            Some(Adoptable::Exported(held)) => match winsys.image_from_iosurface(Arc::clone(&held))
+            {
+                Ok(image) => Some(image),
+                Err(e) => {
+                    return Err((
+                        Untyped { storage: Some(Adoptable::Exported(held)) },
+                        Refusal::UnimportableStorage(e),
+                    ));
+                }
             },
             // Storage with no layout of its own, read under the one this command carries -- the
             // only description of it there will ever be, because the driver laid out a buffer and
@@ -549,7 +567,7 @@ impl Untyped {
                     Err(e) => {
                         return Err((
                             Untyped { storage: Some(Adoptable::Unread(storage)) },
-                            Refusal::UnimportableStorage(e.code),
+                            Refusal::UnimportableStorage(e),
                         ));
                     }
                 }
@@ -620,7 +638,7 @@ impl Untyped {
     /// to return is exactly what [`Adoptable::Unread`] exists to prevent.
     pub fn surface(&self) -> Option<&Arc<dyn Held>> {
         match &self.storage {
-            Some(Adoptable::Ready(held)) => Some(held),
+            Some(Adoptable::Minted(held)) | Some(Adoptable::Exported(held)) => Some(held),
             Some(Adoptable::Unread(_)) | None => None,
         }
     }

@@ -162,6 +162,33 @@ pub trait Held: Send + Sync {
     fn surface(&self) -> &Surface;
 }
 
+/// Who answered for a surface's layout -- which is who a refused import indicts.
+///
+/// A property of the storage and not of the host, so it is asked of the surface rather than
+/// tested with a `cfg!`. A host that both minted and adopted would answer both ways, and fusing
+/// the two is what let a guest's choice of modifier reach an assertion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Layouter {
+    /// This renderer minted the storage, to a layout of its own choosing.
+    ThisHost,
+    /// The guest's driver laid out its own image and reported how. A *different* driver decides
+    /// whether it can be imported, and the image was the guest's to specify.
+    TheExportingDriver,
+}
+
+impl Adoptable {
+    /// A share of storage that already knows its layout, in the shape that says whose answer it
+    /// is.
+    ///
+    /// The one place the two are told apart, so no caller has to remember which host it is on.
+    pub fn of(share: std::sync::Arc<dyn Held>) -> Adoptable {
+        match share.surface().layouter() {
+            Layouter::ThisHost => Adoptable::Minted(share),
+            Layouter::TheExportingDriver => Adoptable::Exported(share),
+        }
+    }
+}
+
 /// Storage that has no layout of its own, and can only be read under one someone else supplies.
 ///
 /// The exporting host's other shape. Most storage arrives with the layout the driver laid it out
@@ -177,7 +204,7 @@ pub trait Held: Send + Sync {
 ///
 /// Host-neutral because the question is: "can this be adopted as a texture's storage" is asked by
 /// vrend on both hosts. A host whose storage always carries its own layout implements this
-/// nowhere, and [`Adoptable`] then only ever holds its other arm.
+/// nowhere, and [`Adoptable`] then only ever holds its other arms.
 pub trait Describable: Send + Sync {
     /// Taken by `Arc<Self>` rather than by reference: what comes back has to hold a share of the
     /// storage it reads, and a share cannot be recovered from a borrow of one. Passing the share
@@ -194,9 +221,18 @@ pub trait Describable: Send + Sync {
 /// the importer's -- a caller that had to test which it held would be re-deciding something
 /// already settled at the export.
 pub enum Adoptable {
-    /// Storage that knows its own layout: the driver laid it out and said so, or this host minted
-    /// it. Adopted exactly as it stands.
-    Ready(std::sync::Arc<dyn Held>),
+    /// Storage this host minted, to a layout it chose. Adopted exactly as it stands, and a
+    /// refusal to adopt it is this renderer's own bug -- nothing about it came from the guest.
+    Minted(std::sync::Arc<dyn Held>),
+    /// Storage the guest's driver laid out and answered for. Adopted exactly as it stands too:
+    /// the layout is a driver's answer about its own image and not a claim to be bounded.
+    ///
+    /// Kept apart from [`Adoptable::Minted`] because a refusal indicts someone else. The image's
+    /// modifier is the *guest's* choice, and the driver that decides whether the layout can be
+    /// imported is not the driver that reported it -- so two drivers disagreeing over a guest's
+    /// choice is a capability mismatch, which is refused. Asserting on it would let a guest that
+    /// picks an exotic modifier abort the worker.
+    Exported(std::sync::Arc<dyn Held>),
     /// Storage with no layout of its own. The description the guest sends is the only one there
     /// will ever be, and it is checked against the storage before anything reads through it.
     Unread(std::sync::Arc<dyn Describable>),
