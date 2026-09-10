@@ -1,0 +1,10 @@
+# The lines of blit.score that this GL driver reads differently, and only
+# those: everything else must agree with it byte for byte.
+#
+# Pixel hashes only, and each has been looked at rather than assumed.
+# res=17 is the one blit in the corpus that is both scaled and linearly filtered. Two drivers
+# weight a downscale's taps differently in the last bits; ink is unchanged, so every pixel the
+# blit should have written was written.
+#
+# Recorded against: OpenGL ES 3.2 Mesa 26.1.8 (gles 32)
+res=17 32x32 hash=6b16991452bc1703 ink=1024/1024
