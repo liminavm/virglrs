@@ -195,8 +195,13 @@ Not a matching score — a score. Matching is phase 3.
 ### Phase 3 — score, and triage the divergences (1 week)
 
 Re-record every classic fixture from the Linux C leg, then score the Rust leg against it.
-Venus has no second leg here, so its scores are pinned against themselves and only move
-deliberately.
+Venus has no second leg here and no Linux pin either. Every venus corpus was recorded against
+KosmicKrisp's heaps and replays the guest's memory type indices verbatim, so on anv the allocations
+have no host address and the content half of the score is empty while the whole command stream
+still replays; `harness/README.md` carries the mechanism and the per-corpus numbers. Two of the
+four corpora are pinnable for command acceptance and context teardown, and none of them for
+bytes -- what would have a content half is a Linux-recorded corpus, which needs a recorder this
+tree does not have, or a boot.
 
 Each divergence goes into one of three buckets: (a) a real virglrs gap the macOS host could not
 reach; (b) a KK-ism encoded as a general truth; (c) a corpus that does not mean the same thing on

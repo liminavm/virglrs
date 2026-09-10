@@ -908,6 +908,24 @@ measuring nothing, and the difference matters because a corpus of zeros agrees w
   macOS's set, and `num_video_caps` is 0), so the renderer refuses all 116 — the right answer to a
   question this host never invited. It is a recording of a guest that asked a *different* host, so
   the corpus does not mean the same thing here. Gateable once a planar target can be backed.
+- **The venus corpora carry KosmicKrisp's memory types.** All four replay their whole command
+  stream on anv -- `venus` 506,657 of 506,657 commands, `synoik-glclient` 58,983, `synoik-lifecycle`
+  5,283, `synoik` 1,348 -- and produce no content at all. A recording replays the guest's
+  `memoryTypeIndex` verbatim, and that guest chose it from what KosmicKrisp's heaps offered; the
+  same index on anv is device-local, so the allocation has no host address, every MAPPABLE
+  `CREATE_BLOB` over it answers `that allocation is not addressable by the host`, and the census
+  reads `UNREADABLE rc=-22`. One mechanism explains every divergence, the
+  `INVALID_EXTERNAL_HANDLE` allocations included -- those sit three hops downstream of a parked
+  blob, importing a resource the park left out of the table. Measured 2026-09-10, `ctl` reads
+  585/606, 45/52, 315/324 and 19/25 against 606, 52, 324 and 25 on macOS, and the census `size`
+  fields move too, because `pad_for_blob` pads a host-visible type and leaves a device-local one
+  alone. **A live Linux guest never reaches this**: it picks from the mask anv actually
+  advertises, so the missing content is neither a virglrs gap nor something the renderer can fix,
+  and only a Linux-recorded corpus or a boot has a content half at all. `synoik` and
+  `synoik-glclient` are `vrend-overview`-shaped here -- their whole value is the census, so they
+  measure nothing and must not be pinned. `venus` and `synoik-lifecycle` diverge in five lines and
+  two because they had almost no content half to lose, so what a pin of those two would carry is
+  command acceptance and context teardown, never bytes.
 
 **The C leg is not always the better oracle on Linux.** Upstream loses to virglrs on three corpora,
 and in each the Rust leg is the one matching the macOS fixture: `vrend-vkclient` (upstream feeds 0
