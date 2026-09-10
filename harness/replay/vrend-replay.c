@@ -67,7 +67,31 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+/* Which of the renderer's extensions this build may call.
+ *
+ * The replayer links ONE leg -- build.sh picks the prefix -- so what it may call is a property of
+ * that leg, not of the platform. A stock upstream virglrenderer exports none of the limina
+ * extensions, and a call to one is an undefined symbol at LINK time rather than a refusal at run
+ * time. So the guard has to be compile-time and build.sh has to decide it; it does, by asking the
+ * chosen library what it exports.
+ *
+ * Default 1 so a hand-run `cc` against a limina leg still builds, which is how this file is most
+ * often compiled while being worked on. */
+#ifndef HAVE_LIMINA_EXT
+#define HAVE_LIMINA_EXT 1
+#endif
+
+/* The IOSurface leg needs both the platform and the extensions that read it. Two conditions and
+ * not one: the surface is an Apple object, and the three calls that reach it are ours. */
+#if defined(__APPLE__) && HAVE_LIMINA_EXT
+#define HAVE_IOSURFACE 1
+#else
+#define HAVE_IOSURFACE 0
+#endif
+
+#if HAVE_IOSURFACE
 #include <IOSurface/IOSurface.h>
+#endif
 #include <string.h>
 #include <sys/uio.h>
 
@@ -221,6 +245,7 @@ static uint32_t made_total, failed_total;
  * mirror image of why the colour offscreens are scored AT their unref -- each is read at the last
  * moment it is both complete and still alive, and for these two kinds of resource that moment is
  * at opposite ends of the run. */
+#if HAVE_IOSURFACE
 static struct { uint32_t handle, w, h; } *iosurf_res;
 static uint32_t iosurf_n, iosurf_cap;
 
@@ -236,6 +261,7 @@ static void iosurf_remember(uint32_t handle, uint32_t w, uint32_t h)
    iosurf_res[iosurf_n].h = h ? h : 1;
    iosurf_n++;
 }
+#endif /* HAVE_IOSURFACE */
 static int want_ctx = -1;
 /* The contexts to replay. One is the common case; more than one exists because a workload can
  * split across contexts that only make sense together -- a video player draws in one and decodes
@@ -303,8 +329,13 @@ static void count_addf(const char *fmt, ...)
  * again after a resume -- and a corpus that legitimately loses an entry must not have to rewrite
  * its pixels to say so. */
 static char *rb_buf;
-static size_t rb_len, rb_cap;
+static size_t rb_len;
+/* Only the writer tracks capacity; main reads the buffer and its length to emit or compare it. */
+#if HAVE_LIMINA_EXT
+static size_t rb_cap;
+#endif
 
+#if HAVE_LIMINA_EXT
 static void rb_addf(const char *fmt, ...)
 {
    va_list ap;
@@ -312,6 +343,7 @@ static void rb_addf(const char *fmt, ...)
    buf_addf(&rb_buf, &rb_len, &rb_cap, fmt, ap);
    va_end(ap);
 }
+#endif
 
 /* Line by line, positional: the score is ordered, so a line that moved is as much a difference as
  * a line that changed. */
@@ -372,6 +404,7 @@ static int copy_src_of_next_cmd(const uint8_t *blob, size_t flen, size_t p,
    return 0;
 }
 
+#if HAVE_IOSURFACE
 /* The IOSurface leg. The readback above reads a resource's TEXTURE; this reads the display
  * surface that texture renders into, which is what the present actually shows. On this stack they
  * are not the same path -- the scanout is an EGL_IOSURFACE_LIMINA EGLImage, so the surface IS the
@@ -485,6 +518,7 @@ static void score_iosurface(uint32_t handle, uint32_t w, uint32_t h)
    }
    free(sp);
 }
+#endif /* HAVE_IOSURFACE */
 
 /* Define what the score will read, before anything else can leave undefined bytes there.
  *
@@ -700,6 +734,7 @@ static void score_resource(const struct res_ev *ev)
    free(px);
 }
 
+#if HAVE_LIMINA_EXT
 /* A cursor over a "VRJ1" journal export, refusing anything that does not fit in what it was
  * given. The replayer reads a blob the renderer under test produced, so a malformed one is a
  * result to report, never something to walk off the end of. */
@@ -1019,6 +1054,7 @@ static bool journals_agree(const void *a, uint64_t a_len, const void *b, uint64_
    free(ea); free(eb);
    return ok;
 }
+#endif /* HAVE_LIMINA_EXT */
 
 int main(int argc, char **argv)
 {
@@ -1078,7 +1114,17 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--smoke")) smoke = true;
       else if (!strcmp(argv[i], "--readback") && i + 1 < argc) readback_res = (uint32_t)atoi(argv[++i]);
       else if (!strcmp(argv[i], "--no-zero-new")) zero_new = false;
-      else if (!strcmp(argv[i], "--rebuild")) rebuild = true;
+      else if (!strcmp(argv[i], "--rebuild")) {
+#if HAVE_LIMINA_EXT
+         rebuild = true;
+#else
+         /* Refuse rather than skip. A gate that silently does not run is worse than one that was
+          * never asked for: the run reports success having scored nothing. */
+         fprintf(stderr, "--rebuild needs a renderer exporting the limina journal extensions, "
+                         "and this replayer\nwas linked against one that does not.\n");
+         return 2;
+#endif
+      }
       else if (!strcmp(argv[i], "--rebuild-score") && i + 1 < argc) rb_score_path = argv[++i];
       else if (!strcmp(argv[i], "--rebuild-expect") && i + 1 < argc) rb_expect_path = argv[++i];
       else if (!strcmp(argv[i], "--score") && i + 1 < argc) score_path = argv[++i];
@@ -1453,6 +1499,7 @@ int main(int argc, char **argv)
                   b->live = false; failed++; continue;
                }
                made++;
+#if HAVE_IOSURFACE
                {
                   uint32_t id = 0;
                   if (virgl_renderer_resource_get_iosurface_id(r->handle, &id) == 0 && id) {
@@ -1460,6 +1507,7 @@ int main(int argc, char **argv)
                      iosurf_remember(r->handle, r->width, r->height);
                   }
                }
+#endif
             }
             if (watch && r->handle == watch) {
                /* set_priv/get_priv round-trip is a registration probe: both go through
@@ -1529,8 +1577,10 @@ int main(int argc, char **argv)
       return failed_total ? 1 : 0;
    }
 
+#if HAVE_IOSURFACE
    for (uint32_t i = 0; i < iosurf_n; i++)
       score_iosurface(iosurf_res[i].handle, iosurf_res[i].w, iosurf_res[i].h);
+#endif
 
    /* A typed blob the stream never unrefs is scored HERE, at the end, from its texture -- the
     * same second chance the --readback resource gets below. Scoring only at the unref read three
@@ -1576,6 +1626,7 @@ int main(int argc, char **argv)
     * later chunks. What it cannot catch is a durable command the recorder never learned to keep:
     * that is absent from both journals and both agree about it. Only pixels answer that, so this
     * is the floor and not the ceiling. */
+#if HAVE_LIMINA_EXT
    if (rebuild) {
       for (int i = 0; i < n_ctx; i++) {
          uint32_t src = (uint32_t)ctx_list[i];
@@ -1676,6 +1727,7 @@ int main(int argc, char **argv)
     * retained, not about the pixels, and a number that moves whenever the recorder changes must
     * not be able to rewrite every pinned score in the tree. */
    virgl_renderer_limina_dump_state();
+#endif /* HAVE_LIMINA_EXT */
 
    /* A blob nothing typed is a real result -- it says the stream never described storage the
     * guest went on to use -- so it is counted rather than passed over in silence. Emitted only
