@@ -62,7 +62,7 @@ use super::ring::ResourceBytes;
 use crate::guest_mem::{GuestMap, HostMapping, PixelSource};
 use crate::ids::ResourceHandle;
 use crate::ids::SurfaceId;
-use crate::surface::{Held, PixelFormat, Surface};
+use crate::surface::{Adoptable, Describable, Held, PixelFormat, Surface};
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
 /// A slice the guest may or may not have sent, as the pointer Vulkan reads it as.
@@ -4201,9 +4201,10 @@ impl Driver {
             // figure yet -- the driver has not allocated it. That is the same number the guest
             // asked for, so an export that then fails credits exactly what it took.
             #[cfg(not(target_os = "macos"))]
-            (None, Ok(Scanout::Exported(image)), _) => {
-                Planned::Exporting { charge: self.admit("exported image", size)?, image }
-            }
+            (None, Ok(Scanout::Exported(image)), _) => Planned::Exporting {
+                charge: self.admit("exported image", size)?,
+                image: Some(image),
+            },
             (None, Err(why), Some(len)) => {
                 let charge = self.admit("exported pages", len as u64)?;
                 let map = match GuestMap::anonymous(len) {
@@ -4222,6 +4223,20 @@ impl Driver {
             // `why` carries the question the image failed at, for the compositor that is handed a
             // share of this and finds no surface to present from; `None` is memory the host
             // cannot address, which no one can be handed a share of at all.
+            // A declared export this side cannot describe. It is still an export: the guest said
+            // the memory is for the world outside it, and on this host that is answered with a
+            // descriptor. What is missing is only the *shape*, and the shape was never this
+            // side's to give -- Mesa's WSI shares a `VkBuffer`, and a buffer has no format, no
+            // tiling and no layout query. The guest supplies it later, with the command that says
+            // what the resource is.
+            //
+            // Before this arm such an allocation fell through to the driver, and then the guest's
+            // `CREATE_BLOB` was refused for memory the host could not address -- which is true and
+            // beside the point, because a shareable blob needs a descriptor and not an address.
+            #[cfg(not(target_os = "macos"))]
+            (None, Err(_), None) if declared => {
+                Planned::Exporting { charge: self.admit("exported buffer", size)?, image: None }
+            }
             (None, Err(why), None) => Planned::Deferred {
                 charge: self.admit("device memory", size)?,
                 why: host_visible.then_some(why),
@@ -4336,28 +4351,65 @@ impl Driver {
             // never told the allocate failed.
             #[cfg(not(target_os = "macos"))]
             Planned::Exporting { charge, image } => {
-                let facts = self.images.get(&image).copied();
-                match facts.ok_or(NoSurface::UnknownImage).and_then(|facts| {
-                    export_dmabuf(&mem.device, device, out, image, facts, info.allocationSize.0)
-                }) {
-                    Ok(surface) => Backing::Owned {
+                // An image is asked to describe itself; anything else is taken as a descriptor
+                // and left undescribed. The two are one call because they are one decision made
+                // at the allocate, and the failure below is the same failure for both.
+                let described = image.map(|image| {
+                    let facts = self.images.get(&image).copied();
+                    facts.ok_or(NoSurface::UnknownImage).and_then(|facts| {
+                        export_dmabuf(&mem.device, device, out, image, facts, info.allocationSize.0)
+                    })
+                });
+                match described {
+                    Some(Ok(surface)) => Backing::Owned {
                         storage: Storage::Texture(Arc::new(Charged::new(surface, charge))),
                         published: false,
                     },
-                    Err(why) => {
+                    // Host-visible memory keeps an address a snapshot can read, and a compositor
+                    // can copy from it, so a failed description costs only the zero-copy path.
+                    Some(Err(why)) if host_visible => {
                         eprintln!(
                             "[virglrs] {id:?}: the allocation is not presentable -- {why}; it \
                              renders correctly and a compositor must copy from it"
                         );
-                        // Host-visible memory keeps an address a snapshot can read; memory the
-                        // host cannot address has none, and saying so is the whole of the arm.
-                        if host_visible {
-                            Backing::Owned {
-                                storage: Storage::heap(Arc::clone(&mem), charge, why),
+                        Backing::Owned {
+                            storage: Storage::heap(Arc::clone(&mem), charge, why),
+                            published: false,
+                        }
+                    }
+                    // No image, or an image that would not describe itself: take the descriptor.
+                    // The layout is the guest's to supply either way, so a description that
+                    // failed is not fatal here -- it only means the host-queried oracle is gone.
+                    other => {
+                        if let Some(Err(why)) = &other {
+                            eprintln!(
+                                "[virglrs] {id:?}: the driver would not describe this image \
+                                 ({why}); its descriptor is exported undescribed, and the guest's \
+                                 own layout is what will read it"
+                            );
+                        }
+                        match descriptor_of(&mem.device, device, out) {
+                            Ok(descriptor) => Backing::Owned {
+                                storage: Storage::exported(descriptor, charge),
                                 published: false,
+                            },
+                            // The guest declared this memory for the world outside it and there
+                            // is no descriptor to give it. Nothing can copy from device-local
+                            // memory, so degrading here would be a window that renders nothing
+                            // with nothing to say why -- and a compositor waiting on a buffer
+                            // that will never arrive, which is what this whole arm is for.
+                            // Failing the allocate lets the guest's WSI fail its swapchain and
+                            // say so.
+                            Err(why) => {
+                                eprintln!(
+                                    "[virglrs] {id:?}: the guest declared {size} bytes for \
+                                     export and the driver exported nothing ({why}); the \
+                                     allocation is refused"
+                                );
+                                return Err(NoMemory::Driver(
+                                    VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                                ));
                             }
-                        } else {
-                            Backing::Driver { charge }
                         }
                     }
                 }
@@ -4649,14 +4701,22 @@ impl Driver {
         if blob_size > len {
             return Err(ExportError::LargerThanAllocation);
         }
-        let write_back = record.write_back();
+        // Whether there is an address is settled here, once, and carried as a *shape* rather than
+        // as a zero somebody downstream has to test. Every caller that wanted an address had to
+        // check for zero and one of them did not; making the two states different variants is
+        // what stops the next one from having to remember.
+        let exported = if addr != 0 {
+            Exported::Mapped { addr, write_back: record.write_back() }
+        } else {
+            Exported::Descriptor
+        };
         let share = storage.clone();
         let record = self.memory.get_mut(&id).expect("the record was here a moment ago");
         let Backing::Owned { published, .. } = &mut record.backing else {
             unreachable!("the backing was owned a moment ago");
         };
         *published = true;
-        Ok((Exported { addr, write_back }, share))
+        Ok((exported, share))
     }
 
     /// Copy an allocation's contents out through a host mapping, returning how many bytes landed.
@@ -4886,8 +4946,15 @@ enum Planned {
     /// the image whose layout the descriptor has to be described by, and `Deferred` has no image
     /// at all. Folding them together would mean an `Option<VkImage>` that is `Some` for exactly
     /// one of the two, which is a flag saying which arm it really is.
+    /// The driver is about to lay the memory out, and a descriptor of it is taken once it has.
+    ///
+    /// `image` is what can describe the result, when anything can: an image has a format, a
+    /// tiling and a layout query, so its descriptor comes back as a [`Surface`] a compositor can
+    /// present from directly. `None` is a declared export with nothing to ask -- a `VkBuffer`, or
+    /// an image this renderer has no record of -- and it comes back as a bare descriptor whose
+    /// layout only the guest can supply. Both are exports; they differ in who knows the shape.
     #[cfg(not(target_os = "macos"))]
-    Exporting { charge: Charge, image: VkImage },
+    Exporting { charge: Charge, image: Option<VkImage> },
     /// The driver's own memory. `why` is `Some` for memory the host can address, which this
     /// renderer maps and owns as [`Storage::Heap`], carrying the question the image failed at for
     /// whoever is later handed a share and finds no surface; `None` is memory it cannot.
@@ -5037,6 +5104,12 @@ impl Allocated {
                 !published
             }
             Backing::Owned { storage: Storage::Texture(_), .. } => true,
+            // There is no host route to these bytes at all -- no address, and no layout to read
+            // them under. A census entry for one would be a buffer of zeros reported as content,
+            // which is indistinguishable from a black frame and is the failure the census exists
+            // to avoid rather than to produce.
+            #[cfg(not(target_os = "macos"))]
+            Backing::Owned { storage: Storage::Exported(_), .. } => false,
             Backing::Imported(_) => false,
         }
     }
@@ -5119,6 +5192,20 @@ pub enum Storage {
     /// driver by host-pointer import. Plain memory with rows the CPU can address; the guest's
     /// fences are the only barrier over them, as they are for any host-visible allocation.
     Linear(Arc<Charged<Pages>>),
+    /// A descriptor of the driver's allocation, with no layout and none to be had.
+    ///
+    /// What a guest's *declared* export gets when nothing can say how the bytes are laid out.
+    /// Mesa's Wayland WSI blits each frame into a linear `VkBuffer` and shares that, and a buffer
+    /// has no format, no tiling and no layout query -- so the descriptor is everything this side
+    /// can hold, and the description arrives later from the guest with the command that says what
+    /// the resource is. See [`crate::dmabuf::Descriptor`].
+    ///
+    /// It is not [`Storage::Texture`] with a piece missing. A `Texture`'s layout is the driver's
+    /// answer about its own image and is an oracle; this one's is the guest's claim, checked
+    /// against the buffer at every reading. Keeping them apart is what stops the second from
+    /// being trusted like the first.
+    #[cfg(not(target_os = "macos"))]
+    Exported(Arc<Charged<crate::dmabuf::Descriptor>>),
     /// The driver's own allocation, mapped once and owned here -- see [`Heap`].
     ///
     /// Where [`Storage::Linear`] substitutes this renderer's pages for the driver's memory,
@@ -5144,6 +5231,8 @@ pub enum Storage {
 /// have that window: the caller's own share is what keeps the count above zero across it.
 pub enum ShareWitness {
     Texture(Weak<dyn Held>),
+    #[cfg(not(target_os = "macos"))]
+    Exported(Weak<Charged<crate::dmabuf::Descriptor>>),
     Linear(Weak<Charged<Pages>>),
     Heap(Weak<Charged<Heap>>),
 }
@@ -5153,6 +5242,8 @@ impl Storage {
     pub fn witness(&self) -> ShareWitness {
         match self {
             Storage::Texture(a) => ShareWitness::Texture(Arc::downgrade(a)),
+            #[cfg(not(target_os = "macos"))]
+            Storage::Exported(a) => ShareWitness::Exported(Arc::downgrade(a)),
             Storage::Linear(a) => ShareWitness::Linear(Arc::downgrade(a)),
             Storage::Heap(a) => ShareWitness::Heap(Arc::downgrade(a)),
         }
@@ -5167,6 +5258,8 @@ impl ShareWitness {
     pub fn held(&self) -> bool {
         match self {
             ShareWitness::Texture(w) => w.strong_count() > 0,
+            #[cfg(not(target_os = "macos"))]
+            ShareWitness::Exported(w) => w.strong_count() > 0,
             ShareWitness::Linear(w) => w.strong_count() > 0,
             ShareWitness::Heap(w) => w.strong_count() > 0,
         }
@@ -5294,6 +5387,9 @@ pub enum NoSurface {
     /// This host neither mints storage of its own nor has a driver that will export a
     /// descriptor of its own -- there is no route to presentable storage at all.
     Unbacked,
+    /// The storage is exported and has no layout of its own: the driver laid out a buffer, which
+    /// has none to report. Not a refusal to export -- see [`Storage::Exported`].
+    Undescribed,
     /// The driver refused to export a descriptor of the allocation.
     Export(VkResult),
     /// An opaque layout: the driver keeps its storage in a layout of its own, and would never
@@ -5316,21 +5412,28 @@ impl core::fmt::Display for NoSurface {
                 f.write_str("the driver's row layout is not one a surface could alias")
             }
             NoSurface::Unbacked => f.write_str("this host has no route to presentable storage"),
+            NoSurface::Undescribed => {
+                f.write_str("the exported buffer has no layout of its own to present by")
+            }
             NoSurface::Export(r) => write!(f, "the driver refused to export it (VkResult {})", r.0),
         }
     }
 }
 
 impl Storage {
-    /// A share of this storage, as the keepalive an EGL image over its surface must hold.
+    /// This storage as something a context can adopt, in whichever of the two shapes it is.
     ///
-    /// `None` when the storage is pages: there is no surface to image, and the reason is the
+    /// `None` when the storage is pages: there is nothing to image, and the reason is the
     /// storage's own to give. Handing out the `Charged` share rather than a fresh one over the
-    /// same surface is what keeps this allocation's charge standing for as long as the image
-    /// does -- see [`crate::surface::Held`].
-    pub fn held(&self) -> Option<Arc<dyn crate::surface::Held>> {
+    /// same storage is what keeps this allocation's charge standing for as long as the adopter
+    /// does -- see [`crate::surface::Held`] and [`crate::surface::Describable`].
+    pub fn adoptable(&self) -> Option<Adoptable> {
         match self {
-            Storage::Texture(t) => Some(Arc::clone(t)),
+            Storage::Texture(t) => Some(Adoptable::Ready(Arc::clone(t))),
+            // The layout is not this side's to give, so what travels is the storage and the
+            // obligation to describe it -- not a layout invented here to fill the hole.
+            #[cfg(not(target_os = "macos"))]
+            Storage::Exported(d) => Some(Adoptable::Unread(Arc::clone(d) as Arc<dyn Describable>)),
             Storage::Linear(_) | Storage::Heap(_) => None,
         }
     }
@@ -5365,6 +5468,12 @@ impl Storage {
         Storage::pages(map, charge, NoSurface::NotDedicated)
     }
 
+    /// A share over a descriptor of the driver's own allocation.
+    #[cfg(not(target_os = "macos"))]
+    fn exported(descriptor: crate::dmabuf::Descriptor, charge: Charge) -> Storage {
+        Storage::Exported(Arc::new(Charged::new(descriptor, charge)))
+    }
+
     /// A share over the driver's own memory, carrying why it is not a surface.
     fn heap(mem: Arc<DriverMemory>, charge: Charge, why: NoSurface) -> Storage {
         let it = Heap { mem, why, said: std::sync::atomic::AtomicBool::new(false) };
@@ -5383,6 +5492,22 @@ impl Storage {
     }
 }
 
+/// A charged descriptor read under a layout an importer supplies.
+///
+/// The share handed to [`crate::dmabuf::Described`] is this whole `Arc` -- the descriptor *and*
+/// its charge -- so the bytes stay counted for exactly as long as somebody is reading them, which
+/// is the same rule every other share here follows.
+#[cfg(not(target_os = "macos"))]
+impl Describable for Charged<crate::dmabuf::Descriptor> {
+    fn describe(
+        self: Arc<Self>,
+        layout: crate::surface::Layout,
+    ) -> Result<Arc<dyn Held>, crate::surface::BadLayout> {
+        let surface = self.it().describe(layout)?;
+        Ok(Arc::new(crate::dmabuf::Described::new(self, surface)))
+    }
+}
+
 /// Two shares are the same share when they name the same storage -- not when they describe
 /// storage that happens to look alike. Identity is the question every caller is actually asking.
 impl PartialEq for Storage {
@@ -5391,12 +5516,16 @@ impl PartialEq for Storage {
             (Storage::Texture(a), Storage::Texture(b)) => Arc::ptr_eq(a, b),
             (Storage::Linear(a), Storage::Linear(b)) => Arc::ptr_eq(a, b),
             (Storage::Heap(a), Storage::Heap(b)) => Arc::ptr_eq(a, b),
+            #[cfg(not(target_os = "macos"))]
+            (Storage::Exported(a), Storage::Exported(b)) => Arc::ptr_eq(a, b),
             // Different kinds of storage are never the same storage, and saying so by hand keeps
             // this total: a wildcard would answer `false` for a kind added later without anyone
             // having decided that it should.
             (Storage::Texture(_), Storage::Linear(_) | Storage::Heap(_))
             | (Storage::Linear(_), Storage::Texture(_) | Storage::Heap(_))
             | (Storage::Heap(_), Storage::Texture(_) | Storage::Linear(_)) => false,
+            #[cfg(not(target_os = "macos"))]
+            (Storage::Exported(_), _) | (_, Storage::Exported(_)) => false,
         }
     }
 }
@@ -5409,6 +5538,10 @@ impl core::fmt::Debug for Storage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Storage::Texture(m) => f.debug_tuple("Texture").field(&m.surface().id()).finish(),
+            #[cfg(not(target_os = "macos"))]
+            Storage::Exported(d) => {
+                f.debug_tuple("Exported").field(&d.it().id()).field(&d.it().size()).finish()
+            }
             Storage::Linear(p) => {
                 f.debug_tuple("Linear").field(&p.it().map.len()).field(&p.it().why).finish()
             }
@@ -5421,9 +5554,17 @@ impl core::fmt::Debug for Storage {
 
 impl Storage {
     /// Where the bytes are and how far they run, as the one pair anything can act on.
+    ///
+    /// A zero address means the host has none, which is a real state and not a failure -- see
+    /// [`Storage::published`], which is what decides whether an address is offered at all.
     pub fn span(&self) -> (usize, u64) {
         match self {
             Storage::Texture(m) => (m.surface().host_addr(), m.surface().alloc_size()),
+            // No address, and none to be taken: mapping the descriptor here would hand the VMM a
+            // buffer whose layout nobody on this side knows, to publish to the guest as if it
+            // were rows.
+            #[cfg(not(target_os = "macos"))]
+            Storage::Exported(d) => (0, d.it().size()),
             Storage::Linear(p) => (p.it().map.host_addr(), p.it().map.len() as u64),
             // The mapping is taken at the allocation and never released before the storage, so
             // there is no un-mapped heap for a caller to have to ask about.
@@ -5442,6 +5583,10 @@ impl Storage {
     pub fn pixels(&self) -> Option<PixelSource<'_>> {
         match self {
             Storage::Texture(_) => None,
+            // Adopted whole like a surface, and with even less to read: the host has no address
+            // for these bytes and no layout to read them under.
+            #[cfg(not(target_os = "macos"))]
+            Storage::Exported(_) => None,
             Storage::Linear(p) => Some(PixelSource::Mapped(&p.it().map)),
             // SAFETY: the mapping is taken at the allocation and released only by the `Heap`'s
             // drop, so it is live for as long as this borrow of the storage is -- which is the
@@ -5459,6 +5604,11 @@ impl Storage {
     pub fn surface(&self) -> Result<&Surface, NoSurface> {
         match self {
             Storage::Texture(m) => Ok(m.surface()),
+            // There is storage, and it is exactly what a compositor wants -- but a *scanout* is
+            // a layout as much as it is bytes, and this one's is the guest's to supply at the
+            // command that types the resource. Nothing here can answer for it.
+            #[cfg(not(target_os = "macos"))]
+            Storage::Exported(_) => Err(NoSurface::Undescribed),
             Storage::Linear(p) => Err(p.it().why),
             Storage::Heap(h) => Err(h.it().why),
         }
@@ -5470,6 +5620,8 @@ impl Storage {
     pub fn first_refusal(&self) -> bool {
         match self {
             Storage::Texture(_) => false,
+            #[cfg(not(target_os = "macos"))]
+            Storage::Exported(d) => d.it().first_refusal(),
             Storage::Linear(p) => !p.it().said.swap(true, std::sync::atomic::Ordering::Relaxed),
             Storage::Heap(h) => !h.it().said.swap(true, std::sync::atomic::Ordering::Relaxed),
         }
@@ -5483,11 +5635,22 @@ impl Storage {
 /// VMM that fetched the address and then asked separately how to cache it could be told about a
 /// different allocation, or about one that had since been freed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Exported {
-    /// Where it lives in this process.
-    pub addr: usize,
-    /// See [`Allocated::write_back`].
-    pub write_back: bool,
+pub enum Exported {
+    /// Bytes the host can address, and how its own caching of them constrains the guest's.
+    Mapped {
+        /// Where it lives in this process.
+        addr: usize,
+        /// See [`Allocated::write_back`].
+        write_back: bool,
+    },
+    /// A buffer this renderer holds a descriptor of and no address for.
+    ///
+    /// Not a failure and not a degraded mapping: it is what an exporting host's storage usually
+    /// is. The guest asked for a resource it can *share*, and sharing wants a descriptor -- the
+    /// compositor's GL context imports one; nobody maps it. An address here would have to be
+    /// invented, and the only thing to invent it from is a lazy `mmap` of a buffer whose layout
+    /// this side does not know, published to the guest as though it were rows.
+    Descriptor,
 }
 
 /// Why an allocation could not be exported as a blob. Every one of these is the guest's doing.
@@ -5889,9 +6052,6 @@ fn export_dmabuf(
     };
 
     let format = pixel_format(facts.format).ok_or(NoSurface::Format(facts.format))?;
-    // A driver with no `VK_KHR_external_memory_fd` cannot export at all, which is a property of
-    // the host and not of this allocation -- so it is `Unbacked` rather than a per-image refusal.
-    let get_fd = d.try_vkGetMemoryFdKHR().ok_or(NoSurface::Unbacked)?;
 
     // The modifier first, because it decides which aspect the layout query has to name. A
     // `DRM_FORMAT_MODIFIER` image knows its own modifier and is asked; a `LINEAR` image is
@@ -5960,6 +6120,43 @@ fn export_dmabuf(
         *plane = PlaneLayout { offset: out.offset.0, pitch };
     }
 
+    let fd = memory_fd(d, device, memory)?;
+
+    Ok(Surface::exported(
+        fd,
+        Layout {
+            width: facts.width,
+            height: facts.height,
+            fourcc: format.fourcc(),
+            modifier,
+            planes,
+            plane_count,
+            alloc_size,
+        },
+    ))
+}
+
+/// Ask the driver for a dma-buf descriptor of an allocation it just made.
+///
+/// The export half on its own, because it is the half that does not need an image. Every
+/// allocation the guest declared for export has one; only some of them have a shape anybody on
+/// this side can describe, and the two questions have to be askable separately or a `VkBuffer`
+/// gets no descriptor because it has no format.
+///
+/// The handle type is `DMA_BUF` and not `OPAQUE_FD`: an opaque fd names memory only this driver
+/// can re-import, and what a descriptor is for here is the *other* driver -- the GL context
+/// compositing the client that allocated this. Measured on this host: Mesa's venus rewrites the
+/// guest's declaration to `DMA_BUF` (`handleTypes` 0x200 in a boot census), so the allocation was
+/// made exportable that way and this is the type it can be exported as.
+#[cfg(not(target_os = "macos"))]
+fn memory_fd(
+    d: &LiveDevice,
+    device: VkDevice,
+    memory: VkDeviceMemory,
+) -> Result<std::os::fd::OwnedFd, NoSurface> {
+    // A driver with no `VK_KHR_external_memory_fd` cannot export at all, which is a property of
+    // the host and not of this allocation -- so it is `Unbacked` rather than a per-image refusal.
+    let get_fd = d.try_vkGetMemoryFdKHR().ok_or(NoSurface::Unbacked)?;
     let mut fd: core::ffi::c_int = -1;
     let get = VkMemoryGetFdInfoKHR {
         sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
@@ -5974,22 +6171,25 @@ fn export_dmabuf(
     if r != VkResult::VK_SUCCESS {
         return Err(NoSurface::Export(r));
     }
-    // A driver that answers `VK_SUCCESS` with no descriptor has exported nothing, and a surface
+    // A driver that answers `VK_SUCCESS` with no descriptor has exported nothing, and storage
     // built over `-1` would fail at every use with no memory of where it came from.
-    let fd = exported_fd(fd).ok_or(NoSurface::Export(VkResult::VK_SUCCESS))?;
+    exported_fd(fd).ok_or(NoSurface::Export(VkResult::VK_SUCCESS))
+}
 
-    Ok(Surface::exported(
-        fd,
-        Layout {
-            width: facts.width,
-            height: facts.height,
-            fourcc: format.fourcc(),
-            modifier,
-            planes,
-            plane_count,
-            alloc_size,
-        },
-    ))
+/// A descriptor of an allocation, and nothing about its shape.
+///
+/// What a declared export gets when nothing can describe it. The size is the kernel's own figure
+/// for the buffer rather than the size the guest asked for -- see
+/// [`crate::dmabuf::Descriptor::exported`] -- which is what every later bound on a guest-supplied
+/// layout is measured against.
+#[cfg(not(target_os = "macos"))]
+fn descriptor_of(
+    d: &LiveDevice,
+    device: VkDevice,
+    memory: VkDeviceMemory,
+) -> Result<crate::dmabuf::Descriptor, NoSurface> {
+    let fd = memory_fd(d, device, memory)?;
+    crate::dmabuf::Descriptor::exported(fd).ok_or(NoSurface::Export(VkResult::VK_SUCCESS))
 }
 
 /// `VK_IMAGE_ASPECT_MEMORY_PLANE_0..3_BIT_EXT`, which is how a DRM-modifier image's planes are
@@ -7305,15 +7505,145 @@ mod tests {
         d.destroy_device(DEVICE, &[]);
     }
 
-    /// A driver that will not export leaves an allocation that still works.
+    /// The shape Mesa's Wayland WSI actually allocates gets a descriptor and publishes as one.
     ///
-    /// The distinction the import path forbids a fallback for does not apply here, and this pins
-    /// which way round it is: a failed *import* would be a dangling host pointer, but a failed
-    /// *export* costs only the ability to be composited without a copy. So the guest's allocate
-    /// succeeds, the storage carries the question it failed, and nothing is silently zeroed.
+    /// The regression guard for a wedge that no unit test would have caught, because every test
+    /// here described a window buffer the way the *minting* host's guests do. Measured on goiaba
+    /// with `vkcube` under a GNOME session: the buffer a venus client shares with its compositor
+    /// is device-local, declared for export as `DMA_BUF`, and dedicated to a **`VkBuffer`** --
+    /// Mesa blits its rendered image into a linear buffer and shares that. Three at a time, one
+    /// per swapchain image, 800x640x4 bytes each.
+    ///
+    /// Before the descriptor path such an allocation was left to the driver, and the guest's
+    /// `CREATE_BLOB` came back "that allocation is not addressable by the host" -- true, and the
+    /// wrong question: a shareable blob wants a descriptor, and the host having no address for it
+    /// is not an obstacle to sharing it. The compositor then asked for a resource that had never
+    /// been created and waited for a buffer that would never exist.
+    ///
+    /// So the four things this pins are the four that were wrong: it is exported, the export does
+    /// not need an image to describe it, publishing it offers a descriptor rather than an address,
+    /// and asking to *map* it is refused rather than answered with a zero.
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn a_driver_that_will_not_export_still_allocates() {
+    fn a_wsi_buffer_is_exported_even_though_nothing_can_describe_it() {
+        use crate::venus::proto::types::{VkBuffer, VkExternalMemoryHandleTypeFlags};
+
+        const DEVICE: VkDevice = VkDevice(3);
+        const MEMORY: VkDeviceMemory = VkDeviceMemory(0x9300);
+        const SIZE: u64 = 2_048_000;
+
+        unsafe extern "C" fn allocate(
+            _: VkDevice,
+            _: *const VkMemoryAllocateInfo,
+            _: *const VkAllocationCallbacks,
+            out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            // SAFETY: the caller's local.
+            unsafe { *out = MEMORY };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn free(_: VkDevice, _: VkDeviceMemory, _: *const VkAllocationCallbacks) {
+        }
+        unsafe extern "C" fn destroy_device(_: VkDevice, _: *const VkAllocationCallbacks) {}
+        unsafe extern "C" fn idle(_: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        /// A memfd stands in for the dma-buf: `lseek` and `dup` are all this path asks of it.
+        unsafe extern "C" fn export(
+            _: VkDevice,
+            _: *const VkMemoryGetFdInfoKHR,
+            out: *mut core::ffi::c_int,
+        ) -> VkResult {
+            // SAFETY: a NUL-terminated literal and no flags; the descriptor is fresh.
+            let fd = unsafe { libc::memfd_create(c"virglrs-test-wsi".as_ptr(), 0) };
+            assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+            // SAFETY: sizing a fresh memfd nothing has mapped.
+            let rc = unsafe { libc::ftruncate(fd, SIZE as libc::off_t) };
+            assert_eq!(rc, 0, "ftruncate: {}", std::io::Error::last_os_error());
+            // SAFETY: the caller's local.
+            unsafe { *out = fd };
+            VkResult::VK_SUCCESS
+        }
+
+        let mut d = Driver::new(Account::for_test(None));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(allocate);
+        fns.plant_vkFreeMemory(free);
+        fns.plant_vkDestroyDevice(destroy_device);
+        fns.plant_vkDeviceWaitIdle(idle);
+        fns.plant_vkGetMemoryFdKHR(export);
+        d.plant_device(DEVICE, fns);
+        // Device-local only, which is what Mesa's WSI picks: it asks for the first type with
+        // DEVICE_LOCAL and no denied bits, and on this host that type is not host-visible.
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(0)]);
+
+        // The chain the guest sends, in the order it sends it.
+        let export_info = VkExportMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+            pNext: core::ptr::null(),
+            // `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`, as measured.
+            handleTypes: VkExternalMemoryHandleTypeFlags(0x200),
+        };
+        let dedicated = VkMemoryDedicatedAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            pNext: (&raw const export_info).cast(),
+            // No image. This is the whole of the difference from a minting host's window buffer,
+            // and it is what every earlier version of this path refused on.
+            image: VkImage(0),
+            buffer: VkBuffer(0x4321),
+        };
+        let info = VkMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: (&raw const dedicated).cast(),
+            allocationSize: VkDeviceSize(SIZE),
+            memoryTypeIndex: 0,
+        };
+        d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None)
+            .expect("a declared export is an export whether or not anything can describe it");
+
+        let allocated = d.memory.get(&ObjectId(1)).expect("allocated");
+        assert!(
+            matches!(allocated.backing, Backing::Owned { storage: Storage::Exported(_), .. }),
+            "the driver's allocation, named by a descriptor this renderer holds"
+        );
+        // No surface, and none invented: a scanout is a layout as much as it is bytes, and this
+        // one's layout is not this side's to give.
+        assert!(matches!(allocated.storage().map(Storage::surface), Some(Err(_))));
+
+        // Publishing offers a descriptor. The address it does not have is absent from the type
+        // rather than present as a zero -- which is what the caller used to have to test.
+        let (published, share) = d.memory_export(ObjectId(1), SIZE).expect("it publishes");
+        assert_eq!(published, Exported::Descriptor);
+        assert!(matches!(share, Storage::Exported(_)), "the share is the descriptor");
+        // And it is offered to a context to adopt, in the shape that says it needs describing.
+        assert!(matches!(share.adoptable(), Some(Adoptable::Unread(_))));
+        // The kernel's figure for the buffer, not the size the guest asked for.
+        assert_eq!(share.span(), (0, SIZE), "no address, and the buffer's own extent");
+
+        // The descriptor outlives the allocation, which is what lets a compositor go on
+        // presenting a client's last frame after the client has freed it.
+        d.free_memory(DEVICE, MEMORY, ObjectId(1));
+        assert!(matches!(share.adoptable(), Some(Adoptable::Unread(_))));
+        drop(share);
+        d.destroy_device(DEVICE, &[]);
+    }
+
+    /// A declared export the driver refuses fails the allocate -- unless the host can address it.
+    ///
+    /// What a failed export costs depends entirely on whether there is another way to the bytes,
+    /// and the two halves here are that difference with one variable between them.
+    ///
+    /// Host-visible memory has one: the host holds a mapping, a compositor can copy through it,
+    /// and the allocation renders correctly -- so the guest is not told anything failed. Memory
+    /// the host cannot address has none. No descriptor and no mapping is no route at all, and an
+    /// allocation in that state is one the guest can render into and nothing can ever read: its
+    /// `CREATE_BLOB` is refused, and a compositor is left waiting for a buffer that will never
+    /// exist. Refusing the allocate is what lets the guest's WSI fail its swapchain and say so,
+    /// and it is the same rule the import path states -- no fallback that reports success for
+    /// work that was not done.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_declared_export_the_driver_refuses_fails_only_what_it_must() {
         use crate::budget::Budget;
         use crate::venus::proto::types::{
             VkExtent3D, VkExternalMemoryHandleTypeFlags, VkImageCreateInfo, VkImageType,
@@ -7356,6 +7686,27 @@ mod tests {
         ) -> VkResult {
             VkResult::VK_ERROR_OUT_OF_HOST_MEMORY
         }
+        unsafe extern "C" fn map(
+            _: VkDevice,
+            _: VkDeviceMemory,
+            _: VkDeviceSize,
+            _: VkDeviceSize,
+            _: VkMemoryMapFlags,
+            out: *mut *mut core::ffi::c_void,
+        ) -> VkResult {
+            thread_local! {
+                static BYTES: std::cell::RefCell<Vec<u8>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
+            }
+            BYTES.with(|b| {
+                let mut b = b.borrow_mut();
+                b.resize(4096, 0);
+                // SAFETY: the caller's local.
+                unsafe { *out = b.as_mut_ptr().cast() };
+            });
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn unmap(_: VkDevice, _: VkDeviceMemory) {}
 
         let budget = Budget::with_cap(None, false);
         let one = crate::ids::ContextId::new(1).expect("not zero");
@@ -7371,8 +7722,17 @@ mod tests {
         fns.plant_vkDeviceWaitIdle(idle);
         fns.plant_vkGetImageSubresourceLayout(layout);
         fns.plant_vkGetMemoryFdKHR(refuse);
+        fns.plant_vkMapMemory(map);
+        fns.plant_vkUnmapMemory(unmap);
         d.plant_device(DEVICE, fns);
-        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(0)]);
+        // Type 0 is memory the host cannot address; type 1 is memory it can. The one variable.
+        d.plant_memory_types(
+            DEVICE,
+            &[
+                VkMemoryPropertyFlags(0),
+                VkMemoryPropertyFlags(HOST_VISIBLE_BIT | HOST_COHERENT_BIT),
+            ],
+        );
         d.note_image(
             IMAGE,
             &VkImageCreateInfo {
@@ -7410,17 +7770,29 @@ mod tests {
             allocationSize: VkDeviceSize(4096),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None)
-            .expect("the guest's allocate succeeds even though the export did not");
-        let allocated = d.memory.get(&ObjectId(1)).expect("allocated");
+        assert!(
+            matches!(
+                d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None),
+                Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE))
+            ),
+            "no descriptor and no address is no route to the bytes at all"
+        );
+        assert!(!d.memory.contains_key(&ObjectId(1)), "and nothing is left behind to be found");
+
+        // The control. The same refused export over memory the host CAN address is not fatal:
+        // the mapping is the other route, so the allocation stands and carries the question it
+        // failed. Without this the assertion above would pass just as well if the refusal were
+        // about the export failing rather than about there being nowhere left to go.
+        let addressable = VkMemoryAllocateInfo { memoryTypeIndex: 1, ..info };
+        d.allocate_memory(DEVICE, ObjectId(2), &addressable, None, &|_| None)
+            .expect("host-visible memory still has a mapping to be composited from");
+        let allocated = d.memory.get(&ObjectId(2)).expect("allocated");
         assert!(allocated.surface().is_none(), "there is no surface, and none is invented");
-        // Device-local memory with no descriptor has no address to publish, and says so by name
-        // rather than by handing out a zero.
-        assert!(matches!(allocated.backing, Backing::Driver { .. }));
+        assert!(matches!(allocated.backing, Backing::Owned { storage: Storage::Heap(_), .. }));
 
         // A `Driver` asserts on drop that it holds no host handles, so the test hands them back
         // the way a guest would rather than leaking them past the assertion.
-        d.free_memory(DEVICE, MEMORY, ObjectId(1));
+        d.free_memory(DEVICE, MEMORY, ObjectId(2));
         d.destroy_device(DEVICE, &[]);
     }
     /// Every allocation the host can address is backed by pages this renderer minted, handed to
@@ -7561,8 +7933,11 @@ mod tests {
 
         // Publishing is a matter of saying where the pages are. Nothing is mapped.
         let (published, share) = d.memory_export(ObjectId(1), ASKED).expect("exports");
-        assert_eq!(published.addr, ptr);
-        assert!(published.write_back, "coherent and cached, as the type says");
+        assert_eq!(
+            published,
+            Exported::Mapped { addr: ptr, write_back: true },
+            "at the pages, and coherent and cached as the type says"
+        );
         assert_eq!(MAPPED.with(Cell::get), 0, "the driver was never asked to map what it imported");
         assert!(matches!(share, Storage::Linear(_)), "and the share is the pages");
         // Both hosts refuse, and both say the same true thing: this allocation dedicated no
@@ -7624,7 +7999,11 @@ mod tests {
             storage.span()
         };
         let (published, plain_share) = d.memory_export(ObjectId(2), ASKED).expect("it exports");
-        assert_eq!(published.addr, heap_span.0, "published at the mapping, not a second one");
+        assert_eq!(
+            published,
+            Exported::Mapped { addr: heap_span.0, write_back: true },
+            "published at the mapping, not a second one"
+        );
         assert_eq!(MAPPED.with(Cell::get), 1, "and publishing maps nothing further");
 
         // The lifetime the minting was there to buy, bought by owning instead. The guest's free
@@ -7808,21 +8187,40 @@ mod tests {
                 Backing::Owned { storage: Storage::Texture(_), .. } => "texture",
                 Backing::Owned { storage: Storage::Linear(_), .. } => "linear",
                 Backing::Owned { storage: Storage::Heap(_), .. } => "heap",
+                #[cfg(not(target_os = "macos"))]
+                Backing::Owned { storage: Storage::Exported(_), .. } => "exported",
                 Backing::Driver { .. } => "driver",
                 Backing::Imported(_) => "imported",
             };
-            // A host that mints no storage of its own has no texture backing to reach: the
-            // scanout shape gets no surface, and an allocation with no surface is the driver's.
-            // The other four are every host's, and are what this test is here for.
-            #[cfg(target_os = "macos")]
+            // A scanout is a texture on both hosts, by opposite routes: one mints an IOSurface
+            // and hands it to the driver, the other takes a descriptor of what the driver laid
+            // out. That the two arrive at the same backing is the point of [`Held`].
             const SCANOUT: &str = "texture";
-            #[cfg(not(target_os = "macos"))]
-            const SCANOUT: &str = "driver";
             assert_eq!(
                 (kind(1), kind(2), kind(3), kind(4), kind(5)),
                 (SCANOUT, "linear", "heap", "driver", "imported"),
                 "the five shapes reach the backings they are named for"
             );
+        }
+
+        /// A driver that exports. A memfd stands in for a dma-buf: `lseek`, `dup` and `mmap`
+        /// are everything this path asks of the descriptor, and a memfd answers all three the
+        /// same way -- so the shape under test is the renderer's and not the kernel's.
+        #[cfg(not(target_os = "macos"))]
+        unsafe extern "C" fn export(
+            _: VkDevice,
+            _: *const VkMemoryGetFdInfoKHR,
+            out: *mut core::ffi::c_int,
+        ) -> VkResult {
+            // SAFETY: a NUL-terminated literal and no flags; the descriptor is fresh.
+            let fd = unsafe { libc::memfd_create(c"virglrs-test-export".as_ptr(), 0) };
+            assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+            // SAFETY: sizing a fresh memfd nothing has mapped.
+            let rc = unsafe { libc::ftruncate(fd, (PITCH * H as u64) as libc::off_t) };
+            assert_eq!(rc, 0, "ftruncate: {}", std::io::Error::last_os_error());
+            // SAFETY: the caller's local.
+            unsafe { *out = fd };
+            VkResult::VK_SUCCESS
         }
 
         unsafe extern "C" fn gone(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
@@ -7844,6 +8242,8 @@ mod tests {
             fns.plant_vkMapMemory(map);
             fns.plant_vkUnmapMemory(unmap);
             fns.plant_vkGetImageSubresourceLayout(layout);
+            #[cfg(not(target_os = "macos"))]
+            fns.plant_vkGetMemoryFdKHR(export);
             fns.plant_vkDestroyDevice(gone);
             fns.plant_vkDeviceWaitIdle(idle);
             d.plant_device(DEVICE, fns);

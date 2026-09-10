@@ -25,7 +25,7 @@ use crate::guest_mem::{Iov, PixelSource};
 use crate::ids::ResourceHandle;
 #[cfg(target_os = "macos")]
 use crate::surface::PixelFormat;
-use crate::surface::{Held, PlanarFormat, Surface};
+use crate::surface::{Adoptable, Held, PlanarFormat, Surface};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -187,6 +187,10 @@ pub enum Refusal {
     /// An IOSurface was minted for the resource and the driver has no entry point to make it
     /// a texture's storage.
     NoEglImage,
+    /// Storage with no layout of its own, described by the guest in a way that does not fit the
+    /// buffer behind it. The guest's error: it chose the layout when it filled the buffer, and
+    /// this is the description it sent of what it chose.
+    UndescribableStorage(crate::surface::BadLayout),
     /// A multisample 2D *array*, on a host with no `glTexStorage3DMultisample`.
     ///
     /// Split out from [`Refusal::UnsupportedMultisampleFormat`] because it cannot claim that
@@ -243,6 +247,10 @@ impl Refusal {
             | Refusal::CubeArraySize
             | Refusal::CubeArrayArraySize
             | Refusal::ArrayOfNonArrayTarget
+            // The guest described the storage it filled, and its description does not fit the
+            // buffer it filled. Nothing in the capset could have excluded that: the numbers are
+            // the guest's own, sent in this command.
+            | Refusal::UndescribableStorage(_)
             | Refusal::ZeroWidth
             | Refusal::BufferBindOnTexture
             | Refusal::NotTextureStorage
@@ -291,7 +299,14 @@ impl Refusal {
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The one refusal that carries a reason of its own, and the reason is the whole message:
+        // "the guest's layout does not fit" without saying which number is wrong would send a
+        // reader to the renderer for a fault that is in the guest's description.
+        if let Refusal::UndescribableStorage(why) = self {
+            return write!(f, "the storage cannot be read as described: {why}");
+        }
         let s = match self {
+            Refusal::UndescribableStorage(_) => unreachable!("answered above"),
             Refusal::UnsupportedFormat => "unsupported texture format",
             Refusal::NoPlanarStorage => "no planar surface to back a multi-plane target",
             Refusal::UnsupportedMultisampleFormat => "unsupported multisample texture format",
@@ -410,16 +425,20 @@ impl Slot {
 /// them -- venus latches it beside its pages and says it once -- so nothing is re-derived or
 /// guessed here.
 pub struct Untyped {
-    /// A share of the exporter's surface, when the storage is one. The share rather than an id:
-    /// an id stops naming this surface the moment the surface dies, and the whole point of
-    /// holding storage across contexts is that it cannot.
-    surface: Option<Arc<dyn Held>>,
+    /// A share of the exporter's storage. The share rather than an id: an id stops naming this
+    /// storage the moment it dies, and the whole point of holding storage across contexts is that
+    /// it cannot.
+    ///
+    /// Two shapes, because the exporting host has two: storage the driver laid out and described,
+    /// and storage that has no description but the one this command is about to supply. Which of
+    /// them it is was settled at the export -- see [`crate::surface::Adoptable`].
+    storage: Option<Adoptable>,
 }
 
 impl Untyped {
     /// Attached, with whatever the exporter published as its storage.
-    pub fn new(surface: Option<Arc<dyn Held>>) -> Untyped {
-        Untyped { surface }
+    pub fn new(storage: Option<Adoptable>) -> Untyped {
+        Untyped { storage }
     }
 
     /// Say what this storage is, which is the one thing that may be done to it.
@@ -459,9 +478,15 @@ impl Untyped {
         limits: &Limits,
         args: Args,
         pixels: Option<&PixelSource<'_>>,
-        plane: Plane,
+        planes: &[Plane],
+        modifier: u64,
         batch: u64,
     ) -> Result<Resource, (Untyped, Refusal)> {
+        // Plane zero is the image. The rest are named in a description of storage that has none
+        // of its own, and read by nothing here -- so the fill below wants the first, and the
+        // description below wants them all. One value, read two ways, rather than a `plane`
+        // argument beside a `planes` one that a caller could make disagree.
+        let plane = planes.first().copied().unwrap_or(Plane { stride: 0, offset: 0 });
         // A blob being given a type is always given a texture's. The guest states the target,
         // so this asks rather than assumes: `gl_target` has no answer for a buffer and would
         // abort on one, and a guest must never be able to do that.
@@ -470,7 +495,26 @@ impl Untyped {
             Ok(_) => return Err((self, Refusal::NotTextureStorage)),
             Err(e) => return Err((self, e)),
         };
-        let image = match self.surface {
+        // Storage with no layout of its own is read under the one this command carries, and
+        // that is the *only* description of it there will ever be -- the driver laid out a
+        // buffer, which has no format, no tiling and no layout to report. It is also the guest's
+        // claim rather than the driver's answer, so it crosses a trust boundary on the way in:
+        // `describe` checks every plane against the kernel's size for the buffer before anything
+        // maps or images it, and a claim that does not fit is the guest's error and refused.
+        let held = match self.storage {
+            Some(Adoptable::Ready(held)) => Some(held),
+            Some(Adoptable::Unread(storage)) => match describe(&storage, &args, planes, modifier) {
+                Ok(held) => Some(held),
+                Err(why) => {
+                    return Err((
+                        Untyped { storage: Some(Adoptable::Unread(storage)) },
+                        Refusal::UndescribableStorage(why),
+                    ));
+                }
+            },
+            None => None,
+        };
+        let image = match held {
             Some(held) if features.adopts_iosurfaces() => match winsys.image_from_iosurface(held) {
                 Ok(image) => Some(image),
                 // The host takes IOSurfaces and would not take this one. See above: ours.
@@ -493,7 +537,7 @@ impl Untyped {
         let storage =
             match alloc_texture(gl, winsys, features, formats, &args, gl_target, image, None) {
                 Ok(s) => s,
-                Err(e) => return Err((Untyped { surface: None }, e)),
+                Err(e) => return Err((Untyped { storage: None }, e)),
             };
         // Whether an image backs the storage is read off the storage, not carried alongside it:
         // the adopt can fail at either step, and a second boolean tracking it would be a copy of
@@ -544,10 +588,57 @@ impl Untyped {
         })
     }
 
-    /// A share of the surface these bytes are, if they are one.
+    /// A share of the surface these bytes are, if they are one already.
+    ///
+    /// Storage still waiting for a description is not one and answers `None`: there is no surface
+    /// until somebody says how to read the buffer, and inventing a layout here to have something
+    /// to return is exactly what [`Adoptable::Unread`] exists to prevent.
     pub fn surface(&self) -> Option<&Arc<dyn Held>> {
-        self.surface.as_ref()
+        match &self.storage {
+            Some(Adoptable::Ready(held)) => Some(held),
+            Some(Adoptable::Unread(_)) | None => None,
+        }
     }
+}
+
+/// Read storage that has no layout of its own under the description the guest just sent.
+///
+/// The guest is the only party that knows: it chose the layout when it blitted its frame into the
+/// buffer, and it states it here. So this is where its numbers are turned into a [`Layout`] --
+/// and `describe` is where they are checked against the buffer, which is the half that makes
+/// trusting them safe rather than merely necessary.
+///
+/// The FourCC is this side's, not the guest's: `scanout_fourcc` is the same table that names a
+/// format to a display controller, so a format with no fourcc is one no importer could be told
+/// about and is refused here rather than guessed at.
+fn describe(
+    storage: &Arc<dyn crate::surface::Describable>,
+    args: &Args,
+    planes: &[Plane],
+    modifier: u64,
+) -> Result<Arc<dyn Held>, crate::surface::BadLayout> {
+    use crate::surface::{Layout, MAX_PLANES, PlaneLayout};
+
+    let fourcc = super::formats::scanout_fourcc(args.format)
+        .map(|c| c.get())
+        .ok_or(crate::surface::BadLayout::Fourcc(0))?;
+    let mut layout = [PlaneLayout { offset: 0, pitch: 0 }; MAX_PLANES];
+    for (at, p) in planes.iter().take(MAX_PLANES).enumerate() {
+        layout[at] = PlaneLayout { offset: u64::from(p.offset), pitch: p.stride };
+    }
+    Arc::clone(storage).describe(Layout {
+        width: args.width,
+        height: args.height,
+        fourcc,
+        modifier,
+        planes: layout,
+        // The guest's own count, bounded by what a layout can hold. `describe` is what says
+        // whether it agrees with the FourCC -- one rule, in one place, over both halves.
+        plane_count: planes.len().min(MAX_PLANES) as u32,
+        // The buffer's extent is the kernel's and the descriptor holds it; whatever is put here
+        // is replaced by `describe` with what `lseek` said.
+        alloc_size: 0,
+    })
 }
 
 /// The host buffer behind a `VIRGL_BIND_CUSTOM` resource, and which side of it holds the truth.

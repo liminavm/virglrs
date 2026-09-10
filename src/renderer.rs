@@ -297,13 +297,31 @@ pub enum BlobStorage {
     Guest,
     /// Memory this renderer minted for the blob, which the guest asked the host to supply.
     Minted(HostShm),
-    /// A share of storage a venus allocation was published from -- a surface, or pages this
-    /// renderer minted. Holding it is what makes the resource resolvable from any context the
-    /// guest attached it to, and what keeps the bytes alive for as long as the resource stands,
-    /// including after the context that minted them is gone. `caching` is how the exporter's
-    /// memory type said the host reaches them, decided at the export.
-    Shared { storage: Storage, caching: Caching, from: Exporter },
+    /// A share of storage a venus allocation was published from -- a surface, a descriptor, or
+    /// pages this renderer minted. Holding it is what makes the resource resolvable from any
+    /// context the guest attached it to, and what keeps the bytes alive for as long as the
+    /// resource stands, including after the context that minted them is gone. `published` is what
+    /// the exporter could offer, decided at the export.
+    Shared { storage: Storage, published: Published, from: Exporter },
 }
+
+/// What a shared blob offers the guest: an address to map, or a buffer to share and no address.
+///
+/// The distinction is the storage's, settled at the export, and it is a shape rather than an
+/// address that might be zero -- see [`crate::venus::driver::Exported`]. Every path that wants to
+/// hand the VMM a mapping matches on this, so there is no arm for storage that has none and no
+/// way to publish `0` as though it were somewhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Published {
+    /// The host has an address, and `caching` is how it reaches the bytes through it. The guest's
+    /// mapping has to be no weaker.
+    Mapped { caching: Caching },
+    /// The host holds a descriptor and no address. The blob can be shared and not mapped.
+    Descriptor,
+}
+
+/// `VIRTGPU_BLOB_FLAG_USE_MAPPABLE`: the guest means to map the blob into its own address space.
+pub const BLOB_FLAG_USE_MAPPABLE: u32 = 1;
 
 /// The allocation a blob was exported from: whose it is, and which object it was.
 ///
@@ -742,15 +760,27 @@ impl Renderer {
                 // all of them is `ffi.rs`'s problem and not this function's.
                 CapsetId::Venus => {
                     let (exported, storage, from) = self.venus_memory_export(ctx, id, desc.size)?;
-                    BlobStorage::Shared {
-                        storage,
-                        caching: if exported.write_back {
-                            Caching::Cached
-                        } else {
-                            Caching::WriteCombining
+                    let published = match exported {
+                        venus::driver::Exported::Mapped { write_back, .. } => Published::Mapped {
+                            caching: if write_back {
+                                Caching::Cached
+                            } else {
+                                Caching::WriteCombining
+                            },
                         },
-                        from,
+                        venus::driver::Exported::Descriptor => Published::Descriptor,
+                    };
+                    // What the guest asked for and what the allocation can do meet here, once,
+                    // and disagree loudly rather than later. A guest that asks to map memory the
+                    // host has no address for would otherwise create the blob, map it, and get
+                    // nothing -- and the refusal it needs would arrive at the map, by which time
+                    // the resource exists and the guest has been told the allocation was fine.
+                    if desc.blob_flags & BLOB_FLAG_USE_MAPPABLE != 0
+                        && published == Published::Descriptor
+                    {
+                        return Err(Error::NotHostVisible);
                     }
+                    BlobStorage::Shared { storage, published, from }
                 }
             },
         };
@@ -1069,7 +1099,7 @@ impl Renderer {
         let blob = self
             .with_resource(handle, |r| match &r.backing {
                 Backing::Blob { storage: BlobStorage::Shared { storage, .. }, .. } => {
-                    Some(storage.held())
+                    Some(storage.adoptable())
                 }
                 Backing::Blob { .. } => Some(None),
                 Backing::Classic { .. } | Backing::Imported { .. } => None,
@@ -1755,9 +1785,14 @@ impl Renderer {
                     caching: Caching::Cached,
                 }),
                 // The blob's size, not the storage's: the export held the one to the other.
-                BlobStorage::Shared { storage, caching, .. } => {
+                BlobStorage::Shared {
+                    storage, published: Published::Mapped { caching }, ..
+                } => {
                     Some(HostMapping { addr: storage.span().0, size: desc.size, caching: *caching })
                 }
+                // Storage with no address is not a mapping that failed: there is nothing to map
+                // and the guest was told so at the create.
+                BlobStorage::Shared { published: Published::Descriptor, .. } => None,
                 BlobStorage::Guest => None,
             },
             // A classic resource is mappable only when something took its mapping, which only
@@ -2094,7 +2129,7 @@ mod tests {
                 },
                 storage: BlobStorage::Shared {
                     storage: pages.clone(),
-                    caching: Caching::Cached,
+                    published: Published::Mapped { caching: Caching::Cached },
                     from: Exporter { ctx: ContextKey::for_test(one), key },
                 },
             },
@@ -2296,7 +2331,7 @@ mod tests {
                     },
                     storage: BlobStorage::Shared {
                         storage: share.clone(),
-                        caching: Caching::Cached,
+                        published: Published::Mapped { caching: Caching::Cached },
                         from: Exporter { ctx: ContextKey::for_test(one), key: any_key() },
                     },
                 },
@@ -2343,7 +2378,7 @@ mod tests {
                     },
                     storage: BlobStorage::Shared {
                         storage: pages.clone(),
-                        caching: Caching::Cached,
+                        published: Published::Mapped { caching: Caching::Cached },
                         from: Exporter { ctx: ContextKey::for_test(one), key: any_key() },
                     },
                 },
@@ -2507,7 +2542,7 @@ mod tests {
                 },
                 storage: BlobStorage::Shared {
                     storage: pages,
-                    caching: Caching::Cached,
+                    published: Published::Mapped { caching: Caching::Cached },
                     from: Exporter { ctx: ContextKey::for_test(one), key: any_key() },
                 },
             },
@@ -2572,7 +2607,7 @@ mod tests {
                 },
                 storage: BlobStorage::Shared {
                     storage: pages,
-                    caching: Caching::Cached,
+                    published: Published::Mapped { caching: Caching::Cached },
                     from: Exporter { ctx: first, key },
                 },
             },
@@ -2621,7 +2656,7 @@ mod tests {
                 },
                 storage: BlobStorage::Shared {
                     storage: pages.clone(),
-                    caching: Caching::Cached,
+                    published: Published::Mapped { caching: Caching::Cached },
                     from: Exporter { ctx: ContextKey::for_test(one), key: any_key() },
                 },
             },

@@ -1880,13 +1880,11 @@ impl Context {
                 width,
                 height,
                 ref planes,
-                ..
-            } => {
-                // Plane zero is the image: this command only ever describes a plain 2D texture
-                // here, and the strides of any others describe planes nothing reads.
-                let plane = planes.first().copied().unwrap_or(Plane { stride: 0, offset: 0 });
-                self.set_resource_type(host, resource, format, bind, width, height, plane, wire)
-            }
+                modifier,
+                usage: _,
+            } => self.set_resource_type(
+                host, resource, format, bind, width, height, planes, modifier, wire,
+            ),
             Command::PipeResourceCreate {
                 target,
                 format,
@@ -4068,7 +4066,8 @@ impl Context {
         bind: u32,
         width: u32,
         height: u32,
-        plane: Plane,
+        planes: &[Plane],
+        modifier: u64,
         wire: &[u32],
     ) -> Result<(), Fault> {
         let cmd = Cmd::PipeResourceSetType;
@@ -4101,7 +4100,8 @@ impl Context {
             host.limits,
             args,
             pixels.as_ref(),
-            plane,
+            planes,
+            modifier,
             host.batch,
         ) {
             Ok(mut res) => {
