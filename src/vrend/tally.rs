@@ -49,6 +49,11 @@ pub struct Tally {
     on: Option<Armed>,
 }
 
+/// How many positions in a fence's walk are reported separately. A context with more
+/// sub-contexts than this has its tail folded into the last bucket -- the question is whether cost
+/// is flat or front-loaded, and a tail bucket answers that as well as a longer array would.
+const HOPS: usize = 8;
+
 struct Armed {
     every: Duration,
     window_began: Instant,
@@ -67,6 +72,25 @@ struct Armed {
     /// Wall time inside `Vrend::take_fence`, the share of the worker the fence path costs. Kept
     /// apart from `busy` because they are different entry points; see the note above.
     fence_busy: Duration,
+    /// The two halves of a hop, apart: time inside `eglMakeCurrent`, and time inside
+    /// `glFenceSync`. They are separated because their fixes are opposite -- a cost in the switch
+    /// is paid per context the walk visits and would be answered by visiting fewer of them, while
+    /// a cost in the sync is the driver's and would be answered by asking it differently. One
+    /// number covering both cannot choose.
+    current_busy: Duration,
+    sync_busy: Duration,
+    /// Hops taken, and what each cost by its position in the walk. A walk whose per-hop cost is
+    /// flat in the index is paying for the *visiting*; one where the first hop holds nearly all of
+    /// it is paying for work that was queued, and visiting the others is free. That distinction is
+    /// the whole question, and no aggregate answers it.
+    hops: u64,
+    hop_busy: [Duration; HOPS],
+    hop_n: [u64; HOPS],
+    /// Fences the driver refused a sync for, which fall back to finishing every context that could
+    /// hold the work. Counted apart from `ordered` -- both answer `Answer::Ordered`, and one is a
+    /// full `glFinish` while the other is free, so a single counter cannot tell an expensive window
+    /// from a cheap one.
+    drained: u64,
     /// Calls to `resource_sync_iosurface`: one blocking wait on the surface's shared event each.
     presents: u64,
     /// Wall time inside `Vrend::submit`. Against the window's own length this also says what
@@ -87,6 +111,12 @@ impl Armed {
             ordered: 0,
             sync_objects: 0,
             fence_busy: Duration::ZERO,
+            current_busy: Duration::ZERO,
+            sync_busy: Duration::ZERO,
+            hops: 0,
+            hop_busy: [Duration::ZERO; HOPS],
+            hop_n: [0; HOPS],
+            drained: 0,
             presents: 0,
             busy: Duration::ZERO,
         }
@@ -131,11 +161,33 @@ impl Tally {
         }
     }
 
-    /// Start of answering one fence, or `None` when unarmed -- which is also what stops the clock
-    /// being read. One pair per fence, not per sync object.
+    /// The clock, or `None` when unarmed -- which is what keeps an unarmed build from reading it
+    /// at all. Every duration below is a difference of two of these.
     #[inline]
-    pub fn fence_began(&self) -> Option<Instant> {
+    pub fn mark(&self) -> Option<Instant> {
         self.on.as_ref().map(|_| Instant::now())
+    }
+
+    /// One hop of a fence's walk: the context switch, then the sync taken on it.
+    ///
+    /// `index` is the hop's position in the walk, with ctx0 last. Takes the three marks rather
+    /// than two durations so the split cannot be computed one way here and another way at the next
+    /// call site.
+    pub fn fence_hop(&mut self, index: usize, marks: Option<(Instant, Instant, Instant)>) {
+        let (Some(a), Some((began, switched, synced))) = (&mut self.on, marks) else { return };
+        let at = index.min(HOPS - 1);
+        a.hops += 1;
+        a.hop_n[at] += 1;
+        a.hop_busy[at] += synced - began;
+        a.current_busy += switched - began;
+        a.sync_busy += synced - switched;
+    }
+
+    /// This fence was answered by finishing rather than by syncs: the driver refused one.
+    pub fn fence_drained(&mut self) {
+        if let Some(a) = &mut self.on {
+            a.drained += 1;
+        }
     }
 
     /// One guest fence was answered, and at what cost: a sync is a flush, an ordering is free.
@@ -224,6 +276,33 @@ impl Tally {
             a.ordered,
             a.presents,
         );
+        // The decomposition, and the line that exists to choose between two fixes. Printed only
+        // when there were hops: a window with none has nothing to say here and a row of zeroes
+        // reads like an answer.
+        if a.hops > 0 {
+            let us =
+                |d: Duration, n: u64| if n == 0 { 0.0 } else { d.as_secs_f64() * 1e6 / n as f64 };
+            let mut by_index = String::new();
+            for at in 0..HOPS {
+                if a.hop_n[at] == 0 {
+                    continue;
+                }
+                by_index.push_str(&format!(
+                    " {}{}:{:.0}",
+                    at,
+                    if at == HOPS - 1 { "+" } else { "" },
+                    us(a.hop_busy[at], a.hop_n[at])
+                ));
+            }
+            eprintln!(
+                "[virglrs] vrend fence hops: {:.1} hop/s  {:.1} us/hop                   ({:.1} us current  {:.1} us sync)  {:.1} drain/s  us/hop by index:{by_index}",
+                a.hops as f64 / secs,
+                us(a.current_busy + a.sync_busy, a.hops),
+                us(a.current_busy, a.hops),
+                us(a.sync_busy, a.hops),
+                a.drained as f64 / secs,
+            );
+        }
         *a = Armed::new(a.every);
         a.window_began = now;
     }
@@ -280,6 +359,12 @@ mod tests {
             a.ordered = 4;
             a.sync_objects = 9;
             a.fence_busy = Duration::from_millis(2);
+            a.current_busy = Duration::from_millis(1);
+            a.sync_busy = Duration::from_millis(1);
+            a.hops = 9;
+            a.hop_busy[0] = Duration::from_millis(1);
+            a.hop_n[0] = 9;
+            a.drained = 1;
             a.presents = 2;
             a.busy = Duration::from_millis(5);
         }
@@ -297,6 +382,12 @@ mod tests {
         assert_eq!(a.busy, Duration::ZERO);
         assert_eq!(a.sync_objects, 0);
         assert_eq!(a.fence_busy, Duration::ZERO, "the fence clock resets with the rest");
+        // The decomposition too. A counter that survives its window does not read as a bug: it
+        // reads as a rate, and the next window reports this one's cost as its own.
+        assert_eq!((a.current_busy, a.sync_busy), (Duration::ZERO, Duration::ZERO));
+        assert_eq!((a.hops, a.drained), (0, 0));
+        assert_eq!(a.hop_busy[0], Duration::ZERO);
+        assert_eq!(a.hop_n[0], 0, "the per-index buckets as well");
         assert_eq!(a.every, Duration::ZERO, "the interval is not a counter and must survive");
     }
 
