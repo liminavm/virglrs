@@ -27,7 +27,7 @@ use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::shader;
 use super::tally;
 use super::transfer::{self, Info};
-use super::waiter;
+use super::waiter::{self, Answer};
 use crate::config::Config;
 use crate::decode;
 use crate::guest_mem::{Iov, PixelSource};
@@ -694,49 +694,57 @@ impl Vrend {
     /// fence is *taken* -- the caller is holding the renderer, and waiting under it is what made
     /// one heavy client slow down every other context.
     pub fn fence_context(&mut self, ctx: ContextId, ring: RingIdx, id: FenceId) {
-        let fence = self.take_fence(Some(ctx));
+        // With no waiter there is no queue to retire behind, so the fence is answered inline --
+        // the way this renderer did before there was one. Taking a sync and dropping it unwaited
+        // would retire the fence early, which is the whole hazard this path exists to prevent.
+        if self.waiter.is_none() {
+            self.finish_contexts(&[ctx]);
+            self.fences.retire_context(ctx, ring, id);
+            return;
+        }
+        let answer = self.take_fence(Some(ctx));
         if super::debug::enabled(super::debug::Switch::Fence) {
             eprintln!(
-                "[virglrs] fence: context ctx={ctx:?} ring={ring:?} id={} sync={} waiter={}",
+                "[virglrs] fence: context ctx={ctx:?} ring={ring:?} id={} answer={}",
                 id.0,
-                fence.is_some(),
-                self.waiter.is_some()
+                answer.name()
             );
         }
-        match &self.waiter {
-            Some(w) => w.retire_context(fence, ctx, ring, id),
-            None => self.fences.retire_context(ctx, ring, id),
-        }
+        let w = self.waiter.as_ref().expect("checked just above");
+        w.retire_context(answer, ctx, ring, id);
     }
 
     /// Answer a fence on the legacy global ring, which names its context from outside.
     ///
     /// `on` is the context whose work the fence is for. `None` -- or a context this renderer does
-    /// not have -- means it cannot be attributed, and the fence is answered the old way, by
-    /// finishing everything.
+    /// not have -- means it cannot be attributed to one, and the fence is answered by its place in
+    /// the waiter's queue instead; see [`Self::take_fence`].
     pub fn fence_global(&mut self, on: Option<ContextId>, id: ClientFenceId) {
-        let fence = self.take_fence(on);
+        if self.waiter.is_none() {
+            self.finish_all();
+            self.fences.retire_global(id);
+            return;
+        }
+        let answer = self.take_fence(on);
         if super::debug::enabled(super::debug::Switch::Fence) {
-            eprintln!(
-                "[virglrs] fence: global id={} on={on:?} sync={} waiter={}",
-                id.0,
-                fence.is_some(),
-                self.waiter.is_some()
-            );
+            eprintln!("[virglrs] fence: global id={} on={on:?} answer={}", id.0, answer.name());
         }
-        match &self.waiter {
-            Some(w) => w.retire_global(fence, id),
-            None => self.fences.retire_global(id),
-        }
+        let w = self.waiter.as_ref().expect("checked just above");
+        w.retire_global(answer, id);
     }
 
-    /// A sync object for the work `on` has queued, taken on the sub-context that queued it.
+    /// How to answer the fence for the work `on` has queued: a sync taken on the sub-context that
+    /// queued it, or [`Answer::Ordered`] for a fence with no work of its own.
     ///
-    /// `None` is not "nothing to wait for": it means this fence could not be answered by waiting
-    /// on one context, and has been answered inline instead, by finishing every context the way
-    /// this renderer used to for all of them. A caller must still queue the retirement, so that it
-    /// cannot overtake a fence ahead of it that is still in flight.
-    fn take_fence(&mut self, on: Option<ContextId>) -> Option<gl::Fence> {
+    /// **A fence that names no context is not a fence over everything.** It rides the same Global
+    /// ring as every context-named fence, and the waiter's queue is FIFO, so retiring it behind
+    /// the queue already places it after every render fenced before it. Finishing every context
+    /// here bought nothing over that and cost a full drain of every GL queue, on the thread that
+    /// services virtio-gpu for all of them -- measured as two thirds of all fences under a
+    /// texture-churning workload, every one of them a `RESOURCE_CREATE_3D` that had rendered
+    /// nothing. The C never did this either: its global fence takes a sync on ctx0, a context that
+    /// never draws.
+    fn take_fence(&mut self, on: Option<ContextId>) -> Answer {
         // `VIRGLRS_FENCE_FINISH=1` puts the old behaviour back -- every context finished inline,
         // on this thread -- so the two can be compared on one build the way the cost of the finish
         // was measured in the first place. Retirement still goes through the waiter's queue, so
@@ -744,24 +752,29 @@ impl Vrend {
         static FORCE_FINISH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let forced = *FORCE_FINISH
             .get_or_init(|| std::env::var("VIRGLRS_FENCE_FINISH").as_deref() == Ok("1"));
-        let taken = match on {
-            _ if forced => None,
-            Some(id) if self.contexts.contains_key(&id) => {
-                // The context's current sub-context is the one that queued the work, and a sync
-                // covers the context it is taken on.
-                let (mut host, contexts) = self.split(id, &NoGuest);
-                contexts[&id].make_current(&mut host);
-                self.gl.fence()
-            }
-            _ => None,
-        };
-        if taken.is_none() {
-            // Either nothing named a context we have, or the driver would not give a sync. Both
-            // leave the fence unanswerable by waiting, so answer it the expensive way rather than
-            // early: an early classic fence hands a venus compositor the frame before.
+        if forced {
             self.finish_all();
+            return Answer::Ordered;
         }
-        taken
+        // Nothing names a context we have: either the Global ring named none, or it named one that
+        // is gone or belongs to venus. Either way there is no work of ours to wait on, and the
+        // queue's order is the answer.
+        let Some(id) = on.filter(|id| self.contexts.contains_key(id)) else {
+            return Answer::Ordered;
+        };
+        // The context's current sub-context is the one that queued the work, and a sync covers the
+        // context it is taken on.
+        let (mut host, contexts) = self.split(id, &NoGuest);
+        contexts[&id].make_current(&mut host);
+        match self.gl.fence() {
+            Some(f) => Answer::Sync(f),
+            // The driver refused a sync for work we know was queued, so it has to be waited for
+            // the expensive way -- but only on the context that queued it, never on every one.
+            None => {
+                self.finish_contexts(&[id]);
+                Answer::Ordered
+            }
+        }
     }
 
     /// `vrend_renderer_resource_sync_iosurface`: make a surface-backed resource's contents whole
@@ -1103,6 +1116,61 @@ mod tests {
 
         // A handle nothing holds. Not an error to a VMM -- it means no pointer this frame.
         assert!(v.cursor_contents(handle(3)).is_none(), "nothing holds this handle");
+    }
+
+    /// Both classic fence entry points, driven end to end against a live driver and a live waiter.
+    ///
+    /// What this is for is the half of the fence path no unit test of [`Answer`] can reach: a
+    /// `Fence` aborts on drop rather than being leaked, so a caller that takes a sync and then
+    /// loses it takes the process with it -- and the only way to that is through these two
+    /// functions, with a waiter running and a context the fence can be attributed to. Asserting on
+    /// the retirements is secondary; surviving the call is the test.
+    #[test]
+    fn both_classic_fence_paths_spend_every_sync_they_take() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Recorder(std::sync::mpsc::Sender<u64>);
+        impl crate::fence::FenceSink for Recorder {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, f: FenceId) {
+                let _ = self.0.send(f.0);
+            }
+            fn global_fence(&mut self, f: ClientFenceId) {
+                let _ = self.0.send(u64::from(f.0));
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let retire = crate::fence::Retirement::start(Box::new(Recorder(tx)));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+        )
+        .expect("vrend comes up");
+        assert!(
+            v.waiter.is_some(),
+            "without a waiter no sync is ever taken and this tests nothing"
+        );
+
+        let ctx = ContextId::new(1).expect("a context id");
+        v.context_create(ctx, &NoGuest).expect("a context");
+
+        // Each of the three shapes a classic fence comes in: named by a context, named by the
+        // global ring, and naming nothing at all.
+        v.fence_context(ctx, RingIdx(0), FenceId(11));
+        v.fence_global(Some(ctx), ClientFenceId(22));
+        v.fence_global(None, ClientFenceId(33));
+
+        // Dropped before the assertions: the waiter drains on the way out, so this is what makes
+        // every fence above have been retired by the time they are read.
+        v.context_destroy(ctx, &NoGuest);
+        drop(v);
+        // Three, each with its own deadline, and then nothing: draining until a timeout would make
+        // every run of this test pay that timeout.
+        let got: Vec<u64> = (0..3)
+            .map(|_| rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a fence retires"))
+            .collect();
+        assert_eq!(got, vec![11, 22, 33], "all three retire, and in the order they were taken");
+        assert!(rx.try_recv().is_err(), "and nothing else was retired");
     }
 
     #[test]
