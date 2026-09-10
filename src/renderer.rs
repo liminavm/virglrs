@@ -1576,8 +1576,8 @@ impl Renderer {
     ///
     /// Classic resources keep theirs in vrend and venus-exported ones in the storage a blob holds
     /// a share of, and callers want the same answer either way -- so it is resolved once here.
-    /// Two callers resolving it two different ways is how "it has an id" and "it can be read"
-    /// came to be separately derivable facts about one resource.
+    /// Two callers resolving it two different ways would make "it has an id" and "it can be
+    /// read" separately derivable facts about one resource.
     ///
     /// A closure rather than a borrow, because one of the two answers lives in a share this call
     /// resolves and the caller does not hold: returning a reference into it would mean handing

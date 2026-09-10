@@ -1481,9 +1481,9 @@ fn releases_a_create(cmd: VkCommandTypeEXT) -> bool {
 /// and the memory it is bound to; a descriptor write names the set and every buffer, view and
 /// sampler it points at. Only the first of each pair is what the entry is *about* -- the entry
 /// stops being true when the thing it wrote into is gone, not when something it merely pointed at
-/// is. Keying on all of them together is why a `vkBindBufferMemory2` over two buffers used to be
-/// lost entirely when one of them was destroyed, taking the other buffer's binding with it -- and
-/// a binding, unlike a descriptor write, is never sent again.
+/// is. Keying on all of them together loses a `vkBindBufferMemory2` over two buffers entirely
+/// when either one is destroyed, taking the surviving buffer's binding with it -- and a binding,
+/// unlike a descriptor write, is never sent again.
 ///
 /// Three served commands do write into an object they do not own and are still left off, each for
 /// a reason that is not "nobody thought about it":

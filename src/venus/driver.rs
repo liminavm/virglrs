@@ -4236,9 +4236,9 @@ impl Driver {
             // tiling and no layout query. The guest supplies it later, with the command that says
             // what the resource is.
             //
-            // Before this arm such an allocation fell through to the driver, and then the guest's
-            // `CREATE_BLOB` was refused for memory the host could not address -- which is true and
-            // beside the point, because a shareable blob needs a descriptor and not an address.
+            // Left to the driver instead, such an allocation gets its `CREATE_BLOB` refused for
+            // memory the host cannot address -- true, and an answer to a question the guest did
+            // not ask, because a shareable blob needs a descriptor and not an address.
             #[cfg(not(target_os = "macos"))]
             (None, Err(_), None) if declared => {
                 Planned::Exporting { charge: self.admit("exported buffer", size)?, image: None }
@@ -6645,16 +6645,6 @@ mod tests {
         VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32,
     );
 
-    /// An allocation is freed on the way out, after everything bound to it, and the census forgets
-    /// it at the same moment.
-    ///
-    /// Two facts about one allocation used to live in two places: the object table held its handle
-    /// under the guest's id, and this driver held a second copy of that handle beside the size.
-    /// The cascade had to skip `VK_OBJECT_TYPE_DEVICE_MEMORY` entirely to avoid freeing both, and
-    /// An export publishes memory to the VMM, and the mark it leaves is the mapping itself.
-    ///
-    /// Every refusal here is a guest's doing, so each has to be an answer rather than an abort:
-    /// naming memory that does not exist, exporting the same memory twice, asking for a blob
     /// The census reports storage once, at whoever owns it -- and an import owns none. A guest
     /// imports so one context can reach what another rendered, and the second Vulkan handle onto
     /// those bytes is not a second buffer. Counting it would report the exporter's window twice
@@ -7779,7 +7769,7 @@ mod tests {
             sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
             pNext: (&raw const export_info).cast(),
             // No image. This is the whole of the difference from a minting host's window buffer,
-            // and it is what every earlier version of this path refused on.
+            // and it is what a recognition rule built around a dedicated image refuses on.
             image: VkImage(0),
             buffer: VkBuffer(0x4321),
         };
@@ -7811,7 +7801,7 @@ mod tests {
         );
 
         // Publishing offers a descriptor. The address it does not have is absent from the type
-        // rather than present as a zero -- which is what the caller used to have to test.
+        // rather than present as a zero -- which is what a caller would otherwise have to test.
         let (published, share) = d
             .memory_export(ObjectId(1), SIZE, Route::Any)
             .expect("and the refusal above cost the allocation nothing");

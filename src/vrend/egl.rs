@@ -612,14 +612,16 @@ impl Winsys {
     ///
     /// Adopting is the other direction, and both hosts do it: one takes an IOSurface a context
     /// exported, the other a dma-buf. It is what a compositor sampling a client's window needs,
-    /// and until this was asked separately a venus client's window on Linux was adopted by
-    /// nothing and composited as a blank texture -- measured with `vkcube` under GNOME, which
-    /// drew a black 500x500 window while every status line read green.
+    /// and asking the minting question in its place answers `false` on every host that does not
+    /// mint -- so a venus client's window on Linux is adopted by nothing and composites as a
+    /// blank texture. Measured with `vkcube` under GNOME: a black 500x500 window, with every
+    /// status line reading green.
     ///
     /// Both halves are needed and neither implies the other: the GL entry point that makes an
     /// EGLImage into texture storage, and the EGL extension that makes a descriptor into an
-    /// EGLImage. Asked here rather than at the import, so a host that cannot do it says so once
-    /// at startup instead of per client window.
+    /// EGLImage. Asked here rather than at the import, so the answer is a property of the host
+    /// and not of the window being adopted. It is silent: a host that cannot adopt composites a
+    /// blank window with nothing said, which `docs/linux-port.md` books.
     pub fn adopts_shared_storage(&self, features: &super::features::Features) -> bool {
         use super::features::Feature;
         if !(features.has(Feature::egl_image) || features.has(Feature::egl_image_storage)) {
