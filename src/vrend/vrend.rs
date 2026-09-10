@@ -681,6 +681,114 @@ impl Vrend {
         Some(Cursor { width: res.args.width, height: res.args.height, pixels })
     }
 
+    /// Read a scanout back *through the descriptor it exports*, importing it and letting the GPU
+    /// detile.
+    ///
+    /// The exporting host's answer to the question the minting host answers by locking an
+    /// IOSurface and copying its rows. Both read the storage a compositor would present from,
+    /// which is the point: reading this resource's texture instead would be cheaper, would give
+    /// the right pixels, and would answer a different question -- it would pass just as happily
+    /// if the exported descriptor named the wrong memory, the wrong pitch or the wrong format,
+    /// which is exactly what this call exists to catch.
+    ///
+    /// The round trip is what makes the descriptor load-bearing. It is imported as an EGL image,
+    /// taken as a texture's storage and read back through a framebuffer, so the GPU applies the
+    /// modifier -- a tiled buffer's bytes in row order are not the picture, and no CPU mapping
+    /// could do this correctly.
+    ///
+    /// Costly, and deliberately on the slow path: this is what a headless sink calls when it has
+    /// no other way to see a frame, not something a present goes through.
+    #[cfg(not(target_os = "macos"))]
+    pub fn read_scanout_through_export(
+        &mut self,
+        handle: ResourceHandle,
+        dst: &mut [u8],
+        stride: usize,
+        height: u32,
+    ) -> Option<u32> {
+        use super::gl::gles::*;
+        use super::gl::{GLint, GLsizei};
+
+        // ctx0 first, as the readback below binds a framebuffer and a texture: doing that in
+        // whichever context ran last would change bindings the guest still expects to be its own.
+        self.switch_ctx0();
+        let (held, width, full_height) = {
+            let res = self.resources.get(&handle)?.resource()?;
+            (res.surface_share()?, res.args.width, res.args.height)
+        };
+        let image = match self.winsys.image_from_iosurface(held) {
+            Ok(image) => image,
+            Err(e) => {
+                eprintln!("[virglrs] vrend: {handle:?}: cannot import its own export ({e})");
+                return None;
+            }
+        };
+
+        let rows = height.min(full_height);
+        let name = self.gl.gen_texture();
+        self.gl.bind_texture(GL_TEXTURE_2D, Some(name));
+        self.gl.drain_errors();
+        self.gl.egl_image_target_texture_2d(GL_TEXTURE_2D, &image);
+        // A sampler state the driver will accept: an imported image has no mip levels, and a
+        // framebuffer attachment of an incomplete texture is a status this would fail on later
+        // with nothing saying why.
+        for p in [GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER] {
+            self.gl.tex_parameter_i(GL_TEXTURE_2D, p, GL_NEAREST as GLint);
+        }
+        self.gl.bind_texture(GL_TEXTURE_2D, None);
+
+        let fb = self.gl.gen_framebuffer();
+        self.gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
+        self.gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(name), 0);
+        let status = self.gl.check_framebuffer_status();
+        let mut got = 0;
+        if status == GL_FRAMEBUFFER_COMPLETE {
+            // Tightly packed, then re-pitched below: `glReadPixels` writes one image at the
+            // alignment GL was told, and asking it to write at the caller's stride would make the
+            // pack alignment a second place the row length is decided.
+            let mut packed = vec![0u8; width as usize * rows as usize * 4];
+            self.gl.pixel_store_i(GL_PACK_ALIGNMENT, 1);
+            if self.gl.read_pixels(
+                0,
+                0,
+                width as GLsizei,
+                rows as GLsizei,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                &mut packed,
+            ) {
+                let row = (width as usize * 4).min(stride);
+                for y in 0..rows as usize {
+                    let (at, to) = (y * width as usize * 4, y * stride);
+                    if to + row > dst.len() {
+                        break;
+                    }
+                    dst[to..to + row].copy_from_slice(&packed[at..at + row]);
+                    // To BGRA, which is what this call owes its caller: a scanout's pixels in the
+                    // order an IOSurface holds them, so the minting host and this one answer the
+                    // same question. `glReadPixels` gives whatever order it was ASKED for and
+                    // converts as it goes, so what came back is RGBA regardless of the fourcc the
+                    // descriptor carries -- the swap is the contract's, not the buffer's, and
+                    // reading GL_BGRA_EXT instead would put it behind an extension for nothing.
+                    for px in dst[to..to + row].as_chunks_mut::<4>().0 {
+                        px.swap(0, 2);
+                    }
+                    got = y as u32 + 1;
+                }
+            }
+        } else {
+            eprintln!(
+                "[virglrs] vrend: {handle:?}: its exported descriptor imports but will not \
+                 attach ({status:#x}); nothing was read"
+            );
+        }
+        self.gl.bind_framebuffer(GL_FRAMEBUFFER, None);
+        self.gl.delete_framebuffer(fb);
+        self.gl.delete_texture(name);
+        self.gl.drain_errors();
+        (got > 0).then_some(got)
+    }
+
     /// A share of that surface, for a holder outside vrend -- a venus context importing this
     /// resource, which must keep the surface alive rather than name it. See
     /// [`resource::Resource::surface_share`].
