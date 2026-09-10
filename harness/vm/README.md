@@ -297,10 +297,19 @@ the failure is indistinguishable from the console pref not taking. Write the pro
 `console.log` to the process's stdout; timestamp each line and the host's sample windows can be
 aimed by them.
 
-**Still open: reading the scores back.** A community-mode run prints a results UID to the console
-(`"54xjtL8f"`), but the result page is client-rendered and `/result/json/` serves the SPA shell
-rather than data, so there is no scraped number yet. Until there is, the profile is the output of a
-cycle and the score is read by a person.
+**Still open: reading the scores back, and the reason is not scraping.** A community-mode run
+prints a UID to the console when it finishes, but `/api/results/details/<uid>/` answers *not found*
+on both `web.gpuscore.com` and `web.basemark.com`, and the configuration block says why:
+`Database: Unavailable`. The run is never stored server-side, so there is nothing to fetch and the
+result page loads forever. Two dead ends worth not repeating: `/result/json/` returns the SPA shell
+for any unknown path, and `firefox --headless --screenshot` renders correctly but fires on the load
+event, which on a client-rendered page captures "Loading, please wait..." (it also wants no other
+Firefox running, and a profile directory that already exists).
+
+So the per-test scores exist only in the DOM of the page that ran them. The routes are Marionette
+on the run instance -- `--marionette`, then a small client over TCP 2828 to read the result table
+once it appears -- or a person reading the screen. Until one is built, a cycle's output is the
+profile, and the score is read by a person.
 
 ## Client corpora, and why the C cannot score them
 
