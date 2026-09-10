@@ -48,10 +48,8 @@
 # What a Linux guest reaches, measured on anv with the poisoning taken out so a boot could count
 # more than one: vkmark's whole scene set, twice over with its non-default options, reaches
 # nothing on this list at all. zink reaches exactly `vkCmdSetColorWriteEnableEXT`, the same
-# command from glmark2 on wayland and from kmscube on KMS. Nothing gets further, because venus
-# host-visible allocations are unbacked off macOS until the dma-buf export lands -- the guest's
-# next CREATE_BLOB reads "not addressable by the host" and gnome-shell segfaults on the error.
-# So the reach of a Linux boot census is bounded by that gap, not by this list.
+# command from glmark2 on wayland and from kmscube on KMS. A GNOME desktop with a venus client
+# on it -- vkcube composited by gnome-shell -- reaches nothing on this list either.
 #
 # So a workload census cannot enumerate this file: the first unserved command kills the context,
 # so a boot discovers exactly one and says nothing about the rest. Reach these deliberately, with
