@@ -19,26 +19,30 @@ SRC="$(cd ../.. && pwd)"
 # vendored C tree and the build the harness makes of it, not from `$SRC/src`, which in this
 # repository is Rust.
 CSRC="$SRC/third_party/virglrenderer"
-CBUILD="$SRC/harness/vm/build"
+. "$SRC/scripts/platform.sh"
+CBUILD_INC="$(virgl_generated_include "$SRC")" || {
+  echo "no built C tree to take generated headers from: run scripts/build-reference.sh" >&2
+  exit 1
+}
 
-PREFIX="${VIRGL_PREFIX:-}"
-if [ -z "$PREFIX" ]; then
-  if [ -f "$CBUILD/src/libvirglrenderer.dylib" ]; then
-    PREFIX="$CBUILD"
-  else
-    PREFIX="$SRC/harness/vm/prefix"
-  fi
+PREFIX="${VIRGL_PREFIX:-$SRC/third_party/virgl-prefix}"
+LIB="$(virgl_find_lib "$PREFIX")" || {
+  echo "no libvirglrenderer under $PREFIX — build it first" >&2; exit 1; }
+LIBDIR="$(dirname "$LIB")"
+
+# The IOSurface scanout leg is Darwin's; nothing links those frameworks elsewhere.
+FRAMEWORKS=""
+if [ "$(uname -s)" = Darwin ]; then
+  FRAMEWORKS="-framework IOSurface -framework CoreFoundation"
 fi
 
-for cand in "$PREFIX/lib/libvirglrenderer.dylib" "$PREFIX/src/libvirglrenderer.dylib"; do
-  [ -f "$cand" ] && LIBDIR="$(dirname "$cand")" && break
-done
-[ -n "${LIBDIR:-}" ] || { echo "no libvirglrenderer.dylib under $PREFIX — build it first" >&2; exit 1; }
-
+# shellcheck disable=SC2086
 cc -O2 -Wall -Wextra -o vrend-replay vrend-replay.c \
-   -I"$CSRC/src" -I"$CBUILD/src" -I"$PREFIX/include/virgl" \
+   -I"$CSRC/src" -I"$CBUILD_INC" -I"$PREFIX/include/virgl" \
    -L"$LIBDIR" -lvirglrenderer -Wl,-rpath,"$LIBDIR" \
-   -framework IOSurface -framework CoreFoundation
+   $FRAMEWORKS
 
 echo "built: $PWD/vrend-replay"
-otool -L vrend-replay | grep virgl
+# Which leg it linked, said out loud: the whole point of the prefix being a parameter is that the
+# answer is not obvious from the command that produced it.
+virgl_link_report vrend-replay | grep virgl

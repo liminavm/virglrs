@@ -91,9 +91,22 @@ if [ ! -f "$CORPUS" ] \
   "$ROOT/scripts/fetch-corpora.sh" "$(basename "$CORPUS")"
 fi
 
-MESA_PREFIX="${MESA_PREFIX:-/Volumes/mesa-cs/zink-kk-prefix}"
-ICD="$MESA_PREFIX/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json"
-[ -f "$ICD" ] || { echo "no KosmicKrisp ICD at $ICD (set MESA_PREFIX)" >&2; exit 1; }
+. "$ROOT/scripts/platform.sh"
+
+# venus needs a host Vulkan driver and nothing else. Where that driver comes from is the only
+# part that differs: on Darwin it is KosmicKrisp out of the same Mesa prefix the renderer was
+# built against, named explicitly because nothing on the system would otherwise find it. A Linux
+# distribution installs its ICDs where the loader already looks, so naming one there would
+# override the host's own driver with whichever happened to be hardcoded -- which is how a replay
+# ends up scoring a driver nobody chose. MESA_PREFIX still overrides on either host.
+ICD=""
+if [ "$(uname -s)" = Darwin ]; then
+  MESA_PREFIX="${MESA_PREFIX:-/Volumes/mesa-cs/zink-kk-prefix}"
+fi
+if [ -n "${MESA_PREFIX:-}" ]; then
+  ICD="$MESA_PREFIX/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json"
+  [ -f "$ICD" ] || { echo "no Vulkan ICD at $ICD (set MESA_PREFIX)" >&2; exit 1; }
+fi
 
 BIN="$HERE/rs/target/release/vkr-replay"
 cargo build --release --manifest-path "$HERE/rs/Cargo.toml" >/dev/null 2>&1
@@ -102,25 +115,21 @@ cargo build --release --manifest-path "$HERE/rs/Cargo.toml" >/dev/null 2>&1
 # replayer's build.sh use. --renderer names it more directly and wins where both are given.
 case "$CHOICE" in
   rs) VIRGL_PREFIX="$ROOT/prefix" ;;
-  c)  VIRGL_PREFIX="$ROOT/harness/vm/prefix" ;;
+  c)  VIRGL_PREFIX="$ROOT/third_party/virgl-prefix" ;;
   "") [ -n "${VIRGL_PREFIX:-}" ] || usage ;;
   *)  VIRGL_PREFIX="" ;;   # a dylib path, used as given
 esac
 
 if [ -n "${VIRGL_PREFIX:-}" ]; then
-  LIB=""
-  for cand in "$VIRGL_PREFIX/lib/libvirglrenderer.1.dylib" \
-              "$VIRGL_PREFIX/lib/libvirglrenderer.dylib"; do
-    [ -f "$cand" ] && LIB="$cand" && break
-  done
-  [ -n "$LIB" ] || { echo "no libvirglrenderer under $VIRGL_PREFIX" >&2; exit 1; }
+  LIB="$(virgl_find_lib "$VIRGL_PREFIX")" \
+    || { echo "no libvirglrenderer under $VIRGL_PREFIX" >&2; exit 1; }
   # This script builds the replayer, never the renderer -- so a prefix laid down by an earlier
   # install.sh scores whatever was in the tree then, silently. That has already put a claim in
   # harness/README.md that was measured against a build three commits old. For the Rust prefix
   # the fix is to build it; for any other, say so and let the caller decide.
   if [ "$VIRGL_PREFIX" = "$ROOT/prefix" ]; then
     "$ROOT/install.sh" >/dev/null
-  elif find "$ROOT/third_party/virglrenderer/src" -name '*.c' -newer "$LIB" 2>/dev/null | read -r _; then
+  elif find "$ROOT/third_party" -name '*.c' -path '*/virglrenderer*/src/*' -newer "$LIB" 2>/dev/null | read -r _; then
     echo "warning: $LIB is older than the C sources it was built from -- stale build" >&2
   fi
 else
@@ -130,4 +139,8 @@ fi
 echo "replay: $LIB" >&2
 RENDERER=(--renderer "$LIB")
 
-exec env VK_ICD_FILENAMES="$ICD" "$BIN" "$CORPUS" "${RENDERER[@]+"${RENDERER[@]}"}" "$@"
+# No ICD named means the host loader picks, which is what a Linux distribution wants.
+if [ -n "$ICD" ]; then
+  exec env VK_ICD_FILENAMES="$ICD" "$BIN" "$CORPUS" "${RENDERER[@]+"${RENDERER[@]}"}" "$@"
+fi
+exec "$BIN" "$CORPUS" "${RENDERER[@]+"${RENDERER[@]}"}" "$@"
