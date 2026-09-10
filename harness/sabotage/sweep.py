@@ -1129,6 +1129,19 @@ SABOTAGES = [
         'a_classic_resource_lends',
     ),
     (
+        "a resource's claim is dropped without condemning vrend's half of it",
+        'src/vrend/resource.rs',
+        """impl Drop for Claim {
+    fn drop(&mut self) {
+        self.condemned.condemn(self.handle);
+    }
+}""",
+        """impl Drop for Claim {
+    fn drop(&mut self) {}
+}""",
+        'a_reset_frees_the_handles_vrend_held',
+    ),
+    (
         'the sample-count ceiling is ignored and the host maximum advertised anyway',
         'virglrs/src/vrend/caps.rs',
         'Some(c) if max_samples > c => {',
