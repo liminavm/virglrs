@@ -53,6 +53,8 @@ use super::proto::types::{
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
 
+#[cfg(target_os = "macos")]
+use super::proto::types::VkImageUsageFlagBits;
 use super::proto::types::{VkImageAspectFlagBits, VkImageSubresource, VkSubresourceLayout};
 #[cfg(not(target_os = "macos"))]
 use super::proto::types::{VkImageDrmFormatModifierPropertiesEXT, VkMemoryGetFdInfoKHR};
