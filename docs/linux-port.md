@@ -244,46 +244,73 @@ it grew by five lines, and the estimate does not move.
 
 ### Phase 5 — the export direction (3–5 weeks, the bulk)
 
-- Replace the allocate path's backing arm: `VkExportMemoryAllocateInfo` + `vkGetMemoryFdKHR`
-  where `driver.rs:4044` prepends the host-pointer import.
-- `EMULATED_ON_THE_HOST` stops emulating; pin both branches of `driver.rs:775`.
-- `export_query` (`ffi.rs:364`) answers fourcc, fds, strides, offsets, modifier for real.
-- `export_blob` (`ffi.rs:801`) reverses, so `BlobStorage` grows a variant holding an fd.
-- `get_fd_for_texture`/`2` (`ffi.rs:1200-1211`) lose their `todo_phase!`.
-- Fence export via `VK_KHR_external_fence_fd`, already in `HOST_EXTENSIONS` and never used.
-- Decide what `resource_read_iosurface` and `resource_sync_iosurface` become on the Rust API.
-- **Drop force-LINEAR** and let the driver tile.
+The inversion, made real. A venus scanout allocation is declared for export and dedicated to one
+image, so the driver lays the memory out and `vkGetMemoryFdKHR` hands back a descriptor of it;
+nothing is minted, and the allocate path prepends no `VkImportMemoryHostPointerInfoEXT`. `Planned`
+grew an `Exporting` arm for the moment that describes — after `vkAllocateMemory`, with a descriptor
+of the driver's own storage — and `src/dmabuf.rs` is what holds one.
 
-**Gate.** The census turning non-zero is *not* a control. The census hashes an allocation's
-*pages*; with force-LINEAR dropped, an OPTIMAL image on radv is tiled, `vkMapMemory` hands back
-tiled bytes, and the hash is non-zero driver-specific noise. Non-zero is not texels — that is a
-diagnostic read as an oracle. The control is **a known-content image read back through a copy**
-(`vkCopyImageToMemory`, `driver.rs:1578`) matching what was written. Absent that, the 41 stay
-pinned as "zero or unstable" and non-zero is not a pass.
+- `EMULATED_ON_THE_HOST` stops emulating, and both branches of the extension switch are pinned by
+  a test that asserts each host's answer rather than the one it is compiled on.
+- `export_query` answers fourcc, fds, strides, offsets and modifier from the descriptor; a partial
+  failure trims the fd count rather than reporting fds it did not produce.
+- `export_blob` reverses. `BlobStorage` needed no fd-holding variant after all: a blob already
+  holds a share of `Storage::Texture`, and on this host that share *is* the descriptor.
+- **force-LINEAR is gone on the exporting host.** It is not parity — on KosmicKrisp an OPTIMAL
+  image's texels are not in imported pages, so the minting host must still force it. Here the
+  driver keeps its own storage and tiling costs nothing, so the tiling check is not carried across.
+- Fence export is `VK_KHR_external_fence_fd`, served through `vkGetFenceFdKHR`. The C ABI's
+  sync-file trio stays refused, and its reason is corrected rather than removed: a
+  `client_fence_id` names a retirement, not a fence object.
+- `resource_read_iosurface` takes `&mut self`, because the exporting host's read is a GPU round
+  trip and needs a context switch. limina builds against it.
+- `get_fd_for_texture`/`2` stay refused, and the doc comment says why: `tex_id` is a GL name, so
+  only a VMM sharing our context could call them, and none does — QEMU's `virtio-gpu-gl` module
+  imports 28 of these entry points and neither of these two.
+
+**CPU access to a dma-buf is a favour, not a property.** Whether the fd maps is the driver's
+choice, and a tiled buffer's bytes are not pixels even if it does. Measured on this host: scanouts
+export with modifier `0x0100000000000001`, Y-tiling. So `Surface::readable()` is the question every
+CPU path asks first, a share with no host address is refused at the venus import rather than passed
+to a driver as a null pointer, and the harness read goes through the GPU instead.
+
+**What is not written yet: a venus client importing a classic resource.** The share it resolves
+to is now a descriptor rather than nothing, and importing one means a dma-buf handle type at
+`vkAllocateMemory` instead of a host pointer. Until that is written the import is refused by name.
+Measured against a live guest: vkmark runs its whole scene set through venus and scores, hitting
+this refusal four times without failing.
+
+**Gate.** The census turning non-zero is *not* a control: it hashes an allocation's pages, and with
+force-LINEAR dropped a tiled image's pages are non-zero driver-specific noise. The control is a
+known-content image read back through a copy (`vkCopyImageToMemory`) matching what was written, and
+until that exists the census entries stay pinned as "zero or unstable".
 
 ### Phase 6 — the GL scanout path (1–2 weeks)
 
-- `EGL_IOSURFACE_LIMINA` (0x3B9A, `egl.rs:170` — a forked-Mesa private extension) becomes standard
-  `EGL_EXT_image_dma_buf_import`; classic export becomes `EGL_MESA_image_dma_buf_export`. This
-  drops the dependency on our Mesa fork on this host.
-- `image_from_iosurface`/`image_from_iosurface_plane` (`egl.rs:463/473`) are the call sites; the
-  planar path maps onto multi-plane dma-buf import directly.
-- Confirm which winsys flag the Linux VMM passes; `egl.rs:96-99` binds GLES only, and the classic
-  caps probe is live (`caps.rs:304-322`) so it adapts.
+`EGL_IOSURFACE_LIMINA` (0x3B9A, a forked-Mesa private extension) is `EGL_EXT_image_dma_buf_import`
+here, and the classic export is `EGL_MESA_image_dma_buf_export` — so this host needs no Mesa fork.
+`image_from_iosurface`/`image_from_iosurface_plane` are the call sites, and the planar path maps
+onto multi-plane dma-buf import directly. Modifiers are sent only when the query produced one.
 
-**The lines this turns green are already named.** Six fixture lines are skipped on Linux for want
-of a surface to read — five scanout IOSurfaces in `vrend.score`, one in `blit.score` — and the
-replay reports them as skipped on every run, so the count is the gate's own progress bar. Two of
-them are the other half of `vrend-nodraw`'s positive control, which on Linux currently moves only
-its 19 offscreens. `blit.score`'s is the red/blue variant, and it is skipped twice over: nothing
-reads its destination, and `needs_redblue_swizzle` cannot fire either, because it is predicated on
-a BGRA resource that cannot be viewed and only a surface-backed one qualifies. Whether it comes
-back depends on whether a dma-buf-imported BGRA EGLImage supports a view here — which the import
-work will answer directly.
+**Gate:** the replayer's own scanout read, matching the fixture, and the skipped count reaching
+zero. **Met.** Forty scanout lines across six corpora are scored where all of them were compiled
+out, the skipped count is zero on nine corpora, and `vrend-nodraw`'s positive control now moves 23
+lines rather than 20 — the three scanout surfaces are the other half of it, as predicted.
 
-**Gate:** the replayer's own dma-buf read, hashed after a flush, matching the C leg, and the
-skipped count reaching zero. The read is the harness's, so both legs are scored by the same code
-and a difference is the renderer's.
+**The read is a round trip, not a mapping.** The exported buffer is tiled, so the replayer's
+`read_iosurface` imports the descriptor back as an EGL image, takes it as a texture's storage and
+reads it through a framebuffer. Reading the resource's texture would be cheaper, would give the
+same pixels, and would pass just as happily if the descriptor named the wrong memory — which is
+the whole point of the line. Armed both ways: moving the exported offset by a page changes the
+scanout hash and not the texture readback; moving the pitch by 64 makes the import fail outright.
+
+**What differs from the macOS fixtures is the GL driver.** Every line that moved is a large
+desktop surface, of the same kind the readback overlays already carry. Two of them were checked
+against this leg's own texture readback of the same resource — `blit` res=21 and `vrend` res=372 —
+and were byte-identical to it, which is what says the export path is not what moved them. The
+blank 1x1 and 48x48 surfaces match the macOS fixture exactly, on every corpus. The moved lines
+live in the per-driver overlays, which `make-overlay.py` now derives for `iosurface` lines as it
+always did for readbacks.
 
 ### Phase 7 — a guest, and a pixel (1 week; the only real gate)
 
