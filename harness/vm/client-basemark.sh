@@ -128,22 +128,29 @@ case "$probe" in
     exit 1 ;;
 esac
 
-echo "=== configuring: community mode and the graphics suite, in the same session"
-firefox --profile "$PROFILE" "$URL_MODE" > /dev/null 2>&1
-sleep 20
+# Configuring is per RUN, not per session. A session that has finished a run has consumed the
+# state `/run/` needs: handing it that URL again lands on `/`, the suite never starts, and the wait
+# below spends its whole 900 s on a browser sitting at the site's front page. Measured: run 2
+# reported "no test page appeared" and `now at: "/"` while the renderer counted 0 fences/s.
+configure() {
+  echo "=== configuring: community mode and the graphics suite, in the same session"
+  firefox --profile "$PROFILE" "$URL_MODE" > /dev/null 2>&1
+  sleep 20
 
-echo "--- reported configuration:"
-grep -o '"[ ]*[A-Za-z][A-Za-z ]*: [^"]*"' "$LOG" | sort -u
-suite_line=$(grep -o '"    Suite: [^"]*"' "$LOG" | tail -1)
-mode_line=$(grep -o '"    Mode: [^"]*"' "$LOG" | tail -1)
-case "$suite_line" in
-  *Graphics*) ;;
-  *) echo "REFUSING: the suite is ${suite_line:-unreported}, not Graphics" >&2; exit 1 ;;
-esac
-case "$mode_line" in
-  *community*) ;;
-  *) echo "REFUSING: mode is ${mode_line:-unreported}" >&2; exit 1 ;;
-esac
+  echo "--- reported configuration:"
+  grep -o '"[ ]*[A-Za-z][A-Za-z ]*: [^"]*"' "$LOG" | sort -u
+  # The newest line each, because the log now carries one configuration block per run.
+  suite_line=$(grep -o '"    Suite: [^"]*"' "$LOG" | tail -1)
+  mode_line=$(grep -o '"    Mode: [^"]*"' "$LOG" | tail -1)
+  case "$suite_line" in
+    *Graphics*) ;;
+    *) echo "REFUSING: the suite is ${suite_line:-unreported}, not Graphics" >&2; exit 1 ;;
+  esac
+  case "$mode_line" in
+    *community*) ;;
+    *) echo "REFUSING: mode is ${mode_line:-unreported}" >&2; exit 1 ;;
+  esac
+}
 
 # The suite is run TWICE and the second run is the one scored. Not a retry -- always, and that is
 # the point. The site's first /result/ of a fresh profile dies: measured twice, it ends on "Loading,
@@ -153,6 +160,7 @@ esac
 # and the first test in the suite is the one warmth moves most. Two legs compared across that are
 # not comparable. So both legs always pay for two runs and are read from the second.
 suite() {
+  configure
   echo "=== launching the suite in that same session (run $1)"
   firefox --profile "$PROFILE" "$URL_RUN" > /dev/null 2>&1
   sleep 12
@@ -187,8 +195,11 @@ return (t.tagName + " " + (t.innerText || t.value || "").trim()).slice(0, 60);
   # The page's own statement of what it is doing -- /run/tests/<n>/graphics_suite/<test_name>/
   # while a test runs. This is the aiming signal: a sample window labelled by the pathname it was
   # taken under is attributable to one test, which is the whole reason this suite needs driving.
-  python3 /tmp/marionette.py waitpath 'graphics_suite' 240 > /dev/null 2>&1 \
-    || echo "WARNING: no test page appeared; the suite may not have started" >&2
+  if ! python3 /tmp/marionette.py waitpath 'graphics_suite' 240 > /dev/null 2>&1; then
+    echo "WARNING: no test page in 240s; at $(python3 /tmp/marionette.py js \
+      'return document.location.pathname' 2>/dev/null) -- not waiting 900s for a result" >&2
+    return 1
+  fi
   echo "now at: $(python3 /tmp/marionette.py js 'return document.location.pathname' 2>/dev/null)"
 
   echo "=== suite $1 running; sample the host vmm now"
