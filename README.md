@@ -32,6 +32,26 @@ implementation and the pinned C one and compares scores; `harness/README.md` des
 layers and what each can and cannot catch. The C leg needs a built virglrenderer prefix, which
 `harness/replay/build.sh` takes from `VIRGL_PREFIX`.
 
+**The tests that open a display are not opted into, and on macOS they need the Mesa environment.**
+Nothing is `#[ignore]`d any more, so a plain `cargo test` runs them and they *fail* rather than
+skip where no display can be opened. On this platform that failure is `eglInitialize` returning
+`EGL_NOT_INITIALIZED`, which means zink found no Vulkan driver rather than that the host has no
+GPU. Export these and the whole suite passes:
+
+```sh
+MESA_PREFIX=/Volumes/mesa-cs/zink-kk-prefix
+export VK_DRIVER_FILES="$MESA_PREFIX/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json"
+export DYLD_LIBRARY_PATH="$MESA_PREFIX/vulkan-rpath"
+export DYLD_FALLBACK_LIBRARY_PATH="$MESA_PREFIX/lib:$EPOXY_PREFIX/lib:$(brew --prefix)/lib"
+export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink EGL_PLATFORM=surfaceless
+export LIBGL_DRIVERS_PATH="$MESA_PREFIX/lib"
+cargo test
+```
+
+**`DYLD_*` must be exported inside the script that runs `cargo`**, not on the command line that
+invokes it: `/bin/bash` is SIP-restricted and strips them at launch, so a caller's copy never
+reaches the test binaries. `harness/ctests/ctests.sh` carries the same recipe for the same reason.
+
 ## Licence
 
 MIT — see `LICENSES/MIT.txt` and `NOTICE`.
