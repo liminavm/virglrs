@@ -490,10 +490,11 @@ impl Untyped {
         // nothing left to hand back but an empty slot, which is what the handle already was.
         // No planes: this is a resource adopting a surface it was handed, and a composite
         // target is never one of those -- it mints its own, and its planes are cut from that.
-        let storage = match alloc_texture(gl, features, formats, &args, gl_target, image, None) {
-            Ok(s) => s,
-            Err(e) => return Err((Untyped { surface: None }, e)),
-        };
+        let storage =
+            match alloc_texture(gl, winsys, features, formats, &args, gl_target, image, None) {
+                Ok(s) => s,
+                Err(e) => return Err((Untyped { surface: None }, e)),
+            };
         // Whether an image backs the storage is read off the storage, not carried alongside it:
         // the adopt can fail at either step, and a second boolean tracking it would be a copy of
         // this fact that the retry above is exactly the thing to make disagree.
@@ -932,6 +933,14 @@ impl Planes {
 
 pub struct Texture {
     pub name: TextureName,
+    /// A descriptor of this texture's own storage, on a host that exports rather than mints.
+    ///
+    /// Separate from `image` because they are opposite directions, not two spellings of one
+    /// thing: `image` is storage this renderer minted that the texture *adopted*, and this is a
+    /// descriptor of storage the texture already had. Only one of them is ever `Some`, and which
+    /// one is a property of the host rather than of the resource -- so folding them into one
+    /// field would need a flag saying which way round it is.
+    pub exported: Option<Arc<dyn Held>>,
     /// The GL target -- not the pipe target: on GLES a 1D texture is a 2D one, a 1D array a
     /// 2D array, and a RECT a 2D.
     pub target: GLenum,
@@ -1182,9 +1191,12 @@ impl Resource {
     /// and the C does not.
     pub fn surface(&self) -> Option<&Surface> {
         match &self.storage {
-            Storage::Texture(t) => {
-                t.image.as_ref().map(|i| i.surface()).or_else(|| Some(t.planes.as_ref()?.surface()))
-            }
+            Storage::Texture(t) => t
+                .image
+                .as_ref()
+                .map(|i| i.surface())
+                .or_else(|| t.exported.as_ref().map(|h| h.surface()))
+                .or_else(|| Some(t.planes.as_ref()?.surface())),
             _ => None,
         }
     }
@@ -1280,7 +1292,7 @@ impl Resource {
                     return Err(Refusal::NoPlanarStorage);
                 }
                 let image = mint_surface(winsys, features, budget, &args);
-                alloc_texture(gl, features, formats, &args, gl_target, image, planes)?
+                alloc_texture(gl, winsys, features, formats, &args, gl_target, image, planes)?
             }
         };
         Ok(Resource {
@@ -1382,6 +1394,7 @@ impl Texture {
             name,
             target: 0,
             immutable: true,
+            exported: None,
             image: None,
             planes: None,
             views: Mutex::default(),
@@ -2080,8 +2093,14 @@ fn zero_texture(gl: &Gl, formats: &Table, a: &Args, storage: &Storage) {
 }
 
 /// `vrend_resource_alloc_texture`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every one is a fact about the texture being made, and grouping them into a struct \
+              would only move the same list one line up"
+)]
 fn alloc_texture(
     gl: &Gl,
+    winsys: &Winsys,
     features: &Features,
     formats: &Table,
     a: &Args,
@@ -2138,6 +2157,9 @@ fn alloc_texture(
             name,
             target,
             immutable,
+            // Storage this renderer minted and the texture adopted; there is nothing to export a
+            // descriptor of, because the surface *is* the storage and is already held.
+            exported: None,
             image: Some(image),
             planes,
             views: Mutex::default(),
@@ -2232,14 +2254,75 @@ fn alloc_texture(
     // meaning one thing whichever branch above created the texture.
     let immutable = gl.get_tex_parameter_i(target, GL_TEXTURE_IMMUTABLE_FORMAT) == GL_TRUE as GLint;
     gl.bind_texture(target, None);
+    // The texture has storage now, which is the earliest a descriptor of it can describe
+    // anything -- and the latest, because the resource is about to be handed out.
+    let exported = export_surface(winsys, a, name);
     Ok(Storage::Texture(Arc::new(Texture {
         name,
         target,
         immutable,
+        exported,
         image: None,
         planes,
         views: Mutex::default(),
     })))
+}
+
+/// Nothing to export: this host's presentable storage is minted, not described -- see
+/// [`mint_surface`], which runs before the texture instead of after it.
+#[cfg(target_os = "macos")]
+fn export_surface(_winsys: &Winsys, _a: &Args, _name: TextureName) -> Option<Arc<dyn Held>> {
+    None
+}
+
+/// A descriptor of a texture's own storage, for the resources a compositor will want to import.
+///
+/// The gate is `mint_surface`'s, and deliberately so: the same binds, the same shape, the same
+/// four formats. What a resource is *for* does not change with the host, and a resource that
+/// would have been given a surface on one host is the one that should carry a descriptor on the
+/// other -- otherwise the two hosts disagree about which resources are presentable, and every
+/// score that reads a scanout diverges for a reason that is not the renderer's arithmetic.
+///
+/// No charge is taken. The bytes are the texture's, which GL already allocated and this renderer
+/// already accounts for; a descriptor of them is a second name for memory that is counted once.
+/// That is the opposite of the minting host, where the surface *is* new storage and is charged
+/// for at the moment it is made.
+///
+/// A driver that will not export leaves the resource with ordinary GL storage and the CPU
+/// readback path, exactly as a refused mint does. It is said once per process: the answer is a
+/// property of the driver and does not change, and a compositor creates resources by the hundred.
+#[cfg(not(target_os = "macos"))]
+fn export_surface(winsys: &Winsys, a: &Args, name: TextureName) -> Option<Arc<dyn Held>> {
+    use crate::surface::PixelFormat;
+
+    if !a.bind.has(Bind::SCANOUT) && !a.bind.has(Bind::SHARED) {
+        return None;
+    }
+    if a.target != TextureTarget::Texture2d || a.last_level != 0 || a.nr_samples > 1 || a.depth != 1
+    {
+        return None;
+    }
+    let format = match a.format.name() {
+        "B8G8R8A8_UNORM" | "B8G8R8X8_UNORM" => PixelFormat::Bgra,
+        "R8G8B8A8_UNORM" | "R8G8B8X8_UNORM" => PixelFormat::Rgba,
+        _ => return None,
+    };
+    match winsys.export_texture(name, a.width, a.height, format) {
+        Ok(surface) => Some(Arc::new(surface) as Arc<dyn Held>),
+        Err(e) => {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[virglrs] vrend: this driver exports no dma-buf for a {}x{} {} resource \
+                     ({e}); scanouts are read back through the CPU instead",
+                    a.width,
+                    a.height,
+                    a.format.name()
+                );
+            }
+            None
+        }
+    }
 }
 
 #[cfg(test)]
