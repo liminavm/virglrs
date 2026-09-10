@@ -317,10 +317,42 @@ nothing, so a window sampled there should show the gpu worker at ~0% renderer wo
 is not evidence the aiming worked, and this rig has already produced a full, plausible profile of a
 benchmark that was not running.
 
-**What the aiming is worth**, from the first cycle that had it: Geometry Stress is 43.6%
-`st_glFinish` and 23.1% `resource_sync_iosurface`; Canvas is 35.6% `transfer::write` and 30.1%
-`st_glFinish`; SVG barely reaches the renderer at all (4.3%). Those are three different targets,
-and a whole-suite profile averages them into one misleading number.
+**Aiming means the WHOLE window sat inside one test.** The tests run about 11 s each, so a 10 s
+window labelled only at its start straddles a boundary — and a straddled window attributes one
+test's work to another: a "Geometry Stress" window carried 21.7% `transfer::write`, which is
+Canvas's signature, and the same window put `resource_sync_iosurface` at 26% where a clean one puts
+it at 55%. Read the pathname **before and after** each window and discard the window when the two
+disagree; 5 s windows keep about half. Start on the first `graphics_suite` path rather than
+whenever the host is ready, or the first three tests are never sampled at all.
+
+**Symbols in a `sample` call graph are mangled, and the count comes after the tree prefix.** A
+needle like `transfer::write` matches nothing (the frame reads `..5vrend8transfer5write`), and a
+count regex anchored at the start of the line matches nothing either, because the line begins
+`+ ! : | 1427 `. Both failures read as a clean zero for every needle at once, which is why the
+aggregation asserts a **positive control** — a frame that must always be there, `Worker::service`.
+A sweep where the control is also zero is a broken sweep, not a fixed renderer.
+
+**What the aiming is worth**: the tests are four different targets, and a whole-suite profile
+averages them into one misleading number. Percentages are of the `gpu worker` thread's own subtree,
+from clean windows, with the classic fence's `finish_all` removed (it is 0.0% in every window):
+
+| window | top of the worker's subtree |
+|---|---|
+| WebGL 1.0.2 | 36.1% `take_fence`, and **all** of it `tc_flush`; no `glFinish` at all |
+| Draw-call Stress | 33-40% `take_fence` (31-38% `tc_flush`), 5-25% `resource_sync_iosurface` |
+| Geometry Stress | 55% `resource_sync_iosurface`, 10% `take_fence` |
+| Canvas | 42% `transfer::write`, 52% `Context::submit`, 1.3% `take_fence` |
+| SVG | barely reaches the renderer at all (2-5%) |
+| result page | 0.1% — the negative control |
+
+So there is no single hotspot: WebGL 1.0.2 and Draw-call Stress are the fence's `glFenceSync`
+draining mesa's threaded-context queue, Geometry Stress is the present-path `glFinish`, and Canvas
+is texture upload with no fence cost worth naming.
+
+**Two runs, and read them as two.** Per-test run-to-run spread on this rig reaches 11% (WebGL 2.0
+measured 4409 then 3914), so no single-run single-digit difference is a result. What a pair does
+settle is agreement: Canvas and Draw-call Stress came back within 0.2% of each other across two
+runs, which makes a difference against a third run worth believing.
 
 ## Client corpora, and why the C cannot score them
 
