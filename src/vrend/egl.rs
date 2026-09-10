@@ -292,6 +292,10 @@ const EGL_IOSURFACE_LIMINA: EGLenum = 0x3B9A;
 /// Writing them out is how plane 2's pitch ends up under plane 1's id.
 #[cfg(not(target_os = "macos"))]
 const EGL_LINUX_DMA_BUF_EXT: EGLenum = 0x3270;
+/// `EGL_GL_TEXTURE_2D_KHR`: the `eglCreateImageKHR` target that takes a GL texture name as its
+/// client buffer, which is how a texture this renderer already made becomes exportable.
+#[cfg(not(target_os = "macos"))]
+const EGL_GL_TEXTURE_2D_KHR: EGLenum = 0x30B1;
 #[cfg(not(target_os = "macos"))]
 const EGL_LINUX_DRM_FOURCC_EXT: EGLint = 0x3271;
 #[cfg(not(target_os = "macos"))]
@@ -687,6 +691,175 @@ impl Winsys {
         );
         // `EGL_NO_CONTEXT` with no surfaces is the documented way to release.
         self.shared.make_current(proc::EGL_NO_CONTEXT)
+    }
+
+    /// Export a texture this renderer made as a dma-buf, so it can be presented without a copy.
+    ///
+    /// The classic path's half of the export direction, and the mirror of `mint_surface`'s on the
+    /// minting host. There the surface is made first and the texture adopts it; here the texture
+    /// is GL's own, made in the ordinary way, and a descriptor of it is taken afterwards. Which
+    /// means this must run *after* the texture has storage -- an image of a texture with none
+    /// describes nothing.
+    ///
+    /// The EGL image is a means and not a result: it exists only to name the texture to the
+    /// export call, and is destroyed here. What survives is the descriptor, which the kernel
+    /// keeps alive independently of any EGL object.
+    ///
+    /// **The context matters and is EGL's, not this renderer's.** A `EGL_GL_TEXTURE_2D_KHR`
+    /// client buffer is a name in a share group, so the image must be made against the context
+    /// that owns it -- and under an embedder the token this renderer holds is not an `EGLContext`
+    /// at all. `eglGetCurrentContext` reads EGL's own binding for this thread, which is true
+    /// whoever made it current.
+    #[cfg(not(target_os = "macos"))]
+    pub fn export_texture(
+        &self,
+        name: crate::vrend::gl::TextureName,
+        width: u32,
+        height: u32,
+        format: crate::surface::PixelFormat,
+    ) -> Result<crate::surface::Surface, EglError> {
+        use std::os::fd::FromRawFd;
+
+        let egl = &self.shared.egl;
+        let query = egl
+            .try_eglExportDMABUFImageQueryMESA()
+            .ok_or_else(|| self.shared.error("eglExportDMABUFImageQueryMESA"))?;
+        let export = egl
+            .try_eglExportDMABUFImageMESA()
+            .ok_or_else(|| self.shared.error("eglExportDMABUFImageMESA"))?;
+
+        // SAFETY: `eglGetCurrentContext` takes nothing and is defined on any thread.
+        let ctx = unsafe { egl.eglGetCurrentContext()() };
+        if ctx == proc::EGL_NO_CONTEXT {
+            return Err(EglError { call: "export_texture with no context current", code: 0 });
+        }
+
+        // SAFETY: the display is initialised, `ctx` is the context EGL says is current on this
+        // thread, and the client buffer is a texture name in that context's share group -- the
+        // texture this call was given, which its caller has just finished giving storage to.
+        // `NULL` is the documented empty attribute list.
+        let image = unsafe {
+            egl.eglCreateImageKHR()(
+                self.shared.display,
+                ctx,
+                EGL_GL_TEXTURE_2D_KHR,
+                name.raw() as usize as EGLClientBuffer,
+                core::ptr::null(),
+            )
+        };
+        if image.is_null() {
+            return Err(self.shared.error("eglCreateImageKHR(EGL_GL_TEXTURE_2D_KHR)"));
+        }
+        // From here every path must destroy the image, so the export is done in a closure and the
+        // destroy follows it once. An early return would leak an EGL object per resource, which
+        // is invisible until a compositor has run for an hour.
+        let got = self.export_image(query, export, image, width, height, format);
+        // SAFETY: an image this call just made on this display, destroyed once.
+        unsafe { egl.eglDestroyImageKHR()(self.shared.display, image) };
+
+        let (fd, layout) = got?;
+        // SAFETY: a descriptor the export call just produced and nothing else holds, so this is
+        // its only owner and the drop is its only close.
+        Ok(crate::surface::Surface::exported(
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+            layout,
+        ))
+    }
+
+    /// Ask an EGL image what it is and take the descriptor. Split out so its caller can destroy
+    /// the image on every path, including the ones that refuse.
+    #[cfg(not(target_os = "macos"))]
+    fn export_image(
+        &self,
+        query: unsafe extern "C" fn(
+            EGLDisplay,
+            EGLImageKHR,
+            *mut core::ffi::c_int,
+            *mut core::ffi::c_int,
+            *mut EGLuint64KHR,
+        ) -> EGLBoolean,
+        export: unsafe extern "C" fn(
+            EGLDisplay,
+            EGLImageKHR,
+            *mut core::ffi::c_int,
+            *mut EGLint,
+            *mut EGLint,
+        ) -> EGLBoolean,
+        image: EGLImageKHR,
+        width: u32,
+        height: u32,
+        format: crate::surface::PixelFormat,
+    ) -> Result<(core::ffi::c_int, crate::surface::Layout), EglError> {
+        use crate::surface::{DRM_FORMAT_MOD_INVALID, Layout, MAX_PLANES, PlaneLayout};
+
+        let (mut fourcc, mut planes, mut modifier) = (0, 0, 0u64);
+        // SAFETY: an image on this display, and three locals.
+        let ok =
+            unsafe { query(self.shared.display, image, &mut fourcc, &mut planes, &mut modifier) };
+        if ok == 0 {
+            return Err(self.shared.error("eglExportDMABUFImageQueryMESA"));
+        }
+        // One descriptor is what a surface holds, so a multi-plane export is refused rather than
+        // half-taken: taking plane 0 and dropping the rest is a buffer that reads as a picture
+        // and is missing its chroma, which displays and displays wrong.
+        if planes != 1 {
+            return Err(EglError { call: "a multi-plane dma-buf export", code: planes });
+        }
+
+        let (mut fds, mut strides, mut offsets) =
+            ([-1; MAX_PLANES], [0; MAX_PLANES], [0; MAX_PLANES]);
+        // SAFETY: an image on this display, and three arrays of at least `planes` entries -- the
+        // query above reported one, and `MAX_PLANES` is four.
+        let ok = unsafe {
+            export(
+                self.shared.display,
+                image,
+                fds.as_mut_ptr(),
+                strides.as_mut_ptr(),
+                offsets.as_mut_ptr(),
+            )
+        };
+        if ok == 0 {
+            return Err(self.shared.error("eglExportDMABUFImageMESA"));
+        }
+        // A driver that reported success and handed back nothing has exported nothing, and a
+        // surface over `-1` would fail at every use with no memory of where it came from.
+        if fds[0] < 0 {
+            return Err(EglError { call: "eglExportDMABUFImageMESA gave no descriptor", code: 0 });
+        }
+        // The pitch is the driver's and is what everything downstream reads rows by; zero is not
+        // a layout, and a surface built on it shears every row onto the one before.
+        let pitch = u32::try_from(strides[0]).ok().filter(|p| *p != 0);
+        let Some(pitch) = pitch else {
+            use std::os::fd::FromRawFd;
+            // SAFETY: a descriptor the export just produced and nothing else holds, so wrapping
+            // it makes this its only owner -- and dropping it is the close this path owes.
+            drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) });
+            return Err(EglError {
+                call: "eglExportDMABUFImageMESA gave no row pitch",
+                code: strides[0],
+            });
+        };
+        // The FourCC the driver reports wins over the one this side would have named. They should
+        // agree; where they do not, the driver is describing the bytes it actually wrote, and the
+        // importer must be told those. `format` is only the fallback for a driver reporting none.
+        let fourcc = if fourcc != 0 { fourcc as u32 } else { format.fourcc() };
+        let mut plane_layout = [PlaneLayout { offset: 0, pitch: 0 }; MAX_PLANES];
+        plane_layout[0] = PlaneLayout { offset: offsets[0].max(0) as u64, pitch };
+        Ok((
+            fds[0],
+            Layout {
+                width,
+                height,
+                fourcc,
+                // Zero is a real modifier (`LINEAR`), so it is passed through as reported. Only a
+                // query that failed leaves `INVALID`, and that is caught above.
+                modifier: if modifier == u64::MAX { DRM_FORMAT_MOD_INVALID } else { modifier },
+                planes: plane_layout,
+                plane_count: 1,
+                alloc_size: u64::from(pitch) * u64::from(height) + offsets[0].max(0) as u64,
+            },
+        ))
     }
 
     /// An EGL image whose pixels are `surface`'s, for a texture to take as its storage.
