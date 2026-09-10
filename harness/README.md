@@ -943,7 +943,7 @@ scored at END of stream because a capture never unrefs its scanout: the opposite
 from the colour offscreens, each read at the last moment it is both complete and still alive.
 
 **On the exporting host that read is a round trip, and deliberately so.** An Intel scanout exports
-Y-tiled, so its bytes in row order are not the picture and no mapping could read it; the renderer
+X-tiled, so its bytes in row order are not the picture and no mapping could read it; the renderer
 imports its own descriptor back as an EGL image and reads it through a framebuffer, letting the
 GPU detile. Reading the resource's texture instead would be cheaper and would give the same
 pixels — and would pass just as happily if the descriptor named the wrong memory, which is the

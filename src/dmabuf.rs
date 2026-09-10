@@ -248,8 +248,8 @@ impl Surface {
     /// **Only a linear buffer is.** A tiled one is a perfectly good dma-buf -- an importer hands
     /// it to a GPU, which knows the modifier and detiles as it samples -- and its bytes read in
     /// row order are not the picture. Measured on this host: an Intel scanout exports with
-    /// modifier `0x0100000000000001`, which is Y-tiling, so this is the common case and not an
-    /// exotic one.
+    /// modifier `0x0100000000000001` (`I915_FORMAT_MOD_X_TILED`), so this is the common case and
+    /// not an exotic one.
     ///
     /// The distinction matters because the caller of a CPU read has a slow path and needs to be
     /// told to take it. A read that returned tiled bytes would be a picture-shaped answer that is
@@ -677,8 +677,8 @@ mod tests {
     /// A tiled buffer is a good descriptor and a bad picture, and every CPU path says so.
     ///
     /// The case this exists for was measured, not imagined: an Intel scanout on this host exports
-    /// with modifier `0x0100000000000001`, which is Y-tiling. The descriptor is exactly what a
-    /// compositor wants -- it hands it to a GPU that knows the modifier -- and the same bytes
+    /// with modifier `0x0100000000000001` (`I915_FORMAT_MOD_X_TILED`). The descriptor is exactly
+    /// what a compositor wants -- it hands it to a GPU that knows the modifier -- and the same bytes
     /// read in row order are not the frame. Before this, they were read, hashed, and compared
     /// against the reference leg, where the difference would have looked like a renderer bug.
     ///
@@ -686,7 +686,7 @@ mod tests {
     /// path to fall back to and needs to be sent to it.
     #[test]
     fn a_tiled_buffer_refuses_every_cpu_path() {
-        const Y_TILED: u64 = 0x0100_0000_0000_0001;
+        const X_TILED: u64 = 0x0100_0000_0000_0001;
         let size = 64 * 16;
         let tiled = Surface::exported(
             memfd(size),
@@ -694,7 +694,7 @@ mod tests {
                 width: 16,
                 height: 16,
                 fourcc: PixelFormat::Bgra.fourcc(),
-                modifier: Y_TILED,
+                modifier: X_TILED,
                 planes: [PlaneLayout { offset: 0, pitch: 64 }; MAX_PLANES],
                 plane_count: 1,
                 alloc_size: size as u64,
@@ -711,7 +711,7 @@ mod tests {
 
         // The descriptor itself is untouched by any of that: exporting it is the whole point.
         let (fd, layout) = tiled.export().expect("a tiled buffer still exports");
-        assert_eq!(layout.modifier, Y_TILED, "and the importer is told how to read it");
+        assert_eq!(layout.modifier, X_TILED, "and the importer is told how to read it");
         drop(fd);
 
         // The same surface laid out linearly reads back, so the refusal is about the modifier and
