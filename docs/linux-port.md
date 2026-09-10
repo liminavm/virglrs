@@ -47,27 +47,33 @@ None may be carried across.
 
 ## Where the ABI stands
 
-- `virgl_renderer_resource_export_blob` (`ffi.rs:801`) is not a stub. It is an unconditional
-  `EINVAL` whose doc comment calls the refusal the finished answer, because rutabaga calls it
-  unconditionally and reads failure as "no handle". On Linux this is a **design reversal**, and
-  `BlobStorage` (`renderer.rs:283-296`) has no variant that can hold an fd — a type change, not a
-  fill-in.
-- The `todo_phase!("P3: dmabuf export")` sites are `virgl_renderer_get_fd_for_texture` and
-  `get_fd_for_texture2` (`ffi.rs:1200-1211`) — the classic GL-texture export.
-- `export_query` (`ffi.rs:364`) answers the header's "not exportable" for everything;
-  `export_fence`/`export_signalled_fence` (`ffi.rs:1283/1288`) are stubs.
-- `driver.rs:96` `EMULATED_ON_THE_HOST` advertises `VK_KHR_external_memory_fd` and
-  `VK_EXT_external_memory_dma_buf` to the guest and strips them from the device, because the
-  driver has neither. The switch at `driver.rs:775` is already conditioned on
-  `VK_EXT_external_memory_metal && !VK_KHR_external_memory_fd`, so on Linux it turns itself off.
-  Pin both branches in a test rather than assuming it.
+- `virgl_renderer_resource_export_blob` exports for real: the blob's share of `Storage::Texture`
+  *is* the descriptor on this host, so `BlobStorage` needed no fd-holding variant after all. It
+  answers `EINVAL` where there is no descriptor to hand back, which is every host that mints
+  rather than exports.
+- `execute`'s `EXPORT_QUERY` answers fourcc, modifier, per-plane stride and offset, and one
+  duplicated fd per plane, from that same descriptor.
+- `virgl_renderer_get_fd_for_texture`/`2` stay refused. Not for want of the machinery: `tex_id` is
+  a GL name, so only a VMM sharing this renderer's context could call them, and none does —
+  QEMU's `virtio-gpu-gl` module imports 28 of these entry points and neither of these two.
+- The fence trio (`export_fence`, `export_signalled_fence`, `attach_fence`) stays refused, and its
+  reason is about the ABI's shape rather than the host's: a `client_fence_id` names a retirement,
+  not a fence object. Venus exports fence fds through `VK_KHR_external_fence_fd` where a fence
+  object exists.
+- `driver.rs`'s `EMULATED_ON_THE_HOST` advertised `VK_KHR_external_memory_fd` and
+  `VK_EXT_external_memory_dma_buf` to the guest and stripped them from the device, because
+  KosmicKrisp has neither. The switch is conditioned on
+  `VK_EXT_external_memory_metal && !VK_KHR_external_memory_fd`, so it turns itself off here, and
+  both branches are pinned by a test that asserts each host's answer rather than the one it is
+  compiled on.
 
 ## Out of scope
 
 **limina on Linux** — the Mach-port id transport is a VMM port. The boundary is not where it first
 appears, though: `resource_iosurface_id`, `resource_read_iosurface` and `resource_sync_iosurface`
-are `Renderer` methods (`renderer.rs:1501-1574`), i.e. the **Rust API**, not only `ffi.rs`. What
-those three become on Linux is in scope, and phase 5 decides it.
+are `Renderer` methods, i.e. the **Rust API**, not only `ffi.rs`. All three stayed and all three
+answer on both hosts; the only signature that moved is `resource_read_iosurface`, which took
+`&mut self` because the exporting host's read is a GPU round trip. Their *names* are booked below.
 
 **A VA-API backend.** Phase 1 says why cfg'ing the video directory out is nonetheless the wrong
 move.
@@ -338,6 +344,44 @@ failure. Say which in the commit.
 
 libkrun first, crosvm as a follow-on. The host's distro, arch and Mesa version decide how painful
 each is.
+
+## Booked for after the port
+
+Neither is on the path to a working Linux renderer, and doing them mid-port is churn against a
+tree still moving.
+
+**The `iosurface` names.** They no longer say what is Apple's and what is everyone's, and the two
+halves want opposite treatment.
+
+The C symbols are the limina fork's own additions -- upstream virglrenderer exports none of them
+(47 `virgl_renderer_*` symbols, zero matching `iosurface`), and QEMU's `virtio-gpu-gl` module
+imports none of them either. Their entire caller set is this tree's two replayers, and
+`virgl_renderer_republish_iosurface` has no caller anywhere while returning `EINVAL` on both
+hosts. So the C spelling is a private debug ABI: rename it only if the fork is being touched for
+another reason, and delete `republish` outright. The `iosurface res=…` score-line key is separate
+again, and costs about a thousand recorded fixture lines across both hosts to move.
+
+The **Rust API** is the half that misleads, because it is limina's real presentation path rather
+than a debug surface. `resource_read_iosurface` and `resource_sync_iosurface` are generic in
+substance and want neutral names. `resource_iosurface_id` is not a rename: on Apple the value is
+an `IOSurfaceGetID`, a system-global handle another process can resolve, and here it is a
+process-local counter that names nothing outside this renderer. Every generic call site uses it as
+a boolean -- both replayers test it for non-zero -- and the transportable handle already exists as
+`resource_export`. So the doc has to say which of the two it is handing back, whatever it is
+called. The `image_*_iosurface` winsys entry points are internal and rename freely.
+
+`Features::adopts_iosurfaces` goes with them but is a semantics fix, not a rename: it fuses "can a
+texture adopt a `Held`'s storage as an EGL image", true on both hosts and relied on by the scanout
+round trip, with "does this host mint surfaces to adopt", which is macOS-only and already said by
+the `#[cfg]` on `mint_surface`. No live bug -- its call sites are macOS-only or unreachable off it
+-- but the predicate denies something this host does.
+
+**Multi-plane dma-buf export.** `Winsys::export_image` refuses `planes != 1`, which is what a
+compressed modifier carrying a CCS or DCC auxiliary plane reports for a single colour buffer. This
+host's ICL exports plain `X_TILED` with one plane, so the refusal has not been observed here.
+`Layout` already carries `MAX_PLANES` entries and the import loop already walks them; the blocker
+is that `image_of_iosurface` passes one fd for every plane, which holds for an aux plane in one
+allocation and not in general.
 
 ## Missing infrastructure
 

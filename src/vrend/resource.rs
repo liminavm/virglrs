@@ -1843,18 +1843,13 @@ fn mint_planes(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args)
     Some(Planes { luma, chroma, planar, conversion: Mutex::default(), textures: Mutex::default() })
 }
 
-/// `vrend_resource_iosurface_init`: the IOSurface a resource's storage is, when it is one.
+/// Nothing, on a host that mints nothing.
 ///
-/// A scanout is the compositor's framebuffer; a shared buffer is every buffer gbm hands out,
-/// which is what a Vulkan compositor imports into venus for each client window. Both are minted
-/// as surfaces so that the first is presented from without a copy and the second can be
-/// imported at all -- there is no dma-buf to export on this host.
-///
-/// Only a single-level, single-sample 2D texture in a 32-bit format IOSurface and Metal both
-/// name. Anything else keeps ordinary GL storage and the CPU readback path, as does a surface
-/// the system or the driver refuses: the fallback is never removed, only reported.
-/// The resource keeps ordinary GL storage, which is what `Features::adopts_iosurfaces` already
-/// reports here and what the overwhelming majority of classic resources take on every host.
+/// The storage a scanout is presented from belongs to the driver here, and what this renderer
+/// gets is a descriptor of it -- see [`export_surface`], which is the same question answered the
+/// other way round. A resource therefore takes ordinary GL storage and may also carry an export
+/// of it; those are not alternatives, and `Texture` holds them in separate fields for that
+/// reason.
 #[cfg(not(target_os = "macos"))]
 fn mint_surface(
     _winsys: &Winsys,
@@ -1865,6 +1860,16 @@ fn mint_surface(
     None
 }
 
+/// `vrend_resource_iosurface_init`: the IOSurface a resource's storage is, when it is one.
+///
+/// A scanout is the compositor's framebuffer; a shared buffer is every buffer gbm hands out,
+/// which is what a Vulkan compositor imports into venus for each client window. Both are minted
+/// as surfaces so that the first is presented from without a copy and the second can be imported
+/// at all -- KosmicKrisp imports storage and cannot produce it, so there is nothing to export.
+///
+/// Only a single-level, single-sample 2D texture in a 32-bit format IOSurface and Metal both
+/// name. Anything else keeps ordinary GL storage and the CPU readback path, as does a surface
+/// the system or the driver refuses: the fallback is never removed, only reported.
 #[cfg(target_os = "macos")]
 fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args) -> Option<Image> {
     let scanout = a.bind.has(Bind::SCANOUT);
