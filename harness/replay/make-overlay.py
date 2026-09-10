@@ -19,14 +19,20 @@
 # refused, and the number is there to be looked at.
 import re, sys
 
-LINE = re.compile(r'^res=(\d+) (\S+) hash=(\S+) ink=(\d+)/(\d+)$')
+# A readback line, of either kind. `iosurface` lines are scored the same way and differ between
+# drivers for the same reason -- they are the display surface's pixels, read through whatever the
+# host presents from -- so they are overlayable too. Keyed by the whole prefix and not by the
+# handle, because a corpus scores `res=21` and `iosurface res=21` as two different facts about
+# one resource, and an overlay that conflated them would pin one over the other.
+LINE = re.compile(r'^(iosurface )?res=(\d+) (\S+)(?: sync=\d+)? hash=(\S+) ink=(\d+)/(\d+)$')
 
 def scored(path):
     out = {}
     for line in open(path):
         m = LINE.match(line.rstrip('\n'))
         if m:
-            out[m.group(1)] = (m.group(2), m.group(3), int(m.group(4)), int(m.group(5)), line.rstrip('\n'))
+            key = (m.group(1) or '') + 'res=' + m.group(2)
+            out[key] = (m.group(3), m.group(4), int(m.group(5)), int(m.group(6)), line.rstrip('\n'))
     return out
 
 def main():
@@ -45,19 +51,19 @@ def main():
 
     want, have = scored(fixture), scored(run)
     lines, moved = [], []
-    for handle, w in want.items():
-        h = have.get(handle)
+    for key, w in want.items():
+        h = have.get(key)
         if h is None:
-            sys.exit(f'{run}: res={handle} is in the fixture and not in the run -- this run does '
+            sys.exit(f'{run}: {key} is in the fixture and not in the run -- this run does '
                      f'not score the same corpus, and an overlay from it would pin the wrong thing')
         if h[:4] == w[:4]:
             continue
         if h[0] != w[0]:
-            sys.exit(f'res={handle}: the fixture says {w[0]} and the run says {h[0]}. An extent is '
+            sys.exit(f'{key}: the fixture says {w[0]} and the run says {h[0]}. An extent is '
                      f'not the driver\'s arithmetic; look at it before pinning anything')
         lines.append(h[4])
         if h[2] != w[2]:
-            moved.append(f'res={handle} {w[0]}: ink {w[2]} -> {h[2]} ({h[2] - w[2]:+d})')
+            moved.append(f'{key} {w[0]}: ink {w[2]} -> {h[2]} ({h[2] - w[2]:+d})')
 
     with open(out, 'w') as f:
         f.write(f'# The lines of {fixture.rsplit("/", 1)[-1]} that this GL driver reads\n'

@@ -81,9 +81,24 @@
 #define HAVE_LIMINA_EXT 1
 #endif
 
-/* The IOSurface leg needs both the platform and the extensions that read it. Two conditions and
- * not one: the surface is an Apple object, and the three calls that reach it are ours. */
-#if defined(__APPLE__) && HAVE_LIMINA_EXT
+#ifndef HAVE_SCANOUT_EXT
+#define HAVE_SCANOUT_EXT 1
+#endif
+
+/* Reading a scanout needs only the calls, which are ours on every host: `sync_iosurface` and
+ * `read_iosurface` are limina extensions, and what they read is whatever the host presents from
+ * -- an IOSurface where storage is minted, an exported dma-buf where it is not.
+ *
+ * Looking a surface up BY ID needs the platform as well, because only Apple has an object to look
+ * up. That is the planar path and nothing else, so the two conditions are separate: making them
+ * one is what compiled the whole scanout leg out on a host that can read it perfectly well. */
+#if HAVE_SCANOUT_EXT
+#define HAVE_SCANOUT_READ 1
+#else
+#define HAVE_SCANOUT_READ 0
+#endif
+
+#if defined(__APPLE__) && HAVE_SCANOUT_EXT
 #define HAVE_IOSURFACE 1
 #else
 #define HAVE_IOSURFACE 0
@@ -245,7 +260,7 @@ static uint32_t made_total, failed_total;
  * mirror image of why the colour offscreens are scored AT their unref -- each is read at the last
  * moment it is both complete and still alive, and for these two kinds of resource that moment is
  * at opposite ends of the run. */
-#if HAVE_IOSURFACE
+#if HAVE_SCANOUT_READ
 static struct { uint32_t handle, w, h; } *iosurf_res;
 static uint32_t iosurf_n, iosurf_cap;
 
@@ -261,7 +276,7 @@ static void iosurf_remember(uint32_t handle, uint32_t w, uint32_t h)
    iosurf_res[iosurf_n].h = h ? h : 1;
    iosurf_n++;
 }
-#endif /* HAVE_IOSURFACE */
+#endif /* HAVE_SCANOUT_READ */
 static int want_ctx = -1;
 /* The contexts to replay. One is the common case; more than one exists because a workload can
  * split across contexts that only make sense together -- a video player draws in one and decodes
@@ -395,8 +410,8 @@ static size_t line_key(const char *line, size_t len)
 
 static size_t line_len(const char *p) { const char *e = strchr(p, '\n'); return e ? (size_t)(e - p) : strlen(p); }
 
-#if !HAVE_IOSURFACE
-/* Whether a line is one only a leg with the IOSurface reads can produce. */
+#if !HAVE_SCANOUT_READ
+/* Whether a line is one only a leg that can read a scanout can produce. */
 static bool iosurface_line(const char *p, size_t n)
 {
    return n >= 10 && !memcmp(p, "iosurface ", 10);
@@ -411,7 +426,7 @@ static bool iosurface_line(const char *p, size_t n)
 static char *for_comparison(const char *src, unsigned *skipped)
 {
    *skipped = 0;
-#if HAVE_IOSURFACE
+#if HAVE_SCANOUT_READ
    return strdup(src);
 #else
    char *out = malloc(strlen(src) + 32);
@@ -549,8 +564,8 @@ static int copy_src_of_next_cmd(const uint8_t *blob, size_t flen, size_t p,
    return 0;
 }
 
-#if HAVE_IOSURFACE
-/* The IOSurface leg. The readback above reads a resource's TEXTURE; this reads the display
+#if HAVE_SCANOUT_READ
+/* The scanout leg. The readback above reads a resource's TEXTURE; this reads the display
  * surface that texture renders into, which is what the present actually shows. On this stack they
  * are not the same path -- the scanout is an EGL_IOSURFACE_LIMINA EGLImage, so the surface IS the
  * framebuffer's storage -- and a port can get one right while getting the other wrong. For venus
@@ -579,6 +594,7 @@ static int copy_src_of_next_cmd(const uint8_t *blob, size_t flen, size_t p,
  *
  * Returns false if this is not a planar surface, and the caller falls back to the BGRA read.
  */
+#if HAVE_IOSURFACE
 static bool score_iosurface_planes(uint32_t handle, int sr)
 {
    uint32_t id = 0;
@@ -626,6 +642,15 @@ static bool score_iosurface_planes(uint32_t handle, int sr)
    CFRelease(surf);
    return true;
 }
+#else
+/* No object to look up, so no planar path: the caller falls through to the BGRA read, which is
+ * the same answer a planar surface gets on a host that has one and cannot read it as BGRA. */
+static bool score_iosurface_planes(uint32_t handle, int sr)
+{
+   (void)handle; (void)sr;
+   return false;
+}
+#endif
 
 static void score_iosurface(uint32_t handle, uint32_t w, uint32_t h)
 {
@@ -663,7 +688,7 @@ static void score_iosurface(uint32_t handle, uint32_t w, uint32_t h)
    }
    free(sp);
 }
-#endif /* HAVE_IOSURFACE */
+#endif /* HAVE_SCANOUT_READ */
 
 /* Define what the score will read, before anything else can leave undefined bytes there.
  *
@@ -1645,7 +1670,7 @@ int main(int argc, char **argv)
                   b->live = false; failed++; continue;
                }
                made++;
-#if HAVE_IOSURFACE
+#if HAVE_SCANOUT_READ
                {
                   uint32_t id = 0;
                   if (virgl_renderer_resource_get_iosurface_id(r->handle, &id) == 0 && id) {
@@ -1723,7 +1748,7 @@ int main(int argc, char **argv)
       return failed_total ? 1 : 0;
    }
 
-#if HAVE_IOSURFACE
+#if HAVE_SCANOUT_READ
    for (uint32_t i = 0; i < iosurf_n; i++)
       score_iosurface(iosurf_res[i].handle, iosurf_res[i].w, iosurf_res[i].h);
 #endif

@@ -6,3 +6,4 @@
 #
 # Recorded against: OpenGL ES 3.2 Mesa 26.1.8 (gles 32)
 res=17 32x32 hash=6b16991452bc1703 ink=1024/1024
+iosurface res=21 32x32 sync=0 hash=9887a26d98e8c103 ink=1024/1024

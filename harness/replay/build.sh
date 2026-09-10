@@ -51,9 +51,21 @@ for sym in $NEEDED; do
   printf '%s\n' "$EXPORTS" | grep -qx "$sym" || { HAVE_LIMINA=0; break; }
 done
 
+# Whether this leg can read a SCANOUT, asked separately. The three calls below are limina's too,
+# but they are not the journal's, and a gate that probes for one symbol and then calls another is
+# a gate that can go green for the wrong reason. What they read is whatever the host presents
+# from, so the answer is a property of the leg and not of the platform: an exported dma-buf
+# answers them as readily as an IOSurface does.
+SCANOUT="virgl_renderer_resource_get_iosurface_id virgl_renderer_resource_sync_iosurface
+virgl_renderer_resource_read_iosurface"
+HAVE_SCANOUT=1
+for sym in $SCANOUT; do
+  printf '%s\n' "$EXPORTS" | grep -qx "$sym" || { HAVE_SCANOUT=0; break; }
+done
+
 # shellcheck disable=SC2086
 cc -O2 -Wall -Wextra -o vrend-replay vrend-replay.c \
-   -DHAVE_LIMINA_EXT=$HAVE_LIMINA \
+   -DHAVE_LIMINA_EXT=$HAVE_LIMINA -DHAVE_SCANOUT_EXT=$HAVE_SCANOUT \
    -I"$CSRC/src" -I"$CBUILD_INC" -I"$PREFIX/include/virgl" \
    -L"$LIBDIR" -lvirglrenderer -Wl,-rpath,"$LIBDIR" \
    $FRAMEWORKS
@@ -61,6 +73,10 @@ cc -O2 -Wall -Wextra -o vrend-replay vrend-replay.c \
 if [ "$HAVE_LIMINA" = 0 ]; then
   echo "note: this leg exports no limina extensions -- the snapshot-journal gate (--rebuild)"
   echo "      is compiled out and will be refused rather than silently skipped."
+fi
+if [ "$HAVE_SCANOUT" = 0 ]; then
+  echo "note: this leg cannot read a scanout -- the scanout lines are compiled out and the runs"
+  echo "      will report them as skipped."
 fi
 echo "built: $PWD/vrend-replay"
 # Which leg it linked, said out loud: the whole point of the prefix being a parameter is that the
