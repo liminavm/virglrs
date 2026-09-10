@@ -175,8 +175,13 @@ The replayers are what make any scoring possible.
   than producing a score for a renderer it never drove. The two ways back are to make the fork
   build off Darwin, or to drive a real ring through the public ABI — which is a VMM's job, and
   would not score the transport anyway. Neither is worth its cost yet.
-- Decide whether the C leg gains a Linux scanout read or the replayer exports and mmaps the
-  dma-buf itself. **This blocks phase 6's gate**, so decide it here.
+- **The replayer exports and mmaps the dma-buf itself.** The alternative — teaching the C leg a
+  Linux scanout read — means carrying a patch on upstream, which is the thing choosing upstream as
+  the Linux leg was meant to avoid. Doing it in the replayer also keeps the read on the side that
+  is allowed to be host-specific: the leg stays a renderer both hosts can obtain unmodified, and
+  the harness owns the platform knowledge, which is already true of every other host difference
+  here. It costs the replayer an `EGL_MESA_image_dma_buf_export` call and an mmap of what comes
+  back, against a fork that would have to be rebased forever.
 
 **Gate:** the replayers run a corpus end to end on every leg they have and produce a score file.
 Not a matching score — a score. Matching is phase 3.
@@ -241,7 +246,8 @@ pinned as "zero or unstable" and non-zero is not a pass.
 - Confirm which winsys flag the Linux VMM passes; `egl.rs:96-99` binds GLES only, and the classic
   caps probe is live (`caps.rs:304-322`) so it adapts.
 
-**Gate:** the scanout read chosen in phase 2, hashed after a flush, matching the C leg.
+**Gate:** the replayer's own dma-buf read, hashed after a flush, matching the C leg. The read
+is the harness's, so both legs are scored by the same code and a difference is the renderer's.
 
 ### Phase 7 — a guest, and a pixel (1 week; the only real gate)
 
