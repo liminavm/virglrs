@@ -7,9 +7,11 @@
 #   sudo python3 tap-keys.py super esc      open it and leave again
 #   sudo python3 tap-keys.py super:1.2 esc  tap, then wait 1.2s instead of the default
 #
-# A capture boots into the overview, where every window is a still thumbnail and the compositor
-# stops presenting -- a workload that draws continuously then records its first frames and
-# nothing after. Escaping to the focused window is what makes the rest of the capture move.
+# A capture boots into the overview, which composites the session's windows as scaled thumbnails
+# inside the shell's own UI. Those thumbnails are live and the compositor keeps presenting, so this
+# is not the difference between a moving capture and a frozen one -- it is the difference between
+# capturing the overview and capturing the workload at its own size. Escaping puts the focused
+# window up, which is the shape a capture or a score is meant to be taken in.
 # `type-into-overview.py` types words; this taps keys, which is the other half of the same need.
 import fcntl, struct, sys, time, os
 

@@ -118,10 +118,11 @@ vaapi-from-vulkan derivation fails.
 
 **A capture can tap keys.** `tap-keys.py` is `type-into-overview.py`'s other half: it taps named
 keys through `/dev/uinput` rather than typing words (`sudo python3 /tmp/tap-keys.py esc`). A guest
-boots into the overview, where every window is a still thumbnail and the compositor stops
-presenting -- so a client that draws continuously records its first frames and nothing after, and
-the captured frame stops being rewritten while everything else still looks healthy. Escaping to
-the focused window is what makes the rest of the capture move.
+boots into the overview, which composites the session's windows as scaled thumbnails inside the
+shell's own UI. They are live and the compositor keeps presenting, so what this costs is not
+motion but framing: what gets captured, or scored, is the overview rather than the client at its
+own size. Escaping puts the focused window up, which is the shape the measurement is meant to be
+taken in.
 
 ## A WebGL client asking for MSAA takes the VM down
 
