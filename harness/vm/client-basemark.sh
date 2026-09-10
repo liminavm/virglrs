@@ -89,14 +89,31 @@ console.log("BASEMARK_PROBE renderer=" +
 </script>
 HTML
 
+# The one Firefox is this script's to end as well as to start. Left running, it holds the stdout
+# the driver reads: `ssh guest client-basemark.sh` returns when nothing holds that stream any more,
+# not when the script exits -- so a run that has finished and printed its scores looks, from the
+# host, exactly like one still going, and the driver hangs until its own timeout.
+#
+# Killed by pattern and not by `$!`, which is the pipeline's LAST element (`tee`) and not the
+# browser. The bracket keeps the pattern from matching the `pkill` that carries it.
+cleanup() {
+  pkill -u "$(id -u)" -f '[f]irefox.*basemark-profile' 2>/dev/null
+  [ -n "${PIPE:-}" ] && kill "$PIPE" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT
+
 echo "=== one Firefox for the whole run"
 # ONE process, start to finish. The configuration community mode records is session state, and a
 # probe/configure/run sequence of separate processes relies on it surviving a SIGTERM and a
 # round trip through the profile on disk. It does not, reliably: the run comes up with defaults
 # and the suite sits behind its Start button while every log line still looks right. Later URLs
 # are handed to the instance that is already running, which is what a person does.
-timeout 900 firefox --profile "$PROFILE" --new-instance --marionette "$URL_PROBE" 2>&1 \
+# 2400 and not 900: two suite runs plus the probe and configure steps do not fit in 15 minutes,
+# and the timeout firing mid-run leaves the driver reading a log that simply stops.
+timeout 2400 firefox --profile "$PROFILE" --new-instance --marionette "$URL_PROBE" 2>&1 \
   | stamp | tee -a "$LOG" &
+PIPE=$!
 sleep 22
 
 probe=$(grep -o 'BASEMARK_PROBE renderer=.*' "$LOG" | tail -1 || true)
