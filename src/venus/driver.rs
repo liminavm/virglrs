@@ -4696,6 +4696,7 @@ impl Driver {
         &mut self,
         id: ObjectId,
         blob_size: u64,
+        route: Route,
     ) -> Result<(Exported, Storage), ExportError> {
         let Some(record) = self.memory.get(&id) else {
             return Err(ExportError::NoSuchAllocation);
@@ -4731,6 +4732,14 @@ impl Driver {
         } else {
             Exported::Descriptor
         };
+        // What the guest asked for against what the allocation has, before anything is
+        // recorded as published. A blob that means to be mapped cannot be served by a descriptor,
+        // and this is the last point at which saying so costs nothing: past the assignment below
+        // the allocation counts as exported, and the guest asking again -- without the flag, or
+        // for any other reason -- would be told it had already published rather than being served.
+        if route == Route::Mapping && exported == Exported::Descriptor {
+            return Err(ExportError::NotHostVisible);
+        }
         let share = storage.clone();
         let record = self.memory.get_mut(&id).expect("the record was here a moment ago");
         let Backing::Owned { published, .. } = &mut record.backing else {
@@ -5702,6 +5711,20 @@ pub enum Exported {
     /// invented, and the only thing to invent it from is a lazy `mmap` of a buffer whose layout
     /// this side does not know, published to the guest as though it were rows.
     Descriptor,
+}
+
+/// What a blob needs of the allocation it is published from.
+///
+/// The guest's `VIRTGPU_BLOB_FLAG_USE_MAPPABLE`, as the one thing the export has to know about
+/// the resource being made. Passed in rather than checked by the caller afterwards, because the
+/// export is what marks the allocation published: a caller that refuses on the way back has
+/// already spent the one export the allocation gets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Route {
+    /// The guest means to map it, so an address is required and a descriptor will not do.
+    Mapping,
+    /// Whatever the allocation has -- an address if there is one, a descriptor otherwise.
+    Any,
 }
 
 /// Why an allocation could not be exported as a blob. Every one of these is the guest's doing.
@@ -7650,7 +7673,8 @@ mod tests {
 
         // And it publishes as a surface rather than refusing: this is the exact call that read
         // back "that allocation is not addressable by the host" before the export existed.
-        let (_, share) = d.memory_export(ObjectId(1), ASKED).expect("a scanout exports");
+        let (_, share) =
+            d.memory_export(ObjectId(1), ASKED, Route::Any).expect("a scanout exports");
         assert!(matches!(share, Storage::Texture(_)), "the share is the exported storage");
         assert!(share.surface().is_ok(), "and it resolves to a surface for a compositor");
         // Offered as the exporting driver's answer and never as a minted one. The two differ in
@@ -7777,9 +7801,20 @@ mod tests {
         // one's layout is not this side's to give.
         assert!(matches!(allocated.storage().map(Storage::surface), Some(Err(_))));
 
+        // A guest asking to *map* this is refused, and refused before anything is spent: the
+        // allocation gets one publication, and a caller that checked on the way back would have
+        // taken it. So the export below must still work after the refusal.
+        assert_eq!(
+            d.memory_export(ObjectId(1), SIZE, Route::Mapping),
+            Err(ExportError::NotHostVisible),
+            "a descriptor is not something to map"
+        );
+
         // Publishing offers a descriptor. The address it does not have is absent from the type
         // rather than present as a zero -- which is what the caller used to have to test.
-        let (published, share) = d.memory_export(ObjectId(1), SIZE).expect("it publishes");
+        let (published, share) = d
+            .memory_export(ObjectId(1), SIZE, Route::Any)
+            .expect("and the refusal above cost the allocation nothing");
         assert_eq!(published, Exported::Descriptor);
         assert!(matches!(share, Storage::Exported(_)), "the share is the descriptor");
         // And it is offered to a context to adopt, in the shape that says it needs describing.
@@ -8256,7 +8291,7 @@ mod tests {
         assert_eq!(budget.live(), span.1, "charged for the pages, as 'exported pages'");
 
         // Publishing is a matter of saying where the pages are. Nothing is mapped.
-        let (published, share) = d.memory_export(ObjectId(1), ASKED).expect("exports");
+        let (published, share) = d.memory_export(ObjectId(1), ASKED, Route::Any).expect("exports");
         assert_eq!(
             published,
             Exported::Mapped { addr: ptr, write_back: true },
@@ -8322,7 +8357,8 @@ mod tests {
             );
             storage.span()
         };
-        let (published, plain_share) = d.memory_export(ObjectId(2), ASKED).expect("it exports");
+        let (published, plain_share) =
+            d.memory_export(ObjectId(2), ASKED, Route::Any).expect("it exports");
         assert_eq!(
             published,
             Exported::Mapped { addr: heap_span.0, write_back: true },
@@ -8881,22 +8917,28 @@ mod tests {
         assert_eq!(driver.memory_census().len(), 2, "both are live and unexported");
 
         // Memory nobody allocated.
-        assert_eq!(driver.memory_export(ObjectId(999), SIZE), Err(ExportError::NoSuchAllocation));
+        assert_eq!(
+            driver.memory_export(ObjectId(999), SIZE, Route::Any),
+            Err(ExportError::NoSuchAllocation)
+        );
         // A blob bigger than the storage would publish whatever follows it in this process.
-        assert_eq!(driver.memory_export(MEM, SIZE + 1), Err(ExportError::LargerThanAllocation));
+        assert_eq!(
+            driver.memory_export(MEM, SIZE + 1, Route::Any),
+            Err(ExportError::LargerThanAllocation)
+        );
         // Memory the host cannot address has nothing to publish. It is the one kind still left
         // to the driver, precisely because there is no address to hand out.
-        assert_eq!(driver.memory_export(LOCAL, SIZE), Err(ExportError::NotHostVisible));
+        assert_eq!(driver.memory_export(LOCAL, SIZE, Route::Any), Err(ExportError::NotHostVisible));
 
         // The export itself. Coherent and cached on the host, so the guest may map it cached.
-        let (published, share) = driver.memory_export(MEM, SIZE).expect("it publishes");
+        let (published, share) = driver.memory_export(MEM, SIZE, Route::Any).expect("it publishes");
         assert_eq!(
             published,
             Exported::Mapped { addr: share.span().0, write_back: true },
             "the address is the share's own, and coherent and cached as the type says"
         );
         assert_eq!(
-            driver.memory_export(MEM, SIZE).err(),
+            driver.memory_export(MEM, SIZE, Route::Any).err(),
             Some(ExportError::AlreadyExported),
             "the mark is the storage's: exporting twice would give two resources one storage"
         );
@@ -8906,7 +8948,7 @@ mod tests {
         // default that happens to be right for the driver we run on today.
         const UNCACHED: ObjectId = ObjectId(14);
         driver.plant_allocation_of(UNCACHED, SIZE, HOST_VISIBLE_BIT | HOST_COHERENT_BIT);
-        let (uncached, _) = driver.memory_export(UNCACHED, SIZE).expect("it publishes");
+        let (uncached, _) = driver.memory_export(UNCACHED, SIZE, Route::Any).expect("it publishes");
         assert!(matches!(uncached, Exported::Mapped { write_back: false, .. }));
         driver.free_memory(DEVICE, handle, UNCACHED);
 
@@ -8920,7 +8962,7 @@ mod tests {
         // the guest, free -- that used to leave the hypervisor pointing at unmapped host memory.
         driver.free_memory(DEVICE, handle, MEM);
         assert_eq!(
-            driver.memory_export(MEM, SIZE),
+            driver.memory_export(MEM, SIZE, Route::Any),
             Err(ExportError::NoSuchAllocation),
             "and there is no allocation left to export"
         );
@@ -8936,7 +8978,8 @@ mod tests {
         let surface = Surface::scanout(64, 8, PixelFormat::Bgra, 256).expect("the system minted");
         let (scan_addr, scan_extent) = (surface.host_addr(), surface.alloc_size());
         driver.plant_scanout_allocation(SCAN, surface);
-        let (scan, scan_share) = driver.memory_export(SCAN, 1024).expect("a scanout publishes too");
+        let (scan, scan_share) =
+            driver.memory_export(SCAN, 1024, Route::Any).expect("a scanout publishes too");
         assert!(matches!(scan_share, Storage::Texture(_)), "the surface itself, not a copy of it");
         assert_eq!(
             scan_share.span(),
