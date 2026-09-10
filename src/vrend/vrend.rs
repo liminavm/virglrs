@@ -793,7 +793,31 @@ impl Vrend {
             }
         }
         // ctx0 last, which also leaves it current -- where `finish_contexts` leaves it.
-        if !refused {
+        //
+        // `VIRGLRS_FENCE_SKIP_CTX0=1` leaves it out, to measure what including it costs. **Default
+        // is to include it**, so an unset environment is the behaviour that ships -- the opposite
+        // polarity to `VIRGLRS_FENCE_FINISH` above, and stated because getting a knob's polarity
+        // backwards has already cost a measurement here.
+        //
+        // **Unresolved, and kept so it can be resolved.** A/B'd 2026-09-10 against vkmark on the
+        // enhanced guest, two boots and three runs each: medians 3873 with, 3878 without -- and
+        // the spread over all twelve runs was 9.4%, against the 4-7% effect being chased. That
+        // vehicle cannot see this, so nothing here is exonerated; a ~1% vehicle (limina's
+        // `boot-enhanced-efi-kk.sh`) would settle it in one A/B. The unit test
+        // `a_fence_covers_every_sub_context_and_ctx0` is this knob's positive control: it counts 3
+        // syncs with it set against 4 without.
+        //
+        // What it would price: a fence on a one-sub-context context pays three things for ctx0 and
+        // not one. An `eglMakeCurrent` the embedder backing does not dedup
+        // (`egl::Winsys` compares the current context only for its own backing); a synchronous
+        // flush, because this share group never gets mesa's deferred one; and a reset of
+        // `Current`'s single `BoundProgram` slot, so the next batch's first draw pays a
+        // `glUseProgram` that would otherwise have been skipped. The third is per fence and on the
+        // draw path, which is how this reaches a workload whose own rendering is venus.
+        static SKIP_CTX0: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let skip_ctx0 = *SKIP_CTX0
+            .get_or_init(|| std::env::var("VIRGLRS_FENCE_SKIP_CTX0").as_deref() == Ok("1"));
+        if !refused && !skip_ctx0 {
             self.switch_ctx0();
             match self.gl.fence() {
                 Some(f) => syncs.push(f),
