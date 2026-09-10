@@ -2283,8 +2283,9 @@ mod tests {
             "the same storage, not a second one describing the same surface"
         );
         assert!(
-            lent.held().is_some(),
-            "a share, so the surface outlives the classic context that made it"
+            matches!(lent.adoptable(), Some(crate::surface::Adoptable::Ready(_))),
+            "a share, so the surface outlives the classic context that made it -- and one that \
+             carries its own layout, because a minted surface knows what it is"
         );
 
         assert!(

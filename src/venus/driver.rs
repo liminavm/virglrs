@@ -62,7 +62,9 @@ use super::ring::ResourceBytes;
 use crate::guest_mem::{GuestMap, HostMapping, PixelSource};
 use crate::ids::ResourceHandle;
 use crate::ids::SurfaceId;
-use crate::surface::{Adoptable, Describable, Held, PixelFormat, Surface};
+#[cfg(not(target_os = "macos"))]
+use crate::surface::Describable;
+use crate::surface::{Adoptable, Held, PixelFormat, Surface};
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
 /// A slice the guest may or may not have sent, as the pointer Vulkan reads it as.
@@ -8566,8 +8568,11 @@ mod tests {
 
         // The export itself. Coherent and cached on the host, so the guest may map it cached.
         let (published, share) = driver.memory_export(MEM, SIZE).expect("it publishes");
-        assert!(published.write_back, "coherent and cached, as the type says");
-        assert_eq!(share.span().0, published.addr, "the address is the share's own");
+        assert_eq!(
+            published,
+            Exported::Mapped { addr: share.span().0, write_back: true },
+            "the address is the share's own, and coherent and cached as the type says"
+        );
         assert_eq!(
             driver.memory_export(MEM, SIZE).err(),
             Some(ExportError::AlreadyExported),
@@ -8580,7 +8585,7 @@ mod tests {
         const UNCACHED: ObjectId = ObjectId(14);
         driver.plant_allocation_of(UNCACHED, SIZE, HOST_VISIBLE_BIT | HOST_COHERENT_BIT);
         let (uncached, _) = driver.memory_export(UNCACHED, SIZE).expect("it publishes");
-        assert!(!uncached.write_back);
+        assert!(matches!(uncached, Exported::Mapped { write_back: false, .. }));
         driver.free_memory(DEVICE, handle, UNCACHED);
 
         // The census stops reporting it: its bytes are the blob's, captured where they live.
@@ -8616,7 +8621,10 @@ mod tests {
             (scan_addr, scan_extent),
             "and it is the surface's own pages"
         );
-        assert_eq!(scan.addr, scan_addr, "which is the address the VMM was handed");
+        assert!(
+            matches!(scan, Exported::Mapped { addr, .. } if addr == scan_addr),
+            "which is the address the VMM was handed"
+        );
 
         driver.abandon_planted();
     }
