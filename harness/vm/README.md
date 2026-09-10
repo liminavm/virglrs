@@ -156,7 +156,7 @@ that corpus exists because typing allocates a resource nothing else in the tree 
 
 ## Cross-path corpora: a client and a compositor on opposite stacks
 
-Three workloads live here as scripts, because quoting a workload through `ssh` is where these
+Four workloads live here as scripts, because quoting a workload through `ssh` is where these
 captures go wrong silently -- the client starts, a window appears, the capture completes, and it
 recorded the wrong stack.
 
@@ -168,6 +168,11 @@ GL at all. Captured with `capture.sh vrend --out shm`.
 the classic tracer records the other half -- the GL shell importing and compositing a buffer a
 Vulkan client produced. Neither recorder sees both halves, which is the point: this is the
 import side, in classic commands.
+
+`client-basemark.sh` drives Basemark Web 3.0's graphics suite on the **stock** guest, for
+profiling rather than for a corpus. It is the worked example for *Profiling a workload* below, and
+it refuses rather than scores when the renderer is software or the reported configuration is not
+the one asked for.
 
 `client-gl-synoik.sh` is the mirror, and the harder one to get right. A GL client on the Vulkan
 compositor needs the session's environment, which an SSH shell does not inherit -- without it the
@@ -231,6 +236,71 @@ instead of a bare fd close at exit.
 
 `--out` is what keeps the two apart. Without it every synoik capture writes `synoik.vkrc` and
 replaces the corpus a pinned score was recorded from.
+
+## Profiling a workload: the sampling cycle
+
+The loop is: run the workload, sample the host renderer, read where the **gpu worker** thread's
+samples land, attack one area, re-run the same measurement unchanged. It found the classic fence
+`glFinish` under the WebGL aquarium and again under Basemark's graphics suite. Nothing below is
+about a particular benchmark; the traps are the ones any driven graphics workload hits here.
+
+**Boot with `--window`, never `--display-capture`.** A capture boot re-encodes every presented
+frame to PNG and reads the scanout back out of its IOSurface to do it. Under a workload that
+presents constantly, that puts `fdeflate::compress`, `write_png` and
+`Renderer::resource_read_iosurface` near the top of the profile -- the vehicle measuring itself.
+Video decode presents rarely and does not notice, which is why `capture.sh` is right to use it and
+a graphics profile is not.
+
+**`--display-size` is a request, not a setting.** It is clamped to what the host window can be, so
+a boot asking for 3840x2160 comes up at 2560x1440. Take the resolution from the boot log's
+`iosurface scanout:` line or from the workload's own report, never from what was passed.
+
+**Sample the worker, not the supervisor.** `pgrep -f '[l]imina-vmm'` matches the supervisor, whose
+argv carries `--vmm-bin ...limina-vmm`. Use `pgrep -f '[l]imina-vmm --cpus'`, then
+`sample <pid> 10 -f prof.txt` in short back-to-back windows. Read the `gpu worker` thread's own
+subtree from the call graph; the whole-process leaf list is dominated by idle threads waiting and
+says almost nothing.
+
+**The gpu worker looking busy is not the workload running.** It is busy for the compositor, for
+the browser's own UI, for a page that has merely loaded. This is the proxy that will cost a cycle:
+a profile taken while a benchmark sat behind its Start button was full of plausible draw work.
+**Look at the screen** (*Pixels are the oracle*, above), or assert something the workload
+itself prints. Nothing in a renderer log can settle it.
+
+### Driving a browser workload
+
+`client-basemark.sh` is the worked example, and every rule in it was paid for:
+
+**One browser process from start to finish.** Configuration a benchmark records is session state.
+A probe/configure/run sequence of separate processes -- each killed, each relying on the state
+reaching disk -- silently loses it, and the run comes up with defaults. Hand later URLs to the
+instance already running (`firefox --profile P <url>` with no `--new-instance`) rather than
+starting another.
+
+**Options go where the site says, and are asserted afterwards.** Basemark's take on its root URL
+and are ignored on `/run/`. Community mode (`?mode=community`) prints its own configuration to the
+console -- that block, not the URL that was asked for, is what says what will run. Assert it:
+a `suite=2` that quietly stayed "All suites" scores the wrong tests and costs a whole run to find.
+
+**Probe the renderer the browser actually got, and refuse a software one.** An SSH shell does not
+carry the session's GL environment, and Firefox will fall back to llvmpipe: the workload draws,
+completes, reports a score, and the renderer under test never sees a command -- a profile that
+reads as "no hotspot". Take the environment from the compositor's `/proc/<pid>/environ`, the way
+`client-gl-synoik.sh` does, then check `WEBGL_debug_renderer_info` from a page.
+
+Two things make that probe lie if you let them. Firefox returns `"Generic Renderer"` to content
+unless `webgl.sanitize-unmasked-renderer` is `false`, so the check passes on llvmpipe. And Firefox
+has blocked top-level `data:` navigation since 59, so a `data:` probe page never loads at all and
+the failure is indistinguishable from the console pref not taking. Write the probe to a real file.
+
+**Console to stdout is how a run is correlated.** `devtools.console.stdout.content` routes content
+`console.log` to the process's stdout; timestamp each line and the host's sample windows can be
+aimed by them.
+
+**Still open: reading the scores back.** A community-mode run prints a results UID to the console
+(`"54xjtL8f"`), but the result page is client-rendered and `/result/json/` serves the SPA shell
+rather than data, so there is no scraped number yet. Until there is, the profile is the output of a
+cycle and the score is read by a person.
 
 ## Client corpora, and why the C cannot score them
 

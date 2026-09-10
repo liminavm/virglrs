@@ -15,16 +15,22 @@
 # the renderer is asserted below and a fallback refuses the run rather than scoring it.
 set -u
 
-URL_PROBE='data:text/html,<canvas id=c></canvas><script>
-var gl=document.getElementById("c").getContext("webgl");
-var e=gl.getExtension("WEBGL_debug_renderer_info");
-console.log("BASEMARK_PROBE renderer="+(e?gl.getParameter(e.UNMASKED_RENDERER_WEBGL):"unknown")
-  +" version="+gl.getParameter(gl.VERSION));
-</script>'
+PROBE_HTML=/tmp/basemark-probe.html
+URL_PROBE="file://$PROBE_HTML"
 # suite=2 is the Graphics suite alone: WebGL 1.0.2, WebGL 2.0, Shader Pipeline, Draw-call Stress,
 # Geometry Stress, Canvas, SVG. Per-test selection is a Corporate-version feature, so the suite is
 # the finest cut available -- which is exactly the seven tests we care about.
-URL_RUN='https://web.gpuscore.com/run/?mode=community&suite=2&conformance=0&battery=0'
+# Community mode is ACTIVATED at the root and persists in the profile; it is not a query parameter
+# that /run/ understands on its own. A fresh profile each run means activating each run, so this is
+# loaded first and its only job is to leave that state behind. Skipping it leaves the suite sitting
+# behind a Start button while the profile records an idle desktop.
+#
+# Every option is set HERE, on the root, and none of them are understood by /run/. Community mode
+# prints its own configuration to the console, and that block -- not the URL we asked for -- is
+# what says which suite is about to run. It is asserted below, because a suite=2 that silently
+# stayed "All suites" scores the JS tests too and costs eight minutes to discover.
+URL_MODE='https://web.gpuscore.com/?mode=community&suite=2&conformance=0&battery=0'
+URL_RUN='https://web.gpuscore.com/run/'
 
 PROFILE=/tmp/basemark-profile
 LOG=/tmp/basemark.log
@@ -61,6 +67,7 @@ mkdir -p "$PROFILE"
 # actually appear -- a silent pref rename would leave the run looking fine and unattributable.
 cat > "$PROFILE/user.js" <<'PREFS'
 user_pref("devtools.console.stdout.content", true);
+user_pref("webgl.sanitize-unmasked-renderer", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("browser.sessionstore.resume_from_crash", false);
 user_pref("browser.startup.homepage_override.mstone", "ignore");
@@ -69,25 +76,65 @@ user_pref("app.update.auto", false);
 user_pref("toolkit.telemetry.enabled", false);
 PREFS
 
-echo "=== probing the renderer Firefox actually got"
-timeout 60 firefox --profile "$PROFILE" --new-instance "$URL_PROBE" 2>&1 | stamp | tee "$LOG" &
-sleep 25
-probe=$(grep -o 'BASEMARK_PROBE renderer=[^ ]*' "$LOG" | tail -1 || true)
+# A real file, not a data: URL: Firefox has blocked top-level data: navigation since 59, so a
+# data: probe never loads at all -- and the failure is indistinguishable from the console pref not
+# taking, which is a diagnostic pointing at the wrong thing.
+cat > "$PROBE_HTML" <<'HTML'
+<canvas id=c></canvas><script>
+var gl = document.getElementById("c").getContext("webgl");
+var e = gl && gl.getExtension("WEBGL_debug_renderer_info");
+console.log("BASEMARK_PROBE renderer=" +
+  (e ? gl.getParameter(e.UNMASKED_RENDERER_WEBGL) : "unknown") +
+  " version=" + (gl ? gl.getParameter(gl.VERSION) : "no-webgl"));
+</script>
+HTML
+
+echo "=== one Firefox for the whole run"
+# ONE process, start to finish. The configuration community mode records is session state, and a
+# probe/configure/run sequence of separate processes relies on it surviving a SIGTERM and a
+# round trip through the profile on disk. It does not, reliably: the run comes up with defaults
+# and the suite sits behind its Start button while every log line still looks right. Later URLs
+# are handed to the instance that is already running, which is what a person does.
+timeout 600 firefox --profile "$PROFILE" --new-instance "$URL_PROBE" 2>&1 | stamp | tee -a "$LOG" &
+sleep 22
+
+probe=$(grep -o 'BASEMARK_PROBE renderer=.*' "$LOG" | tail -1 || true)
 echo "probe: ${probe:-NONE}"
 case "$probe" in
   *llvmpipe*|*softpipe*|*swrast*)
     echo "REFUSING: Firefox is on a software rasteriser -- this run would profile nothing" >&2
-    pkill -f "$PROFILE" 2>/dev/null
     exit 1 ;;
   "")
-    echo "REFUSING: no probe line reached the log; the console pref did not take, so the sample" >&2
-    echo "          windows would have nothing to be aimed by" >&2
-    pkill -f "$PROFILE" 2>/dev/null
+    echo "REFUSING: no probe line reached the log; the console pref did not take, so nothing" >&2
+    echo "          here can be correlated or trusted" >&2
     exit 1 ;;
 esac
-pkill -f "$PROFILE" 2>/dev/null
-sleep 3
 
-echo "=== running the graphics suite; sample the host vmm now"
-echo "=== host side: sample \$(pgrep -f '[l]imina-vmm --cpus') 20 -f /tmp/prof.txt"
-exec firefox --profile "$PROFILE" --new-instance --kiosk "$URL_RUN" 2>&1 | stamp | tee -a "$LOG"
+echo "=== configuring: community mode and the graphics suite, in the same session"
+firefox --profile "$PROFILE" "$URL_MODE" > /dev/null 2>&1
+sleep 20
+
+echo "--- reported configuration:"
+grep -o '"[ ]*[A-Za-z][A-Za-z ]*: [^"]*"' "$LOG" | sort -u
+suite_line=$(grep -o '"    Suite: [^"]*"' "$LOG" | tail -1)
+mode_line=$(grep -o '"    Mode: [^"]*"' "$LOG" | tail -1)
+case "$suite_line" in
+  *Graphics*) ;;
+  *) echo "REFUSING: the suite is ${suite_line:-unreported}, not Graphics" >&2; exit 1 ;;
+esac
+case "$mode_line" in
+  *community*) ;;
+  *) echo "REFUSING: mode is ${mode_line:-unreported}" >&2; exit 1 ;;
+esac
+
+echo "=== launching the suite in that same session"
+firefox --profile "$PROFILE" "$URL_RUN" > /dev/null 2>&1
+sleep 10
+
+# Framing, not motion: see tap-keys.py. The overview keeps presenting, but it composites the
+# window as a thumbnail inside the shell's UI rather than showing it at its own size.
+sudo python3 /tmp/tap-keys.py esc || echo "WARNING: could not tap esc" >&2
+
+echo "=== suite launched; sample the host vmm now"
+echo "=== host side: sample \$(pgrep -f '[l]imina-vmm --cpus') 10 -f prof.txt"
+wait
