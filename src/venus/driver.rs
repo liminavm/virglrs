@@ -4130,6 +4130,19 @@ impl Driver {
             return Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE));
         }
         let alias_span = alias.as_ref().map(|b| self.span(b));
+        // A share whose bytes no host pointer names cannot be imported this way, and the chain
+        // built below would not fail -- it would hand the driver a null `pHostPointer`. That is
+        // what an exporting host's classic scanout is: a perfectly good descriptor of storage the
+        // CPU has no address for. Importing one properly means a dma-buf handle type instead of a
+        // host pointer, which is a different call and not yet made, so this is refused by name
+        // rather than attempted with an address that is not one.
+        if let Some((0, _)) = alias_span {
+            eprintln!(
+                "[virglrs] {id:?}: cannot import a share with no host address -- its storage is a \
+                 descriptor of the driver's memory, not a mapping of ours"
+            );
+            return Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE));
+        }
         let surface = if import.is_some() {
             Err(NoSurface::NotExported)
         } else {
@@ -6634,6 +6647,81 @@ mod tests {
     /// process can drop its handle to the resource while another still has the memory bound. A
     /// client exiting is the ordinary case: the compositor's next submit still reads the buffer.
     /// So the importer's record holds the share, and the pages go only when the last holder does.
+    /// A share the CPU has no address for is refused, not imported at a null pointer.
+    ///
+    /// The exporting host lends descriptors: a classic scanout's storage is a dma-buf the driver
+    /// laid out, and on this host it is tiled, so nothing maps it. `Storage::span` answers zero
+    /// for such a share -- correctly, there is no address -- and the allocate path would have put
+    /// that zero straight into `VkImportMemoryHostPointerInfoEXT.pHostPointer` and called the
+    /// driver with it. Not a guest error and not a Vulkan failure: a null pointer handed to a
+    /// driver that was told it was memory.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_share_with_no_host_address_is_refused_rather_than_imported_at_null() {
+        use super::super::proto::types::VkImportMemoryResourceInfoMESA;
+        use crate::surface::{DRM_FORMAT_MOD_INVALID, Layout, PlaneLayout, Surface};
+
+        const DEVICE: VkDevice = VkDevice(3);
+        const LEN: u64 = 16384;
+
+        unsafe extern "C" fn allocate(
+            _d: VkDevice,
+            _info: *const VkMemoryAllocateInfo,
+            _a: *const VkAllocationCallbacks,
+            _out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            unreachable!("the refusal comes before the driver is asked for anything");
+        }
+
+        let mut d = Driver::new(Account::for_test(None));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(allocate);
+        d.plant_device(DEVICE, fns);
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(HOST_VISIBLE_BIT as _)]);
+
+        // A descriptor of storage that is not ours: tiled, so no CPU path opens it, and the fd
+        // is never mapped -- which is the whole point, and why any fd will do here.
+        let fd = std::fs::File::open("/dev/null").expect("every host has one").into();
+        let mut planes = [PlaneLayout { offset: 0, pitch: 0 }; crate::surface::MAX_PLANES];
+        planes[0] = PlaneLayout { offset: 0, pitch: 256 };
+        let tiled = Surface::exported(
+            fd,
+            Layout {
+                width: 64,
+                height: 64,
+                fourcc: crate::surface::PixelFormat::Bgra.fourcc(),
+                // Anything but LINEAR: the modifier is what says the bytes are not rows.
+                modifier: 0x0100_0000_0000_0001,
+                planes,
+                plane_count: 1,
+                alloc_size: LEN,
+            },
+        );
+        assert_ne!(tiled.layout().modifier, DRM_FORMAT_MOD_INVALID, "a real descriptor");
+        let lent = Storage::lent(std::sync::Arc::new(tiled));
+        assert_eq!(lent.span().0, 0, "the premise: this share names no host address");
+
+        let import = VkImportMemoryResourceInfoMESA {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+            pNext: core::ptr::null(),
+            resourceId: 7,
+        };
+        let info = VkMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: (&raw const import).cast(),
+            allocationSize: VkDeviceSize(LEN),
+            memoryTypeIndex: 0,
+        };
+        let resolve = |_| Some(ResourceBytes::Shared(lent.clone()));
+        assert!(
+            d.allocate_memory(DEVICE, ObjectId(80), &info, None, &resolve).is_err(),
+            "the guest is told the handle is not importable"
+        );
+        assert!(!d.memory.contains_key(&ObjectId(80)), "and nothing is left behind for it");
+
+        d.abandon_planted();
+    }
+
     #[test]
     fn an_import_holds_the_storage_it_resolved() {
         use super::super::proto::types::VkImportMemoryResourceInfoMESA;

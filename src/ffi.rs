@@ -1660,9 +1660,21 @@ pub extern "C" fn virgl_renderer_get_cursor_data(
     })
 }
 
+/// Refused, on both hosts, and not for want of a way to do it.
+///
+/// `tex_id` is a *GL texture name*, not a resource: the only caller that could produce one is a
+/// VMM sharing this renderer's GL context, which is a thing exactly one VMM does and none of
+/// them ask for here -- QEMU's `virtio-gpu-gl` module imports 28 of these entry points and
+/// neither of these two. A caller that has a resource wants
+/// [`virgl_renderer_resource_export_blob`] or [`virgl_renderer_execute`]'s `EXPORT_QUERY`, which
+/// are served and answer from the descriptor the storage already carries.
+///
+/// So this stays a refusal rather than becoming an untested path with no way to score it: the
+/// export machinery it would use is the same, and is measured through the calls that have
+/// callers.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_get_fd_for_texture(_tex_id: u32, _fd: *mut c_int) -> c_int {
-    todo_phase!("P3: dmabuf export -- not a path macOS has")
+    todo_phase!("no caller: `tex_id` is a GL name, not a resource")
 }
 
 #[unsafe(no_mangle)]
@@ -1672,7 +1684,7 @@ pub extern "C" fn virgl_renderer_get_fd_for_texture2(
     _stride: *mut c_int,
     _offset: *mut c_int,
 ) -> c_int {
-    todo_phase!("P3: dmabuf export -- not a path macOS has")
+    todo_phase!("no caller: `tex_id` is a GL name, not a resource")
 }
 
 // ---------------------------------------------------------------- caps
