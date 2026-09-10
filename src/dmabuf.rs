@@ -249,6 +249,22 @@ impl Surface {
         self.mapped().map_or(0, |m| m.ptr as usize)
     }
 
+    /// Never a host allocation, whether or not it is mapped.
+    ///
+    /// The distinction [`Surface::host_addr`] does not make. That address is a mapping of the
+    /// *exporting driver's* buffer -- a GEM mmap -- and it is a fine thing to publish to the VMM,
+    /// which is what a mappable blob does with it. It is not a fine thing to hand a second driver
+    /// as `VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT`: that handle type means memory
+    /// the *host* allocated, and importing another driver's pages under it aliases storage the
+    /// importer knows nothing about. The route for these bytes is the descriptor, and until a
+    /// dma-buf handle type is passed at `vkAllocateMemory` there is no route at all.
+    ///
+    /// So `None` unconditionally, and not "`None` unless mapped": whether a mapping has been
+    /// taken yet is a fact about this process, and the question is about whose pages they are.
+    pub fn as_host_allocation(&self) -> Option<usize> {
+        None
+    }
+
     /// Whether the bytes behind this descriptor are pixels the CPU can read in row order.
     ///
     /// **Only a linear buffer is.** A tiled one is a perfectly good dma-buf -- an importer hands

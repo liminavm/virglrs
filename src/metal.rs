@@ -828,6 +828,17 @@ impl Surface {
         unsafe { IOSurfaceGetBaseAddress(self.as_ref()) as usize }
     }
 
+    /// These bytes as a host allocation another device may import.
+    ///
+    /// An IOSurface is host memory this renderer minted, which is exactly what
+    /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT` is for: a second device is handed
+    /// the address and binds its own image to the same pages. See
+    /// [`crate::surface::Surface::as_host_allocation`] for the question, and `dmabuf.rs` for the
+    /// host that answers `None` to it.
+    pub fn as_host_allocation(&self) -> Option<usize> {
+        Some(self.host_addr()).filter(|addr| *addr != 0)
+    }
+
     /// Copy the surface's bytes out, returning how many landed in `dst`.
     ///
     /// This is how a scanout allocation is read back at all: its storage *is* the surface, and

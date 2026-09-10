@@ -4131,17 +4131,21 @@ impl Driver {
             );
             return Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE));
         }
-        let alias_span = alias.as_ref().map(|b| self.span(b));
-        // A share whose bytes no host pointer names cannot be imported this way, and the chain
-        // built below would not fail -- it would hand the driver a null `pHostPointer`. That is
-        // what an exporting host's classic scanout is: a perfectly good descriptor of storage the
-        // CPU has no address for. Importing one properly means a dma-buf handle type instead of a
-        // host pointer, which is a different call and not yet made, so this is refused by name
-        // rather than attempted with an address that is not one.
-        if let Some((0, _)) = alias_span {
+        // What the import may act on, which is not the same question as where the bytes are.
+        // The chain built below hands the driver a `pHostPointer`, and that handle type means
+        // memory the *host* allocated: pages this renderer minted, or a mapping it made of memory
+        // the VMM shared with it. Storage that is only named by a descriptor has no such address
+        // -- and storage whose descriptor this renderer has mapped has an address that is still
+        // not one, because the pages belong to the exporting driver. Both are refused by name
+        // here rather than attempted: importing them properly means a dma-buf handle type at
+        // `vkAllocateMemory` instead of a host pointer, which is a different call and not yet
+        // made.
+        let alias_span = alias.as_ref().and_then(|b| self.as_host_allocation(b));
+        if alias.is_some() && alias_span.is_none() {
             eprintln!(
-                "[virglrs] {id:?}: cannot import a share with no host address -- its storage is a \
-                 descriptor of the driver's memory, not a mapping of ours"
+                "[virglrs] {id:?}: cannot import this share as host memory -- its storage is the \
+                 exporting driver's, named by a descriptor, and a mapping of one is not a host \
+                 allocation"
             );
             return Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE));
         }
@@ -4485,6 +4489,19 @@ impl Driver {
             // Resolved from the share itself. No table is consulted, so it answers the same for
             // the context that made the storage and for any other the guest attached it to.
             ResourceBytes::Shared(storage) => storage.span(),
+        }
+    }
+
+    /// These bytes as a host allocation a second device may import, if they are one.
+    ///
+    /// What an import may act on, as against [`Self::span`], which is what a mapping covers. See
+    /// [`Storage::as_host_allocation`].
+    pub fn as_host_allocation(&self, bytes: &ResourceBytes) -> Option<(usize, u64)> {
+        match bytes {
+            // A mapping this renderer made of memory the VMM shared with it, which is the one
+            // thing a host-pointer import was for before any of the rest existed.
+            ResourceBytes::Host(map) => Some((map.host_addr(), map.len() as u64)),
+            ResourceBytes::Shared(storage) => storage.as_host_allocation(),
         }
     }
 
@@ -5578,6 +5595,34 @@ impl Storage {
             Storage::Heap(h) => {
                 (h.it().mem.mapped.expect("heap storage is mapped"), h.it().mem.len)
             }
+        }
+    }
+
+    /// This storage as a host allocation another device may import, if it is one.
+    ///
+    /// The counterpart to [`Storage::span`], and deliberately not derived from it. `span` answers
+    /// "where are these bytes in this process", which is the question the VMM's mapping asks;
+    /// this one answers "are these pages this renderer's to lend to a second driver", which is
+    /// the question `VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT` asks. An exporting
+    /// host makes them different answers: a dma-buf's mapping has an address and is still not a
+    /// host allocation, so a caller reading `span().0 != 0` as permission would hand another
+    /// driver a view of the exporting driver's pages.
+    pub fn as_host_allocation(&self) -> Option<(usize, u64)> {
+        match self {
+            Storage::Texture(m) => {
+                m.surface().as_host_allocation().map(|addr| (addr, m.surface().alloc_size()))
+            }
+            // A descriptor names the driver's memory. There is no address to lend even when there
+            // is an address to publish.
+            #[cfg(not(target_os = "macos"))]
+            Storage::Exported(_) => None,
+            // Pages this renderer minted for exactly this, which is why the declared export mints
+            // rather than letting the driver allocate.
+            Storage::Linear(p) => Some((p.it().map.host_addr(), p.it().map.len() as u64)),
+            // The driver's own allocation, mapped by us. Not lent onward -- refused by name and
+            // out loud at the import, because a guest reaching it is telling us the
+            // declared-export gate is in the wrong place.
+            Storage::Heap(_) => None,
         }
     }
 
@@ -6940,6 +6985,107 @@ mod tests {
             "the guest is told the handle is not importable"
         );
         assert!(!d.memory.contains_key(&ObjectId(80)), "and nothing is left behind for it");
+
+        d.abandon_planted();
+    }
+
+    /// A LINEAR descriptor *does* have a host address, and it is still not one to lend.
+    ///
+    /// The tiled case above is refused because there is nothing to hand over. This one is the
+    /// case a test of that shape cannot reach: the descriptor is linear, so the mapping is taken
+    /// and the address is real -- and the pages behind it are the exporting driver's, reached
+    /// through a GEM mmap. Handed to a second driver as
+    /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT` it claims to be memory the host
+    /// allocated, which aliases storage that driver knows nothing about.
+    ///
+    /// So "is there an address" was the wrong question, and asking it let the answer depend on
+    /// whether a mapping had happened to be taken. The premise below asserts the address is
+    /// there, or the refusal would be the tiled one over again under a new name.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_linear_descriptor_has_an_address_and_is_still_not_a_host_allocation() {
+        use super::super::proto::types::VkImportMemoryResourceInfoMESA;
+        use crate::surface::{DRM_FORMAT_MOD_LINEAR, Layout, PlaneLayout, Surface};
+
+        const DEVICE: VkDevice = VkDevice(3);
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 64;
+        const PITCH: u32 = WIDTH * 4;
+        const LEN: u64 = (PITCH * HEIGHT) as u64;
+
+        unsafe extern "C" fn allocate(
+            _d: VkDevice,
+            _info: *const VkMemoryAllocateInfo,
+            _a: *const VkAllocationCallbacks,
+            _out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            unreachable!("the refusal comes before the driver is asked for anything");
+        }
+
+        let mut d = Driver::new(Account::for_test(None));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(allocate);
+        d.plant_device(DEVICE, fns);
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(HOST_VISIBLE_BIT as _)]);
+
+        // A memfd stands in for the dma-buf: `mmap` is what this path asks of it, and what the
+        // premise below needs to succeed.
+        // SAFETY: a NUL-terminated literal and no flags; the descriptor is fresh.
+        let raw = unsafe { libc::memfd_create(c"virglrs-test-lend".as_ptr(), 0) };
+        assert!(raw >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+        // SAFETY: sizing a fresh memfd nothing has mapped.
+        let rc = unsafe { libc::ftruncate(raw, LEN as libc::off_t) };
+        assert_eq!(rc, 0, "ftruncate: {}", std::io::Error::last_os_error());
+        // SAFETY: a descriptor this scope owns and hands over exactly once.
+        let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+
+        let mut planes = [PlaneLayout { offset: 0, pitch: 0 }; crate::surface::MAX_PLANES];
+        planes[0] = PlaneLayout { offset: 0, pitch: PITCH };
+        let linear = Surface::exported(
+            fd,
+            Layout {
+                width: WIDTH,
+                height: HEIGHT,
+                fourcc: crate::surface::PixelFormat::Bgra.fourcc(),
+                modifier: DRM_FORMAT_MOD_LINEAR,
+                planes,
+                plane_count: 1,
+                alloc_size: LEN,
+            },
+        );
+        let lent = Storage::lent(std::sync::Arc::new(linear));
+        assert_ne!(lent.span().0, 0, "the premise: this one really does map");
+        assert!(
+            lent.as_host_allocation().is_none(),
+            "and the address it has is the exporting driver's, not this renderer's to lend"
+        );
+
+        let import = VkImportMemoryResourceInfoMESA {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+            pNext: core::ptr::null(),
+            resourceId: 9,
+        };
+        let info = VkMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: (&raw const import).cast(),
+            allocationSize: VkDeviceSize(LEN),
+            memoryTypeIndex: 0,
+        };
+        let resolve = |_| Some(ResourceBytes::Shared(lent.clone()));
+        assert!(
+            d.allocate_memory(DEVICE, ObjectId(81), &info, None, &resolve).is_err(),
+            "the guest is told the handle is not importable, rather than given an alias"
+        );
+        assert!(!d.memory.contains_key(&ObjectId(81)), "and nothing is left behind for it");
+
+        // The control, on the predicate itself: pages this renderer minted are exactly what the
+        // handle type is for, and they still answer with an address. Without this the assertion
+        // above would pass just as well if nothing were lendable any more.
+        let minted = Storage::pages_for_test(4096, &Account::for_test(None));
+        assert!(
+            minted.as_host_allocation().is_some(),
+            "minted pages are host memory, and lending them is what the declared mint is for"
+        );
 
         d.abandon_planted();
     }
