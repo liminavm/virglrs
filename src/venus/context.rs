@@ -925,6 +925,7 @@ impl Context {
         &mut self,
         id: ObjectId,
         blob_size: u64,
+        route: driver::Route,
     ) -> Result<(Exported, driver::Storage, ObjectKey), ExportError> {
         // The key, and only the key. The export itself no longer reaches Vulkan, so the device
         // and the handle the table could resolve are not its business; what it still owes the
@@ -938,7 +939,7 @@ impl Context {
                 .ok_or(ExportError::NoSuchAllocation)?;
             objects.key_of(id).ok_or(ExportError::NoSuchAllocation)?
         };
-        let (exported, share) = self.driver.memory_export(id, blob_size)?;
+        let (exported, share) = self.driver.memory_export(id, blob_size, route)?;
         // Before the caller gets the share, and under the lock it is holding: from here on the
         // allocate that made this survives the guest's free for as long as anyone holds a share,
         // and there is no instant at which it does not.

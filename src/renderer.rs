@@ -759,7 +759,19 @@ impl Renderer {
                 // a distinct `Error` and the caller is told which; the C ABI's single errno for
                 // all of them is `ffi.rs`'s problem and not this function's.
                 CapsetId::Venus => {
-                    let (exported, storage, from) = self.venus_memory_export(ctx, id, desc.size)?;
+                    // What the guest asked for travels *into* the export, because the export is
+                    // what spends the allocation's one publication. A guest that asks to map
+                    // memory the host has no address for would otherwise create the blob, map it,
+                    // and get nothing -- and the refusal it needs would arrive at the map, by
+                    // which time the resource exists and the guest has been told the allocation
+                    // was fine.
+                    let route = if desc.blob_flags & BLOB_FLAG_USE_MAPPABLE != 0 {
+                        venus::driver::Route::Mapping
+                    } else {
+                        venus::driver::Route::Any
+                    };
+                    let (exported, storage, from) =
+                        self.venus_memory_export(ctx, id, desc.size, route)?;
                     let published = match exported {
                         venus::driver::Exported::Mapped { write_back, .. } => Published::Mapped {
                             caching: if write_back {
@@ -770,16 +782,6 @@ impl Renderer {
                         },
                         venus::driver::Exported::Descriptor => Published::Descriptor,
                     };
-                    // What the guest asked for and what the allocation can do meet here, once,
-                    // and disagree loudly rather than later. A guest that asks to map memory the
-                    // host has no address for would otherwise create the blob, map it, and get
-                    // nothing -- and the refusal it needs would arrive at the map, by which time
-                    // the resource exists and the guest has been told the allocation was fine.
-                    if desc.blob_flags & BLOB_FLAG_USE_MAPPABLE != 0
-                        && published == Published::Descriptor
-                    {
-                        return Err(Error::NotHostVisible);
-                    }
                     BlobStorage::Shared { storage, published, from }
                 }
             },
@@ -1524,6 +1526,7 @@ impl Renderer {
         ctx_id: ContextId,
         mem: BlobId,
         blob_size: u64,
+        route: venus::driver::Route,
     ) -> Result<(Exported, Storage, Exporter), Error> {
         let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
         // The exporter is named here and not by the caller, because this is where the live
@@ -1531,7 +1534,7 @@ impl Renderer {
         // says which one it got.
         v.with_context_mut(ctx_id, |ctx| {
             let ctx_key = ctx.key();
-            ctx.memory_export(ObjectId(mem.0), blob_size)
+            ctx.memory_export(ObjectId(mem.0), blob_size, route)
                 .map(|(exported, storage, key)| (exported, storage, Exporter { ctx: ctx_key, key }))
         })
         .ok_or(Error::NoContext)?
