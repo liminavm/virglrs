@@ -22,14 +22,27 @@ PREFIX="$(cd "$PREFIX" && pwd)"
 VERSION=1.3.0
 
 cargo build --release
-cp "$HERE/target/release/libvirglrenderer.dylib" "$PREFIX/lib/libvirglrenderer.1.dylib"
 
-# The install name is the ABSOLUTE path of the installed library, matching what meson records.
-# A consumer links against the path it finds here, and dyld resolves it from the recorded id --
-# get this wrong and the app loads whichever libvirglrenderer is on the default path instead.
-install_name_tool -id "$PREFIX/lib/libvirglrenderer.1.dylib" \
-  "$PREFIX/lib/libvirglrenderer.1.dylib"
-ln -sf libvirglrenderer.1.dylib "$PREFIX/lib/libvirglrenderer.dylib"
+# The versioned name is the real file and the bare name a symlink to it, which is the shape meson
+# installs and therefore the shape a consumer of this prefix expects to find. What differs between
+# the hosts is only the suffix, and whether the recorded identity needs rewriting after the copy.
+if [ "$(uname -s)" = Darwin ]; then
+  cp "$HERE/target/release/libvirglrenderer.dylib" "$PREFIX/lib/libvirglrenderer.1.dylib"
+  # The install name is the ABSOLUTE path of the installed library, matching what meson records.
+  # A consumer links against the path it finds here, and dyld resolves it from the recorded id --
+  # get this wrong and the app loads whichever libvirglrenderer is on the default path instead.
+  install_name_tool -id "$PREFIX/lib/libvirglrenderer.1.dylib" \
+    "$PREFIX/lib/libvirglrenderer.1.dylib"
+  ln -sf libvirglrenderer.1.dylib "$PREFIX/lib/libvirglrenderer.dylib"
+else
+  cp "$HERE/target/release/libvirglrenderer.so" "$PREFIX/lib/libvirglrenderer.so.1"
+  # Nothing to rewrite: ELF carries a soname recorded at link time rather than an absolute id,
+  # and a consumer finds this copy through its own rpath or LD_LIBRARY_PATH. rustc's soname for
+  # a cdylib is the bare `libvirglrenderer.so` while meson's is `.so.1`; both names exist here,
+  # so a consumer resolves either. Deliberately not overridden -- the loader matches on the file
+  # it is pointed at, which is what the renderer swap on the QEMU rig relies on.
+  ln -sf libvirglrenderer.so.1 "$PREFIX/lib/libvirglrenderer.so"
+fi
 
 # The headers are the C tree's. They define the ABI both implementations serve, so there is no
 # Rust-side copy to drift -- virglrs is checked against them by harness/abi.

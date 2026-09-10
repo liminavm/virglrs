@@ -22,7 +22,9 @@ ROOT="$(cd ../.. && pwd)"
 PIN=0
 [ "${1:-}" = "--pin" ] && PIN=1
 
-PREFIX="${VIRGL_PREFIX:-$ROOT/harness/vm/prefix}"
+. "$ROOT/scripts/platform.sh"
+
+PREFIX="${VIRGL_PREFIX:-$ROOT/third_party/virgl-prefix}"
 
 # Own the freshness of the prefix we are about to score, the way vkr-replay.sh does. This gate
 # reads a built dylib and nothing else, so without this it happily pins or checks a dylib from
@@ -33,16 +35,11 @@ if [ "$PREFIX" = "$ROOT/prefix" ]; then
   "$ROOT/install.sh" >/dev/null
 fi
 
-LIB=""
-for cand in "$PREFIX/lib/libvirglrenderer.1.dylib" "$PREFIX/lib/libvirglrenderer.dylib" \
-            "$PREFIX/src/libvirglrenderer.dylib"; do
-  [ -f "$cand" ] && LIB="$cand" && break
-done
-[ -n "$LIB" ] || { echo "no libvirglrenderer under $PREFIX" >&2; exit 1; }
+LIB="$(virgl_find_lib "$PREFIX")" || { echo "no libvirglrenderer under $PREFIX" >&2; exit 1; }
 
 # Any other prefix is built by someone else, so all we can do is say when it looks stale.
 if [ "$PREFIX" != "$ROOT/prefix" ] \
-   && find "$ROOT/third_party/virglrenderer/src" -name '*.c' -newer "$LIB" 2>/dev/null | read -r _; then
+   && find "$ROOT/third_party" -name '*.c' -path '*/virglrenderer*/src/*' -newer "$LIB" 2>/dev/null | read -r _; then
   echo "warning: $LIB is older than the C sources it was built from -- stale build" >&2
 fi
 
@@ -52,9 +49,16 @@ trap 'rm -rf "$TMP"' EXIT
 # Every exported symbol, not an intersection with any one consumer: what the dylib exports is
 # defined by this tree, while who calls what is defined outside it and moves without warning.
 # A port that exports the whole list satisfies every consumer of it.
-nm -gU "$LIB" | awk '$2 == "T" || $2 == "S" { print $3 }' | LC_ALL=C sort -u > "$TMP/symbols.txt"
+virgl_exported_symbols "$LIB" > "$TMP/symbols.txt"
 
-cc -O0 -o "$TMP/abi-dump" "$HERE/abi-dump.c" -I"$ROOT/third_party/virglrenderer/src" -I"$ROOT/harness/vm/build/src"
+# Against the FORK's headers on either host, because they are the ABI virglrs implements -- not
+# whichever C tree this host happens to score against. Only `virgl-version.h` is taken from a
+# build directory, and it contributes nothing to the dump.
+GEN_INC="$(virgl_generated_include "$ROOT")" || {
+  echo "no built C tree to take generated headers from: run scripts/build-reference.sh" >&2
+  exit 1
+}
+cc -O0 -o "$TMP/abi-dump" "$HERE/abi-dump.c" -I"$ROOT/third_party/virglrenderer/src" -I"$GEN_INC"
 "$TMP/abi-dump" > "$TMP/layout.txt"
 
 fail=0
@@ -85,11 +89,41 @@ if [ "$PIN" = 1 ]; then
     echo "does not, and a floor both must meet can only be recorded from the C." >&2
     exit 2
   fi
+  # And pinning from a stock upstream build would LOWER it: upstream carries none of the limina
+  # extensions, so the new floor would drop them silently and every later run would pass while
+  # virglrs quietly stopped exporting the symbols limina actually calls. The floor is the fork's
+  # export set; only a fork build may record it.
+  if [ -s "$HERE/symbols-limina.txt" ] \
+     && [ -n "$(LC_ALL=C comm -23 "$HERE/symbols-limina.txt" "$TMP/symbols.txt")" ]; then
+    echo "refusing to pin the symbol floor from a build that carries no limina extensions:" >&2
+    echo "it would lower the floor rather than record it. Pin from a fork build." >&2
+    exit 2
+  fi
   cp "$TMP/symbols.txt" "$HERE/symbols.txt"
   echo "pinned symbols.txt ($(wc -l < "$TMP/symbols.txt" | tr -d ' ') lines)"
 else
   missing="$(LC_ALL=C comm -23 "$HERE/symbols.txt" "$TMP/symbols.txt")"
   extra="$(LC_ALL=C comm -13 "$HERE/symbols.txt" "$TMP/symbols.txt")"
+
+  # The floor is the fork's export set, and it has two halves that fail differently.
+  #
+  # The limina extensions (symbols-limina.txt) exist only in our fork. virglrs must export them,
+  # because limina calls them; a stock upstream virglrenderer has no reason to and legitimately
+  # does not. Scoring an upstream leg against the whole floor reports twenty-two failures for a
+  # tree that is behaving correctly -- a red that means nothing, which is worse than no gate,
+  # because the next person learns to expect it red.
+  #
+  # So: everything must meet the core floor. Only the Rust build must also meet the extensions.
+  if [ -s "$HERE/symbols-limina.txt" ] && [ "$PREFIX" != "$ROOT/prefix" ]; then
+    missing="$(LC_ALL=C comm -23 <(printf '%s\n' "$missing" | sed '/^$/d') "$HERE/symbols-limina.txt")"
+    absent_ext="$(LC_ALL=C comm -12 \
+      <(LC_ALL=C comm -23 "$HERE/symbols.txt" "$TMP/symbols.txt") "$HERE/symbols-limina.txt")"
+    if [ -n "$absent_ext" ]; then
+      echo "note: this leg carries none of the limina extensions ($(printf '%s\n' "$absent_ext" | wc -l | tr -d ' ') symbols)."
+      echo "      expected of a stock upstream build; the Rust build is held to them."
+    fi
+  fi
+
   if [ -n "$missing" ]; then
     echo "symbols missing from $LIB:" >&2
     echo "$missing" | sed 's/^/  - /' >&2
