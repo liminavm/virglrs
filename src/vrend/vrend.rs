@@ -744,10 +744,17 @@ impl Vrend {
         let mut got = 0;
         if status == GL_FRAMEBUFFER_COMPLETE {
             // Tightly packed, then re-pitched below: `glReadPixels` writes one image at the
-            // alignment GL was told, and asking it to write at the caller's stride would make the
-            // pack alignment a second place the row length is decided.
+            // pack state GL was told, and asking it to write at the caller's stride would make
+            // the pack state a second place the row length is decided.
+            //
+            // `pack_tight` and not the alignment alone. `Gl::read_pixels` bounds its slice
+            // against a tightly packed image and says so in its own SAFETY comment -- "with pack
+            // row length zero and alignment 1, which every caller sets" -- so a stale
+            // `GL_PACK_ROW_LENGTH` left on ctx0 by an earlier readback would have the driver
+            // write past the end of `packed` on any host without `glReadnPixelsKHR`. Four fields
+            // decide one fact, and this is the one place that names the fact.
             let mut packed = vec![0u8; width as usize * rows as usize * 4];
-            self.gl.pixel_store_i(GL_PACK_ALIGNMENT, 1);
+            self.gl.pack_tight();
             if self.gl.read_pixels(
                 0,
                 0,
