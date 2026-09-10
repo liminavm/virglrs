@@ -4,7 +4,11 @@
 #
 # Pack the recorded corpora for a release, and write the manifest that pins them.
 #
-#   pack-corpora.sh [OUT]      default: dist/corpora/ under the repository root
+#   pack-corpora.sh [--prune] [OUT]      OUT default: dist/corpora/ under the repository root
+#
+# The manifest is regenerated from what is in harness/vm/captures/, so packing on a host that has
+# only some of the recordings would drop the pins for the rest. That is refused by name; --prune
+# is how a corpus is actually retired.
 #
 # The corpora are recordings, not source: they run to gigabytes raw and compress by about fifty
 # times, because a command stream over mostly-repetitive pixel data is what they are. So a release
@@ -24,6 +28,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/platform.sh"
 CAPTURES="$ROOT/harness/vm/captures"
 MANIFEST="$ROOT/harness/replay/corpora.toml"
+
+PRUNE=0
+if [ "${1:-}" = --prune ]; then PRUNE=1; shift; fi
 OUT="${1:-$ROOT/dist/corpora}"
 
 # One corpus generation, one tag. A release asset replaced in place under an existing tag would
@@ -45,6 +52,30 @@ generator_for() {
 
 command -v zstd >/dev/null || { echo "zstd is not installed" >&2; exit 1; }
 [ -d "$CAPTURES" ] || { echo "no corpora at $CAPTURES — see harness/README.md" >&2; exit 1; }
+
+# The manifest is rewritten from whatever is in CAPTURES, so a host holding a subset of the
+# recordings silently drops the rest -- and the dropped ones are exactly the hosted corpora a
+# second machine has never fetched, which is the normal state of a second machine. The result is
+# a plausible manifest that pins less than the tree needs, and nothing downstream can tell it from
+# a deliberate prune. So say which entries would go and refuse; --prune is how a real removal is
+# spelled, and it has to be typed.
+missing=""
+if [ -f "$MANIFEST" ]; then
+    while read -r name; do
+        [ -n "$name" ] || continue
+        [ -f "$CAPTURES/$name" ] || missing="$missing $name"
+    done <<EOF
+$(sed -n 's/^name = "\(.*\)"$/\1/p' "$MANIFEST")
+EOF
+fi
+if [ -n "$missing" ] && [ "$PRUNE" = 0 ]; then
+    echo "refusing to rewrite $MANIFEST: it pins corpora this host does not have," >&2
+    echo "and rewriting it here would drop them:" >&2
+    for name in $missing; do echo "    $name" >&2; done
+    echo >&2
+    echo "Fetch them first (scripts/fetch-corpora.sh), or pass --prune to drop them on purpose." >&2
+    exit 1
+fi
 
 # Assets go under the tag, which is the layout a release download URL already has
 # (`$base/$tag/$asset`). So `CORPORA_BASE=file://$OUT` is not an approximation of the real fetch
@@ -94,7 +125,11 @@ HEADER
             fi
         fi
     done
-} > "$MANIFEST"
+} > "$MANIFEST.tmp"
+# Only now, with every hash computed and every asset packed, does the pinned file change: the
+# redirection above truncates its target before the loop runs, and a zstd that runs out of disk
+# halfway would otherwise leave a manifest pinning the corpora it got to.
+mv "$MANIFEST.tmp" "$MANIFEST"
 
 echo "==> manifest: $MANIFEST (tag $TAG)"
 echo "==> assets:   $ASSETS"
