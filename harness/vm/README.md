@@ -350,9 +350,20 @@ draining mesa's threaded-context queue, Geometry Stress is the present-path `glF
 is texture upload with no fence cost worth naming.
 
 **Two runs, and read them as two.** Per-test run-to-run spread on this rig reaches 11% (WebGL 2.0
-measured 4409 then 3914), so no single-run single-digit difference is a result. What a pair does
-settle is agreement: Canvas and Draw-call Stress came back within 0.2% of each other across two
-runs, which makes a difference against a third run worth believing.
+measured 4409 then 3914), so no single-run single-digit difference is a result.
+
+**A/B the knob, not the history.** Comparing today's scores against ones recorded before a rebase
+compares two builds of two trees, and attributes to your change whatever else moved. The classic
+fence has `VIRGLRS_FENCE_FINISH=1` for exactly this: one boot each, same bundle, same scripts. It
+is also its own positive control — with the knob on, `finish_all` is 78-88% of the worker on
+Draw-call and Geometry Stress and 16-21% on the *idle result page*; with it off, 0.0% everywhere. A
+knob A/B where both legs agree is a knob that did not take.
+
+**The scores live only in the result page's DOM, and that page sometimes dies.** One run ended at
+`/result/` stuck on "Loading, please wait..." with `JSON.parse: expected double-quoted property
+name` in the console — the site's own failure, after the run had finished and printed its UID.
+Community mode prints the *configuration* to the console, not the results, so there is no fallback:
+re-run the suite. Handing `/run/` to the same browser session works and does not need a fresh boot.
 
 ## Client corpora, and why the C cannot score them
 
