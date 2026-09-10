@@ -429,20 +429,20 @@ impl Surface {
         // compression plane out as chroma at half the width.
         //
         // So a plane past the first exists to be *named* in an import and not to be read as a
-        // picture: only a format that has more than one plane of pixels answers here.
-        if plane > 0 && self.layout.fourcc != DRM_FORMAT_NV12 {
+        // picture, and the FourCC's own rule is what says how many planes of pixels there are.
+        // `plane_rule` is that rule and this asks it rather than carrying a second copy: the
+        // copy that was here said four bytes an element for everything that is not NV12, which
+        // is wrong for R8, RG16 and the four 16-bit-float codes the rule knows.
+        let (pixel_planes, element) = plane_rule(self.layout.fourcc)?;
+        if plane >= pixel_planes {
             return None;
         }
+        // The only multi-plane rule is NV12's, whose chroma is half-resolution in both axes.
         let sub = u32::from(plane > 0);
         let shape = PlaneShape {
             width: self.layout.width >> sub,
             height: self.layout.height >> sub,
-            bytes_per_element: match (self.layout.fourcc, plane) {
-                (DRM_FORMAT_NV12, 0) => 1,
-                (DRM_FORMAT_NV12, _) => 2,
-                // Not a planar format: one plane of whole pixels.
-                _ => 4,
-            },
+            bytes_per_element: element[plane as usize],
             bytes_per_row: p.pitch,
             offset: u32::try_from(p.offset).unwrap_or(u32::MAX),
         };
@@ -1098,11 +1098,37 @@ mod tests {
         for (format, code) in crate::vrend::formats::scanout_fourccs() {
             seen += 1;
             let name: String = code.get().to_le_bytes().iter().map(|b| *b as char).collect();
-            assert!(
-                plane_rule(code.get()).is_some(),
-                "{name} ({}) is offered as a scanout format and cannot be bounded",
-                format.name()
+            let Some((planes, element)) = plane_rule(code.get()) else {
+                panic!(
+                    "{name} ({}) is offered as a scanout format and cannot be bounded",
+                    format.name()
+                );
+            };
+            // And what a plane says about itself is that same rule, not a second copy of it. The
+            // copy that used to live in `Surface::plane` answered four bytes an element for
+            // everything but NV12, so R8 read four times too wide and the 16-bit-float codes
+            // half.
+            let one = Surface::exported(
+                memfd(4096),
+                Layout {
+                    width: 4,
+                    height: 4,
+                    fourcc: code.get(),
+                    modifier: DRM_FORMAT_MOD_LINEAR,
+                    planes: [PlaneLayout { offset: 0, pitch: 64 }; MAX_PLANES],
+                    plane_count: planes,
+                    alloc_size: 4096,
+                },
             );
+            for at in 0..planes {
+                let (shape, _) = one.plane(at).unwrap_or_else(|| {
+                    panic!("{name} has {planes} planes of pixels and would not describe {at}")
+                });
+                assert_eq!(
+                    shape.bytes_per_element, element[at as usize],
+                    "{name} plane {at} disagrees with its own rule"
+                );
+            }
         }
         assert_eq!(seen, 14, "the generated table changed size; check the rules above it");
     }

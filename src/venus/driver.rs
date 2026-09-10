@@ -4959,15 +4959,14 @@ enum Backing {
 enum Planned {
     /// Bytes that exist already -- an import, a surface, or minted pages.
     Ready(Backing),
-    /// A scanout on a host that exports: the driver is about to allocate the storage, and the
-    /// descriptor of it is taken once the call returns.
+    /// A scanout on a host that exports: the driver is about to lay the memory out, and a
+    /// descriptor of it is taken once it has.
     ///
     /// Separate from [`Planned::Deferred`] even though both are settled after the call, because
     /// they are settled into different things and from different information -- this one carries
     /// the image whose layout the descriptor has to be described by, and `Deferred` has no image
     /// at all. Folding them together would mean an `Option<VkImage>` that is `Some` for exactly
     /// one of the two, which is a flag saying which arm it really is.
-    /// The driver is about to lay the memory out, and a descriptor of it is taken once it has.
     ///
     /// `image` is what can describe the result, when anything can: an image has a format, a
     /// tiling and a layout query, so its descriptor comes back as a [`Surface`] a compositor can
