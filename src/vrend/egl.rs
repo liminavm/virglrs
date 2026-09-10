@@ -944,7 +944,16 @@ impl Winsys {
                     code: strides[at],
                 });
             };
-            plane_layout[at] = PlaneLayout { offset: offsets[at].max(0) as u64, pitch };
+            // Refused, not clamped, for the same reason as the pitch two lines up: a negative
+            // offset is not an offset, and reading it as zero would put the plane at the start of
+            // the buffer and describe a picture that is not there.
+            let Ok(offset) = u64::try_from(offsets[at]) else {
+                return Err(EglError {
+                    call: "eglExportDMABUFImageMESA gave a negative plane offset",
+                    code: offsets[at],
+                });
+            };
+            plane_layout[at] = PlaneLayout { offset, pitch };
         }
         // The FourCC the driver reports wins over the one this side would have named. They should
         // agree; where they do not, the driver is describing the bytes it actually wrote, and the

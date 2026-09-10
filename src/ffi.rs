@@ -618,6 +618,10 @@ fn supported_structures(q: &mut abi::SupportedStructures) -> c_int {
 /// than exporting it says about every resource. A caller that asked for descriptors and cannot
 /// have them is refused instead -- handing back `-1` dressed as success is how a VMM comes to
 /// `mmap` nothing.
+///
+/// **Ownership transfers on success only, and a refusal writes no out-parameter.** The same rule
+/// [`virgl_renderer_resource_export_blob`] states, because a caller has no way to know it is
+/// talking to two calls with two rules.
 fn export_query(q: &mut abi::ExportQuery) -> c_int {
     if q.hdr.size as usize != core::mem::size_of::<abi::ExportQuery>() {
         return EINVAL;
@@ -654,33 +658,43 @@ fn export_query(q: &mut abi::ExportQuery) -> c_int {
     if planes == 0 || planes > q.out_fds.len() {
         return EINVAL;
     }
+    // Prepared whole, then written. `virgl_renderer_resource_export_blob` documents the rule this
+    // call has to share -- ownership transfers on success only, and a refusal writes neither
+    // out-parameter -- and a caller cannot apply one call's rule to the other. So the descriptors
+    // live in this vector until nothing can fail: a refusal drops them, which closes them, and
+    // the caller is left owing nothing rather than owning a short count it has to infer.
+    let mut offsets = Vec::with_capacity(planes);
+    let mut dups = Vec::with_capacity(planes);
+    for plane in layout.planes.iter().take(planes) {
+        // The layout's offset is 64-bit and the ABI's field is 32. A narrowing at a boundary is
+        // refused, not truncated: a wrapped offset names a row that is not the plane's.
+        let Ok(offset) = u32::try_from(plane.offset) else {
+            return EINVAL;
+        };
+        offsets.push(offset);
+        // Every plane of a single allocation is the same descriptor at a different offset --
+        // checked where the export happens rather than assumed here, so a layout whose planes
+        // were separate buffers never reaches this. A caller taking ownership needs one per
+        // plane, because it will close each of them. A duplicate even for the first: `fd` is this
+        // call's own reference and is closed when it returns, so handing it out for one plane and
+        // duplicates for the rest would make the planes differ in who closes them.
+        if q.in_export_fds != 0 {
+            let Ok(dup) = fd.try_clone() else {
+                return EINVAL;
+            };
+            dups.push(dup);
+        }
+    }
     q.out_num_fds = planes as u32;
     q.out_fourcc = layout.fourcc;
     q.out_modifier = layout.modifier;
     for (at, plane) in layout.planes.iter().enumerate().take(planes) {
         q.out_strides[at] = plane.pitch;
-        q.out_offsets[at] = plane.offset as u32;
-        // Every plane of a single allocation is the same descriptor at a different offset --
-        // checked where the export happens rather than assumed here, so a layout whose planes
-        // were separate buffers never reaches this. A caller taking ownership needs one per
-        // plane, because it will close each of them.
-        q.out_fds[at] = if q.in_export_fds != 0 {
-            // A duplicate even for the first plane: `fd` is this call's own reference and is
-            // closed when it returns, so handing it out for one plane and duplicates for the
-            // rest would make the planes differ in who closes them.
-            match fd.try_clone() {
-                Ok(dup) => into_raw(dup),
-                // Out of descriptors partway through leaves the caller owning what it already
-                // has: it reads `out_num_fds` and closes that many, so the count is trimmed to
-                // what was actually produced rather than the whole being abandoned.
-                Err(_) => {
-                    q.out_num_fds = at as u32;
-                    return EINVAL;
-                }
-            }
-        } else {
-            -1
-        };
+        q.out_offsets[at] = offsets[at];
+        q.out_fds[at] = -1;
+    }
+    for (at, dup) in dups.into_iter().enumerate() {
+        q.out_fds[at] = into_raw(dup);
     }
     0
 }
