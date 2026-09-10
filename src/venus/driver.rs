@@ -32,7 +32,7 @@ use super::proto::types::{
     VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlags, VkImageBlit, VkImageCopy,
     VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties, VkImageLayout,
     VkImageMemoryBarrier, VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy, VkImageType,
-    VkImageUsageFlagBits, VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
+    VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
     VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance,
     VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo,
     VkMemoryMapFlags, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
@@ -5732,6 +5732,20 @@ unsafe impl OutStruct for VkPhysicalDeviceMemoryBudgetPropertiesEXT {
 ///
 /// A copy, not an edit in place: the decoder's struct is the guest's request, and the round trip
 /// re-encodes it. The `pNext` chain is carried over untouched.
+///
+/// **Only on a host that imports.** Every word above is an argument about host-minted pages: the
+/// driver is handed memory this renderer owns, and a tiled image over it is given private storage
+/// of the driver's own and rendered there, so the surface reads as blank. A host that exports the
+/// driver's own allocation has no such memory to be written past -- the driver tiles as it likes,
+/// the modifier is what the importer is told, and forcing rows here would cost the tiling the
+/// export direction exists to preserve. So this dissolves rather than porting, and the guest's
+/// request goes through untouched.
+#[cfg(not(target_os = "macos"))]
+pub fn external_images_are_linear(info: &VkImageCreateInfo) -> VkImageCreateInfo {
+    *info
+}
+
+#[cfg(target_os = "macos")]
 pub fn external_images_are_linear(info: &VkImageCreateInfo) -> VkImageCreateInfo {
     let mut info = *info;
     if info.tiling != VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
@@ -5787,6 +5801,10 @@ fn chain_find<T: Chained>(mut node: *const core::ffi::c_void) -> Option<T> {
 
 /// Whether an image's `pNext` chain says it is for the world outside this guest -- external
 /// memory with at least one handle type. A link naming no handle types shares nothing.
+///
+/// Only the minting host asks: it is the test [`external_images_are_linear`] keys on, and that
+/// rule does not exist where storage is exported rather than imported.
+#[cfg(target_os = "macos")]
 fn has_external_handle_types(node: *const core::ffi::c_void) -> bool {
     chain_find::<VkExternalMemoryImageCreateInfo>(node).is_some_and(|e| e.handleTypes.0 != 0)
 }
@@ -6911,12 +6929,21 @@ mod tests {
         d.abandon_planted();
     }
 
-    /// An image the guest shares outside this device is created with rows the host can address,
-    /// and only that image: the rule keys on external handle types, and leaves alone an image
-    /// that already chose its layout by DRM format modifier.
+    /// What a shared image's create info becomes, which is not the same question on both hosts.
+    ///
+    /// Where storage is minted here and imported by the driver, an image the guest shares is
+    /// forced to rows the host can address -- a tiled image over imported memory is rendered into
+    /// private storage of the driver's own, and the surface reads blank. Where storage is the
+    /// driver's and this side exports a descriptor of it, there is no imported memory to be
+    /// written past: the driver tiles as it likes and the modifier tells the importer, so the
+    /// guest's request goes through untouched.
+    ///
+    /// Both are pinned here rather than only the local one, because the difference is the third
+    /// KosmicKrisp-ism `docs/linux-port.md` says must dissolve rather than port, and a rule that
+    /// quietly came back would look exactly like this test passing.
     #[test]
     fn an_image_the_guest_shares_is_created_linear() {
-        use super::super::proto::types::VkExternalMemoryHandleTypeFlags;
+        use super::super::proto::types::{VkExternalMemoryHandleTypeFlags, VkImageUsageFlagBits};
         const INPUT: u32 = VkImageUsageFlagBits::VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT.0 as u32;
         const SAMPLED: u32 = VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT.0 as u32;
 
@@ -6941,8 +6968,20 @@ mod tests {
             VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
             (&raw const external).cast(),
         ));
-        assert_eq!(shared.tiling, VkImageTiling::VK_IMAGE_TILING_LINEAR, "made addressable");
-        assert_eq!(shared.usage.0, SAMPLED, "and never an input attachment");
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(shared.tiling, VkImageTiling::VK_IMAGE_TILING_LINEAR, "made addressable");
+            assert_eq!(shared.usage.0, SAMPLED, "and never an input attachment");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                shared.tiling,
+                VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
+                "the driver keeps its own layout, and the modifier is what the importer is told"
+            );
+            assert_eq!(shared.usage.0, SAMPLED | INPUT, "and keeps the usage the guest asked for");
+        }
         assert_eq!(shared.pNext, (&raw const external).cast(), "the chain is the guest's");
 
         let untouched = |why: &str, info: VkImageCreateInfo| {
