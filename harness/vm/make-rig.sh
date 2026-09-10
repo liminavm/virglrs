@@ -92,8 +92,16 @@ build_rust_app() {
 
   # third_party is gitignored in limina, so the worktree has none; it is theirs by symlink.
   mkdir -p "$WT/third_party"
+  # Only the gitignored bulk is linked -- 14 GB of vendored trees that must not be copied. A
+  # TRACKED file (third_party/manifest.toml is the only one) is left to the worktree's own
+  # checkout: symlinking over it is a type change, and the next checkout refuses to run past it
+  # with "local changes would be overwritten", naming a file nobody edited.
   for e in "$LIMINA"/third_party/*; do
-    ln -sfn "$e" "$WT/third_party/$(basename "$e")"
+    n="$(basename "$e")"
+    if git -C "$LIMINA" ls-files --error-unmatch "third_party/$n" > /dev/null 2>&1; then
+      continue
+    fi
+    ln -sfn "$e" "$WT/third_party/$n"
   done
   ln -sfn "$ROOT" "$WT/third_party/virglrs"
 
