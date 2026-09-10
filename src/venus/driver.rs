@@ -4362,9 +4362,9 @@ impl Driver {
                 // at the allocate, and the failure below is the same failure for both.
                 let described = image.map(|image| {
                     let facts = self.images.get(&image).copied();
-                    facts.ok_or(NoSurface::UnknownImage).and_then(|facts| {
-                        export_dmabuf(&mem.device, device, out, image, facts, info.allocationSize.0)
-                    })
+                    facts
+                        .ok_or(NoSurface::UnknownImage)
+                        .and_then(|facts| export_dmabuf(&mem.device, device, out, image, facts))
                 });
                 match described {
                     Some(Ok(surface)) => Backing::Owned {
@@ -6119,7 +6119,6 @@ fn export_dmabuf(
     memory: VkDeviceMemory,
     image: VkImage,
     facts: ImageFacts,
-    alloc_size: u64,
 ) -> Result<Surface, NoSurface> {
     use crate::dmabuf::{
         DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, Layout, MAX_PLANES, PlaneLayout,
@@ -6202,6 +6201,29 @@ fn export_dmabuf(
     }
 
     let fd = memory_fd(d, device, memory)?;
+    // The buffer's own size, asked of the kernel. The guest's `allocationSize` is what it *asked*
+    // for; this is what it got, and it is the figure every read through this surface is bounded
+    // by -- so taking the guest's would make the bound a number the guest chooses. Both are in
+    // hand here, which is exactly why only one of them may be recorded.
+    let size =
+        crate::dmabuf::buffer_size(std::os::fd::AsFd::as_fd(&fd)).ok_or(NoSurface::Layout)?;
+    // And the driver's own layout is checked against it, in the arithmetic `describe` uses for
+    // the guest's. A driver is not the trust boundary the guest is, so this is an assertion about
+    // a host invariant in every way but the response: an image whose planes do not fit its own
+    // buffer is one this side must not read, whoever got it wrong.
+    for (at, plane) in planes.iter().enumerate().take(plane_count as usize) {
+        let end = u64::from(plane.pitch)
+            .checked_mul(u64::from(facts.height))
+            .and_then(|rows| rows.checked_add(plane.offset));
+        if end.is_none_or(|end| end > size) {
+            eprintln!(
+                "[virglrs] venus: the driver's plane {at} does not fit the buffer it exported \
+                 ({:?} of {size} bytes)",
+                end
+            );
+            return Err(NoSurface::Layout);
+        }
+    }
 
     Ok(Surface::exported(
         fd,
@@ -6212,7 +6234,7 @@ fn export_dmabuf(
             modifier,
             planes,
             plane_count,
-            alloc_size,
+            alloc_size: size,
         },
     ))
 }
@@ -7654,6 +7676,12 @@ mod tests {
             "a LINEAR image is linear, and is not asked"
         );
         assert_eq!(surface.plane_count(), 1);
+        // The buffer's extent is the kernel's answer about the buffer, and this driver's export
+        // is deliberately bigger than the guest's request -- an aligned pitch over 48 rows. Two
+        // figures are in hand at the export and only one of them may be recorded, so this asserts
+        // which: reads through the surface are bounded by what the buffer *is*.
+        assert_eq!(surface.alloc_size(), PITCH as u64 * 48, "the kernel's figure for the buffer");
+        assert_ne!(surface.alloc_size(), ASKED, "and not the size the guest asked for");
         // The descriptor is real: it maps, and what is written through it reads back.
         assert_eq!(surface.write_from(&[0x5a; 64]), 64);
         let mut back = [0u8; 64];
