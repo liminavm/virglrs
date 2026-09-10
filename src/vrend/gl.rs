@@ -53,9 +53,9 @@ pub use types::*;
 /// A fence sync object, owned.
 ///
 /// Unlike every other name in this module this is not a `GLuint` the driver hands out but an
-/// opaque pointer, and it owns a driver allocation: dropping it without [`Gl::wait_fence`] leaks
+/// opaque pointer, and it owns a driver allocation: dropping it without [`Gl::fence_delete`] leaks
 /// that allocation, so `Drop` aborts rather than letting the leak pass. There is exactly one way
-/// to make one ([`Gl::fence`]) and one way to spend it ([`Gl::wait_fence`], which consumes it).
+/// to make one ([`Gl::fence`]) and one way to spend it ([`Gl::fence_delete`], which consumes it).
 ///
 /// **`Send`, and that is the point.** A sync object belongs to the share group, not to the context
 /// that created it, so the spec allows any context of that group -- on any thread -- to wait on it
@@ -74,7 +74,7 @@ impl Drop for Fence {
         // A sync object dropped on the floor is a driver allocation nothing will ever free, and
         // the fence it stood for is one the guest may still be waiting on. Both are bugs at the
         // site that dropped it, so say so there rather than leaking quietly.
-        panic!("a Fence was dropped instead of being spent on Gl::wait_fence");
+        panic!("a Fence was dropped instead of being spent on Gl::fence_delete");
     }
 }
 

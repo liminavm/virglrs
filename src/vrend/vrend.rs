@@ -1079,14 +1079,14 @@ impl Vrend {
     ///
     /// The renders live on the queue of whichever sub-context drew them, and a finish waits for
     /// one context's queue only -- so a caller that cannot say whose work it needs has to finish
-    /// them all. A caller that *can* say wants [`Vrend::finish_contexts`]: this one is the
+    /// them all. A caller that *can* say wants `Vrend::finish_contexts`: this one is the
     /// fallback, and it is far too expensive to sit on a path that runs per frame.
     ///
     /// Finishing ctx0 alone is not a substitute, whatever it costs: ctx0 never draws, and the
     /// harness caught that reading the frame before last off a scanout.
     ///
     /// "Every context" means every *guest* context and ctx0. The blitter holds a GL context of its
-    /// own ([`blitter::Blitter`]) and is in neither this nor [`Vrend::finish_contexts`], so a blit
+    /// own ([`blitter::Blitter`]) and is in neither this nor `Vrend::finish_contexts`, so a blit
     /// into a surface-backed destination is waited for by neither. A *fence* does cover it -- the
     /// blitter is left at the end of every blit and a departure is where a sync is taken, so one is
     /// already in hand (see [`Current::switch_to`]) -- but these two finishes still do not, and
