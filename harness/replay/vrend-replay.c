@@ -277,7 +277,7 @@ static bool ctx_wanted(uint16_t id)
       if ((uint16_t)ctx_list[i] == id) return true;
    return false;
 }
-static const char *score_path, *expect_path, *caps_path;
+static const char *score_path, *expect_path, *caps_path, *overlay_path;
 static const char *rb_score_path, *rb_expect_path;
 static bool zero_new = true;
 
@@ -360,6 +360,151 @@ static void diff_lines(const char *a, const char *b)
       a = ae ? ae + 1 : a + an;
       b = be ? be + 1 : b + bn;
    }
+}
+
+/* ---- comparing a score against a fixture recorded elsewhere -------------------------------
+ *
+ * A score is three kinds of line at once. Most are renderer facts, and must agree on every host.
+ * Some are pixel hashes, which are the GL driver's arithmetic: a separable blur accumulates in a
+ * different order on another driver and the last bits move, with every pixel still inked. And
+ * some are lines a leg cannot produce at all, because the thing they read does not exist there.
+ *
+ * One golden cannot carry all three, and a golden per host is the wrong answer to that: 335 of
+ * `vrend.score`'s 341 lines must agree, and a second copy of them is a second writer of one fact
+ * -- the pair drifts the first time only one of them is re-recorded. So the fixture holds what
+ * must agree; an OVERLAY names the few lines this driver reads differently, and is named for the
+ * driver rather than the OS, because the driver is what decides them; and a line the leg cannot
+ * reach is skipped, counted and reported rather than failed. */
+
+/* The key a line is addressed by: its first token if that token carries an `=` (`res=387`),
+ * otherwise its first two (`loop 0`, `iosurface res=21`, `probe transfer-of-unknown-resource`).
+ * Every score line is uniquely named by that much. Deliberately not positional: an overlay whose
+ * lines moved when the corpus grew a resource would be an overlay nobody could review. */
+static size_t line_key(const char *line, size_t len)
+{
+   size_t i = 0;
+   while (i < len && line[i] != ' ') i++;
+   if (memchr(line, '=', i)) return i;
+   if (i < len) {
+      size_t j = i + 1;
+      while (j < len && line[j] != ' ') j++;
+      return j;
+   }
+   return i;
+}
+
+static size_t line_len(const char *p) { const char *e = strchr(p, '\n'); return e ? (size_t)(e - p) : strlen(p); }
+
+#if !HAVE_IOSURFACE
+/* Whether a line is one only a leg with the IOSurface reads can produce. */
+static bool iosurface_line(const char *p, size_t n)
+{
+   return n >= 10 && !memcmp(p, "iosurface ", 10);
+}
+#endif
+
+/* The fixture and the score, reduced to what THIS leg can be asked about.
+ *
+ * Applied to both sides, so the skip is symmetric: it removes a question, never an answer. The
+ * count comes back so the run can say how much of the fixture went unmeasured -- a skip nobody
+ * is told about is indistinguishable from a pass, which is the whole failure this guards. */
+static char *for_comparison(const char *src, unsigned *skipped)
+{
+   *skipped = 0;
+#if HAVE_IOSURFACE
+   return strdup(src);
+#else
+   char *out = malloc(strlen(src) + 32);
+   if (!out) return NULL;
+   size_t w = 0;
+   for (const char *p = src; *p; ) {
+      size_t n = line_len(p);
+      if (iosurface_line(p, n)) {
+         (*skipped)++;
+      } else {
+         /* The count of IOSurfaces this leg backed is not a measurement here either. Neutralised
+          * rather than dropped, because it is one field of the loop line and the rest of that
+          * line -- every command, transfer and submit -- is exactly what must still agree. */
+         const char *f = NULL;
+         for (size_t i = 0; i + 17 <= n; i++)
+            if (!memcmp(p + i, "iosurface-backed ", 17)) { f = p + i; break; }
+         if (f) {
+            size_t head = (size_t)(f - p) + 17;
+            memcpy(out + w, p, head); w += head;
+            memcpy(out + w, "skipped", 7); w += 7;
+            const char *t = f + 17;
+            while (t < p + n && *t >= '0' && *t <= '9') t++;
+            memcpy(out + w, t, (size_t)(p + n - t)); w += (size_t)(p + n - t);
+         } else {
+            memcpy(out + w, p, n); w += n;
+         }
+         out[w++] = '\n';
+      }
+      p += n + (p[n] == '\n');
+   }
+   out[w] = 0;
+   return out;
+#endif
+}
+
+/* Replace each of the fixture's lines with the overlay's line of the same key.
+ *
+ * Every failure mode here is an error rather than a no-op, because each one leaves an overlay
+ * that quietly corrects nothing -- and a fixture nobody notices has stopped being corrected is
+ * scored against the wrong driver's numbers while reading green. A key the fixture does not
+ * carry is a stale line; a key it carries twice cannot be addressed; and a line identical to the
+ * one it replaces says this line is no longer driver-specific, which is a finding to act on and
+ * not something to leave lying in a file. */
+static char *apply_overlay(const char *want, const char *ov, const char *ov_path, int *ok)
+{
+   char *out = malloc(strlen(want) + strlen(ov) + 2);
+   if (!out) { *ok = 0; return NULL; }
+   size_t w = 0;
+
+   for (const char *p = want; *p; ) {
+      size_t n = line_len(p);
+      size_t k = line_key(p, n);
+      const char *use = p; size_t use_n = n;
+
+      for (const char *q = ov; *q; ) {
+         size_t m = line_len(q);
+         if (m && q[0] != '#' && line_key(q, m) == k && !memcmp(q, p, k)) {
+            if (m == n && !memcmp(q, p, n)) {
+               fprintf(stderr, "%s: line for `%.*s` is identical to the fixture's -- this line is "
+                               "no longer driver-specific, drop it from the overlay\n",
+                       ov_path, (int)k, p);
+               *ok = 0;
+            }
+            use = q; use_n = m;
+            break;
+         }
+         q += m + (q[m] == '\n');
+      }
+      memcpy(out + w, use, use_n); w += use_n;
+      out[w++] = '\n';
+      p += n + (p[n] == '\n');
+   }
+   out[w] = 0;
+
+   /* Every overlay line has to have landed somewhere. */
+   for (const char *q = ov; *q; ) {
+      size_t m = line_len(q);
+      if (m && q[0] != '#') {
+         size_t k = line_key(q, m), hits = 0;
+         for (const char *p = want; *p; ) {
+            size_t n = line_len(p);
+            if (line_key(p, n) == k && !memcmp(p, q, k)) hits++;
+            p += n + (p[n] == '\n');
+         }
+         if (hits != 1) {
+            fprintf(stderr, "%s: `%.*s` names %s in the fixture\n", ov_path, (int)k, q,
+                    hits ? "more than one line" : "no line");
+            *ok = 0;
+         }
+      }
+      q += m + (q[m] == '\n');
+   }
+   return out;
 }
 
 
@@ -1129,6 +1274,7 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--rebuild-expect") && i + 1 < argc) rb_expect_path = argv[++i];
       else if (!strcmp(argv[i], "--score") && i + 1 < argc) score_path = argv[++i];
       else if (!strcmp(argv[i], "--expect") && i + 1 < argc) expect_path = argv[++i];
+      else if (!strcmp(argv[i], "--expect-overlay") && i + 1 < argc) overlay_path = argv[++i];
       else if (!strcmp(argv[i], "--caps") && i + 1 < argc) caps_path = argv[++i];
       else if (!strcmp(argv[i], "--flags") && i + 1 < argc)
          flag_override = (long)strtoul(argv[++i], NULL, 0);
@@ -1794,11 +1940,50 @@ int main(int argc, char **argv)
             ok = 0;
          } else {
             want[elen] = 0;
-            if ((size_t)elen == total && !memcmp(want, text, total)) {
+
+            /* The fixture, corrected for this driver and reduced to what this leg can be asked
+             * about, against the score reduced the same way. Both transforms are on copies: what
+             * --score writes is the run's own answer and is never edited to match a golden. */
+            if (overlay_path) {
+               FILE *of = fopen(overlay_path, "rb");
+               if (!of) {
+                  fprintf(stderr, "reading %s: %s\n", overlay_path, strerror(errno));
+                  ok = 0;
+               } else {
+                  fseek(of, 0, SEEK_END);
+                  long olen = ftell(of);
+                  fseek(of, 0, SEEK_SET);
+                  char *ov = malloc((size_t)olen + 1);
+                  if (!ov || fread(ov, 1, (size_t)olen, of) != (size_t)olen) {
+                     fprintf(stderr, "short read of %s\n", overlay_path);
+                     ok = 0;
+                  } else {
+                     ov[olen] = 0;
+                     int ov_ok = 1;
+                     char *merged = apply_overlay(want, ov, overlay_path, &ov_ok);
+                     if (!ov_ok) ok = 0;
+                     if (merged) { free(want); want = merged; }
+                     fprintf(stderr, "overlay %s applied to %s\n", overlay_path, expect_path);
+                  }
+                  free(ov);
+                  fclose(of);
+               }
+            }
+
+            unsigned want_skipped = 0, have_skipped = 0;
+            char *want_cmp = for_comparison(want, &want_skipped);
+            char *have_cmp = for_comparison(text, &have_skipped);
+            if (want_skipped)
+               fprintf(stderr, "skipped: %u line(s) of %s this leg cannot read\n",
+                       want_skipped, expect_path);
+            if (!want_cmp || !have_cmp) {
+               fprintf(stderr, "out of memory comparing the score\n");
+               ok = 0;
+            } else if (!strcmp(want_cmp, have_cmp)) {
                fprintf(stderr, "score matches %s\n", expect_path);
             } else {
                fprintf(stderr, "SCORE DIFFERS from %s:\n", expect_path);
-               diff_lines(want, text);
+               diff_lines(want_cmp, have_cmp);
                /* A hash says two implementations disagree and nothing about how. The pixels
                 * behind it are gone by now -- they are read, hashed and freed one resource at a
                 * time, and keeping every readback against the chance of a mismatch would hold a
@@ -1811,6 +1996,8 @@ int main(int argc, char **argv)
                           "offscreens, half2png.py for a half-float one such as a blob window)\n");
                ok = 0;
             }
+            free(want_cmp);
+            free(have_cmp);
          }
          free(want);
          fclose(ef);
