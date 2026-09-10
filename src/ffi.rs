@@ -660,8 +660,10 @@ fn export_query(q: &mut abi::ExportQuery) -> c_int {
     for (at, plane) in layout.planes.iter().enumerate().take(planes) {
         q.out_strides[at] = plane.pitch;
         q.out_offsets[at] = plane.offset as u32;
-        // Every plane of a single allocation is the same descriptor at a different offset. A
-        // caller taking ownership needs one per plane, because it will close each of them.
+        // Every plane of a single allocation is the same descriptor at a different offset --
+        // checked where the export happens rather than assumed here, so a layout whose planes
+        // were separate buffers never reaches this. A caller taking ownership needs one per
+        // plane, because it will close each of them.
         q.out_fds[at] = if q.in_export_fds != 0 {
             // A duplicate even for the first plane: `fd` is this call's own reference and is
             // closed when it returns, so handing it out for one plane and duplicates for the
