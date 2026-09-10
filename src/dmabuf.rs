@@ -38,7 +38,7 @@
 //! arithmetic is ordinary Rust, and the export call itself belongs to the driver module that owns
 //! the device.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -596,16 +596,29 @@ pub struct Descriptor {
     said: AtomicBool,
 }
 
+/// How big a dma-buf is, according to the kernel.
+///
+/// `dma_buf_llseek` exists to answer exactly this, and it is the only figure for a buffer that
+/// nobody in the guest chooses -- which is what makes it the one every bound is measured against.
+/// `None` for a buffer of no size, which is a descriptor nothing can be read through and which
+/// would make every such bound vacuous.
+///
+/// One place, because there are two callers: a descriptor the guest will describe later, and an
+/// export the driver describes now. The second used to take the guest's `allocationSize` for the
+/// same field, which is the pair this tree spells as one value.
+pub fn buffer_size(fd: std::os::fd::BorrowedFd<'_>) -> Option<u64> {
+    // SAFETY: a descriptor the caller owns for the length of the borrow; `lseek` reads its size
+    // and moves a file offset nothing here uses.
+    let end = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) };
+    u64::try_from(end).ok().filter(|n| *n != 0)
+}
+
 impl Descriptor {
     /// Take ownership of a descriptor the driver just exported, and ask the kernel how big it is.
     ///
-    /// `None` for a buffer of no size, which is a descriptor nothing can be read through and
-    /// which would make every bound below vacuous.
+    /// `None` for a buffer of no size -- see [`buffer_size`].
     pub fn exported(fd: OwnedFd) -> Option<Descriptor> {
-        // SAFETY: a descriptor this call owns; `lseek` on a dma-buf reads its size and moves a
-        // file offset nothing here uses.
-        let end = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) };
-        let size = u64::try_from(end).ok().filter(|n| *n != 0)?;
+        let size = buffer_size(fd.as_fd())?;
         Some(Descriptor { fd, id: next_id(), size, said: AtomicBool::new(false) })
     }
 
