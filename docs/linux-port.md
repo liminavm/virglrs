@@ -164,20 +164,28 @@ the count of *executed* tests is part of the gate, not the pass rate.
 
 ### Phase 2 — port the replayers (1–2 weeks)
 
-Neither replayer runs on Linux; this is what makes any scoring possible.
+The replayers are what make any scoring possible.
 
-- `vrend-replay.c`: replace the IOSurface leg with a scanout read both legs serve.
-- The venus replayer: the sixteen `limina_*` symbols exist in the fork off-Apple, so it should
-  load — confirm, and fix what phase 0's inventory says is unrun.
+- `vrend-replay.c`: what it may call is a property of the leg it linked, not of the platform, so
+  `build.sh` asks the library what it exports and compiles the rest out. `--rebuild` refuses on a
+  leg without the journal rather than silently scoring nothing.
+- **The venus replayer has one leg on Linux.** `vkr-replay` feeds the ring without a VM through
+  `virgl_renderer_limina_replay_begin`/`_end`, which are ours; upstream exports neither, and there
+  is no route to the ring that does not go through them. It refuses such a library by name rather
+  than producing a score for a renderer it never drove. The two ways back are to make the fork
+  build off Darwin, or to drive a real ring through the public ABI — which is a VMM's job, and
+  would not score the transport anyway. Neither is worth its cost yet.
 - Decide whether the C leg gains a Linux scanout read or the replayer exports and mmaps the
   dma-buf itself. **This blocks phase 6's gate**, so decide it here.
 
-**Gate:** both replayers run a corpus end to end on both legs and produce a score file. Not a
-matching score — a score. Matching is phase 3.
+**Gate:** the replayers run a corpus end to end on every leg they have and produce a score file.
+Not a matching score — a score. Matching is phase 3.
 
 ### Phase 3 — score, and triage the divergences (1 week)
 
-Re-record every fixture from the Linux fork leg, then score the Rust leg against it.
+Re-record every classic fixture from the Linux C leg, then score the Rust leg against it.
+Venus has no second leg here, so its scores are pinned against themselves and only move
+deliberately.
 
 Each divergence goes into one of three buckets: (a) a real virglrs gap the macOS host could not
 reach; (b) a KK-ism encoded as a general truth; (c) a corpus that does not mean the same thing on
