@@ -297,19 +297,30 @@ the failure is indistinguishable from the console pref not taking. Write the pro
 `console.log` to the process's stdout; timestamp each line and the host's sample windows can be
 aimed by them.
 
-**Still open: reading the scores back, and the reason is not scraping.** A community-mode run
-prints a UID to the console when it finishes, but `/api/results/details/<uid>/` answers *not found*
-on both `web.gpuscore.com` and `web.basemark.com`, and the configuration block says why:
-`Database: Unavailable`. The run is never stored server-side, so there is nothing to fetch and the
-result page loads forever. Two dead ends worth not repeating: `/result/json/` returns the SPA shell
-for any unknown path, and `firefox --headless --screenshot` renders correctly but fires on the load
-event, which on a client-rendered page captures "Loading, please wait..." (it also wants no other
-Firefox running, and a profile directory that already exists).
+**Reading the scores back, and aiming the windows: Marionette.** Start Firefox with
+`--marionette` and drive it over TCP 2828; `marionette.py` is a ~100-line client with three verbs
+(`js`, `click`, `wait`). It answers both problems this rig had:
 
-So the per-test scores exist only in the DOM of the page that ran them. The routes are Marionette
-on the run instance -- `--marionette`, then a small client over TCP 2828 to read the result table
-once it appears -- or a person reading the screen. Until one is built, a cycle's output is the
-profile, and the score is read by a person.
+  * **Aiming.** While a test runs, the page's location is
+    `/run/tests/<n>/graphics_suite/<test_name>/`. Poll `document.location.pathname` before each
+    sample window and the window is attributable to one named test rather than to the suite.
+  * **Scores.** They are in the DOM of the page that ran them; `document.body.innerText` on the
+    result page gives every per-test number. Do not go looking for them on the server: the UID a
+    community-mode run prints is not a stored result (`/api/results/details/<uid>/` answers 404 on
+    both hosts, and the configuration block says `Database: Unavailable`), and `/result/json/`
+    returns the SPA shell for any unknown path. `firefox --headless --screenshot` renders but fires
+    on the load event, so on a client-rendered page it captures "Loading, please wait...".
+
+**A run gets its own negative control for free.** The suite ends on a result page that draws
+nothing, so a window sampled there should show the gpu worker at ~0% renderer work -- measured
+0.1%, against 43.6% on Geometry Stress in the same run. Take one. Without it, "the worker was busy"
+is not evidence the aiming worked, and this rig has already produced a full, plausible profile of a
+benchmark that was not running.
+
+**What the aiming is worth**, from the first cycle that had it: Geometry Stress is 43.6%
+`st_glFinish` and 23.1% `resource_sync_iosurface`; Canvas is 35.6% `transfer::write` and 30.1%
+`st_glFinish`; SVG barely reaches the renderer at all (4.3%). Those are three different targets,
+and a whole-suite profile averages them into one misleading number.
 
 ## Client corpora, and why the C cannot score them
 
