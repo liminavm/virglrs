@@ -1,0 +1,16 @@
+# The lines of vrend.score that this GL driver reads differently, and only
+# those: everything else must agree with it byte for byte.
+#
+# Pixel hashes only, and each has been looked at rather than assumed.
+# Five of these are one gaussian drop shadow, drawn on five surfaces: a separable blur
+# accumulates in a different order here and the last bits move. res=459 is the cursor arrow,
+# three pixels of antialiased edge. Ink is unchanged on all six, so the same pixels are lit --
+# what moved is the arithmetic, not the drawing.
+#
+# Recorded against: OpenGL ES 3.2 Mesa 26.1.8 (gles 32)
+res=387 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=406 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=400 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=431 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=436 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=459 32x32 hash=d985b226ca0d182a ink=485/1024

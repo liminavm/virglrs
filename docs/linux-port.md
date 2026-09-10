@@ -246,8 +246,19 @@ pinned as "zero or unstable" and non-zero is not a pass.
 - Confirm which winsys flag the Linux VMM passes; `egl.rs:96-99` binds GLES only, and the classic
   caps probe is live (`caps.rs:304-322`) so it adapts.
 
-**Gate:** the replayer's own dma-buf read, hashed after a flush, matching the C leg. The read
-is the harness's, so both legs are scored by the same code and a difference is the renderer's.
+**The lines this turns green are already named.** Six fixture lines are skipped on Linux for want
+of a surface to read — five scanout IOSurfaces in `vrend.score`, one in `blit.score` — and the
+replay reports them as skipped on every run, so the count is the gate's own progress bar. Two of
+them are the other half of `vrend-nodraw`'s positive control, which on Linux currently moves only
+its 19 offscreens. `blit.score`'s is the red/blue variant, and it is skipped twice over: nothing
+reads its destination, and `needs_redblue_swizzle` cannot fire either, because it is predicated on
+a BGRA resource that cannot be viewed and only a surface-backed one qualifies. Whether it comes
+back depends on whether a dma-buf-imported BGRA EGLImage supports a view here — which the import
+work will answer directly.
+
+**Gate:** the replayer's own dma-buf read, hashed after a flush, matching the C leg, and the
+skipped count reaching zero. The read is the harness's, so both legs are scored by the same code
+and a difference is the renderer's.
 
 ### Phase 7 — a guest, and a pixel (1 week; the only real gate)
 
