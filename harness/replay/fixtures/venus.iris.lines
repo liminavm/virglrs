@@ -1,0 +1,16 @@
+# What `venus` still means on a driver that did not record it.
+#
+# Generated from a run, never transcribed from a diff. A corpus replays the guest's memory type
+# indices verbatim, and this one's guest chose them out of KosmicKrisp's heaps; the same indices
+# on anv are device-local, so nothing the content half of the score describes is addressable here
+# and its `mem`, `blob` and `iosurface` lines measure nothing. Those are left unpinned rather than
+# pinned at zero. What is here is acceptance, which means the same thing on any driver -- see
+# `compare_lines` in harness/replay/rs/src/main.rs and "What Linux scores, and what it cannot" in
+# harness/README.md.
+prologue 0 / 0
+cmds 506657 / 506657
+ctl 585 / 606
+skipped flow-control 72172
+skipped classic [2, 4, 5, 6, 7]
+unreplayable imports []
+parked 0

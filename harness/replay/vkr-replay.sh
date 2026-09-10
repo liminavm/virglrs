@@ -7,8 +7,10 @@
 #   vkr-replay.sh <corpus.vkrc> --renderer rs|c|<libvirglrenderer.dylib> [replayer options]
 #
 # --score <file> writes the score; --expect <file> compares against a pinned one and exits
-# non-zero on any difference. The score is renderer state, not pixels: a VM-free replay has no
-# scanout, so what it compares is the accept counts and the device memory the commands left.
+# non-zero on any difference; --expect-lines <file> compares against a fixture that pins only some
+# of the score's lines, for a corpus whose content half means nothing on this driver. The score is
+# renderer state, not pixels: a VM-free replay has no scanout, so what it compares is the accept
+# counts and the device memory the commands left.
 #
 # Which renderer to run is mandatory: --renderer rs (the Rust tree) or c (the reference C), or a
 # dylib path of your own, or VIRGL_PREFIX set to a prefix. There is deliberately no default. A
@@ -32,8 +34,9 @@ usage() {
 case "$CORPUS" in /*) ;; *) CORPUS="$(pwd)/$CORPUS" ;; esac
 shift
 
-# Resolve --score/--expect against the caller's directory too: everything below runs from the
-# script's own, and a relative golden path would otherwise land somewhere the caller cannot see.
+# Resolve --score/--expect/--expect-lines against the caller's directory too: everything below
+# runs from the script's own, and a relative golden path would otherwise land somewhere the caller
+# cannot see.
 ARGS=()
 CHOICE=""
 # The snapshot-journal gate runs by default on the Rust tree, the same as the classic replayer's.
@@ -48,7 +51,7 @@ while [ $# -gt 0 ]; do
       CHOICE="${2:-}"
       [ -n "$CHOICE" ] || { echo "--renderer wants rs, c, or a dylib path" >&2; exit 2; }
       shift 2 ;;
-    --score|--expect)
+    --score|--expect|--expect-lines)
       case "${2:-}" in
         /*) ARGS+=("$1" "$2") ;;
         "") echo "$1 wants a path" >&2; exit 2 ;;

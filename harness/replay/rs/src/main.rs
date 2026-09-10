@@ -58,6 +58,8 @@ struct Args {
     score: Option<String>,
     /// Compare the score against this file and fail on any difference.
     expect: Option<String>,
+    /// Compare the score against a file that pins only some of its lines. See `compare_lines`.
+    expect_lines: Option<String>,
     /// Exercise only what a skeleton owes: init, context create, resource create. No replay feed,
     /// no commands, no scoring. This is P1's gate -- a renderer that gets through it has a working
     /// ABI, resource table and context table, which is all a skeleton claims.
@@ -78,6 +80,7 @@ fn parse_args() -> Result<Args, String> {
     let mut verbose = false;
     let mut score = None;
     let mut expect = None;
+    let mut expect_lines = None;
     let mut smoke = false;
     let mut rebuild = false;
     let mut rebuild_at = None;
@@ -95,6 +98,9 @@ fn parse_args() -> Result<Args, String> {
             "--verbose" => verbose = true,
             "--score" => score = Some(it.next().ok_or("--score wants a path")?),
             "--expect" => expect = Some(it.next().ok_or("--expect wants a path")?),
+            "--expect-lines" => {
+                expect_lines = Some(it.next().ok_or("--expect-lines wants a path")?)
+            }
             "--smoke" => smoke = true,
             "--rebuild" => rebuild = true,
             "--rebuild-at" => {
@@ -116,6 +122,14 @@ fn parse_args() -> Result<Args, String> {
     if smoke && rebuild {
         return Err("--smoke replays nothing, so there is no journal to rebuild from".into());
     }
+    if smoke && expect_lines.is_some() {
+        return Err("--smoke scores nothing; drop --expect-lines".into());
+    }
+    if expect.is_some() && expect_lines.is_some() {
+        // Two fixtures over one score, and nothing says which is the authority. The reader of a
+        // failure would have to work out which file the verdict came from.
+        return Err("--expect and --expect-lines are two goldens for one score; pass one".into());
+    }
     Ok(Args {
         corpus: corpus.ok_or("no corpus given")?,
         renderer: renderer
@@ -125,6 +139,7 @@ fn parse_args() -> Result<Args, String> {
         verbose,
         score,
         expect,
+        expect_lines,
         smoke,
         rebuild,
         rebuild_at,
@@ -1276,6 +1291,68 @@ fn score_text(t: &Tally, census: &[String]) -> String {
     out
 }
 
+/// Compare the score against a fixture that pins some of its lines rather than all of them.
+///
+/// `--expect` is the whole score and stays the gate wherever a host can produce a whole score.
+/// A venus corpus on another driver cannot. A corpus is a recording, and a recording replays the
+/// guest's `memoryTypeIndex` verbatim; where those types were host-visible on the host that
+/// recorded them and are device-local here, the allocations the content half describes never
+/// become addressable, so the `mem`, `blob` and `iosurface` lines report nothing this run
+/// measured. A golden of those is a corpus of zeros agreeing with itself. Acceptance still means
+/// the same thing on any driver, and this pins that.
+///
+/// It is not a weaker `--expect` for anyone to reach for, and three rules keep it from becoming
+/// one. `prologue`, `cmds` and `ctl` must be pinned, so every failure the score counts moves a
+/// pinned line and cannot be dropped by choosing a smaller fixture. A fixture that pins every
+/// line is refused, because that is `--expect` spelled longer. And the count it did not pin is
+/// part of the verdict, because a subset nobody is told about reads exactly like a pass.
+///
+/// Lines are matched whole and by value, not by position: what a fixture pins is a fact the score
+/// must still state, and where the score states it is the score's business.
+fn compare_lines(want: &str, score: &str, path: &str) -> bool {
+    let pins: Vec<&str> =
+        want.lines().map(str::trim_end).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+    let have: Vec<&str> = score.lines().collect();
+    let key = |l: &str| l.split_whitespace().next().unwrap_or("").to_string();
+
+    if pins.is_empty() {
+        eprintln!("vkr-replay: {path} pins no lines");
+        return false;
+    }
+    for owed in ["prologue", "cmds", "ctl"] {
+        if !pins.iter().any(|l| key(l) == owed) {
+            eprintln!(
+                "vkr-replay: {path} does not pin `{owed}`, so a failure the score counts would \
+                 move no pinned line"
+            );
+            return false;
+        }
+    }
+
+    let mut ok = true;
+    for pin in &pins {
+        if have.contains(pin) {
+            continue;
+        }
+        ok = false;
+        eprintln!("PINNED LINE MISSING from the score, per {path}:");
+        eprintln!("  - {pin}");
+        for line in have.iter().filter(|l| key(l) == key(pin)) {
+            eprintln!("  + {line}");
+        }
+    }
+    if ok && pins.len() == have.len() {
+        eprintln!("vkr-replay: {path} pins every line of the score -- use --expect");
+        return false;
+    }
+    eprintln!(
+        "{} of {} score lines pinned by {path}; the rest are not compared",
+        pins.len(),
+        have.len()
+    );
+    ok
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
@@ -1283,7 +1360,8 @@ fn main() -> ExitCode {
             eprintln!("vkr-replay: {e}");
             eprintln!(
                 "usage: vkr-replay <corpus.vkrc> --renderer <lib> [--flags N] [--verbose]\n\
-                 \x20               [--score <file>] [--expect <file>] [--smoke] [--rebuild]"
+                 \x20               [--score <file>] [--expect <file>] [--expect-lines <file>]\n\
+                 \x20               [--smoke] [--rebuild]"
             );
             return ExitCode::FAILURE;
         }
@@ -1315,7 +1393,11 @@ fn main() -> ExitCode {
     let score = score_text(&t, &census);
     print!("{score}");
 
-    let mut ok = t.failed() == 0;
+    // What makes the run fail. Normally every failure the tally counted. With `--expect-lines`
+    // the pinned lines carry the prologue, command and ctl failures -- the fixture refuses one
+    // that does not pin them -- so the fixture is what judges those, and `rebuild_fail`, which
+    // the score text deliberately does not carry, is the one that stays fatal on its own.
+    let mut ok = if args.expect_lines.is_some() { t.rebuild_fail == 0 } else { t.failed() == 0 };
 
     if let Some(path) = &args.score {
         if let Err(e) = std::fs::write(path, &score) {
@@ -1344,6 +1426,16 @@ fn main() -> ExitCode {
                 }
                 ok = false;
             }
+            Err(e) => {
+                eprintln!("vkr-replay: reading {path}: {e}");
+                ok = false;
+            }
+        }
+    }
+
+    if let Some(path) = &args.expect_lines {
+        match std::fs::read_to_string(path) {
+            Ok(want) => ok = compare_lines(&want, &score, path) && ok,
             Err(e) => {
                 eprintln!("vkr-replay: reading {path}: {e}");
                 ok = false;

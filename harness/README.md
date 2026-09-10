@@ -886,6 +886,22 @@ first time only one is re-recorded. So:
   naming a key the fixture does not carry is refused; so is a line identical to the one it
   replaces, which says the difference is gone and the line belongs deleted.
 
+- **`--expect-lines <file>`** is the venus side's answer to a different problem, and the only
+  place a golden is *smaller* than the score. An overlay corrects lines this driver reads
+  differently; this one is for lines this driver does not read at all, because the corpus asked
+  another host for the memory behind them. A venus corpus replays the guest's `memoryTypeIndex`
+  verbatim, so its content half describes allocations that are addressable only on the heaps that
+  recorded it. Pinning those at zero would be a corpus of zeros agreeing with itself, so they are
+  left unpinned and acceptance is what the fixture carries.
+
+  Three rules keep it from being a weaker `--expect` for anyone to reach for: `prologue`, `cmds`
+  and `ctl` must be pinned, so every failure the score counts moves a pinned line and cannot be
+  dropped by choosing a smaller fixture; a fixture that pins every line is refused as `--expect`
+  spelled longer; and the fraction it did pin is part of the verdict, because a subset nobody is
+  told about reads exactly like a pass. `rebuild_fail` is not in the score text, so the rebuild
+  gate stays fatal on its own -- which is what keeps `synoik` out (below). Lines match whole and
+  by value rather than by position.
+
 - **Lines the leg cannot read are skipped, counted and reported** — not compared, and not
   silently dropped. `skipped: 5 line(s) of fixtures/vrend.score this leg cannot read` is part of
   the verdict. On both hosts the count is now zero; it stays in the verdict because a skip nobody
@@ -893,9 +909,11 @@ first time only one is re-recorded. So:
   same reason, rather than printed as `0`: a leg that took no measurement must not report one, and
   the rest of that line is exactly what still has to agree.
 
-**What Linux scores, and what it cannot.** Nine corpora are green there — `blit`, `sampled`,
+**What Linux scores, and what it cannot.** Eleven corpora are green there — `blit`, `sampled`,
 `surface`, `teardown`, `vrend`, `vrend-shm`, `vrend-vkclient`, `vrend-vkclient-nofeed` and
-`vrend-webgl`, the last three carrying their journal pins. The rest are not failing; they are
+`vrend-webgl`, the last three carrying their journal pins, plus `venus` and `synoik-lifecycle` on
+their acceptance lines alone (see `--expect-lines` above, and the venus bullet below for what that
+does and does not carry). The rest are not failing; they are
 measuring nothing, and the difference matters because a corpus of zeros agrees with itself:
 
 - **The video corpora** (`vrend-vp9stock`, `vrend-h264`, `vrend-hevc`, both `vrend-composite`
@@ -921,11 +939,15 @@ measuring nothing, and the difference matters because a corpus of zeros agrees w
   fields move too, because `pad_for_blob` pads a host-visible type and leaves a device-local one
   alone. **A live Linux guest never reaches this**: it picks from the mask anv actually
   advertises, so the missing content is neither a virglrs gap nor something the renderer can fix,
-  and only a Linux-recorded corpus or a boot has a content half at all. `synoik` and
-  `synoik-glclient` are `vrend-overview`-shaped here -- their whole value is the census, so they
-  measure nothing and must not be pinned. `venus` and `synoik-lifecycle` diverge in five lines and
-  two because they had almost no content half to lose, so what a pin of those two would carry is
-  command acceptance and context teardown, never bytes.
+  and only a Linux-recorded corpus or a boot has a content half at all. One cause, three refusals: an allocation with
+  no host address, a blob larger than the allocation because `pad_for_blob` rounds a host-visible
+  type and leaves a device-local one alone, and -- once the guest has freed it -- no allocation at
+  all. `venus` and `synoik-lifecycle` are pinned here with `--expect-lines` and
+  `fixtures/*.iris.lines`, seven acceptance lines each at their own Linux values, which is 7 of 13
+  and 7 of 11 score lines; `cmds 506657 / 506657` on the largest corpus in the tree is a real
+  wedge detector and it is not bytes. `synoik` and `synoik-glclient` are `vrend-overview`-shaped
+  here and stay unpinned: their whole value is the census, only 7 of 32 lines would be pinnable,
+  and the rebuild gate fails on the same unaddressable allocations.
 
 **The C leg is not always the better oracle on Linux.** Upstream loses to virglrs on three corpora,
 and in each the Rust leg is the one matching the macOS fixture: `vrend-vkclient` (upstream feeds 0
