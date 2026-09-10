@@ -11,8 +11,11 @@
 //! cursor update queued behind a drain of the aquarium's frame, and the desktop went sticky under
 //! load in a way no throughput number showed.
 //!
-//! So the wait moves here. The submitting thread takes a sync object and flushes -- which costs
-//! it a flush, not a drain -- and hands the fence to this thread, which waits on a context of its
+//! So the wait moves here. The submitting thread takes a sync object and flushes -- which costs it
+//! a flush rather than a wait for the GPU, though not nothing: measured, `glFenceSync` is 21% of
+//! the worker under a draw-call-heavy workload and 79% of that is blocked in mesa's `tc_flush`,
+//! waiting for the threaded context's own thread to drain its batch queue -- and hands the fence to
+//! this thread, which waits on a context of its
 //! own and retires through [`crate::fence::Handle`] when the work has run. It holds no renderer
 //! and no renderer lock, so nothing else queues behind it.
 //!
@@ -50,11 +53,39 @@ enum Retire {
     Global(ClientFenceId),
 }
 
+/// What answers a classic fence.
+///
+/// The two are not "a sync" and "no sync": they are two different ways of being answered, and
+/// collapsing them into an `Option` is what let a fence with nothing of its own to wait for be
+/// mistaken for one whose wait had been skipped.
+pub enum Answer {
+    /// A sync on the context whose work this fence is for. It retires once that signals.
+    Sync(Fence),
+    /// Nothing of its own to wait for, so it retires behind whatever is already queued.
+    ///
+    /// This is the whole answer for a fence on a command that queued no GL work -- a
+    /// `RESOURCE_CREATE_3D` allocates storage and renders nothing, and two thirds of the fences
+    /// under a texture-churning workload are exactly that. The guest puts every Global-ring fence
+    /// on one `dma_fence` context and signals every id at or below the one delivered, and this
+    /// queue is FIFO, so retiring behind the queue *is* retiring behind every render fenced before
+    /// it. Nothing is waited for twice and nothing is answered early.
+    Ordered,
+}
+
+impl Answer {
+    /// What this answer is called in a trace.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Answer::Sync(_) => "sync",
+            Answer::Ordered => "ordered",
+        }
+    }
+}
+
 struct Job {
-    /// The work to wait for, or `None` for a fence with nothing to wait on -- a context that had
-    /// taken no sync, or a driver that refused one. It still travels the queue, because leaving it
-    /// out would let it overtake a fence ahead of it that is still in flight.
-    fence: Option<Fence>,
+    /// How this fence is answered; see [`Answer`]. An `Ordered` job still travels the queue,
+    /// because leaving it out would let it overtake a fence ahead of it that is still in flight.
+    fence: Answer,
     retire: Retire,
 }
 
@@ -85,13 +116,13 @@ impl Waiter {
         Waiter { q, thread: Some(thread) }
     }
 
-    /// Queue a fence to retire once `fence`'s work has run.
-    pub fn retire_context(&self, fence: Option<Fence>, ctx: ContextId, ring: RingIdx, id: FenceId) {
+    /// Queue a fence to retire once its work has run.
+    pub fn retire_context(&self, fence: Answer, ctx: ContextId, ring: RingIdx, id: FenceId) {
         self.push(Job { fence, retire: Retire::Context(ctx, ring, id) });
     }
 
-    /// Queue a global-ring fence to retire once `fence`'s work has run.
-    pub fn retire_global(&self, fence: Option<Fence>, id: ClientFenceId) {
+    /// Queue a global-ring fence to retire once its work has run.
+    pub fn retire_global(&self, fence: Answer, id: ClientFenceId) {
         self.push(Job { fence, retire: Retire::Global(id) });
     }
 
@@ -147,9 +178,9 @@ fn run(
             }
         };
         if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
-            eprintln!("[virglrs] fence: waiter woke, sync={}", job.fence.is_some());
+            eprintln!("[virglrs] fence: waiter woke, answer={}", job.fence.name());
         }
-        if let Some(fence) = job.fence {
+        if let Answer::Sync(fence) = job.fence {
             wait_out(&gl, &fence);
             gl.fence_delete(fence);
         }
@@ -219,6 +250,123 @@ mod tests {
         let mut row = vec![0u8; stride];
         assert_eq!(s.read_rows(&mut row, stride, 1), 1, "the surface's first row reads back");
         row[0]
+    }
+
+    /// A surface, and a framebuffer over it that `queue` renders into.
+    ///
+    /// Returned rather than inlined because two tests need the same target, and the second one is
+    /// only meaningful if it is rendering into exactly what the first one does.
+    fn render_target(winsys: &Winsys, gl: &Gl) -> Arc<surface::Surface> {
+        let surface =
+            Arc::new(surface::Surface::plain(W, H, PixelFormat::Bgra).expect("an IOSurface"));
+        let image = winsys
+            .image_from_iosurface(Arc::clone(&surface) as Arc<dyn surface::Held>)
+            .expect("an EGL image over the surface");
+        let tex = gl.gen_texture();
+        gl.bind_texture(GL_TEXTURE_2D, Some(tex));
+        gl.egl_image_target_texture_2d(GL_TEXTURE_2D, &image);
+        let fb = gl.gen_framebuffer();
+        gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
+        gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(tex), 0);
+        assert_eq!(
+            gl.check_framebuffer_status(),
+            GL_FRAMEBUFFER_COMPLETE,
+            "the IOSurface-backed texture is a complete framebuffer"
+        );
+        gl.viewport(0, 0, W as GLsizei, H as GLsizei);
+        surface
+    }
+
+    /// A sink that says which fences were retired, in order.
+    struct Recorder(std::sync::mpsc::Sender<ClientFenceId>);
+
+    impl crate::fence::FenceSink for Recorder {
+        fn context_fence(&mut self, _ctx: ContextId, _ring: RingIdx, _fence: FenceId) {}
+        fn global_fence(&mut self, fence: ClientFenceId) {
+            let _ = self.0.send(fence);
+        }
+    }
+
+    /// An `Ordered` fence retires behind the work queued before it, which is the whole claim the
+    /// design rests on.
+    ///
+    /// A fence with nothing of its own to wait for takes no sync and no finish -- under a
+    /// texture-churning workload two thirds of all fences are exactly that, every one a
+    /// `RESOURCE_CREATE_3D` that rendered nothing. What makes it safe is not a wait but the
+    /// queue's order: every render fenced before it is already ahead of it, so a consumer woken by
+    /// the `Ordered` fence sees that render complete.
+    ///
+    /// **The control is the point**, as in the test above. The same `Ordered` fence with nothing
+    /// ahead of it must come back stale; if it does not, the render is completing on its own and
+    /// this test would pass with the ordering deleted.
+    #[test]
+    fn an_ordered_fence_retires_behind_the_work_queued_before_it() {
+        let _display = crate::vrend::one_display_at_a_time();
+        let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
+        let ctx = winsys
+            .create_context(Version { major: 3, minor: 1 }, None)
+            .expect("a GLES 3.1 context");
+        winsys.make_current(&ctx).expect("ctx is current on this thread");
+        let gl = Gl::new(winsys.gles());
+        let surface = render_target(&winsys, &gl);
+
+        let (tx, retired) = std::sync::mpsc::channel();
+        let retirement = crate::fence::Retirement::start(Box::new(Recorder(tx)));
+        let display = winsys.thread_display().expect("a winsys of our own lends its display");
+        let wait_ctx = winsys
+            .create_context(Version { major: 3, minor: 1 }, Some(&ctx))
+            .expect("a shared context");
+        let waiter = Waiter::start(display, wait_ctx, Gl::new(winsys.gles()), retirement.handle());
+
+        let black = |gl: &Gl| {
+            gl.clear_color([0.0, 0.0, 0.0, 1.0]);
+            gl.clear(GL_COLOR_BUFFER_BIT);
+            gl.finish();
+        };
+
+        // The control: an Ordered fence with an EMPTY queue ahead of it. It must retire while the
+        // render is still in flight, or nothing below distinguishes ordering from luck.
+        let mut passes = FIRST_PASSES;
+        let mut alone = 0xff;
+        for _ in 0..6 {
+            black(&gl);
+            queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
+            gl.flush();
+            waiter.retire_global(Answer::Ordered, ClientFenceId(1));
+            assert_eq!(retired.recv().expect("the sink answers"), ClientFenceId(1));
+            alone = first_pixel_blue(&surface);
+            if alone != 0xff {
+                break;
+            }
+            gl.finish();
+            passes *= 4;
+        }
+        assert_ne!(
+            alone, 0xff,
+            "an Ordered fence with nothing ahead of it still came back complete at every size \
+             tried, so this test cannot tell ordering from a render that finished on its own"
+        );
+
+        // The same Ordered fence, this time behind a Sync for that render. FIFO is what makes it
+        // wait, and the reader must now see the finished colour.
+        black(&gl);
+        queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
+        let sync = gl.fence().expect("the driver gives a sync object");
+        waiter.retire_context(
+            Answer::Sync(sync),
+            ContextId::new(1).expect("a context id"),
+            RingIdx(0),
+            FenceId(2),
+        );
+        waiter.retire_global(Answer::Ordered, ClientFenceId(3));
+        assert_eq!(retired.recv().expect("the sink answers"), ClientFenceId(3));
+        let behind = first_pixel_blue(&surface);
+
+        eprintln!("[ordered] {passes} passes: alone={alone:#04x} behind={behind:#04x}");
+        assert_eq!(
+            behind, 0xff,
+            "an Ordered fence retired before the render a Sync queued ahead of it had run"
+        );
     }
 
     /// A CPU reader must see the render a classic fence waited for.
