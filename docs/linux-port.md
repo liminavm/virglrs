@@ -404,8 +404,8 @@ each is.
 
 ## Booked for after the port
 
-Neither is on the path to a working Linux renderer, and doing them mid-port is churn against a
-tree still moving.
+None of these is on the path to a working Linux renderer, and doing them mid-port is churn
+against a tree still moving.
 
 **The `iosurface` names.** They no longer say what is Apple's and what is everyone's, and the two
 halves want opposite treatment.
@@ -444,7 +444,42 @@ that function is not given and a struct the wire bindings do not carry. The modi
 guest's image's, so a guest that asks for `Y_TILED_CCS` gets a descriptor claiming one plane under
 a two-plane modifier. Measured against iris here, that pairing is refused at `eglCreateImageKHR`
 with `EGL_BAD_MATCH`, so the failure is an importer's refusal and not a picture read from the
-wrong bytes.
+wrong bytes -- and a refusal by construction rather than by luck, because such a layout is the
+guest's driver's answer about a guest's image and is offered as
+[`Adoptable::Exported`](../src/surface.rs), whose refusals are refused.
+
+**An exported blob is not exportable onward.** A venus allocation that came back as
+`Storage::Exported` -- Mesa's WSI buffer, and every declared export with no shape -- has a real
+dma-buf descriptor and still answers `NotExportable` to `resource_export`, `export_blob` and the
+`EXPORT_QUERY` structure. The descriptor is right there; what is missing is the code to hand it
+onward with the guest's layout, which only arrives at `PIPE_RESOURCE_SET_TYPE`. Nothing on this
+host asks yet -- rutabaga calls `export_blob` per blob create and takes the refusal -- so this is
+a VMM that wants to pass a client's window buffer to a compositor outside the guest, and it will
+be an unexplained blank window when it does.
+
+**A venus context cannot import a venus client's buffer.** The other side of the same gap. A
+compositor running in a venus context, handed a share of a client's exported storage, is refused
+at `vkAllocateMemory` because there is nothing to import it *as*: a descriptor is not a host
+allocation, and the dma-buf handle type that would take one is not passed. That is the shape a
+seated Vulkan compositor takes -- it works on the minting host, where the share is an IOSurface's
+pages -- so it is the next thing a Wayland compositor written against Vulkan will hit here. Both
+halves want the same piece of work: `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT` at
+`vkAllocateMemory`, and a layout to go with it.
+
+**A classic export holds a descriptor per resource, for the resource's lifetime, uncharged.**
+`export_surface` takes a dma-buf from the driver for every SHARED or SCANOUT classic resource and
+keeps it until the resource dies. A desktop's resources are many and `RLIMIT_NOFILE` defaults to
+1024 under QEMU, so a busy session can run the host out of descriptors -- and the budget will not
+see it coming, because a file descriptor is not bytes and the ledger counts bytes. Two things to
+decide: whether the descriptor can be taken on demand rather than held, and whether descriptors
+want a count of their own beside the memory cap.
+
+**A host with no `EGL_EXT_image_dma_buf_import` composites a blank window and says nothing.**
+`Untyped::set_type` drops storage it cannot adopt and falls through to an ordinary texture, which
+is right on a host whose storage has pixels to read and wrong for a descriptor, whose bytes the
+host has no address for at all. `Descriptor::first_refusal` exists to say so once and is not
+called from there. The gate itself is also quieter than its own documentation claims: it says it
+reports at startup, and it is asked per `SET_TYPE` and prints nothing.
 
 ## Missing infrastructure
 

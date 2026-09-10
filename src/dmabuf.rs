@@ -29,9 +29,14 @@
 //!
 //! This module is on CLAUDE.md's list by decision, not by accident, and `docs/linux-port.md` says
 //! why: mapping a descriptor is a foreign call with a lifetime the type system cannot see, and
-//! the alternative was to spread it through `driver.rs` and `egl.rs`. The unsafe here is the
-//! `mmap`/`munmap` pair and nothing else -- the layout arithmetic above it is ordinary Rust, and
-//! the export call itself belongs to the driver module that owns the device.
+//! the alternative was to spread it through `driver.rs` and `egl.rs`.
+//!
+//! What is in here: the `mmap`/`munmap` pair; the `lseek` that asks the kernel how big a buffer
+//! is; the copies in and out of the mapping, which is where the bounds reasoning lives and where
+//! a wrong figure would read or write past the pages; and `unsafe impl Send`/`Sync` for the
+//! mapping, which is the claim that a raw pointer to shared pages may cross threads. The layout
+//! arithmetic is ordinary Rust, and the export call itself belongs to the driver module that owns
+//! the device.
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::OnceLock;

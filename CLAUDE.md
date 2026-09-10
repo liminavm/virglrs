@@ -20,7 +20,9 @@ the Vulkan bindings (`vulkan.rs`, `venus/driver.rs`); the EGL winsys and the GLE
 (`vrend/egl.rs`, `vrend/gl.rs`, with the tables `gl-gen` generates into them); the IOSurface and
 Metal bindings (`metal.rs`), which are the only Objective-C in the tree; the dma-buf descriptors
 (`dmabuf.rs`), `metal.rs`'s counterpart on a host that exports storage rather than minting it,
-whose unsafe is the `mmap`/`munmap` of an exported descriptor; the VideoToolbox
+whose unsafe is the `mmap`/`munmap` of an exported descriptor, the `lseek` that asks the kernel
+how big it is, the copies in and out of that mapping, and the `Send`/`Sync` the mapping asserts;
+the VideoToolbox
 bindings (`videotoolbox.rs`), which are C APIs and so add no Objective-C; the guest-memory
 mapping (`guest_mem.rs`); the C shim (`ffi.rs`, `abi.rs`); and the venus wire decoder
 (`venus/cs.rs`), which owns the arena every decoded pointer points into. Every unsafe block
