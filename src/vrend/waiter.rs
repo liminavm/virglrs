@@ -59,8 +59,18 @@ enum Retire {
 /// collapsing them into an `Option` is what let a fence with nothing of its own to wait for be
 /// mistaken for one whose wait had been skipped.
 pub enum Answer {
-    /// A sync on the context whose work this fence is for. It retires once that signals.
-    Sync(Fence),
+    /// One sync per GL queue the fenced work could be on. It retires once every one has signalled.
+    ///
+    /// **Not one sync.** Each sub-context has a command queue of its own and a sync covers only the
+    /// context it was taken on (see `Context::gl_contexts`), so a sync on whichever sub-context
+    /// happened to be current left a sibling's renders unwaited-for -- and ctx0's uploads with
+    /// them, which is where a `Vrend::transfer` with no context named puts its work. The set is the
+    /// one `Vrend::finish_contexts` finishes, and the two have to cover the same queues: the whole
+    /// point of the fence path is that it replaces that finish without changing what a fence means.
+    ///
+    /// Never empty. A fence answered by no sync at all would retire as soon as the waiter reached
+    /// it, which is early, so `Vrend::decide_fence` asserts rather than building one.
+    Syncs(Vec<Fence>),
     /// Nothing of its own to wait for, so it retires behind whatever is already queued.
     ///
     /// This is the whole answer for a fence on a command that queued no GL work -- a
@@ -76,7 +86,7 @@ impl Answer {
     /// What this answer is called in a trace.
     pub fn name(&self) -> &'static str {
         match self {
-            Answer::Sync(_) => "sync",
+            Answer::Syncs(_) => "sync",
             Answer::Ordered => "ordered",
         }
     }
@@ -180,9 +190,14 @@ fn run(
         if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
             eprintln!("[virglrs] fence: waiter woke, answer={}", job.fence.name());
         }
-        if let Answer::Sync(fence) = job.fence {
-            wait_out(&gl, &fence);
-            gl.fence_delete(fence);
+        if let Answer::Syncs(fences) = job.fence {
+            // Every one, and each spent as it is waited out: they are independent queues, so the
+            // last to signal is what the fence is waiting for and the order they are waited in
+            // does not matter.
+            for fence in fences {
+                wait_out(&gl, &fence);
+                gl.fence_delete(fence);
+            }
         }
         if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
             eprintln!("[virglrs] fence: waiter done waiting, retiring");
@@ -353,7 +368,7 @@ mod tests {
         queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
         let sync = gl.fence().expect("the driver gives a sync object");
         waiter.retire_context(
-            Answer::Sync(sync),
+            Answer::Syncs(vec![sync]),
             ContextId::new(1).expect("a context id"),
             RingIdx(0),
             FenceId(2),

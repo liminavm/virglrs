@@ -120,7 +120,7 @@ impl Tally {
     pub fn fence(&mut self, answer: &super::waiter::Answer) {
         if let Some(a) = &mut self.on {
             match answer {
-                super::waiter::Answer::Sync(_) => a.syncs += 1,
+                super::waiter::Answer::Syncs(_) => a.syncs += 1,
                 super::waiter::Answer::Ordered => a.ordered += 1,
             }
         }

@@ -733,8 +733,8 @@ impl Vrend {
         w.retire_global(answer, id);
     }
 
-    /// How to answer the fence for the work `on` has queued: a sync taken on the sub-context that
-    /// queued it, or [`Answer::Ordered`] for a fence with no work of its own.
+    /// How to answer the fence for the work `on` has queued: a sync on each GL queue that work
+    /// could be on, or [`Answer::Ordered`] for a fence with no work of its own.
     ///
     /// **A fence that names no context is not a fence over everything.** It rides the same Global
     /// ring as every context-named fence, and the waiter's queue is FIFO, so retiring it behind
@@ -771,19 +771,49 @@ impl Vrend {
         let Some(id) = on.filter(|id| self.contexts.contains_key(id)) else {
             return Answer::Ordered;
         };
-        // The context's current sub-context is the one that queued the work, and a sync covers the
-        // context it is taken on.
-        let (mut host, contexts) = self.split(id, &NoGuest);
-        contexts[&id].make_current(&mut host);
-        match self.gl.fence() {
-            Some(f) => Answer::Sync(f),
-            // The driver refused a sync for work we know was queued, so it has to be waited for
-            // the expensive way -- but only on the context that queued it, never on every one.
-            None => {
-                self.finish_contexts(&[id]);
-                Answer::Ordered
+        // One sync per queue, and NOT one sync. A sync covers the context it was taken on and
+        // nothing else -- `Context::gl_contexts` says so -- so taking one on whichever sub-context
+        // happened to be current answered the fence while a sibling sub-context's renders were
+        // still queued, and ctx0's uploads with them. This is exactly the set `finish_contexts`
+        // finishes, which is the set it has to be: the fence path exists to replace that finish,
+        // and a replacement that covers less is not one.
+        let mut syncs = Vec::new();
+        let mut refused = false;
+        if let Some(ctx) = self.contexts.get(&id) {
+            for (sub, gl_ctx) in ctx.gl_contexts() {
+                self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
+                self.current.switched_to(GlContext::Sub(id, sub));
+                match self.gl.fence() {
+                    Some(f) => syncs.push(f),
+                    None => {
+                        refused = true;
+                        break;
+                    }
+                }
             }
         }
+        // ctx0 last, which also leaves it current -- where `finish_contexts` leaves it.
+        if !refused {
+            self.switch_ctx0();
+            match self.gl.fence() {
+                Some(f) => syncs.push(f),
+                None => refused = true,
+            }
+        }
+        if refused {
+            // The driver refused a sync for work we know was queued, so it has to be waited for
+            // the expensive way -- but only on the contexts that could hold it, never on every
+            // one. What was already taken is spent first: a `Fence` aborts on drop rather than
+            // leaking a driver allocation, so dropping the partial set would take the process
+            // down on the path that exists to recover.
+            for f in syncs {
+                self.gl.fence_delete(f);
+            }
+            self.finish_contexts(&[id]);
+            return Answer::Ordered;
+        }
+        assert!(!syncs.is_empty(), "a fence answered by no sync at all would retire early");
+        Answer::Syncs(syncs)
     }
 
     /// `vrend_renderer_resource_sync_iosurface`: make a surface-backed resource's contents whole
@@ -1181,6 +1211,59 @@ mod tests {
             .collect();
         assert_eq!(got, vec![11, 22, 33], "all three retire, and in the order they were taken");
         assert!(rx.try_recv().is_err(), "and nothing else was retired");
+    }
+
+    /// A fence covers every GL queue its context could have rendered on, not whichever sub-context
+    /// happened to be current.
+    ///
+    /// Each sub-context has a command queue of its own, so one sync answered the fence while a
+    /// sibling's renders were still outstanding -- and the guest was told work was done that was
+    /// not. The count is what pins it: with one sync per queue this is the number of sub-contexts
+    /// plus ctx0, and a build that takes one sync answers 1 whatever the context looks like.
+    #[test]
+    fn a_fence_covers_every_sub_context_and_ctx0() {
+        let _display = crate::vrend::one_display_at_a_time();
+        // Nothing asserts on retirement here; what is asserted is the shape of the answer.
+        struct Ignore;
+        impl crate::fence::FenceSink for Ignore {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Ignore));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+        )
+        .expect("vrend comes up");
+
+        let ctx = ContextId::new(1).expect("a context id");
+        v.context_create(ctx, &NoGuest).expect("a context");
+
+        // `cmd | obj << 8 | len << 16`, then the payload -- see `proto`. Two more sub-contexts, so
+        // the answer has to grow: a context always has sub-context 0 already.
+        for sub in [7u32, 9] {
+            v.submit(
+                ctx,
+                &[crate::vrend::proto::Cmd::CreateSubCtx as u32 | (1 << 16), sub],
+                &NoGuest,
+            )
+            .expect("the context takes the batch")
+            .expect("a sub-context is created");
+        }
+
+        let answer = v.decide_fence(Some(ctx));
+        let Answer::Syncs(syncs) = answer else {
+            panic!("a context with queued sub-contexts is answered by syncs, got {}", answer.name())
+        };
+        assert_eq!(syncs.len(), 4, "sub-contexts 0, 7 and 9, and ctx0");
+        // Spent by hand: nothing retired these, and a `Fence` aborts on drop.
+        for f in syncs {
+            v.gl.fence_delete(f);
+        }
+
+        v.context_destroy(ctx, &NoGuest);
     }
 
     #[test]
