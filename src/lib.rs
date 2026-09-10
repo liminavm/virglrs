@@ -53,6 +53,8 @@ pub mod decode;
 #[cfg(not(target_os = "macos"))]
 #[path = "decode_unbacked.rs"]
 pub mod decode;
+#[cfg(not(target_os = "macos"))]
+pub mod dmabuf;
 pub mod fence;
 pub mod ffi;
 pub mod guest_mem;

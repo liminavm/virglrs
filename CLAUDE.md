@@ -18,7 +18,9 @@ of the bugs this renderer has cost us. Every rule below is that reason, applied.
 **Keep `unsafe` minimal and wrapped.** Unsafe lives in named modules and nowhere else. They are:
 the Vulkan bindings (`vulkan.rs`, `venus/driver.rs`); the EGL winsys and the GLES bindings
 (`vrend/egl.rs`, `vrend/gl.rs`, with the tables `gl-gen` generates into them); the IOSurface and
-Metal bindings (`metal.rs`), which are the only Objective-C in the tree; the VideoToolbox
+Metal bindings (`metal.rs`), which are the only Objective-C in the tree; the dma-buf descriptors
+(`dmabuf.rs`), `metal.rs`'s counterpart on a host that exports storage rather than minting it,
+whose unsafe is the `mmap`/`munmap` of an exported descriptor; the VideoToolbox
 bindings (`videotoolbox.rs`), which are C APIs and so add no Objective-C; the guest-memory
 mapping (`guest_mem.rs`); the C shim (`ffi.rs`, `abi.rs`); and the venus wire decoder
 (`venus/cs.rs`), which owns the arena every decoded pointer points into. Every unsafe block
@@ -29,6 +31,12 @@ safe Rust, and an unsafe block outside these modules is a design failure, not a 
 imports an IOSurface but does not export one, so a surface has to be minted host-side. It owns the
 surface's lifetime and hands the rest of the tree a safe handle — never a raw `IOSurfaceRef`, and
 never an id, which is worth nothing the moment its surface dies.
+
+`dmabuf.rs` is the same argument in the other direction. Where KosmicKrisp will not export, a Linux
+driver will not render into host pages we minted, so the storage is the driver's and this side owns
+a descriptor of it. It hands out the same kind of safe handle for the same reason: a raw fd is
+worth nothing once it is closed, and who closes it must not be a question any call site has to
+answer.
 
 The list is exhaustive on purpose: a module that starts needing unsafe is a module whose types are
 wrong. Handlers in `venus/context.rs` in particular must stay safe — when one needs a raw pointer,
