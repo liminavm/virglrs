@@ -201,7 +201,10 @@ a more capable leg.
 The snapshot-journal fixed-point gate runs here — and a fixed-point gate needs a live world, so
 confirm it compares a populated one rather than nothing to nothing.
 
-**Gate:** a committed Linux fixture set with every divergence resolved or categorised.
+**Gate:** a committed Linux fixture set with every divergence resolved or categorised. Met for
+the nine corpora this host can score; `harness/README.md` carries which those are, and why the
+video corpora and `vrend-overview` are not among them. Bucket (a) came back **empty** — on
+`vrend.bin`, a 71 MB recording of a real session, the two legs agree across all 341 lines.
 
 ### Phase 4 — enumerate the command gap (3–4 days)
 

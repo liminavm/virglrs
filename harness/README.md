@@ -887,6 +887,29 @@ first time only one is re-recorded. So:
   same reason, rather than printed as `0`: a leg that took no measurement must not report one, and
   the rest of that line is exactly what still has to agree.
 
+**What Linux scores, and what it cannot.** Nine corpora are green there — `blit`, `sampled`,
+`surface`, `teardown`, `vrend`, `vrend-shm`, `vrend-vkclient`, `vrend-vkclient-nofeed` and
+`vrend-webgl`, the last three carrying their journal pins. The rest are not failing; they are
+measuring nothing, and the difference matters because a corpus of zeros agrees with itself:
+
+- **The video corpora** (`vrend-vp9stock`, `vrend-h264`, `vrend-hevc`, both `vrend-composite`
+  scores) need hardware decode this host has none of, so every decode target reads back zero on
+  both legs. `vrend-h264` and `vrend-hevc` then report `0 differing lines` between the two
+  renderers, which is agreement about nothing — the exact weak oracle the blob fixture's `ink=0`
+  warning is about. Do not read those as passes and do not pin them here.
+- **`vrend-overview`** replays 116 creates of a `Y8_U8V8_420_UNORM` composite planar target. The
+  Linux capset correctly does not advertise that (`capability_bits_v2` has bit 20 clear, against
+  macOS's set, and `num_video_caps` is 0), so the renderer refuses all 116 — the right answer to a
+  question this host never invited. It is a recording of a guest that asked a *different* host, so
+  the corpus does not mean the same thing here. Gateable once a planar target can be backed.
+
+**The C leg is not always the better oracle on Linux.** Upstream loses to virglrs on three corpora,
+and in each the Rust leg is the one matching the macOS fixture: `vrend-vkclient` (upstream feeds 0
+of 24 blob-content records, throws 3622 submit errors, and reads back nothing from all six windows
+that virglrs reproduces hash-for-hash), `vrend-webgl` (`res=1505` inks 1903 texels against
+upstream's 0), and `vrend-overview` (two text strips where upstream inks fewer pixels). Where the
+two legs disagree on Linux, check which one the fixture agrees with before assuming the C is right.
+
 So the Linux invocation is the macOS one plus its overlay:
 
 ```sh

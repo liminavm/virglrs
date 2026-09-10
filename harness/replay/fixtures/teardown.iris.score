@@ -1,8 +1,11 @@
-# The lines of blit.score that this GL driver reads
+# The lines of teardown.score that this GL driver reads
 # differently, and only those: everything else must agree with it byte for byte.
 #
 # Written by make-overlay.py from a scored run. Pixel hashes only -- an extent that
 # moved is refused here, because that is not arithmetic.
 #
 # Recorded against: OpenGL ES 3.2 Mesa 26.1.8 (gles 32)
-res=17 32x32 hash=6b16991452bc1703 ink=1024/1024
+res=10 64x64 hash=84ab6d375f778383 ink=4096/4096
+res=11 64x64 hash=af934cee8b5c4383 ink=4096/4096
+res=13 64x64 hash=af934cee8b5c4383 ink=4096/4096
+res=15 64x64 hash=af934cee8b5c4383 ink=4096/4096

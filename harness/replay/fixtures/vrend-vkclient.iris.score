@@ -1,0 +1,24 @@
+# The lines of vrend-vkclient.score that this GL driver reads
+# differently, and only those: everything else must agree with it byte for byte.
+#
+# Written by make-overlay.py from a scored run. Pixel hashes only -- an extent that
+# moved is refused here, because that is not arithmetic.
+#
+# Recorded against: OpenGL ES 3.2 Mesa 26.1.8 (gles 32)
+#
+# Ink moved on these, which is an antialiased edge landing on different
+# pixels rather than a different drawing. Small, and worth re-reading if it grows:
+#   res=1444 32x32: ink 488 -> 485 (-3)
+res=1355 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=1368 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=1374 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=1400 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=1415 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=1444 32x32 hash=d985b226ca0d182a ink=485/1024
+res=1495 250x250 hash=7e0dc6dd55c4eb18 ink=62500/62500
+res=1509 144x144 hash=2df23efa70c3c935 ink=10614/20736
+res=1511 144x144 hash=81b3e8f1e7f8c88e ink=12212/20736
+res=1582 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=1597 250x250 hash=64d3096a6ae9a20a ink=59520/62500
+res=1505 144x144 hash=81b3e8f1e7f8c88e ink=12212/20736
+res=1340 1280x800 hash=c0ac64f3128c8b02 ink=1024000/1024000
