@@ -25,6 +25,10 @@ PIN=0
 . "$ROOT/scripts/platform.sh"
 
 PREFIX="${VIRGL_PREFIX:-$ROOT/third_party/virgl-prefix}"
+# Where the reference C lands depends on which script built it, and the replay ladder already
+# knows both places. A gate that knows one of them reports "no libvirglrenderer" on a host that
+# has a perfectly good reference leg installed.
+[ -n "${VIRGL_PREFIX:-}" ] || [ -d "$PREFIX" ] || PREFIX="$ROOT/harness/vm/prefix"
 
 # Own the freshness of the prefix we are about to score, the way vkr-replay.sh does. This gate
 # reads a built dylib and nothing else, so without this it happily pins or checks a dylib from
