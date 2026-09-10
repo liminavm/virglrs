@@ -275,7 +275,7 @@ mod tests {
         let surface =
             Arc::new(surface::Surface::plain(W, H, PixelFormat::Bgra).expect("an IOSurface"));
         let image = winsys
-            .image_from_iosurface(Arc::clone(&surface) as Arc<dyn surface::Held>)
+            .image_from_surface(Arc::clone(&surface) as Arc<dyn surface::Held>)
             .expect("an EGL image over the surface");
         let tex = gl.gen_texture();
         gl.bind_texture(GL_TEXTURE_2D, Some(tex));
@@ -409,7 +409,7 @@ mod tests {
         let surface =
             Arc::new(surface::Surface::plain(W, H, PixelFormat::Bgra).expect("an IOSurface"));
         let image = winsys
-            .image_from_iosurface(Arc::clone(&surface) as Arc<dyn surface::Held>)
+            .image_from_surface(Arc::clone(&surface) as Arc<dyn surface::Held>)
             .expect("an EGL image over the surface");
 
         let tex = gl.gen_texture();

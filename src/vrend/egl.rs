@@ -994,8 +994,8 @@ impl Winsys {
     /// Made against no context: the image belongs to the display, and any context on it may
     /// bind it. Fails, naming the call, when the driver will not import the surface -- the
     /// resource then keeps ordinary GL storage, and the caller says so.
-    pub fn image_from_iosurface(&self, held: Arc<dyn Held>) -> Result<Image, EglError> {
-        self.image_of_iosurface(held, None)
+    pub fn image_from_surface(&self, held: Arc<dyn Held>) -> Result<Image, EglError> {
+        self.image_of_surface(held, None)
     }
 
     /// An EGL image over *one plane* of a planar surface, in that plane's own layout.
@@ -1004,12 +1004,12 @@ impl Winsys {
     /// separately and the images are what the plane resources take as storage. Each holds its
     /// own share of the surface: the surface outlives whichever plane image is dropped last,
     /// and no plane's image is a view into something already freed.
-    pub fn image_from_iosurface_plane(
+    pub fn image_from_surface_plane(
         &self,
         held: Arc<dyn Held>,
         plane: Plane,
     ) -> Result<Image, EglError> {
-        self.image_of_iosurface(held, Some(plane))
+        self.image_of_surface(held, Some(plane))
     }
 
     /// Import an exported dma-buf as an EGL image, through `EGL_EXT_image_dma_buf_import`.
@@ -1030,7 +1030,7 @@ impl Winsys {
     /// displays wrong. Omitting the attributes instead asks EGL to work it out, which is the
     /// honest form of not knowing.
     #[cfg(not(target_os = "macos"))]
-    fn image_of_iosurface(
+    fn image_of_surface(
         &self,
         held: Arc<dyn Held>,
         plane: Option<Plane>,
@@ -1127,7 +1127,7 @@ impl Winsys {
     }
 
     #[cfg(target_os = "macos")]
-    fn image_of_iosurface(
+    fn image_of_surface(
         &self,
         held: Arc<dyn Held>,
         plane: Option<Plane>,
@@ -1628,10 +1628,10 @@ mod tests {
         let id = surface.surface().id();
 
         let luma = winsys
-            .image_from_iosurface_plane(Arc::clone(&surface), Plane::Luma)
+            .image_from_surface_plane(Arc::clone(&surface), Plane::Luma)
             .expect("the driver imports the luma plane");
         let chroma = winsys
-            .image_from_iosurface_plane(Arc::clone(&surface), Plane::ChromaPair)
+            .image_from_surface_plane(Arc::clone(&surface), Plane::ChromaPair)
             .expect("the driver imports the chroma plane");
 
         assert_ne!(luma.raw(), chroma.raw(), "a plane image per plane, not one image twice");
@@ -1683,7 +1683,7 @@ mod tests {
 
         let read = |plane: Plane, format, w, h| -> Vec<u8> {
             let image = winsys
-                .image_from_iosurface_plane(Arc::clone(&surface), plane)
+                .image_from_surface_plane(Arc::clone(&surface), plane)
                 .expect("the driver imports the plane");
             let texture = gl.gen_texture();
             gl.bind_texture(GL_TEXTURE_2D, Some(texture));

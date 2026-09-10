@@ -519,7 +519,7 @@ impl Untyped {
             // Minted here, to a layout chosen here, on a host that says it adopts what it
             // mints. A refusal is then this renderer's own defect and it crashes: degrading would
             // hide it behind a window that renders the wrong thing.
-            Some(Adoptable::Minted(held)) => match winsys.image_from_iosurface(held) {
+            Some(Adoptable::Minted(held)) => match winsys.image_from_surface(held) {
                 Ok(image) => Some(image),
                 Err(e) => panic!(
                     "the driver adopts minted storage but refused a minted {}x{} {} one: {e}",
@@ -533,8 +533,7 @@ impl Untyped {
             // it. So this one is refused, and the share is handed back with the slot: a guest
             // that asks for a modifier this host's GL cannot import gets a resource it cannot
             // create, and not a dead worker.
-            Some(Adoptable::Exported(held)) => match winsys.image_from_iosurface(Arc::clone(&held))
-            {
+            Some(Adoptable::Exported(held)) => match winsys.image_from_surface(Arc::clone(&held)) {
                 Ok(image) => Some(image),
                 Err(e) => {
                     return Err((
@@ -562,7 +561,7 @@ impl Untyped {
                         ));
                     }
                 };
-                match winsys.image_from_iosurface(held) {
+                match winsys.image_from_surface(held) {
                     Ok(image) => Some(image),
                     Err(e) => {
                         return Err((
@@ -1961,7 +1960,7 @@ fn mint_planes(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args)
     };
     // Both planes of the one surface, each holding its own share of it: the surface outlives
     // whichever image is dropped last.
-    let plane = |which| match winsys.image_from_iosurface_plane(Arc::clone(&surface) as _, which) {
+    let plane = |which| match winsys.image_from_surface_plane(Arc::clone(&surface) as _, which) {
         Ok(image) => Some(image),
         Err(e) => {
             eprintln!(
@@ -2050,7 +2049,7 @@ fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args
     // surface letting go -- a venus context that imported it, or a texture still sitting in
     // `Vrend.doomed` after the guest unreffed its resource.
     let charge = budget.charge("IOSurface", surface.alloc_size());
-    match winsys.image_from_iosurface(Arc::new(Charged::new(surface, charge))) {
+    match winsys.image_from_surface(Arc::new(Charged::new(surface, charge))) {
         Ok(image) => {
             if scanout {
                 eprintln!(

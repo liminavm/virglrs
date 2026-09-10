@@ -1379,7 +1379,7 @@ pub extern "C" fn virgl_renderer_resource_get_iosurface_id(
         if r.with_resource(handle, |_| ()).is_none() {
             return EINVAL;
         }
-        let id = r.resource_iosurface_id(handle).map_or(0, |s| s.0);
+        let id = r.resource_surface_id(handle).map_or(0, |s| s.0);
         // SAFETY: caller-provided out-pointer, checked non-null.
         unsafe { *iosurface_id = id };
         0
@@ -1409,7 +1409,7 @@ pub extern "C" fn virgl_renderer_resource_read_iosurface(
     // SAFETY: the C contract is that `dst` addresses `height` rows of `dst_stride` bytes, which
     // is exactly `len`. Nothing else in this process holds a reference to the caller's buffer.
     let dst = unsafe { core::slice::from_raw_parts_mut(dst.cast::<u8>(), len) };
-    with(EINVAL, |r| match r.resource_read_iosurface(handle, dst, dst_stride as usize, height) {
+    with(EINVAL, |r| match r.resource_read_surface(handle, dst, dst_stride as usize, height) {
         Some(rows) if rows == height => 0,
         other => {
             eprintln!(
@@ -1429,7 +1429,7 @@ pub extern "C" fn virgl_renderer_resource_sync_iosurface(res_handle: u32) -> c_i
     let Some(handle) = ResourceHandle::new(res_handle) else {
         return EINVAL;
     };
-    with(EINVAL, |r| if r.resource_sync_iosurface(handle) { 0 } else { EINVAL })
+    with(EINVAL, |r| if r.resource_sync_surface(handle) { 0 } else { EINVAL })
 }
 
 #[unsafe(no_mangle)]

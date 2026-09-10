@@ -70,9 +70,9 @@ None may be carried across.
 ## Out of scope
 
 **limina on Linux** — the Mach-port id transport is a VMM port. The boundary is not where it first
-appears, though: `resource_iosurface_id`, `resource_read_iosurface` and `resource_sync_iosurface`
+appears, though: `resource_surface_id`, `resource_read_surface` and `resource_sync_surface`
 are `Renderer` methods, i.e. the **Rust API**, not only `ffi.rs`. All three stayed and all three
-answer on both hosts; the only signature that moved is `resource_read_iosurface`, which took
+answer on both hosts; the only signature that moved is `resource_read_surface`, which took
 `&mut self` because the exporting host's read is a GPU round trip. Their *names* are booked below.
 
 **A VA-API backend.** Phase 1 says why cfg'ing the video directory out is nonetheless the wrong
@@ -96,7 +96,7 @@ platform-neutral module and having it yield host-generic storage keeps one owner
 and a `dmabuf.rs` as two implementations.
 
 **It is not a rename.** `surface() -> &Surface` is the *entire* trait, and the semantics behind it
-are IOSurface-shaped: `features.rs:175 adopts_iosurfaces`, the `external_images_are_linear` pins
+are IOSurface-shaped: `features.rs:228 adopts_iosurfaces`, the `external_images_are_linear` pins
 at `driver.rs:6398-6407`, and the six exhaustive `Storage` matches. About 60 non-test lines across
 seven files name the concrete type, but the line count is not the cost. Budget 2–3 weeks.
 
@@ -107,7 +107,7 @@ virglrenderer against mature Mesa would be the better oracle and cannot be used:
 
 - `harness/replay/rs/src/abi.rs:99-128` dlopens sixteen `virgl_renderer_limina_*` symbols
   (`replay_begin/submit/ring_cmd/end`, `journal_*`, `memory_census/read/write`, `sync_*`) plus
-  `resource_get_iosurface_id` and `resource_read_iosurface`. Upstream exports none of them; the
+  `resource_get_iosurface_id` and `resource_read_surface`. Upstream exports none of them; the
   venus replayer cannot `dlopen` an upstream build at all.
 - `harness/replay/vrend-replay.c:70` includes `<IOSurface/IOSurface.h>` and scores every scanout
   through `IOSurfaceLookup`/`IOSurfaceLock` (lines 408-425); `build.sh:41` links
@@ -301,7 +301,7 @@ Linux was adopted by nothing and composited as a blank texture.
 - Fence export is `VK_KHR_external_fence_fd`, served through `vkGetFenceFdKHR`. The C ABI's
   sync-file trio stays refused, and its reason is corrected rather than removed: a
   `client_fence_id` names a retirement, not a fence object.
-- `resource_read_iosurface` takes `&mut self`, because the exporting host's read is a GPU round
+- `resource_read_surface` takes `&mut self`, because the exporting host's read is a GPU round
   trip and needs a context switch. limina builds against it.
 - `get_fd_for_texture`/`2` stay refused, and the doc comment says why: `tex_id` is a GL name, so
   only a VMM sharing our context could call them, and none does — QEMU's `virtio-gpu-gl` module
@@ -329,7 +329,7 @@ until that exists the census entries stay pinned as "zero or unstable".
 
 `EGL_IOSURFACE_LIMINA` (0x3B9A, a forked-Mesa private extension) is `EGL_EXT_image_dma_buf_import`
 here, and the classic export is `EGL_MESA_image_dma_buf_export` — so this host needs no Mesa fork.
-`image_from_iosurface`/`image_from_iosurface_plane` are the call sites, and the planar path maps
+`image_from_surface`/`image_from_surface_plane` are the call sites, and the planar path maps
 onto multi-plane dma-buf import directly. Modifiers are sent only when the query produced one.
 
 The export takes every plane the modifier reports, not just the colour one: a compressed modifier
@@ -342,7 +342,7 @@ measures the colour plane and stops short of anything past it.
 No such buffer reaches the renderer on this host -- an ICL scanout is plain `X_TILED` with one
 plane -- so the export path is pinned by unit tests over stubbed export calls, using the layout
 GBM reports for a real `Y_TILED_CCS` buffer here, and not by a boot. The import side is measured
-directly: the attribute list `image_of_iosurface` builds for such a buffer, one descriptor named
+directly: the attribute list `image_of_surface` builds for such a buffer, one descriptor named
 by both planes, is accepted by iris.
 
 The size of a single-plane export changed with it. `alloc_size` is now the whole allocation rather
@@ -412,25 +412,33 @@ each is.
 None of these is on the path to a working Linux renderer, and doing them mid-port is churn
 against a tree still moving.
 
-**The `iosurface` names.** They no longer say what is Apple's and what is everyone's, and the two
-halves want opposite treatment.
+**The `iosurface` names.** The Rust half is done and the C half deliberately is not, because the
+two are different things wearing one word.
 
-The C symbols are the limina fork's own additions -- upstream virglrenderer exports none of them
-(47 `virgl_renderer_*` symbols, zero matching `iosurface`), and QEMU's `virtio-gpu-gl` module
-imports none of them either. Their entire caller set is this tree's two replayers, and
-`virgl_renderer_republish_iosurface` has no caller anywhere while returning `EINVAL` on both
-hosts. So the C spelling is a private debug ABI: rename it only if the fork is being touched for
-another reason, and delete `republish` outright. The `iosurface res=…` score-line key is separate
-again, and costs about a thousand recorded fixture lines across both hosts to move.
+The **Rust API** was the half that misled, being limina's real presentation path rather than a
+debug surface: `resource_read_surface`, `resource_sync_surface`, `resource_surface_id`, and the
+winsys `image_from_surface`/`image_from_surface_plane`/`image_of_surface`. `resource_surface_id`
+was never a naming problem alone -- on Apple the value is an `IOSurfaceGetID`, a system-global
+handle another process can resolve, and here it is a counter this renderer keeps that names
+nothing outside the process -- so its doc says which of the two a caller is holding, and that a
+generic caller may read only the presence bit. `Features::adopts_iosurfaces` keeps its name: its
+body is `cfg!(target_os = "macos")` and the question really is whether this host can take an
+IOSurface as a texture's storage, so a neutral name there would read as a question the other host
+can answer.
 
-The **Rust API** is the half that misleads, because it is limina's real presentation path rather
-than a debug surface. `resource_read_iosurface` and `resource_sync_iosurface` are generic in
-substance and want neutral names. `resource_iosurface_id` is not a rename: on Apple the value is
-an `IOSurfaceGetID`, a system-global handle another process can resolve, and here it is a
-process-local counter that names nothing outside this renderer. Every generic call site uses it as
-a boolean -- both replayers test it for non-zero -- and the transportable handle already exists as
-`resource_export`. So the doc has to say which of the two it is handing back, whatever it is
-called. The `image_*_iosurface` winsys entry points are internal and rename freely.
+The **C symbols** keep the old spelling. They are the limina fork's own additions -- upstream
+virglrenderer exports none of them (47 `virgl_renderer_*` symbols, zero matching `iosurface`), and
+QEMU's `virtio-gpu-gl` module imports none either -- so their entire caller set is this tree's two
+replayers and the spelling is a private debug ABI. Renaming it is worth doing only while the fork
+is open for another reason, because `harness/abi/symbols.txt` and `symbols-limina.txt` pin the
+exported list against the reference leg and both trees would have to move together.
+`virgl_renderer_republish_iosurface` is the same coupling and not the free deletion it looks like:
+our `ffi.rs` answers `EINVAL` and nothing calls it, but the fork implements it over a Mach port
+(`limina_republish_surface`) and both symbol fixtures name it, so dropping it here alone would
+make virglrs export less than the leg it is scored against.
+
+The `iosurface res=…` score-line key is separate again, and costs about a thousand recorded
+fixture lines across both hosts to move.
 
 **A declared host-visible allocation still gets minted pages on the exporting host.** The third
 shape at allocate -- declared for export, host-visible, not a window buffer -- mints pages here and

@@ -1541,7 +1541,17 @@ impl Renderer {
         .map_err(export_error)
     }
 
-    /// The IOSurface a resource is presented from, or `None` when it is not presented from one.
+    /// A name for the surface a resource is presented from, or `None` when it is not presented
+    /// from one.
+    ///
+    /// **What the name is worth differs by host, and no caller may assume the better half.** On
+    /// Apple it is an `IOSurfaceGetID`: a system-global handle another process can resolve, which
+    /// is what the Mach-port publish carries. On a host that exports its storage there is no such
+    /// registry, so it is a counter this renderer keeps and it names nothing outside this
+    /// process. What every generic caller actually wants of it is whether it is there at all --
+    /// both replayers test it for non-zero -- and the handle that does travel is
+    /// [`Self::resource_export`]. So read this as a presence bit unless the code is already
+    /// Apple-only.
     ///
     /// Resolved the whole way down on every call, exactly like [`Self::resource_host_mapping`]:
     /// resource, to the allocation it was published from, to the surface that allocation is. The
@@ -1553,7 +1563,7 @@ impl Renderer {
     /// A share of pages has no surface, and a compositor presenting from one gets a black
     /// window with nothing to say why. The pages know why -- which question the image failed
     /// at allocate -- and say it here, once, the first time they are asked.
-    pub fn resource_iosurface_id(&self, handle: ResourceHandle) -> Option<SurfaceId> {
+    pub fn resource_surface_id(&self, handle: ResourceHandle) -> Option<SurfaceId> {
         if let Some(surface) = self.classic_surface(handle) {
             return Some(surface.id());
         }
@@ -1674,7 +1684,7 @@ impl Renderer {
     ///
     /// `None` when there is no way to read it at all. That is *not* the same answer as zero rows:
     /// a caller reads `None` as "take your slow path" and a zero as "there was nothing there".
-    pub fn resource_read_iosurface(
+    pub fn resource_read_surface(
         &mut self,
         handle: ResourceHandle,
         dst: &mut [u8],
@@ -1732,32 +1742,32 @@ impl Renderer {
     /// Classic only: a venus scanout renders into its surface on the guest's own timeline and
     /// must never be synced from here. `false` for a resource that has no surface -- the VMM's
     /// cue to read its pixels back the slow way.
-    pub fn resource_sync_iosurface(&mut self, handle: ResourceHandle) -> bool {
+    pub fn resource_sync_surface(&mut self, handle: ResourceHandle) -> bool {
         // Who the guest kernel attached it to is who is allowed to have rendered into it, so it
         // is also the set whose work has to be complete. Delegating to that decision beats
         // inventing a second one here, and it is what keeps a page-flip from waiting on contexts
         // that never touched the surface.
         let attached = self.with_resource(handle, |r| r.attached.clone()).unwrap_or_default();
-        self.vrend.as_mut().is_some_and(|v| v.resource_sync_iosurface(handle, &attached))
+        self.vrend.as_mut().is_some_and(|v| v.resource_sync_surface(handle, &attached))
     }
 
     /// Which context's completion a classic scanout's contents wait on, so the caller can wait for
     /// it asynchronously instead of asking this thread to.
     ///
-    /// This is [`Self::resource_sync_iosurface`] asked as a question rather than given as an order,
+    /// This is [`Self::resource_sync_surface`] asked as a question rather than given as an order,
     /// and it exists because that order is expensive in the wrong place: the renders are finished
     /// on the thread that services virtio-gpu for every guest context, so one surface's GPU
     /// completion stalls all of them. A caller that takes the context named here, fences it, and
     /// presents when the fence retires waits for exactly the same work on a thread of its own.
     ///
     /// `None` means this thread has to do the waiting after all, and the caller should fall back to
-    /// [`Self::resource_sync_iosurface`]. Three different reasons, none of which the caller can act
+    /// [`Self::resource_sync_surface`]. Three different reasons, none of which the caller can act
     /// on differently: the resource has no surface, nothing has it attached, or more than one
     /// context has -- a single fence names one context, and picking one of several would answer for
     /// work the other still has outstanding.
     pub fn resource_present_waits_on(&self, handle: ResourceHandle) -> Option<ContextId> {
         // Who the guest kernel attached it to is who is allowed to have rendered into it, which is
-        // the same set `resource_sync_iosurface` finishes. One place decides it.
+        // the same set `resource_sync_surface` finishes. One place decides it.
         let attached = self.with_resource(handle, |r| r.attached.clone())?;
         let [only] = attached[..] else { return None };
         // A resource with no surface is the readback case, and has no fence to offer either.
@@ -2666,9 +2676,9 @@ mod tests {
             },
             Vec::new(),
         );
-        assert_eq!(r.resource_iosurface_id(blob), None, "nothing to present from");
+        assert_eq!(r.resource_surface_id(blob), None, "nothing to present from");
         assert!(!pages.first_refusal(), "the ask above was the first, and it has been said");
-        assert_eq!(r.resource_iosurface_id(blob), None);
+        assert_eq!(r.resource_surface_id(blob), None);
         assert!(!pages.first_refusal(), "and it is not said again");
     }
 

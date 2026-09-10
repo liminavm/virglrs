@@ -91,7 +91,7 @@ struct Armed {
     /// full `glFinish` while the other is free, so a single counter cannot tell an expensive window
     /// from a cheap one.
     drained: u64,
-    /// Calls to `resource_sync_iosurface`: one blocking wait on the surface's shared event each.
+    /// Calls to `resource_sync_surface`: one blocking wait on the surface's shared event each.
     presents: u64,
     /// Wall time inside `Vrend::submit`. Against the window's own length this also says what
     /// share of the worker's second the command path took, which is the other half of the

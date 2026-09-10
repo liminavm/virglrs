@@ -716,7 +716,7 @@ impl Vrend {
             let res = self.resources.get(&handle)?.resource()?;
             (res.surface_share()?, res.args.width, res.args.height)
         };
-        let image = match self.winsys.image_from_iosurface(held) {
+        let image = match self.winsys.image_from_surface(held) {
             Ok(image) => image,
             Err(e) => {
                 eprintln!("[virglrs] vrend: {handle:?}: cannot import its own export ({e})");
@@ -989,7 +989,7 @@ impl Vrend {
     ///
     /// A resource attached to nothing has no such set, and is finished the old way rather than
     /// early: presenting a frame that has not been rendered is worse than presenting it late.
-    pub fn resource_sync_iosurface(
+    pub fn resource_sync_surface(
         &mut self,
         handle: ResourceHandle,
         attached: &[ContextId],

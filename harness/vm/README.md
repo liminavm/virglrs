@@ -263,7 +263,7 @@ about a particular benchmark; the traps are the ones any driven graphics workloa
 **Boot with `--window`, never `--display-capture`.** A capture boot re-encodes every presented
 frame to PNG and reads the scanout back out of its IOSurface to do it. Under a workload that
 presents constantly, that puts `fdeflate::compress`, `write_png` and
-`Renderer::resource_read_iosurface` near the top of the profile -- the vehicle measuring itself.
+`Renderer::resource_read_surface` near the top of the profile -- the vehicle measuring itself.
 Video decode presents rarely and does not notice, which is why `capture.sh` is right to use it and
 a graphics profile is not.
 
@@ -336,7 +336,7 @@ benchmark that was not running.
 **Aiming means the WHOLE window sat inside one test.** The tests run about 11 s each, so a 10 s
 window labelled only at its start straddles a boundary — and a straddled window attributes one
 test's work to another: a "Geometry Stress" window carried 21.7% `transfer::write`, which is
-Canvas's signature, and the same window put `resource_sync_iosurface` at 26% where a clean one puts
+Canvas's signature, and the same window put `resource_sync_surface` at 26% where a clean one puts
 it at 55%. Read the pathname **before and after** each window and discard the window when the two
 disagree; 5 s windows keep about half. Start on the first `graphics_suite` path rather than
 whenever the host is ready, or the first three tests are never sampled at all.
@@ -355,8 +355,8 @@ from clean windows, with the classic fence's `finish_all` removed (it is 0.0% in
 | window | top of the worker's subtree |
 |---|---|
 | WebGL 1.0.2 | 36.1% `take_fence`, and **all** of it `tc_flush`; no `glFinish` at all |
-| Draw-call Stress | 33-40% `take_fence` (31-38% `tc_flush`), 5-25% `resource_sync_iosurface` |
-| Geometry Stress | 55% `resource_sync_iosurface`, 10% `take_fence` |
+| Draw-call Stress | 33-40% `take_fence` (31-38% `tc_flush`), 5-25% `resource_sync_surface` |
+| Geometry Stress | 55% `resource_sync_surface`, 10% `take_fence` |
 | Canvas | 42% `transfer::write`, 52% `Context::submit`, 1.3% `take_fence` |
 | SVG | barely reaches the renderer at all (2-5%) |
 | result page | 0.1% — the negative control |

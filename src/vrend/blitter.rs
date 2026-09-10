@@ -912,7 +912,7 @@ mod tests {
             let surface: Arc<dyn Held> = Arc::new(surface);
             let planes = [Plane::Luma, Plane::ChromaPair].map(|which| {
                 let image = winsys
-                    .image_from_iosurface_plane(Arc::clone(&surface), which)
+                    .image_from_surface_plane(Arc::clone(&surface), which)
                     .expect("the driver imports the plane");
                 let name = gl.gen_texture();
                 gl.bind_texture(GL_TEXTURE_2D, Some(name));
