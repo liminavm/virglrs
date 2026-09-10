@@ -5917,10 +5917,18 @@ fn export_dmabuf(
         _ => DRM_FORMAT_MOD_INVALID,
     };
 
-    // How many memory planes there are is a property of the FourCC, and every format this
-    // renderer exports is single-plane. A planar export would have to read the plane count out
-    // of the modifier's own properties rather than assume it, so it is refused here instead of
-    // guessed at -- see `pixel_format` for what is accepted.
+    // How many *memory* planes an image has is a property of the modifier, not of the FourCC:
+    // every format this renderer exports has one plane of pixels, and a compressed modifier adds
+    // an auxiliary plane to it -- this host's ICL lays `I915_FORMAT_MOD_Y_TILED_CCS` out as two
+    // planes of single-plane ARGB8888. The modifier above is the guest's image's, so this cannot
+    // assume it is one that adds none.
+    //
+    // Reading the real count wants `VkDrmFormatModifierPropertiesListEXT`, which needs the
+    // physical device this function is not given and a struct the wire bindings do not yet carry.
+    // Until it does, an image whose modifier has an auxiliary plane is described here as having
+    // one. Measured against iris on this host: a `Y_TILED_CCS` buffer declared as a single plane
+    // is refused at `eglCreateImageKHR` with `EGL_BAD_MATCH`, so such an import fails loudly at
+    // the importer rather than being read as the wrong pixels.
     let plane_count = 1u32;
     let layout_query = d.try_vkGetImageSubresourceLayout().ok_or(NoSurface::Layout)?;
     let mut planes = [PlaneLayout { offset: 0, pitch: 0 }; MAX_PLANES];

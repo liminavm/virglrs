@@ -299,6 +299,23 @@ here, and the classic export is `EGL_MESA_image_dma_buf_export` — so this host
 `image_from_iosurface`/`image_from_iosurface_plane` are the call sites, and the planar path maps
 onto multi-plane dma-buf import directly. Modifiers are sent only when the query produced one.
 
+The export takes every plane the modifier reports, not just the colour one: a compressed modifier
+describes a single-plane format with an auxiliary plane beside it, and a descriptor missing it
+promises a compression plane that is not in the layout. All of them must be one allocation, which
+is what a `Surface` can hold, and that is checked against the descriptors' inodes rather than
+assumed. The allocation's size is the kernel's `lseek(SEEK_END)` answer, because `pitch * height`
+measures the colour plane and stops short of anything past it.
+
+No such buffer reaches the renderer on this host -- an ICL scanout is plain `X_TILED` with one
+plane -- so the export path is pinned by unit tests over stubbed export calls, using the layout
+GBM reports for a real `Y_TILED_CCS` buffer here, and not by a boot. The import side is measured
+directly: the attribute list `image_of_iosurface` builds for such a buffer, one descriptor named
+by both planes, is accepted by iris.
+
+The size of a single-plane export changed with it. `alloc_size` is now the whole allocation rather
+than `pitch * height`, which is what the driver actually reserved, so the budget charges the real
+figure and a `LINEAR` mapping covers the whole buffer.
+
 **Gate:** the replayer's own scanout read, matching the fixture, and the skipped count reaching
 zero. **Met.** Forty scanout lines across six corpora are scored where all of them were compiled
 out, the skipped count is zero on nine corpora, and `vrend-nodraw`'s positive control now moves 23
@@ -376,12 +393,15 @@ round trip, with "does this host mint surfaces to adopt", which is macOS-only an
 the `#[cfg]` on `mint_surface`. No live bug -- its call sites are macOS-only or unreachable off it
 -- but the predicate denies something this host does.
 
-**Multi-plane dma-buf export.** `Winsys::export_image` refuses `planes != 1`, which is what a
-compressed modifier carrying a CCS or DCC auxiliary plane reports for a single colour buffer. This
-host's ICL exports plain `X_TILED` with one plane, so the refusal has not been observed here.
-`Layout` already carries `MAX_PLANES` entries and the import loop already walks them; the blocker
-is that `image_of_iosurface` passes one fd for every plane, which holds for an aux plane in one
-allocation and not in general.
+**Multi-plane export on the venus side.** A classic export takes every plane a compressed
+modifier reports; a venus one still describes every image as having a single memory plane.
+`export_dmabuf` cannot do better yet: the real count is
+`VkDrmFormatModifierPropertiesListEXT::drmFormatModifierPlaneCount`, which needs a physical device
+that function is not given and a struct the wire bindings do not carry. The modifier there is the
+guest's image's, so a guest that asks for `Y_TILED_CCS` gets a descriptor claiming one plane under
+a two-plane modifier. Measured against iris here, that pairing is refused at `eglCreateImageKHR`
+with `EGL_BAD_MATCH`, so the failure is an importer's refusal and not a picture read from the
+wrong bytes.
 
 ## Missing infrastructure
 

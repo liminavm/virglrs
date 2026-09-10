@@ -399,13 +399,28 @@ impl Surface {
             return None;
         }
         let p = self.layout.planes[plane as usize];
-        // A subsampled chroma plane is half the luma plane in both directions. Two planes means
-        // NV12 here, which is the only planar layout this renderer exports.
-        let sub = u32::from(plane > 0 && self.layout.plane_count == 2);
+        // How a plane is *sampled* is a property of the FourCC, never of how many planes the
+        // allocation has. A second plane means half-resolution two-byte chroma in NV12 and
+        // something else entirely under a compressed modifier, which carries an auxiliary plane
+        // for a single-plane format -- this host's ICL exports `I915_FORMAT_MOD_Y_TILED_CCS` as
+        // two planes of ARGB8888. Counting planes to decide the layout would hand that buffer's
+        // compression plane out as chroma at half the width.
+        //
+        // So a plane past the first exists to be *named* in an import and not to be read as a
+        // picture: only a format that has more than one plane of pixels answers here.
+        if plane > 0 && self.layout.fourcc != DRM_FORMAT_NV12 {
+            return None;
+        }
+        let sub = u32::from(plane > 0);
         let shape = PlaneShape {
             width: self.layout.width >> sub,
             height: self.layout.height >> sub,
-            bytes_per_element: if plane == 0 { 1 } else { 2 },
+            bytes_per_element: match (self.layout.fourcc, plane) {
+                (DRM_FORMAT_NV12, 0) => 1,
+                (DRM_FORMAT_NV12, _) => 2,
+                // Not a planar format: one plane of whole pixels.
+                _ => 4,
+            },
             bytes_per_row: p.pitch,
             offset: u32::try_from(p.offset).unwrap_or(u32::MAX),
         };

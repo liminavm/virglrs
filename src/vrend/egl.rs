@@ -766,6 +766,44 @@ impl Winsys {
         ))
     }
 
+    /// What says two descriptors name one buffer: the device and inode behind them.
+    ///
+    /// `dma_buf_fd` installs each new descriptor on the *same* `struct file`, and DRM PRIME caches a
+    /// buffer object's dma-buf, so every export of one allocation shares an inode and a second
+    /// allocation does not. Measured on this host: two exports of one GBM buffer both report inode
+    /// 2337, a separately created buffer 2338.
+    ///
+    /// `None` for a descriptor that will not stat, which is a reason to refuse rather than to guess:
+    /// an unknown identity cannot be compared against another one.
+    #[cfg(not(target_os = "macos"))]
+    fn buffer_identity(fd: std::os::fd::BorrowedFd<'_>) -> Option<(libc::dev_t, libc::ino_t)> {
+        use std::os::fd::AsRawFd;
+        let mut st = core::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: an open descriptor the caller owns for the length of the borrow, and a `stat` this
+        // call fills; it is read only where `fstat` reported success.
+        let rc = unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        // SAFETY: `fstat` returned zero, so it initialised the struct.
+        let st = unsafe { st.assume_init() };
+        Some((st.st_dev, st.st_ino))
+    }
+
+    /// How many bytes the allocation behind a descriptor holds, asked of the kernel.
+    ///
+    /// A dma-buf answers `lseek(SEEK_END)` with the size of the whole buffer; that is what
+    /// `dma_buf_llseek` is for. `None` for a descriptor that will not seek, leaving the caller its
+    /// arithmetic -- which is right for one plane and short for more.
+    #[cfg(not(target_os = "macos"))]
+    fn buffer_size(fd: std::os::fd::BorrowedFd<'_>) -> Option<u64> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: an open descriptor the caller owns for the length of the borrow. Seeking a
+        // descriptor this renderer owns moves only its own file offset, which nothing here reads.
+        let end = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) };
+        u64::try_from(end).ok().filter(|n| *n != 0)
+    }
+
     /// Ask an EGL image what it is and take the descriptor. Split out so its caller can destroy
     /// the image on every path, including the ones that refuse.
     #[cfg(not(target_os = "macos"))]
@@ -791,6 +829,7 @@ impl Winsys {
         format: crate::surface::PixelFormat,
     ) -> Result<(core::ffi::c_int, crate::surface::Layout), EglError> {
         use crate::surface::{DRM_FORMAT_MOD_INVALID, Layout, MAX_PLANES, PlaneLayout};
+        use std::os::fd::{AsFd, IntoRawFd};
 
         let (mut fourcc, mut planes, mut modifier) = (0, 0, 0u64);
         // SAFETY: an image on this display, and three locals.
@@ -799,17 +838,21 @@ impl Winsys {
         if ok == 0 {
             return Err(self.shared.error("eglExportDMABUFImageQueryMESA"));
         }
-        // One descriptor is what a surface holds, so a multi-plane export is refused rather than
-        // half-taken: taking plane 0 and dropping the rest is a buffer that reads as a picture
-        // and is missing its chroma, which displays and displays wrong.
-        if planes != 1 {
-            return Err(EglError { call: "a multi-plane dma-buf export", code: planes });
-        }
+        // `MAX_PLANES` is what a `Layout` can describe and what the arrays below hold, so a
+        // driver claiming more planes than that is refused before it is given anywhere to write
+        // them. Zero planes is a successful query that described nothing.
+        let Some(count) = usize::try_from(planes).ok().filter(|n| (1..=MAX_PLANES).contains(n))
+        else {
+            return Err(EglError {
+                call: "a dma-buf export with no usable plane count",
+                code: planes,
+            });
+        };
 
         let (mut fds, mut strides, mut offsets) =
             ([-1; MAX_PLANES], [0; MAX_PLANES], [0; MAX_PLANES]);
         // SAFETY: an image on this display, and three arrays of at least `planes` entries -- the
-        // query above reported one, and `MAX_PLANES` is four.
+        // query above reported `count`, which was just bounded by `MAX_PLANES`.
         let ok = unsafe {
             export(
                 self.shared.display,
@@ -822,32 +865,76 @@ impl Winsys {
         if ok == 0 {
             return Err(self.shared.error("eglExportDMABUFImageMESA"));
         }
+        // Own every descriptor before anything below can refuse. From here each refusal is a
+        // plain `return`, and the drop is what closes them -- a path that returned while holding
+        // raw integers would leak one descriptor per plane, per export, invisibly.
+        let owned: Vec<Option<std::os::fd::OwnedFd>> = fds[..count]
+            .iter()
+            .map(|&raw| {
+                use std::os::fd::FromRawFd;
+                // SAFETY: a descriptor the export just produced and nothing else holds, so
+                // wrapping it makes this its only owner.
+                (raw >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+            })
+            .collect();
         // A driver that reported success and handed back nothing has exported nothing, and a
         // surface over `-1` would fail at every use with no memory of where it came from.
-        if fds[0] < 0 {
+        let Some(owned) = owned.into_iter().collect::<Option<Vec<_>>>() else {
             return Err(EglError { call: "eglExportDMABUFImageMESA gave no descriptor", code: 0 });
-        }
-        // The pitch is the driver's and is what everything downstream reads rows by; zero is not
-        // a layout, and a surface built on it shears every row onto the one before.
-        let pitch = u32::try_from(strides[0]).ok().filter(|p| *p != 0);
-        let Some(pitch) = pitch else {
-            use std::os::fd::FromRawFd;
-            // SAFETY: a descriptor the export just produced and nothing else holds, so wrapping
-            // it makes this its only owner -- and dropping it is the close this path owes.
-            drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) });
-            return Err(EglError {
-                call: "eglExportDMABUFImageMESA gave no row pitch",
-                code: strides[0],
-            });
         };
+
+        // Every plane must be the same buffer at a different offset, because that is what the
+        // rest of this renderer holds: a `Surface` is *one* descriptor plus a layout, and the
+        // import reaches every plane through it. The export hands back a descriptor per plane
+        // and they are ordinarily dups of one -- `dma_buf_fd` installs a new fd on the same
+        // `struct file`, so they share an inode. Measured on this host's ICL: a 256x64 ARGB8888
+        // buffer with `I915_FORMAT_MOD_Y_TILED_CCS` exports two planes, both inode 2339.
+        //
+        // Checked and not assumed, because a driver that laid the planes in separate allocations
+        // would produce a layout whose plane 0 imports perfectly and whose plane 1 names the
+        // wrong memory -- a picture missing its chroma, or a compression plane describing
+        // another buffer. That refuses by name here instead.
+        let identity = Self::buffer_identity(owned[0].as_fd());
+        if identity.is_none()
+            || owned[1..].iter().any(|f| Self::buffer_identity(f.as_fd()) != identity)
+        {
+            return Err(EglError {
+                call: "a dma-buf export whose planes are not one allocation",
+                code: planes,
+            });
+        }
+
+        // The pitch is the driver's and is what everything downstream reads rows by; zero is not
+        // a layout, and a surface built on it shears every row onto the one before. Every plane,
+        // not just the first: an auxiliary plane with no pitch is as unreadable as a colour one.
+        let mut plane_layout = [PlaneLayout { offset: 0, pitch: 0 }; MAX_PLANES];
+        for at in 0..count {
+            let Some(pitch) = u32::try_from(strides[at]).ok().filter(|p| *p != 0) else {
+                return Err(EglError {
+                    call: "eglExportDMABUFImageMESA gave no row pitch",
+                    code: strides[at],
+                });
+            };
+            plane_layout[at] = PlaneLayout { offset: offsets[at].max(0) as u64, pitch };
+        }
         // The FourCC the driver reports wins over the one this side would have named. They should
         // agree; where they do not, the driver is describing the bytes it actually wrote, and the
         // importer must be told those. `format` is only the fallback for a driver reporting none.
         let fourcc = if fourcc != 0 { fourcc as u32 } else { format.fourcc() };
-        let mut plane_layout = [PlaneLayout { offset: 0, pitch: 0 }; MAX_PLANES];
-        plane_layout[0] = PlaneLayout { offset: offsets[0].max(0) as u64, pitch };
+        // How big the allocation is, asked of the kernel rather than derived. `pitch * height`
+        // measures the colour plane and nothing else, so it is short by exactly the auxiliary
+        // plane a compressed modifier adds -- on the ICL buffer above, 65536 against a real
+        // 131072, and a mapping cut to the smaller number would fault on the plane past it.
+        // `lseek(SEEK_END)` is what `dma_buf_llseek` exists to answer; the arithmetic stays as
+        // the fallback for a descriptor that will not seek.
+        let alloc_size = Self::buffer_size(owned[0].as_fd()).unwrap_or_else(|| {
+            u64::from(plane_layout[0].pitch) * u64::from(height) + plane_layout[0].offset
+        });
+        let mut owned = owned;
         Ok((
-            fds[0],
+            // The planes are one allocation, checked above, so plane 0's descriptor names all of
+            // them and the rest are dups this has no further use for. They close on the drop.
+            owned.swap_remove(0).into_raw_fd(),
             Layout {
                 width,
                 height,
@@ -856,8 +943,8 @@ impl Winsys {
                 // query that failed leaves `INVALID`, and that is caught above.
                 modifier: if modifier == u64::MAX { DRM_FORMAT_MOD_INVALID } else { modifier },
                 planes: plane_layout,
-                plane_count: 1,
-                alloc_size: u64::from(pitch) * u64::from(height) + offsets[0].max(0) as u64,
+                plane_count: count as u32,
+                alloc_size,
             },
         ))
     }
@@ -949,6 +1036,14 @@ impl Winsys {
         // A single-plane import of plane N still describes it as *plane 0* of the image it is
         // making: the attribute index is a position in the image being built, not in the
         // allocation being read. The offset is what carries which plane of the allocation it is.
+        //
+        // Every plane names the same descriptor because every plane *is* the same allocation --
+        // checked where the export happens (`Winsys::export_image`), not assumed here.
+        //
+        // Measured against iris on this host: this list, built for a two-plane
+        // `I915_FORMAT_MOD_Y_TILED_CCS` buffer with one descriptor named twice, is accepted. The
+        // same buffer declared as one plane under that modifier is refused with `EGL_BAD_MATCH`,
+        // which is what makes a wrong plane count an importer's refusal rather than wrong pixels.
         for (at, &(fd_a, off_a, pitch_a, mod_lo, mod_hi)) in
             DMA_BUF_PLANE_ATTRS.iter().enumerate().take(count)
         {
@@ -1050,6 +1145,234 @@ fn parse_egl_version(s: &str) -> Version {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // What a stubbed `eglExportDMABUFImageMESA` pair will answer. Thread-local because the two
+    // are plain `extern "C"` pointers with nowhere to carry a receiver, and one test per thread
+    // is what `cargo test` already gives.
+    #[cfg(not(target_os = "macos"))]
+    thread_local! {
+        static STUB: std::cell::RefCell<Stub> = std::cell::RefCell::new(Stub::default());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[derive(Default)]
+    struct Stub {
+        fourcc: core::ffi::c_int,
+        planes: core::ffi::c_int,
+        modifier: u64,
+        /// One per plane, duplicated into the export's array so the code under test owns what it
+        /// is handed -- which is the contract the real driver has.
+        fds: Vec<std::os::fd::OwnedFd>,
+        strides: Vec<EGLint>,
+        offsets: Vec<EGLint>,
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    unsafe extern "C" fn stub_query(
+        _d: EGLDisplay,
+        _i: EGLImageKHR,
+        fourcc: *mut core::ffi::c_int,
+        planes: *mut core::ffi::c_int,
+        modifier: *mut EGLuint64KHR,
+    ) -> EGLBoolean {
+        STUB.with_borrow(|s| {
+            // SAFETY: three out-pointers the caller under test passed as live locals.
+            unsafe {
+                *fourcc = s.fourcc;
+                *planes = s.planes;
+                *modifier = s.modifier;
+            }
+        });
+        1
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    unsafe extern "C" fn stub_export(
+        _d: EGLDisplay,
+        _i: EGLImageKHR,
+        fds: *mut core::ffi::c_int,
+        strides: *mut EGLint,
+        offsets: *mut EGLint,
+    ) -> EGLBoolean {
+        use std::os::fd::AsRawFd;
+        STUB.with_borrow(|s| {
+            for (at, fd) in s.fds.iter().enumerate() {
+                // SAFETY: duplicating a descriptor this stub owns; the copy is what the code
+                // under test takes ownership of, exactly as the driver's export hands one over.
+                let dup = unsafe { libc::dup(fd.as_raw_fd()) };
+                assert!(dup >= 0, "dup: {}", std::io::Error::last_os_error());
+                // SAFETY: arrays of `MAX_PLANES` entries, written within the plane count the
+                // query above reported.
+                unsafe {
+                    *fds.add(at) = dup;
+                    *strides.add(at) = s.strides[at];
+                    *offsets.add(at) = s.offsets[at];
+                }
+            }
+        });
+        1
+    }
+
+    /// A winsys over an embedder that vouches for a display nothing dereferences. Enough to call
+    /// [`Winsys::export_image`], which touches the display only by passing it to the two stubs.
+    #[cfg(not(target_os = "macos"))]
+    fn stub_winsys() -> Winsys {
+        let (winsys, _ctx0, _made) = Winsys::embedded(
+            Flavour::Gles,
+            Box::new(FakeEmbedder::default()),
+            &[Version { major: 3, minor: 2 }],
+        )
+        .expect("a display the embedder vouched for");
+        winsys
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn memfd(len: usize) -> std::os::fd::OwnedFd {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // SAFETY: a name that outlives the call, and no flags.
+        let fd = unsafe { libc::memfd_create(c"virglrs-egl-test".as_ptr(), 0) };
+        assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+        // SAFETY: a fresh descriptor nothing else holds.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        // SAFETY: sizing a fresh memfd nothing has mapped.
+        let rc = unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) };
+        assert!(rc == 0, "ftruncate: {}", std::io::Error::last_os_error());
+        fd
+    }
+
+    /// A compressed modifier's auxiliary plane travels with the buffer it describes.
+    ///
+    /// The numbers are this host's, measured through GBM: a 256x64 `ARGB8888` buffer created with
+    /// `I915_FORMAT_MOD_Y_TILED_CCS` exports two planes -- colour at offset 0 pitch 1024, the
+    /// compression plane at offset 65536 pitch 128 -- both descriptors naming one 131072-byte
+    /// allocation. Taking plane 0 alone would hand an importer a buffer whose modifier promises a
+    /// compression plane that is not in the layout.
+    ///
+    /// `alloc_size` is the other half of the point: `pitch * height` is 65536, which is the
+    /// colour plane and not the buffer, and a mapping cut to it stops before the aux plane.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_compressed_modifiers_aux_plane_is_exported_with_the_colour_plane() {
+        const Y_TILED_CCS: u64 = 0x0100_0000_0000_0004;
+        let buffer = memfd(131072);
+        let second = buffer.try_clone().expect("dup");
+        STUB.with_borrow_mut(|s| {
+            *s = Stub {
+                fourcc: 0x3432_5241, // DRM_FORMAT_ARGB8888
+                planes: 2,
+                modifier: Y_TILED_CCS,
+                fds: vec![buffer, second],
+                strides: vec![1024, 128],
+                offsets: vec![0, 65536],
+            };
+        });
+
+        let winsys = stub_winsys();
+        let (fd, layout) = winsys
+            .export_image(
+                stub_query,
+                stub_export,
+                core::ptr::dangling_mut(),
+                256,
+                64,
+                crate::surface::PixelFormat::Bgra,
+            )
+            .expect("an export whose planes are one allocation");
+        use std::os::fd::FromRawFd;
+        // SAFETY: the descriptor the call handed back, owned here so the test closes it.
+        drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+
+        assert_eq!(layout.plane_count, 2, "both planes are described");
+        assert_eq!(layout.planes[0], crate::surface::PlaneLayout { offset: 0, pitch: 1024 });
+        assert_eq!(layout.planes[1], crate::surface::PlaneLayout { offset: 65536, pitch: 128 });
+        assert_eq!(layout.modifier, Y_TILED_CCS);
+        assert_eq!(
+            layout.alloc_size, 131072,
+            "the kernel's size for the whole buffer, not the colour plane's arithmetic"
+        );
+    }
+
+    /// Planes in two allocations are refused, and every descriptor is closed on the way out.
+    ///
+    /// A `Surface` is one descriptor plus a layout, so a layout whose planes are separate buffers
+    /// cannot be represented -- plane 1 would be imported at an offset into plane 0's memory.
+    /// Two pipes stand in for two allocations: they have different inodes, and the read ends
+    /// answer whether the write ends this handed out were closed, which no test of fd numbers
+    /// could do without racing another thread's opens.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn planes_in_separate_allocations_are_refused_and_their_descriptors_closed() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let mut ends = Vec::new();
+        let mut write_ends = Vec::new();
+        for _ in 0..2 {
+            let mut fds = [0 as core::ffi::c_int; 2];
+            // SAFETY: a two-element array this call fills.
+            let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) };
+            assert!(rc == 0, "pipe2: {}", std::io::Error::last_os_error());
+            // SAFETY: two fresh descriptors nothing else holds.
+            ends.push(unsafe { OwnedFd::from_raw_fd(fds[0]) });
+            write_ends.push(unsafe { OwnedFd::from_raw_fd(fds[1]) });
+        }
+        STUB.with_borrow_mut(|s| {
+            *s = Stub {
+                fourcc: 0x3432_5241,
+                planes: 2,
+                modifier: 0,
+                fds: write_ends,
+                strides: vec![1024, 1024],
+                offsets: vec![0, 65536],
+            };
+        });
+
+        let winsys = stub_winsys();
+        let got = winsys.export_image(
+            stub_query,
+            stub_export,
+            core::ptr::dangling_mut(),
+            256,
+            64,
+            crate::surface::PixelFormat::Bgra,
+        );
+        let err = got.expect_err("two allocations cannot be one surface");
+        assert_eq!(err.call, "a dma-buf export whose planes are not one allocation");
+
+        // Drop the stub's own write ends, so the only thing that could still hold one open is a
+        // descriptor the refusal leaked.
+        STUB.with_borrow_mut(|s| s.fds.clear());
+        for read_end in &ends {
+            let mut byte = 0u8;
+            // SAFETY: a descriptor this test owns, read into one live local byte.
+            let n = unsafe { libc::read(read_end.as_raw_fd(), (&raw mut byte).cast(), 1) };
+            assert_eq!(
+                n, 0,
+                "the refusal must close every descriptor it was handed; a leaked write end \
+                 leaves this pipe open and the read returns EAGAIN instead of end-of-file"
+            );
+        }
+    }
+
+    /// More planes than a layout can hold is refused before anything is written into one.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_plane_count_a_layout_cannot_hold_is_refused() {
+        STUB.with_borrow_mut(|s| {
+            *s = Stub { fourcc: 0x3432_5241, planes: 5, ..Stub::default() };
+        });
+        let winsys = stub_winsys();
+        let err = winsys
+            .export_image(
+                stub_query,
+                stub_export,
+                core::ptr::dangling_mut(),
+                256,
+                64,
+                crate::surface::PixelFormat::Bgra,
+            )
+            .expect_err("five planes is past MAX_PLANES");
+        assert_eq!(err.call, "a dma-buf export with no usable plane count");
+    }
 
     /// An embedder that hands out tokens of its own and counts what it was asked for. The
     /// display is never dereferenced by anything this exercises, only compared against
