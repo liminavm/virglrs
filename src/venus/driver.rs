@@ -4508,11 +4508,13 @@ impl Driver {
     /// then it stops, because there is nothing to make. What it returns is the image, so that
     /// after `vkAllocateMemory` the layout query has something to ask about.
     ///
-    /// Deliberately *not* checking the tiling. The minting host must refuse an OPTIMAL image
-    /// because it is about to hand the driver pages the driver would never write into; here the
-    /// driver keeps its own storage and a tiled buffer exports perfectly well -- the modifier is
-    /// what tells the importer how to read it. Carrying that check across would refuse exactly
-    /// the buffers this direction exists to support.
+    /// Deliberately *not* judging the tiling here. The minting host must refuse anything but a
+    /// layout it can address, because it is about to hand the driver pages the driver would never
+    /// write into; here the driver keeps its own storage and a *tiled* buffer exports perfectly
+    /// well -- the modifier is what tells the importer how to read it -- so carrying that check
+    /// across would refuse exactly the buffers this direction exists to support. The one tiling
+    /// with no answer, OPTIMAL, is refused where the question is actually asked, at the layout
+    /// query, and falls through to a descriptor with no shape rather than failing the export.
     #[cfg(not(target_os = "macos"))]
     fn scanout_surface(
         &mut self,
@@ -5394,8 +5396,11 @@ pub enum NoSurface {
     Undescribed,
     /// The driver refused to export a descriptor of the allocation.
     Export(VkResult),
-    /// An opaque layout: the driver keeps its storage in a layout of its own, and would never
-    /// write a byte into pages minted here.
+    /// An opaque layout, which neither host can describe -- for the same reason from two
+    /// directions. Minting one is pointless: the driver keeps its storage in a layout of its own
+    /// and would never write a byte into pages minted here. Exporting one has nothing to ask:
+    /// only a LINEAR or a DRM_FORMAT_MODIFIER image has a valid subresource layout, so the pitch
+    /// an OPTIMAL image reports is not a number about the bytes.
     Tiling(VkImageTiling),
     /// The driver's layout is not rows a surface could alias -- no layout query, a zero pitch,
     /// rows that do not add up to the image, or a pitch IOSurface would not take.
@@ -6076,7 +6081,12 @@ fn export_dmabuf(
             }
             props.drmFormatModifier
         }
-        _ => DRM_FORMAT_MOD_INVALID,
+        // No DRM name, and no honest layout either: `vkGetImageSubresourceLayout` is valid
+        // only for a LINEAR or a DRM_FORMAT_MODIFIER image, so an OPTIMAL one answers with a
+        // pitch that describes nothing -- and an importer told `INVALID` reads the bytes as
+        // rows. Refused here rather than described wrongly; the descriptor is still exported,
+        // because what is missing is the shape and not the storage.
+        tiling => return Err(NoSurface::Tiling(tiling)),
     };
 
     // How many *memory* planes an image has is a property of the modifier, not of the FourCC:
@@ -7627,6 +7637,163 @@ mod tests {
         d.free_memory(DEVICE, MEMORY, ObjectId(1));
         assert!(matches!(share.adoptable(), Some(Adoptable::Unread(_))));
         drop(share);
+        d.destroy_device(DEVICE, &[]);
+    }
+
+    /// An OPTIMAL image is exported as a descriptor with no shape, and its layout is never asked.
+    ///
+    /// `vkGetImageSubresourceLayout` is valid only for a LINEAR or a DRM_FORMAT_MODIFIER image.
+    /// Asked about an OPTIMAL one it is free to answer anything at all, and the answer would then
+    /// travel as a pitch beside `DRM_FORMAT_MOD_INVALID` -- which tells an importer to read tiled
+    /// bytes as rows, so the window displays, and displays sheared. The refusal is the layout's
+    /// and not the export's: the storage is fine and the descriptor is still handed out, which is
+    /// the whole of "exportable and presentable are two questions".
+    ///
+    /// So the assertion that carries this is the *count*: the driver's layout query is planted
+    /// and must never be called. An assertion about the storage alone would also pass if the
+    /// query were called and its answer merely discarded, and it is the call that is the defect.
+    ///
+    /// The LINEAR control is `an_exported_scanout_takes_the_driver_s_descriptor_and_the_driver_s_layout`,
+    /// which asks the same driver the same question and does get a surface out of it.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_optimal_image_is_exported_without_being_described() {
+        use crate::venus::proto::types::{
+            VkBuffer, VkExtent3D, VkExternalMemoryHandleTypeFlags, VkImageCreateInfo, VkImageType,
+            VkSampleCountFlagBits,
+        };
+        use std::cell::Cell;
+
+        const DEVICE: VkDevice = VkDevice(3);
+        const MEMORY: VkDeviceMemory = VkDeviceMemory(0x9400);
+        const IMAGE: VkImage = VkImage(0x79);
+        const SIZE: u64 = 64 * 48 * 4;
+
+        thread_local! {
+            /// How many times the driver was asked for a layout it has no valid answer to.
+            static LAYOUT_ASKED: Cell<u32> = const { Cell::new(0) };
+        }
+
+        unsafe extern "C" fn allocate(
+            _: VkDevice,
+            _: *const VkMemoryAllocateInfo,
+            _: *const VkAllocationCallbacks,
+            out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            // SAFETY: the caller's local.
+            unsafe { *out = MEMORY };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn free(_: VkDevice, _: VkDeviceMemory, _: *const VkAllocationCallbacks) {
+        }
+        unsafe extern "C" fn destroy_device(_: VkDevice, _: *const VkAllocationCallbacks) {}
+        unsafe extern "C" fn idle(_: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        /// A plausible answer, which is the point: a driver that returns rubbish would be caught
+        /// by the bounds checks downstream, and one that returns a well-formed lie would not.
+        unsafe extern "C" fn layout(
+            _: VkDevice,
+            _: VkImage,
+            _: *const VkImageSubresource,
+            out: *mut VkSubresourceLayout,
+        ) {
+            LAYOUT_ASKED.set(LAYOUT_ASKED.get() + 1);
+            // SAFETY: the caller's local.
+            unsafe {
+                (*out).offset = VkDeviceSize(0);
+                (*out).rowPitch = VkDeviceSize(64 * 4);
+                (*out).size = VkDeviceSize(SIZE);
+            }
+        }
+        unsafe extern "C" fn export(
+            _: VkDevice,
+            _: *const VkMemoryGetFdInfoKHR,
+            out: *mut core::ffi::c_int,
+        ) -> VkResult {
+            // SAFETY: a NUL-terminated literal and no flags; the descriptor is fresh.
+            let fd = unsafe { libc::memfd_create(c"virglrs-test-optimal".as_ptr(), 0) };
+            assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+            // SAFETY: sizing a fresh memfd nothing has mapped.
+            let rc = unsafe { libc::ftruncate(fd, SIZE as libc::off_t) };
+            assert_eq!(rc, 0, "ftruncate: {}", std::io::Error::last_os_error());
+            // SAFETY: the caller's local.
+            unsafe { *out = fd };
+            VkResult::VK_SUCCESS
+        }
+
+        LAYOUT_ASKED.set(0);
+        let mut d = Driver::new(Account::for_test(None));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(allocate);
+        fns.plant_vkFreeMemory(free);
+        fns.plant_vkDestroyDevice(destroy_device);
+        fns.plant_vkDeviceWaitIdle(idle);
+        fns.plant_vkGetImageSubresourceLayout(layout);
+        fns.plant_vkGetMemoryFdKHR(export);
+        d.plant_device(DEVICE, fns);
+        // Device-local, so the descriptor is the only route to these bytes and the heap arm is
+        // not what the assertions below would be reading.
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(0)]);
+        d.note_image(
+            IMAGE,
+            &VkImageCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                pNext: core::ptr::null(),
+                flags: VkImageCreateFlags(0),
+                imageType: VkImageType::VK_IMAGE_TYPE_2D,
+                format: VkFormat::VK_FORMAT_B8G8R8A8_UNORM,
+                extent: VkExtent3D { width: 64, height: 48, depth: 1 },
+                mipLevels: 1,
+                arrayLayers: 1,
+                samples: VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT,
+                // The one variable against the LINEAR control.
+                tiling: VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
+                usage: VkImageUsageFlags(0),
+                sharingMode: Default::default(),
+                queueFamilyIndexCount: 0,
+                pQueueFamilyIndices: core::ptr::null(),
+                initialLayout: VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
+            },
+        );
+
+        let export_info = VkExportMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+            pNext: core::ptr::null(),
+            handleTypes: VkExternalMemoryHandleTypeFlags(0x200),
+        };
+        let dedicated = VkMemoryDedicatedAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            pNext: (&raw const export_info).cast(),
+            image: IMAGE,
+            buffer: VkBuffer(0),
+        };
+        let info = VkMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: (&raw const dedicated).cast(),
+            allocationSize: VkDeviceSize(SIZE),
+            memoryTypeIndex: 0,
+        };
+        d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None)
+            .expect("a tiling this side cannot describe is not a refusal to export");
+
+        assert_eq!(
+            LAYOUT_ASKED.get(),
+            0,
+            "an OPTIMAL image has no valid subresource layout, so it is never asked for one"
+        );
+        let allocated = d.memory.get(&ObjectId(1)).expect("allocated");
+        assert!(
+            matches!(allocated.backing, Backing::Owned { storage: Storage::Exported(_), .. }),
+            "the descriptor stands; it is only the shape that is missing"
+        );
+        assert!(
+            matches!(allocated.storage().map(Storage::surface), Some(Err(_))),
+            "and no surface is invented out of a pitch the driver never validly reported"
+        );
+
+        // A `Driver` asserts on drop that it holds no host handles.
+        d.free_memory(DEVICE, MEMORY, ObjectId(1));
         d.destroy_device(DEVICE, &[]);
     }
 
