@@ -112,6 +112,13 @@ pub enum BadLayout {
     Extent { width: u32, height: u32 },
     /// A FourCC this renderer has no plane rule for, so it cannot check the rest.
     Fourcc(u32),
+    /// A pixel format with no DRM FourCC at all, named as the guest's command named it. A
+    /// different claim from the one above: there is nothing to tell an importer the bytes are,
+    /// rather than a name whose planes are unknown here.
+    NoFourcc(&'static str),
+    /// More planes than a layout can hold. The guest's count, refused rather than trimmed: a
+    /// trimmed count describes a different buffer from the one the guest sent.
+    TooManyPlanes { said: usize, max: usize },
     /// A layout claim this side cannot check. See [`Describable::describe`].
     Modifier(u64),
     /// The plane count disagrees with what the FourCC has.
@@ -130,6 +137,10 @@ impl core::fmt::Display for BadLayout {
         match self {
             BadLayout::Extent { width, height } => write!(f, "an empty {width}x{height} image"),
             BadLayout::Fourcc(c) => write!(f, "fourcc {c:#010x} has no plane rule here"),
+            BadLayout::NoFourcc(name) => write!(f, "{name} has no DRM fourcc to import it by"),
+            BadLayout::TooManyPlanes { said, max } => {
+                write!(f, "{said} planes, and a layout holds {max}")
+            }
             BadLayout::Modifier(m) => {
                 write!(f, "modifier {m:#018x} is not one this side can bound")
             }

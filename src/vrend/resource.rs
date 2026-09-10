@@ -664,9 +664,17 @@ fn describe(
 
     let fourcc = super::formats::scanout_fourcc(args.format)
         .map(|c| c.get())
-        .ok_or(crate::surface::BadLayout::Fourcc(0))?;
+        .ok_or(crate::surface::BadLayout::NoFourcc(args.format.name()))?;
+    // The guest's count, refused above what a layout holds rather than trimmed to it. Trimming
+    // would describe a buffer the guest did not send and then check that one instead.
+    if planes.len() > MAX_PLANES {
+        return Err(crate::surface::BadLayout::TooManyPlanes {
+            said: planes.len(),
+            max: MAX_PLANES,
+        });
+    }
     let mut layout = [PlaneLayout { offset: 0, pitch: 0 }; MAX_PLANES];
-    for (at, p) in planes.iter().take(MAX_PLANES).enumerate() {
+    for (at, p) in planes.iter().enumerate() {
         layout[at] = PlaneLayout { offset: u64::from(p.offset), pitch: p.stride };
     }
     Arc::clone(storage).describe(Layout {
@@ -675,9 +683,9 @@ fn describe(
         fourcc,
         modifier,
         planes: layout,
-        // The guest's own count, bounded by what a layout can hold. `describe` is what says
-        // whether it agrees with the FourCC -- one rule, in one place, over both halves.
-        plane_count: planes.len().min(MAX_PLANES) as u32,
+        // The guest's own count, refused above. `describe` is what says whether it agrees with
+        // the FourCC -- one rule, in one place, over both halves.
+        plane_count: planes.len() as u32,
         // The buffer's extent is the kernel's and the descriptor holds it; whatever is put here
         // is replaced by `describe` with what `lseek` said.
         alloc_size: 0,
@@ -2470,14 +2478,19 @@ fn export_surface(winsys: &Winsys, a: &Args, name: TextureName) -> Option<Arc<dy
         "R8G8B8A8_UNORM" | "R8G8B8X8_UNORM" => PixelFormat::Rgba,
         _ => return None,
     };
-    // Said once, each way. A needle that only fires on failure reads the same when the export
-    // works and when the gate above quietly stopped matching anything, and "no refusals in the
-    // log" is exactly the reading this renderer has been caught trusting before.
-    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let first = || !SAID.swap(true, std::sync::atomic::Ordering::Relaxed);
+    // Said once, each way -- and that needs a latch each way. A needle that only fires on
+    // failure reads the same when the export works and when the gate above quietly stopped
+    // matching anything, and "no refusals in the log" is exactly the reading this renderer has
+    // been caught trusting before. One latch for both lines would print whichever came first and
+    // then go silent, so a refusal after a success would be the invisible case again.
+    static EXPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let first = |said: &std::sync::atomic::AtomicBool| {
+        !said.swap(true, std::sync::atomic::Ordering::Relaxed)
+    };
     match winsys.export_texture(name, a.width, a.height, format) {
         Ok(surface) => {
-            if first() {
+            if first(&EXPORTED) {
                 let l = *surface.layout();
                 eprintln!(
                     "[virglrs] vrend: scanouts export as dma-bufs: {}x{} {} is fourcc {:#010x} \
@@ -2493,7 +2506,7 @@ fn export_surface(winsys: &Winsys, a: &Args, name: TextureName) -> Option<Arc<dy
             Some(Arc::new(surface) as Arc<dyn Held>)
         }
         Err(e) => {
-            if first() {
+            if first(&REFUSED) {
                 eprintln!(
                     "[virglrs] vrend: this driver exports no dma-buf for a {}x{} {} resource \
                      ({e}); scanouts are read back through the CPU instead",
@@ -2510,6 +2523,105 @@ fn export_surface(winsys: &Winsys, a: &Args, name: TextureName) -> Option<Arc<dy
 #[cfg(test)]
 mod tests {
     use super::Conversion;
+
+    /// What the guest sends about a buffer's shape is refused by name, and never repaired.
+    ///
+    /// Two numbers arrive with `PIPE_RESOURCE_SET_TYPE` and neither is this side's to fix. A
+    /// plane count above what a layout holds used to be trimmed to fit, which then checked a
+    /// buffer the guest had not described; and a format with no DRM FourCC was reported as
+    /// "fourcc 0x00000000 has no plane rule", which names neither the format nor the real
+    /// problem -- that there is nothing to tell an importer the bytes are.
+    ///
+    /// The spy is what makes the refusals mean anything: it records the layout it is handed, so
+    /// the test can say that the refused cases never reached it and that the accepted one arrived
+    /// with the guest's own count rather than a repaired one.
+    #[test]
+    fn a_layout_the_guest_got_wrong_is_refused_by_name_and_never_trimmed() {
+        use super::{Args, Bind, Plane, ResourceFlags, TextureTarget, describe};
+        use crate::surface::{BadLayout, Layout, MAX_PLANES};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Spy(Mutex<Option<Layout>>);
+
+        impl crate::surface::Describable for Spy {
+            fn describe(
+                self: Arc<Self>,
+                layout: Layout,
+            ) -> Result<Arc<dyn crate::surface::Held>, BadLayout> {
+                *self.0.lock().expect("no panics here") = Some(layout);
+                // The storage's own answer is not what is under test; what matters is what it was
+                // asked, and that it was asked at all.
+                Err(BadLayout::NoDescriptor)
+            }
+        }
+
+        // Taken from the generated table rather than named here, so this does not carry its own
+        // copy of which formats can be a scanout.
+        let bgra = super::super::formats::scanout_fourccs()
+            .next()
+            .expect("some format can be scanned out")
+            .0;
+        let opaque = (1..super::super::proto::FORMAT_MAX)
+            .map(super::Format::table)
+            .find(|f| f.name() != "???" && super::super::formats::scanout_fourcc(*f).is_none())
+            .expect("some format cannot");
+        let args = |format| Args {
+            target: TextureTarget::Texture2d,
+            format,
+            bind: Bind::SHARED,
+            width: 64,
+            height: 48,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: ResourceFlags::default(),
+        };
+        let plane = Plane { stride: 256, offset: 0 };
+
+        // A format with no FourCC: named, and named as the guest's command named it.
+        let spy: Arc<Spy> = Arc::default();
+        let storage: Arc<dyn crate::surface::Describable> = spy.clone();
+        let no_fourcc = args(opaque);
+        let Err(why) = describe(&storage, &no_fourcc, &[plane], 0) else {
+            panic!("{} cannot be told to an importer", opaque.name());
+        };
+        assert_eq!(why, BadLayout::NoFourcc(opaque.name()));
+        assert!(
+            why.to_string().contains(opaque.name()),
+            "the message names the format, not a zero: {why}"
+        );
+        assert!(spy.0.lock().expect("no panics").is_none(), "and the storage was never asked");
+
+        // More planes than a layout holds: refused, not trimmed to fit.
+        let spy: Arc<Spy> = Arc::default();
+        let storage: Arc<dyn crate::surface::Describable> = spy.clone();
+        let scanout = args(bgra);
+        let too_many = vec![plane; MAX_PLANES + 1];
+        let Err(why) = describe(&storage, &scanout, &too_many, 0) else {
+            panic!("a layout holds {MAX_PLANES}");
+        };
+        assert_eq!(why, BadLayout::TooManyPlanes { said: MAX_PLANES + 1, max: MAX_PLANES });
+        assert!(spy.0.lock().expect("no panics").is_none(), "and nothing was described");
+
+        // The control: a count a layout can hold reaches the storage unchanged, which is what
+        // says the two refusals above are about the numbers and not about this path being shut.
+        let spy: Arc<Spy> = Arc::default();
+        let storage: Arc<dyn crate::surface::Describable> = spy.clone();
+        let Err(why) = describe(&storage, &scanout, &[plane], 0) else {
+            panic!("the spy refuses whatever it is asked");
+        };
+        assert_eq!(
+            why,
+            BadLayout::NoDescriptor,
+            "the storage had the last word, so it was reached"
+        );
+        let asked = spy.0.lock().expect("no panics").expect("the storage was asked");
+        assert_eq!(asked.plane_count, 1, "the guest's own count");
+        assert_eq!(asked.planes[0].pitch, 256);
+        assert_eq!((asked.width, asked.height), (64, 48));
+    }
     use super::Format;
     use super::{PlaneRequest, plane_request};
 
