@@ -128,21 +128,29 @@ case "$mode_line" in
   *) echo "REFUSING: mode is ${mode_line:-unreported}" >&2; exit 1 ;;
 esac
 
-echo "=== launching the suite in that same session"
-firefox --profile "$PROFILE" "$URL_RUN" > /dev/null 2>&1
-sleep 12
+# The suite is run TWICE and the second run is the one scored. Not a retry -- always, and that is
+# the point. The site's first /result/ of a fresh profile dies: measured twice, it ends on "Loading,
+# please wait..." with a JSON.parse error of its own, after the run has finished and printed its
+# UID. Re-running in the same session works. But a re-run ONLY on failure would make the score's
+# warmth -- shader cache, JIT, the lot -- depend on whether the site happened to break that day,
+# and the first test in the suite is the one warmth moves most. Two legs compared across that are
+# not comparable. So both legs always pay for two runs and are read from the second.
+suite() {
+  echo "=== launching the suite in that same session (run $1)"
+  firefox --profile "$PROFILE" "$URL_RUN" > /dev/null 2>&1
+  sleep 12
 
-# Framing, not motion: see tap-keys.py. The overview keeps presenting, but it composites the
-# window as a thumbnail inside the shell's UI rather than showing it at its own size.
-sudo python3 /tmp/tap-keys.py esc || echo "WARNING: could not tap esc" >&2
-sleep 2
+  # Framing, not motion: see tap-keys.py. The overview keeps presenting, but it composites the
+  # window as a thumbnail inside the shell's UI rather than showing it at its own size.
+  sudo python3 /tmp/tap-keys.py esc || echo "WARNING: could not tap esc" >&2
+  sleep 2
 
-# /run/ does not auto-start; it waits behind a Start button, and there is no URL parameter that
-# skips it. Clicked in the page rather than tapped through the focus order, because a tab-then-enter
-# guess reads as success whether or not it hit anything -- which is how a full profile once got
-# taken of a benchmark that had not started. This reports what it clicked, and refuses if nothing
-# matched.
-clicked=$(python3 /tmp/marionette.py js '
+  # /run/ does not auto-start; it waits behind a Start button, and there is no URL parameter that
+  # skips it. Clicked in the page rather than tapped through the focus order, because a
+  # tab-then-enter guess reads as success whether or not it hit anything -- which is how a full
+  # profile once got taken of a benchmark that had not started. This reports what it clicked, and
+  # refuses if nothing matched.
+  clicked=$(python3 /tmp/marionette.py js '
 var els = Array.from(document.querySelectorAll("button,a,input[type=button],input[type=submit],[role=button]"));
 var t = els.filter(function (e) {
   var s = (e.innerText || e.value || "").trim();
@@ -151,27 +159,41 @@ var t = els.filter(function (e) {
 if (!t) { return "NONE"; }
 t.click();
 return (t.tagName + " " + (t.innerText || t.value || "").trim()).slice(0, 60);
-') || clicked='"ERROR"'
-echo "start control: $clicked"
-# Best effort, not a gate: once the session is configured, /run/ starts on its own, and a run that
-# clicked nothing still runs. What settles whether the suite is going is the page itself, below.
-case "$clicked" in
-  *NONE*|*ERROR*) echo "note: no Start control matched; /run/ normally starts by itself" >&2 ;;
-esac
+  ') || clicked='"ERROR"'
+  echo "start control: $clicked"
+  # Best effort, not a gate: once the session is configured, /run/ starts on its own, and a run
+  # that clicked nothing still runs. What settles whether the suite is going is the page itself.
+  case "$clicked" in
+    *NONE*|*ERROR*) echo "note: no Start control matched; /run/ normally starts by itself" >&2 ;;
+  esac
 
-# The page's own statement of what it is doing -- /run/tests/<n>/graphics_suite/<test_name>/ while
-# a test runs. This is the aiming signal: a sample window labelled by the pathname it was taken
-# under is attributable to one test, which is the whole reason this suite needs driving.
-python3 /tmp/marionette.py wait 'graphics_suite|Test \(test' 240 > /dev/null 2>&1 \
-  || echo "WARNING: no test page appeared; the suite may not have started" >&2
-echo "now at: $(python3 /tmp/marionette.py js 'return document.location.pathname' 2>/dev/null)"
+  # The page's own statement of what it is doing -- /run/tests/<n>/graphics_suite/<test_name>/
+  # while a test runs. This is the aiming signal: a sample window labelled by the pathname it was
+  # taken under is attributable to one test, which is the whole reason this suite needs driving.
+  python3 /tmp/marionette.py waitpath 'graphics_suite' 240 > /dev/null 2>&1 \
+    || echo "WARNING: no test page appeared; the suite may not have started" >&2
+  echo "now at: $(python3 /tmp/marionette.py js 'return document.location.pathname' 2>/dev/null)"
 
-echo "=== suite running; sample the host vmm now"
-echo "=== host side: sample \$(pgrep -f '[l]imina-vmm --cpus') 10 -f prof.txt"
+  echo "=== suite $1 running; sample the host vmm now"
+  echo "=== host side: sample \$(pgrep -f '[l]imina-vmm --cpus') 5 -f prof.txt"
 
-# The scores live only in this page's DOM -- the run is never stored server-side. Waiting on the
-# result table is also what says the suite finished, which nothing else here can tell us.
-echo "=== waiting for the result table"
-python3 /tmp/marionette.py wait 'WebGL|Shader Pipeline|Geometry' 900 > /tmp/basemark-scores.txt \
-  && { echo "--- scores:"; cat /tmp/basemark-scores.txt; } \
-  || echo "WARNING: no result table appeared" >&2
+  # WHICH page, by pathname -- not by what the text says. Body text cannot tell a test page from
+  # the result page: every test page reads "WebGL 2.0 Test", so waiting for /WebGL/ returns at test
+  # 5 of 20 and prints a test page's furniture under "scores:". That is how a run once reported
+  # scores it had not taken. The suite is at /run/tests/<n>/..., the results at /result/.
+  echo "=== waiting for /result/ (suite $1)"
+  if ! python3 /tmp/marionette.py waitpath '/result/' 900 > /dev/null 2>&1; then
+    echo "WARNING: the suite never reached /result/ (run $1)" >&2
+    return 1
+  fi
+  # Reached the page; now whether it RENDERED. These are two conditions and the site fails the
+  # second on its own -- hence the digits, which "Loading, please wait..." does not have.
+  python3 /tmp/marionette.py wait 'Shader Pipeline[^0-9]*[0-9]' 180 > /tmp/basemark-scores.txt 2>/dev/null \
+    || { echo "WARNING: /result/ rendered no score table (run $1)" >&2; return 1; }
+  echo "--- scores (run $1):"
+  cat /tmp/basemark-scores.txt
+  return 0
+}
+
+suite 1 || echo "note: run 1 yielded no scores; this is usual and is why there are two" >&2
+suite 2 || echo "REFUSING to report: run 2 yielded no scores either" >&2

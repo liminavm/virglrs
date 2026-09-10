@@ -6,11 +6,17 @@
 #   python3 marionette.py js 'return document.title'      run script, print its JSON result
 #   python3 marionette.py click 'button.start'            click the first match of a CSS selector
 #   python3 marionette.py wait 'WebGL' 300                poll innerText until it matches, print it
+#   python3 marionette.py waitpath '/result/' 900          poll location.pathname until it matches
 #
 # Firefox must have been started with `--marionette` (port 2828). Two things this exists for:
 #
 #   * Clicking. Tapping tab-then-enter through /dev/uinput guesses at focus order and reads as
 #     success whether or not anything was hit.
+#   * Telling one page from another. `wait` on body text cannot: a benchmark's own test pages say
+#     "WebGL 2.0 Test", so waiting for `WebGL` to appear matches test 5 of 20 and reads a test page
+#     as a result page. The pathname distinguishes them (`/run/tests/<n>/...` against `/result/`),
+#     which is what `waitpath` is for. Wait on the pathname for *which page*, on the text for
+#     *what the page has rendered* -- they are two questions and one verb cannot answer both.
 #   * Reading scores. Basemark's community mode reports `Database: Unavailable` and never stores a
 #     run server-side, so /api/results/details/<uid>/ answers 404 and the result page has nothing
 #     to fetch. The numbers exist only in the DOM of the page that ran them, and this is how they
@@ -93,6 +99,18 @@ def main():
         )
         print("clicked" if hit else "NO MATCH")
         return 0 if hit else 1
+
+    if verb == "waitpath":
+        deadline = time.time() + (float(sys.argv[3]) if len(sys.argv) > 3 else 300)
+        pattern = re.compile(arg)
+        while time.time() < deadline:
+            path = m.js("return document.location.pathname") or ""
+            if pattern.search(path):
+                print(path)
+                return 0
+            time.sleep(2)
+        print(f"TIMEOUT: pathname {arg!r} never appeared (last: {path!r})", file=sys.stderr)
+        return 1
 
     if verb == "wait":
         deadline = time.time() + (float(sys.argv[3]) if len(sys.argv) > 3 else 300)
