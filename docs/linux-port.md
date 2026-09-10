@@ -427,6 +427,15 @@ a boolean -- both replayers test it for non-zero -- and the transportable handle
 `resource_export`. So the doc has to say which of the two it is handing back, whatever it is
 called. The `image_*_iosurface` winsys entry points are internal and rename freely.
 
+**A declared host-visible allocation still gets minted pages on the exporting host.** The third
+shape at allocate -- declared for export, host-visible, not a window buffer -- mints pages here and
+hands the driver a host pointer, which is the minting host's device. It leaves such an allocation
+as `Storage::Linear`, so a compositor can only *copy* from it where a descriptor would have let it
+sample. Nothing reaches it yet: Mesa's venus picks device-local memory for anything it shares, so
+every case measured on this host takes the descriptor path instead. The first GL/Vulkan interop
+client that shares host-visible memory will find it. Routing it through a descriptor as well, with
+the mapping taken by `vkMapMemory` for the MAPPABLE half, is the fix.
+
 **Multi-plane export on the venus side.** A classic export takes every plane a compressed
 modifier reports; a venus one still describes every image as having a single memory plane.
 `export_dmabuf` cannot do better yet: the real count is
