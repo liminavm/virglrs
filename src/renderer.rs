@@ -1609,6 +1609,29 @@ impl Renderer {
         self.vrend.as_mut().is_some_and(|v| v.resource_sync_iosurface(handle, &attached))
     }
 
+    /// Which context's completion a classic scanout's contents wait on, so the caller can wait for
+    /// it asynchronously instead of asking this thread to.
+    ///
+    /// This is [`Self::resource_sync_iosurface`] asked as a question rather than given as an order,
+    /// and it exists because that order is expensive in the wrong place: the renders are finished
+    /// on the thread that services virtio-gpu for every guest context, so one surface's GPU
+    /// completion stalls all of them. A caller that takes the context named here, fences it, and
+    /// presents when the fence retires waits for exactly the same work on a thread of its own.
+    ///
+    /// `None` means this thread has to do the waiting after all, and the caller should fall back to
+    /// [`Self::resource_sync_iosurface`]. Three different reasons, none of which the caller can act
+    /// on differently: the resource has no surface, nothing has it attached, or more than one
+    /// context has -- a single fence names one context, and picking one of several would answer for
+    /// work the other still has outstanding.
+    pub fn resource_present_waits_on(&self, handle: ResourceHandle) -> Option<ContextId> {
+        // Who the guest kernel attached it to is who is allowed to have rendered into it, which is
+        // the same set `resource_sync_iosurface` finishes. One place decides it.
+        let attached = self.with_resource(handle, |r| r.attached.clone())?;
+        let [only] = attached[..] else { return None };
+        // A resource with no surface is the readback case, and has no fence to offer either.
+        self.vrend.as_ref()?.resource_surface(handle).map(|_| only)
+    }
+
     /// Where a blob resource lives in this process, for a VMM about to publish it to the guest.
     ///
     /// The one question the mapping calls ask, in one answer: an address on its own is not enough
@@ -1808,6 +1831,69 @@ mod tests {
 
     fn renderer(config: Config) -> Renderer {
         Renderer::new(Box::new(NoSink), config, None).expect("no vrend is asked for")
+    }
+
+    /// A present is only handed to the caller to fence when exactly one context could have
+    /// rendered into the surface.
+    ///
+    /// A single fence names one context. Offering one where two are attached would answer the
+    /// present for one context's work while the other's renders were still outstanding -- the same
+    /// defect as fencing one sub-context of several, one level up, and the frame would be presented
+    /// half-drawn. So the several-context case declines and the caller finishes instead, which is
+    /// slow and right. The counts either side of one are what pin it: nothing attached declines
+    /// too, because there is no context to name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_present_is_only_fenceable_when_one_context_could_have_drawn_it() {
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut r =
+            Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
+                .expect("vrend comes up");
+
+        let one = ContextId::new(1).expect("a context id");
+        let two = ContextId::new(2).expect("a context id");
+        let scanout = ResourceHandle::new(1).expect("a handle");
+        for c in [one, two] {
+            r.context_create(c, CapsetId::Virgl, "drawing".into()).expect("a context");
+        }
+        // SHARED is what mints the surface: without one there is nothing to present and nothing to
+        // fence, which is the third way this declines.
+        r.resource_create(
+            scanout,
+            ClassicArgs {
+                target: crate::vrend::pipe::TextureTarget::Texture2d,
+                // Wire 1 is B8G8R8A8_UNORM, the only shape a surface is minted for.
+                format: crate::vrend::proto::Format::from_wire(1).expect("a format"),
+                bind: crate::vrend::resource::Bind::SHARED,
+                width: 64,
+                height: 64,
+                depth: 1,
+                array_size: 1,
+                last_level: 0,
+                nr_samples: 0,
+                flags: crate::vrend::resource::ResourceFlags::default(),
+            },
+            Vec::new(),
+        )
+        .expect("a surface-backed resource");
+
+        assert_eq!(
+            r.resource_present_waits_on(scanout),
+            None,
+            "attached to nothing, there is no context to fence"
+        );
+        r.ctx_attach_resource(one, scanout);
+        assert_eq!(
+            r.resource_present_waits_on(scanout),
+            Some(one),
+            "one context could have drawn it, so its fence answers the present"
+        );
+        r.ctx_attach_resource(two, scanout);
+        assert_eq!(
+            r.resource_present_waits_on(scanout),
+            None,
+            "two could have, and one fence cannot answer for both"
+        );
     }
 
     /// The two questions `HostShm::for_blob` answers, and it answers them from the source alone.
