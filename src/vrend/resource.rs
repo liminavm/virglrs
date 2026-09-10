@@ -931,6 +931,18 @@ impl Planes {
     }
 }
 
+/// Which of the three shapes of presentable storage a resource has, so the choice between them
+/// is made in one place. Borrowed, never held: a caller that needs it to outlive the resource
+/// asks [`Resource::surface_share`], which is the same choice resolved into a share.
+enum Presented<'a> {
+    /// Storage this renderer minted and the texture adopted.
+    Minted(&'a Image),
+    /// A descriptor of storage the texture already had, on a host that exports.
+    Exported(&'a Arc<dyn Held>),
+    /// A planar decode target, whose surface is its luma plane's.
+    Planar(&'a Planes),
+}
+
 pub struct Texture {
     pub name: TextureName,
     /// A descriptor of this texture's own storage, on a host that exports rather than mints.
@@ -1190,15 +1202,28 @@ impl Resource {
     /// to have no surface while holding one, which the C ABI reports as "not IOSurface-backed"
     /// and the C does not.
     pub fn surface(&self) -> Option<&Surface> {
-        match &self.storage {
-            Storage::Texture(t) => t
-                .image
-                .as_ref()
-                .map(|i| i.surface())
-                .or_else(|| t.exported.as_ref().map(|h| h.surface()))
-                .or_else(|| Some(t.planes.as_ref()?.surface())),
-            _ => None,
+        Some(match self.presented()? {
+            Presented::Minted(i) => i.surface(),
+            Presented::Exported(h) => h.surface(),
+            Presented::Planar(p) => p.surface(),
+        })
+    }
+
+    /// Where this resource's presentable storage is, resolved once.
+    ///
+    /// Both [`Self::surface`] and [`Self::surface_share`] answer from here, because they are two
+    /// views of one fact and answering them from two matches let them disagree: a texture that
+    /// exports its own storage was reachable by reference and not by share, so the resource had a
+    /// surface to publish an id from and nothing to hand a holder.
+    fn presented(&self) -> Option<Presented<'_>> {
+        let Storage::Texture(t) = &self.storage else { return None };
+        if let Some(image) = t.image.as_ref() {
+            return Some(Presented::Minted(image));
         }
+        if let Some(held) = t.exported.as_ref() {
+            return Some(Presented::Exported(held));
+        }
+        Some(Presented::Planar(t.planes.as_ref()?))
     }
 
     /// A share of that surface, for a holder outside the classic side.
@@ -1207,12 +1232,11 @@ impl Resource {
     /// importing this resource must hold the surface, not name it, so that the import stays good
     /// after this resource and the context that made it are both gone.
     pub fn surface_share(&self) -> Option<Arc<dyn Held>> {
-        match &self.storage {
-            Storage::Texture(t) => {
-                t.image.as_ref().map(Image::held).or_else(|| Some(t.planes.as_ref()?.held()))
-            }
-            _ => None,
-        }
+        Some(match self.presented()? {
+            Presented::Minted(i) => i.held(),
+            Presented::Exported(h) => h.clone(),
+            Presented::Planar(p) => p.held(),
+        })
     }
 
     /// `vrend_format_is_bgra` of the resource's own format.
