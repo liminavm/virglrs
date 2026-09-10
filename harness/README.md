@@ -864,7 +864,10 @@ A score is three kinds of line at once, and only the first is the renderer's:
   different order on another driver and the last bits move; a linearly filtered downscale weights
   its taps differently. Ink is unchanged, so the same pixels are lit. Seven lines across the whole
   fixture set, and each has been looked at rather than assumed.
-- **lines a leg cannot produce** — the `iosurface` reads, off Apple.
+- **lines a leg cannot produce** — the `iosurface` reads, on a leg without the calls that make
+  them. Not a platform: a scanout is read through `sync_iosurface` and `read_iosurface`, and what
+  those read is whatever the host presents from, an IOSurface or an exported dma-buf. Only the
+  *planar* read needs Apple, because only Apple has a surface to look up by id.
 
 One golden cannot carry all three, and a golden per host is the wrong answer to that: most of the
 file must agree, so a second copy of it is a second writer of one fact and the pair drifts the
@@ -873,8 +876,10 @@ first time only one is re-recorded. So:
 - **`--expect-overlay <file>`** names the lines this driver reads differently, keyed by `res=`
   rather than by position, so it stays reviewable when a corpus grows a resource. It is named for
   the driver, not the OS — the driver is what decides those lines, and a Mesa update moving one is
-  a thing to notice. `fixtures/vrend.iris.score` is six lines; `fixtures/blit.iris.score` is one.
-  Generate them from a run, never by transcribing a diff.
+  a thing to notice. `fixtures/vrend.iris.score` is nine lines; `fixtures/blit.iris.score` is two.
+  `iosurface` lines are overlayable for the same reason the readbacks are — they are the display
+  surface's pixels, and a driver's arithmetic reaches them too. Generate them from a run, never by
+  transcribing a diff.
 
   Nothing about an overlay is allowed to be a no-op, because an overlay that quietly corrects
   nothing leaves the fixture scored against another driver's numbers while reading green. A line
@@ -883,7 +888,8 @@ first time only one is re-recorded. So:
 
 - **Lines the leg cannot read are skipped, counted and reported** — not compared, and not
   silently dropped. `skipped: 5 line(s) of fixtures/vrend.score this leg cannot read` is part of
-  the verdict. The `iosurface-backed` field of the loop line is neutralised on both sides for the
+  the verdict. On both hosts the count is now zero; it stays in the verdict because a skip nobody
+  is told about is indistinguishable from a pass. The `iosurface-backed` field of the loop line is neutralised on both sides for the
   same reason, rather than printed as `0`: a leg that took no measurement must not report one, and
   the rest of that line is exactly what still has to agree.
 
@@ -917,23 +923,32 @@ So the Linux invocation is the macOS one plus its overlay:
     --expect fixtures/vrend.score --expect-overlay fixtures/vrend.iris.score
 ```
 
-Forgetting the overlay is loud — six failures — which is the point of not having the wrapper guess
-it. **The positive control transfers too:** `--nodraw` on Linux moves 20 lines, the command count
-and the same 19 offscreens that lose their ink on macOS. The three scanout IOSurfaces that are the
-other half of that control are among the skipped lines until the dma-buf read lands.
+Forgetting the overlay is loud — nine failures — which is the point of not having the wrapper guess
+it. **The positive control transfers too:** `--nodraw` on Linux moves 23 lines, the command count,
+the same 19 offscreens that lose their ink on macOS, and the three scanout surfaces that are the
+other half of that control.
 
-### The IOSurface leg
+### The scanout leg
 
-IOSurface is the macOS dma-buf and the whole present path. vrend renders *into* the display
-surface — it is wrapped as an `EGL_IOSURFACE_LIMINA` EGLImage, so the framebuffer's storage IS the
-surface — and venus imports the guest image as an `MTLTexture` over one. So `transfer_read_iov`
-and `read_iosurface` are not two views of one thing; they are different paths, and a port can get
-either right while getting the other wrong.
+The display surface is the whole present path, and vrend renders *into* it rather than into a
+texture that is later copied there. On macOS the surface is an IOSurface the renderer mints and
+the framebuffer takes as storage; on Linux it is a dma-buf the driver laid out and the renderer
+holds a descriptor of. Either way `transfer_read_iov` and `read_iosurface` are not two views of
+one thing — they are different paths, and a port can get either right while getting the other
+wrong.
 
 Classic scores the surface itself: `sync_iosurface` (a classic-only blit-and-wait — a venus blob
 renders into its surface directly and must never be synced), then `read_iosurface`, hashed. It is
 scored at END of stream because a capture never unrefs its scanout: the opposite end of the run
 from the colour offscreens, each read at the last moment it is both complete and still alive.
+
+**On the exporting host that read is a round trip, and deliberately so.** An Intel scanout exports
+Y-tiled, so its bytes in row order are not the picture and no mapping could read it; the renderer
+imports its own descriptor back as an EGL image and reads it through a framebuffer, letting the
+GPU detile. Reading the resource's texture instead would be cheaper and would give the same
+pixels — and would pass just as happily if the descriptor named the wrong memory, which is the
+failure this line exists to catch. Measured: moving the exported offset by a page changes the
+scanout hash and leaves the texture readback untouched.
 
 Venus scores only a count of backed blobs. `read_iosurface` takes a byte stride and a row count,
 and the venus corpus carries no geometry — dimensions live in `SET_SCANOUT_BLOB`, a virtio-gpu
