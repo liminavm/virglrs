@@ -860,8 +860,9 @@ impl Vrend {
     /// nothing. The C never did this either: its global fence takes a sync on ctx0, a context that
     /// never draws.
     fn take_fence(&mut self, on: Option<ContextId>) -> Answer {
+        let began = self.tally.fence_began();
         let answer = self.decide_fence(on);
-        self.tally.fence(&answer);
+        self.tally.fence(&answer, began);
         answer
     }
 
@@ -913,10 +914,13 @@ impl Vrend {
         // expensive and is not. It costs ctx0 an `eglMakeCurrent` the embedder backing does not
         // dedup, a flush that is synchronous on this share group, and a reset of `Current`'s single
         // `BoundProgram` slot -- so the next batch's first draw pays a `glUseProgram` it would have
-        // skipped. All three together price at nothing: A/B'd 2026-09-10 on limina's vkmark vehicle
-        // (four boots, legs alternated so a host drift is absorbed, ~1-2% resolution, guest-CPU and
-        // llvmpipe controls held), skipping it was not faster than its neighbouring leg on either
-        // vkmark or us/cmd. Do not re-derive this from the shape of the code.
+        // skipped. All three together are bounded under ~2%: A/B'd 2026-09-10 on limina's vkmark
+        // vehicle (four boots, legs alternated so a host drift is absorbed, guest-CPU and llvmpipe
+        // controls held), skipping it measured +0.7% and +1.7% against its neighbouring leg, both
+        // inside that vehicle's noise. So it is not the ~5% this was suspected of, and a 1-2% cost
+        // is not excluded. Do not re-derive the hypothesis from the shape of the code -- and note
+        // that `us/cmd` cannot price this, because the tally's submit window does not contain
+        // `take_fence` (see [`tally`]); the fence line's own timer is what to read.
         if !refused {
             self.switch_ctx0();
             match self.gl.fence() {
