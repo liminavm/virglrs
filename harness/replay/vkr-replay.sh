@@ -115,7 +115,8 @@ cargo build --release --manifest-path "$HERE/rs/Cargo.toml" >/dev/null 2>&1
 # replayer's build.sh use. --renderer names it more directly and wins where both are given.
 case "$CHOICE" in
   rs) VIRGL_PREFIX="$ROOT/prefix" ;;
-  c)  VIRGL_PREFIX="$ROOT/third_party/virgl-prefix" ;;
+  c)  VIRGL_PREFIX="$ROOT/third_party/virgl-prefix"
+      [ -d "$VIRGL_PREFIX" ] || VIRGL_PREFIX="$ROOT/harness/vm/prefix" ;;
   "") [ -n "${VIRGL_PREFIX:-}" ] || usage ;;
   *)  VIRGL_PREFIX="" ;;   # a dylib path, used as given
 esac

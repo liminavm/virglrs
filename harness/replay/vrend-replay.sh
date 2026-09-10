@@ -84,21 +84,32 @@ if [ ! -f "$CORPUS" ] \
   "$ROOT/scripts/fetch-corpora.sh" "$(basename "$CORPUS")"
 fi
 
-MESA_PREFIX="${MESA_PREFIX:-/Volumes/mesa-cs/zink-kk-prefix}"
-EPOXY_PREFIX="${EPOXY_PREFIX:-/Users/kov/Projects/limina/third_party/epoxy-egl-prefix}"
-VULKAN_LIB="${VULKAN_LIB:-/opt/homebrew/opt/vulkan-loader/lib}"
-ICD="$MESA_PREFIX/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json"
+# The environment is the point of this wrapper, and on Darwin it is most of the work: vrend runs
+# on zink over KosmicKrisp through an epoxy built WITH EGL, none of which is on the default loader
+# path. A Linux distribution ships EGL and a native GL driver where the loader already looks, so
+# there is nothing to name -- and naming something anyway would override the host's own driver
+# with whichever happened to be hardcoded, which is how a replay ends up scoring a stack nobody
+# chose. So the whole block is Darwin's, rather than a set of variables with empty Linux values.
+if [ "$(uname -s)" = Darwin ]; then
+  MESA_PREFIX="${MESA_PREFIX:-/Volumes/mesa-cs/zink-kk-prefix}"
+  EPOXY_PREFIX="${EPOXY_PREFIX:-/Users/kov/Projects/limina/third_party/epoxy-egl-prefix}"
+  VULKAN_LIB="${VULKAN_LIB:-/opt/homebrew/opt/vulkan-loader/lib}"
+  ICD="$MESA_PREFIX/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json"
 
-[ -f "$ICD" ] || { echo "no KosmicKrisp ICD at $ICD (set MESA_PREFIX)" >&2; exit 1; }
-# libEGL comes from Mesa; epoxy is the GL dispatch the renderer links, and Homebrew's is CGL-only.
-[ -f "$MESA_PREFIX/lib/libEGL.dylib" ] || {
-  echo "no libEGL at $MESA_PREFIX (set MESA_PREFIX)" >&2; exit 1; }
-[ -f "$EPOXY_PREFIX/lib/libepoxy.0.dylib" ] || {
-  echo "no epoxy-with-EGL at $EPOXY_PREFIX (set EPOXY_PREFIX)" >&2; exit 1; }
+  [ -f "$ICD" ] || { echo "no KosmicKrisp ICD at $ICD (set MESA_PREFIX)" >&2; exit 1; }
+  # libEGL comes from Mesa; epoxy is the GL dispatch the renderer links, and Homebrew's is CGL-only.
+  [ -f "$MESA_PREFIX/lib/libEGL.dylib" ] || {
+    echo "no libEGL at $MESA_PREFIX (set MESA_PREFIX)" >&2; exit 1; }
+  [ -f "$EPOXY_PREFIX/lib/libepoxy.0.dylib" ] || {
+    echo "no epoxy-with-EGL at $EPOXY_PREFIX (set EPOXY_PREFIX)" >&2; exit 1; }
+fi
 
 case "$RENDERER" in
   rs) VIRGL_PREFIX="$ROOT/prefix" ;;
-  c)  VIRGL_PREFIX="$ROOT/harness/vm/prefix" ;;
+  # build-reference.sh installs here on both hosts; the macOS rig predates that and keeps its
+  # own, so the older location is a fallback rather than a second convention to maintain.
+  c)  VIRGL_PREFIX="$ROOT/third_party/virgl-prefix"
+      [ -d "$VIRGL_PREFIX" ] || VIRGL_PREFIX="$ROOT/harness/vm/prefix" ;;
   "") [ -n "${VIRGL_PREFIX:-}" ] || usage ;;
 esac
 # Build what is about to be scored. This script builds the replayer, never the renderer, so a
@@ -113,9 +124,14 @@ VIRGL_PREFIX="$VIRGL_PREFIX" "$HERE/build.sh" >/dev/null
 
 # zink needs the Vulkan loader on the dyld path: it dlopens @rpath/libvulkan.1.dylib, and the
 # replayer is not the app bundle whose rpath would resolve it.
-exec env \
-  DYLD_LIBRARY_PATH="$MESA_PREFIX/lib:$EPOXY_PREFIX/lib:$VULKAN_LIB" \
-  VK_ICD_FILENAMES="$ICD" \
-  MESA_LOADER_DRIVER_OVERRIDE=zink \
-  GALLIUM_DRIVER=zink \
-  "$HERE/vrend-replay" "$CORPUS" "$@"
+if [ "$(uname -s)" = Darwin ]; then
+  # zink needs the Vulkan loader on the dyld path: it dlopens @rpath/libvulkan.1.dylib, and the
+  # replayer is not the app bundle whose rpath would resolve it.
+  exec env \
+    DYLD_LIBRARY_PATH="$MESA_PREFIX/lib:$EPOXY_PREFIX/lib:$VULKAN_LIB" \
+    VK_ICD_FILENAMES="$ICD" \
+    MESA_LOADER_DRIVER_OVERRIDE=zink \
+    GALLIUM_DRIVER=zink \
+    "$HERE/vrend-replay" "$CORPUS" "$@"
+fi
+exec "$HERE/vrend-replay" "$CORPUS" "$@"
