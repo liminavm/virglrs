@@ -1789,22 +1789,28 @@ pub extern "C" fn virgl_renderer_context_create_fence(
     })
 }
 
-/// The Linux sync-file trio. The VMM never calls them -- rutabaga's generic component wraps them,
-/// and limina's gpu device reaches a fence through the retire callback, never an fd -- and there
-/// is no fd on this host to hand back, so this is a permanent refusal rather than a gap.
+/// The Linux sync-file trio, refused.
+///
+/// Not for want of a descriptor: venus already exports fence fds through `VK_KHR_external_fence_fd`
+/// where the driver has it, for the MESA sync commands. What is missing is the other half -- a
+/// `client_fence_id` here names an entry in a retirement queue, not a fence object, and there is
+/// nothing left addressable by that id once it has retired. Serving these would mean keeping a
+/// driver fence alive per client id on the chance someone asks, for callers that do not: rutabaga's
+/// generic component wraps them and limina's gpu device reaches a fence through the retire
+/// callback. A refusal is the finished answer until a caller exists to shape the design around.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_export_fence(_client_fence_id: u64, _fd: *mut c_int) -> c_int {
-    todo_phase!("P3: sync-file fd -- not a path macOS has")
+    todo_phase!("no caller: a client fence id names a retirement, not a fence object")
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_export_signalled_fence() -> c_int {
-    todo_phase!("P3: sync-file fd -- not a path macOS has")
+    todo_phase!("no caller: a client fence id names a retirement, not a fence object")
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_attach_fence(_ctx_id: c_int, _fence_fd: c_int) -> c_int {
-    todo_phase!("P3: sync-file fd -- not a path macOS has")
+    todo_phase!("no caller: a client fence id names a retirement, not a fence object")
 }
 
 #[unsafe(no_mangle)]
