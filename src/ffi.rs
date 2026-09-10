@@ -220,6 +220,7 @@ fn errno(e: renderer::Error) -> c_int {
         | ClassicRefused(_)
         | ClaimRefused(_) => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
+        NotExportable => -libc::EINVAL,
         // The C answers a readback it cannot serve with a bare -1, and the VMM tells it apart
         // from an errno.
         Transfer(transfer::Error::NotReadable) => -1,
@@ -605,38 +606,91 @@ fn supported_structures(q: &mut abi::SupportedStructures) -> c_int {
     0
 }
 
-/// How a resource could be exported to another process, which here is never.
+/// How a resource could be exported to another process, and optionally the descriptors for it.
 ///
-/// Every answer is the "not exportable" one the header defines: a zero `out_fourcc` says so, and
-/// the invalid modifier says no layout is being claimed. That is not a stub. A dma-buf is the only
-/// thing this call can describe, macOS has none, and the scanout path deliberately goes the other
-/// way -- limina reads an IOSurface id off the resource and composites it, never a descriptor.
+/// Two questions with one shape, which the header separates by `in_export_fds`: without it the
+/// caller wants to know whether and how, with it the caller wants the descriptors and takes
+/// ownership of them. Both are answered from one [`renderer::Renderer::resource_export`], so a
+/// caller cannot be told a resource is exportable and then handed nothing.
 ///
-/// Which is also why asking for the descriptors themselves is refused rather than answered with
-/// `-1`: a caller that set `in_export_fds` wants file descriptors, and handing it a closed one
-/// dressed as success is how a VMM comes to `mmap` nothing.
+/// A resource with no descriptor is not an error: the header's "not exportable" answer is a zero
+/// `out_fourcc` and the invalid modifier, and that is what a host which mints its storage rather
+/// than exporting it says about every resource. A caller that asked for descriptors and cannot
+/// have them is refused instead -- handing back `-1` dressed as success is how a VMM comes to
+/// `mmap` nothing.
 fn export_query(q: &mut abi::ExportQuery) -> c_int {
     if q.hdr.size as usize != core::mem::size_of::<abi::ExportQuery>() {
-        return EINVAL;
-    }
-    // What the request asks for is settled before any resource is looked up: the answer is the
-    // same for every resource in this tree, so a lookup could only make the refusal arrive later.
-    if q.in_export_fds != 0 {
         return EINVAL;
     }
     let Some(handle) = ResourceHandle::new(q.in_resource_id) else {
         return EINVAL;
     };
+    // The resource has to exist whatever the answer is about it, and a caller asking about one
+    // that does not is a different mistake from one asking about a resource that cannot export.
     if with(None, |r| r.with_resource(handle, |_| ())).is_none() {
         return EINVAL;
     }
-    q.out_num_fds = 1;
-    q.out_fourcc = 0;
-    q.out_fds[0] = -1;
-    q.out_strides[0] = 0;
-    q.out_offsets[0] = 0;
-    q.out_modifier = abi::DRM_FORMAT_MOD_INVALID;
+    let exported = with(Err(renderer::Error::NotExportable), |r| r.resource_export(handle));
+    let (fd, layout) = match exported {
+        Ok((fd, _, layout)) => (fd, layout),
+        Err(_) => {
+            // Not exportable, said the way the header says it. The descriptor slot stays `-1`
+            // and the caller is told no layout is being claimed rather than a plausible one.
+            if q.in_export_fds != 0 {
+                return EINVAL;
+            }
+            q.out_num_fds = 1;
+            q.out_fourcc = 0;
+            q.out_fds[0] = -1;
+            q.out_strides[0] = 0;
+            q.out_offsets[0] = 0;
+            q.out_modifier = abi::DRM_FORMAT_MOD_INVALID;
+            return 0;
+        }
+    };
+    // More planes than the ABI has room for cannot be described at all, and describing the first
+    // few would be a layout the caller would read as whole.
+    let planes = layout.plane_count as usize;
+    if planes == 0 || planes > q.out_fds.len() {
+        return EINVAL;
+    }
+    q.out_num_fds = planes as u32;
+    q.out_fourcc = layout.fourcc;
+    q.out_modifier = layout.modifier;
+    for (at, plane) in layout.planes.iter().enumerate().take(planes) {
+        q.out_strides[at] = plane.pitch;
+        q.out_offsets[at] = plane.offset as u32;
+        // Every plane of a single allocation is the same descriptor at a different offset. A
+        // caller taking ownership needs one per plane, because it will close each of them.
+        q.out_fds[at] = if q.in_export_fds != 0 {
+            // A duplicate even for the first plane: `fd` is this call's own reference and is
+            // closed when it returns, so handing it out for one plane and duplicates for the
+            // rest would make the planes differ in who closes them.
+            match fd.try_clone() {
+                Ok(dup) => into_raw(dup),
+                // Out of descriptors partway through leaves the caller owning what it already
+                // has: it reads `out_num_fds` and closes that many, so the count is trimmed to
+                // what was actually produced rather than the whole being abandoned.
+                Err(_) => {
+                    q.out_num_fds = at as u32;
+                    return EINVAL;
+                }
+            }
+        } else {
+            -1
+        };
+    }
     0
+}
+
+/// Give up ownership of a descriptor to a C caller.
+///
+/// The one place a descriptor stops being Rust's. Named, rather than written inline, because
+/// `into_raw_fd` at a call site reads like a conversion and is in fact the moment nothing will
+/// ever close this again unless the caller does.
+fn into_raw(fd: std::os::fd::OwnedFd) -> c_int {
+    use std::os::fd::IntoRawFd;
+    fd.into_raw_fd()
 }
 
 // ---------------------------------------------------------------- contexts
@@ -1142,25 +1196,45 @@ const RESOURCE_INFO_EXT_VERSION: c_int = 0;
 
 /// Hand a resource's storage to another process as a file descriptor.
 ///
-/// Refused, always, and that is the finished answer rather than a stub. Every descriptor kind this
-/// call can name is a Linux one -- dma-buf, an opaque driver fd, POSIX shm -- and a blob here is
-/// either the guest's own pages or host memory published as an address. Neither has an fd, and
-/// minting one would be inventing a second way to reach storage that already has an owner.
+/// The descriptor is a *new* reference to storage the resource goes on holding, so the caller
+/// owning it and the resource owning its own are not in tension: the kernel frees the buffer when
+/// the last reference goes, whichever that turns out to be. Ownership transfers on success only,
+/// which is why nothing is written to either out-pointer before the export has produced one.
 ///
-/// The C reaches the same place by a longer road: it refuses a `map_ptr` blob outright (a
-/// host-visible venus blob is shared by pointer and has no descriptor), and its remaining arms
-/// call an export callback the proxy context does not implement.
-///
-/// rutabaga calls this unconditionally from `create_blob` and reads a failure as "no handle", so
-/// the refusal is the expected path and not an error anyone reports. The scanout route is
-/// deliberately elsewhere: limina reads an IOSurface id off the resource and composites that.
+/// `EINVAL` for a resource with no descriptor, which on a host that mints its storage is every
+/// resource. That is the expected path and not an error anyone reports: rutabaga calls this
+/// unconditionally from `create_blob` and reads a failure as "no handle". Where the descriptor
+/// does not exist, the scanout travels the other way -- limina reads a surface id off the
+/// resource and composites that.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_export_blob(
-    _res_id: u32,
-    _fd_type: *mut u32,
-    _fd: *mut c_int,
+    res_id: u32,
+    fd_type: *mut u32,
+    fd: *mut c_int,
 ) -> c_int {
-    EINVAL
+    if fd_type.is_null() || fd.is_null() {
+        return EINVAL;
+    }
+    let Some(handle) = ResourceHandle::new(res_id) else {
+        return EINVAL;
+    };
+    let exported = with(Err(renderer::Error::NotExportable), |r| r.resource_export(handle));
+    let (owned, kind, _) = match exported {
+        Ok(it) => it,
+        Err(e) => return errno(e),
+    };
+    // SAFETY: both were checked non-null above, and the caller owns writable storage for each --
+    // this is the ABI's way of returning two values. Written together and only here, so there is
+    // no path on which the caller learns the kind of a descriptor it was not given.
+    unsafe {
+        *fd_type = match kind {
+            renderer::FdType::DmaBuf => abi::BLOB_FD_TYPE_DMABUF,
+            renderer::FdType::Opaque => abi::BLOB_FD_TYPE_OPAQUE,
+            renderer::FdType::Shm => abi::BLOB_FD_TYPE_SHM,
+        };
+        *fd = into_raw(owned);
+    }
+    0
 }
 
 /// Where a blob resource lives, for the three ABI calls that each want part of the same answer.
@@ -2593,13 +2667,17 @@ mod tests {
         assert_eq!(unsafe { virgl_renderer_execute((&raw mut q).cast(), 4) }, EINVAL);
     }
 
-    /// Nothing in this tree has a dma-buf, so the export query's every answer is the header's
-    /// own "not exportable": a zero fourcc, and a modifier that claims no layout.
+    /// What the export query answers before it has a resource to answer about.
     ///
-    /// Asking for the descriptors is refused instead of answered, because a caller that set
-    /// `in_export_fds` wants file descriptors and a `-1` dressed as success is how a VMM comes to
-    /// map nothing. The resource lookup is ahead of both, so this runs with no renderer and gets
-    /// the same refusal a nonexistent resource gets -- which is the C's answer too.
+    /// The lookup is ahead of every other question, so all of this is reachable with no renderer:
+    /// resource zero is the ABI's "no resource" and must not reach a lookup at all, a resource
+    /// that is not there is `EINVAL` whether or not descriptors were asked for, and a refusal
+    /// writes nothing -- a caller that pre-filled its out-fields must find them as it left them.
+    ///
+    /// What a *live* resource is told is not pinned here and cannot be: it needs an initialized
+    /// renderer, which a unit test cannot stand up without making a process-global one every
+    /// other test would share. The export itself is gated where the storage is made
+    /// (`venus::driver`) and where it is read (the replayer's own dma-buf read).
     #[test]
     fn an_export_query_says_the_resource_cannot_be_exported() {
         use std::mem::size_of;
@@ -2634,21 +2712,21 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { virgl_renderer_execute((&raw mut q).cast(), whole) }, EINVAL);
 
-        // The two halves the renderer is not needed for: what a live resource would be told.
+        // Both forms of the request stop at the same place while there is no resource, so
+        // neither can be told apart by whether it asked for descriptors.
         q.in_resource_id = 1;
         q.in_export_fds = 1;
-        assert_eq!(export_query(&mut q), EINVAL, "descriptors are refused, never faked");
+        assert_eq!(export_query(&mut q), EINVAL, "no resource, whether or not fds were wanted");
         q.in_export_fds = 0;
-        assert_eq!(export_query(&mut q), EINVAL, "and with no renderer there is no resource");
+        assert_eq!(export_query(&mut q), EINVAL, "and the same without them");
     }
 
-    /// The two blob calls that this platform answers by refusing, and the shape of each refusal.
+    /// The blob calls' refusals, and that they are told apart.
     ///
-    /// Both are finished answers rather than stubs -- see each function's own doc -- so what is
-    /// pinned here is that they are told apart: a resource that does not exist is `EINVAL`
-    /// whichever call is asked, while a resource that does exist and simply cannot be served this
-    /// way is `EOPNOTSUPP`, which the header defines as "try `virgl_renderer_resource_map`
-    /// instead". A caller that got `EINVAL` for both would go looking for its own bug.
+    /// A resource that does not exist is `EINVAL` whichever call is asked, while a resource that
+    /// does exist and simply cannot be served this way is `EOPNOTSUPP`, which the header defines
+    /// as "try `virgl_renderer_resource_map` instead". A caller that got `EINVAL` for both would
+    /// go looking for its own bug.
     ///
     /// The live-resource arm of `map_fixed` needs an initialized renderer, which a unit test
     /// cannot stand up without making a process-global one every other test would share; it is
@@ -2665,15 +2743,28 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_ne!(EOPNOTSUPP, ENOTSUP, "the header promises EOPNOTSUPP, and Darwin's differ");
 
-        // An fd export is refused for every resource, existing or not: nothing here has one.
+        // An fd export of a resource that is not there. rutabaga calls this unconditionally and
+        // reads a failure as "no handle", so this is the ordinary path and not an error.
         let mut fd_type = 0xdead_beefu32;
         let mut fd = 7;
         assert_eq!(
             virgl_renderer_resource_export_blob(1, &raw mut fd_type, &raw mut fd),
             EINVAL,
-            "rutabaga reads this as `no handle`, which is the truth"
+            "no renderer, so no resource to export"
         );
         assert_eq!((fd_type, fd), (0xdead_beef, 7), "and a refusal writes neither out-parameter");
+        // Ownership transfers on success only, so the two out-parameters are written together or
+        // not at all -- and a null one is the caller breaking its own promise, never a write.
+        assert_eq!(
+            virgl_renderer_resource_export_blob(1, core::ptr::null_mut(), &raw mut fd),
+            EINVAL
+        );
+        assert_eq!(
+            virgl_renderer_resource_export_blob(1, &raw mut fd_type, core::ptr::null_mut()),
+            EINVAL
+        );
+        assert_eq!(virgl_renderer_resource_export_blob(0, &raw mut fd_type, &raw mut fd), EINVAL);
+        assert_eq!((fd_type, fd), (0xdead_beef, 7), "still untouched");
 
         // A cursor read before any renderer exists. `NULL` is the C's answer too, and a VMM reads
         // it as "no cursor image", never as an error worth reporting.

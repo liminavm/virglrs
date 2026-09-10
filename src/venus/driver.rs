@@ -6222,6 +6222,66 @@ mod tests {
         }
     }
 
+    /// The other half of the emulation decision: what the device is actually created with.
+    ///
+    /// `advertised_extensions` decides what the guest is *told*; this decides what is forwarded
+    /// to `vkCreateDevice`, and the two must not be assumed to move together. Where the driver
+    /// has neither, the guest's request is stripped, because the driver would fail the whole
+    /// device create for an extension it does not have. Where the driver has the real thing, the
+    /// request is forwarded and the renderer's own half is what makes the export path work at all
+    /// -- stripping it there would leave a Linux driver unable to export a descriptor, which is
+    /// the failure that reads as "no dma-buf" everywhere downstream and names itself nowhere.
+    ///
+    /// Both branches are pinned rather than one, because the switch turns itself off by host and
+    /// a test that only ever ran on the host it is off for would be watching nothing.
+    #[test]
+    fn a_device_is_created_with_the_external_memory_the_driver_really_has() {
+        const METAL: VkPhysicalDevice = VkPhysicalDevice(1);
+        const NATIVE: VkPhysicalDevice = VkPhysicalDevice(2);
+
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_extensions(METAL, &["VK_EXT_external_memory_metal"]);
+        driver.plant_extensions(
+            NATIVE,
+            &["VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf"],
+        );
+
+        // What a venus guest asks for, believing it is on Linux -- which it does on every host.
+        let asked = ["VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf"];
+
+        let metal = driver.device_extensions(METAL, &asked);
+        for name in EMULATED_ON_THE_HOST {
+            assert!(
+                !metal.contains(&name.to_string()),
+                "{name} is stripped where the driver lacks it: forwarding it fails vkCreateDevice",
+            );
+        }
+        assert!(
+            metal.contains(&"VK_EXT_external_memory_metal".to_string()),
+            "and the interop that emulates it is added instead",
+        );
+
+        let native = driver.device_extensions(NATIVE, &asked);
+        for name in EMULATED_ON_THE_HOST {
+            assert_eq!(
+                native.iter().filter(|n| *n == name).count(),
+                1,
+                "{name} is forwarded where the driver has it, and exactly once",
+            );
+        }
+        assert!(
+            !native.contains(&"VK_EXT_external_memory_metal".to_string()),
+            "and no Metal interop is asked of a driver that has none",
+        );
+
+        // A guest that asked for neither still gets them, because the renderer's own export path
+        // needs them and the guest never asks on its behalf.
+        let unasked = driver.device_extensions(NATIVE, &[]);
+        for name in EMULATED_ON_THE_HOST {
+            assert!(unasked.contains(&name.to_string()), "{name} is the renderer's own need");
+        }
+    }
+
     /// A guest chains what it wants onto an answer's `pNext`, in whatever order it likes, and
     /// the struct a handler is after is rarely the first link. A walk that stops at the head
     /// finds it exactly when the guest happened to put it there, which is not a contract.

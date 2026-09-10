@@ -775,6 +775,17 @@ impl Surface {
     ///
     /// Asked of the surface, never stored. See the module docs: an id outliving its surface is
     /// the bug this whole module is shaped to prevent.
+    /// A descriptor another process could import this by, and how to read it -- which on this
+    /// host is neither.
+    ///
+    /// An IOSurface travels as a global id and a Mach send right, never as a file descriptor, and
+    /// there is nothing to synthesise: a descriptor over these pages would name memory the
+    /// importer's driver has no way to interpret. `None` rather than a refusal type, because the
+    /// caller is choosing between two transports and this says which one is available.
+    pub fn export(&self) -> Option<(std::os::fd::OwnedFd, crate::surface::Layout)> {
+        None
+    }
+
     pub fn id(&self) -> SurfaceId {
         // SAFETY: we hold a reference to the surface for the duration of this call.
         SurfaceId(unsafe { IOSurfaceGetID(self.as_ref()) })

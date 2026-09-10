@@ -24,6 +24,65 @@ pub use crate::metal::{PixelFormat, PlanarFormat, Surface};
 #[cfg(not(target_os = "macos"))]
 pub use crate::dmabuf::{PixelFormat, PlanarFormat, Surface};
 
+// How storage could be handed to another process, as every importer spells it.
+//
+// Here and not in `crate::dmabuf` because it is the *question*, not the answer: "how would this
+// resource be exported" is asked of the Rust API on both hosts, and a caller must be able to ask
+// without first knowing which host it is on. A host that exports nothing answers that it cannot,
+// which is a different thing from the question being unaskable.
+//
+// Plain data throughout -- no descriptor, no lifetime, nothing a platform owns. What owns the
+// descriptor is `Held`; what fills these numbers in is the platform module behind it.
+
+/// `DRM_FORMAT_MOD_LINEAR`: rows one after another, no tiling.
+pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+/// `DRM_FORMAT_MOD_INVALID`: the importer should not assume any particular layout. What a driver
+/// that cannot report a modifier leaves behind, and never something to pass on as if it were one.
+pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
+/// The most planes any format here has. NV12 is two; the array is sized for what DRM allows so
+/// that a format added later does not silently truncate.
+pub const MAX_PLANES: usize = 4;
+
+/// Where one plane sits in the exported allocation.
+///
+/// Offset and pitch together, because neither locates a plane on its own and a caller holding one
+/// without the other has to guess the second -- which is how a plane ends up sheared. Read from
+/// the driver, never computed here: what this side would compute is what the layout *ought* to
+/// be, and the export is worth having precisely because the driver may disagree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlaneLayout {
+    pub offset: u64,
+    pub pitch: u32,
+}
+
+/// What the exporting driver said about the allocation, as an importer needs it.
+///
+/// One value rather than six arguments threaded through the export path: an importer needs every
+/// field or none of them, and a `fourcc` that arrived without its modifier describes a buffer
+/// nobody can read. See [`crate::surface::Held`] for why the descriptor and the keepalive travel
+/// together rather than as a pair.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Layout {
+    pub width: u32,
+    pub height: u32,
+    pub fourcc: u32,
+    /// `DRM_FORMAT_MOD_INVALID` when the driver would not say. An importer must then be told the
+    /// modifier is unknown rather than handed `LINEAR`, which is a different claim.
+    pub modifier: u64,
+    pub planes: [PlaneLayout; MAX_PLANES],
+    pub plane_count: u32,
+    /// The whole allocation, which is what a mapping covers and what the budget was charged.
+    pub alloc_size: u64,
+}
+
+impl Layout {
+    /// The first plane's pitch, for the many callers that only ever have one plane.
+    pub fn bytes_per_row(&self) -> u32 {
+        self.planes[0].pitch
+    }
+}
+
 /// One plane of a planar surface, as this side lays it out.
 ///
 /// The pitch and offset are dictated, never discovered. The guest is told this layout and

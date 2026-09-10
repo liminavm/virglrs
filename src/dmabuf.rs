@@ -39,6 +39,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::ids::SurfaceId;
 use crate::surface::PlaneShape;
+pub use crate::surface::{
+    DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, Layout, MAX_PLANES, PlaneLayout,
+};
 
 /// A DRM `fourcc`, as the kernel and every importer spell a pixel format.
 ///
@@ -54,16 +57,6 @@ const DRM_FORMAT_ARGB8888: u32 = fourcc(b'A', b'R', b'2', b'4');
 const DRM_FORMAT_ABGR8888: u32 = fourcc(b'A', b'B', b'2', b'4');
 /// `DRM_FORMAT_NV12`: a luma plane then an interleaved half-resolution chroma plane.
 const DRM_FORMAT_NV12: u32 = fourcc(b'N', b'V', b'1', b'2');
-
-/// `DRM_FORMAT_MOD_LINEAR`: rows one after another, no tiling.
-pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
-/// `DRM_FORMAT_MOD_INVALID`: the importer should not assume any particular layout. What a driver
-/// that cannot report a modifier leaves behind, and never something to pass on as if it were one.
-pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-
-/// The most planes any format here has. NV12 is two; the array is sized for what DRM allows so
-/// that a format added later does not silently truncate.
-pub const MAX_PLANES: usize = 4;
 
 /// A pixel format storage can be exported in.
 ///
@@ -131,45 +124,6 @@ impl PlanarFormat {
         match self {
             PlanarFormat::BiPlanar420 => 2,
         }
-    }
-}
-
-/// Where one plane sits in the exported allocation.
-///
-/// Offset and pitch together, because neither locates a plane on its own and a caller holding one
-/// without the other has to guess the second -- which is how a plane ends up sheared. Read from
-/// the driver, never computed here: what this side would compute is what the layout *ought* to
-/// be, and the export is worth having precisely because the driver may disagree.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PlaneLayout {
-    pub offset: u64,
-    pub pitch: u32,
-}
-
-/// What the exporting driver said about the allocation, as an importer needs it.
-///
-/// One value rather than six arguments threaded through the export path: an importer needs every
-/// field or none of them, and a `fourcc` that arrived without its modifier describes a buffer
-/// nobody can read. See [`crate::surface::Held`] for why the descriptor and the keepalive travel
-/// together rather than as a pair.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Layout {
-    pub width: u32,
-    pub height: u32,
-    pub fourcc: u32,
-    /// `DRM_FORMAT_MOD_INVALID` when the driver would not say. An importer must then be told the
-    /// modifier is unknown rather than handed `LINEAR`, which is a different claim.
-    pub modifier: u64,
-    pub planes: [PlaneLayout; MAX_PLANES],
-    pub plane_count: u32,
-    /// The whole allocation, which is what a mapping covers and what the budget was charged.
-    pub alloc_size: u64,
-}
-
-impl Layout {
-    /// The first plane's pitch, for the many callers that only ever have one plane.
-    pub fn bytes_per_row(&self) -> u32 {
-        self.planes[0].pitch
     }
 }
 
@@ -246,6 +200,20 @@ impl Surface {
     pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
         use std::os::fd::AsFd;
         self.fd.as_fd()
+    }
+
+    /// A second reference to the same storage, and how to read it.
+    ///
+    /// Duplicated and not handed over: the surface goes on naming its storage after an export,
+    /// and a caller closing what it was given must not close what this still holds. `dup` is what
+    /// makes the two independent -- both name one dma-buf, and the kernel frees it when the last
+    /// one goes.
+    ///
+    /// The layout travels with it because a descriptor alone is bytes nobody can interpret, and a
+    /// caller that had to fetch the two separately could hold a layout belonging to a different
+    /// export of the same resource.
+    pub fn export(&self) -> Option<(std::os::fd::OwnedFd, Layout)> {
+        Some((self.fd.try_clone().ok()?, self.layout))
     }
 
     /// What the driver said the allocation is.
