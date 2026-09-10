@@ -218,7 +218,29 @@ larger than on KK**, and every reachable unserved command poisons the context.
 A throwaway boot of a Linux guest against the Rust renderer, purely to enumerate what it reaches
 that we do not serve. One run, one list — never chased command by command.
 
-**Gate:** the list. The rest of the estimate is re-derived from it.
+**Gate:** the list. Met, and it is short.
+
+**What a boot reaches.** With `unsupported`'s poisoning taken out so a boot could count more than
+one command, vkmark's whole scene set — twice, with its non-default options — reaches nothing
+unserved. zink reaches exactly one, `vkCmdSetColorWriteEnableEXT`, and reaches it from glmark2 on
+wayland and from kmscube on KMS alike. Nothing gets further, and not because there is nothing
+further to find: the guest's next host-visible `CREATE_BLOB` reads `not addressable by the host`,
+which is phase 6's gap, and gnome-shell segfaults on the error. **A Linux boot census is bounded
+by the export work, not by the command gap** — so the list below is cut from what the guest's
+venus device advertises rather than from what one boot survived to send.
+
+**What the host makes reachable.** The doc's premise was right and its size was not. The Linux
+guest's venus device advertises 169 extensions on anv, and re-cutting `src/venus/unserved.txt`
+against them moves **five commands** in four groups from `out-of-reach` to `wanted`:
+`vkCmdSetColorWriteEnableEXT`, `vkCmdSetDepthBias2EXT`, `vkCmdSetFragmentShadingRateKHR`,
+`vkGetPhysicalDeviceFragmentShadingRatesKHR`, `vkCmdSetVertexInputEXT`. Nothing moves the other
+way: every `wanted` group's extension is advertised here too. The 34 commands still out of reach
+are acceleration structures, ray tracing, mesh shaders, the descriptor heap, cooperative matrix,
+`maintenance10` and shader objects — none of which anv exposes through venus either.
+
+So `out-of-reach` could not go on meaning "this host cannot send it", and the ledger now reads it
+as *no* supported host can. That is the phase's real output: the gap did not grow by a category,
+it grew by five lines, and the estimate does not move.
 
 ### Phase 5 — the export direction (3–5 weeks, the bulk)
 

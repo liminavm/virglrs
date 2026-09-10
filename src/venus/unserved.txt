@@ -15,14 +15,19 @@
 #   wanted            The reference serves it, this host can run it, and a guest here can emit it.
 #                     This is the work, and `group` is the unit to do it in: one probe program per
 #                     group, RED against this build and GREEN against the C, then the handlers.
-#   out-of-reach      The guest's venus device advertises no such extension, so nothing running
-#                     here can send it. Serving it would mean a `try_` accessor that refuses by
-#                     name -- there is no test that could go green.
+#   out-of-reach      No supported host's guest venus device advertises the extension, so nothing
+#                     that runs here can send it. Serving it would mean a `try_` accessor that
+#                     refuses by name -- there is no test that could go green. The bar is every
+#                     host, not the one at hand: a command out of reach on KosmicKrisp and
+#                     reachable on anv is `wanted`, and four groups below moved that way once the
+#                     Linux guest was asked.
 #   not-in-reference  The C refuses it too. Mostly commands the venus driver answers guest-side
 #                     and never puts on the wire. Not a gap against the reference; a decision.
 #
-# The counts are measured, not estimated: `wanted` was cut against the extension list of a real
-# guest venus device on this host, not against vk.xml and not against the host driver.
+# The counts are measured, not estimated: every status was cut against the extension lists of real
+# guest venus devices -- one per supported host -- and not against vk.xml or the host driver. The
+# Linux guest advertises 169 device extensions on anv, and every `wanted` group's extension is
+# among them, so nothing here is wanted on one host and out of reach on the other.
 #
 # What a line here costs, when a guest reaches it: nothing guest-side names the command. Poisoning
 # is the right answer and it is still not a diagnosable one -- the guest's next call fails, its
@@ -39,6 +44,14 @@
 # nothing, because zink emits `vkCmdDrawMultiIndexedEXT` -- which this build serves -- wherever
 # the plain `vkCmdDrawIndexed` below would appear. A stock Fedora 44 desktop, measured
 # 2026-09-08, refuses `vkCreateBufferView` repeatedly while it is merely running.
+#
+# What a Linux guest reaches, measured on anv with the poisoning taken out so a boot could count
+# more than one: vkmark's whole scene set, twice over with its non-default options, reaches
+# nothing on this list at all. zink reaches exactly `vkCmdSetColorWriteEnableEXT`, the same
+# command from glmark2 on wayland and from kmscube on KMS. Nothing gets further, because venus
+# host-visible allocations are unbacked off macOS until the dma-buf export lands -- the guest's
+# next CREATE_BLOB reads "not addressable by the host" and gnome-shell segfaults on the error.
+# So the reach of a Linux boot census is bounded by that gap, not by this list.
 #
 # So a workload census cannot enumerate this file: the first unserved command kills the context,
 # so a boot discovers exactly one and says nothing about the rest. Reach these deliberately, with
@@ -97,10 +110,10 @@ vkCmdSetAlphaToOneEnableEXT                        wanted:extended-dynamic-state
 vkCmdSetColorBlendAdvancedEXT                      wanted:extended-dynamic-state3
 vkCmdSetColorBlendEnableEXT                        wanted:extended-dynamic-state3
 vkCmdSetColorBlendEquationEXT                      wanted:extended-dynamic-state3
-vkCmdSetColorWriteEnableEXT                        out-of-reach:color-write-enable
+vkCmdSetColorWriteEnableEXT                        wanted:color-write-enable
 vkCmdSetColorWriteMaskEXT                          wanted:extended-dynamic-state3
 vkCmdSetConservativeRasterizationModeEXT           wanted:extended-dynamic-state3
-vkCmdSetDepthBias2EXT                              out-of-reach:depth-bias-control
+vkCmdSetDepthBias2EXT                              wanted:depth-bias-control
 vkCmdSetDepthBiasEnable                            wanted:core-dynamic-state
 vkCmdSetDepthBounds                                wanted:core-dynamic-state
 vkCmdSetDepthClampEnableEXT                        wanted:extended-dynamic-state3
@@ -109,7 +122,7 @@ vkCmdSetDepthClipEnableEXT                         wanted:extended-dynamic-state
 vkCmdSetDepthClipNegativeOneToOneEXT               wanted:extended-dynamic-state3
 vkCmdSetDeviceMask                                 wanted:core-dynamic-state
 vkCmdSetExtraPrimitiveOverestimationSizeEXT        wanted:extended-dynamic-state3
-vkCmdSetFragmentShadingRateKHR                     out-of-reach:fragment-shading-rate
+vkCmdSetFragmentShadingRateKHR                     wanted:fragment-shading-rate
 vkCmdSetLineRasterizationModeEXT                   wanted:extended-dynamic-state3
 vkCmdSetLineStipple                                wanted:core-dynamic-state
 vkCmdSetLineStippleEnableEXT                       wanted:extended-dynamic-state3
@@ -126,7 +139,7 @@ vkCmdSetSampleLocationsEXT                         wanted:sample-locations
 vkCmdSetSampleLocationsEnableEXT                   wanted:extended-dynamic-state3
 vkCmdSetSampleMaskEXT                              wanted:extended-dynamic-state3
 vkCmdSetTessellationDomainOriginEXT                wanted:extended-dynamic-state3
-vkCmdSetVertexInputEXT                             out-of-reach:vertex-input-dynamic-state
+vkCmdSetVertexInputEXT                             wanted:vertex-input-dynamic-state
 vkCmdTraceRaysIndirect2KHR                         out-of-reach:ray-tracing-maintenance1
 vkCmdTraceRaysIndirectKHR                          out-of-reach:ray-tracing-pipeline
 vkCmdTraceRaysKHR                                  out-of-reach:ray-tracing-pipeline
@@ -155,7 +168,7 @@ vkGetDeviceQueue                                   wanted:device-queue
 vkGetImageOpaqueCaptureDataEXT                     out-of-reach:descriptor-heap
 vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR  out-of-reach:cooperative-matrix
 vkGetPhysicalDeviceDescriptorSizeEXT               out-of-reach:descriptor-heap
-vkGetPhysicalDeviceFragmentShadingRatesKHR         out-of-reach:fragment-shading-rate
+vkGetPhysicalDeviceFragmentShadingRatesKHR         wanted:fragment-shading-rate
 vkGetPrivateData                                   not-in-reference:private-data
 vkGetRayTracingCaptureReplayShaderGroupHandlesKHR  out-of-reach:ray-tracing-pipeline
 vkGetRayTracingShaderGroupHandlesKHR               out-of-reach:ray-tracing-pipeline
