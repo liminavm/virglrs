@@ -31,6 +31,14 @@ pub struct Config {
     /// synchronously. Measured on this host: the worker spends a median 9% and up to 38% of its
     /// wall clock inside the fence path.
     ///
+    /// **Measured, and it buys less than it looks like it should.** With the host patched, the
+    /// sync's own cost falls from 107 to 5 microseconds a hop -- and `eglMakeCurrent`'s rises from
+    /// 1.2 to 92, because EGL requires a switch to flush the context it releases and the work the
+    /// sync no longer submitted is still queued when the walk moves on. The drain relocates one hop
+    /// rather than leaving. What is left is about a fifth off a fence, and nothing a score could
+    /// resolve. The fence path stops paying it only when the walk no longer *leaves* the loaded
+    /// context, which is [`crate::vrend::vrend::Vrend`]'s walk order and not this flag.
+    ///
     /// Claiming it of a host that does not have it is not a small mistake, which is why the
     /// default is the safe answer and the VMM has to say otherwise: the flush this drops is what
     /// submits the work the fence is taken over, so on a stock driver the fence would be waited on
