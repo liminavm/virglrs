@@ -1,13 +1,14 @@
-# The lines of vrend.score that this GL driver reads differently, and only
-# those: everything else must agree with it byte for byte.
+# The lines of vrend.score that this GL driver reads
+# differently, and only those: everything else must agree with it byte for byte.
 #
-# Pixel hashes only, and each has been looked at rather than assumed.
-# Five of these are one gaussian drop shadow, drawn on five surfaces: a separable blur
-# accumulates in a different order here and the last bits move. res=459 is the cursor arrow,
-# three pixels of antialiased edge. Ink is unchanged on all six, so the same pixels are lit --
-# what moved is the arithmetic, not the drawing.
+# Written by make-overlay.py from a scored run. Pixel hashes only -- an extent that
+# moved is refused here, because that is not arithmetic.
 #
 # Recorded against: OpenGL ES 3.2 Mesa 26.1.8 (gles 32)
+#
+# Ink moved on these, which is an antialiased edge landing on different
+# pixels rather than a different drawing. Small, and worth re-reading if it grows:
+#   res=459 32x32: ink 488 -> 485 (-3)
 res=387 250x250 hash=64d3096a6ae9a20a ink=59520/62500
 res=406 250x250 hash=64d3096a6ae9a20a ink=59520/62500
 res=400 250x250 hash=64d3096a6ae9a20a ink=59520/62500
