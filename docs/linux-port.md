@@ -270,7 +270,8 @@ of the driver's own storage — and `src/dmabuf.rs` is what holds one.
 
 **CPU access to a dma-buf is a favour, not a property.** Whether the fd maps is the driver's
 choice, and a tiled buffer's bytes are not pixels even if it does. Measured on this host: scanouts
-export with modifier `0x0100000000000001`, Y-tiling. So `Surface::readable()` is the question every
+export with modifier `0x0100000000000001` (`I915_FORMAT_MOD_X_TILED`). So `Surface::readable()` is
+the question every
 CPU path asks first, a share with no host address is refused at the venus import rather than passed
 to a driver as a null pointer, and the harness read goes through the GPU instead.
 
