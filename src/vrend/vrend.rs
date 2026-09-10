@@ -745,6 +745,15 @@ impl Vrend {
     /// nothing. The C never did this either: its global fence takes a sync on ctx0, a context that
     /// never draws.
     fn take_fence(&mut self, on: Option<ContextId>) -> Answer {
+        let answer = self.decide_fence(on);
+        self.tally.fence(&answer);
+        answer
+    }
+
+    /// How this fence is answered. Wrapped by [`Self::take_fence`], which is the only caller: the
+    /// decision has four exits and an instrument that must be remembered at each of them is one
+    /// that will be missing from the fifth.
+    fn decide_fence(&mut self, on: Option<ContextId>) -> Answer {
         // `VIRGLRS_FENCE_FINISH=1` puts the old behaviour back -- every context finished inline,
         // on this thread -- so the two can be compared on one build the way the cost of the finish
         // was measured in the first place. Retirement still goes through the waiter's queue, so
@@ -813,6 +822,7 @@ impl Vrend {
         if self.resource_surface(handle).is_none() {
             return false;
         }
+        self.tally.present();
         if attached.is_empty() {
             // Reachable when the last context holding it was destroyed and the VMM flushes it
             // anyway -- a compositor that died. Said out loud because the same branch is where a
