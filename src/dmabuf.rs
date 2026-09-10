@@ -243,12 +243,35 @@ impl Surface {
         self.mapped().map_or(0, |m| m.ptr as usize)
     }
 
+    /// Whether the bytes behind this descriptor are pixels the CPU can read in row order.
+    ///
+    /// **Only a linear buffer is.** A tiled one is a perfectly good dma-buf -- an importer hands
+    /// it to a GPU, which knows the modifier and detiles as it samples -- and its bytes read in
+    /// row order are not the picture. Measured on this host: an Intel scanout exports with
+    /// modifier `0x0100000000000001`, which is Y-tiling, so this is the common case and not an
+    /// exotic one.
+    ///
+    /// The distinction matters because the caller of a CPU read has a slow path and needs to be
+    /// told to take it. A read that returned tiled bytes would be a picture-shaped answer that is
+    /// not the picture, which is worse than no answer -- it would hash, it would differ from the
+    /// reference leg, and nothing in the difference would say why.
+    pub fn readable(&self) -> bool {
+        self.layout.modifier == DRM_FORMAT_MOD_LINEAR
+    }
+
     /// The mapping, taken on first use.
     ///
     /// `MAP_SHARED` and read-write: an importer that could only read could not be composited
     /// into, and a private mapping would take a copy-on-write snapshot whose writes the driver
     /// never sees -- which is the quietest possible way to render into nothing.
+    ///
+    /// `None` for a tiled buffer even though the descriptor would map perfectly well: see
+    /// [`Surface::readable`]. Refusing here rather than at each call site is what keeps every CPU
+    /// path honest at once.
     fn mapped(&self) -> Option<&Mapping> {
+        if !self.readable() {
+            return None;
+        }
         self.map
             .get_or_init(|| {
                 let len = usize::try_from(self.layout.alloc_size).ok().filter(|n| *n != 0)?;
@@ -280,7 +303,21 @@ impl Surface {
     /// because [`crate::surface`]'s callers were written against storage that is always
     /// addressable and have no vocabulary for storage that is not.
     fn refuse(&self, what: &str) {
-        if !self.said.swap(true, Ordering::Relaxed) {
+        if self.said.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        // Two different refusals, and they send a reader to different places. A tiled buffer is
+        // working exactly as intended and simply cannot be read this way; a descriptor that will
+        // not map is a driver saying no. Reporting both as "cannot be mapped" would have the
+        // reader hunting for a mapping failure that never happened.
+        if !self.readable() {
+            eprintln!(
+                "[virglrs] dma-buf surface {}: {what} cannot read a tiled buffer (modifier \
+                 {:#018x}); its bytes in row order are not the picture, so nothing was read and \
+                 the caller must take its slow path",
+                self.id.0, self.layout.modifier,
+            );
+        } else {
             eprintln!(
                 "[virglrs] dma-buf surface {}: {what} needs a CPU mapping and this descriptor \
                  cannot be mapped ({}); nothing was read or written",
@@ -635,6 +672,55 @@ mod tests {
         s.said.store(false, Ordering::Relaxed);
         assert_eq!(s.read_into(&mut dst), 0);
         assert!(s.said.load(Ordering::Relaxed));
+    }
+
+    /// A tiled buffer is a good descriptor and a bad picture, and every CPU path says so.
+    ///
+    /// The case this exists for was measured, not imagined: an Intel scanout on this host exports
+    /// with modifier `0x0100000000000001`, which is Y-tiling. The descriptor is exactly what a
+    /// compositor wants -- it hands it to a GPU that knows the modifier -- and the same bytes
+    /// read in row order are not the frame. Before this, they were read, hashed, and compared
+    /// against the reference leg, where the difference would have looked like a renderer bug.
+    ///
+    /// Refused, and not "read as zero": the two are told apart by the caller, which has a slow
+    /// path to fall back to and needs to be sent to it.
+    #[test]
+    fn a_tiled_buffer_refuses_every_cpu_path() {
+        const Y_TILED: u64 = 0x0100_0000_0000_0001;
+        let size = 64 * 16;
+        let tiled = Surface::exported(
+            memfd(size),
+            Layout {
+                width: 16,
+                height: 16,
+                fourcc: PixelFormat::Bgra.fourcc(),
+                modifier: Y_TILED,
+                planes: [PlaneLayout { offset: 0, pitch: 64 }; MAX_PLANES],
+                plane_count: 1,
+                alloc_size: size as u64,
+            },
+        );
+        assert!(!tiled.readable(), "a modifier that is not LINEAR is not rows");
+
+        let mut dst = [0xabu8; 64];
+        assert_eq!(tiled.read_into(&mut dst), 0);
+        assert_eq!(dst, [0xab; 64], "and the buffer is left as it was, not filled with tiles");
+        assert_eq!(tiled.read_rows(&mut dst, 16, 4), 0);
+        assert_eq!(tiled.write_from(&[0; 8]), 0, "nor written through");
+        assert_eq!(tiled.host_addr(), 0, "and there is no address to publish");
+
+        // The descriptor itself is untouched by any of that: exporting it is the whole point.
+        let (fd, layout) = tiled.export().expect("a tiled buffer still exports");
+        assert_eq!(layout.modifier, Y_TILED, "and the importer is told how to read it");
+        drop(fd);
+
+        // The same surface laid out linearly reads back, so the refusal is about the modifier and
+        // not about anything else this test happens to have set up.
+        let linear = plain(16, 16, 64);
+        assert!(linear.readable());
+        assert_eq!(linear.write_from(&[0x5a; 64]), 64);
+        assert_eq!(linear.read_into(&mut dst), 64);
+        assert_eq!(dst, [0x5a; 64]);
     }
 
     /// Every id is its own, and none is reused. A recycled id would name a live surface with a

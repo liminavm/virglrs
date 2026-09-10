@@ -1632,6 +1632,12 @@ impl Renderer {
     ///
     /// The count of rows that landed, so a caller that asked for more than the surface holds is
     /// told so rather than handed a buffer with a stale tail in it.
+    ///
+    /// `None` for storage whose bytes are not pixels the CPU can read in row order -- a tiled
+    /// dma-buf, which is what an Intel scanout exports as. That is *not* the same answer as zero
+    /// rows: a caller reads `None` as "take your slow path" and a zero as "there was nothing
+    /// there", and handing back tiled bytes would be worse than either, because they hash and
+    /// they are picture-shaped and nothing about them says they are not the picture.
     pub fn resource_read_iosurface(
         &self,
         handle: ResourceHandle,
@@ -1640,12 +1646,18 @@ impl Renderer {
         height: u32,
     ) -> Option<u32> {
         if let Some(surface) = self.classic_surface(handle) {
+            if !surface.readable() {
+                return None;
+            }
             let rows = surface.read_rows(dst, stride, height);
             trace_blank_readback("classic", handle, surface.id().0, dst, stride, rows);
             return Some(rows);
         }
         let storage = self.resource_storage(handle)?;
         let surface = storage.surface().ok()?;
+        if !surface.readable() {
+            return None;
+        }
         let rows = surface.read_rows(dst, stride, height);
         trace_blank_readback("shared", handle, surface.id().0, dst, stride, rows);
         Some(rows)
