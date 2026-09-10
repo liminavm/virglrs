@@ -860,7 +860,7 @@ impl Vrend {
     /// nothing. The C never did this either: its global fence takes a sync on ctx0, a context that
     /// never draws.
     fn take_fence(&mut self, on: Option<ContextId>) -> Answer {
-        let began = self.tally.fence_began();
+        let began = self.tally.mark();
         let answer = self.decide_fence(on);
         self.tally.fence(&answer, began);
         answer
@@ -895,11 +895,20 @@ impl Vrend {
         // and a replacement that covers less is not one.
         let mut syncs = Vec::new();
         let mut refused = false;
+        // `hop` is the position in the walk, ctx0 included at the end, because what the walk costs
+        // per position is the question the hop line exists to answer.
+        let mut hop = 0usize;
         if let Some(ctx) = self.contexts.get(&id) {
             for (sub, gl_ctx) in ctx.gl_contexts() {
+                let began = self.tally.mark();
                 self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
                 self.current.switched_to(GlContext::Sub(id, sub));
-                match self.gl.fence() {
+                let switched = self.tally.mark();
+                let taken = self.gl.fence();
+                let marks = began.zip(switched).zip(self.tally.mark()).map(|((b, s), t)| (b, s, t));
+                self.tally.fence_hop(hop, marks);
+                hop += 1;
+                match taken {
                     Some(f) => syncs.push(f),
                     None => {
                         refused = true;
@@ -922,8 +931,13 @@ impl Vrend {
         // that `us/cmd` cannot price this, because the tally's submit window does not contain
         // `take_fence` (see [`tally`]); the fence line's own timer is what to read.
         if !refused {
+            let began = self.tally.mark();
             self.switch_ctx0();
-            match self.gl.fence() {
+            let switched = self.tally.mark();
+            let taken = self.gl.fence();
+            let marks = began.zip(switched).zip(self.tally.mark()).map(|((b, s), t)| (b, s, t));
+            self.tally.fence_hop(hop, marks);
+            match taken {
                 Some(f) => syncs.push(f),
                 None => refused = true,
             }
@@ -937,6 +951,9 @@ impl Vrend {
             for f in syncs {
                 self.gl.fence_delete(f);
             }
+            // Counted apart from the free ordering, which answers with the same `Answer`: this one
+            // is a full finish of every context that could hold the work.
+            self.tally.fence_drained();
             self.finish_contexts(&[id]);
             return Answer::Ordered;
         }
