@@ -36,12 +36,32 @@ if [ "$(uname -s)" = Darwin ]; then
   FRAMEWORKS="-framework IOSurface -framework CoreFoundation"
 fi
 
+# Whether this leg carries the limina extensions -- the snapshot journal and the IOSurface reads.
+# Asked of the library being linked rather than assumed from the platform, because it is a
+# property of the leg: a stock upstream virglrenderer exports none of them, and calling one is an
+# undefined symbol at link time. The replayer compiles those sections out and refuses the options
+# that drive them, rather than failing to build or, worse, reporting a gate it never ran.
+NEEDED="virgl_renderer_limina_journal_export virgl_renderer_limina_journal_restore
+virgl_renderer_limina_journal_replay_upto virgl_renderer_limina_replay_begin
+virgl_renderer_limina_replay_end virgl_renderer_limina_classic_content_export
+virgl_renderer_limina_classic_content_restore virgl_renderer_limina_dump_state"
+HAVE_LIMINA=1
+EXPORTS="$(virgl_exported_symbols "$LIB")"
+for sym in $NEEDED; do
+  printf '%s\n' "$EXPORTS" | grep -qx "$sym" || { HAVE_LIMINA=0; break; }
+done
+
 # shellcheck disable=SC2086
 cc -O2 -Wall -Wextra -o vrend-replay vrend-replay.c \
+   -DHAVE_LIMINA_EXT=$HAVE_LIMINA \
    -I"$CSRC/src" -I"$CBUILD_INC" -I"$PREFIX/include/virgl" \
    -L"$LIBDIR" -lvirglrenderer -Wl,-rpath,"$LIBDIR" \
    $FRAMEWORKS
 
+if [ "$HAVE_LIMINA" = 0 ]; then
+  echo "note: this leg exports no limina extensions -- the snapshot-journal gate (--rebuild)"
+  echo "      is compiled out and will be refused rather than silently skipped."
+fi
 echo "built: $PWD/vrend-replay"
 # Which leg it linked, said out loud: the whole point of the prefix being a parameter is that the
 # answer is not obvious from the command that produced it.
