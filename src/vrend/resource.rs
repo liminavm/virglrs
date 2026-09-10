@@ -191,6 +191,9 @@ pub enum Refusal {
     /// buffer behind it. The guest's error: it chose the layout when it filled the buffer, and
     /// this is the description it sent of what it chose.
     UndescribableStorage(crate::surface::BadLayout),
+    /// A guest-supplied description the bounds accepted and the driver would not import. Also the
+    /// guest's, and refused rather than asserted for the same reason: the numbers are its own.
+    UnimportableStorage(core::ffi::c_int),
     /// A multisample 2D *array*, on a host with no `glTexStorage3DMultisample`.
     ///
     /// Split out from [`Refusal::UnsupportedMultisampleFormat`] because it cannot claim that
@@ -251,6 +254,7 @@ impl Refusal {
             // buffer it filled. Nothing in the capset could have excluded that: the numbers are
             // the guest's own, sent in this command.
             | Refusal::UndescribableStorage(_)
+            | Refusal::UnimportableStorage(_)
             | Refusal::ZeroWidth
             | Refusal::BufferBindOnTexture
             | Refusal::NotTextureStorage
@@ -305,8 +309,13 @@ impl fmt::Display for Refusal {
         if let Refusal::UndescribableStorage(why) = self {
             return write!(f, "the storage cannot be read as described: {why}");
         }
+        if let Refusal::UnimportableStorage(code) = self {
+            return write!(f, "the driver would not import the storage as described ({code:#x})");
+        }
         let s = match self {
-            Refusal::UndescribableStorage(_) => unreachable!("answered above"),
+            Refusal::UndescribableStorage(_) | Refusal::UnimportableStorage(_) => {
+                unreachable!("answered above")
+            }
             Refusal::UnsupportedFormat => "unsupported texture format",
             Refusal::NoPlanarStorage => "no planar surface to back a multi-plane target",
             Refusal::UnsupportedMultisampleFormat => "unsupported multisample texture format",
@@ -495,40 +504,56 @@ impl Untyped {
             Ok(_) => return Err((self, Refusal::NotTextureStorage)),
             Err(e) => return Err((self, e)),
         };
-        // Storage with no layout of its own is read under the one this command carries, and
-        // that is the *only* description of it there will ever be -- the driver laid out a
-        // buffer, which has no format, no tiling and no layout to report. It is also the guest's
-        // claim rather than the driver's answer, so it crosses a trust boundary on the way in:
-        // `describe` checks every plane against the kernel's size for the buffer before anything
-        // maps or images it, and a claim that does not fit is the guest's error and refused.
-        let held = match self.storage {
-            Some(Adoptable::Ready(held)) => Some(held),
-            Some(Adoptable::Unread(storage)) => match describe(&storage, &args, planes, modifier) {
-                Ok(held) => Some(held),
-                Err(why) => {
-                    return Err((
-                        Untyped { storage: Some(Adoptable::Unread(storage)) },
-                        Refusal::UndescribableStorage(why),
-                    ));
-                }
-            },
+        // Whose fault a refused import is depends entirely on who supplied the layout, and that
+        // is exactly what the two shapes of storage record -- so they are handled apart rather
+        // than joined into one call with a flag beside it saying whom to blame.
+        let image = match self.storage {
+            // Either there is no storage here, or this host adopts none -- said once at init.
+            // Neither is news, and neither means there are no pixels: the fill below reads them
+            // where they are.
             None => None,
-        };
-        let image = match held {
-            Some(held) if features.adopts_iosurfaces() => match winsys.image_from_iosurface(held) {
+            Some(_) if !winsys.adopts_shared_storage(features) => None,
+            // The layout is the exporting driver's own answer about its own image. A host that
+            // says it adopts and then refuses one is a host bug, and it crashes: degrading would
+            // hide our own defect behind a window that renders the wrong thing.
+            Some(Adoptable::Ready(held)) => match winsys.image_from_iosurface(held) {
                 Ok(image) => Some(image),
-                // The host takes IOSurfaces and would not take this one. See above: ours.
                 Err(e) => panic!(
-                    "the driver imports IOSurfaces but refused an exported {}x{} {} one: {e}",
+                    "the driver adopts exported storage but refused an exported {}x{} {} one: {e}",
                     args.width,
                     args.height,
                     args.format.name()
                 ),
             },
-            // Either this host adopts no surfaces -- said once at init -- or these bytes are
-            // not one, which the storage that minted them already said. Neither is news, and
-            // neither means there are no pixels: the fill below reads them where they are.
-            Some(_) | None => None,
+            // Storage with no layout of its own, read under the one this command carries -- the
+            // only description of it there will ever be, because the driver laid out a buffer and
+            // a buffer has no format, no tiling and no layout to report. That makes it the
+            // guest's claim rather than the driver's answer, so it crosses a trust boundary
+            // twice: `describe` bounds every plane against the kernel's own size for the buffer,
+            // and the driver then has the last word on whether it can read them that way. A
+            // refusal at either step is a guest describing storage it filled some other way, so
+            // it is refused -- never asserted, because a guest must not be able to abort the
+            // host.
+            Some(Adoptable::Unread(storage)) => {
+                let held = match describe(&storage, &args, planes, modifier) {
+                    Ok(held) => held,
+                    Err(why) => {
+                        return Err((
+                            Untyped { storage: Some(Adoptable::Unread(storage)) },
+                            Refusal::UndescribableStorage(why),
+                        ));
+                    }
+                };
+                match winsys.image_from_iosurface(held) {
+                    Ok(image) => Some(image),
+                    Err(e) => {
+                        return Err((
+                            Untyped { storage: Some(Adoptable::Unread(storage)) },
+                            Refusal::UnimportableStorage(e.code),
+                        ));
+                    }
+                }
+            }
         };
         // The share is gone into the image, or was never there; a refusal past this point has
         // nothing left to hand back but an empty slot, which is what the handle already was.

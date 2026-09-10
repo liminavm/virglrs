@@ -380,6 +380,15 @@ pub fn scanout_fourcc(format: Format) -> Option<DrmFourcc> {
     generated::SCANOUT_FOURCCS.iter().find(|(f, _)| *f == format).map(|&(_, code)| code)
 }
 
+/// Every format a scanout can be, with the fourcc it carries.
+///
+/// The table itself, for the one caller that needs the whole of it rather than one lookup: the
+/// side that has to be able to *bound* a layout in any of these codes, and must fail here rather
+/// than in a guest's window when the generated table grows one.
+pub fn scanout_fourccs() -> impl Iterator<Item = (Format, DrmFourcc)> {
+    generated::SCANOUT_FOURCCS.iter().copied()
+}
+
 /// A format's host-side entry: the GL triple, and what the driver answered when asked to make a
 /// texture of it -- `vrend_format_table`'s `bindings` and `flags`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -602,6 +602,35 @@ impl Winsys {
         self.extensions.contains(name)
     }
 
+    /// Whether storage another context exported can become a texture's storage here.
+    ///
+    /// Deliberately not [`super::features::Features::adopts_iosurfaces`], which asks a different
+    /// question: whether this host can *mint* storage of its own and back a texture with it. Only
+    /// the minting host can, and `crate::dmabuf` has no constructor that makes storage at all --
+    /// so the two answers differ per host and fusing them would switch the minting paths on where
+    /// there is nothing to mint.
+    ///
+    /// Adopting is the other direction, and both hosts do it: one takes an IOSurface a context
+    /// exported, the other a dma-buf. It is what a compositor sampling a client's window needs,
+    /// and until this was asked separately a venus client's window on Linux was adopted by
+    /// nothing and composited as a blank texture -- measured with `vkcube` under GNOME, which
+    /// drew a black 500x500 window while every status line read green.
+    ///
+    /// Both halves are needed and neither implies the other: the GL entry point that makes an
+    /// EGLImage into texture storage, and the EGL extension that makes a descriptor into an
+    /// EGLImage. Asked here rather than at the import, so a host that cannot do it says so once
+    /// at startup instead of per client window.
+    pub fn adopts_shared_storage(&self, features: &super::features::Features) -> bool {
+        use super::features::Feature;
+        if !(features.has(Feature::egl_image) || features.has(Feature::egl_image_storage)) {
+            return false;
+        }
+        // An IOSurface is imported through a Limina-specific target that needs no EGL extension
+        // to advertise it; a dma-buf is imported through `EGL_EXT_image_dma_buf_import`, and a
+        // display without it would refuse every descriptor.
+        cfg!(target_os = "macos") || self.has_extension("EGL_EXT_image_dma_buf_import")
+    }
+
     /// Whether an sRGB drawable can be asked for -- `vrend_winsys_has_gl_colorspace`.
     ///
     /// On a display of ours it is the EGL extension. On an embedder's it is the extension when

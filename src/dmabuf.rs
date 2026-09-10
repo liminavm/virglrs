@@ -517,13 +517,27 @@ impl std::fmt::Debug for Surface {
     }
 }
 
-/// How many memory planes a FourCC's pixels occupy, for a layout that has to be checked against
-/// a buffer. `None` is a FourCC this renderer will not interpret, which is not the same as one
-/// the kernel has no name for.
-fn planes_of(fourcc: u32) -> Option<u32> {
-    match fourcc {
-        DRM_FORMAT_ARGB8888 | DRM_FORMAT_ABGR8888 => Some(1),
-        DRM_FORMAT_NV12 => Some(2),
+/// How a FourCC's pixels sit in memory: how many planes, and how many bytes one element of each
+/// plane is. What a layout has to be checked against before anything reads the buffer under it.
+///
+/// Matched on the four characters rather than on computed codes, because that is how
+/// `drm_fourcc.h` writes them and it is what makes a wrong entry visible on the page.
+///
+/// The set is every code [`crate::vrend::formats::scanout_fourcc`] can produce, plus `NV12` for
+/// the planar decode path -- and the two are pinned together by a test, so a code added to the
+/// generated table without a rule here fails this tree's own suite rather than one guest's
+/// window. `None` is a FourCC this renderer will not bound, and is refused by name.
+fn plane_rule(fourcc: u32) -> Option<(u32, [u32; MAX_PLANES])> {
+    let flat = |bytes: u32| Some((1, [bytes, 0, 0, 0]));
+    match &fourcc.to_le_bytes() {
+        b"R8  " => flat(1),
+        b"RG16" => flat(2),
+        b"AR24" | b"XR24" | b"AB24" | b"XB24" => flat(4),
+        b"AR30" | b"XR30" | b"AB30" | b"XB30" => flat(4),
+        b"AB4H" | b"XB4H" | b"AB48" | b"XB48" => flat(8),
+        // The one planar layout: full-resolution 8-bit luma, then half-resolution two-byte
+        // interleaved chroma.
+        b"NV12" => Some((2, [1, 2, 0, 0])),
         _ => None,
     }
 }
@@ -617,23 +631,20 @@ impl Descriptor {
         if layout.modifier != DRM_FORMAT_MOD_LINEAR && layout.modifier != DRM_FORMAT_MOD_INVALID {
             return Err(BadLayout::Modifier(layout.modifier));
         }
-        let wants = planes_of(layout.fourcc).ok_or(BadLayout::Fourcc(layout.fourcc))?;
+        let (wants, bytes) = plane_rule(layout.fourcc).ok_or(BadLayout::Fourcc(layout.fourcc))?;
         if layout.plane_count != wants {
             return Err(BadLayout::PlaneCount { said: layout.plane_count, wants });
         }
         for at in 0..wants {
             let p = layout.planes[at as usize];
             // A subsampled plane rounds *up*: an odd-sized NV12 image still has a chroma row for
-            // its last luma row, and rounding down would bound the buffer one row short.
+            // its last luma row, and rounding down would bound the buffer one row short. Only a
+            // planar layout has a plane past the first, so the rule and the subsampling are the
+            // same fact.
             let sub = u32::from(at > 0);
             let (w, h) = (layout.width.div_ceil(1 << sub), layout.height.div_ceil(1 << sub));
-            let bpe = match (layout.fourcc, at) {
-                (DRM_FORMAT_NV12, 0) => 1,
-                (DRM_FORMAT_NV12, _) => 2,
-                _ => 4,
-            };
             let tight = w
-                .checked_mul(bpe)
+                .checked_mul(bytes[at as usize])
                 .ok_or(BadLayout::Extent { width: layout.width, height: layout.height })?;
             if p.pitch < tight {
                 return Err(BadLayout::Pitch { plane: at, pitch: p.pitch, tight });
@@ -1050,6 +1061,28 @@ mod tests {
         let mut seen = [0u8; 64];
         assert_eq!(b.read_into(&mut seen), 64);
         assert_eq!(seen, [0x5a; 64]);
+    }
+
+    /// Every FourCC a scanout can carry has a rule for bounding a layout in it.
+    ///
+    /// The two tables are one fact in two places: `scanout_fourcc` is generated from the C's
+    /// format tables and says which codes a resource may be described as, and `plane_rule` says
+    /// how to bound a description in one. A code in the first with no entry in the second is a
+    /// guest window refused at `SET_TYPE` with nothing in this tree having decided that it should
+    /// be -- which is how `XB4H` was found, in a boot rather than here.
+    #[test]
+    fn every_scanout_fourcc_can_be_bounded() {
+        let mut seen = 0;
+        for (format, code) in crate::vrend::formats::scanout_fourccs() {
+            seen += 1;
+            let name: String = code.get().to_le_bytes().iter().map(|b| *b as char).collect();
+            assert!(
+                plane_rule(code.get()).is_some(),
+                "{name} ({}) is offered as a scanout format and cannot be bounded",
+                format.name()
+            );
+        }
+        assert_eq!(seen, 14, "the generated table changed size; check the rules above it");
     }
 
     /// Every id is its own, and none is reused. A recycled id would name a live surface with a
