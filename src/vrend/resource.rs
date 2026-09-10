@@ -2307,11 +2307,30 @@ fn export_surface(winsys: &Winsys, a: &Args, name: TextureName) -> Option<Arc<dy
         "R8G8B8A8_UNORM" | "R8G8B8X8_UNORM" => PixelFormat::Rgba,
         _ => return None,
     };
+    // Said once, each way. A needle that only fires on failure reads the same when the export
+    // works and when the gate above quietly stopped matching anything, and "no refusals in the
+    // log" is exactly the reading this renderer has been caught trusting before.
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let first = || !SAID.swap(true, std::sync::atomic::Ordering::Relaxed);
     match winsys.export_texture(name, a.width, a.height, format) {
-        Ok(surface) => Some(Arc::new(surface) as Arc<dyn Held>),
+        Ok(surface) => {
+            if first() {
+                let l = *surface.layout();
+                eprintln!(
+                    "[virglrs] vrend: scanouts export as dma-bufs: {}x{} {} is fourcc {:#010x} \
+                     modifier {:#018x}, pitch {}",
+                    a.width,
+                    a.height,
+                    a.format.name(),
+                    l.fourcc,
+                    l.modifier,
+                    l.bytes_per_row(),
+                );
+            }
+            Some(Arc::new(surface) as Arc<dyn Held>)
+        }
         Err(e) => {
-            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if first() {
                 eprintln!(
                     "[virglrs] vrend: this driver exports no dma-buf for a {}x{} {} resource \
                      ({e}); scanouts are read back through the CPU instead",
