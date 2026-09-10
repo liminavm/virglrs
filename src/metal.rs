@@ -771,10 +771,6 @@ impl Surface {
         ))
     }
 
-    /// The global id another process looks this surface up by.
-    ///
-    /// Asked of the surface, never stored. See the module docs: an id outliving its surface is
-    /// the bug this whole module is shaped to prevent.
     /// Whether the bytes are pixels the CPU can read in row order, which for an IOSurface is
     /// always: the minting path exists precisely because these pages are addressable, and a
     /// surface whose rows the host could not read could not be presented from either.
@@ -793,6 +789,10 @@ impl Surface {
         None
     }
 
+    /// The global id another process looks this surface up by.
+    ///
+    /// Asked of the surface, never stored. See the module docs: an id outliving its surface is
+    /// the bug this whole module is shaped to prevent.
     pub fn id(&self) -> SurfaceId {
         // SAFETY: we hold a reference to the surface for the duration of this call.
         SurfaceId(unsafe { IOSurfaceGetID(self.as_ref()) })
