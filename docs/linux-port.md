@@ -343,7 +343,19 @@ Everything above compiles and scores. None of it says the transport works.
 Boot the C leg first so there is a reference frame, then the Rust one. Capture and look.
 `harness/vm/frame.py` prints facts and renders no verdict; that discipline carries over unchanged.
 
-**Gate:** a frame, compared against the C leg's frame.
+**Gate:** a frame, compared against the C leg's frame. **Met.** Both legs seat a GNOME session
+under `cage` on this host and draw the overview -- wallpaper, workspace thumbnails, dock, search
+-- and the two captures differ in **16 pixels of 921600**, a 5x6 box that is the clock's minute
+digit. Two independent boots, so anything nondeterministic in window placement or damage would
+have shown and did not.
+
+**Both legs must be booted under the same host GL API, and the desktop is where that is easiest to
+get wrong.** GTK hands QEMU a desktop GL 4.6 core context unless `GDK_GL=gles` is in the
+environment, and `gl=es` does not reach it because that path goes through GDK. The C leg accepts
+such a context and this renderer refuses it by name, so a comparison run without the variable is
+the C on desktop GL against a guest that quietly fell back to llvmpipe -- with a seated session,
+a running shell and a captured frame to say everything is fine. `renderer:` naming `virgl` is the
+control, and `grep -c virglrs` on the log is what says which leg drew it.
 
 ## A new unsafe module is allowed, by decision
 
