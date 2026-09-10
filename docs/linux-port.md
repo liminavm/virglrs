@@ -229,11 +229,10 @@ that we do not serve. One run, one list — never chased command by command.
 **What a boot reaches.** With `unsupported`'s poisoning taken out so a boot could count more than
 one command, vkmark's whole scene set — twice, with its non-default options — reaches nothing
 unserved. zink reaches exactly one, `vkCmdSetColorWriteEnableEXT`, and reaches it from glmark2 on
-wayland and from kmscube on KMS alike. Nothing gets further, and not because there is nothing
-further to find: the guest's next host-visible `CREATE_BLOB` reads `not addressable by the host`,
-which is phase 6's gap, and gnome-shell segfaults on the error. **A Linux boot census is bounded
-by the export work, not by the command gap** — so the list below is cut from what the guest's
-venus device advertises rather than from what one boot survived to send.
+wayland and from kmscube on KMS alike. A census still stops early for a reason of its own: the
+first unserved command kills the context, so one boot discovers one command and says nothing
+about the rest. So the list below is cut from what the guest's venus device advertises rather
+than from what one boot survived to send.
 
 **What the host makes reachable.** The doc's premise was right and its size was not. The Linux
 guest's venus device advertises 169 extensions on anv, and re-cutting `src/venus/unserved.txt`
@@ -250,11 +249,40 @@ it grew by five lines, and the estimate does not move.
 
 ### Phase 5 — the export direction (3–5 weeks, the bulk)
 
-The inversion, made real. A venus scanout allocation is declared for export and dedicated to one
-image, so the driver lays the memory out and `vkGetMemoryFdKHR` hands back a descriptor of it;
-nothing is minted, and the allocate path prepends no `VkImportMemoryHostPointerInfoEXT`. `Planned`
-grew an `Exporting` arm for the moment that describes — after `vkAllocateMemory`, with a descriptor
-of the driver's own storage — and `src/dmabuf.rs` is what holds one.
+The inversion, made real. An allocation the guest **declares for export** gets a descriptor: the
+driver lays the memory out and `vkGetMemoryFdKHR` hands back an fd for it; nothing is minted, and
+the allocate path prepends no `VkImportMemoryHostPointerInfoEXT`. `Planned` grew an `Exporting`
+arm for the moment that takes it — after `vkAllocateMemory`, over the driver's own storage — and
+`src/dmabuf.rs` is what holds one.
+
+**Exportable and presentable are two questions, and only the minting host could answer them
+together.** There, the host has to *make* storage of a concrete pixel layout, so a window buffer
+is recognised by shape: exported, and dedicated to one image of a presentable format. Here the
+driver made the storage, and the shape test is the wrong question — Mesa's Wayland WSI renders
+into an OPTIMAL image and blits into a linear `VkBuffer`, and it is the **buffer** it declares for
+export and shares with the compositor. A buffer has no format, no tiling and no
+`vkGetImageSubresourceLayout`: there is nothing to ask the driver.
+
+So the two are asked separately. Exportable is the declaration alone, and yields
+`Storage::Exported` — a `Descriptor`, which is an fd and the kernel's own size for it (`lseek`),
+and which stays one for life. Presentable is a layout, which only a dedicated image can answer
+for; when one does the descriptor comes back as a `Surface` and the driver's answer is an oracle.
+
+**A descriptor's layout arrives from the guest, at `PIPE_RESOURCE_SET_TYPE`**, which already
+carried the modifier and the per-plane strides and offsets. `Descriptor::describe` mints a
+*separate* `Surface` over a second reference to the buffer, so two contexts may read one
+descriptor under different layouts and neither can disturb the other — which matters because a
+guest may send two descriptions that disagree. That is also the trust boundary: every plane is
+bounded against the kernel's size in checked arithmetic, and any modifier but `LINEAR` and
+`INVALID` is refused by name, because a compressed one carries an auxiliary plane whose extent
+follows a different rule. A layout the bounds accept and the driver still will not import is
+refused too, not asserted — the numbers are the guest's.
+
+**Adopting exported storage is not minting it.** `Winsys::adopts_shared_storage` asks whether a
+context can take storage another one exported (an IOSurface here, a dma-buf there — both hosts
+do); `Features::adopts_iosurfaces` asks whether this host mints storage of its own, which only
+the minting host does. They were one predicate, and while they were, a venus client's window on
+Linux was adopted by nothing and composited as a blank texture.
 
 - `EMULATED_ON_THE_HOST` stops emulating, and both branches of the extension switch are pinned by
   a test that asserts each host's answer rather than the one it is compiled on.
@@ -398,12 +426,6 @@ process-local counter that names nothing outside this renderer. Every generic ca
 a boolean -- both replayers test it for non-zero -- and the transportable handle already exists as
 `resource_export`. So the doc has to say which of the two it is handing back, whatever it is
 called. The `image_*_iosurface` winsys entry points are internal and rename freely.
-
-`Features::adopts_iosurfaces` goes with them but is a semantics fix, not a rename: it fuses "can a
-texture adopt a `Held`'s storage as an EGL image", true on both hosts and relied on by the scanout
-round trip, with "does this host mint surfaces to adopt", which is macOS-only and already said by
-the `#[cfg]` on `mint_surface`. No live bug -- its call sites are macOS-only or unreachable off it
--- but the predicate denies something this host does.
 
 **Multi-plane export on the venus side.** A classic export takes every plane a compressed
 modifier reports; a venus one still describes every image as having a single memory plane.
