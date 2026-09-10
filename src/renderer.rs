@@ -53,6 +53,14 @@ pub enum Error {
     RendererAbsent,
     /// The context bound a capset no build serves yet.
     RendererUnimplemented,
+    /// The resource has no descriptor another process could import it by: this host mints its
+    /// storage rather than exporting it, or the resource has no presentable storage at all.
+    ///
+    /// Not a failure to report. A VMM asks this of every resource it is about to publish and
+    /// handles "no descriptor" as a matter of course -- rutabaga reads it as "no handle" and
+    /// carries on -- so it is an answer, and the renderer says which answer rather than a
+    /// generic refusal a caller would have to guess the meaning of.
+    NotExportable,
     /// The stream violated the protocol; its context is poisoned and accepts nothing further.
     Poisoned,
     /// A submission waited on a ring that is not running in that context.
@@ -131,6 +139,7 @@ impl std::fmt::Display for Error {
             Error::NoContext => "no such context",
             Error::RendererAbsent => "this build was not initialized to serve that capset",
             Error::RendererUnimplemented => "no renderer serves that capset yet",
+            Error::NotExportable => "the resource has no descriptor to export",
             Error::Poisoned => "the context is poisoned",
             Error::NoRing => "no such running ring in that context",
             Error::NoAllocation => "no such allocation in that context",
@@ -1528,6 +1537,53 @@ impl Renderer {
                 None
             }
         }
+    }
+
+    /// Do something with the surface a resource is presented from, wherever it came from.
+    ///
+    /// Classic resources keep theirs in vrend and venus-exported ones in the storage a blob holds
+    /// a share of, and callers want the same answer either way -- so it is resolved once here.
+    /// Two callers resolving it two different ways is how "it has an id" and "it can be read"
+    /// came to be separately derivable facts about one resource.
+    ///
+    /// A closure rather than a borrow, because one of the two answers lives in a share this call
+    /// resolves and the caller does not hold: returning a reference into it would mean handing
+    /// back a borrow of something already dropped. The closure is where the share is still alive.
+    fn with_surface<T>(
+        &self,
+        handle: ResourceHandle,
+        f: impl FnOnce(&crate::surface::Surface) -> T,
+    ) -> Option<T> {
+        if let Some(surface) = self.classic_surface(handle) {
+            return Some(f(surface));
+        }
+        let storage = self.resource_storage(handle)?;
+        let surface = storage.surface().ok()?;
+        Some(f(surface))
+    }
+
+    /// A descriptor of a resource's storage, for a VMM that composites by importing rather than
+    /// by reading an address.
+    ///
+    /// The export direction, at the API's edge. What comes back is a descriptor the caller owns
+    /// -- a *new* reference, duplicated from the renderer's, so the resource goes on naming its
+    /// own storage and closing one does not close the other. Handing over the renderer's own
+    /// would make every export the last one.
+    ///
+    /// `Err` is the answer on a host that mints storage instead of exporting it, and for a
+    /// resource that has no presentable storage at all. Neither is a failure to report: the
+    /// caller asked how this could be exported and was told it could not, which is what it has
+    /// to handle anyway.
+    pub fn resource_export(
+        &self,
+        handle: ResourceHandle,
+    ) -> Result<(std::os::fd::OwnedFd, FdType, crate::surface::Layout), Error> {
+        self.with_surface(handle, |surface| {
+            let (fd, layout) = surface.export()?;
+            Some((fd, FdType::DmaBuf, layout))
+        })
+        .flatten()
+        .ok_or(Error::NotExportable)
     }
 
     /// The surface a classic resource is presented from, when vrend gave it one. Asked of vrend,
