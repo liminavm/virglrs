@@ -190,7 +190,7 @@ impl Context {
     ) -> Option<T> {
         let (gl, winsys, features) = (host.gl, host.winsys, host.features);
         if host.blitter.is_none() {
-            match blitter::Blitter::open(winsys, gl, host.version, host.share) {
+            match blitter::Blitter::open(winsys, gl, host.current, host.version, host.share) {
                 Ok(b) => *host.blitter = Some(b),
                 Err(e) => {
                     eprintln!("[virglrs] vrend: no GL context for the blitter ({e}); no blit");

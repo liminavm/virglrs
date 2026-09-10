@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 
+use super::context::{Current, GlContext};
 use super::features::{Feature, Features};
 use super::gl::gles::*;
 use super::gl::{
@@ -288,15 +289,23 @@ impl Blitter {
     /// Bring the blit context up: its own GL context sharing the renderer's objects, and the one
     /// vertex array, buffer, framebuffer and passthrough vertex shader every blit reuses.
     ///
-    /// Leaves its own context current -- the caller is switching to it anyway.
+    /// Leaves its own context current -- the caller is switching to it anyway, and the switch is
+    /// [`Current`]'s because it is the thing that must not be done behind its back. A bare
+    /// `winsys.make_current` here would leave the caller's sub-context with no sync over the work
+    /// it had queued, *and* leave `Current` naming a context that is no longer the one bound -- so
+    /// the next departure would pass its verification, take its sync on this blitter's context, and
+    /// file it under the sub-context's name. A fence would then collect a sync that covers none of
+    /// the renders it is answering for and retire ahead of them, which is the whole failure
+    /// `Answer::Syncs` exists to prevent.
     pub fn open(
         winsys: &Winsys,
         gl: &Gl,
+        current: &mut Current,
         version: Version,
         share: &egl::Context,
     ) -> Result<Blitter, egl::EglError> {
         let ctx = winsys.create_context(version, Some(share))?;
-        winsys.make_current(&ctx)?;
+        current.switch_to(winsys, gl, GlContext::Blitter, &ctx);
         let vao = gl.gen_vertex_array();
         let vbo = gl.gen_buffer();
         let fbo = gl.gen_framebuffer();
@@ -891,8 +900,13 @@ mod tests {
         let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
         let version = Version { major: 3, minor: 1 };
         let ctx = winsys.create_context(version, None).expect("a 3.1 context");
-        winsys.make_current(&ctx).expect("current");
+        // Through `Current`, as the renderer does, so what it believes is bound is what is bound --
+        // and so the sync it takes when the blitter's context is opened under it is one this test
+        // owns and spends. A `Current` built fresh beside a bind it did not make would record that
+        // sync against the wrong context, which is the mistake `Blitter::open` used to invite.
         let gl = Gl::new(winsys.gles(), crate::vrend::gl::FenceFlush::Needed);
+        let mut current = Current::ctx0();
+        current.switch_to(&winsys, &gl, GlContext::Ctx0, &ctx);
 
         // The base texture, as a composite target's own storage is: RGBA8, one level.
         let base = gl.gen_texture();
@@ -900,8 +914,8 @@ mod tests {
         gl.tex_storage_2d(GL_TEXTURE_2D, 1, GL_RGBA8, W as GLsizei, H as GLsizei);
         gl.bind_texture(GL_TEXTURE_2D, None);
 
-        let mut blitter =
-            Blitter::open(&winsys, &gl, version, &ctx).expect("the blitter's context opens");
+        let mut blitter = Blitter::open(&winsys, &gl, &mut current, version, &ctx)
+            .expect("the blitter's context opens");
 
         let convert = |blitter: &mut Blitter, luma: u8| -> [u8; 4] {
             let surface = Surface::planar(W, H, PlanarFormat::BiPlanar420).expect("a surface");
@@ -974,6 +988,9 @@ mod tests {
         near(convert(&mut blitter, 235), [255, 255, 255, 255], "the white anchor");
         // Mid grey. 130, not 128 -- which is what tells limited range from full.
         near(convert(&mut blitter, 128), [130, 130, 130, 255], "the mid-grey anchor");
+
+        // Opening the blitter left ctx0 with a sync over it, and a `Fence` aborts on drop.
+        current.spend_all(&gl);
     }
 
     #[test]

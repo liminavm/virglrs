@@ -709,6 +709,16 @@ impl Winsys {
     }
 
     /// Make `ctx` current on this thread, with no surface.
+    ///
+    /// **On the renderer's thread the only caller is `Current::switch_to`**, and nothing but this
+    /// note enforces that. A bare bind elsewhere breaks two things at once: the context it leaves
+    /// gets no sync over the work it had queued, and `Current` goes on naming a context that is no
+    /// longer bound -- so the *next* departure passes [`Winsys::still_bound`], takes its sync on
+    /// whatever this bound instead, and files it under the wrong name. A fence then collects a sync
+    /// that covers none of the renders it answers for. The audited exceptions are `Vrend::new`,
+    /// which binds ctx0 before a `Current` exists and agrees with the `Current::ctx0` that follows,
+    /// and [`ThreadDisplay::make_current`] on the fence waiter's thread, which is a different
+    /// thread's currency and deliberately does not touch the stash.
     pub fn make_current(&self, ctx: &Context) -> Result<(), EglError> {
         assert!(Arc::ptr_eq(&ctx.shared, &self.shared), "a context from another display");
         self.shared.make_current(ctx.ctx)?;
