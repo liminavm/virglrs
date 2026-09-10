@@ -200,8 +200,7 @@ impl Context {
             }
         }
         let blitter = host.blitter.as_mut().expect("just built");
-        winsys.make_current(blitter.context()).expect("the blitter's context can be made current");
-        host.current.switched_to(GlContext::Blitter);
+        host.current.switch_to(winsys, gl, GlContext::Blitter, blitter.context());
         let outcome = run(blitter, gl, features, host.current.program());
         self.make_current(host);
         Some(outcome)

@@ -15,7 +15,7 @@
 
 use super::blitter;
 use super::caps;
-use super::context::{Context, Current, Fault, GlContext, Guest, Host, Todo};
+use super::context::{Context, Current, Fault, GlContext, Guest, Host, Pending, Todo};
 use super::egl::{self, EglError, Flavour, GlContexts, Version, Winsys};
 use super::features::{Feature, Features};
 use super::formats::Table;
@@ -346,8 +346,31 @@ impl Vrend {
 
     /// Make ctx0 current.
     fn switch_ctx0(&mut self) {
-        self.winsys.make_current(&self.ctx0).expect("ctx0 was current once and still exists");
-        self.current.switched_to(GlContext::Ctx0);
+        self.current.switch_to(&self.winsys, &self.gl, GlContext::Ctx0, &self.ctx0);
+    }
+
+    /// Bind the GL context `which` names.
+    ///
+    /// `false` when it names something this renderer no longer has: a sub-context of a context that
+    /// has been destroyed, which only an embedder-backed winsys can leave a [`Pending`] entry for
+    /// (it cannot verify what is current, so it never takes the sync that would have retired the
+    /// entry at the departure). Its work went with its GL context and there is nothing to fence.
+    fn bind(&mut self, which: GlContext) -> bool {
+        let Vrend { winsys, gl, current, ctx0, blitter, contexts, .. } = self;
+        let gl_ctx = match which {
+            GlContext::Ctx0 => Some(&*ctx0),
+            GlContext::Blitter => blitter.as_ref().map(|b| b.context()),
+            GlContext::Sub(id, sub) => contexts
+                .get(&id)
+                .and_then(|c| c.gl_contexts().find(|(s, _)| *s == sub).map(|(_, g)| g)),
+        };
+        match gl_ctx {
+            Some(g) => {
+                current.switch_to(winsys, gl, which, g);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The host a context's commands run against, and the contexts beside it: two disjoint
@@ -903,53 +926,60 @@ impl Vrend {
         // still queued, and ctx0's uploads with them. This is exactly the set `finish_contexts`
         // finishes, which is the set it has to be: the fence path exists to replace that finish,
         // and a replacement that covers less is not one.
+        //
+        // **Almost none of those syncs are taken here.** One is taken when the thread *leaves* a
+        // context, where the departure's release flush drains it anyway, and kept until a fence
+        // comes for it (`Current::switch_to`). So this collects what is already waiting and binds
+        // only what is not -- in the common case the one context the thread is still on, which
+        // costs no switch at all because binding what is bound is a thread-local read. What this
+        // replaced walked all five contexts, and the first departure from the loaded one cost a
+        // median 589 microseconds of the worker, up to 12 milliseconds.
         let mut syncs = Vec::new();
         let mut refused = false;
-        // `hop` is the position in the walk, ctx0 included at the end, because what the walk costs
-        // per position is the question the hop line exists to answer.
-        let mut hop = 0usize;
-        if let Some(ctx) = self.contexts.get(&id) {
-            for (sub, gl_ctx) in ctx.gl_contexts() {
-                let began = self.tally.mark();
-                self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
-                self.current.switched_to(GlContext::Sub(id, sub));
-                let switched = self.tally.mark();
-                let taken = self.gl.fence();
-                let marks = began.zip(switched).zip(self.tally.mark()).map(|((b, s), t)| (b, s, t));
-                self.tally.fence_hop(hop, marks);
-                hop += 1;
-                match taken {
-                    Some(f) => syncs.push(f),
-                    None => {
-                        refused = true;
-                        break;
-                    }
-                }
+        let loaded = self.current.on();
+        // Pass one: every sync already taken. No bind, no flush, no walk.
+        let mut to_bind: Vec<GlContext> = Vec::new();
+        let subs: Vec<GlContext> = match self.contexts.get(&id) {
+            Some(ctx) => ctx.gl_contexts().map(|(sub, _)| GlContext::Sub(id, sub)).collect(),
+            None => Vec::new(),
+        };
+        // ctx0, where this renderer's own blits and transfers run -- and the blitter's own context,
+        // whose work neither `finish_contexts` nor `finish_all` has ever waited for. That gap is
+        // closed here for nothing: the blitter is left at the end of every blit, so a sync over it
+        // is already in hand. It is covered for every context rather than only the one the blit was
+        // for, because a blit's destination is a resource and a resource is not a context's.
+        for which in subs.into_iter().chain([GlContext::Ctx0, GlContext::Blitter]) {
+            match self.current.take(which) {
+                Some(Pending::Synced(f)) => syncs.push(f),
+                // Left without a verifiable context, so nothing names its work: bind and sync it
+                // the expensive way. Only an embedder-backed winsys gets here.
+                Some(Pending::NeedsSync) => to_bind.push(which),
+                // Not left since its last sync, so it has queued nothing since -- unless it is what
+                // the thread is still on, which has queued everything and been left by nothing.
+                None if which == loaded => to_bind.push(which),
+                None => {}
             }
         }
-        // ctx0 last, which also leaves it current -- where `finish_contexts` leaves it.
-        //
-        // **This sync is free, measured, and the measurement is worth keeping** because it looks
-        // expensive and is not. It costs ctx0 an `eglMakeCurrent` the embedder backing does not
-        // dedup, a flush that is synchronous on this share group, and a reset of `Current`'s single
-        // `BoundProgram` slot -- so the next batch's first draw pays a `glUseProgram` it would have
-        // skipped. All three together are bounded under ~2%: A/B'd 2026-09-10 on limina's vkmark
-        // vehicle (four boots, legs alternated so a host drift is absorbed, guest-CPU and llvmpipe
-        // controls held), skipping it measured +0.7% and +1.7% against its neighbouring leg, both
-        // inside that vehicle's noise. So it is not the ~5% this was suspected of, and a 1-2% cost
-        // is not excluded. Do not re-derive the hypothesis from the shape of the code -- and note
-        // that `us/cmd` cannot price this, because the tally's submit window does not contain
-        // `take_fence` (see [`tally`]); the fence line's own timer is what to read.
-        if !refused {
+        // Pass two, and the loaded context last: binding anything else leaves it, and a departure
+        // takes its sync, so visiting it last is the difference between one bind and two.
+        to_bind.sort_by_key(|which| *which == loaded);
+        let mut hop = 0usize;
+        for which in to_bind {
             let began = self.tally.mark();
-            self.switch_ctx0();
+            if !self.bind(which) {
+                continue;
+            }
             let switched = self.tally.mark();
             let taken = self.gl.fence();
             let marks = began.zip(switched).zip(self.tally.mark()).map(|((b, s), t)| (b, s, t));
             self.tally.fence_hop(hop, marks);
+            hop += 1;
             match taken {
                 Some(f) => syncs.push(f),
-                None => refused = true,
+                None => {
+                    refused = true;
+                    break;
+                }
             }
         }
         if refused {
@@ -967,7 +997,13 @@ impl Vrend {
             self.finish_contexts(&[id]);
             return Answer::Ordered;
         }
-        assert!(!syncs.is_empty(), "a fence answered by no sync at all would retire early");
+        if syncs.is_empty() {
+            // None of these contexts has been left since its last sync and the thread is on none of
+            // them, so there is no work of ours here to wait for at all -- the context was named by
+            // a fence over something that never reached GL. The queue's order is the answer, which
+            // is what it is for a fence that names no context either.
+            return Answer::Ordered;
+        }
         Answer::Syncs(syncs)
     }
 
@@ -1031,8 +1067,7 @@ impl Vrend {
         for id in which {
             let Some(ctx) = self.contexts.get(id) else { continue };
             for (sub, gl_ctx) in ctx.gl_contexts() {
-                self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
-                self.current.switched_to(GlContext::Sub(*id, sub));
+                self.current.switch_to(&self.winsys, &self.gl, GlContext::Sub(*id, sub), gl_ctx);
                 self.gl.finish();
             }
         }
@@ -1052,13 +1087,14 @@ impl Vrend {
     ///
     /// "Every context" means every *guest* context and ctx0. The blitter holds a GL context of its
     /// own ([`blitter::Blitter`]) and is in neither this nor [`Vrend::finish_contexts`], so a blit
-    /// into a surface-backed destination is waited for by neither -- which predates the bounding
-    /// and is not fixed by it.
+    /// into a surface-backed destination is waited for by neither. A *fence* does cover it -- the
+    /// blitter is left at the end of every blit and a departure is where a sync is taken, so one is
+    /// already in hand (see [`Current::switch_to`]) -- but these two finishes still do not, and
+    /// nothing here closes that.
     pub fn finish_all(&mut self) {
         for (id, ctx) in &self.contexts {
             for (sub, gl_ctx) in ctx.gl_contexts() {
-                self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
-                self.current.switched_to(GlContext::Sub(*id, sub));
+                self.current.switch_to(&self.winsys, &self.gl, GlContext::Sub(*id, sub), gl_ctx);
                 self.gl.finish();
             }
         }
@@ -1183,6 +1219,20 @@ impl Vrend {
     }
 }
 
+impl Drop for Vrend {
+    /// Spend the syncs still held for contexts the thread has left.
+    ///
+    /// A `Fence` aborts on drop rather than leak a driver allocation, so a renderer going away
+    /// holding one would take the process down on its way out. ctx0 is bound first because deleting
+    /// a sync needs *some* context of its share group current, and ctx0 is the one still standing:
+    /// it is a field of this struct, so it is dropped after this runs.
+    fn drop(&mut self) {
+        self.switch_ctx0();
+        let Vrend { gl, current, .. } = self;
+        current.spend_all(gl);
+    }
+}
+
 /// A guest that answers nothing: for a switch of GL context, which asks nothing of the guest.
 struct NoGuest;
 
@@ -1244,6 +1294,160 @@ mod tests {
             gl::FenceFlush::Submits,
             "and a host that has claimed it does not, or the drain just moves to the flush"
         );
+    }
+
+    /// The fence path's cost is a context switch, and what removes it is that a context is synced
+    /// when it is *left* rather than when a fence comes looking for it. Two things have to hold for
+    /// that, and neither is visible from a score: the sync has to actually be taken at the
+    /// departure, and it has to be taken only while this renderer can *prove* its own context is
+    /// current. The proof is `Winsys::still_bound`, and on a host where it answered `false` the
+    /// whole mechanism would degrade silently to the walk it replaced -- correct, and slow, with
+    /// nothing to say so. So it is asserted here against the live driver.
+    #[test]
+    fn leaving_a_context_is_what_fences_it() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+        )
+        .expect("vrend comes up");
+
+        let id = ContextId::new(1).expect("a context id is non-zero");
+        v.context_create(id, &NoGuest).expect("a classic context comes up");
+        let sub = GlContext::Sub(id, crate::vrend::proto::SubContextId(0));
+
+        // Nothing has been left yet, so nothing is held: an entry exists for exactly those contexts
+        // the thread has departed from since their last sync.
+        assert!(v.current.take(sub).is_none(), "a context never left holds no sync");
+
+        // Leaving ctx0 takes one over ctx0's queue -- which is the assertion that matters, because
+        // `NeedsSync` here would mean `still_bound` could not vouch for what was current and every
+        // fence pays a switch again.
+        assert!(v.bind(sub), "the context's sub-context binds");
+        match v.current.take(GlContext::Ctx0) {
+            Some(Pending::Synced(f)) => v.gl.fence_delete(f),
+            other => panic!("leaving ctx0 takes a sync over it; got {other:?}"),
+        }
+
+        // Going back retires what was held for the context arrived at, because work is about to be
+        // queued on it that a sync taken before that work does not cover.
+        assert!(v.bind(sub), "binding what is bound is not a departure");
+        assert!(v.bind(GlContext::Ctx0), "ctx0 binds");
+        assert!(
+            v.current.take(GlContext::Ctx0).is_none(),
+            "arriving at a context retires the sync taken when it was last left"
+        );
+        match v.current.take(sub) {
+            Some(Pending::Synced(f)) => v.gl.fence_delete(f),
+            other => panic!("leaving the sub-context takes a sync over it; got {other:?}"),
+        }
+    }
+
+    /// A sync is a driver allocation, and what it describes is a sub-context's command queue. When
+    /// that queue goes away nothing will ever come back for the sync -- a fence collects only
+    /// sub-contexts that still exist -- so the destroy path has to spend it. The guest drives that
+    /// path as often as it likes, which is what makes an entry left behind a leak it can mint
+    /// without bound rather than a tidiness problem.
+    #[test]
+    fn destroying_a_context_spends_what_was_held_for_its_sub_contexts() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+        )
+        .expect("vrend comes up");
+
+        let id = ContextId::new(1).expect("a context id is non-zero");
+        v.context_create(id, &NoGuest).expect("a classic context comes up");
+        let sub = GlContext::Sub(id, crate::vrend::proto::SubContextId(0));
+
+        // Leave the sub-context, so a sync over it is held, then destroy the context under it.
+        assert!(v.bind(sub), "the sub-context binds");
+        assert!(v.bind(GlContext::Ctx0), "and is left, which takes a sync over it");
+        v.context_destroy(id, &NoGuest);
+
+        assert!(
+            v.current.take(sub).is_none(),
+            "a destroyed context leaves no sync behind: nothing would ever collect it"
+        );
+    }
+
+    /// A fence still covers every queue the work could be on, which is the whole reason the walk
+    /// existed. Collecting syncs taken at departures instead of taking them here changes where they
+    /// come from and must not change the set: a sub-context left earlier is covered by the sync it
+    /// was left with, and the context the thread is still on by one taken in place.
+    #[test]
+    fn a_fence_covers_the_context_left_and_the_one_still_loaded() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+        )
+        .expect("vrend comes up");
+
+        let id = ContextId::new(1).expect("a context id is non-zero");
+        v.context_create(id, &NoGuest).expect("a classic context comes up");
+        let sub = GlContext::Sub(id, crate::vrend::proto::SubContextId(0));
+
+        // Work on the sub-context, then leave it for ctx0: the sub-context is now covered by a sync
+        // in hand, and ctx0 is what the thread is on.
+        assert!(v.bind(sub), "the sub-context binds");
+        assert!(v.bind(GlContext::Ctx0), "and the thread goes back to ctx0");
+
+        match v.decide_fence(Some(id)) {
+            Answer::Syncs(syncs) => {
+                assert_eq!(
+                    syncs.len(),
+                    2,
+                    "the sub-context left and ctx0 still loaded -- one sync each, neither dropped"
+                );
+                for f in syncs {
+                    v.gl.fence_delete(f);
+                }
+            }
+            Answer::Ordered => {
+                panic!("work was queued on two contexts; ordering does not cover it")
+            }
+        }
+
+        // And a second fence with nothing done in between covers nothing of its own: no context has
+        // been left since, and the one the thread is on was just synced. The queue's order is the
+        // answer, which is what it is for a fence that names no context at all.
+        //
+        // ctx0 is the exception -- it is what the thread is on, so it is always synced in place.
+        match v.decide_fence(Some(id)) {
+            Answer::Syncs(syncs) => {
+                assert_eq!(syncs.len(), 1, "only the loaded context, fenced where it stands");
+                for f in syncs {
+                    v.gl.fence_delete(f);
+                }
+            }
+            Answer::Ordered => {}
+        }
     }
 
     #[test]

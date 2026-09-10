@@ -16,6 +16,7 @@
 //! that cannot outlive it, and a [`Gles`] table loaded once a context is current. Nothing else
 //! sees an `EGLDisplay` or an `EGLContext`.
 
+use core::cell::Cell;
 use core::ffi::CStr;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -230,6 +231,17 @@ pub struct Winsys {
     flavour: Flavour,
     version: Version,
     extensions: BTreeSet<String>,
+    /// The context token this renderer last bound on this thread, as an address.
+    ///
+    /// Never dereferenced -- only compared, which is the one question it answers:
+    /// [`Winsys::still_bound`]. An integer rather than an `EGLContext` so the winsys stays
+    /// `Send`: the value is an identity this crate may compare, not a pointer it may follow.
+    ///
+    /// Written by [`Winsys::make_current`] and [`Winsys::release_current`] only, which is why it
+    /// is not in [`Shared`]: [`ThreadDisplay`] binds through `Shared` from the fence waiter's
+    /// thread, and currency is per thread -- a stash shared with it would answer for the wrong
+    /// one.
+    bound: Cell<usize>,
 }
 
 /// An EGL context on the winsys's display. Destroyed with it; cannot outlive the display.
@@ -522,6 +534,7 @@ impl Winsys {
             flavour,
             version: Version { major: major as u32, minor: minor as u32 },
             extensions,
+            bound: Cell::new(0),
         })
     }
 
@@ -585,7 +598,11 @@ impl Winsys {
         };
         let shared = Arc::new(Shared { egl, display, backing: Backing::Embedder(contexts) });
         let ctx0 = Context { shared: Arc::clone(&shared), ctx };
-        Ok((Winsys { shared, flavour, version, extensions }, ctx0, version_made))
+        Ok((
+            Winsys { shared, flavour, version, extensions, bound: Cell::new(0) },
+            ctx0,
+            version_made,
+        ))
     }
 
     pub fn flavour(&self) -> Flavour {
@@ -694,7 +711,36 @@ impl Winsys {
     /// Make `ctx` current on this thread, with no surface.
     pub fn make_current(&self, ctx: &Context) -> Result<(), EglError> {
         assert!(Arc::ptr_eq(&ctx.shared, &self.shared), "a context from another display");
-        self.shared.make_current(ctx.ctx)
+        self.shared.make_current(ctx.ctx)?;
+        self.bound.set(ctx.ctx as usize);
+        Ok(())
+    }
+
+    /// Whether the context this renderer last bound is still the one current on this thread.
+    ///
+    /// The question exists because one operation cannot be done blind: taking a GL sync over the
+    /// work queued on a context *without first binding it*, which is what lets the fence path
+    /// avoid a switch it would otherwise pay (see [`Current::switch_to`](super::context::Current)).
+    /// A sync taken while a foreign context is current belongs to the foreign share group, and
+    /// nothing in ours can ever wait on it -- so the shadow of what we last bound is not enough,
+    /// and this asks the only authority.
+    ///
+    /// `eglGetCurrentContext` *is* that authority and is a thread-local read, which is why the
+    /// truth is affordable here. It costs far less than the `eglMakeCurrent` a `false` answer
+    /// forces, and a `true` answer is not a belief.
+    pub fn still_bound(&self) -> bool {
+        match &self.shared.backing {
+            Backing::Own { .. } => {
+                let bound = self.bound.get();
+                // SAFETY: `eglGetCurrentContext` takes nothing and is defined on any thread.
+                bound != 0 && unsafe { self.shared.egl.eglGetCurrentContext()() } as usize == bound
+            }
+            // An embedder's tokens are its own -- under GTK a `GdkGLContext *`, which is not an
+            // `EGLContext` and must never be passed to EGL -- so there is nothing to ask EGL to
+            // compare against. Unknowable answers `false`: that costs a switch and never a sync
+            // taken in the wrong share group.
+            Backing::Embedder(_) => false,
+        }
     }
 
     /// A handle to this display for another thread, which can bind a context it owns and nothing
@@ -721,7 +767,9 @@ impl Winsys {
             "an embedder's contexts are released by the embedder, not through a null token"
         );
         // `EGL_NO_CONTEXT` with no surfaces is the documented way to release.
-        self.shared.make_current(proc::EGL_NO_CONTEXT)
+        self.shared.make_current(proc::EGL_NO_CONTEXT)?;
+        self.bound.set(0);
+        Ok(())
     }
 
     /// Export a texture this renderer made as a dma-buf, so it can be presented without a copy.

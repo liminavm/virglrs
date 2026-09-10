@@ -24,8 +24,8 @@ use super::features::{Feature, Features};
 use super::formats::{Description, Table};
 use super::gl::gles::*;
 use super::gl::{
-    BindingPoint, BoundProgram, BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei,
-    GLuint, Gl, ImageUnit, ProgramName, QueryName, SamplerName, ShaderName, TextureName,
+    BindingPoint, BoundProgram, BufferName, Fence, FramebufferName, GLbitfield, GLenum, GLint,
+    GLsizei, GLuint, Gl, ImageUnit, ProgramName, QueryName, SamplerName, ShaderName, TextureName,
     TextureUnit, TransformFeedbackName, UniformLocation, VertexArrayName,
 };
 use super::journal::{self, Census, Entry, Retained, Seq, StateKey, Step, order, state_key};
@@ -89,7 +89,7 @@ fn bindable(attached: bool, slot: Option<&resource::Slot>) -> Option<&Resource> 
 }
 
 /// Which GL context a shadow of GL state belongs to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum GlContext {
     Ctx0,
     Sub(ContextId, SubContextId),
@@ -99,8 +99,34 @@ pub enum GlContext {
     Blitter,
 }
 
-/// What this renderer shadows of the current GL context's state rather than ask GL for it, and
-/// the name of the context that shadow describes.
+/// What is known about a GL context's queued work, recorded when the thread left it.
+///
+/// An entry exists for exactly those contexts that have been left since they were last current,
+/// and it describes *all* of that context's work: nothing can have been queued on a context the
+/// thread is not on. Arriving at one therefore retires its entry, because the work about to be
+/// queued would not be covered by a sync taken before it -- and the sync taken at the next leave
+/// covers the old work and the new together, so nothing is lost.
+pub enum Pending {
+    /// A sync over everything that was queued on it, taken while it was verifiably current.
+    Synced(Fence),
+    /// It was left with no sync, because what was current could not be verified -- so its work is
+    /// still out there and nothing names it. Whoever needs it covered must bind it and sync it the
+    /// expensive way. Only an embedder-backed winsys produces this; see [`Winsys::still_bound`].
+    NeedsSync,
+}
+
+impl core::fmt::Debug for Pending {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Pending::Synced(_) => f.write_str("Synced"),
+            Pending::NeedsSync => f.write_str("NeedsSync"),
+        }
+    }
+}
+
+/// What this renderer shadows of the current GL context's state rather than ask GL for it, the
+/// name of the context that shadow describes, and a sync over the work every context it has left
+/// still had queued.
 ///
 /// The name is the shadow's key and never a reason to skip work. Which context the thread has
 /// current is EGL's to answer and a belief about it is falsifiable: the VMM makes its own
@@ -112,23 +138,124 @@ pub enum GlContext {
 /// its shadow with the switch away from it, and a program deleted in one context cannot leave a
 /// sibling in the share group believing it bound. The price is one redundant bind after each
 /// switch, which no draw pays.
+///
+/// **Leaving a context is where its fence is cheapest, which is why the switch is this type's and
+/// not its callers'.** EGL requires `eglMakeCurrent` to flush the context it releases, and on this
+/// share group that flush is synchronous (`_mesa_make_current` -> `st_glFlush(curCtx, 0)`) -- so
+/// the departure drains the context whether or not anyone wanted it drained. A sync taken in the
+/// instant before the switch rides that drain for nothing, and spares the fence path the switch it
+/// would otherwise make to go back and take one. Measured before this existed: a fence walked five
+/// contexts and the *first departure from the loaded one* cost 589 microseconds of the worker,
+/// median, up to 12 milliseconds. No walk order avoids it -- covering the others means leaving the
+/// loaded one -- so the fence path stopped walking instead.
+///
+/// That is only sound if the context being left is really current, which is the belief above. So
+/// it is verified rather than assumed, against the one authority ([`Winsys::still_bound`]): a sync
+/// taken while a foreign context is current belongs to the foreign share group and nothing of ours
+/// could ever wait on it. Unverifiable means [`Pending::NeedsSync`] and a switch later, never a
+/// sync in the wrong group.
 #[derive(Debug)]
 pub struct Current {
     on: GlContext,
     program: BoundProgram,
+    pending: crate::Map<GlContext, Pending>,
 }
 
 impl Current {
     /// Ctx0 with nothing bound, as [`Vrend::new`](super::vrend::Vrend) leaves the thread.
     pub fn ctx0() -> Current {
-        Current { on: GlContext::Ctx0, program: BoundProgram::default() }
+        Current {
+            on: GlContext::Ctx0,
+            program: BoundProgram::default(),
+            pending: crate::Map::default(),
+        }
     }
 
-    /// Record that `on`'s GL context is the one the thread now has current.
-    pub fn switched_to(&mut self, on: GlContext) {
-        if self.on != on {
-            self.on = on;
+    /// Bind `to`'s GL context, taking a sync over what the context being left still has queued.
+    ///
+    /// The only way to change what is current: the sync must be taken *before* the bind and while
+    /// the old context is still on, so a caller that could do the two halves separately is a
+    /// caller that can do them in the wrong order. What makes the sync reachable is the release
+    /// flush of the very `eglMakeCurrent` below -- or `glFenceSync` itself, on a host that
+    /// [`FenceFlush::Submits`](super::gl::FenceFlush) -- so neither half works alone.
+    pub fn switch_to(&mut self, winsys: &Winsys, gl: &Gl, to: GlContext, gl_ctx: &egl::Context) {
+        if self.on != to {
+            // A sync here is worth one avoided switch in the fence path, and is only valid if what
+            // we last bound is what is still bound. Unverified is recorded as such, not guessed.
+            let left = if winsys.still_bound() {
+                gl.fence().map_or(Pending::NeedsSync, Pending::Synced)
+            } else {
+                Pending::NeedsSync
+            };
+            self.retire(gl, self.on);
+            self.pending.insert(self.on, left);
+        }
+        winsys
+            .make_current(gl_ctx)
+            .expect("a GL context this renderer owns can be made current on its own thread");
+        self.shadow(to);
+        // Arriving retires whatever was held for it: work is about to be queued that a sync taken
+        // before it does not cover, and the sync at the next departure covers both.
+        self.retire(gl, to);
+    }
+
+    /// Record that `to` is the context current, dropping a shadow that described another.
+    ///
+    /// Private, and half of [`Current::switch_to`]: on its own it is a claim about GL state that
+    /// nothing made true. It is a method rather than inline so the shadow rule can be tested for
+    /// what it is, without a winsys to bind through.
+    fn shadow(&mut self, to: GlContext) {
+        if self.on != to {
+            self.on = to;
             self.program = BoundProgram::default();
+        }
+    }
+
+    /// Which context the thread has current, for the one caller that has to fence it in place.
+    pub fn on(&self) -> GlContext {
+        self.on
+    }
+
+    /// Take what is held for `of`, leaving nothing behind. `None` when it has queued no work since
+    /// its last sync -- the thread has not been on it.
+    pub fn take(&mut self, of: GlContext) -> Option<Pending> {
+        self.pending.remove(&of)
+    }
+
+    /// Spend and forget whatever is held for `of`, because it is about to stop being true.
+    ///
+    /// A destroy path must do this *after* the thread has left the context being destroyed, never
+    /// before: leaving is what records an entry, so a purge ahead of the departure is undone by it.
+    pub fn retire(&mut self, gl: &Gl, of: GlContext) {
+        if let Some(Pending::Synced(f)) = self.pending.remove(&of) {
+            gl.fence_delete(f);
+        }
+    }
+
+    /// Spend and forget everything held for `id`'s sub-contexts, whose GL contexts are going away.
+    ///
+    /// A stale entry would not be *unsafe* -- a sync outlives the context that took it, being a
+    /// share-group object -- but nothing would ever come back for it, because a fence collects only
+    /// sub-contexts that still exist. One per destroyed sub-context, for as long as the process
+    /// runs, on a path a guest drives: that is a leak with a guest's hand on the tap.
+    pub fn retire_context(&mut self, gl: &Gl, id: ContextId) {
+        let doomed: Vec<GlContext> = self
+            .pending
+            .keys()
+            .copied()
+            .filter(|c| matches!(c, GlContext::Sub(c, _) if *c == id))
+            .collect();
+        for c in doomed {
+            self.retire(gl, c);
+        }
+    }
+
+    /// Spend everything held, for a renderer being torn down. A `Fence` aborts on drop.
+    pub fn spend_all(&mut self, gl: &Gl) {
+        for (_, p) in self.pending.drain() {
+            if let Pending::Synced(f) = p {
+                gl.fence_delete(f);
+            }
         }
     }
 
@@ -196,8 +323,8 @@ pub struct Host<'a> {
 
 impl Host<'_> {
     fn make_current(&mut self, sub: SubContextId, gl_ctx: &egl::Context) {
-        self.winsys.make_current(gl_ctx).expect("a sub-context's GL context can be made current");
-        self.current.switched_to(GlContext::Sub(self.ctx, sub));
+        let to = GlContext::Sub(self.ctx, sub);
+        self.current.switch_to(self.winsys, self.gl, to, gl_ctx);
     }
 
     /// A resource the context may reach, with vrend's side of it.
@@ -1367,7 +1494,17 @@ impl Context {
             let gl_ctx = sub.destroy(host.gl, host.current.program());
             drop(gl_ctx);
         }
-        host.current.switched_to(GlContext::Ctx0);
+        // A real switch, not a note that one happened: every sub-context's GL context has just
+        // been destroyed, so what the thread has current must be something that still exists --
+        // and `Current` is about to be asked to fence whatever it is left on.
+        //
+        // The loop above leaves each sub-context as it moves to the next, and this switch leaves
+        // the last one, so every departure that could record a sync has happened by here. That is
+        // why the purge is after the switch and not inside `Sub::destroy`, where it would be undone
+        // by the very next iteration. The syncs themselves are over queues being torn down and are
+        // worth nothing; taking them anyway is what keeps `switch_to` the only way to switch.
+        host.current.switch_to(host.winsys, host.gl, GlContext::Ctx0, host.share);
+        host.current.retire_context(host.gl, host.ctx);
     }
 
     fn create_sub(&mut self, host: &mut Host<'_>, id: SubContextId) -> Result<(), EglError> {
@@ -1991,6 +2128,10 @@ impl Context {
         host.make_current(id, &sub.gl_ctx);
         drop(sub.destroy(host.gl, host.current.program()));
         self.make_current(host);
+        // After the switch back, which is the departure that records a sync over the queue of the
+        // sub-context just destroyed. A guest may destroy sub-contexts for as long as it likes, so
+        // an entry left here is a driver allocation it can mint without bound.
+        host.current.retire(host.gl, GlContext::Sub(host.ctx, id));
     }
 }
 
@@ -4526,21 +4667,21 @@ mod tests {
         let a = GlContext::Sub(ctx, SubContextId(0));
         let b = GlContext::Sub(ctx, SubContextId(1));
         let mut current = Current::ctx0();
-        current.switched_to(a);
+        current.shadow(a);
         let bound = *current.program();
 
         // Being told about the context already current changes nothing: a `make_current` that did
         // not switch must not throw away a shadow that is still true, or every one of them would.
-        current.switched_to(a);
+        current.shadow(a);
         assert_eq!(*current.program(), bound);
 
         // A real switch does. GL's current program is per-context, so what was bound on `a` says
         // nothing about `b` -- and `b` may be a context this thread has never had current, or a
         // brand new one that happens to reuse a name.
-        current.switched_to(b);
+        current.shadow(b);
         assert_eq!(*current.program(), BoundProgram::default());
 
-        current.switched_to(GlContext::Blitter);
+        current.shadow(GlContext::Blitter);
         assert_eq!(*current.program(), BoundProgram::default());
     }
 

@@ -31,13 +31,17 @@ pub struct Config {
     /// synchronously. Measured on this host: the worker spends a median 9% and up to 38% of its
     /// wall clock inside the fence path.
     ///
-    /// **Measured, and it buys less than it looks like it should.** With the host patched, the
-    /// sync's own cost falls from 107 to 5 microseconds a hop -- and `eglMakeCurrent`'s rises from
-    /// 1.2 to 92, because EGL requires a switch to flush the context it releases and the work the
-    /// sync no longer submitted is still queued when the walk moves on. The drain relocates one hop
-    /// rather than leaving. What is left is about a fifth off a fence, and nothing a score could
-    /// resolve. The fence path stops paying it only when the walk no longer *leaves* the loaded
-    /// context, which is [`crate::vrend::vrend::Vrend`]'s walk order and not this flag.
+    /// **On its own it buys almost nothing, and it is the other half of the fix that does.** With
+    /// the host patched, the sync's own cost falls from 107 to 5 microseconds a hop -- and
+    /// `eglMakeCurrent`'s rises from 1.2 to 92, because EGL requires a switch to flush the context
+    /// it releases and the work the sync no longer submitted is still queued when the thread moves
+    /// on. Measured alone, the drain relocates rather than leaves, and no score could resolve what
+    /// was left. What collects it is that the fence path no longer *leaves* the loaded context at
+    /// all: a context is synced when the thread departs it, where the release flush was going to
+    /// drain it anyway, and a fence collects those syncs instead of walking for them (see
+    /// [`Current::switch_to`](crate::vrend::context::Current::switch_to)). That walk is what this
+    /// flag's 92 microseconds were being paid for, so the two are worth measuring together and
+    /// neither is worth much apart.
     ///
     /// Claiming it of a host that does not have it is not a small mistake, which is why the
     /// default is the safe answer and the VMM has to say otherwise: the flush this drops is what

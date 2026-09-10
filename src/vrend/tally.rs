@@ -79,7 +79,13 @@ struct Armed {
     /// number covering both cannot choose.
     current_busy: Duration,
     sync_busy: Duration,
-    /// Hops taken, and what each cost by its position in the walk. A walk whose per-hop cost is
+    /// Binds a fence had to make, and what each cost by its position. This is the line the fence
+    /// path is tuned against: a fence that binds nothing but the context already loaded reads ~1
+    /// hop with a near-zero `current` half, and anything more means syncs are being taken here
+    /// rather than collected from the departures that were paying for them anyway.
+    ///
+    /// Kept in the older shape -- cost by index -- because that is what told us where the money
+    /// was. A walk whose per-hop cost is
     /// flat in the index is paying for the *visiting*; one where the first hop holds nearly all of
     /// it is paying for work that was queued, and visiting the others is free. That distinction is
     /// the whole question, and no aggregate answers it.
@@ -168,9 +174,9 @@ impl Tally {
         self.on.as_ref().map(|_| Instant::now())
     }
 
-    /// One hop of a fence's walk: the context switch, then the sync taken on it.
+    /// One bind a fence had to make: the context switch, then the sync taken on it.
     ///
-    /// `index` is the hop's position in the walk, with ctx0 last. Takes the three marks rather
+    /// `index` is the bind's position, with the already-loaded context last. Takes the three marks rather
     /// than two durations so the split cannot be computed one way here and another way at the next
     /// call site.
     pub fn fence_hop(&mut self, index: usize, marks: Option<(Instant, Instant, Instant)>) {

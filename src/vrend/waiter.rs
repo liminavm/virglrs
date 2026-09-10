@@ -68,8 +68,14 @@ pub enum Answer {
     /// one `Vrend::finish_contexts` finishes, and the two have to cover the same queues: the whole
     /// point of the fence path is that it replaces that finish without changing what a fence means.
     ///
+    /// Most of these were taken long before the fence asked for them, when the thread left the
+    /// context (`Current::switch_to`), which is why covering every queue no longer costs a walk of
+    /// them. It also means the blitter's queue is covered, which no finish here has ever managed.
+    ///
     /// Never empty. A fence answered by no sync at all would retire as soon as the waiter reached
-    /// it, which is early, so `Vrend::decide_fence` asserts rather than building one.
+    /// it, which is early, so `Vrend::decide_fence` answers [`Answer::Ordered`] instead -- which is
+    /// not a fallback but the right answer: no sync to collect and none to take in place means no
+    /// context has run since the last fence, and the queue's order already covers what came before.
     Syncs(Vec<Fence>),
     /// Nothing of its own to wait for, so it retires behind whatever is already queued.
     ///
