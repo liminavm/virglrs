@@ -225,6 +225,12 @@ impl Surface {
         self.id
     }
 
+    /// Never this host: `dmabuf.rs` has no constructor that makes storage, so every surface
+    /// here is one the guest's driver laid out. See [`crate::surface::Layouter`].
+    pub fn layouter(&self) -> crate::surface::Layouter {
+        crate::surface::Layouter::TheExportingDriver
+    }
+
     pub fn bytes_per_row(&self) -> u32 {
         self.layout.bytes_per_row()
     }
