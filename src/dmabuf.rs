@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::ids::SurfaceId;
 use crate::surface::PlaneShape;
 pub use crate::surface::{
-    DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, Layout, MAX_PLANES, PlaneLayout,
+    BadLayout, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, Layout, MAX_PLANES, PlaneLayout,
 };
 
 /// A DRM `fourcc`, as the kernel and every importer spell a pixel format.
@@ -517,6 +517,179 @@ impl std::fmt::Debug for Surface {
     }
 }
 
+/// How many memory planes a FourCC's pixels occupy, for a layout that has to be checked against
+/// a buffer. `None` is a FourCC this renderer will not interpret, which is not the same as one
+/// the kernel has no name for.
+fn planes_of(fourcc: u32) -> Option<u32> {
+    match fourcc {
+        DRM_FORMAT_ARGB8888 | DRM_FORMAT_ABGR8888 => Some(1),
+        DRM_FORMAT_NV12 => Some(2),
+        _ => None,
+    }
+}
+
+/// Storage the driver owns, named by a descriptor and nothing else.
+///
+/// A [`Surface`] is a descriptor *plus* the layout needed to read it. Some storage never gets the
+/// second half. Mesa's Wayland WSI shares a compositor a linear buffer it blits its rendered
+/// image into, and dedicates that allocation to a `VkBuffer` -- which has no format, no tiling
+/// and no `vkGetImageSubresourceLayout`, so there is no question to ask the driver. Measured on
+/// this host: `vkcube`'s swapchain is three 2048000-byte allocations, each dedicated to a buffer
+/// and declared for export as DMA_BUF, beside an OPTIMAL image that is never exported. What the
+/// buffer holds is decided by whoever blits into it, and the only party that knows is the guest.
+///
+/// So this is the descriptor on its own, and it stays one for its whole life. An importer that
+/// learns a layout does not fill it in: [`Descriptor::describe`] mints a separate [`Surface`]
+/// over a second reference to the same buffer. Two importers may read one descriptor under
+/// different layouts and neither can see the other's, which is what stops a guest that sends two
+/// disagreeing descriptions of one resource from making either of them read the other's numbers.
+pub struct Descriptor {
+    fd: OwnedFd,
+    id: SurfaceId,
+    /// The kernel's own figure for the buffer, and what every bound below is measured against.
+    /// `dma_buf_llseek` exists to answer exactly this. Deliberately not the allocation size the
+    /// guest asked for: that is a number the guest chooses, and this is the one it cannot.
+    size: u64,
+    /// Whether it has already been said that this storage has no layout of its own. Latched, for
+    /// the same reason [`Surface`]'s own refusal is: a compositor asks every frame.
+    said: AtomicBool,
+}
+
+impl Descriptor {
+    /// Take ownership of a descriptor the driver just exported, and ask the kernel how big it is.
+    ///
+    /// `None` for a buffer of no size, which is a descriptor nothing can be read through and
+    /// which would make every bound below vacuous.
+    pub fn exported(fd: OwnedFd) -> Option<Descriptor> {
+        // SAFETY: a descriptor this call owns; `lseek` on a dma-buf reads its size and moves a
+        // file offset nothing here uses.
+        let end = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) };
+        let size = u64::try_from(end).ok().filter(|n| *n != 0)?;
+        Some(Descriptor { fd, id: next_id(), size, said: AtomicBool::new(false) })
+    }
+
+    /// Whether this is the first time the descriptor has been asked for a layout it does not
+    /// have. `true` once, so a caller says why exactly once rather than per frame.
+    pub fn first_refusal(&self) -> bool {
+        !self.said.swap(true, Ordering::Relaxed)
+    }
+
+    /// The kernel's size for the buffer.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn id(&self) -> SurfaceId {
+        self.id
+    }
+
+    /// The descriptor, borrowed. An importer dups it; nothing takes it.
+    pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.fd.as_fd()
+    }
+
+    /// A second reference to the same buffer, for a caller that publishes descriptors.
+    pub fn export(&self) -> Option<OwnedFd> {
+        self.fd.try_clone().ok()
+    }
+
+    /// Read this buffer under a layout someone else chose.
+    ///
+    /// The layout does not come from the driver here -- there is no driver answer to be had -- so
+    /// it comes from the guest, and this is the trust boundary it crosses. Every field is checked
+    /// against the kernel's size for the buffer, in checked arithmetic, before a [`Surface`]
+    /// exists to be mapped or imaged: a plane that reaches past the end would otherwise be an
+    /// `mmap` the host reads out of, or a GPU fetch outside the BO, on the guest's say-so.
+    ///
+    /// The modifier is an allowlist rather than a range check because a modifier is not a number
+    /// to bound: a compressed one carries an auxiliary plane whose size follows a rule of its own,
+    /// and "the planes the guest declared fit" is not the same claim for it. `LINEAR` and
+    /// `INVALID` are what a guest compositing over virgl can actually produce -- virgl advertises
+    /// no modifiers -- so anything else is refused by name until one is measured.
+    ///
+    /// `alloc_size` is taken from the kernel and never from the caller's `layout`: the buffer's
+    /// extent is one fact, and the descriptor is the only party that holds it.
+    pub fn describe(&self, layout: Layout) -> Result<Surface, BadLayout> {
+        if layout.width == 0 || layout.height == 0 {
+            return Err(BadLayout::Extent { width: layout.width, height: layout.height });
+        }
+        if layout.modifier != DRM_FORMAT_MOD_LINEAR && layout.modifier != DRM_FORMAT_MOD_INVALID {
+            return Err(BadLayout::Modifier(layout.modifier));
+        }
+        let wants = planes_of(layout.fourcc).ok_or(BadLayout::Fourcc(layout.fourcc))?;
+        if layout.plane_count != wants {
+            return Err(BadLayout::PlaneCount { said: layout.plane_count, wants });
+        }
+        for at in 0..wants {
+            let p = layout.planes[at as usize];
+            // A subsampled plane rounds *up*: an odd-sized NV12 image still has a chroma row for
+            // its last luma row, and rounding down would bound the buffer one row short.
+            let sub = u32::from(at > 0);
+            let (w, h) = (layout.width.div_ceil(1 << sub), layout.height.div_ceil(1 << sub));
+            let bpe = match (layout.fourcc, at) {
+                (DRM_FORMAT_NV12, 0) => 1,
+                (DRM_FORMAT_NV12, _) => 2,
+                _ => 4,
+            };
+            let tight = w
+                .checked_mul(bpe)
+                .ok_or(BadLayout::Extent { width: layout.width, height: layout.height })?;
+            if p.pitch < tight {
+                return Err(BadLayout::Pitch { plane: at, pitch: p.pitch, tight });
+            }
+            let end = u64::from(p.pitch)
+                .checked_mul(u64::from(h))
+                .and_then(|rows| rows.checked_add(p.offset))
+                .ok_or(BadLayout::Overrun { plane: at, end: u64::MAX, size: self.size })?;
+            if end > self.size {
+                return Err(BadLayout::Overrun { plane: at, end, size: self.size });
+            }
+        }
+        let fd = self.fd.try_clone().map_err(|_| BadLayout::NoDescriptor)?;
+        Ok(Surface::exported(fd, Layout { alloc_size: self.size, ..layout }))
+    }
+}
+
+impl std::fmt::Debug for Descriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Descriptor")
+            .field("id", &self.id.0)
+            .field("fd", &self.fd.as_raw_fd())
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+/// One importer's reading of a [`Descriptor`], as the thing that keeps it alive.
+///
+/// The [`crate::surface::Held`] share that travels for storage whose layout was never the
+/// driver's to give. It holds two things that must not come apart: a share of the descriptor its
+/// owner exported -- which carries the memory charge, so releasing it is what credits the budget
+/// -- and this importer's own [`Surface`] over a second reference to the same buffer.
+///
+/// The reading is per-importer by construction. Nothing here is written into the shared
+/// descriptor, so a second importer describing the same buffer differently gets its own `Surface`
+/// and cannot disturb this one.
+pub struct Described {
+    /// Held, never read: what it carries is the right to keep the buffer and its charge alive for
+    /// as long as this reading of them exists.
+    _share: std::sync::Arc<dyn Send + Sync>,
+    surface: Surface,
+}
+
+impl Described {
+    pub fn new(share: std::sync::Arc<dyn Send + Sync>, surface: Surface) -> Described {
+        Described { _share: share, surface }
+    }
+}
+
+impl crate::surface::Held for Described {
+    fn surface(&self) -> &Surface {
+        &self.surface
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +909,147 @@ mod tests {
         assert_eq!(linear.write_from(&[0x5a; 64]), 64);
         assert_eq!(linear.read_into(&mut dst), 64);
         assert_eq!(dst, [0x5a; 64]);
+    }
+
+    fn bgra(width: u32, height: u32, pitch: u32) -> Layout {
+        Layout {
+            width,
+            height,
+            fourcc: PixelFormat::Bgra.fourcc(),
+            modifier: DRM_FORMAT_MOD_LINEAR,
+            planes: [PlaneLayout { offset: 0, pitch }; MAX_PLANES],
+            plane_count: 1,
+            alloc_size: 0,
+        }
+    }
+
+    /// The buffer's extent is the kernel's, and a description of it can only ever be a reading.
+    ///
+    /// A guest that sends a layout claiming a bigger allocation than the buffer has would, if the
+    /// claim were taken, get an `mmap` of that length and a GPU fetch bounded by it. The size a
+    /// `Surface` ends up with comes from `lseek` on the descriptor, so the claim cannot travel.
+    #[test]
+    fn a_description_takes_its_extent_from_the_buffer_not_from_the_caller() {
+        let d = Descriptor::exported(memfd(4096)).expect("a sized buffer");
+        assert_eq!(d.size(), 4096);
+        let lying = Layout { alloc_size: 1 << 30, ..bgra(16, 16, 64) };
+        let s = d.describe(lying).expect("a layout that fits");
+        assert_eq!(s.alloc_size(), 4096, "the kernel's figure, not the caller's");
+    }
+
+    /// A buffer with no size is a descriptor nothing can be read through, and every bound over it
+    /// would be vacuous -- so there is no `Descriptor` for one to be checked against.
+    #[test]
+    fn an_empty_buffer_is_not_a_descriptor() {
+        assert!(Descriptor::exported(memfd(0)).is_none());
+    }
+
+    /// The checks a guest-supplied layout has to pass, one refusal each.
+    ///
+    /// These are the trust boundary: past `describe` the layout is used to `mmap` and to build an
+    /// EGL image, so a plane reaching past the buffer is a host read outside the allocation on the
+    /// guest's say-so. Each case is the smallest change to a layout that does fit.
+    #[test]
+    fn a_layout_that_does_not_fit_the_buffer_is_refused() {
+        let d = Descriptor::exported(memfd(4096)).expect("a sized buffer");
+        d.describe(bgra(16, 16, 64)).expect("16 rows of 64 bytes is exactly 1024");
+
+        assert_eq!(
+            d.describe(bgra(0, 16, 64)).err(),
+            Some(BadLayout::Extent { width: 0, height: 16 })
+        );
+        assert_eq!(
+            d.describe(bgra(16, 16, 63)).err(),
+            Some(BadLayout::Pitch { plane: 0, pitch: 63, tight: 64 }),
+            "a row narrower than its own pixels"
+        );
+        assert_eq!(
+            d.describe(bgra(16, 65, 64)).err(),
+            Some(BadLayout::Overrun { plane: 0, end: 4160, size: 4096 }),
+            "one row more than the buffer holds"
+        );
+        // The same overrun reached by the offset rather than by the height.
+        let mut shifted = bgra(16, 16, 64);
+        shifted.planes[0].offset = 3200;
+        assert_eq!(
+            d.describe(shifted).err(),
+            Some(BadLayout::Overrun { plane: 0, end: 4224, size: 4096 })
+        );
+        // Arithmetic that would wrap is an overrun, not a pass.
+        let mut huge = bgra(16, u32::MAX, 64);
+        huge.planes[0].offset = u64::MAX - 16;
+        assert!(matches!(d.describe(huge), Err(BadLayout::Overrun { .. })));
+
+        assert_eq!(
+            d.describe(Layout { plane_count: 2, ..bgra(16, 16, 64) }).err(),
+            Some(BadLayout::PlaneCount { said: 2, wants: 1 }),
+            "a plane count the fourcc does not have"
+        );
+        assert_eq!(
+            d.describe(Layout { fourcc: 0xdead_beef, ..bgra(16, 16, 64) }).err(),
+            Some(BadLayout::Fourcc(0xdead_beef))
+        );
+    }
+
+    /// Only a layout this side can bound is accepted.
+    ///
+    /// A compressed modifier carries an auxiliary plane whose size follows a rule of its own, so
+    /// "the planes the guest declared fit" is not the same claim for it -- and a guest naming one
+    /// would have the buffer read as something it is not. Refused by name until one is measured.
+    #[test]
+    fn a_modifier_this_side_cannot_bound_is_refused_by_name() {
+        const Y_TILED_CCS: u64 = 0x0100_0000_0000_0004;
+        let d = Descriptor::exported(memfd(4096)).expect("a sized buffer");
+        assert_eq!(
+            d.describe(Layout { modifier: Y_TILED_CCS, ..bgra(16, 16, 64) }).err(),
+            Some(BadLayout::Modifier(Y_TILED_CCS))
+        );
+        d.describe(Layout { modifier: DRM_FORMAT_MOD_INVALID, ..bgra(16, 16, 64) })
+            .expect("no claim about the layout is a claim this side can carry");
+    }
+
+    /// An NV12 chroma plane is bounded at its own rounded-up extent.
+    ///
+    /// Rounding the half-resolution plane *down* would bound an odd-sized image one row short and
+    /// let a layout through that reaches past the buffer by that row.
+    #[test]
+    fn a_subsampled_plane_is_bounded_at_its_rounded_up_extent() {
+        let planar = |height: u32, offset: u64, size: usize| {
+            let d = Descriptor::exported(memfd(size)).expect("a sized buffer");
+            let mut l = bgra(16, height, 16);
+            l.fourcc = PlanarFormat::BiPlanar420.fourcc();
+            l.plane_count = 2;
+            l.planes[1] = PlaneLayout { offset, pitch: 16 };
+            d.describe(l).map(|_| ())
+        };
+        // 5 luma rows of 16, then 3 chroma rows of 16 at offset 80: 128 bytes in all.
+        assert!(planar(5, 80, 128).is_ok(), "ceil(5/2) is 3 chroma rows");
+        assert!(
+            matches!(planar(5, 80, 127), Err(BadLayout::Overrun { plane: 1, .. })),
+            "and the third chroma row has to be there"
+        );
+    }
+
+    /// Two importers read one descriptor independently.
+    ///
+    /// The layout is the importer's, not the buffer's, and a guest may describe one resource
+    /// differently in two contexts. Nothing is written back into the descriptor, so the second
+    /// description cannot make the first read the second's numbers.
+    #[test]
+    fn two_descriptions_of_one_buffer_do_not_disturb_each_other() {
+        let d = Descriptor::exported(memfd(4096)).expect("a sized buffer");
+        let a = d.describe(bgra(16, 16, 64)).expect("a");
+        let b = d.describe(bgra(8, 8, 128)).expect("b");
+        assert_eq!((a.layout().width, a.bytes_per_row()), (16, 64));
+        assert_eq!((b.layout().width, b.bytes_per_row()), (8, 128));
+        assert_ne!(a.id(), b.id(), "each reading is its own surface");
+
+        // And each holds its own reference to the one buffer: writing through one is visible
+        // through the other, which is what makes them readings rather than copies.
+        assert_eq!(a.write_from(&[0x5a; 64]), 64);
+        let mut seen = [0u8; 64];
+        assert_eq!(b.read_into(&mut seen), 64);
+        assert_eq!(seen, [0x5a; 64]);
     }
 
     /// Every id is its own, and none is reused. A recycled id would name a live surface with a

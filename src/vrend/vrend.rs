@@ -625,11 +625,11 @@ impl Vrend {
     pub fn resource_attach_blob(
         &mut self,
         handle: ResourceHandle,
-        surface: Option<Arc<dyn surface::Held>>,
+        storage: Option<surface::Adoptable>,
     ) {
         self.resources
             .entry(handle)
-            .or_insert_with(|| resource::Slot::Untyped(resource::Untyped::new(surface)));
+            .or_insert_with(|| resource::Slot::Untyped(resource::Untyped::new(storage)));
     }
 
     /// The IOSurface a resource is presented from, if its storage is one. Asked of the resource

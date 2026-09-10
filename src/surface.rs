@@ -101,6 +101,52 @@ pub struct PlaneShape {
     pub offset: u32,
 }
 
+/// Why a layout does not describe a buffer.
+///
+/// Every variant is the guest's error, not the host's: these are the checks a layout that arrived
+/// over the wire has to pass before anything maps or images the descriptor under it. So they are
+/// reported and refused, never asserted -- see CLAUDE.md on the trust boundary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BadLayout {
+    /// An empty image. Nothing downstream has a meaning for a zero extent.
+    Extent { width: u32, height: u32 },
+    /// A FourCC this renderer has no plane rule for, so it cannot check the rest.
+    Fourcc(u32),
+    /// A layout claim this side cannot check. See [`Describable::describe`].
+    Modifier(u64),
+    /// The plane count disagrees with what the FourCC has.
+    PlaneCount { said: u32, wants: u32 },
+    /// A row narrower than the pixels it must hold.
+    Pitch { plane: u32, pitch: u32, tight: u32 },
+    /// A plane that reaches past the end of the buffer.
+    Overrun { plane: u32, end: u64, size: u64 },
+    /// The descriptor could not be duplicated -- out of file descriptors, and the host's fault
+    /// rather than the guest's.
+    NoDescriptor,
+}
+
+impl core::fmt::Display for BadLayout {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BadLayout::Extent { width, height } => write!(f, "an empty {width}x{height} image"),
+            BadLayout::Fourcc(c) => write!(f, "fourcc {c:#010x} has no plane rule here"),
+            BadLayout::Modifier(m) => {
+                write!(f, "modifier {m:#018x} is not one this side can bound")
+            }
+            BadLayout::PlaneCount { said, wants } => {
+                write!(f, "{said} planes for a format that has {wants}")
+            }
+            BadLayout::Pitch { plane, pitch, tight } => {
+                write!(f, "plane {plane}'s pitch {pitch} is narrower than its {tight}-byte row")
+            }
+            BadLayout::Overrun { plane, end, size } => {
+                write!(f, "plane {plane} ends at {end} of a {size}-byte buffer")
+            }
+            BadLayout::NoDescriptor => f.write_str("the descriptor could not be duplicated"),
+        }
+    }
+}
+
 /// Whatever keeps a [`Surface`] alive, seen as the surface.
 ///
 /// A surface is adopted as GL storage by whoever renders through it, and that is not always
@@ -114,4 +160,44 @@ pub struct PlaneShape {
 /// owner decides what holding means.
 pub trait Held: Send + Sync {
     fn surface(&self) -> &Surface;
+}
+
+/// Storage that has no layout of its own, and can only be read under one someone else supplies.
+///
+/// The exporting host's other shape. Most storage arrives with the layout the driver laid it out
+/// in, and is a [`Surface`] from the moment it exists. Some never can be: a `VkBuffer` a guest
+/// blits its frame into has no format, no tiling and no layout query, so the driver has no answer
+/// to give and the only description that will ever exist is the guest's own, which arrives later
+/// with the command that says what the resource is.
+///
+/// Reading is not filling in. Each call mints a *separate* [`Held`] over its own reference to the
+/// same storage, so two importers may read one buffer under different layouts without either
+/// being able to disturb the other -- and a guest that describes one resource two different ways
+/// cannot make either description read the other's numbers.
+///
+/// Host-neutral because the question is: "can this be adopted as a texture's storage" is asked by
+/// vrend on both hosts. A host whose storage always carries its own layout implements this
+/// nowhere, and [`Adoptable`] then only ever holds its other arm.
+pub trait Describable: Send + Sync {
+    /// Taken by `Arc<Self>` rather than by reference: what comes back has to hold a share of the
+    /// storage it reads, and a share cannot be recovered from a borrow of one. Passing the share
+    /// in is what makes "the reading outlives nothing it depends on" a property of the signature.
+    fn describe(
+        self: std::sync::Arc<Self>,
+        layout: Layout,
+    ) -> Result<std::sync::Arc<dyn Held>, BadLayout>;
+}
+
+/// Storage a blob resource offers a context that is about to say what it is.
+///
+/// The two shapes above, as one value, because the choice between them is the storage's and not
+/// the importer's -- a caller that had to test which it held would be re-deciding something
+/// already settled at the export.
+pub enum Adoptable {
+    /// Storage that knows its own layout: the driver laid it out and said so, or this host minted
+    /// it. Adopted exactly as it stands.
+    Ready(std::sync::Arc<dyn Held>),
+    /// Storage with no layout of its own. The description the guest sends is the only one there
+    /// will ever be, and it is checked against the storage before anything reads through it.
+    Unread(std::sync::Arc<dyn Describable>),
 }
