@@ -390,6 +390,13 @@ pub enum Backing {
 
 pub struct Resource {
     pub handle: ResourceHandle,
+    /// The claim on vrend's half of this resource, when this build has a vrend to hold one.
+    ///
+    /// It carries no data and is never read: dropping it is its whole purpose. Vrend keeps the
+    /// host storage under this handle, and this is what says that storage lives exactly as long as
+    /// the entry holding it -- so an id is free again the moment this table lets go of it, by
+    /// whatever route. See [`crate::vrend::resource::Claim`].
+    pub host: Option<crate::vrend::resource::Claim>,
     pub backing: Backing,
     /// The guest pages behind the resource, when it has any. Owned by the VMM, valid until it
     /// detaches them; we keep the description, never a copy.
@@ -612,6 +619,9 @@ pub struct Renderer {
     /// that is the actual access pattern: many readers looking up a handle, one writer when the
     /// VMM creates or unrefs. See the lock order in `venus::vkr`.
     resources: Arc<RwLock<crate::Map<ResourceHandle, Resource>>>,
+    /// Where a dropped [`Resource`]'s claim on vrend's half goes. Vrend drains it; see
+    /// [`crate::vrend::resource::Slots`].
+    condemned: crate::vrend::resource::Condemned,
     contexts: crate::Map<ContextId, Context>,
     /// The host memory both arms are answerable for, and the cap on it -- see [`crate::budget`].
     /// It is the renderer's because the cap is on the process total: venus charges its
@@ -645,6 +655,7 @@ impl Renderer {
         // thread needs the table long after the call that created its ring returned, and it must
         // not need the renderer to get it.
         let resources: Arc<RwLock<crate::Map<ResourceHandle, Resource>>> = Arc::default();
+        let condemned = vrend::resource::Condemned::default();
         // Before either arm, and once: a build serving only classic has a cap too, and two
         // ledgers would be two answers to the one question the cap is asked.
         let budget = crate::budget::Budget::from_env();
@@ -657,13 +668,20 @@ impl Renderer {
         }
         let fences = Retirement::start(fences);
         let vrend = if config.vrend {
-            Some(vrend::vrend::Vrend::new(config, &budget, fences.handle(), contexts)?)
+            Some(vrend::vrend::Vrend::new(
+                config,
+                &budget,
+                fences.handle(),
+                contexts,
+                condemned.clone(),
+            )?)
         } else {
             None
         };
         Ok(Renderer {
             config,
             resources: Arc::clone(&resources),
+            condemned,
             contexts: crate::Map::default(),
             venus: config.venus.then(|| venus::vkr::Vkr::new(config, resources.clone(), &budget)),
             budget,
@@ -859,9 +877,22 @@ impl Renderer {
         Ok(())
     }
 
+    /// The claim a new resource carries: `Some` exactly when there is a vrend holding a half to
+    /// claim. One place decides it, so a resource cannot come into the table without one.
+    fn claim(&self, handle: ResourceHandle) -> Option<crate::vrend::resource::Claim> {
+        self.vrend.as_ref().map(|_| crate::vrend::resource::Claim::new(handle, &self.condemned))
+    }
+
     /// File a resource under a handle `free_handle` has already cleared.
     fn insert(&mut self, handle: ResourceHandle, backing: Backing, iov: Vec<GuestIov>) {
-        let r = Resource { handle, backing, iov, priv_: VmmPtr::NULL, attached: Vec::new() };
+        let r = Resource {
+            handle,
+            backing,
+            iov,
+            priv_: VmmPtr::NULL,
+            attached: Vec::new(),
+            host: self.claim(handle),
+        };
         self.resources.write().expect("the resource lock is never poisoned").insert(handle, r);
     }
 
@@ -903,9 +934,9 @@ impl Renderer {
     }
 
     pub fn resource_unref(&mut self, handle: ResourceHandle) {
-        if let Some(v) = self.vrend.as_mut() {
-            v.resource_destroy(handle);
-        }
+        // Vrend's half is not told: dropping the entry below is what condemns it, the same as
+        // every other way an entry leaves this table. Telling it here as well would make two
+        // writers of one fact, and the day they disagree is a handle naming storage that is gone.
         // Detach from every context first. A context holding a dangling handle is how the C's
         // use-after-free reached the command stream.
         let mut resources = self.resources.write().expect("the resource lock is never poisoned");
@@ -1072,7 +1103,10 @@ impl Renderer {
     ///
     /// What is left is a renderer that has been initialized and nothing more -- the config, the
     /// retirement thread and the venus renderer stay, and an id used before this call is free
-    /// again.
+    /// again. Free on *both* halves: dropping an entry condemns the host storage vrend holds under
+    /// its handle, so clearing the table is the whole of it and there is no vrend-specific step to
+    /// remember here. A guest reboot is what reaches this, and a device that came back to a
+    /// half-empty table aborted the process on the first handle the guest reused.
     pub fn reset(&mut self) {
         for id in self.contexts.keys().copied().collect::<Vec<_>>() {
             self.context_destroy(id);
@@ -1256,8 +1290,8 @@ impl Renderer {
     }
 
     /// One classic context's journal, for the VMM to store beside its own.
-    pub fn vrend_journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
-        self.vrend.as_ref()?.journal_export(id)
+    pub fn vrend_journal_export(&mut self, id: ContextId) -> Option<Vec<u8>> {
+        self.vrend.as_mut()?.journal_export(id)
     }
 
     /// One classic context's resource contents, for the VMM to store beside its journal.
@@ -1319,8 +1353,8 @@ impl Renderer {
 
     /// Which levels of a resource a capture reads, and how many bytes each needs. `None` for a
     /// resource deliberately left out.
-    fn content_plan(&self, handle: ResourceHandle) -> Option<Vec<(u32, Box3, usize)>> {
-        let res = self.vrend.as_ref()?.resource(handle)?;
+    fn content_plan(&mut self, handle: ResourceHandle) -> Option<Vec<(u32, Box3, usize)>> {
+        let res = self.vrend.as_mut()?.resource(handle)?;
         // A multisample surface cannot be read back at all, and is a render target the compositor
         // draws again anyway. A resource whose only storage is the guest's pages holds nothing
         // this renderer could restore -- the VMM's RAM dump carries those bytes.
@@ -1477,13 +1511,13 @@ impl Renderer {
     }
 
     /// Each classic context's journal size and entry count, round-tripped.
-    pub fn vrend_journal_report(&self) -> Vec<(ContextId, usize, Result<usize, &'static str>)> {
-        self.vrend.as_ref().map(|v| v.journal_report()).unwrap_or_default()
+    pub fn vrend_journal_report(&mut self) -> Vec<(ContextId, usize, Result<usize, &'static str>)> {
+        self.vrend.as_mut().map(|v| v.journal_report()).unwrap_or_default()
     }
 
     /// What the classic renderer has retained for a rebuild.
-    pub fn journal_census(&self) -> crate::vrend::journal::Census {
-        self.vrend.as_ref().map(|v| v.journal_census()).unwrap_or_default()
+    pub fn journal_census(&mut self) -> crate::vrend::journal::Census {
+        self.vrend.as_mut().map(|v| v.journal_census()).unwrap_or_default()
     }
 
     pub fn counts(&self) -> (usize, usize) {
@@ -1563,7 +1597,7 @@ impl Renderer {
     /// A share of pages has no surface, and a compositor presenting from one gets a black
     /// window with nothing to say why. The pages know why -- which question the image failed
     /// at allocate -- and say it here, once, the first time they are asked.
-    pub fn resource_surface_id(&self, handle: ResourceHandle) -> Option<SurfaceId> {
+    pub fn resource_surface_id(&mut self, handle: ResourceHandle) -> Option<SurfaceId> {
         if let Some(surface) = self.classic_surface(handle) {
             return Some(surface.id());
         }
@@ -1593,7 +1627,7 @@ impl Renderer {
     /// resolves and the caller does not hold: returning a reference into it would mean handing
     /// back a borrow of something already dropped. The closure is where the share is still alive.
     fn with_surface<T>(
-        &self,
+        &mut self,
         handle: ResourceHandle,
         f: impl FnOnce(&crate::surface::Surface) -> T,
     ) -> Option<T> {
@@ -1618,7 +1652,7 @@ impl Renderer {
     /// caller asked how this could be exported and was told it could not, which is what it has
     /// to handle anyway.
     pub fn resource_export(
-        &self,
+        &mut self,
         handle: ResourceHandle,
     ) -> Result<(std::os::fd::OwnedFd, FdType, crate::surface::Layout), Error> {
         self.with_surface(handle, |surface| {
@@ -1632,13 +1666,16 @@ impl Renderer {
     /// The surface a classic resource is presented from, when vrend gave it one. Asked of vrend,
     /// which owns the resource's host side, rather than mirrored in the table: the surface lives
     /// and dies with the texture whose storage it is.
-    fn classic_surface(&self, handle: ResourceHandle) -> Option<&crate::surface::Surface> {
-        self.vrend.as_ref()?.resource_surface(handle)
+    fn classic_surface(&mut self, handle: ResourceHandle) -> Option<&crate::surface::Surface> {
+        self.vrend.as_mut()?.resource_surface(handle)
     }
 
     /// The GL texture a classic resource's storage is. Asked of vrend, which owns it.
-    pub fn classic_texture(&self, handle: ResourceHandle) -> Option<crate::vrend::gl::TextureName> {
-        self.vrend.as_ref()?.resource_texture(handle)
+    pub fn classic_texture(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> Option<crate::vrend::gl::TextureName> {
+        self.vrend.as_mut()?.resource_texture(handle)
     }
 
     /// The pixels behind a classic cursor resource, for a VMM that draws the pointer itself.
@@ -1765,13 +1802,13 @@ impl Renderer {
     /// on differently: the resource has no surface, nothing has it attached, or more than one
     /// context has -- a single fence names one context, and picking one of several would answer for
     /// work the other still has outstanding.
-    pub fn resource_present_waits_on(&self, handle: ResourceHandle) -> Option<ContextId> {
+    pub fn resource_present_waits_on(&mut self, handle: ResourceHandle) -> Option<ContextId> {
         // Who the guest kernel attached it to is who is allowed to have rendered into it, which is
         // the same set `resource_sync_surface` finishes. One place decides it.
         let attached = self.with_resource(handle, |r| r.attached.clone())?;
         let [only] = attached[..] else { return None };
         // A resource with no surface is the readback case, and has no fence to offer either.
-        self.vrend.as_ref()?.resource_surface(handle).map(|_| only)
+        self.vrend.as_mut()?.resource_surface(handle).map(|_| only)
     }
 
     /// Where a blob resource lives in this process, for a VMM about to publish it to the guest.
@@ -1786,7 +1823,11 @@ impl Renderer {
     /// allocation it was published from. There is no longer a case that has to be re-checked
     /// against the exporting context, because there is no longer an address this renderer
     /// hands out without owning.
-    pub fn resource_host_mapping(&self, handle: ResourceHandle) -> Result<HostMapping, Error> {
+    pub fn resource_host_mapping(&mut self, handle: ResourceHandle) -> Result<HostMapping, Error> {
+        // Asked of vrend before the table is borrowed, because the answer for a classic resource
+        // is vrend's and the closure below holds the table while it runs. A handle vrend has no
+        // buffer for answers `None`, which is every backing the arms below serve themselves.
+        let classic = self.vrend.as_mut().and_then(|v| v.resource_mapping(handle));
         self.with_resource(handle, |r| match &r.backing {
             Backing::Blob { desc, storage } => match storage {
                 // The mapping answers for its own extent: `desc.size` is what was asked for,
@@ -1812,12 +1853,11 @@ impl Renderer {
             // the blob claim does. Asked of vrend rather than kept here: vrend owns the buffer,
             // so it owns the address into it, and a copy on this side would outlive the
             // buffer by exactly as long as it took someone to forget to clear it.
-            Backing::Classic { .. } => self.vrend.as_ref().and_then(|v| {
-                let (addr, size) = v.resource_mapping(handle)?;
+            Backing::Classic { .. } => classic.map(|(addr, size)| {
                 // Write-back: these are ordinary driver pages the host reaches through a
                 // coherent mapping, which is the C's `inferred_gl_caching_type` for a buffer
                 // it did not get from gbm.
-                Some(HostMapping { addr, size, caching: Caching::Cached })
+                HostMapping { addr, size, caching: Caching::Cached }
             }),
             Backing::Imported { .. } => None,
         })
@@ -1980,6 +2020,51 @@ mod tests {
         Renderer::new(Box::new(NoSink), config, None).expect("no vrend is asked for")
     }
 
+    /// A reset frees every handle, vrend's half of them included.
+    ///
+    /// `Renderer::reset` says an id used before it is free again, and that is a claim about both
+    /// halves of a resource: the table's entry and the GL storage vrend holds under the same
+    /// handle. Nothing else in the tree reaches a device reset -- a replay never resets, so no
+    /// corpus can score this -- and the failure it guards is not a wrong pixel but an abort: the
+    /// next create of a reused handle finds vrend's half still there and trips the assert that
+    /// trusts this call. A guest reboot is what does it on a VMM, which makes it a guest taking
+    /// the host down.
+    #[test]
+    fn a_reset_frees_the_handles_vrend_held() {
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut r =
+            Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
+                .expect("vrend comes up");
+
+        let ctx = ContextId::new(1).expect("a context id");
+        let handle = ResourceHandle::new(1).expect("a handle");
+        let args = || ClassicArgs {
+            target: crate::vrend::pipe::TextureTarget::Texture2d,
+            format: crate::vrend::proto::Format::from_wire(1).expect("a format"),
+            bind: crate::vrend::resource::Bind::SAMPLER_VIEW,
+            width: 64,
+            height: 64,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: crate::vrend::resource::ResourceFlags::default(),
+        };
+
+        r.context_create(ctx, CapsetId::Virgl, "drawing".into()).expect("a context");
+        r.resource_create(handle, args(), Vec::new()).expect("a classic resource");
+        r.ctx_attach_resource(ctx, handle);
+
+        r.reset();
+
+        // The table's half is free -- this much was always true.
+        assert!(r.with_resource(handle, |_| ()).is_none(), "the reset emptied the table");
+        // And vrend's half with it, which is what the create proves: it asserts on a handle it
+        // still holds, so a reset that freed only the table aborts here rather than failing.
+        r.resource_create(handle, args(), Vec::new())
+            .expect("the handle is free again, on both halves");
+    }
+
     /// A present is only handed to the caller to fence when exactly one context could have
     /// rendered into the surface.
     ///
@@ -2133,6 +2218,7 @@ mod tests {
         let pages = Storage::pages_for_test(4096, &Account::for_test(None));
         let exported = |attached: Vec<ContextId>| Resource {
             handle: blob,
+            host: None,
             backing: Backing::Blob {
                 desc: BlobDesc {
                     blob_mem: crate::abi::BLOB_MEM_HOST3D,
@@ -2184,6 +2270,7 @@ mod tests {
             shm,
             Resource {
                 handle: shm,
+                host: None,
                 backing: Backing::Imported {
                     desc: ImportDesc {
                         blob_mem: BlobMem::Host3d,
@@ -2216,6 +2303,7 @@ mod tests {
             minted,
             Resource {
                 handle: minted,
+                host: None,
                 backing: Backing::Blob {
                     desc: BlobDesc {
                         blob_mem: crate::abi::BLOB_MEM_HOST3D,
@@ -2276,6 +2364,7 @@ mod tests {
         };
         let classic = |handle, surface, attached| Resource {
             handle,
+            host: None,
             backing: Backing::Classic { args, surface },
             iov: Vec::new(),
             priv_: VmmPtr(core::ptr::null_mut()),
@@ -2336,6 +2425,7 @@ mod tests {
             blob,
             Resource {
                 handle: blob,
+                host: None,
                 backing: Backing::Blob {
                     desc: BlobDesc {
                         blob_mem: crate::abi::BLOB_MEM_HOST3D,
@@ -2383,6 +2473,7 @@ mod tests {
             linear,
             Resource {
                 handle: linear,
+                host: None,
                 backing: Backing::Blob {
                     desc: BlobDesc {
                         blob_mem: crate::abi::BLOB_MEM_HOST3D,

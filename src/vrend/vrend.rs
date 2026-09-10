@@ -86,7 +86,10 @@ pub struct Vrend {
     /// The version guest contexts are made with: the newest the driver gave ctx0.
     version: Version,
     current: Current,
-    resources: crate::Map<ResourceHandle, resource::Slot>,
+    /// Vrend's half of the resource table. Its owner is the renderer's table: an entry here
+    /// lives exactly as long as the [`resource::Claim`] the renderer holds under the same
+    /// handle, and [`resource::Slots`] is what makes that true rather than a rule to follow.
+    resources: resource::Slots,
     contexts: crate::Map<ContextId, Context>,
     pub todo: Todo,
     /// What the command path costs per guest command. Inert unless armed -- see
@@ -195,6 +198,7 @@ impl Vrend {
         budget: &Arc<crate::budget::Budget>,
         fences: crate::fence::Handle,
         contexts: Option<Box<dyn GlContexts>>,
+        condemned: resource::Condemned,
     ) -> Result<Vrend, InitError> {
         let fences_for_inline = fences.clone();
         // An embedder's winsys arrives with ctx0 already made and current, because its display is
@@ -303,7 +307,7 @@ impl Vrend {
             ctx0,
             version,
             current: Current::ctx0(),
-            resources: crate::Map::default(),
+            resources: resource::Slots::new(condemned),
             contexts: crate::Map::default(),
             todo: Todo::default(),
             tally: tally::Tally::from_env(),
@@ -347,6 +351,10 @@ impl Vrend {
         ctx: ContextId,
         guest: &'a dyn Guest,
     ) -> (Host<'a>, &'a mut crate::Map<ContextId, Context>) {
+        // A batch is the other place with a context to spare, and the only one a workload that
+        // frees resources without creating any ever reaches. Before the batch, never inside it: a
+        // switch under a running command would leave a context the command still expects.
+        self.sweep_condemned();
         let Vrend {
             winsys,
             gl,
@@ -385,7 +393,7 @@ impl Vrend {
             formats,
             limits,
             shader_cfg,
-            resources,
+            resources: resources.sync(),
             pixels,
             guest,
             ctx,
@@ -402,12 +410,12 @@ impl Vrend {
     ///
     /// The resources are counted here and not in `Context` because that is where they live -- one
     /// table shared by every context, so no single context can answer for it.
-    pub fn journal_census(&self) -> Census {
+    pub fn journal_census(&mut self) -> Census {
         let mut c = Census::default();
         for ctx in self.contexts.values() {
             c += ctx.journal_census();
         }
-        for wire in self.resource_preamble() {
+        for wire in self.resources.preamble() {
             c.add_wire(wire.len(), true);
         }
         c
@@ -418,24 +426,12 @@ impl Vrend {
     /// `None` for a context that is not here. An empty journal still serializes: a context that
     /// built nothing is a fact worth restoring accurately, and the alternative -- answering
     /// "no journal" -- is what the VMM reads as "this context is not mine to rebuild".
-    pub fn journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
-        let ctx = self.contexts.get(&id)?;
-        Some(crate::vrend::journal::serialize(&ctx.journal(self.resource_preamble())))
-    }
-
-    /// The commands a rebuild must send before anything else: what described each claimed blob,
-    /// and what typed each attached one.
-    ///
-    /// They live on the resource table rather than on a context because one table serves every
-    /// context, so no single context can walk it. Describe before type, per resource: a resource
-    /// has at most one of the two -- a described one arrives with its shape, an attached one is
-    /// told its shape later -- so the order between them never actually arises, and stating it is
-    /// cheaper than relying on that staying true.
-    fn resource_preamble(&self) -> impl Iterator<Item = &Vec<u32>> {
-        self.resources
-            .values()
-            .filter_map(|s| s.resource())
-            .flat_map(|r| r.described_by.as_ref().into_iter().chain(r.typed_by.as_ref()))
+    pub fn journal_export(&mut self, id: ContextId) -> Option<Vec<u8>> {
+        // Named separately, because one is read while the other is reconciled: a `&mut self`
+        // method could not hold both.
+        let Vrend { contexts, resources, .. } = self;
+        let ctx = contexts.get(&id)?;
+        Some(crate::vrend::journal::serialize(&ctx.journal(resources.preamble())))
     }
 
     /// Each live context's journal: how many bytes it exports, and how many entries those bytes
@@ -444,13 +440,15 @@ impl Vrend {
     /// The round-trip is the point. A census counts what was retained, which a serializer bug
     /// would leave untouched; parsing our own output back is the cheapest thing that actually
     /// exercises the format on a real world rather than on a fixture we wrote.
-    pub fn journal_report(&self) -> Vec<(ContextId, usize, Result<usize, &'static str>)> {
-        self.contexts
-            .keys()
+    pub fn journal_report(&mut self) -> Vec<(ContextId, usize, Result<usize, &'static str>)> {
+        // The ids are collected first: exporting one reconciles the resource table, which is a
+        // borrow of this renderer that cannot be held while walking its contexts.
+        let ids: Vec<ContextId> = self.contexts.keys().copied().collect();
+        ids.into_iter()
             .filter_map(|id| {
-                let bytes = self.journal_export(*id)?;
+                let bytes = self.journal_export(id)?;
                 let read_back = crate::vrend::journal::parse(&bytes).map(|e| e.len());
-                Some((*id, bytes.len(), read_back))
+                Some((id, bytes.len(), read_back))
             })
             .collect()
     }
@@ -540,7 +538,13 @@ impl Vrend {
 
     /// Create the host side of a classic resource, on ctx0.
     pub fn resource_create(&mut self, handle: ResourceHandle, args: Args) -> Result<(), Refusal> {
-        assert!(!self.resources.contains_key(&handle), "the renderer checked the handle was free");
+        // Ahead of both the assert and the charge: a handle the guest has freed is free here too,
+        // and the storage it gave back is refunded before this asks the budget for more.
+        self.sweep_condemned();
+        assert!(
+            !self.resources.sync().contains_key(&handle),
+            "the renderer checked the handle was free"
+        );
         self.switch_ctx0();
         let res = Resource::create(
             &self.gl,
@@ -551,7 +555,7 @@ impl Vrend {
             &self.budget,
             args,
         )?;
-        self.resources.insert(handle, resource::Slot::Resource(res));
+        self.resources.sync().insert(handle, resource::Slot::Resource(res));
         Ok(())
     }
 
@@ -574,7 +578,11 @@ impl Vrend {
         handle: ResourceHandle,
         size: u64,
     ) -> Result<Args, ClaimRefused> {
-        assert!(!self.resources.contains_key(&handle), "the renderer checked the handle was free");
+        self.sweep_condemned();
+        assert!(
+            !self.resources.sync().contains_key(&handle),
+            "the renderer checked the handle was free"
+        );
         let mut res = self
             .contexts
             .get_mut(&ctx)
@@ -599,7 +607,7 @@ impl Vrend {
             );
             return Err(why);
         }
-        self.resources.insert(handle, resource::Slot::Resource(res));
+        self.resources.sync().insert(handle, resource::Slot::Resource(res));
         Ok(args)
     }
 
@@ -607,7 +615,7 @@ impl Vrend {
     ///
     /// `None` for every resource that was never published to a guest, which is every ordinary
     /// classic one: the address exists only because [`Self::claim_described`] took it.
-    pub fn resource_mapping(&self, handle: ResourceHandle) -> Option<(usize, u64)> {
+    pub fn resource_mapping(&mut self, handle: ResourceHandle) -> Option<(usize, u64)> {
         let res = self.resource(handle)?;
         Some((res.mapped?, res.args.width as u64))
     }
@@ -628,22 +636,23 @@ impl Vrend {
         storage: Option<surface::Adoptable>,
     ) {
         self.resources
+            .sync()
             .entry(handle)
             .or_insert_with(|| resource::Slot::Untyped(resource::Untyped::new(storage)));
     }
 
     /// The IOSurface a resource is presented from, if its storage is one. Asked of the resource
     /// every time: the surface goes with the resource, and there is no other place to hold one.
-    pub fn resource_surface(&self, handle: ResourceHandle) -> Option<&surface::Surface> {
-        self.resources.get(&handle)?.resource()?.surface()
+    pub fn resource_surface(&mut self, handle: ResourceHandle) -> Option<&surface::Surface> {
+        self.resources.sync().get(&handle)?.resource()?.surface()
     }
 
     /// The GL texture a resource's storage is, when its storage is one.
     ///
     /// Asked of the resource every time rather than mirrored anywhere: the name is the texture's
     /// and dies with it, and a copy kept elsewhere would outlive the object it names.
-    pub fn resource_texture(&self, handle: ResourceHandle) -> Option<gl::TextureName> {
-        Some(self.resources.get(&handle)?.resource()?.texture()?.name)
+    pub fn resource_texture(&mut self, handle: ResourceHandle) -> Option<gl::TextureName> {
+        Some(self.resources.sync().get(&handle)?.resource()?.texture()?.name)
     }
 
     /// The pixels behind a cursor resource: `vrend_renderer_get_cursor_contents`.
@@ -662,7 +671,7 @@ impl Vrend {
         // whichever context ran last would change a binding the guest still expects to be its
         // own. It also has to happen before the resource is borrowed, since it needs `&mut self`.
         self.switch_ctx0();
-        let res = self.resources.get(&handle)?.resource()?;
+        let res = self.resources.sync().get(&handle)?.resource()?;
         // Multisampled is refused here rather than left to fail downstream. It would: attaching
         // one and reading it back is an error GL reports, so the answer is already `None`. But
         // this is the C's guard set and the refusals are supposed to be the readable half of it
@@ -713,7 +722,7 @@ impl Vrend {
         // whichever context ran last would change bindings the guest still expects to be its own.
         self.switch_ctx0();
         let (held, width, full_height) = {
-            let res = self.resources.get(&handle)?.resource()?;
+            let res = self.resources.sync().get(&handle)?.resource()?;
             (res.surface_share()?, res.args.width, res.args.height)
         };
         let image = match self.winsys.image_from_surface(held) {
@@ -799,8 +808,11 @@ impl Vrend {
     /// A share of that surface, for a holder outside vrend -- a venus context importing this
     /// resource, which must keep the surface alive rather than name it. See
     /// [`resource::Resource::surface_share`].
-    pub fn resource_surface_share(&self, handle: ResourceHandle) -> Option<Arc<dyn surface::Held>> {
-        self.resources.get(&handle)?.resource()?.surface_share()
+    pub fn resource_surface_share(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> Option<Arc<dyn surface::Held>> {
+        self.resources.sync().get(&handle)?.resource()?.surface_share()
     }
 
     /// Answer a classic context fence: make it true that the GL work has run, and retire it.
@@ -1056,18 +1068,30 @@ impl Vrend {
         self.gl.finish();
     }
 
-    /// Delete the host side of a resource, on ctx0. A handle this renderer never held is
-    /// nothing to delete: the renderer's table also holds resources vrend has no side of.
-    pub fn resource_destroy(&mut self, handle: ResourceHandle) {
-        // An untyped slot owns only a share of someone else's storage: dropping it is the
-        // whole of its teardown, and it needs no GL context to do it.
-        if let Some(resource::Slot::Resource(res)) = self.resources.remove(&handle) {
-            self.switch_ctx0();
-            if let Some(still_attached) = res.destroy(&self.gl) {
+    /// Delete the host side of every resource whose owner has let it go.
+    ///
+    /// Nothing calls this to destroy a particular resource, and that is the point: what a handle
+    /// is owed was settled when the renderer's table dropped its [`resource::Claim`], and this is
+    /// only the place with the GL context that half needs. So it is called wherever ctx0 can be
+    /// made current -- before a create charges for storage, and once per batch -- and does
+    /// nothing at all when nothing is owed, which is the common case.
+    ///
+    /// An untyped slot owns only a share of someone else's storage: dropping it is the whole of
+    /// its teardown and it needs no context, so it goes with the rest and asks for nothing.
+    fn sweep_condemned(&mut self) {
+        let parked = self.resources.take_parked();
+        if parked.is_empty() {
+            return;
+        }
+        self.switch_ctx0();
+        for slot in parked {
+            if let resource::Slot::Resource(res) = slot
+                && let Some(still_attached) = res.destroy(&self.gl)
+            {
                 self.doomed.push(still_attached);
             }
-            self.sweep_doomed();
         }
+        self.sweep_doomed();
     }
 
     /// Delete the parked texture storage nothing holds any more. Called where ctx0 is current.
@@ -1083,8 +1107,8 @@ impl Vrend {
         }
     }
 
-    pub fn resource(&self, handle: ResourceHandle) -> Option<&Resource> {
-        self.resources.get(&handle)?.resource()
+    pub fn resource(&mut self, handle: ResourceHandle) -> Option<&Resource> {
+        self.resources.sync().get(&handle)?.resource()
     }
 
     /// The guest attached pages to a resource: a host-memory buffer pays them whatever they are
@@ -1094,7 +1118,7 @@ impl Vrend {
     /// guest -- see [`resource::Shadow`].
     pub fn resource_attached(&mut self, handle: ResourceHandle, pages: &Iov<'_>) {
         if let Some(Resource { storage: resource::Storage::Host(shadow), .. }) =
-            self.resources.get_mut(&handle).and_then(resource::Slot::resource_mut)
+            self.resources.sync().get_mut(&handle).and_then(resource::Slot::resource_mut)
             && !shadow.mirror_into(pages)
         {
             eprintln!(
@@ -1107,7 +1131,7 @@ impl Vrend {
     /// (`vrend_pipe_resource_detach_iov`).
     pub fn resource_detaching(&mut self, handle: ResourceHandle, pages: &Iov<'_>) {
         if let Some(Resource { storage: resource::Storage::Host(shadow), .. }) =
-            self.resources.get_mut(&handle).and_then(resource::Slot::resource_mut)
+            self.resources.sync().get_mut(&handle).and_then(resource::Slot::resource_mut)
         {
             // The pages are about to go away, so what they hold survives only here -- and is
             // owed back to whatever pages arrive next.
@@ -1153,6 +1177,7 @@ impl Vrend {
         }
         let res = self
             .resources
+            .sync()
             .get_mut(&handle)
             .and_then(resource::Slot::resource_mut)
             .ok_or(transfer::Error::NoPages)?;
@@ -1239,6 +1264,7 @@ mod tests {
             &crate::budget::Budget::with_cap(None, false),
             retire.handle(),
             None,
+            crate::vrend::resource::Condemned::default(),
         )
         .expect("vrend comes up");
         let present: Vec<&str> = v.features.present().map(|f| f.name()).collect();
@@ -1269,6 +1295,7 @@ mod tests {
             &crate::budget::Budget::with_cap(None, false),
             retire.handle(),
             None,
+            crate::vrend::resource::Condemned::default(),
         )
         .expect("vrend comes up");
 
@@ -1329,6 +1356,7 @@ mod tests {
             &crate::budget::Budget::with_cap(None, false),
             retire.handle(),
             None,
+            crate::vrend::resource::Condemned::default(),
         )
         .expect("vrend comes up");
         assert!(
@@ -1380,6 +1408,7 @@ mod tests {
             &crate::budget::Budget::with_cap(None, false),
             retire.handle(),
             None,
+            crate::vrend::resource::Condemned::default(),
         )
         .expect("vrend comes up");
 

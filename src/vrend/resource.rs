@@ -413,6 +413,109 @@ pub enum Slot {
     Resource(Resource),
 }
 
+/// The handles whose vrend half has lost its owner, written by a [`Claim`]'s drop and drained by
+/// [`Slots::sync`].
+///
+/// Handles and not storage, because this is the one part that crosses a thread boundary: the claim
+/// lives in the renderer's table, which venus's ring threads read, while the map it condemns from
+/// is vrend's and belongs to one thread. A handle is a name -- moving it needs no GL context,
+/// which is exactly what a drop has not got.
+#[derive(Clone, Default)]
+pub struct Condemned(Arc<Mutex<Vec<ResourceHandle>>>);
+
+impl Condemned {
+    fn condemn(&self, handle: ResourceHandle) {
+        self.0.lock().expect("the condemned list is never held across a panic").push(handle);
+    }
+
+    fn take(&self) -> Vec<ResourceHandle> {
+        std::mem::take(
+            &mut *self.0.lock().expect("the condemned list is never held across a panic"),
+        )
+    }
+}
+
+/// The renderer's claim on vrend's half of one resource.
+///
+/// Held by the renderer's table entry and by nothing else, which is what makes the two halves one
+/// fact: dropping the entry condemns vrend's half, whether the entry went through an unref, a
+/// reset, or a call site nobody has written yet. Nothing has to remember to do it, so nothing can
+/// forget -- and a resource's id is free again the moment its owner lets go. See [`Slots`].
+pub struct Claim {
+    handle: ResourceHandle,
+    condemned: Condemned,
+}
+
+impl Claim {
+    pub fn new(handle: ResourceHandle, condemned: &Condemned) -> Claim {
+        Claim { handle, condemned: condemned.clone() }
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.condemned.condemn(self.handle);
+    }
+}
+
+/// Vrend's half of the resource table: the host storage under each handle.
+///
+/// The map is private and reached only through [`Slots::sync`], which first drops every entry
+/// whose [`Claim`] is gone. That is the whole mechanism: there is no way to read this map without
+/// reconciling it against its owner first, so a handle cannot be found here after the renderer's
+/// table has let it go, and no caller -- `Renderer::reset` included -- owes vrend a step of its
+/// own.
+///
+/// Deleting the storage is a second half and deliberately not here. It needs a current GL context,
+/// which a drop has not got, so a reconciled slot is parked and swept from a place that has one --
+/// the same split the doomed textures already use.
+pub struct Slots {
+    /// Private on purpose: see the type's doc. Every reader goes through `sync`.
+    map: crate::Map<ResourceHandle, Slot>,
+    condemned: Condemned,
+    /// Slots whose owner is gone and whose storage still wants a GL context to delete.
+    parked: Vec<Slot>,
+}
+
+impl Slots {
+    pub fn new(condemned: Condemned) -> Slots {
+        Slots { map: crate::Map::default(), condemned, parked: Vec::new() }
+    }
+
+    /// The map, reconciled against the renderer's table first.
+    ///
+    /// A condemned handle this never held is a no-op: the renderer's table also holds resources
+    /// vrend has no side of, and every one of them condemns its handle just the same.
+    pub fn sync(&mut self) -> &mut crate::Map<ResourceHandle, Slot> {
+        for handle in self.condemned.take() {
+            if let Some(slot) = self.map.remove(&handle) {
+                self.parked.push(slot);
+            }
+        }
+        &mut self.map
+    }
+
+    /// The commands a rebuild must send before anything else: what described each claimed blob,
+    /// and what typed each attached one.
+    ///
+    /// It walks this table rather than a context's, because one table serves every context and no
+    /// single context can answer for it -- and it is a method here rather than a walk outside so
+    /// that reconciling comes first. A resource the guest has freed owes a rebuild nothing, and an
+    /// entry read before its claim was collected would put it in the preamble anyway.
+    pub fn preamble(&mut self) -> impl Iterator<Item = &Vec<u32>> {
+        self.sync()
+            .values()
+            .filter_map(|s| s.resource())
+            .flat_map(|r| r.described_by.as_ref().into_iter().chain(r.typed_by.as_ref()))
+    }
+
+    /// The slots waiting on a GL context, for the one caller that has one to give.
+    pub fn take_parked(&mut self) -> Vec<Slot> {
+        self.sync();
+        std::mem::take(&mut self.parked)
+    }
+}
+
 impl Slot {
     /// The resource this names, or `None` while nothing has typed it.
     pub fn resource(&self) -> Option<&Resource> {
