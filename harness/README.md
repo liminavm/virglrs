@@ -853,6 +853,52 @@ the corpus they were recorded from.
 reports a clean pass for a renderer it never ran -- the failure `vkr-replay.sh`'s header warns
 about, reached by being in the wrong directory rather than by forgetting the flag.
 
+### Scoring on a second host
+
+A score is three kinds of line at once, and only the first is the renderer's:
+
+- **renderer facts** — every count, every extent, most hashes. These must agree on every host, and
+  they do: `vrend.bin`, the 71 MB recording of a GNOME session, scores 341 lines identically on
+  the C leg and the Rust one on Linux, and 335 of them match the macOS fixture too.
+- **the GL driver's arithmetic** — a handful of pixel hashes. A separable blur accumulates in a
+  different order on another driver and the last bits move; a linearly filtered downscale weights
+  its taps differently. Ink is unchanged, so the same pixels are lit. Seven lines across the whole
+  fixture set, and each has been looked at rather than assumed.
+- **lines a leg cannot produce** — the `iosurface` reads, off Apple.
+
+One golden cannot carry all three, and a golden per host is the wrong answer to that: most of the
+file must agree, so a second copy of it is a second writer of one fact and the pair drifts the
+first time only one is re-recorded. So:
+
+- **`--expect-overlay <file>`** names the lines this driver reads differently, keyed by `res=`
+  rather than by position, so it stays reviewable when a corpus grows a resource. It is named for
+  the driver, not the OS — the driver is what decides those lines, and a Mesa update moving one is
+  a thing to notice. `fixtures/vrend.iris.score` is six lines; `fixtures/blit.iris.score` is one.
+  Generate them from a run, never by transcribing a diff.
+
+  Nothing about an overlay is allowed to be a no-op, because an overlay that quietly corrects
+  nothing leaves the fixture scored against another driver's numbers while reading green. A line
+  naming a key the fixture does not carry is refused; so is a line identical to the one it
+  replaces, which says the difference is gone and the line belongs deleted.
+
+- **Lines the leg cannot read are skipped, counted and reported** — not compared, and not
+  silently dropped. `skipped: 5 line(s) of fixtures/vrend.score this leg cannot read` is part of
+  the verdict. The `iosurface-backed` field of the loop line is neutralised on both sides for the
+  same reason, rather than printed as `0`: a leg that took no measurement must not report one, and
+  the rest of that line is exactly what still has to agree.
+
+So the Linux invocation is the macOS one plus its overlay:
+
+```sh
+./vrend-replay.sh ../vm/captures/vrend.bin --renderer rs \
+    --expect fixtures/vrend.score --expect-overlay fixtures/vrend.iris.score
+```
+
+Forgetting the overlay is loud — six failures — which is the point of not having the wrapper guess
+it. **The positive control transfers too:** `--nodraw` on Linux moves 20 lines, the command count
+and the same 19 offscreens that lose their ink on macOS. The three scanout IOSurfaces that are the
+other half of that control are among the skipped lines until the dma-buf read lands.
+
 ### The IOSurface leg
 
 IOSurface is the macOS dma-buf and the whole present path. vrend renders *into* the display
