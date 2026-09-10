@@ -14,6 +14,13 @@
 //!
 //! So this counts work done, not time spent in functions, and divides.
 //!
+//! **What `busy` does and does not cover.** It is the time inside `Vrend::submit` and nothing else.
+//! The fence path is a different entry point — `fence_context` and `fence_global` call
+//! `take_fence` outside that window — so `us/cmd` and the submit line's `% of wall` are **blind to
+//! what a fence costs**, and an A/B of the fence path that reads them sees nothing and means
+//! nothing. That was learned by reporting exactly that. The fence line below carries its own timer
+//! for the same reason, and the two shares are of the same wall clock, so they can be added.
+//!
 //! **Fences and presents are counted for the same reason, one level up.** A sampling profile says
 //! what *share* of the worker a sync or a present wait took; it cannot say how many the guest asked
 //! for. That is the question a change to the fence path leaves open — removing the drain may have
@@ -53,6 +60,13 @@ struct Armed {
     syncs: u64,
     /// Fences answered by the queue's order alone, which cost nothing.
     ordered: u64,
+    /// Sync objects taken, which is not the same as fences: one fence syncs every sub-context of
+    /// its context plus ctx0. Divided by `syncs` this says how many queues a fence covers — the
+    /// number a deduction about the sub-context count needs and cannot otherwise get.
+    sync_objects: u64,
+    /// Wall time inside `Vrend::take_fence`, the share of the worker the fence path costs. Kept
+    /// apart from `busy` because they are different entry points; see the note above.
+    fence_busy: Duration,
     /// Calls to `resource_sync_iosurface`: one blocking wait on the surface's shared event each.
     presents: u64,
     /// Wall time inside `Vrend::submit`. Against the window's own length this also says what
@@ -71,6 +85,8 @@ impl Armed {
             dwords: 0,
             syncs: 0,
             ordered: 0,
+            sync_objects: 0,
+            fence_busy: Duration::ZERO,
             presents: 0,
             busy: Duration::ZERO,
         }
@@ -115,14 +131,25 @@ impl Tally {
         }
     }
 
-    /// One guest fence was answered, and at what cost: a sync is a flush, an ordering is free.
+    /// Start of answering one fence, or `None` when unarmed -- which is also what stops the clock
+    /// being read. One pair per fence, not per sync object.
     #[inline]
-    pub fn fence(&mut self, answer: &super::waiter::Answer) {
-        if let Some(a) = &mut self.on {
-            match answer {
-                super::waiter::Answer::Syncs(_) => a.syncs += 1,
-                super::waiter::Answer::Ordered => a.ordered += 1,
+    pub fn fence_began(&self) -> Option<Instant> {
+        self.on.as_ref().map(|_| Instant::now())
+    }
+
+    /// One guest fence was answered, and at what cost: a sync is a flush, an ordering is free.
+    pub fn fence(&mut self, answer: &super::waiter::Answer, began: Option<Instant>) {
+        let Some(a) = &mut self.on else { return };
+        match answer {
+            super::waiter::Answer::Syncs(f) => {
+                a.syncs += 1;
+                a.sync_objects += f.len() as u64;
             }
+            super::waiter::Answer::Ordered => a.ordered += 1,
+        }
+        if let Some(began) = began {
+            a.fence_busy += Instant::now() - began;
         }
     }
 
@@ -177,13 +204,21 @@ impl Tally {
         // are a different problem at the same rate.
         let fences = a.syncs + a.ordered;
         let per_submit = if a.submits == 0 { 0.0 } else { fences as f64 / a.submits as f64 };
+        // Per fence and not per sync object: the unit a change to the fence path moves. The ratio
+        // between the two is printed beside it, because it is how many GL queues one fence covers
+        // and nothing else reports it.
+        let per_fence_us =
+            if fences == 0 { 0.0 } else { a.fence_busy.as_secs_f64() * 1e6 / fences as f64 };
+        let syncs_each = if a.syncs == 0 { 0.0 } else { a.sync_objects as f64 / a.syncs as f64 };
         eprintln!(
             "[virglrs] vrend fences: {:.1} fence/s ({:.1} sync/s  {:.1} ordered/s)  \
-             {per_submit:.2} fence/submit  {:.1} present/s  \
+             {per_submit:.2} fence/submit  {syncs_each:.2} sync/fenced  \
+             {per_fence_us:.1} us/fence  {:.1}% of wall  {:.1} present/s  \
              (n={} sync, {} ordered, {} present over {secs:.1}s)",
             fences as f64 / secs,
             a.syncs as f64 / secs,
             a.ordered as f64 / secs,
+            100.0 * a.fence_busy.as_secs_f64() / secs,
             a.presents as f64 / secs,
             a.syncs,
             a.ordered,
@@ -219,7 +254,7 @@ mod tests {
             for _ in 0..100 {
                 t.command();
             }
-            t.fence(&super::super::waiter::Answer::Ordered);
+            t.fence(&super::super::waiter::Answer::Ordered, None);
             t.present();
             t.batch_ended(b, 512);
         }
@@ -243,6 +278,8 @@ mod tests {
             a.dwords = 70;
             a.syncs = 3;
             a.ordered = 4;
+            a.sync_objects = 9;
+            a.fence_busy = Duration::from_millis(2);
             a.presents = 2;
             a.busy = Duration::from_millis(5);
         }
@@ -258,6 +295,8 @@ mod tests {
                     window's rate carries this one's"
         );
         assert_eq!(a.busy, Duration::ZERO);
+        assert_eq!(a.sync_objects, 0);
+        assert_eq!(a.fence_busy, Duration::ZERO, "the fence clock resets with the rest");
         assert_eq!(a.every, Duration::ZERO, "the interval is not a counter and must survive");
     }
 
