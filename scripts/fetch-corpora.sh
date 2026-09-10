@@ -38,8 +38,10 @@ for c in m.get('corpus', []):
 PY
 }
 
+. "$ROOT/scripts/platform.sh"
+
 verify_one() { # $1 = path, $2 = expected sha256
-    [ "$(shasum -a 256 "$1" | cut -d' ' -f1)" = "$2" ]
+    [ "$(virgl_sha256 "$1")" = "$2" ]
 }
 
 case "${1:-}" in

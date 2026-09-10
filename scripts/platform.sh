@@ -84,3 +84,33 @@ virgl_link_report() {
     *)      ldd "$1" ;;
     esac
 }
+
+# The SHA-256 of a file, as a bare hex digest.
+#
+# `shasum` is Perl's and ships with macOS; `sha256sum` is coreutils' and ships with Linux. Neither
+# host has both. This matters more than a missing tool usually does, because the callers use the
+# answer to decide whether a download is intact: with `shasum` absent the command substitution is
+# empty, the comparison fails, and the corpus is reported as not matching its pin -- which blames
+# the bytes for the absence of a program. Fail loudly instead.
+virgl_sha256() {
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum > /dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        echo "no sha256 tool: install coreutils (sha256sum) or perl (shasum)" >&2
+        exit 1
+    fi
+}
+
+# The size of a file in bytes.
+#
+# `stat` is not one program: BSD's takes -f%z and GNU's takes -c%s, and each rejects the other's
+# flag. Same shape of trap as virgl_sha256 above -- the caller writes the answer into a manifest,
+# so a silent empty string becomes a pinned size of nothing.
+virgl_file_size() {
+    case "$(uname -s)" in
+    Darwin) stat -f%z "$1" ;;
+    *)      stat -c%s "$1" ;;
+    esac
+}

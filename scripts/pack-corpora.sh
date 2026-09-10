@@ -21,6 +21,7 @@
 # it a decision rather than a step. See harness/replay/corpora.toml.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$ROOT/scripts/platform.sh"
 CAPTURES="$ROOT/harness/vm/captures"
 MANIFEST="$ROOT/harness/replay/corpora.toml"
 OUT="${1:-$ROOT/dist/corpora}"
@@ -75,8 +76,8 @@ HEADER
     for path in "$CAPTURES"/*.bin "$CAPTURES"/*.vkrc; do
         [ -f "$path" ] || continue
         name="$(basename "$path")"
-        sha="$(shasum -a 256 "$path" | cut -d' ' -f1)"
-        size="$(stat -f%z "$path")"
+        sha="$(virgl_sha256 "$path")"
+        size="$(virgl_file_size "$path")"
         gen="$(generator_for "$name")"
 
         printf '\n[[corpus]]\nname = "%s"\nsha256 = "%s"\nsize = %s\n' "$name" "$sha" "$size"
