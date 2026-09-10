@@ -396,14 +396,42 @@ mod procs {
     ];
 }
 
+/// Whether a fence needs a flush behind it to be reachable at all.
+///
+/// A property of the host's GL and never of the work, so it is settled once when the table is
+/// taken and is not a decision any fence site makes. An enum rather than a `bool` because the two
+/// answers are not more and less of one thing: one of them issues a second driver call and the
+/// other deliberately does not, and a call site reading `true` could not say which way round that
+/// was. See [`crate::config::Config::gl_fences_without_draining`] for who answers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FenceFlush {
+    /// `glFenceSync` leaves the commands it fences in the client-side buffer, so a `glFlush`
+    /// follows it. What every stock Mesa does for a context that shares with another, and the
+    /// only answer that is safe when the host is unknown.
+    Needed,
+    /// `glFenceSync` submits the work itself. A flush behind it would be a second submission of
+    /// nothing, and -- on a host whose share group holds an externally shared image, which is
+    /// every context here -- a synchronous one: `_mesa_flush` drops `PIPE_FLUSH_ASYNC` whenever
+    /// `HasExternallySharedImages`, so keeping it would move the drain rather than remove it.
+    Submits,
+}
+
 /// The driver's entry points behind a safe surface.
 pub struct Gl {
     t: Gles,
+    /// Settled at construction: see [`FenceFlush`].
+    fence_flush: FenceFlush,
 }
 
 impl Gl {
-    pub fn new(t: Gles) -> Gl {
-        Gl { t }
+    pub fn new(t: Gles, fence_flush: FenceFlush) -> Gl {
+        Gl { t, fence_flush }
+    }
+
+    /// Whether a fence taken here is flushed behind. Asked rather than re-derived: the
+    /// configuration is read once, and this is the only copy of the answer.
+    pub fn fence_flush(&self) -> FenceFlush {
+        self.fence_flush
     }
 
     /// The raw table, for the census of what the driver exports.
@@ -2367,6 +2395,11 @@ impl Gl {
     /// forever. The waiting thread cannot repair this later -- `GL_SYNC_FLUSH_COMMANDS_BIT`
     /// flushes the *waiter's* context, which is not the one holding the work.
     ///
+    /// Which is why [`FenceFlush`] is about whether the sync *already did* the submitting, and
+    /// never about whether the submitting matters. On a host that answers [`FenceFlush::Submits`]
+    /// the work is issued by `glFenceSync` itself and the flush is dropped because it would be
+    /// redundant -- not because a fence may go unsubmitted.
+    ///
     /// `None` if the driver refused to make one, which is the caller's cue that this fence cannot
     /// be answered by waiting and must be answered some other way.
     pub fn fence(&self) -> Option<Fence> {
@@ -2375,7 +2408,9 @@ impl Gl {
         if sync.is_null() {
             return None;
         }
-        self.flush();
+        if self.fence_flush == FenceFlush::Needed {
+            self.flush();
+        }
         Some(Fence(sync))
     }
 

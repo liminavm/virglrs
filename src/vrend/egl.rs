@@ -1674,7 +1674,7 @@ mod tests {
         let ctx =
             winsys.create_context(Version { major: 3, minor: 1 }, None).expect("a 3.1 context");
         winsys.make_current(&ctx).expect("current");
-        let gl = Gl::new(winsys.gles());
+        let gl = Gl::new(winsys.gles(), crate::vrend::gl::FenceFlush::Needed);
 
         let surface = Surface::planar(64, 64, PlanarFormat::BiPlanar420).expect("a planar surface");
         assert!(surface.fill_plane(0, LUMA_BYTE), "the luma plane fills");

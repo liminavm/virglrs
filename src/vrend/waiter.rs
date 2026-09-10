@@ -322,7 +322,7 @@ mod tests {
             .create_context(Version { major: 3, minor: 1 }, None)
             .expect("a GLES 3.1 context");
         winsys.make_current(&ctx).expect("ctx is current on this thread");
-        let gl = Gl::new(winsys.gles());
+        let gl = Gl::new(winsys.gles(), crate::vrend::gl::FenceFlush::Needed);
         let surface = render_target(&winsys, &gl);
 
         let (tx, retired) = std::sync::mpsc::channel();
@@ -331,7 +331,12 @@ mod tests {
         let wait_ctx = winsys
             .create_context(Version { major: 3, minor: 1 }, Some(&ctx))
             .expect("a shared context");
-        let waiter = Waiter::start(display, wait_ctx, Gl::new(winsys.gles()), retirement.handle());
+        let waiter = Waiter::start(
+            display,
+            wait_ctx,
+            Gl::new(winsys.gles(), crate::vrend::gl::FenceFlush::Needed),
+            retirement.handle(),
+        );
 
         let black = |gl: &Gl| {
             gl.clear_color([0.0, 0.0, 0.0, 1.0]);
@@ -404,7 +409,7 @@ mod tests {
             .create_context(Version { major: 3, minor: 1 }, None)
             .expect("a GLES 3.1 context");
         winsys.make_current(&ctx).expect("ctx is current on this thread");
-        let gl = Gl::new(winsys.gles());
+        let gl = Gl::new(winsys.gles(), crate::vrend::gl::FenceFlush::Needed);
 
         let surface =
             Arc::new(surface::Surface::plain(W, H, PixelFormat::Bgra).expect("an IOSurface"));
@@ -434,7 +439,7 @@ mod tests {
         let wait_ctx = winsys
             .create_context(Version { major: 3, minor: 1 }, Some(&ctx))
             .expect("a shared context");
-        let wait_gl = Gl::new(winsys.gles());
+        let wait_gl = Gl::new(winsys.gles(), crate::vrend::gl::FenceFlush::Needed);
         let seen = Arc::clone(&surface);
         let (ask, asked) = std::sync::mpsc::channel::<(Fence, bool)>();
         let (told, answer) = std::sync::mpsc::channel::<u8>();

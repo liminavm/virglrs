@@ -64,6 +64,12 @@ fn config_of(flags: c_int) -> Config {
         vrend: flags & abi::NO_VIRGL == 0,
         guest_vram: flags & abi::USE_GUEST_VRAM != 0,
         video: flags & abi::USE_VIDEO != 0,
+        // The ABI has no flag for it and will not be given one. It is a claim about the GL the
+        // caller linked, and the flag word is the wrong place to make it: a bit reserved today
+        // means something else tomorrow, and a C caller that set it by accident would lose its
+        // fences. A caller that knows its driver submits on `glFenceSync` says so through
+        // `Renderer::new`, which is the API this one is a translation of.
+        gl_fences_without_draining: false,
     }
 }
 
@@ -2854,14 +2860,26 @@ mod tests {
     fn the_init_flags_decode_into_the_configuration_they_name() {
         assert_eq!(
             config_of(0),
-            Config { venus: false, vrend: true, guest_vram: false, video: false }
+            Config {
+                venus: false,
+                vrend: true,
+                guest_vram: false,
+                video: false,
+                ..Config::default()
+            }
         );
 
         // Every flag that means something, and one that does not, to show it changes nothing.
         let all = abi::VENUS | abi::NO_VIRGL | abi::USE_GUEST_VRAM | abi::USE_VIDEO | abi::USE_EGL;
         assert_eq!(
             config_of(all),
-            Config { venus: true, vrend: false, guest_vram: true, video: true }
+            Config {
+                venus: true,
+                vrend: false,
+                guest_vram: true,
+                video: true,
+                ..Config::default()
+            }
         );
 
         // One at a time, so a bit read for the wrong field cannot hide behind another.

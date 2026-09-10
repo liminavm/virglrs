@@ -22,6 +22,22 @@ pub struct Config {
     /// asked for: bringing VideoToolbox up registers supplemental decoders process-wide, which is
     /// not a thing to do to a caller who never asked for video.
     pub video: bool,
+    /// This host's GL submits a fence's work without draining its own command queue.
+    ///
+    /// A statement about the GL underneath, not a request: the VMM ships the driver and so is the
+    /// only party that knows. Stock Mesa is the other answer, and the default -- `_mesa_fence_sync`
+    /// may only defer a flush for a context that shares with nobody (mesa issue 1430), and every
+    /// context here shares with ctx0, so `glFenceSync` drains the threaded context's call queue
+    /// synchronously. Measured on this host: the worker spends a median 9% and up to 38% of its
+    /// wall clock inside the fence path.
+    ///
+    /// Claiming it of a host that does not have it is not a small mistake, which is why the
+    /// default is the safe answer and the VMM has to say otherwise: the flush this drops is what
+    /// submits the work the fence is taken over, so on a stock driver the fence would be waited on
+    /// against commands still sitting in the client-side buffer, and nothing in this renderer would
+    /// ever issue them. A fence that never retires is a guest that hangs. See
+    /// [`crate::vrend::gl::FenceFlush`], which is where the two answers are spelled.
+    pub gl_fences_without_draining: bool,
 }
 
 /// The renderer a context bound when it was created.

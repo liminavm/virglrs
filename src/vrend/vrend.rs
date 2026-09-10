@@ -215,7 +215,14 @@ impl Vrend {
                 (winsys, ctx0, version)
             }
         };
-        let gl = Gl::new(winsys.gles());
+        // One fact, read from the configuration once: whether this host's GL needs a flush
+        // behind a fence. Both this table and the waiter thread's are made with it.
+        let fence_flush = if config.gl_fences_without_draining {
+            gl::FenceFlush::Submits
+        } else {
+            gl::FenceFlush::Needed
+        };
+        let gl = Gl::new(winsys.gles(), fence_flush);
         let version_string = gl.get_string(GL_VERSION);
         // Whose choice the client API was depends on who minted the context, so it is read back
         // rather than assumed. A desktop-GL context parses as a plausible GLES number and serves
@@ -278,9 +285,12 @@ impl Vrend {
         let waiter = match winsys.thread_display() {
             None => None,
             Some(display) => match winsys.create_context(version, Some(&ctx0)) {
-                Ok(wait_ctx) => {
-                    Some(waiter::Waiter::start(display, wait_ctx, Gl::new(winsys.gles()), fences))
-                }
+                Ok(wait_ctx) => Some(waiter::Waiter::start(
+                    display,
+                    wait_ctx,
+                    Gl::new(winsys.gles(), fence_flush),
+                    fences,
+                )),
                 Err(e) => {
                     eprintln!(
                         "[virglrs] vrend: no context for the fence waiter ({e}); \
@@ -1185,6 +1195,39 @@ fn parse_gles_version(s: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host property decides whether a fence is flushed behind, and an inverted reading of it
+    /// is invisible from inside: both answers take a fence, both hand back a `Fence`, and the
+    /// difference is one driver call that shows up as a stall or a hang rather than as an error.
+    /// So the mapping is pinned here, where getting it backwards is a failed assert instead of a
+    /// slow boot nobody can attribute.
+    #[test]
+    fn the_host_property_decides_whether_a_fence_is_flushed_behind() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let up = |config| {
+            let retire = crate::fence::Retirement::start(Box::new(Discard));
+            Vrend::new(config, &crate::budget::Budget::with_cap(None, false), retire.handle(), None)
+                .expect("vrend comes up")
+        };
+
+        // The default is the answer that is safe on a host nobody has vouched for: take the fence,
+        // then flush, because a fence over unsubmitted commands never signals.
+        assert_eq!(
+            up(Config::default()).gl.fence_flush(),
+            gl::FenceFlush::Needed,
+            "a host that has not claimed the property gets the flush"
+        );
+        assert_eq!(
+            up(Config { gl_fences_without_draining: true, ..Config::default() }).gl.fence_flush(),
+            gl::FenceFlush::Submits,
+            "and a host that has claimed it does not, or the drain just moves to the flush"
+        );
+    }
 
     #[test]
     fn a_blob_is_never_published_past_the_resource_backing_it() {
