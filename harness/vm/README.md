@@ -174,6 +174,22 @@ profiling rather than for a corpus. It is the worked example for *Profiling a wo
 it refuses rather than scores when the renderer is software or the reported configuration is not
 the one asked for.
 
+**It has a consumer outside this tree, and nothing here will warn you about it.** limina's
+performance battery calls `client-basemark.sh`, `marionette.py` and `tap-keys.py` in place rather
+than copying them — deliberately, so the traps each of them encodes are not maintained twice and
+cannot drift apart. The consequence is a cross-repo interface with no gate on either side: limina
+reaches them through its untracked `third_party/virglrs`, so renaming one, moving it, or changing
+what it expects in the guest breaks limina's battery silently, and the break surfaces as a
+performance run that scores nothing rather than as a failure. Their *names, paths and guest-side
+contract* are therefore load-bearing beyond this directory. Change the insides freely; tell limina
+before changing the surface.
+
+It is also the only workload either tree has that separates the two costs of the classic path.
+Its tests split into a frame-paced regime (about one fence per submit, 30-60 presents/s) and a
+texture-churn one (17-19 fences per submit, 900+ fences/s, 1-2 presents/s), so a change to the
+present path and a change to the fence path move different rows. A battery that averages the two
+together reads a change to either as a wash, which is what happened to the fence drain.
+
 `client-gl-synoik.sh` is the mirror, and the harder one to get right. A GL client on the Vulkan
 compositor needs the session's environment, which an SSH shell does not inherit -- without it the
 stack falls back to llvmpipe and records nothing while looking healthy -- so the script reads it
