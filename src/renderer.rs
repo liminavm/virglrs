@@ -1633,13 +1633,16 @@ impl Renderer {
     /// The count of rows that landed, so a caller that asked for more than the surface holds is
     /// told so rather than handed a buffer with a stale tail in it.
     ///
-    /// `None` for storage whose bytes are not pixels the CPU can read in row order -- a tiled
-    /// dma-buf, which is what an Intel scanout exports as. That is *not* the same answer as zero
-    /// rows: a caller reads `None` as "take your slow path" and a zero as "there was nothing
-    /// there", and handing back tiled bytes would be worse than either, because they hash and
-    /// they are picture-shaped and nothing about them says they are not the picture.
+    /// Storage the CPU cannot read in row order -- a tiled dma-buf, which is what an Intel
+    /// scanout exports as -- is read by importing the descriptor back and letting the GPU detile.
+    /// Not by reading the resource's texture, which would be cheaper and would answer a different
+    /// question: it would pass just as happily if the descriptor named the wrong memory. See
+    /// [`crate::vrend::vrend::Vrend::read_scanout_through_export`].
+    ///
+    /// `None` when there is no way to read it at all. That is *not* the same answer as zero rows:
+    /// a caller reads `None` as "take your slow path" and a zero as "there was nothing there".
     pub fn resource_read_iosurface(
-        &self,
+        &mut self,
         handle: ResourceHandle,
         dst: &mut [u8],
         stride: usize,
@@ -1647,7 +1650,19 @@ impl Renderer {
     ) -> Option<u32> {
         if let Some(surface) = self.classic_surface(handle) {
             if !surface.readable() {
+                // The minting host has nowhere else to go: an IOSurface that will not map is the
+                // end of the road, and the caller is told so rather than handed tiled bytes,
+                // which hash and are picture-shaped and say nothing about not being the picture.
+                #[cfg(target_os = "macos")]
                 return None;
+                #[cfg(not(target_os = "macos"))]
+                {
+                    // Read while the surface is borrowed; the round trip below needs `&mut self`.
+                    let id = surface.id().0;
+                    let rows = self.read_classic_through_export(handle, dst, stride, height)?;
+                    trace_blank_readback("exported", handle, id, dst, stride, rows);
+                    return Some(rows);
+                }
             }
             let rows = surface.read_rows(dst, stride, height);
             trace_blank_readback("classic", handle, surface.id().0, dst, stride, rows);
@@ -1661,6 +1676,22 @@ impl Renderer {
         let rows = surface.read_rows(dst, stride, height);
         trace_blank_readback("shared", handle, surface.id().0, dst, stride, rows);
         Some(rows)
+    }
+
+    /// The round trip through a classic resource's exported descriptor.
+    ///
+    /// Split out for one reason: the read needs `&mut self` and the caller is holding a borrow of
+    /// the surface that told it to come here. Taking the mutable borrow there would be a second
+    /// resolution of the same resource, which is the shape this file keeps collapsing.
+    #[cfg(not(target_os = "macos"))]
+    fn read_classic_through_export(
+        &mut self,
+        handle: ResourceHandle,
+        dst: &mut [u8],
+        stride: usize,
+        height: u32,
+    ) -> Option<u32> {
+        self.vrend.as_mut()?.read_scanout_through_export(handle, dst, stride, height)
     }
 
     /// Complete a classic scanout's renders before the surface they landed in is presented.
