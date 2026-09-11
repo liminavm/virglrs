@@ -1,0 +1,669 @@
+# virglrs commit map, main reworded to the CLAUDE.md commit-message rules.
+# old_sha	new_sha ('-' = not on main)	where it lives now	old subject
+00657a4de23f2b4fa3bff4b049dfff9bdf792fc9	141bf4dcae56c0d677ae73dca32065935aee09f0	main	vrend: refill a journal slot rather than rebuilding it
+00f866ce28330a3457ca80f5156ab109f04204bf	04ccca47e76d628947e153e56cad4c2f58abd815	main	renderer: put shared memory behind the attach gate too
+030fc7d131c1852ab17a0a8a155a2e78b8a7ea26	e32ce684a0451f17022dfc775ce4ba05fff2dc01	main	vrend: a feature owns its entry points, and the wrappers behind it are infallible
+033678c9bbb2a54a91f1df2209b8b551bf457fea	69b5827e0b7fd6a67960b5a1417da1fdac62003c	main	vrend: a binding point, a texture unit and an image unit are three things
+035cb2adfe55ddf7089ba085279105261d333b59	4a0bfba1832dc98f109da1b5fad4c8480e169316	main	harness: configure the suite before every run, not once per session
+03a152b0c4e79ebb118d0042f34fbfe4d7f1f3e3	bc5731611a3f2315c4ce3d677ef47e6e7c4b250e	main	vrend: put a classic context's pixels back after its world is rebuilt
+03c1ff17c6d8ecc7f80348f47be4bf46fc9141d5	f4875800bf0b30d6cd42cd051db39595ead8f7a5	main	harness: score the strided array by what it decodes, not by whether it builds
+0481fb1ce82951a1ebfad127236df5c7a9af2c58	fa8fa260ace99986be9b80e8b2b093a9d7129803	main	vulkan: generate the driver's proc tables from the same vk.xml as the wire
+06439d206d430ce00a17c821f2d1df4731bb4e72	53eefb53002e88d751203ca1e6b85ba2f40282ce	main	harness: drive and read the browser over Marionette
+06aa706d6ac8154577a8a541e2a84da082bc2368	5f60b16e5141569571106c1ce739461394206371	main	vrend: create the texture buffer the C creates, and pin the acceptance set
+070e1cf12202c1f1adbfbb59dd1898ec313aa638	6b0bf7be928a35cbdae1886849aea0a7cb7d47e2	main	vrend: resolve a resource's presentable storage once
+07d0c1e8712cfc6e8d148c854538dbfcf5ceefce	7a63eef504f5e75f6fdba361ae7f83f8c93d2efb	main	vrend: refuse a planar blob by name, and record what serving one would take
+08c5257daad71337709131d394310bcd3c979555	c4fe1e2fb54af2c26f0a1e10be5a215c4a171256	main	vrend: read an exported scanout back through its own descriptor
+08f9d5bd0f1727cc5cc3a91c03f3e5b286403e22	95d4869d1cece7821335f4f44f92cd60f388f299	main	venus: give the resource table and each context a lock of their own
+09578559e9f6b5469ed233a094ac93af4ae794b4	912394ae2dbe4fad018e05bc22d165fdd6d30e18	main	vrend: name who writes a scanout, not only who renders into one
+0980e75a699e0cee1c70a3f129c0d8ee6047aa93	270f481cb565805e3d9b0269b85fd0ea4f5bd121	main	harness: say which half of a reply the corpus is missing
+0a9cf162c62f3a127e91627966dc63b2edef2512	d5889efba5372483e593be9a5a20989e3a4fc63d	main	docs: plan the Linux port, and say what the cost actually is
+0aeb134b1e4136fd147df0fad373d3d71e7e0201	e222ef743cb03556b19b2fabe6085d368882f3d2	main	harness: the desktop session is the classic corpus
+0bf88b9e578578904711b0962830ee667dddd166	6f4e738de66a5768cf179d7c5bc55d0e682e7edb	main	venus: let a classic resource lend the surface a venus context imports
+0c38b13aa4e18115515e97f75da8bdd9b6e99724	0f556d6807e4b9a2fde27837ba12d7420f55cd30	main	vrend: give gl a fence sync that cannot be taken without its flush
+0c7dd33ef67014050c80c056c278f5bd6148f479	b7b31baa4dbedd48fc5ed993662666dda8f8ea81	main	harness: the overview keeps presenting; correct what escaping it buys
+0cab3aa26dfbb7d85cd00f31172fd358982ecfe6	d6c761b53728c02020e1641acfc2cfb46d9c2975	main	ffi: stop claiming to understand callbacks versions we have not read
+0cb7620ffe8cd99a0a1eabccb072535014449100	8c91d3bd01e244840c8defb98145dc4a22b8c421	main	Give the repository its own guidance and a README
+0cff6f8da000f114f078e5e0ac32b40f741c1706	96100ce1d1f70e11872b7280f3f7c6b5939bc9cd	main	vrend: the context layer, up to the no-draw gate
+0d96121ce19f9f3a5f8ec1eca9fd86809f43390c	090bc7214613af74ca4cfcb41ca9b1b0bad1efcb	main	vrend: bind samplers without allocating, and say what a consumer must optimize
+0e729d3cd6568fbdcaed25b2210fa6422670b814	48d9062f9978c57cfb543a54794f1fbef27b916d	main	harness: pack-corpora refuses to drop pins it cannot see
+0ed9ead4627c104ecaac0819495bfcd23986164e	ca2a684b601b8d7a19a5ae254c8bf149a463a74c	main	vrend: export a classic scanout's texture as a dma-buf
+0fc298441f2178009fcc5cfad252b0814b311693	4cc840b890591225ce9b87efea0b28ed2dc26f3b	main	ci: probe whether a hosted runner rasterizes
+0fce652248b12d724906a94ea56c47c1bfc6fedc	4485d0b15c8aebd4d65616bf1d50afc3f2fde0c0	main	venus-gen: refuse a mako that rewrites the templates
+0fe22e42e1f90dec9cdb36c0403e20a57a36c580	6d1775386352a8bd1863f781f4875e2700c39bab	main	virglrs: generate the object lifecycle, and pass both corpora with no GPU
+101b854f9545b878774adce43bf0390c72a71388	f4283cfec7ea54a078cdc3ea1baa54f14e721f09	main	harness: a sweep that hangs is a sweep that cannot report the cases it was extended for
+106a21572c2e7817b25d1aa3fa6799d80219570a	86dff0cabf6bc37085e0a1d94e55dba1aaa2ae18	main	docs: design the video phase, and settle the rebase question with facts
+10716cffb05eab1a494eece49987c8e3da5bb677	f735f2a5a5bbd471a90a98227e249ab2e4c22100	main	venus: score a group on the worker log, not on the probe
+1157a6df92fed5ec855ff6e007d906a5a5f31bd1	e84902f2e530efe1b5eadcf7132581b67cd4139f	main	venus: name a read-back allocation the way the census named it
+11ed53311ad431846363cc5998b93e41e79843c1	d10367270a307cdd9250be0ff2e0334fc262a288	main	venus: pin that a scanout export lends the surface and not a name for it
+11fa8164e0995d2c31d067bc9c5960f68665ce6d	eb2a19e2d6f50886323626abc16245b48a0f18cb	main	vrend: refuse the guest's numbers by name, and say a refusal out loud
+121124510973de308937a39a206205213514248c	ee3f5e295e62513aa18982b86d3b5422f3265161	main	vrend: refuse a planar texture transfer by name, not by its bound
+135243df6409911e235688605d813193d5e35523	508a0384fc78dfc8f89e64abb49703266de418ea	main	docs: the blank-texture case is reachable, unwanted, and not next
+135efa289eaa3e8bbb975d46ca93f189679ea4a0	b3957ce05295abba7bc17bc4c69e8b0c8a6e0345	main	ffi: stop reading a size-versioned callbacks struct as a whole struct
+14dc9eab6791a693f611189eba40a6ad95b2850c	5dd162bc43ea31d4949bfade806d958b57c62dbc	main	vrend: serve VP9 hardware decode
+154ef6c6d3745964316607eebea0be2eb9e5dd24	d73bf911063c569025b2c2a1f1267daac1ea62d5	main	harness: park device-memory blob creates until their allocation lands
+164f3cf709c52828a9c424fdd8ccec475b5b7718	4b169af79f357c0dd591fdfc4d2c6b0a7a0397cb	main	harness: record what the video oracle actually indicted
+165cc82930753643e8100882eec48be276cac5b8	688d01feacf721aaeae6a7873a84e3c6ee245c11	main	harness: run the C tree's own tests against both legs
+17214e8cc632750a2af05b2ca5e5465e1373f6af	d1b627864499be5c2af41984d785820bc052575e	main	vrend: ask EGL which context is current, never remember it
+17bb3970245cd30343fdd8f8caed5d4cb7acec93	983efdfbe774b6cd1c99a438ea38ef6196308a0f	main	renderer: a context name is a name, not the buffer it travelled in
+17cdba0e3fb0d820c929abb092e89a66dccc601b	51cae95680a7b18f322ec93603c68150be2c9789	main	venus: do not let a guest's allocation size wrap when it is padded
+17f8fd045fe201ed537eedb9566d24108b11476f	d3c914c6dfbb3874bb094e9c0df15e01c903a272	main	vrend: run on the embedder's GL contexts when it has some
+18c59a0e01b6bdcf5f013f237591168a71426cb9	8b8347d081966ee4858c29286d8d1dbb53b7cb90	main	venus: tell the journal which recordings a pool reset discarded
+18c9dbc75a1742eb8326ef18acf859fa3b78dced	ec24dc96e7face89059968ee6e304a56de943460	main	ffi: the sync-file trio is a refusal, not a gap
+18f4c5e9d0eedd86a520e1c4f02fac40e234566d	93a205bd1ef681b7088ee4834974a3e5241f2247	main	ffi: answer a transfer the way virglrenderer answers one
+18fc8df6dadbdc8953814755510a4af945969a45	d27a69340ce9de5e7d70acde9aa96a1b1fc38e0b	main	venus: keep the minting host compiling
+19358f4c9319237fe997f0926b0d515636c14423	35c118e55cb7b7cc9c45cfbcb5e4610029952c28	main	docs: P0 is done
+195e5d059f74fa1e4cf74dccc822f6b3921e6950	cdd78effe5f3d3c607c189906b54e715cb4632c7	main	vrend: let an object keep the command that created it
+1962048a3e48608c1518eb5173999af084ea855e	44c901dd75ab30877ca94ead11d48611668980c0	main	vrend: ask the cheaper question first when binding UBOs
+199205339930b3689b8478f7b1661fa897387001	4601a485300335b1a97d3247ecca062038962101	main	venus: let a resource hold a share of its storage, not a name in one context's table
+1a2faf8ae1a7c808166fb6d11fe70e28e22ca48d	8787db83f48c42818b683f1d816a2df57e13853d	main	harness: make the correctness leg able to fail
+1aa193d7a0efee566f45f465912254b1a2795b07	294d6553097d38ac489d9b5933b27172f9e0b4fb	main	vrend: have the sampler-view trace say whether a view was ever possible
+1b232b65ddff12cb5686b552aedd3af99f354534	7c292dcb54c4630e74ad2c08f191faccf5d7c9d4	main	harness: say what a Rust score and a C score disagree about
+1b2d26f2de0b2b23ab64f9cb0d05a5120dcd8cf9	d6e23282271b38ea2ffc5aaad3f0aee44a62b1b0	main	vrend: link the selected variants and serve the draws
+1b694291bb2d268876cadf46c5b83d9e53af5bf1	9210e1526c9f3a9f098997d0fabe77065f2555c2	main	vrend: time the fence path, and say what the submit timer never covered
+1ba05e925c91f61bcb046f27ba7e18a0a4b677ef	840fe5dfc0d080f7c1d76e1da00b69f0438feae7	main	vrend: export every plane a compressed modifier reports
+1c4caa1991addbfb9b65ee9536bbbc42591f0406	f537df087d551f0b908b045d924099757f126e79	main	venus: what a blob needs of an allocation travels into the export
+1c7f015932963cc7f1951cf67d7164cf1555449b	7f5483cc05e83cc2ce44b9ae034526254a4bbe4f	main	venus: witness the cap in both spellings of the properties query
+1d82a78f1384b434110697c370c61db4c70e5863	977c5d52bd4f80b1b87b7bb65588889ec585c7ce	main	venus: answer the memory budget from our ledger, not from the GPU driver
+1dd0d9d2583192630fac44c3f27514e2a1c2c3f1	055a1da647c31b61de467841f65752314d44f001	main	vrend: export a context's journal as one seq-ordered stream
+1e1ed36597bcfcd847e3455c46c7938ca433f71f	cb583ee6e4d34b400a7102b813db8203ca9200ea	main	venus: let a pool's objects die with the pool
+1f0755b805e6807346130574010fb01aec0a0dc4	0cdcf0806e76711e15fceee6b6aa66bf94e8b574	main	venus: an unserved command stops the context, whatever the reply flag said
+1f58c5622c33390bb8f339fb813ed15b9ccb9460	18a220cf9461e5996c76af6c22b060fb4a71a028	main	harness: record the replayer's lockfile after virglrs took bytemuck
+1f7765df05b4d2cc1ba6484b681ec2ae968e612d	30b0658f84417a99260001632f6329a9410844fe	main	harness: score the composite planar corpus instead of crashing on it
+1fd19c253f067fb5f6c60e6e5b964418059db48a	fd17672bccdeb36dbb73d346e2f6f18189c0d11e	main	vrend: a fence covers every queue its work could be on, not one of them
+205aec3706549cbfe154bf779c6730327a9ee2c5	825ec37a03a01a22bcdc65dd3b71909cbe404f89	main	harness: state the gate's real cost, now it is three suites
+2064fbbbf05bcaae280ebc35bef2fa006ec20e5f	ebf7867c4d938cd69bced5e9d549da526763cd66	main	vkr_record: record the control path, not only the command stream
+20dbaeae199874e97c038e2c38c18106049af2cf	33b4a5a455a1cd775346a743ff375987f6dfb6ea	main	harness: say what a lost blob share would actually do
+214b5be8a7ff2925183b756c1620be3d42c7022b	3cdbdee9077cf435967d2a0b2fe2e544be552aa7	main	harness: name the corpora that would show a per-command cost
+21748207bf35ae3ea3371226d1baedd78c1e1e50	26a86e84c4000124d2a9f7a253c8a9624604260f	main	docs: what venus still owes, carried into P3
+21d1a9824ee29ba649f52138d525a3833e32c722	3a3fcd072586d4ed8cc6f79cc72f315e5010c955	main	docs: the IOSurface rules a port owes
+21f2f463ce5e2816c2f000ec3d5f71f9db70ac9f	fae8c4f807cb4dd943aa365023dfdffc040c8c71	main	video: port the H.264 framing, and bring the C serializers into the oracle build
+22a0429a4fde99ad792744f7e37561285b37295c	237cd28058c97773776b8b63c56ae8df583804eb	main	docs: nine of ten transport commands, and the two rules the last four established
+22a098d51739a84120a2a6250dfb039b1d6feb51	ddf4c66ee9b12b5101f75c3f5db8dd6034eca552	main	docs: drop the census-divergence question, answered
+237e4a605a557069ffdffbd7a2ca840d1cfa17e2	aa0b5d20d936dba2e148b0aa77bdc27898eca274	main	venus: a pool and its contents are one record, and die with their device
+23e34cdd71ee7c72bc3e3502c9c083b50a6d4942	fbd22dd4164bbbf81c727b276cea63b97f60607f	main	vrend: name the call a sampler view's GL error came from
+243f5a70b0e9eec7f8ae08c1fa728278a1bcb21b	4946eabb8dc6242c018b7a78d2b6f5bb6c78d4f5	main	vrend: type an attached blob, adopting the surface its exporter published
+248f8aa2389de1af6630d03abbc5f51e7ccf8c00	c6929c1c76c880d6aebb58d81f9062cafb36aaa6	main	harness: run the replay wrappers on either host
+24ebab97fa9ea052897b0a71af0ca04edc1999de	7421048c9d68784fbb3fea1070ff242101d67684	main	vrend: say what attached means, and what actually makes a present sound
+2512f2ebbad8581a9488293d47daa908509894db	9666f2adddbbb7e4e8e2422760be7913c817eb20	main	vrend: the program owns whether its sysval block is current
+2539cf0fb8d960dd09dfaad7ceda7282daa8ddfb	580275d8d49f5c72291a3b2cd97764281f5afa18	main	vrend: serve the blob a classic context describes for itself
+268c5bb93771739aa432ee9cf7f3415f22a268b2	702ba7118b0a2c0eb243ab23a46271123ae3bf3c	main	renderer: a blob holds one kind of storage
+271d684d1bf95e12c64c4d1422f2e1cfc3642277	3f293e246bae48e8d9df4f2d5b698937375f4b4f	main	renderer: make reset destroy what it reports destroying
+2778918a204878033549cc068104f126b26bc51a	b4e531eb9936d6229261cb481669477b17e29021	main	venus: answer the guest, into the window it lent us
+2819606be61f756c58ccf82aa54c34e4fd16993d	39421c090563719be095ed75e5d5d79866a8a86b	main	venus: prove three counts stay with their own three arrays
+28dd116d24c62d2845349ab0474bb08f49662dfa	407b4b35d6c1661324950e68c8d80a9c2081ab51	main	venus: an opaque layout is not a layout to ask for
+2925777bd9486c45cee4c007ce2f9bb881af56be	e8ba40b750633b0e89ba3c7093567a8213152cb3	main	venus: a command argument that is one pointee is a reference, not a pointer
+2a16dcba3668e7a51f38a30ac2e1fe812734eb02	56afe7adb4ddc3c1f1558b536d42b854e749bd52	main	vkr_record: stamp every event with an execution clock (format v4)
+2a3974edbbc12a65db2dae84c9413676f5b6f417	c159a413f9ff8171f080791df007175b3f436d73	main	virglrs: generate the venus wire serializer
+2a5db23481470b9bd453ee71949d5502c49d466a	2dfd5fb7ac74aa94b72202ab2d29226e92a96ab6	main	venus: let an Option mean optional, and nothing else
+2ab6e400991be9b76679cccb386a5329ec8e17f2	d4fb7f23380e5fbe97b2435e10cb41caa8aceeb6	main	build-reference: take the host's own epoxy and Mesa when it has them
+2ad18369eaed615278dbbe5da19b3d9019fc64e6	02a8bac99d2d830c82f8441088145bf3593bfd4f	main	video: a codec is one of four things, not a profile beside four options
+2c0c7a4caf721a542c5d4fd2704ef412ccab3d2b	fa11d0cfd1cbae5417ab4b2264b322e21ef47d64	main	docs: the frame, and the three things between a served transport and it
+2c663a76e5f58a5a2dd8d8d088942dd251170bdb	879570a5331a4074818381a58b93538e2f748bcc	main	video: synthesize the HEVC VPS, SPS and PPS
+2cbdccf60daa33a7a423a4e39e3d2ba4f604ccac	10fe7cffd10649e951ecd395f2b7c723dbcdcc43	main	renderer: make the second spelling of a known capset unwritable
+2d2bc38f6f9124a19d7471409eef61d5750c6c72	1f1991e41c2b8113dbe5cd09868e49c729ecd5bf	main	vrend: a host that cannot adopt a buffer degrades; only the guest's error faults
+2d85ad163cccd73c9561e0589ec97acf9e1c83d9	1e8eae342620ea749700027c4ad22d75e8106f74	main	metal: read a surface's bytes back, under the lock that makes them real
+2e20b76cb44efb7a2d7e9ec2204bc55c037d5c80	ba0b7cfaaf62dff092663293a8d29d548735925e	main	vrend: blit the layer the destination asked for, not the source's
+2e8822a456cbdc0bcfa55f309a9d965df03bae16	7184233e9d831b547924d73b3403b427fa91dd55	main	harness: a Ptyxis corpus, for the paths only unit tests covered
+2ee6e06e0c2235677d5bb4b3527137f6d1c03be0	4b07da416655e74ca416a648366e639b587e2e0b	main	harness: document the venus snapshot gate, and where it has to run
+311341c854c2f03ed78809d09a9d4ee977f406c6	3ce4625c60a82a4f211a8767556fecf04ac9edd9	main	venus: decode a strided array, and walk it by the array and not by the guest
+3195ab04b0c5efa9b1133b6f6014c732530cd91b	f6ebdd2168ec04ae7e21b0389ec49e5d0641cf8c	main	venus: give a create's out-handle the type of the word it actually holds
+31acc4cdd098b14c4bd5402f4b1b6245c9f54ceb	8a14c164d73231cb8bf7ab58d01682056049fe1e	main	docs: the symbol fixture question is settled, so it leaves the open list
+31c22f6546225d529ba7b4658645025e9aae656e	40813af68c001a0958a12ebb9b4d8caae762cc97	main	virglrs: the venus object table, and the two lookup failures that are not alike
+31d5bba4e56d335f7d599e28f9f0a9fa9bc31833	cb3ed821ee4018c79893e7ccc45e8ee5b4776baa	main	harness: pin the seven lines Mesa's iris reads differently
+31e32b08e9131435f58477e7bd644ea5be541aa8	7f40bfe8f4f541470a0454166965138ac5a4db06	main	harness: model a blob as untyped storage the stream describes
+3374d7a17e73426ba5e41ac0c6a0b24256dda566	dff24b715846fba7f9e5bd6df4b5a266cdad7af9	main	harness: record that the GL-client-on-synoik leg fails, and what it is not
+339794dbfec221612c13891e9ac6376bc8aa9edd	77470078c03b9701ff2b97a89494469066fc851e	main	harness: replay video, and pin VP9 hardware decode as a score
+33e95462b7e5650a6187018dd907c84b835f68c2	58359443cc68deb79856f1e04f8005989fa964bc	main	harness: re-record the two synthetic goldens for the retire commands
+33f77c95b1efd85884222eb2c2a4192cdaeaf4fd	278a21e3b0dae97bee6df37e94caa2b7542bc4af	main	vrend: the scanout readback pins the pack state, not one field of it
+341493ce8499a49234cbdc94e7b666b03714d066	effeaadec88445d1dfb86bc6d012842cbd43b656	main	guest memory: map it, and make a reference into it unrepresentable
+343ad89d98ccdb458c43a67ba3040635d89820bd	2685fea781c72096475d86d517ac349038c46214	main	vrend: the bind that bound the vertex buffers is what remembers how many
+34ed41da0e9d7baba80cd22d514716c5b527cf33	99463fb327eeb48d9586db2ed4021d13b08f3560	main	vrend: ask the driver whether a texture is immutable-format
+35828e317697508cb969c0440e9fdfb27fc9e589	8c9c0d8c6aea59414eff3c42b3bac70f577350b8	main	docs: retire the vrend budget entry, and keep the one piece still owed
+35881d9c73a791c45f3127f0119476a5dc898d6d	835ed5eb8b2f767adea0e00ae8426666fcd75588	main	docs: book the declared host-visible allocation on the exporting host
+35e1485cb8f81b24dae37643b26de144c31b8cf3	c209df58430091866ff174402e4f5a7755247dbc	main	dmabuf: a plane's element size has one table, not two
+3654e4af8ae1460c61c335669b331e6df1be08e2	79ee310fa88e6ecee7f7d57a994620dea38fef3c	main	harness: score a surface destroyed while the framebuffer draws through it
+366c82cae974b02ce4d54b41eb2bd02239883a22	d45c9c96896fbef21300297f5e25bb0f669696a6	main	docs: no video route on the rig types a blob, measured rather than reasoned
+37b4cf592d69826cfc3ebb74a02383e7b914d521	17f432fca162de8d3457304695be80eb41f1ac4c	main	harness: replay a blob's recorded pixels, and score them
+384f514a7da73c7bfb826fe2dd0257f5ba8216c2	873efb46f7ffacb3a9f19eeffa943361ef5e8fb1	main	harness: pin what a rebuild loses, instead of requiring it to lose nothing
+38b1ceda6aecabd10b5e579ece9ac6b98fc8ef70	5b90e5c8a9ede3bd95ab041479dd06e8a7d53766	main	venus: bind memory and write descriptors, so a later submit has something real to draw
+38d8492ad67e90b7fc09682e5d897434bd752f9d	6c6121971fdfde1a904db0c2604e74815ecab925	main	venus: serve Vulkan's two-call enumeration, both halves
+38e5fc0226ded761ccdb2e1dc31c058db0f96f9b	1a53bb650e69d7b5089b41333d38e73b559a05ec	main	vrend: take an embedder's contexts when it can name no display
+39111a989307f95329fb3dbed8f468e803a6df36	7dd2396fc8562446e35fc72cfd78fedc2f88b628	main	venus: serve device memory, and answer the census with it
+39b0c6859944080374987d235892ec3fad0520a0	6123e2e8107a47db28f95538c15ddb04fed47a65	main	vrend: a fence with no work of its own rides the queue, not a full drain
+3a747d3bf3217fb96779fd44627ae2971b45b84f	d791877287b230d8a7abc2304c681460786686da	main	harness: bring the corpora here, and make both replay legs run from this tree
+3ab6de12a6683a0537bd08fdfb0515802ba6f136	c366c7aa4447d8cad606e5811ea2efe12f7965ed	main	venus: keep an invented handle out of the driver, and serve the compute pair
+3ab6e2bdeaa645e28c3528c0055b4cce7d1ba912	9b47b9372fbff3064f72f7892da67bce81eda06d	main	venus: answer the out-struct queries instead of counting them
+3b46783635689b0c0a6468fd09edc1ae48b60010	d01a9e1ef006b9d00375395291ed1f01191bfbbd	main	harness: state the transport gap as a set, not as what a boot happened to hit
+3b656178f1c976e4b11dfca1d30831715ce00d6f	0ed95f2a26889952512dcdf1fb317ec9e9c4f67e	main	docs: the pixel gate is met on Linux
+3b7e3af07d1051126fc79a7eddb51670a3064608	2cd5a598f874b09236932a7a7d26d11ffb62b2cd	main	venus-gen: emit the structs the renderer builds but the wire never carries
+3c2a31c107c43dbe4b6c9442a25118209ea67da8	634b6c12544209243d8d315487535b129c03391b	main	ci: delete the probes, which have answered
+3c86062b331fd05ae2286306eb5b38359569b3f6	93311a9ec9370f770f942cce860fbdb5ccd9549f	main	venus: hand the VMM the address of the blob it just exported
+3cf54b904bb7fe2d9d7bd8553d1981cf2538c4d1	7518d31451745aaa2681b1de6093996ed39ee122	main	vrend: a driver that contradicts its own probe crashes instead of degrading
+3d3513da1b18adcfb285b389adabbaf47dc85a64	519b2fc6aa140887becfe2651018c490fe9c828e	main	harness: say that the basemark client has a consumer outside this tree
+3d5092a4d2329722528a0d9ce02ffbc588a00a15	461019fcf04dac93d9a838d18badd1115b3df682	main	harness: the basemark client ends the browser it started
+3d645886ccaeb4e6d226a4c60e662983d5f47688	194c0a6a887e2cc86eb5fcdec09c556b84b76c35	main	test: recover the display guard from a poisoned lock
+3d96795d0339706020ea505defa80338419fcef7	fca374a934aa9cf405cd0749c80ffe56566f0dd8	main	vrend: let a blob keep the command that gave it a type
+3daa548a203ee20a0b64054f04e791a6ac6ae45e	4a8eace4086ef8ea834d312f7941fc7c6795e642	main	harness: seven sabotages for the executed command streams
+3ddfac91fdf1d156fb7bd2b2b14a60b7ad964b3d	90993c414722b2476a2ae44965a97f3efb144791	main	harness: score the described blob's reconciliation and its bookkeeping
+3e18af2ff182229810fa3a8569f59dce3cc5ee0a	c0d0bb45b3b222aa011e8591ef734666c63a2013	main	venus: a decoded command borrows from the decoder, and now says so
+3fd6646404d4e2b759ea5b36f62d5b6548887f51	455fb22586b8b112e6259d4c9952d9cde52dd37e	main	test: make the suite build and pass on a host that mints no storage
+407cb70ca5f7b7c0bfa01db7ef37f943e2306aaf	f4b3bff4541d4589e063ee6275bb4dbc716ef092	main	harness: drop force_ctx_0 from the readback; the limitation it documented is gone
+411acb160c227bd575e5546e9dbd95d0f05f33aa	6ec2bca62807d67791e21e0ec638d5bdf3b17b6c	main	docs: two values that must agree are one value
+41212a58d6239501c3c1128fb5e123a1e8f75474	9cccfb1d3d49c3225d93059cf176f7cf7799e2da	main	harness: give the venus replayer a score two implementations can be diffed on
+414a276e1e5abf1688ced4bf34c45e5e3ff7003e	b150df0d246eb95f6efb0e4ad35fd431b582de96	main	vrend: pin why a planar transfer cannot overrun here
+42008bb6a231613667a80dbf2d207ec38120077e	58aa6d6604afc3b967abbb59be98e0d842b284c7	main	vrend: never take a texture view of imported storage
+42442b8da93ee67ceb6bc3ac9a443e5e3e233005	f13a3a988a7511ac380d38f4ad6d4dbf3712fc77	main	video: port the bit writer and reader the parameter sets are built out of
+42aa94aa1bff860795b25330419c14c5b253e2b3	7734351c8c8105f07fe80a39bb94d19752f67cda	main	vrend: make the switch back out of the blit context structural
+42ab94be3583435ebe7b14fa93956d16d627b0d2	1ac0a2e707cf24673f4bb2529258a4e66dd05eca	main	docs: the replayer reads the dma-buf, not the C leg
+42dbb44ef580ade25771f361194c1bb836eeb0dc	b6616fe835b14a5b24b12ae47034e01033b6fa22	main	harness: let the rig boot either renderer, without either bundle standing in for the other
+432597184873d8c135c15f3b2550f8ef21c27be1	c6bccf7c0c7598d093afae5b8e1b115d924d2192	main	venus: an array becomes a slice on the struct that owns it, with the right lifetime
+43424f345f8b29d832cb5207ea15b3f740d68c31	7bd0691760e8be0a157116f11e6e9268c905a415	main	vrend: one row reversal, and a test that holds it
+444eecba07eef0836e587fea8d68ea26b225dd60	4042e993023277de3dfb85ced5184c9523c46af9	main	renderer: name the surface renders are landing in, and announce the trace
+44e05f21e283c0ccecc94a92eb3df6fe0465bd0e	3a4422f7d7a11b86c45899f22e4fd880d998c6a8	main	harness: eleven sabotages for the ring transport
+44eed6b9145b2b5025611ae3370ba28cf1e43778	479da162e5c85f05c2a46ff61f3979a5b85c3e30	main	harness: record what a seated boot found that no corpus can
+4654a345faab18d908736f962a1aa1ac8b655a36	02d047be22d96737b087be49a12ab89c80e12e58	main	renderer: ask which context a present waits on, rather than waiting here
+4658cde981f1987597dfa617f2df1a15d0e0afcd	126df41ec373cec9134b239e79020f4dc215315c	main	harness: record synoik through its session end, not mid-frame
+46f38c311a37d4ea7840882e33832131bc5896db	a9d72fa016cd236d6059a728c3b0c737f081a8ea	main	venus: derive which handles are pools from vk.xml, instead of listing them
+47258fb06bc1e352294349e6b78638184ac0b984	3b785d218cd763a976aec69dabb48d23efa2e409	main	venus: say why each unserved command is unserved, and hold the file to it
+48d9860c81f0fae0d387d4152c17168694abd222	959b0aceeff7fb31ee7d891f031740c8e119ddad	main	ffi: answer the export calls from the storage that now has a descriptor
+49c3c4c875f18c5cac3388e6da074309dc3e9afa	993ca0474b9151023732cbb84395be9ef929ea10	main	vrend: a dirty mask is as wide as the slots it tracks
+49c50c53c9f4786dde70a9b150f6f4eb4247b94e	f1bff8e8c601c2dea801e565cdeee990977ce56d	main	harness: attribute every zero census hash, and say what a fix would cost
+49d03db970df81f3ecf06ffd20f75247bb1fc9d7	e4ccd39d33b2ca45714ba684136078cefc59f7ce	main	docs: carry over the vendoring and fork-discipline notes
+4a0aaf54b30a5ecf903c26b39fc285c80525ae6b	34e9f12ef51cb5304d6501e4a34739368f73b9cf	main	venus: copy an image back into a buffer, the one command a corpus asked for and this build refused
+4a10f9b19d2dcb0a8704567433c2edcfc3cc9eb9	fa8c7656d85ccd7fd58f2b42574aff3a918cac29	main	Answer get_cap_set before init, as its callers ask it
+4a303b8cc0386fd4ef753580b7211245e5942c29	092525862e54dbe2be7a9bc87a570e071a6e6c7c	main	venus: name the unsound rule that turns a missing transport command into a silent lie
+4a3e864b38f3e89070efdadab5c1257a0ea636e4	d6e9b862e8b7bf376e72f8da3d70378cc44c2431	main	docs: book the naming work, and stop the ABI survey describing the past
+4aa068e6d57e4d499b99f2306e02b0d0da7219d8	e1e1c35692b89d6381f202289dc7497de59fc89b	main	venus: serve the four commands a GTK client asks for that no capture did
+4ab66fff49e7f9649b4ca517085c4640d1270cfc	47dcf058d71010b33043ab1d84a0db4b51792996	main	config: a context binds a named renderer, not a masked flag word
+4afa3ef2974723b918004699479b5c6b9a239002	b1460a654c303dd6ffcfe7e0d9902f120c49ba8f	main	vrend: answer a classic fence by waiting for its context, not everything
+4b00e9d90601a8ab7641c1594d775392c3f2cec6	fe1bacab3eff6858003a01ab22ced5b9666321b4	main	venus: gate the force-LINEAR import with the rule that uses it
+4b07bed988f9dc2f03cea8b36ef0c2cda4407606	192aa1cd4f15c8d10505ded89f31621981239167	main	vrend: deliver a decoded picture into a composite target's surface planes
+4b60a57d6503c13854b086fd754c6450fbcab6c0	1ca8c1ad85725c65aee08301ac2cce3bfc6133cd	main	harness: score the classic replayer by fixture, not by heuristic
+4b7911f4243b46e3f383d9351bb130976edb1054	895df218eb1fde4dc35eac5ca35e50ad8254bc10	main	harness: score the build that is in the tree, not the one that was
+4b8e279361645ad1bf699eb69862abd4124d9072	ca3e3207bd9a265a440dc457dc2395eb51134886	main	harness: score a refusal, and stop the sweep manufacturing one
+4be475eea59b44de39234493e5ef4cb83311a3b7	20aef7accd6c52de6d49287d31dab71b3a6d9a93	main	venus: name a blob's exporter by the occupant, not by the context id
+4bfdefe89dbbfa3b21c6df07d479f7c5e41c1f26	24a91ebc84db07b184e678ea8df5db7d8db16ad2	main	vrend: say what depends on the pack state, at the state
+4c586a12e754334417037803c8c47559183d704d	48807ed2b52042cbd859b719fb18f331c0695d6e	main	vrend: parse the wire fields the draw path indexed and matched by
+4c993da7115cff7285336ebdcf87d70b7ed30e26	56919db7265cefccb0fc324fd62b1dadfaa62f1a	main	harness: say what the replay gate does not measure
+4d28aeef9b057f0f9c0a98aaa3df477a86e926c3	5d4794062965bc68c043f7ee96c53b6011369ecd	main	venus: serve the events group
+4d4b19f88c59717ddf569506b944149c017ecfea	f265650f727585244edc5656eedc6c3081b08adf	main	harness: a corpus that forces the shader blitter, before the blitter
+4d7047e3a8476ad7613e7f3ebbe1d5b8700cbb1e	d8d16c2fcaa0b274f95ede088b92e410e3610b8c	main	harness: a caps dump that builds against a stock virglrenderer
+4dd24dfa2da78174eb1b1c89bf7767a1145c6154	c4c77951eba0786e8af130c7565002ddb5b845ae	main	ci: pin the probe's Mesa and epoxy revs to fetchable ones
+4df3641b3be4b349f6eb5e750ad77bd0a73b3ecd	f0309bb0cc39fa1264cdc0ee2d253a2bc55151a3	main	docs: the glTexBuffer guard is decided and landed
+4e12139400880b193247a76da0eb90d6afbb7c76	a612d1415c576e2a53b2d1a05b912dbd474a3d2a	main	venus: witness the one line that turns a budget refusal into a dead context
+4e35befcb320f3a2d999a80bef632883a1c5b7af	445e90c4cc9512ee43ae2e609185d8f5448529d3	main	venus: a string is the one wire member that is not a split pair
+4e5de9bce233e07bc9194acd78b74e76904d2f74	0337dd5758327ed8a39f3aeb2dc3f69e7b241931	main	venus: a journal whose entries die with what they describe
+4e8a8260634a359e251859489a192408f9509f26	99dc6079207a4ca995a870d21b8f36ef25bea761	main	budget: give classic a payer, and the renderer the ledger
+4e9fe9f6255db9f0437b68b5cb84d119ee8a9e46	7f4cc307e10bee90c200dda0baa3c5fd21f3cab4	main	venus-gen: witness what an array accessor hands back
+4ea0974ea076f2fa8922b9f87d63cb0f9751cdaf	f8ab5e817fa4b34a5d250e8d2484fb6923d9ef1d	main	venus: account for the host memory a guest makes this process hold
+4eaac43e2b901c99bb7b711a19b153b0cbf374d4	bdd01725a2708c90b8d49dd3a524b32573ad6b12	main	venus: allocate command buffers and descriptor sets from their pools
+4edad1f5a87f685b97e74ada965203c970fa5203	57a190a73880146782ea055c908f7f36daf01694	main	venus: a buffer's size is the kernel's figure on both export paths
+4f6cc91b1ccfe68ff97f6891566b6f03826aed31	54a01e3d8bf5664535e8b648e749d7365d1ade70	main	venus: a string length the guest chose cannot be padded into a process abort
+4f7842f000ab367aa3e9d4b736a77de4282d6739	925fc7b98d9b9f315cfe6e21615695b4b207e8ee	main	ci: make the probe's KK step say WHY it found no GPU
+4fbf425cdac77a42f1f25bef9bda23659bca7225	4a8e8b5b4ef50ec71fcedd8ce44c9eea40fca7e5	main	vrend: do not retry a conversion that cannot come out differently
+502c165c63c78005fb4e8bb20cb56bd035b751db	392dbecfeb42c82116d33bf903aa74b8b8807014	main	venus: say which device a deep object is destroyed on, and prove it
+50319bb712afa63d5e4a6a379e2968c448014948	00c83d1db6318a368da7c5fb442aa6a326e23ab4	main	vrend: back a composite decode target with a two-plane surface
+5066be92ae29904de90d40b4dcd2cc9da2aaa199	4242bb86878dca3c99a6ec92b4dc3b235bca1131	main	venus: name the host's half of the pair the guest already names
+519234e8eed655b869763f5bf2d5f16e3c7ab145	d6f597737ade0beda8c15f7c67d4f323be9efcae	main	harness: a golden match is the vrend verdict, not the ink floor
+51bb1f82381c51c216cc970a23a17227ffdf0086	8aa2de1b7b496754214115f6c3d4bdc1b51a8fe6	main	harness: the symbol fixture is a floor, the layout stays exact
+5237cbe45f66f6a7bc263f7255c4ac8b3fa60c01	8c840b3025f88d1c98c848eae62b3c6ff7ad0210	main	virglrs: the venus capset, and the vkr root it hangs off
+526481f2b02de0fac0bdb5f77c7b1715e3a3be7f	79a52c65c805699e79159d0f8d8117285d89f5c1	main	guest memory: mint it, not just map it
+531f83f05e2a96d5951b5f53a5367ab59843275d	b38105eb8bd0d82ab8416c250526b7cec13f1a88	main	metal: dictate a planar surface's layout instead of discovering it
+533da7c1f78cd4818875b88920ec3b3bcab71fba	289878b7d9cc19ac84510fa5824866b3eb10f776	main	venus: serve the feedback-loop enable, and stop aborting on an entry point a device lacks
+53c752a7c670bede3d32eb3fce66f7b3dcd2533b	88044bcbcafbad62cc0a27e352a192db1ff8ddbd	main	vrend: let a second thread bind a context of the share group
+5422c6b88f2ae12b3af8d5adced6047360fdad59	78b4abfc67a9ed340666dd82e0a293eceee1cfe7	main	venus-gen: an array parameter is a pointer, not an aggregate
+5439430a628e48667e3818cb156783e2085c9515	6527db6aacfe1947e14c47291702eaee48462c9d	main	harness: record what drives a video workload, and stop hiding the decodes
+545690c47d18ecb1bf805f57e5a634878400b143	0f60d11465cdcdcceeca0a10f1d19c63ce97cd47	main	test: run the GPU tests, and hold the constraint that kept them out
+546cbf55a1417a7662b75913b39c4564f783ee69	8568cc754d0a6fa37fc20e9310ceb953b8cb75a6	main	ids: a resource handle that cannot be zero
+547291863c8fab49095a08fedf92f35b537939e7	dd9b0facf8ea3ded9c2717b636cb0e8e516a2947	main	harness: score the conformance vectors, and find the rig lying about rs
+549114b1bcca33eed23e18a511e09533fc070c31	7ab86abace05ac3aba8a27fff55aaa792028cad7	main	venus: give the oracle's two failures two names
+54f657ad130ef90f959f309f1afbaf9fe21f2448	024cdc0d54cfd9896e6873733ddb94096878dd4b	main	harness: catch the C leaking a blit's texture parameters into a later draw
+553eec96997c80d1f710ccd5901c2bdf820db29e	7e150cdf13be7216704e34810602a63a34eaf037	main	vrend: the EGL winsys and the GLES bindings, generated from the Khronos registries
+5606691b6c01d5e5500d6504190f70c696c2ea0a	7cd13c2cffb69d93107ec3c133c9bce06522df50	main	harness: free a resource with a surface of it still on the framebuffer
+5625040f17d99bd2716a3e074b86578ebf3054f7	89caa399883188a6ec438afaff16f1c15cd4b101	main	ffi: hand the guest's buffers to a closure, so the borrow cannot outlive the call
+577a3be5d07bdb757404fc9026c61e0f4bd1aa02	71a80b7a97ade3b60b34584166032cf4f01f6706	main	harness: score the scanout on a host that exports its storage
+5791eb1f4e79daf455522db73f30c1ee98becf34	e509d412d88085df9ccefe65b831b79d8f043fcb	main	harness: gate the resource a guest allocates only when someone types
+57b072ddf8102dd9b73d1f383081b11119c7826f	891f65855c22fcacf8550b074c9ea40a2714df8f	main	vrend: bring the classic renderer up -- resources and transfers on a GLES host
+57e7778c8dd4dcce670c30f7a9197b2fe3e9a451	d1feb8827726b1a7dac1017afa72bba5f04cd7a9	main	docs: venus has one leg on Linux, and say why
+57fd10657846745a801c22d41998d24f63589f2f	7a220d0dd9cb5674295d9804caa94291d5385587	main	video: reconcile a decode plane's two pixel sizes where both are visible
+580e5b1de7478da227139a2691bae2cc96769c23	429e0378409ad141ab5489bfffe3feb40a80ded2	main	venus: serve the fourteen simple objects the corpora ask for
+5838024256942d9059b18c06a7ac326dfbf1fe53	1166fd592e43567cd3fa0e6759df2c4bbff75038	main	venus: report which commands a corpus asked for and this build refused
+58613ed1c58c162f21fd309a3e7f999fb2ec0c13	486abc679b50abbe4ee9538cfbebf1933bdbd3c0	main	venus: a query with a `ret` says no in the field built for it
+58a29c9b1ac982cbde7f76a90df3bc8a6b809b9b	0ed4eb7639996b57bd6a0813b94edce38ab7298e	main	venus: let the journal drop what no export would carry
+58c4b55d489a5c121bd4084ed9e8bff7ff3a8261	2332e22044523029ff22eea083ccb8d5d7dc3a5e	main	docs: the classic drop-and-log item was already served
+593350ecf230ccdab11db9f67cf3d6ab6b5eaaf3	94572f596885bd7f5923976634b135693ebb5399	main	vrend: a knob to price the ctx0 sync a fence takes, and why it is unresolved
+59bf7e4ae4b489dd992db921743f42a76c14bdc4	e48317b72df1304b35f2406e1b29f677d236cf15	main	venus: say when a capture read back nothing but zeros
+59f82eb2ea651e19921be95f43196bbe3a58b60f	6fa3639c2b8b21c870dbc462242c2e52481fd188	main	vrend: offer the composite planar decode target
+5a48d1bd1b466622423c75fe254fb5d6ee3beb43	13b6e43f1b6a1cd2baeeeec2231580db725bf648	main	vrend: record that the reimported texture was checked for a channel swap
+5af9e8fd99867570823a30a8d5f9c99abbae1ae3	f47b52a2107b9d32ff631e51e90bac3474fe93db	main	docs: the GL client on the Vulkan compositor is served
+5b2267087ea6f3d87b07d4ad8dfd05a97f4166ac	aba42740aeca95377f57ead9ab3913c07fe5ffcb	main	vrend: finish the context that rendered before a scanout is read
+5bc29de95b30affee49927ef07d5a132cc0d114b	f8fb79419ab40a9aa62f769df8962904da32966f	main	harness: check sampler views, not DSA states, for the resources they name
+5bd076303418f4adabd1b5625ef8aab1639c0eef	cf342831345bdfc2b0d404a82fd601e3b5cb92fa	main	venus: write down the commands a guest may send and this build does not serve
+5bf658c949740524771b1ca7152955e2867dd94f	a642aed5951c10b9f3749268829a65ce092c2685	main	venus: serve the fifteen commands a frame is recorded from
+5c2f19604c98a4e72ab68289469ec4fd3fb3f823	d34b8a7487bc8e9915cc4795f29778668b1bf9dc	main	venus: stop an array accessor offering a None its command cannot be in
+5c446354736e644280116c48598adea14329e9dc	dad5dc6058abb983661525ea9f67547c82aeeb16	main	vrend: hand the VMM the cursor's pixels, so a pointer is drawn
+5c86d9a80c2b8826f290761015cc32cbc31ad6c5	f5cb3399e4ff5bde5de0362bfbb5e218a73a188a	main	vrend: a render-target view belongs to its resource, not to the surface
+5d269fe8a1c12a03d2113987ce06f1f4210d3758	0559bb8bbb9e053dc8aae8a1642d4a9936d6b927	main	harness: let vkr-replay.sh take an explicit --renderer again
+5d7f4dc364d9a3d24ca8601c440579ffa8320da0	6177b275ea81a9b64c35afff5e17e23e5a33368f	main	metal: a scanout is minted in the order its image was created in
+5df470f95b087e5240d896c79f5e9afcbb279fd8	433eba228553c743f4aeddb12c5cce02fd332f49	main	ffi: one ownership rule for both export calls, and no silent narrowings
+5ec180e2282a7703ad6fde33b4077fcbf52f41ff	f73edc2e16fb8f5046f8ccf732a04583848a0627	main	vrend: make the attach that clobbers a guest's bytes unrepresentable
+5ed1c24b4b98331b8e0e937f5c58bddaa79d7787	cf64afc90b90316d3b2ef450491fd35ee0a7f8a2	main	vrend: read TGSI text into typed tokens, and print it back as the C does
+5f4fa4ac04148e4248d81c8a46ca6a6ecebceb37	506c13673ad8b996f3d5a476fcae4e9706da8cd0	main	venus: let the driver tile where the storage is its own
+6141c343f336812afd129f523fe272b1070df7a2	ad5cb6f4e1d3b1444fd678ea49dc7bac2b7fae72	main	ci: ask the paravirtual device which MTLGPUFamily it supports
+617413333656241e7a1075baf2d5e4ccbc089447	9faabd1421e006656816a7d9f032aba9c2fdba94	main	vrend: a handle names a resource or storage nothing has typed yet
+61a1db51d681951f5ec1083cd3ad887c3b153d2e	6806d398daa01394557cc943bbcb7652cddf450d	main	venus: advertise the external memory the Metal path emulates, both halves
+61abe500be5749a364b863d6c54084506caa2fe2	deb095baa3042d3ba867df7866a471a08e4261c2	main	vrend: split the fence's cost into the walk and the sync, and by hop
+61dafee09eccd66b38eed306bdbd8b7c9ad71a64	ce96f6f300d0bb8f6f74da71a42a48309410e07c	main	harness: the plan to rewrite this renderer in Rust, and the test floor it needs
+61f8a3d6d8ae7a85a45acbdad31b75c22c1c2357	1c38a599ae9ad5ef510dbf4d47a64413fb65cfbb	main	docs: book what the minting work left owed, so it stops living in a session
+622bf519c9bd0b74deeec1a79e159ebb9a62e091	152afcf17760d37b9cfe15e947e068213a4d1d58	main	harness: teach the four scripts the host they are running on
+630701a80dddd6239a7a1358d275f1938c18caf6	10b7db23a26c010d5aa6b22bb0d5f745c1fe1ecc	main	harness: the census zeros are the declared exports now, not every allocation
+6338ca159dcd1eb74056eb068a81e29bb53fdab3	27fab2dd7ab863ce0c568414de03ec95f9e64074	main	egl: import one plane of a planar surface, in that plane's own layout
+633da4677eab57a198c2b237018d812f11656917	b0c007f0bd61dba33ca2871fd38def3b39219182	main	docs: comments say what is true, not what changed
+637802bffc8a395c32edd87cc60ae58fcf700232	d7cf8963739f24817138ad868659c6faa358f634	main	vrend: charge the IOSurfaces classic mints
+6379dc0ddba309392bacd22ab9020d9d0dc25fc5	14fd69966366a8b765f63a14c85144d3245f85f7	main	docs: the scanout gap is closed, so say what is true now
+647684ced9ca7366f01286ad2087b75d350a4c98	27883eb3357722fd75940ac15885be067253e43e	main	venus: name the command that poisoned a ring
+6500022569ba24d660cad3ab90700f120ad3479a	585568049cc36add6f7297d4800e2205b312e8b4	main	scanout: read the presented IOSurface back, so a headless boot has a frame
+652dff65fe7089aea2bdbc693cc070f747de6ad0	9e6922ab98ec64c9012245b1558d21fd27008f63	main	venus: give each bitmask its own type instead of 87 names for two
+66025c794ced8d8b1783d3bc9cfac2e0f9ca5fa5	ee44a79b3fd0eb846fc52239a57056bdd8939146	main	harness: re-pin the caps fixture from a replayer that registers the VP9 decoder
+667ae6c9f1a8f04fe24d4f6a49c5519791ca51d1	d4e09c68da0b23899f74165b6b52c97227c9a485	main	abi: answer get_iosurface_id from the surface, not from a memory
+67152460a603b6e5435369251012c96c1bc28ab5	a3a7c17084d4b62e18ccfa05f210577ac9f820ae	main	vrend: a program delete unbinds what it deletes
+67714fb5e1e7f271a98f4e9cb257c5c3f0f294e2	5a0bb1d8d9a77e248a508b6baa99ebb569eb91d2	main	venus: one slot per object id, so live and ghost cannot both be true
+68ac4fc3b5924977516e1cebbb820317031a781b	ae8d1be6dea0c9014f8ac341d2b17da1421dbccb	main	harness: replay a workload that spans contexts, not half of one
+68c05feae24d832b344411c4ef1fcccd12720600	d110194e67877746f1d40c73ca26c4a07df6b847	main	vrend/video: replicate the frozen picture into every dropped target
+6926251bb1f96da2ea921ab89da15b86657a2b6d	0fe94519704c836f7f1095cf376a69c994e516e0	main	venus: an import holds the storage it resolved
+694ee93215db24fee6b91caeb274f3069d13a5f5	37c97c791e48c89560b753ab7e430ea4eb33b714	main	harness: tell the result page from a test page by its pathname
+6a69c6f10d43b5ef36cdcfc37496628c9a9eb1df	9e14c10ca805d256b93ad013a2f6666ad2bc6b7c	main	venus: the ring loop, as a thread that owns its ring and dispatches nothing
+6a6f7f042a08bc182cf63a1bdfe54f8cffcbe537	1d2dfa543abb1e850cfbf983a49cf5121fed7c4e	main	harness: separate the two reasons replay cannot score the ring transport
+6a7b899100bc7bdf61d20f330cfd21c7be756516	f6258ec9c819e360ff13a858bedf9ae50abd1b22	main	renderer: trace the other door into a scanout
+6ac319c92f3d76a958c7dae4a40d8ce215a4cebc	3b2165cc685b132d5ae2f6b9f88c4e74f019efae	main	venus: advertise what this build can serialize, not what the driver has
+6b028b7ecad1f96d6672a63dbef9c270bf2d5fa3	0d50932e2d40af2ab7043df4b2c8a2d3ef31ac3d	main	vrend: stop advertising the composite decode target this build cannot back
+6c8aaf2844d2e0903854515edcc887efa94cbafc	cf2cb153456133603b63a9b82f85d0a446aec946	main	virglrs: the venus command stream, the trust boundary
+6ceb2caed87322922c7dd1fe19e1b05f004e3ccf	cc30de8dae4fcb035894a86338dedb12468b273f	main	venus: resetting a descriptor pool frees its sets, and the table has to be told
+6dd6dec1268e121305aafd51d9a3bbe477ef8af4	46761cd6c588257989e60153688b992b0b3f300c	main	vrend: the ctx0 fence sync is free, measured; drop the knob that asked
+6ded116ad5c15cdc0fdbd2b175075b39aa575917	d7866b307cefdc53528f6a5869519b385a70fab9	main	metal: mint the IOSurface a scanout blob lives in
+6e1c4c151060be7023766cb57c9a4a5e358658d2	c12bf92685e8656a5abd36f1a57e26c67598cc39	main	renderer: return why a blob was refused instead of printing it
+6e952f194ac130612edbc341b287e386f0c9c086	1da61ea3f02de60b3608e213aee11eebcbb9e085	main	docs: exportable and presentable are two questions
+6ee9f616dda360d4c5e85a148b0204e220767b1d	1a3c8e0f734c9ce0ac1014af49edacf36bd942ee	main	venus: own the driver's memory instead of substituting pages for it
+6fe7057788e85ab454877136ff61904ef41cde08	5971b92d1257c67be2921c261a498e4846ba98a0	main	video: decode AV1, hardware only, refusing super-resolution frames
+700f096e0358b06af7a8d77fb648a2ec17e2a254	2d6076e34f6d3708cec83fde99f78caac82341b1	main	venus: three transport facts that each change a design, established not inferred
+703450861a703e3110717b73181034d4f4b9d258	b78b16719b4802799416e317ad972450692d1dc8	main	Give the twelve files that never had a licence header one
+716cfbf8d7b8da7d7f0d0e68a13b8ac5683e3721	0b2d291e9adbf75578172e2a6872f4256133867d	main	renderer: describe a resource in the renderer's own types, not the ABI's
+71f563e52b477ae9ffac8aa63144f56db9fca88f	faad0a6f239febc1184d5eb51c9248049b9b0913	main	virglrs: the skeleton, exporting the pinned ABI exactly
+73157eaf61c7521a7614bf5fff34527729942868	dd3608bc85559e81d2c2eb0dbbdd4f4117bfe42b	main	vrend: answer a feature question with a bit, not a tree descent
+73a57035f2900f24a3910be424a993d5eec13fa9	479a694aab42ee76c284fb40d7f8667ef7df1ac9	main	spike: the memory entry holds up on both sides of hv_vm_map
+73c4e1d29fce21537f733be3aae9c3c7001b00e9	6641d51fb1c399e67b19bd16432373b5fbc9b59e	main	harness: gate a program and a sub-context destroyed under the renderer
+747df157bf7785794cb7b839eb5fef401c884e20	efe13e8ef14e0d76315ce992a6e3a17107e7d2ac	main	tgsi: reach the shader fixture from the crate root, not from inside it
+74bd8278703c193b55c353ea9d6a236d20bee29d	b39f2f6fce6dccb0cd40a7c4c2aad9d990f75013	main	venus: back memory the guest means to export with pages this renderer minted
+75c9189d5b7410991533ce2c68098154ce71847d	b262c1bb7b8a296f4b182a5f109145d474b16643	main	virglrs: spell out the type names that were abbreviated for nothing
+75dc628f0b14a730fbcb2ea587a4d4276c8ed49f	04e2ff635a16033352baed04bbe66ed81bf31e1f	main	venus: close the five holes the sabotage sweep found in the transport witnesses
+75f87d09dd94e8e6b8f1e3574da061c31d9900fe	ed5c9c5ff39fe581e9e1e9447b6e2f484b21925c	main	venus: create an image the guest shares with rows the host can address
+76efd9fd7ec107025db89056331f65e87a4553ac	5037aa8b51119f5a9ddad5021d47761d35502b3a	main	venus: carry a context's sync state across a suspend as what the guest asked for
+7818ebd6920bb5c00d082921d680a38bd67fce27	ee73af3997c2b7a7b260cd13c37788748dabcb5a	main	video: synthesize the H.264 parameter sets
+783701e11075bd3ff684d6221edee3bc8fed952c	5bf261604fdb5bd1c71d494d41431b326e37d77d	main	harness: a capture rig of our own, so a real guest can feed the corpus
+790aa82ca8d6880d4f6ba84ea80dc6f563f3e03a	a93edf9fcc4dfa04d2ccfb600b5327b550b9ce0a	main	venus: serve the four host image copy commands
+7931b574a9b32afc3669c770a8e9ec9ca28754df	5d1d2c074e510d0d4149b97c89a9d4e17c9c2e0f	main	venus: carry both halves of the (guest id, host handle) pair to the object table
+798b0ea5601479755876f238a8d2d7421bf7fb9b	ab7bb0f8b49458333630bc245dda3dfd53a2c5b8	main	harness: gate nine corpora on Linux
+79b1314495ee7eac25003fc470a8c136bb3efb1a	abe24b77ab455dd2fe8b58be211fcf616ec0503d	main	harness: say which blob went unfed, and when the cap bit
+7a84f74fb64da7c85c0654eb3c5a24508d9e984a	17d41790615a45d8ba018292213ec81a8b2ccd46	main	venus: say what a line on the ledger costs when a guest reaches it
+7ae9a9a6dac9a767be8452d94aad402c277bff12	74cb2dd851c5c5b45af067ddad9580ef18a9c531	main	build: ignore the machmem spike binaries
+7b751617d18ad7c3aaed30d471a36ca6efac2ca5	5c6dff8d69d0f3f2d28ea9774ebaf306f54eb62c	main	vrend: a program has a name and a uniform has a location
+7b7901b93012c3ab5f61571cdfff9535b897b8bd	d156622edff6fb73ad8543b5b13ba128bf4c934b	main	virglrs: generate venus's dispatch trait, the renderer's side of the wire
+7bc77163303725d995f3c67bbcd3a8df8a4373f5	8f25629d3fc70bad7c383ebb4a77d1bad6fd495b	main	docs: there is one AV1 decoder, and it is VideoToolbox
+7c65f0fd632a45d20bedf4f339baf6d5777b5e4e	8dc2589a058380687eab9a2a0ecf721ba57c3244	main	vrend: a page-flip finishes the surface's contexts, not every context
+7cf3972fde5e9e2bf5a7fb6b31d77bb429675801	f74323efd447c375059d1e7130608d95d7c15dbd	main	venus: name a recorded context by id AND generation
+7d0d3f2461c5413ad29e087d204eeee9f8fbb62f	e8358838f3529a30a3ab12b905fea8464435fb2f	main	venus: refuse every id a failed enumeration was offered
+7de5b5ed40f5c8a5ccad3bc1579bc237911acfc7	363dbaf7dcca6c96d9bc467391bef43d6bd5e951	main	venus: swap a device group's host handles for the guest's own ids
+7df09455e4e36054833e740d5e49f767ea134395	a18fcb848a38953c037037cb4b00ffd2833ca401	main	vrend: a ceiling on the sample counts we advertise
+7e9f238022c49f5dc7a1dc2901e115235053a680	1eb86eebef631e70518e08af565cb889cef4e6fa	main	venus: serve vkResetFenceResourceMESA, and own the fd its export leaves
+7eee0f7fd8dffe4ebc77ac169c457db357a462dc	d8aa5e4a486d80e4a40119c31c2472709a8239bd	main	venus: serve vkFreeDescriptorSets, which GTK's Vulkan renderer needs a few frames in
+7ef391cd40412a0c699c1ded7c93bc60b73f40ef	790435ef3e48bead333186dff337df8de33c153c	main	harness: a desktop corpus with its wallpaper, and the first pixel gate
+7f0589a72d51af990000b57b22441179c3a4f909	d1d8ae472e0c061e3c262635ba43cf60314b51f3	main	virglrs: fill the venus serializer's gaps, and fix the pointer's wire width
+8029524dcde8a831d1c4ca768b75b451dc0aebf9	6d222f5849aab64c634f11fe83099d751ecce719	main	metal: copy a decoded picture's rows into one plane of a surface
+820dc73b971225d3bb8b8ddd8597b864ed34ab24	34c59b22118652d49bb1a742e2678b916db44aed	main	venus: let a recording name its buffer once
+82c358f1f624c72d1ed166f9ef80bcfb399024fc	8a973d5ea7dc0a82dba8407f0d6e449862d9b50f	main	docs: P6 is done, by a shorter route than the plan described
+842a03ef9e98554a38f1435f9139f006015fce20	6728ba1d17531e8cf306c66405225cf453c36360	main	vrend: only a format a display controller names can be scanned out
+845f810d3bb989a8da4e5c5e470f487e396268bf	3b4ed0c90f8b492e42cbf89e77f3b7a16e7cd4b4	main	harness: score AV1 decode against the C, 400 pictures across six clips
+84b63331a4913b67bd7a049181a898745ed19be6	9495e2bb688a9cfb75eb8528d0b97979d4c93c79	main	venus: wall the command structs' single-value members, as their arrays already were
+8535a879360e38e9451a3a3df09e708a94244f1a	eedd323e306c02336c8d356cd9ed2aeb57131a4c	main	vrend: retain the video creates on the records they create
+857bd2594769efef059377fbda3fe2f53fcec075	191d5a43472dd47a57b0e56d4905e69fb8506f88	main	venus: a shared surface carries its own charge, and outlives the context's slot
+865f1f68c15b5d74373315849721febddfc267e6	7db92104b3731183d7f91aa43eb780743bb71f3a	main	harness: rebuild against the resources the context could actually reach
+86a0a957a370ab482a64326eec91d0ed5d76d8c9	ec117961c76f41ccafd21b407e72849ab4040558	main	venus: an array's pointer is not the handlers' to read
+86f58da4c13360ed32dfb9587fd8cb0190ccdd92	9cf087176cfc04f148a23e6b272bb3699beabb85	main	venus: let the memory ledger name an occupant by the key, not by a count of its own
+874936c2ecaf5fb4489bd38243ff88ff7cc8db93	c2204fc1db8ba065ebf94b087cd9e50695cfae62	main	harness: score against a fixture recorded on another driver
+87f8e8127073d10576ef10816aca529f7aa8fa89	4aef110aaf4fa30924e13a5676ab1a893b19e235	main	harness: name why the Basemark scores cannot be fetched
+8826e9ad38424bcbe30e5a1e2d1b99effe3aa89f	3fdbc324a87b355a9e5e5357a5222dbf68977b7e	main	harness: record the aimed numbers the fence fix leaves behind
+886f0d8d45b0c3fa5d83324bd033145304e45db7	94c1f21371282af98f63392ab4b113a775a19e70	main	build: optimize this crate on the dev profile too
+88e77f5ca0ec871a0d9b0c4e0016f58bfb68b7c8	aa6d14bf4db0ef1de5cc624b9b70e6600524b9e7	main	vrend: decode the classic protocol, and prove it against the guest's own encoder
+894b36d9270e03ef176c530556c256eae4c39f0f	728e64c3b849dc3a7dd0d2d27e7ff38bc76de6bc	main	vrend: make a classic fence wait for the GL work it fences
+897d1ade96638d9959a7972dd1aa56bc53ac79fc	310ee626aa3ec2114cc7bcb20989212f5f0a5efa	main	virglrs: generate the venus command layer and its dispatch
+8a1acc2d2502076f0377380c39086b401068461c	112e3fd30479bb235ee2c54f4e42f6cbb864865b	main	harness: the venus decoder's differential test, and the four bugs it found
+8a1baef435f392655450b326f1aa07ccd9130cc1	4dcb4f7339c455a17b8261038c50631b4de2be9d	main	vrend: put a texture binding back after filling a blob, don't clear it
+8a58429838c55c9d2121d56012ac68958037f065	6a09aa948922be2f3e0449f1c2a49038c3575d3b	main	vrend: select each shader's variant under the key the bound state makes
+8a893f4b0ce1c6c1210842a3247461f4253b43a0	b5e043e84e0140376efca85a03d87287dae7da0f	main	vrend: the IOSurface scanout, closing the no-draw gate
+8aa9be25eefe971d7d0e9ff7d99954dadc927c4e	beed4fb3f551e225e39cac22342f5473eac606d3	main	venus: put an allocation's captured bytes back the way they came out
+8ac00b6e28b6b55b73f77048b0f79ed2f9e6b31c	b9e1fba9f892f5677e584d860bb454212502c9f7	main	docs: say what venus_memory_export returns now, and stop over-reading the zeros
+8adbb41958516f79a433e24a3ff18e12747bc5fe	b0287840bdc6019d6922636552d4cef48cdd13c4	main	venus: serve the sync loop a frame is submitted and waited on through
+8b07211313f73273df4a4563fcb5e177bfdf8e3d	31b6a6707b3f762913702056f4c15530c79f869d	main	vrend: a surface destroyed while attached is detached with it
+8b4813953e1c5ebbbae1faa988e14948b37d70a1	f31668ab8d7785b260a61de58f0ce17f2564051c	main	vrend: serve the HEVC intra slices that index a set we cannot reproduce
+8b5858f8d234037995ca7814f6b6fa06c7b9f859	d69b7f87797faf6936be8aad5e73ccb1ad91bd06	main	vrend: the shader blitter's colour path
+8b711235ddc4c0f81a2adfe620559b7e922900ba	efa78eab0ab45a4d84f3fb8887cd92f92386d099	main	venus: give a validated array's shadow the same certainty as the array itself
+8c10b36339f9c994a161cdfa33f5bed5603295ce	01f47258169d5810c46aafd993dfcdfe6d492ba0	main	venus: plant contents in a reply's outputs, so a swap has somewhere to show
+8ca7fed54ce5477febdc932aec9b35d2aad62249	130c80cdea7dd30d2c1247ce0af92cf5a23a3a24	main	harness: re-pin the caps fixture from the merged C, and name what now differs
+8d14dcaadda012788a7ba49b4deffd1a722d2aa8	d281b5b4fbb837634dd073838f2cde9d4074be2b	main	vrend: reconcile a blob's layout once, and say a refusal once
+8d31c3a20ec1f0907829b9eca3033644406b156c	7e5372dc3457640cda1cd777e787ce0a5b3fe616	main	harness: capture the bytes behind an imported blob
+8e0c69664c25caddf1dedce38f553b4fdb25e7d2	47bd36e8c34cacaab91db066ad2dba4f2d022a45	main	venus: build the pipelines a command buffer will bind
+8e58a03381ed71020766944030de80c5e2df26e5	81811c90ac52b8bf6cc00b06176fdc641cce8a40	main	docs: the scanout leg is not a platform, and say what it costs
+8f62e72c30fce7725eeda0fe7526c9116f336f2a	2b27eeb58250f651a0e5986860fa5ef5a796fa67	main	venus: a blob is an array whose element type vk.xml declines to name
+8fa913825d40e18b4f25cb4ac83e307a0130dfc9	7b6f3ffaffa4b8e178cf61e08ad25c0e4c7c41d9	main	harness: pin the remaining ABI structs
+90cfa33a02340d78060037905601c7fb27868e70	7c85f2983ad607447ebac080d898894262cbaef4	main	venus: keep a ring's published virtqueue seqno across a restore
+913e00efd1066a8fdd5353877efe09a1d3fd3dbf	03c45ab39b57d2182645484168ae046e3f0ce533	main	harness: count IOSurface-backed blobs in the venus score
+914395ac4323717b5b56efa76086d651f35eea4d	1e714d7e91f10e741189d2e554eb64cddeb73857	main	venus: export the driver's storage instead of minting our own
+919decc948a0695dfdbd17828000561881e8c63c	2083fc0fe35fdc928b86fdf97ebabaa2ea85f62a	main	vrend: read a blob's pixels where they are, instead of blanking it
+91f7c74caae4c265539c5f56cea30d04268ea3bd	3f71bf6938b5eadf0c0ee35e2b4d590f8720dc8f	main	venus: prove the exported descriptor was closed, not that its number is free
+927d904175771cb17da18ab7a526b9eabb9d674c	ee44a7077438ba4d85369bd5f63bc0251214d69f	main	venus: the nesting witness needed something to tell a refusal apart from
+9302aa429687000f9559efd23404e5f2811feb04	d20a208d61410826e8590ee9880c26d01628c672	main	venus: re-cut the unserved ledger against a Linux guest
+931c04c0f000fca13a9828dab408f0340e6ae783	3e7517e25fa94c2794434b8f7658b595e60ab052	main	venus: every query index is held to the pool, not only the read-back's
+939337d1b3acfe9f7d6445c2428c6c2e60381558	9b86d43b0e807863a49823648f94467716a583e3	main	harness: zero a new resource, so a score line is not the allocator's answer
+939c84153cda7954d0c7c15f411fd58d3fa28b83	d9462bc0864f677d5231be9adbd3075f3df51005	main	harness: arm the fluster gate, and pin what both legs decode
+93c0261771d7f7979a276ee1734e2e21ae64ff61	e62ebe17976bd4838fcdbf4bb5301f6596af7e7c	main	venus: run the command streams a guest recorded, one copy at a time
+94a38e3321f8d81bf676cdb38fa68cef4284a454	7ca2129080bf13b64b1789ba62f335879ba4967a	main	vrend: say the storage refuses the view, not that it swaps channels
+95557bd94abd1464ffe03319965d92e9f2eca0d5	666bff51711d5df30b7f21ade3ad11aed67a0b9a	main	venus: ask the share whether it is held, not the resource table
+955b6b069036ff89d370d1247b92a9e85f9a78f2	8c2e60a61e0432c9081043a1b028dd1de5a543b0	main	virglrs: make the crate cargo fmt and cargo clippy clean
+95d9ee84c0b7d51f05d3ac43425d839287ee8e84	b446bb73d7466dfc8211b4bde23b5e07c765bff3	main	docs: record that the MESA resource import is forwarded, not translated
+95daabe9497a76a847727a74990290384bc86bbd	c16a8510222d1cddd79eff896789553b8ed710d9	main	venus: a declared export gets a descriptor, described or not
+9679a06fdd82cc874c79dd37d33664a6f5836dce	c41ee9e4315cad47318872ce3c4cc4077e2c070f	main	vendor: allow a local clone as the source for the pinned C tree
+96ad6c5cde20ad96e2cc5ba884ea535f58799ab7	32d010b7310dd3f25099b5cc3adc7389ecc12cd0	main	venus: serve vkCmdCopyImage, which the overview's blur asks for
+96d6cdfcb59cd0aa2d314f9cb2b0693326f178fb	ce444e6c94d381be61b96b435969c122d5963f74	main	build: take the reference C renderer from a pin, not from the parent directory
+96de39840fd559adc37a3b8e3b51ef0ac3f46db1	1312c6b28ec708a8c2d29604655b29b8e9d0fe7c	main	ci: give the probe libclc and spirv-llvm-translator
+9721bddf74304937b7b447ade11c48ce375606c2	af0ae6687de6b38a18230444d25229860860d052	main	harness: witness the resource size that travels with a published allocation
+98472a0270bbc383fddf64f4af0debd7ad85d1c0	956ae0858338cacbf7f3b153e4ac2fdabc749e94	main	docs: scope the planar negative to what was booted, and name what was not
+991d3bf7a71a4f2ff5a257d2f3ac305e07e2828e	c8fde24c362cf7f4a1b954777e5345a3b05780ec	main	venus: witness the census names the driver's own heap
+99414bcd7023e36fd169c2f60cc0f65e6648682c	5b95f6e739a123c73c035c906fb7d1da7409db93	main	harness: pin the composite corpus where it decodes, and score both codecs
+99cb44bc5286341b8787b98b25bd1d6a87868be4	f729be101e706fb32730e1295769d27a1cf2fed1	main	venus: stand up the instance tree against a real driver
+9b650d8c99e09657458e3b04dea64b8333659b8e	a2b9e3472e59531d2a5d8168af06f14f9b80ceed	main	venus: lend the reply slot to a submission instead of looking it up
+9bfc277744dd3a9f9d1f004d454f4d06800ccebc	5df78f7c342e91f7fe79716379d9860b67f4b870	main	venus: forward the twelve device operations whose whole answer is a result
+9c126733ed662eec778f8b7d84ae7b9d351608d8	238a4ade8b65340a38d358f738eac02529fbca5f	main	harness: say why the budget's witnesses are its whole coverage
+9c238e072e0902753337ac6de0c620e48b53c995	a390f80673660f28d6a0a60eddfc244fb8765347	main	ffi: say at init where the GL contexts came from
+9c37e2c711a35f41c989a9a20b6af5c716ec4dc4	99931e3caca92d308d3b5f5ad03ec9ee826ad4bb	main	harness: write down the sampling cycle, so the next one starts at the rig
+9ce9a8731adb431308fdc720aeda152ae52d288d	53da417f18d94c3d71296c2f21849735a5049621	main	venus: serve the twenty-six recording commands the seated desktop sends
+9d384bd61c3e8635c6f32d67045bfe0848146711	9127d5889b764f927cca7343e847d971382ec923	main	harness: score the vrend scanout IOSurface, not only the texture
+9d6402ef84da89ee2f2a6a10f76afa82056429e8	a5bd2cc726ed9205179e3a626054b93868be585d	main	harness: record the witness layer that now exists
+9df6d39a281d85fb5d58da124f55c0ed9451f803	6aabdbf9c8f689d077212073809707a98a68027b	main	harness: score a blob through the address the guest reads it at
+9ea81460e85993c7f4a62e349654adc2f91749f8	ed355bd8dcd9fbea949c6c48b949cbfd7cf3853b	main	vrend: adopting exported storage is not minting it
+9eb5305d71e69ebb2c27d6137371cee265d63438	8a5ffa63093f7848bd96bccdae86d31937aebc3e	main	harness: make the replay wrappers refuse to guess which renderer to score
+9f29859c97d1027c6fc434ba3e6c38bacbd33846	77403b16049395fd19a298bb084ba748d05753a2	main	harness: score H.264 and HEVC decode against the C, 300 pictures each
+9f412717f5024ca0511904f6833af4cbd56dd42c	51511b32ff4de6db5b7d0f143ec0f4ea6a3bafd1	main	harness: pin synoik-glclient, and retract the ring flow-control story with it
+9fc3f9a4764931db8422e2d4ac1038714dd578fa	a790031202e83a990d8213d136c6848040726ba9	main	harness: a probe that names each command of the events group
+9fd84c290459be2f046d0923ee2edf6f34de0f6e	b0935ca526f56ca1a89430d670b52639947fd3e4	main	harness: the absent-out-blob sabotage fails as a test, not as a build
+a07b8bdb9dec7225808f8928e00220ff8778b689	fc6413d662bda61b5b10f4832bc4b241da921ef4	main	venus: export, restore and replay a context's journal through the ABI
+a0a626faa6511f3ac34838b25ae095eb7f1c81a8	aea2bdc5badcc1501f05f8a0bd7c731aa0c14a7b	main	vrend: give a swizzled view its own object without asking for a view
+a10793f407be4f500cfc2e4022b1abf1c38d8ae3	665eac9c26747591fd041fb66b5ebd4d25e1d918	main	vrend: understand a resource once, instead of checking it and then deciding again
+a10ce32fda821ee275147db526b00fa4e7142132	06619937c58c6f0e99f204bfac700bb77013671a	main	vrend: serve the classic capsets
+a12287531d14380306995818e6f0e30225cf6e0f	138fd47456a08a3c2423548799fe277f7b3ec883	main	video: let the AV1 model carry the caller's side of a held frame
+a1846b8acb6cb9a3075867ca59a983e695c89dc8	f94cee03c67fb2d0120b3e02cb7cbefcb0c8d45f	main	venus: an array stops being a count and a pointer at the decoder
+a18c8d566dbd6acf24c334a7539fff9453537784	f91a17af4b98fb094e7c819d9ecee8cd99dd4abf	main	harness: keep the three client workloads as scripts, not as ssh one-liners
+a1f0c7a02a965c5b81c3210622f99f59442010d9	9db3f8a3b468d5c2bd9e0f41a6e6c69ce6045fed	main	venus: a mutator is about what it wrote into, not everything it named
+a205b740592dc9adacf165b7c5dd3ed46a59ac99	15f9847d18f429df9495163c00e9dc55c36f93d1	main	harness: sabotage the new copy handler, both ways it can be hollowed out
+a241d0a1eef57e0dd64246903ad93f3547d55717	0644f8fa200d60695ae237263e366dec31ff3185	main	harness: look at the pixels, because every other signal lied
+a24bd11531a505cea93d7f705678b3fbe9f285d6	5276e3e1e0ae6ce53ebbffa20fc0f1a0758cd6d3	main	harness: give the replayer the same rustfmt settings as the crate it drives
+a2deee86749b08e53a5417ee1ce231e7808396f6	ba392e4abd0b2de374b2b6aac3b8017ddd9ed1b3	main	venus: serve the queries that only ever had to fill a struct
+a30eb7f15945306d7a7e8b4e743a8873a87b6ff0	62c4ce843fa32bb1095ffb68385421c62f91a6b3	main	virglrs: finish every GL context before a scanout is read
+a4287f7d327b60ed38129ce752df270a0c60cce0	1b9a05b8cd23be05e07bfc5bc3a131a3aa107287	main	fluster: let a run be narrowed to named vectors
+a43b3aca0cc04cb90d35743c282c9926c9f469cd	a617ff7481f03e51847aeade709f248238aac815	main	ffi: give NoDesc a Debug, so the tests build again
+a4530b48891a08991cb006e76fbe48654a672aa2	f9b4173880ee7e65673cb8c39d20fa82dd7d8b5b	main	venus: a free is checked against the pool that allocated the objects
+a46a0090bdfc040a8e66b63c4ab0a0023ffebb82	2cec6008948830fe823ea31b1e0081fcfe5dc5b1	main	venus: serve the four commands that put bytes into memory
+a4a90a705f3a802ebda8da9b655b265af9ba04ab	2fc5be5ebd8b9b04c017a93a1cf558a0c3864de2	main	venus: the budget's three missing diagnostics — census, watermark, name
+a4c9bb9d33d58e3836db4804b531c02d7729096f	507e0b326f31c5fe68c97f887b1ee790caa767c6	main	venus: stamp ALIVE for the rings that asked, on a thread nothing can stall
+a4e6d67445e46272839fff90e5fced67a99a96fb	0bc584c982e2a150022d1cff53265a2036ae1a63	main	renderer: take the descriptor an import hands over, and give it back when refused
+a5197d1a37663ad1133ea25cd89b409fff0b65c1	8da4ce32b344284bf9429440e4fe9fe88f5c0a4c	main	harness: the worst proxy is the one telling the truth
+a597d0a32a548d2218fa253082b6a78680445a0d	0d20cb627699d76c031705c0d10595cf7dc34b31	main	venus: pin the padding tolerance to alignment, and the empty array to its alignment
+a6aabe68d62ce273085854d4a307277b4e3c5b88	eda98826e9c798667365570e95a81b99bef6ca57	main	harness: follow virglrs out of the C tree
+a6d7f80db14b8d23ac46f19ed1047547f2d21a29	6a7af86eb7dfe5687984d055faa9b689a5cd1870	main	vrend: make every refusal say why refusing is safe
+a766e78e1f66d979f181969667516234f495e643	55452a65cbcbac31772451445355b117eca7b8a3	main	venus: an out blob remembers the room it was given
+a81b760c378fcd27515662f6031d7e843dd5c0f4	60df8872209a2a334c4df712f73686bcfed9cc6e	main	budget: move the ledger out of venus, and Charged with it
+a81db4e6859f4eedabcae1ac52bcc1e500d22bf5	8c2c0a9818416e33af06cace2dd7a221ea8af7bd	main	harness: sweep the design that minting left, not the one it replaced
+a8369f8d9768d7e51e8867397f45bc8ec3c9a42a	5b2d38fa04a97b5feb3f6d626a8e672535ecb195	main	vrend: say the surface view's storage invariant out loud
+a85fd4a595ed51693614fbc9f31f55afaba3cf39	b939682ac2ff5ab36f5f9210089ede257202994d	main	venus: answer what memory a resource can be bound into
+a86f6a93679099ea403c2d83cb4a2d61c4dfe249	7cfa372e1e3bdd2e9d8e81a948a34ad534d92e9b	main	venus: dispatch reports one verdict, and a skipped ghost is named
+a8a81a6dadb25d670c5599516c708dac80328cd5	5e1be13e6d5d0ae4165348a1af458270f6353222	main	vrend: a draw binds only what its own context attached
+a9106f53681c003c7071f5484dc256e0de02d40b	20826c621b50359283952b35e57a7bde2f73d71c	main	harness: record what each rig guest needs to actually render
+a994c911c6032c1b7ec241dbb0a250bc1c58fbfa	e62500c9d0c7652d9be4113da425d7305a3df858	main	vrend: rebuild a context from its journal, and say what would not go back
+a9f08c3819f471a41fb2d69ec4b463066bf40a46	08d5d86c5a831d760e2271b82734cba4cc4f504f	main	docs: existence precedes purpose, in both protocols
+aa2a8637d15d0069d337dd9b5c672d50c3a3582b	e24fb58aee7dcf666959610c388720c1dec7a219	main	venus: publish a guest's device memory as the blob it asked for
+aa7ec5f06b0b934d1b716b7652e58f939f85fcb0	3bfca3e9f43c93abaaf19ebf0d2439891a83d901	main	harness: say which half of the sampler deviation closes
+aac71c0030c6f8544bd9c191b6374e4239460e27	5d79005cf7972158ddd345e6cd37e1f559125cfc	main	venus: let a refused create stay refused, and destroy what a context still holds
+aad28d984754be0f084bfc350d67e434e00921bd	363e11b1c10cfe5c9113c3de9489336f7fb7baad	main	venus: a ghost cannot absorb a command the guest is waiting on
+ab0b6a38142bb112d29842cc84c38b244ca102c7	8f6fbe07fe51f9ea98eb729f3268605686f88f34	main	harness: A/B the fence knob, not two builds a rebase apart
+ab3695d20c5ccebca8758a9f22d8e4f8c771c0d9	75ec4689116c7de558c3e0bcf7b86d32613afef8	main	vrend/video: a frame with nothing to decode says so
+ab56f9d5efa8af30de078fd1cb57f75ff9c461ba	87fa2e382f95134abcce9f43cf43d2cb0a956a71	main	venus: serve vkQueueSubmit2, which zink reaches for and this build refused
+abb24fc993b4b4d23e61e9447a4598b0a9322a67	54ba84e2057d1ccd5e71ab87087e3c4b7c905b10	main	harness: --smoke, the gate a skeleton can pass
+abef6e7ee619777f13e183f1c8348118013a7634	1c0909d50264d6bf19119b7185c6442cc6e193a4	main	vrend: make state_key exhaustive, so an unclassified command cannot compile
+ac0e02d12fec34d05d77483747c8d224c11896e2	c2d870565ad59fd74d3a12c1e25433d941b29e89	main	Build on a host that mints no storage of its own
+ac9d2d8f691579e2728ee04908d10edb438d05b8	6d53e47b2f654e485870df08d8b26e7f8889c0fa	main	harness: sabotage the unserved command's refusal
+ae46e23e3ba49c5a1784596a1b60e4fb6185ccdb	3f9e8855d8a4f223a3ff922ca26448ac2d7a602c	main	vrend: skip a glUseProgram GL already has
+ae72c935583db6c507791dfa7df07c08daec37fb	854c200763eb0915fbaa5cf3e229426e7f7c6283	main	harness: score the dropped optional array through its caller
+aeb71dd5d3bcfe9198b7bbdbd71826243d2fce12	19bd43b548d8ca65139c532ef3b299660fd57340	main	docs: say how to run the tests that open a display on macOS
+af4d3ce7dd0d5ce3222b751d2370c6dc29473ba0	12a01dc151f4427dbc76d03c1113de7b93eacbd7	main	harness: score the venus journal as a fixed point, and fix the build that hid it
+af6a896bf773792589294aed6e4d164fe692f2c7	019fd807c4465e5b70cc4fdf5d589450d6d0c520	main	docs: put VP9 first in the video phase, and say why
+af999cfd229116d51f509ee1cf8eb760ba1bf2fb	e883f590732890c37b95304a6004534c60a9e267	main	renderer: say that a host transfer cannot poison a guest context
+afbfdf48efffc278e9f5b899dfeb5f503dec6fa2	aabcfabc815ee9bed84a1b2bbab3989ed7abbe98	main	harness: pin the C ABI -- exported symbols and struct layouts
+b21a1fb322aaecb84ed8db149809eac1b96187e7	a057ffeb0ae17f9234a57b82af721fa09fc91837	main	harness: pin all three conformance suites, and name the five it found
+b3955876bb00b91e46869d285192df54cd6fe067	ddda0306d1a0d5b9215af1992112a39c4a167bc6	main	venus: give a scanout its surface, and give the import the same pages
+b45bc2cf7d08f626683bea4459848144cb303c16	9d40d12a012f46342f45416781f807f777e23856	main	renderer: answer in named causes, and leave errno at the shim
+b4b3e020e13dcc6c28d1a67c3f30011d67f3d09e	be6280ae1761e3d8e43055eaff66b9c4cc79eb53	main	venus: one owner for an allocation, and a teardown nobody has to call
+b4b730d06b1be319e6771e0901796b77a173e2a0	d946cc187846f8f1523d43805150c4b7753ca196	main	venus: tell the guest what this build can serialize, not what the driver can do
+b51374ca46e1e725a6f697c65fd044424a5211f2	741087e8d7c282023e9de4a737ba3dd3fe39fafc	main	harness: check every sabotage target before building anything
+b52815d25381677ce8c236817282d0daee321ae9	24cf73e4696ad0538b24f9ed051b80c3a675c07c	main	vrend: ask once per batch which blobs copy, and keep the buffer they copy into
+b5446feed3f0582baff6fb373a2a144ba6469ffb	2c3c2f58c2f7ba13482637e9cdac104d7b5061bc	main	harness: the sweep passes its own cwd
+b56f0aae40f43d4b163333bf8477ad562864e7a3	53780b046fe6c152f820982d7fc69d1a1a2f2aa0	main	venus: derive an array's mutability the same way a scalar's is derived
+b5b512ed64c2dbca8b722a9f15ae0705ddbdd874	ea09ab43e39c407292510f0281c4b0bda21c6401	main	venus: refuse an import that resolves to nothing, rather than allocating around it
+b5bfc197f694a4f4345b703ccb445bfa5e4ef2bc	d1203b47b6ca379a50afa620ee446f807fb13048	main	video: decode HEVC, and the video capset now matches the C byte for byte
+b5e9f0208519e5ae3617dc46587dbc9177d7a82e	ba787eddab5c9e1d4808c086de16e385eeb18fce	main	venus: a failing driver test should report its own assertion
+b611372c534d3e3659141468e155927dcaabf16a	441f57f47b40b72f62f31f3a65cd29d7cc8a7ada	main	venus: give every stream its own place to be answered into
+b70650bd6c9e8c0966f06df7948789e7e4e19347	e6fffcc589ed6094fae026a505f236e7b85a9e73	main	vrend: ask VideoToolbox what this host decodes, and register before asking
+b7291029f2962abd53f2f5f7a3c17e8ed9038f5a	8474f5debfa75b89944baa670d581ffb6036b581	main	harness: pin a corpus with no GPU client in it
+b7b9026a05e9cea4950f32470c5949545fdfe77d	1a38501e5d323a05e48dd20bd6c7f9dd3214df2d	main	harness: keep the all-zero hashes where the rule that needs them lives
+b80967ead2f12a8f393af30121fd5627b5259c23	e9c74ed829b24685ab41aed57f2baab68c8d35a0	main	harness: score the desktop recording shapes, and follow the described-blob refactor
+b84d4e4b225c885792e86495b5c136d97f3a53f4	babf3856fe57bea80ba70d51b7ede4f3d33ace49	main	venus: the two prunes a generational key cannot do, and a census that names what it drops
+b85d64e3046c0f810a90acaeab87b12795e499e2	4299a81fe8401608032f692b865b8a04207ac8c3	main	vrend: say that every transfer route converges, and why it must
+b8bd04517173ae6645a5a0f3bd3a18bfb29b7cf2	a13ac9ee91d709c943619217b2ae1023f91bdfab	main	vrend: hold the current sub-context out of the map
+b9522b7a7ff0f95fb1f5e2b1bacd27dfe820a193	1cf1610607679d293f22197d53fb3896c4aa3df0	main	harness: a VM-free venus replayer, and three recorder bugs it found
+b9eed2aaeb7ec4230a51d437989270e32535a883	ad90a3dcc5e215730a5f554f5e3905b91b4881b1	main	harness: two GTK sabotages refuse the command instead of breaking the build
+bb35d089c9478997c83a62c4a1fe394d68da5770	2136ff394eeffe18601a6942a9eda3c40edf7c64	main	Say why a resource was refused, and let the resource path be traced
+bc05bbc982a252845398b7bb8c3ddba725e0d760	a1d7d81574109019614cc035d16b140d16a0fd11	main	Relicense to GPL-2.0-only WITH LicenseRef-limina-exception
+bc640c31bbbd18fe9d43658b762d6a887cd82c24	7e98dc0877c6207c3acd70640bab47dba7dee7d8	main	docs: the transport is served, and the executed streams have their own two rules
+bc7fe5b59790bfcb686aab8cb6764f5fe0851cbe	1731334c0c39ebc124aaad0dc792dd3af514cd59	main	venus: let one refusal have one wording
+bc956bb385527a197f7445f2d8cb317586239309	ead37c92a64ceec9161f030cc4e51f85f5313a1a	main	ids: a context id cannot be zero, and the Rust API has no global
+bd199173988911de39fec6e9a3d8aaa5c1fc59e1	15fbd37b648db14b8cdf787cb5ae3a572f140ea1	main	venus: serve the buffer-view group
+be296f58dee56479df28e7fbb60954be82adc0d5	69c81f9611edbefa85d89e0d03a98c685f7a5d1b	main	venus: a binary semaphore is not a timeline, and saying so is not optional
+bfecf50fada592e932a3b0eddc1b532ee6ad8fdd	9d0e4dfd3a42d851213834da3d5f80d89a6f0804	main	venus: a replay that could not rebuild something says so, and fails
+c002c36221091c592639c22b27251c5d3be879d5	98c312779ccdcc5e818bee726d41ad71b950a9b4	main	docs: VP9 has landed, and the descriptor needs no translation
+c010202ae0f650336d8ea75d045aa45a96bc5272	975cbecae56a1a2db5cdc939e6c400729a3404b4	main	harness: ask for a resource at its own bytes per texel, not at four
+c0372184d4a57811f1eaebb400b7596f18b64c88	35f1767293bfd42994bf0c3b288db6d539da0229	main	venus: fail the build when the command set changes under mutates()
+c0b9abfc6eb824c9aef4a524113bc68637867120	3d28800d64ffb554866db27acbd234b608449a91	main	build-reference: pass no --reconfigure rather than an empty argument
+c0e65064b7c8e0388ec9103b721af07397763a04	32047f2aa07fcbe46de78d6c5580397bffecd97d	main	capset: hand over the struct, and let the build prove the bytes are safe
+c0eb5dee5262957b9a9e9fce201bdb83cf6cabf8	d1be0b072e7eb622cba5861864f1d13715f1e755	main	vrend: give a program slot the serial it names
+c12d2d8fa59d7dceaed53e3c2150dbd38258772f	edc730c4c8c80987a056eab95500adbc0bbe5d03	main	docs: the plan became the design, so it takes that name
+c13ef7ed6b8d4927cde4099b03d6f4de0af95919	0d1b2b784502969e8f80023a47a16c0b4f33d4a7	main	harness: run the snapshot-journal gate by default on the Rust tree
+c25c4550ad869826a2693719a9d4687e280b99af	8ba4e5ba0ee9280910cd8c3a11552f3c726d6954	main	vrend: keep the current state a rebuild would otherwise have to guess
+c299aaed8749cd54836d550cde54488c5c10b121	eba607f0f75e72b3de417a51d22634f5e877b957	main	venus: serve the timestamps group
+c29fe75f50737c53607eb7d040ddb86511ef0484	3a3e837e5976dda5ff4a7af9ab7b010717dee7e4	main	vrend: say a blob's pixels could not be used, not that it had none
+c2a0fbb24ed05b9537dc816744923fe7bea06099	79b533fbd37d244174189c10b8ef752794858038	main	harness: score a planar IOSurface plane by plane
+c2e5070a11a2638c48fc14e14d1cbe670fb81999	2b55e8fdb5448ad7a4d145e62942ba35ba620edd	main	harness: add a browser/WebGL workload, and record why it must not ask for MSAA
+c3c719039fbf080688104cc9a02a4c811502b722	80845d0cead31bb7fcda4bdf648f6fdf83d56600	main	ci: probe the zink-on-KosmicKrisp stack on a hosted runner
+c405c580172fa60e3a04764d7f5e1066ea2a8eb3	24b7aa94cfdb160e2bcc1c9a84ff84afff5d9a31	main	harness: decide census stability per allocation, and correct why it moves
+c45477f5b43fe5f2df709d5ec89ade2fc9371849	411326e5b1c840e7d08c7f5422471d8ce84a39d3	main	Hand a fence to the VMM only when it agreed to be called
+c4b0f731692a1ef58edf8df5dfbb34ad6070449f	a01a8b7e730acf4cd4997e8bd544959ad29d26ce	main	harness: record the layout oracle in the test floor
+c590ec335dcd6ae7ba17e0ec229e1385f0005c2e	c43cf6f3c80bc93de2a140c289e83dc40a8faa15	main	virglrs: an EGL image holds whatever owns its surface, not a surface share
+c5f10e925d9d1c613c0c6ddc3ce4d27a902bd388	140260880bbf944d024b038e9e1beb41264f6dab	main	virglrs: generate Vulkan's types for venus from the pinned vk.xml
+c6484df921827b83f69786fdec5f390da8b8b6d6	cbe9e3f4248bf98440dfa7c8e7e72766ae59eff3	main	vrend: put destroy's must-use back where it belongs
+c6cd60774eee1589f77bf1ae78f51c4daee80136	9adccfc7c36114bb83977578e9c3dd6db0cd6cf8	main	config: ask for what the renderer should be, not for a C flag word
+c757eda83fd2cde46fafc8c4512bb2db635393b8	b09031c9f0e582174f66793aa8952eb246e55055	main	venus: refuse to stand a second context up on a live id
+c77798afcd5bfa43815d70393137c51316d11acb	d3e4aeadd38e279e49b340db49758b04c1017b5f	main	vrend: count the fences and the presents, not just the commands
+c7a24b7a377acde1e6aeca0eefb11341ac7590b0	660bd33f529ffc22874b245240e3f1e1c96c6385	main	dmabuf: a tiled buffer is a good descriptor and a bad picture
+c7aa08620cf0c3450126badd2f504ee197c9e8d3	e708c05712f5b814089599d0f731770f72cc6252	main	docs: correct the reply-encoding claim, and drop ash for a generated proc table
+c806fc983c874c3d98a01201ff54155efad25d76	a7969293c26c8beb8a9fe59f80a58097a22470e3	main	venus: serve the timeline semaphore trio, with the guest's own timeout
+c88ef5e3aeb035ed4e029204b916feaa0634c88b	927f38c2f0bff434f6eb572e40569c91871d444f	main	Revert the sampler-view GL objects: they blank the seated desktop
+c8907244732b531caaf09164420bfd743a26e207	ee48c5e653c1e4e12706ad6157a8fa227c302650	main	vrend: refuse at the draw what the C repaired or skipped with a warning
+c96f76b1490ccc1e2e0aafdd2f2e4db7ad774052	725ab3d0ad7ce35fb07919f190d291263fbdca68	main	vrend: convert a composite target's planes into the texture it is sampled as
+ca08a8c9d242c63a02e0952b5fbd747917a25cda	0b68ed2b84c0ae7b0dc6157128c4186e83e36179	main	metal: stop the surface tests racing each other for a recycled id
+cb52d4c8817c5cd60bbc093348123039eaf97efc	4d11c2365792649b8f86a52ac796ae8b70a6abce	main	venus: the enumeration witness never checked the count it claimed to
+cb613e058658bebd201b11771b94d2cf1ca9e3a6	40df282210aa3789db7eb235993b9f5ee2a10f56	main	video: rest the CoreFoundation Send claim on the type, not on a distant mutex
+cbc43c36082cde51fa921673ba38b272df600955	c1f638db14775349fce27314baac91ee33cd34df	main	build: let libEGL already be on the linker's path
+cc1eaa0614e43c432138941fae23b41a85087126	931c9c7a29c43926ac3deec05c4bb254016991ce	main	venus: a driver that will not answer is not a device with no extensions
+ccbd1868afa6dc627ce1edad19fc5912227a6f77	ae0d7a987e620efd646d2cd8f6dfcf7fa02d3d77	main	venus: let the enumerations' refusal have one owner too
+cd45a25bb72305ba6256545a6b45c6bf20b68d58	b028ef930622d5b7a4b797c8063a1eff8fee4aa1	main	docs: name what is wrong under the blob-import port, not just that it lands
+ce241daa48d7f074b155993f6fcf05be40bddc0c	5e5b21a8345781ee03bb5a7e01e3bfc55fb5cadb	main	harness: the rig's disks and bundles live here too
+cec8911f62eb48b8f759c04ade68791a504a735b	e82ea79d312cfddd4263f504b0100c63e748d83b	main	vrend: a thread that waits for classic fences, holding no renderer
+cf09565991418a7ce2fb62fb05a23b4ced750be8	ef159e9e17461f1a69c9b9f7726981dd26404bd0	main	venus: one owner for every object, so a dead parent's children die with it
+cf365b72887f91b59b733d1f9d5f31d139070ca1	57004c075083564fa2cd9a77fb010a25eda8ead5	main	vrend: translate TGSI to the GLSL the C emits, byte for byte
+cfabb0a2a9d1b31119755794521f4297ed9644db	861bb1d44f5d6c900de35f29797f07ecee9cfaee	main	venus: decide whether a guest's ring layout is habitable, before mapping anything
+cff0562b258c9c15f5094c83ffdb937398bbc9c5	b30856c5b5ad3428db0887d29c13a4fc17f7164a	main	venus: an allocation says what its bytes are once, and a charge names its context for good
+d0b1299ade345ddf3ac5f4ca2c1709682a9a6f54	f7a5ad3d0119f4300edc644106be033e17073ee5	main	venus: serve vkCreateRingMESA and vkDestroyRingMESA
+d0d667f02925a92a4cb9754f3c897948e4353eea	c945f61ad5df4a99b0ef9de4bae785c277d9902d	main	spike: guest RAM and minted storage cross a process boundary on mach alone
+d202244b0edb114025488c213383e2adaa73f68d	3c18cafdce686e804600278d4822613f24489fd6	main	docs: write down what is owed, so it stops living in a session
+d22d98b503b266dd5b19ec4517393c0fd4150896	dcf55bda35f78c069dc9e67301d5414b65bd848a	main	venus: say why an allocation could not be read, and how much was
+d258528b142dd6d4a82217d0e934dae892ad5111	ef8298ebab9be727e7ba7214ad41ddf52466dee5	main	vrend: bridge a constant buffer delivered as a resource into plain uniforms
+d301c5ea9a82c131a012141e0ed7819edd3f26e4	c4a4b1df55b1cbd40c733e3982cef9d07c009705	main	docs: the cross-import is served, and one frame is not evidence of a desktop
+d30b8ce87ec5f3dc8a3974a76cb8c9b9d624e94b	4813d7a1e6ff43113e07bc5a6dd36f751d1e404e	main	vrend: resolve the draw's program once, not thirty times
+d37551f3d4c22136a50f7ff2914ae3a2497a491f	7c7db5ce8a737c5563e3904cd19fbcaf955299c1	main	vrend: parse a shader's text the moment it is whole, and print it when asked
+d3c93bf2b8dd27e8932b825f522e9fc9add5a7e1	544c63aac0d73bb41833e66abe97d21e29f1a720	main	harness: compile the replayer against what its leg exports
+d439ad02392601a7401cc0054f442cee412919f2	da22ce87558e6bda5cb170115b972a4289268f0b	main	vrend: give every sampler view its own GL object
+d43e0e9d8bf9a3eeceef01fc3994d00bed7ef57a	09357eaf2d565e9a56398855300f197ce6fba59a	main	harness: check the C bundle before deleting the only one there is
+d52b0d1b0425186beb5c15f11c8186bfae7b0a3b	58128a7f629ee71e6656ddbee9345d5ca0dac98f	main	docs: book the blob-publish lock window and the missing venus cost gate
+d6a55a714d9ee81c41d716323779fb148119834d	0e275b97d7cfef2984c5a4afafba374ea8f5bf5b	main	vrend/video: refuse a plane pair the copy would only error on
+d6a89b652e6b08299599d59df965e0089d7a48a3	8fc0696e04f184a3dde7f77f30c1c54ba0c8d7a2	main	venus: witness the forwarded commands against a planted driver
+d6bbfbbd5648940e4e3b66f04babc0de8d7faba7	06e65080e8e5d2447c47f281e7ad735cc140c456	main	venus: keep an allocation a blob still holds, and fence the gate on it
+d6cfbd1784cd042a711714e4c8a14dde1646142f	2b7f816aa511827b3e88d570f7044d64e2440972	main	vrend: key linked programs on a variant id the sub-context mints
+d6fb75c21873a4f19ee05a64db5c28ccdc8aceaf	c4f4de605a6d04eeca2b828ef3f6118f179639f5	main	venus: the string door's doc named one member for all of them
+d94b8fe3b8f9b652c092be641d3fd8b701511d95	799b6e1c5d3d950d508348efc0248dc51a270c4a	main	venus: widen the arena's generation, which a guest was free to cycle round
+d9545e37ba773c46100e23a1d9f7a8c12ec51a62	c58d01600cf29b82c3518188c8166b1046fef71e	main	venus: walk a pNext chain in one place
+d9e81552ef6fbf6498f91f9f257b3203fe8772a2	ea9099bebfe781405cff071790023fa38c5ecf77	main	CLAUDE.md: add commit message guidelines
+da2cf07f4051ea7e1c6871ae58e4271319fe6467	56b27a839a91364112298c35371303286b1b4af4	main	docs: name metal.rs as an unsafe module, and record what the corpus cannot see
+da3ea99a9a31e882e9bd7e07046971a6b23f2b56	066f051e82f84761284022dbdcbba8561455feca	main	dmabuf: the measured modifier is X_TILED, not Y
+dbcea6755b33d00d44c6b16056552b9d7d0a44ab	f8d4b302744c515dc10d9fadd53a9c862c9c3c99	main	Relicense to MIT: the metadata the header rewrite could not carry
+dbd2f5eb24c12655912eb48485763d43c22b3fd6	2b24daf7f638ddc8f604fac1cceca91e6c82b6ea	main	venus: refuse to import a share the host has no address for
+dc011d8586ebe9a99b3da452888d3ed4c6cfcd67	c49bda03a58bad4739abccf4cab9e2f43d139fbd	main	harness: capture a classic corpus from the enhanced guest, for video
+dc2be3ce4bfd8474151062e1e4a46792e9b30a65	e76ffce9cb225c80a9076b4903c963c050bce050	main	harness: score against upstream on Linux, since the fork will not build there
+dc56c69f6b2cc094ed86ad3366d1870b4735d328	7a9d50547da4841ee44a87e5c1c057c3f924e254	main	venus: witness the run a pool allocation hands over
+dcefb3b33fb50e4ab96ec156bf6f1eba51129814	64010ced5de06193882870220c3c32fc7d464e84	main	vrend: reach a composite target whose decoder is already gone
+dd4b4b46dee87686e324cd909d3e74d909fe5eac	5f6ef1fc124d02d3a169e0203a3edfedf44c7cbd	main	venus: a destroyed pool takes its objects out of the object table
+dd4ecbb916e3625dca998329f01549ba5a186e9f	016369d228dbd76f7b111da48908ee6568aa4251	main	metal: mint a planar IOSurface, one allocation with its planes inside it
+dd6c1e9c790af036e6734282250279674eb3df58	d92b9d2717333381ef8980914b8e8c031524dc2d	main	venus: witness the handlers that do more than forward an array
+dde3e206d59f7e659c9b1b2f7fada7c943e9bcbe	2295b1fd4c4c47d796d692619a91eecd655c147e	main	venus: serve the four remaining ring-transport commands, suspending rather than blocking
+de18e7d2726461bc85fc58e2fd5ba94c92524247	beeb42b94aa4984ad1c1d1d669beda7b5c1ddaaa	main	docs: the two decoders agree on descriptor slots, within stated bounds
+de33597aa2ceba6c6c109db4ee68d445191a21d3	1b8ea9640e8562c1d5aa091f35ca247fd51c268b	main	virglrs: generate venus's protocol info, what the capset tells a guest
+de80f40c1482f379f26bc33b796e9a7474e5ff2c	b1fff470a0d689d6bf40398e0ba65396913a24cf	main	harness: gate the C tests on the first divergence, not the whole diff
+def5650f532ba8856e2231ecabfa9d13963d851f	1d2b555e8edb4b1a1195c9981818670bff58e796	main	venus: let no address query hand the driver a null
+df695488bf88f7d8db5e00ea4dfcd40c2c3c18ff	f36b85bd3942d85cd59084db55b366e09d5a0aea	main	harness: write the rule the census taught, not the story
+df7b0d33aad97d023dd99c8caf107eaf15a6a4c0	406708af916f3ddecc7dfcf34bccd4c22fb1f1a6	main	vrend: say that journal_seq answers 0 because it is unwritten
+e003ca1b3f211f2497f3e3f09fadd1d29b1a2776	a9caa06c69107e5ccb719ef3011d833c2dfb1f1a	main	video: refuse an AV1 order hint width instead of asserting on it
+e01d7bc0b7148f50540b6f34164e498bee8e859a	70d24f5bb6e62e5665b667d7155b0852e3d0617c	main	docs: score parity is not the P2 midpoint on its own
+e045e7f9cac054061d203cf809cddb0b0d6a01d2	4bfec6515377c19f5832536f26762278a337a68f	main	venus: tee every dispatched command into the journal
+e0461ebbbec73b154bc934378cd360ca56d6ee4b	7ddce17d58b2d67e22a4244da1b49d848ecd0e2f	main	docs: the dangling-object state does occur, and two frames that did not score colour
+e07782f77b17bfd843c1c433cfdfbd9bbb00aa05	1ed8cdfde0552a1fa978b2324a1908961f42f434	main	venus: every backing gives its allocation back, not only the two that owned one
+e0e3cdfa4a3062b367e762e0beac3b49b99d8043	a03f3ec59fa4a3ea43986e280b5a993df7ba29a5	main	harness: book the C leg's unreproducibility, and the QEMU rig as the fix
+e1916d7c15153e343dd8646028e1943367137b33	8a18d61aceaa87166d8e9147f29a331462435b2e	main	venus: mint the pages for every allocation the host can address
+e1a0d83864c7fa80eb39c8b981a7bd4bfd561ad9	ecaa3ff1c107567d422f3fc44fd215bfb8081984	main	venus: serve the two-call enumerations, and speak for the renderer in one
+e2454bd0a596a153e69be9229311c5ce52f30a2b	6e631ebf543abad34646f344451d25e5e507b874	main	abi: finish the last three P2 entry points, two of them as refusals
+e2c69993002635786a0f1afd966daf204fa79540	54a6af2e10308e37109071af0df9b3ac428e3884	main	vrend: keep the framebuffer working after the guest frees what it draws into
+e30f917fe77d4e10773d97763b31ec30cf12352b	100f88006cb2bfc31d41247f903d35d15b1bd3ca	main	egl: prove a plane image samples its plane, by content
+e3198b7ae66567a2d2487f9bfe075b25264f8300	d725b7e02e6a2f99e85e7335c205498f7974a95d	main	harness: score the blits the sweep cannot read, through a draw
+e31adceb67ade77694a0c00b6ed9b9588b71c42c	5e9c6c5b58dc5494f9b72568742805f50e888e17	main	harness: render a half-float readback, so a blob mismatch can be looked at
+e33a80b3086284cc7901aa6e155f601aeb92ab6c	237909b7772edbeb5156e8a3303fee526d5263e2	main	venus: let the driver's tables say which handle they hold
+e386697f353ec21da05e1b1d0ad2cdb95593b1da	2734ac270fb56a53d053515a88af0dc2ed4d12f4	main	venus: stop the census reporting storage a context only borrows
+e4268099be13285f69b4859ea1167043a777ce9d	ff5e1b7fa2a17f081438b2cb218211c563b25460	main	harness: the recorder's default capacity holds a desktop
+e4bebecf33beef3698c91f1a21176e19af5fd9c9	23a9532693d438325107e02d9361ae8c0e281fed	main	docs: the liveness stamp and the poison rule are decisions now, not open ones
+e524668c61b7694a7051dc7fb04d7b5606bfe226	5632fb20992d0081bb786bc6f0aab15fde8c5c0d	main	harness: catch the venus replayer's lock up with the crate
+e55ceff811caee5dd543c6f4d0a3b35dc4ec350e	cb54ba333132f7062235c30749c1377222f013d5	main	docs: describe the oracle the harness actually has
+e5aaad99e78c9f52372249e02fcd1c73d8723d7a	dbe8c245d88401c902854d3f8f1bb433dcc6226b	main	harness: build the reference renderer here, not in limina's tree
+e6b14bd44bbfbd35dc64cf54023e1ef95d75422c	1824525bd12d0cfff57d80aa4416d8d33686b193	main	venus: one resolution for the resource a guest asks about and then imports
+e6b552c751972eaea01fd702ff2c1417aff84651	94e715bf6a3760796a58b617f2c4a3b5af40492a	main	venus: have the ring self-deadlock say where the ring actually stands
+e755c4587a8112f44959c699460ed0f7689b4499	f2594953faab418809206f28e837543c0b574c54	main	harness: document the IOSurface leg
+e7bdac1920c86b1c67a5db6d7aa0c980e4e636cb	11e32fe63d8c253db9483c36dc7464b5e9be6a72	main	video: rebuild the AV1 frame header and temporal units from the descriptor
+e7c5d45b05cf4b3b2525ab887ac6a3bbaba60406	0456d8087cc2b7ed6a3927aa530186bb00b32da4	main	fence: retire through a trait, not the VMM's callback table
+e81518d858a130660221b1b9ea1810001d783273	f12bf02bd956027ddb4c57a7e37cbc181c161bbd	main	harness: document --smoke
+e89074bd97188d373a3bcd30e6e6da28e6b4601d	cf951ebc27b990fde45bdf843fc7124c37c296ac	main	metal: a planar plane's pitch is the kernel's, and it is not the tight one
+e94ec6fd50aa250a168d6cfd84087f4d3aa7d7b9	69207f2851e4ca98defa6a6009a4ede004e6cd18	main	vrend: report a resource's texture name under the resource switch
+e9ba8b3d1bc17111f7452249a72a3c1c13c22324	7cb9ee33a3dfe9ccb720a0a9e334c7ea3457365c	main	vrend: generate the format tables from gallium's yaml and the C's GL triples
+ea7723776989b87e2c58d0f41cec6412e6993557	83071cde671a3c028b7f1bf61148b206d091d73c	main	Restore the sampler-view GL objects: the desktop failures were flakes
+eb92c918d6a38f64ed6fc2aaa2601998973cdb0f	09da48bc14aa7f54131a87e6613e05f358ef8591	main	harness: retire a corpus's views before it frees what they name
+ebab714f70c1df009a3d6c3e68d7f0ed6691757e	21bc8049ac65798b1fbf2dd2cac41382897996eb	main	venus: hold a recording under its buffer, not in the journal's vector
+ebf2362fdf75847eb017fd7d4e47eefd5812f76f	2bf6b0de22d5b5bc5d3f1ff3633139166d9cbd3a	main	vrend: a VideoToolbox decompression session, and planes that cannot be over-read
+ec73d40469b493c4646302de896b730768b46a3c	6d8f426747b5c90543753b26daed8357356f26a9	main	venus: refuse to answer a command this build does not serve
+ecc56a0c140ae7d7cdd291b9b2a36f0da0f3d142	12b3610fb47c58b8a6da06aae541e81754b49b5a	main	docs: blob resources are P3's blocker, not one of its gaps
+ecda9f685d7b94fb885f757ba490cb923d68526b	d70b241217901c1ced3211337817bd3326fe7a5c	main	docs: book the desktop-GL leg with what now needs it
+ee13c54d8f2e9ba797440829fa87e679802ef02c	58421b6ebaf8f5a7c4e165cf66ea010e369c3653	main	venus: witness the pipeline run that only partly succeeds
+ee2f171eaa2ac5e1ff665b403c4f531484714e2f	7d2ee66b0a3ef72563c718fd37ebab1d08b6d419	main	vrend: compare a sysval generation, not the sysval block
+ee3962531b179460b073bad46d13de7f4438d9a7	82cb577b503735066c760575e04eb99a83e5fd94	main	refusals: one marker for both renderers, and name the object
+ee40d37cc5b47f70a86fa8dd43a6df11328e9143	ed7d31f08aa3d59ceb5fd0ae8a8dca6468f99061	main	docs: re-plan the phases against what the harness proved
+ee742454d14344ade758195e6f9c98057978734d	36ade8dfae75880ae7af24ce756023e6cd107875	main	venus: a mapping of a descriptor is not a host allocation
+eed47561926a2e1a2fb382d76cf31c264cf06924	176b5cb6842cf99f22479d809453151315215acd	main	vrend: the gallium slot caps are one table
+efcea05ce7ed58b971bce2ee8e30e34da8485617	abf63b625fd892fc951711f394ee7f39a1072221	main	venus: test the generation against an orphan, which is the only thing it guards
+f007757417dd5d1b803fb1468b8882be08b343be	c507c7631eb8c80350a2b1d8925ee06f071d5869	main	venus: the rest of the arrays stop being a count and a pointer
+f00ec03a047da391f172f90f7fdf2482585e5f71	721df76ee9ec992582f300f3ffa8dc1c7d7d2022	main	harness: score the hazard the classic fence exists for
+f01daa2570019303d9359c4495d417bb8ad00007	25d18e2ae651a2cb92e7e1e8791077244b6c1120	main	docs: retire the blob-publish lock window; the witness already closed it
+f0a0399132279c51aa27f458a505bf19045d76a4	9e7327db304ceffd49cfa23d268e1a2748f0a2ac	main	docs: the bare-integer id item is landed
+f0c1646f6257e36e2fb3c20eb89ab427d1ee953e	ea22118bfadc81537f93c77b268220e96b052ed1	main	docs: book the export gaps, and say what dmabuf.rs's unsafe actually is
+f1110edc6b7f3a8dad2bf1f06d39a5659c643584	022761b57c67745fe67f48b795d163f83459d837	main	harness: let the ABI gate own the freshness of what it scores
+f159f5766e0ec2b27032520d83df8c058801175f	b3c984315a273907d57a9b9e6f4594258ffa744d	main	vrend: count what a guest command costs, because a pegged profile cannot
+f1764c1dc5c57f0f2a8d61f7eed80dbdaf237ab0	a0895a4776bd28129904ec120ff506875d8da9a5	main	harness: drive the Basemark graphics suite, so the sample can be aimed
+f1923bee2ea9469bd3ae58437300b2a9ddc17ae5	6974c544be416cd8073188d8d748d95fb8e94f95	main	harness: build the rust leg's limina, instead of swapping a dead dylib
+f19fdaefecb07b68029b5df0d274cb3a37e49cae	cf223dddc333af5159e304c1bf7c0dc383c67c64	main	renderer: say which half of CREATE_BLOB failed
+f280626aa6ddd89b3f31f16556b097cd1efbfb81	2f437e2bb18907fc5e783b51cb9bfe28e3a32a0f	main	venus: serve the query pool family, with the read-back measured against the pool
+f312e7be9518471f1c1f301ffb095e7234680d29	6d16cbe0830efd78ea11fa730fc83d772b6544bd	main	ids: a ring's object id and its fence timeline index are two types
+f32b241cd10c1e5f6947f2063791f9c4f03dbe22	c333ce8757e2cc50f3c4c814f5828267001143b6	main	surface: whose layout it is decides whether a refusal asserts
+f3631f371b9867bcce66fd8567b934a24bcc1d5a	ea59623b13f007e88f8ca93748144d0a292a3833	main	venus: replay the frees, so a pool ends holding what the guest holds
+f36d52a1ff7f94d1fb1fc7f9d5c1fcf040dd3232	3a36465b2c37b0460c91b9c75c9a4779ad0645d9	main	vrend: the encoder's object byte is answered by every command, not defaulted
+f3ce7745f98df337dc9496c00f07f186b3d58925	04d66e40725c987e468769b8500bf8ae7ed7c060	main	docs: the classic corpus carries 33 translations
+f425a5f8c71790c50214d5ed28248c6bb99ef222	13990a09d7bb4db47f6ab8eafdf1f6c846e64640	main	venus: hold the generated structs to the layout a C compiler gives them
+f464cd45c5406391be161ad08a453f78561fa693	9c483e3ca45ef8ab9dc41034dbb2e2e3416629a9	main	vrend: a sampler view of a plane-backed target binds that plane's image
+f53a6d78f0b09b2ece54777081d02a095bf2b673	945f8302952d460c4d80a591643d9646901ded94	main	video: decode H.264, keeping the session across a mid-GOP parameter set change
+f5860ba3a2aea4c99f6296ace206525b0a0c6abf	dc0cfe2bb2d3f357e2b54ce1ec84fb059c1bde49	main	harness: rebuild a context from its journal and require the same world
+f615a41152e70e513ed4e59e29bdaeb880c0645d	248a48ce016b01d2e97bb1072bfaace84d93a88f	main	video: derive the AV1 sequence header, and read the descriptor's bit-fields
+f620563604df739e2fdab49c60535593e1b644b4	d81f2ff5ebacdcb7274d5dceb03e309e11012e24	main	vrend: mint the view for a swizzle, not for every sampler view
+f64ea1b34acbb53b9403faca6f884fb1482a27e6	6a741bc04d9b52f26fd7ce89fbb5d6f5e0e057a6	main	docs: book the vrend budget accounting design
+f66eacd7d04cc024dcf9330a2644b1a6ae798ace	f1b3d1930f9cc020a26b85c21c08a360f9469975	main	harness: the venus replayer exists; say what it still cannot do
+f6f8f438f69f8fab75d8d4e04a21b3c66e5946fb	d1df12c791c63cc0ac978a3f3818cf257754eea0	main	venus: diff every reply against venus-protocol's own encoder
+f74163c77c87327e37f8f4a98b06f34c47739c8a	2db27520e0027495bd5bcb3b8aeb42c298736bd4	main	harness: say what the three guest images actually are
+f79435028df0bdef24be0aa0da5f13dc7b978e6a	091e7a97e038b2c2ef94947bfd5a4cfcacafcc1e	main	venus: record the full ring stream, so a corpus has a beginning
+f7c3b80a96888a12e9aecc8575fffc0ec59673ee	81079bf4ac960fe3926f424d6fb3c3ceb692443c	main	virglrs: route venus submissions into the generated dispatcher
+f7f9c2cf9c46b643556f0c9a9cc706c9df067154	933780deaaa0c81c7ee0e2e1bff1da33a59664d5	main	venus: prove the count and the array behind it are the same number
+f8352942e4c19914d0a16d445055ccb61b0147d6	0e838488272c2c8a4abcf58af9c61065a1d07f1f	main	venus: decode an output blob as room the guest offers
+f83996d74976dd6cec8532b859cf20f339fca976	6dcb2e9f84c82e0ed4bd015697a5b068b93c0394	main	venus: start the rings, and make a running one unreachable
+f8f8a3898f6455454e3e1f3197591e7b24d61b11	f061bc494b555f22b42bd8c6f74ddfc38d380a92	main	harness: three sabotages for the one resolution behind the query and the import
+f91faa3ab15cf0aa77ff74d790967c256c08e4e9	e45660cdfeb95524e58fa89904823c223d155993	main	vrend: name an unserved decode layout once, not once per allocation
+f9eee144c45213ec78ebfb37b351bb1de990744d	9fcee6cf590c8ab3ba38eb59f53a8437e0773e1d	main	harness: pin the corpora to a release, and fetch them when they are missing
+fa420c6202b054850c579d4292ceaa86029f1f61	708b20e1fa0fee40b3058ffc49579ee6ce2e1d6a	main	harness: do not symlink a tracked file into the rig worktree
+fa633752882110833a736a4f6f1c55c0931d7c7f	3f078cc757f0e6934ee743ed46845b912fb1fc33	main	harness: the ring-seqno wake has no honest sabotage, and that is the design
+fa6c0eda08a74ebe15fb70268f0b30e0b26efbd7	cd33bec7b33b09e2be90c24abe80f5a367f7ad93	main	Serve resource_get_info_ext, and answer it with the real texture
+fab575ba2fe232882e67133831085819047026ca	03156761d4d2cf489255ea5a71370a83f6e7eb64	main	Stop claiming iosurface storage on a host that has none
+fac5320a5a53bb2eef9398e2f09ae5bd18a9eb0d	045a741988cce76384891ccb53aa37956f88e99f	main	venus: destroy a device's objects on the way out, before the device
+fad18ac4250670830364d0ab74d2f4dc32f7bc1f	26e99fba3c40b21ed4c8d2927f2ab0a971735e0f	main	vrend: name the guest defect a wrong colour matrix comes from
+fba0f07ea34b0b653fbbcbfea5626f9edba307d3	760ba1b4348c161a0cfa3359318215e43dc5de21	main	venus: a ring takes a share of the memory it lives in, not a way to find it
+fc0096279f6c2640bc48824e0867bb7855417314	c9f6e6add126add85efecafe85a5fced442c3889	main	docs: the guest-plane writeback is for export, not for decode
+fc159dda06a8f1f9b8b5a058bd8781712e76e1f4	e642055df2790f8fd661062fd13237c9de08f532	main	renderer: name the surface a blank scanout readback came out of
+fc3c9183b71a49a1797ed265939a729c12098100	6a5f5f6eff812348fcf83b995811c536a3b192a8	main	harness: bisect a scanout's score line by stream position
+fc3fa95eee088d28cc9bcdd49bade6bccc38d0d7	5798048c71347e0fc90a47cd848e05d8ecfe295b	main	docs: P3 order and the host GL, measured
+fc8fe4c952c2cf49ab79d81878add1236b51e48e	3ae1ae92e42272f940c1957fc2284f5f26a45087	main	harness: let the vrend trace decoder be imported, not only run
+fc9b3964e829d1314fc0e664e09eaf6492feea20	345365c5d5e7e25a7c53a7012937f9181f96491f	main	vrend: the shader blitter's depth path
+fdc69afb8cf54129b1c04b1f506f92093c2e1176	833393efdcd9e8cd7141fbd59d75ac38c4cd8914	main	docs: the venus generator's C is not confined to its templates
+fe5e2092c45f47747eeac4667a33a10a9e8081fe	835c0c122f1c536888795b8423e2e5e997d38183	main	venus: pages know why they are not a surface, and a scanout of them says so once
+fea55653930a0fe9facdf071db59830f7654a4b2	fec19e27cccb4e057e20ee4d95efa5988614fed2	main	vrend: hash the tables the command path walks, never order them
+feef5488deaf3faa1c7a84d0aee7ec1d0d81a9ff	c6b0d21c3ddb08992e84e0d68d6c075f1d2b6760	main	vrend: stop building a fill list for every command
+ffaaafede11b1668485bc6e8ea14a23de652f4d7	ee444403631a37486969a2541ed47493daf720dc	main	docs: P4's delivery path was designed against code the merge replaced
+57d6ecfda3c4a4b92a7029b3a79e3c2cc56b15e0	deb095baa3042d3ba867df7866a471a08e4261c2	main (was 61abe500be57 before the reword)	vrend: split the fence's cost into the walk and the sync, and by hop
+9994798d675299d4619023db586a715e092894c4	ea9099bebfe781405cff071790023fa38c5ecf77	main (was d9e81552ef6f before the reword)	CLAUDE.md: add commit message guidelines
+0a3692631de7c090b249a15b01d8d215cc2db946	-	dropped; local branch old-main only	docs: give two test docs back the sentence that says what they are
+dd6eb0675796376d738456bc8c5b9cc7e0aba97e	-	dropped; local branch old-main only	harness: refuse a sabotage whose witness this host does not build
+5582aa3281f5fb762b7d0d5c55d05f20bd9ce204	-	parked/fence-sync, unchanged	harness: point the sabotage sweep at this repository
+4e674542e150c546039e980696ebb6f5c020fc7f	-	parked/fence-sync, unchanged	vrend: name the method that actually spends a Fence
+627bba19bba821d7a1a356e7ba863eb354364d7f	-	parked/fence-sync, unchanged	vrend: open the blitter through Current, not behind its back
+7715b058e3ca66e48c306678f106486728dc82ea	-	parked/fence-sync, unchanged	vrend: fence a context when the thread leaves it, not when a fence asks
+d0416c9066ec34448362d095daa3d8355536b029	-	parked/fence-sync, unchanged	config: say what the host property measured, including where the cost went
+e801e0fe6a4ae6acfc69f3a5f9ef40a197f84c9f	-	parked/fence-sync, unchanged	vrend: let a VMM say its GL submits a fence, and stop flushing behind it
+033339a83636a7b9aa321d0287d45e90b592b28a	-	unpushed: goiaba main / local kov-linux-tip, on the pre-removal base	harness: the sweep asks whether a resource claim is collected
+1ed17c25a38baf67ebbda43011b64d71414d84f8	-	unpushed: goiaba main / local kov-linux-tip, on the pre-removal base	renderer: a resource's id is free when its owner lets go of it
+44ba79dd7a9b2798715b74bcafd2119d1d129543	-	unpushed: goiaba main / local kov-linux-tip, on the pre-removal base	renderer: the presentation path is named for the surface, not for Apple's kind of one
+398851e318067ea034a53ff9a552f1c0c2e82055	-	unpushed: goiaba main / local kov-linux-tip, on the pre-removal base	harness: a venus corpus's acceptance travels to another driver, its bytes do not
+a0cdf8901f18a091291bffabed781317273d1829	-	unpushed: goiaba main / local kov-linux-tip, on the pre-removal base	docs: a venus corpus recorded on one host's heaps scores no bytes on another
