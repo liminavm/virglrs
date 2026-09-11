@@ -141,6 +141,28 @@ it. Fix the template.
 - Commit as work finishes. Never `git add -A` — this tree has untracked local files that must
   not be committed. Never push without asking.
 
+## Commit messages
+
+Linux-style: `git log --oneline` should tell a reader who has not seen the code what each diff
+does. The aphoristic voice of the rules above is for principles; it does not belong in a commit.
+
+- **Subject:** `area: <imperative verb> <concrete object>`, aim for 60 characters, never over 72.
+  It names what the code does differently, not the principle the change serves. A subject that
+  needs "and" is usually two commits.
+- **Body**, wrapped at 72, in this order: the problem as observable behaviour; its cause, if not
+  obvious; what this commit changes; how it was verified. History — false starts, what was
+  measured and rejected — goes last, in its own paragraph, and only if it would stop someone
+  repeating it.
+- **Plain words.** Code identifiers in backticks. Project shorthand ("the sweep", "census",
+  "witness") is glossed once or not used. No first person, no rhetorical closers, no session
+  names.
+- **Trailers:** `Fixes: <sha12> ("<subject>")` when correcting an earlier commit.
+
+| Not this | This |
+|---|---|
+| `vrend: open the blitter through Current, not behind its back` | `vrend: bind the blitter context via Current::switch_to` |
+| `docs: give two test docs back the sentence that says what they are` | `docs: restore doc comment heads truncated by 633da46` |
+
 ## Licensing
 
 MIT, which is virglrenderer's licence and Mesa's — this was written against both, and taking a
