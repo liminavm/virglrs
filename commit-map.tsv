@@ -662,8 +662,8 @@ dd6eb0675796376d738456bc8c5b9cc7e0aba97e	-	dropped; local branch old-main only	h
 7715b058e3ca66e48c306678f106486728dc82ea	-	parked/fence-sync, unchanged	vrend: fence a context when the thread leaves it, not when a fence asks
 d0416c9066ec34448362d095daa3d8355536b029	-	parked/fence-sync, unchanged	config: say what the host property measured, including where the cost went
 e801e0fe6a4ae6acfc69f3a5f9ef40a197f84c9f	-	parked/fence-sync, unchanged	vrend: let a VMM say its GL submits a fence, and stop flushing behind it
-033339a83636a7b9aa321d0287d45e90b592b28a	-	unpushed: goiaba main / local kov-linux-tip, on the pre-removal base	harness: the sweep asks whether a resource claim is collected
-1ed17c25a38baf67ebbda43011b64d71414d84f8	-	unpushed: goiaba main / local kov-linux-tip, on the pre-removal base	renderer: a resource's id is free when its owner lets go of it
-44ba79dd7a9b2798715b74bcafd2119d1d129543	-	unpushed: goiaba main / local kov-linux-tip, on the pre-removal base	renderer: the presentation path is named for the surface, not for Apple's kind of one
-398851e318067ea034a53ff9a552f1c0c2e82055	-	unpushed: goiaba main / local kov-linux-tip, on the pre-removal base	harness: a venus corpus's acceptance travels to another driver, its bytes do not
-a0cdf8901f18a091291bffabed781317273d1829	-	unpushed: goiaba main / local kov-linux-tip, on the pre-removal base	docs: a venus corpus recorded on one host's heaps scores no bytes on another
+033339a83636a7b9aa321d0287d45e90b592b28a	f0fdc66e4cbda4b2f8902916916b8008c03e535d	main (rebased from goiaba's unpushed main)	harness: the sweep asks whether a resource claim is collected
+1ed17c25a38baf67ebbda43011b64d71414d84f8	e8ba4fb5989c583fc29362c162c21e126d522f3d	main (rebased from goiaba's unpushed main)	renderer: a resource's id is free when its owner lets go of it
+44ba79dd7a9b2798715b74bcafd2119d1d129543	f375f8248969c24b668e2ec872a9fddae4d64725	main (rebased from goiaba's unpushed main)	renderer: the presentation path is named for the surface, not for Apple's kind of one
+398851e318067ea034a53ff9a552f1c0c2e82055	8811eb17f26f36afd8f93c601661c0c614bc0f5f	main (rebased from goiaba's unpushed main)	harness: a venus corpus's acceptance travels to another driver, its bytes do not
+a0cdf8901f18a091291bffabed781317273d1829	62ea3c2f40b483aed9973719becabc4f3a1f436d	main (rebased from goiaba's unpushed main)	docs: a venus corpus recorded on one host's heaps scores no bytes on another
