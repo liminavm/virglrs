@@ -1192,6 +1192,17 @@ SABOTAGES = [
         'an_allocation_the_host_refuses_poisons_instead_of_aborting',
     ),
     (
+        'a pNext chain is decoded as deep as the guest cares to make it',
+        'venus-gen/rustgen.py',
+        """                '    if depth >= %d {' % len(next_types),
+                '        dec.set_fatal();',
+                '        return core::ptr::null_mut();',
+                '    }',
+""",
+        '',
+        'a_pnext_chain_deeper_than_the_structs_it_may_name_is_refused',
+    ),
+    (
         "a ring the guest named 0 is quietly renamed instead of refused",
         'src/ids.rs',
         """    pub const fn new(raw: u64) -> Option<RingId> {

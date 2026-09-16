@@ -916,6 +916,38 @@ mod tests {
         assert_eq!(empty.as_ptr().align_offset(align_of::<u64>()), 0);
     }
 
+    /// A `pNext` chain is decoded by recursion of its own depth, and the depth is the guest's to
+    /// choose: the wire carries every link's header before any link's body. A chain that names
+    /// more links than there are structs it may name has necessarily named one twice, which
+    /// Vulkan forbids, so it is refused at that link -- long before it can choose how deep the
+    /// ring thread's stack goes. The chain here is a quarter of a million links of one struct a
+    /// buffer create admits; unbounded, decoding it overruns any thread's stack.
+    #[test]
+    fn a_pnext_chain_deeper_than_the_structs_it_may_name_is_refused() {
+        use crate::venus::proto::serialize::vn_decode_VkBufferCreateInfo_pnext_temp;
+        use crate::venus::proto::types::VkStructureType;
+
+        const LINKS: usize = 1 << 18;
+        let proto = AllOfIt;
+        let mut buf = vec![0u8; LINKS * (8 + 4) + 8];
+        let mut enc = Encoder::new(&mut buf, &proto);
+        for _ in 0..LINKS {
+            enc.encode_simple_pointer(true);
+            enc.encode_scalar::<VkStructureType>(
+                VkStructureType::VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO,
+            );
+        }
+        enc.encode_simple_pointer(false);
+
+        let temp = Bump::new();
+        let hard = AtomicBool::new(false);
+        let mut dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
+        // The links before the refusal are still handed back, as every partial decode is: the
+        // poison is what the dispatch reads, and it is what stops the command.
+        vn_decode_VkBufferCreateInfo_pnext_temp(&mut dec);
+        assert!(dec.hard_fatal(), "a chain longer than the structs it may name is refused");
+    }
+
     /// The arena's cap bounds what a guest may ask for; it is not a promise the host can pay it.
     /// A request the allocator refuses is the guest's problem, and it costs the stream, never the
     /// process.
