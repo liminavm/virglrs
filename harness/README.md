@@ -1417,7 +1417,9 @@ arrived as 225 entries), and a transfer walks the list per row, so the one-entry
 shape whose cost no boot pays. `--pages N` on the classic replayer splits every backing into
 N-byte entries and is what a transfer-path number must be taken at; 16384 is the observed guest
 average and 4096 the worst case. The score does not move with it, on either leg, which is what
-`--expect` asserts.
+`--expect` asserts. Pair timing runs on `--no-rebuild` too: the rebuild leg replays the API-door
+blob feed and the readbacks a second time, so its `n api` count on the transfers line is about
+double, and a pair that differs on the flag compares two different corpora.
 
 **`vrend-av1.score` is stale.** It predates scoring at the format's own bytes per texel and cannot
 be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
