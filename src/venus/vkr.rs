@@ -10,13 +10,15 @@
 //!
 //! # Lock order
 //!
-//! Once rings run on their own threads, three locks exist and every path takes them in this order:
+//! Once rings run on their own threads, two locks exist and every path takes them in this order:
 //!
 //! 1. the resource table (`Renderer::resources`, a read-write lock),
-//! 2. one context (`Vkr::contexts`, a mutex each -- so two contexts' rings never wait on each other),
-//! 3. the unimplemented-command census (`Vkr::todo`).
+//! 2. one context (`Vkr::contexts`, a mutex each -- so two contexts' rings never wait on each other).
 //!
-//! The park mutex inside a `RingThread` is a leaf: nothing is taken while it is held.
+//! The park mutex inside a `RingThread` and the lock inside the unimplemented-command census
+//! (`Vkr::todo`) are leaves: nothing is taken while either is held, and no batch holds either.
+//! The census in particular is shared by every context and is not a batch's to hold -- a batch
+//! that held it would be one every other context's ring had to wait out.
 //!
 //! A caller arriving through the ABI blocks at each step, because it must run the command it was
 //! given. A ring thread never blocks on any of them -- it tries, and a miss is `Verdict::Busy`,
@@ -68,8 +70,9 @@ pub struct Vkr {
     /// counting again, because a second count is a second answer free to disagree with this one.
     generations: u64,
     /// The commands this build does not serve yet, counted across every context. Kept on the root
-    /// because it answers a question about the build, not about a guest.
-    pub todo: Arc<Mutex<Unimplemented>>,
+    /// because it answers a question about the build, not about a guest. Its lock is its own, and
+    /// a leaf: a batch reaches it for one increment on the way to poisoning, never for its length.
+    pub todo: Arc<Unimplemented>,
     /// The entry points that exist before any instance does. One per renderer rather than one per
     /// context: they are the loader's, identical for every guest, and immutable once resolved.
     global: Arc<Global>,
@@ -135,18 +138,21 @@ pub type SharedResources = Arc<RwLock<dyn ShmResources + Send + Sync>>;
 struct RingDispatch {
     ctx: Weak<Mutex<Context>>,
     resources: SharedResources,
-    todo: Arc<Mutex<Unimplemented>>,
+    todo: Arc<Unimplemented>,
     global: Arc<Global>,
 }
 
 impl Dispatch for RingDispatch {
-    /// Take the three locks in the renderer's order, or give up and say so.
+    /// Take the two locks in the renderer's order, or give up and say so.
     ///
-    /// Every one of them is a `try`. A ring thread that blocked on the context lock would deadlock
-    /// against its own `vkDestroyRingMESA`, which runs inside a dispatch that holds it -- and one
-    /// that blocked on the census would deadlock against the same batch, which holds that too.
-    /// `Busy` costs a retry on the next turn of the loop and nothing else, because the loop keeps
-    /// the batch and does not advance its position until the batch has actually run.
+    /// Both are a `try`. A ring thread that blocked on the context lock would deadlock against
+    /// its own `vkDestroyRingMESA`, which runs inside a dispatch that holds it. `Busy` costs a
+    /// retry on the next turn of the loop and nothing else, because the loop keeps the batch and
+    /// does not advance its position until the batch has actually run.
+    ///
+    /// The census is not taken here. It is one context's lock in no sense -- every context's
+    /// rings would contend on it -- and the batch only reaches it on the way to poisoning, where
+    /// it takes its own lock for one increment.
     fn try_dispatch(&self, ring: RingId, reply: &mut Option<ReplyStream>, buf: &[u8]) -> Verdict {
         let Some(ctx) = self.ctx.upgrade() else {
             return Verdict::Poisoned;
@@ -157,10 +163,7 @@ impl Dispatch for RingDispatch {
         let Ok(mut ctx) = ctx.try_lock() else {
             return Verdict::Busy;
         };
-        let Ok(mut todo) = self.todo.try_lock() else {
-            return Verdict::Busy;
-        };
-        match ctx.dispatch_ring(ring, reply, buf, &mut todo, &self.global, &*resources) {
+        match ctx.dispatch_ring(ring, reply, buf, &self.todo, &self.global, &*resources) {
             Submitted::Done => Verdict::Ran,
             Submitted::Poisoned => Verdict::Poisoned,
             // A ring's own stream may only wait on a virtqueue seqno; the handler for the other
@@ -181,7 +184,7 @@ impl Vkr {
             config,
             contexts: BTreeMap::new(),
             generations: 0,
-            todo: Arc::new(Mutex::new(Unimplemented::default())),
+            todo: Arc::new(Unimplemented::default()),
             global: Arc::new(crate::vulkan::global()),
             resources,
             budget: Arc::clone(budget),
@@ -294,9 +297,9 @@ impl Vkr {
     /// the place that knows the answer.
     /// Returns how the batch ended, because it may not have ended: a `vkWaitRingSeqnoMESA` stops
     /// it partway, and the caller has to wait *with no lock of this renderer held* and come back
-    /// with the rest. It cannot be waited on here -- `on_context` holds the context, the resource
-    /// table and the census, and the ring whose head we would be waiting for needs the first of
-    /// those to advance it. See [`Submitted`].
+    /// with the rest. It cannot be waited on here -- `on_context` holds the context and the
+    /// resource table, and the ring whose head we would be waiting for needs the first of those
+    /// to advance it. See [`Submitted`].
     ///
     /// Rings are promoted whether the batch finished or suspended. A `vkCreateRingMESA` before the
     /// wait has to start reading, or the wait is on a ring that will never run.
@@ -332,7 +335,7 @@ impl Vkr {
         })
     }
 
-    /// Run one submission against a locked context and the census behind it.
+    /// Run one submission against a locked context.
     ///
     /// The two locks are taken here, in the order this module documents, so that no caller picks
     /// its own. `false` from the closure is a poisoned stream, which is the only way a submission
@@ -340,20 +343,19 @@ impl Vkr {
     fn on_context<T>(
         &mut self,
         id: ContextId,
-        f: impl FnOnce(&mut Context, &mut Unimplemented, &Global, &dyn ShmResources) -> T,
+        f: impl FnOnce(&mut Context, &Unimplemented, &Global, &dyn ShmResources) -> T,
     ) -> Result<T, Error> {
         let ctx = self.contexts.get(&id).ok_or(Error::NoContext)?;
         let resources = self.resources.read().expect("the resource lock is never poisoned");
         let mut ctx = ctx.lock().expect("a context lock is never poisoned");
-        let mut todo = self.todo.lock().expect("the census lock is never poisoned");
-        Ok(f(&mut ctx, &mut todo, &self.global, &*resources))
+        Ok(f(&mut ctx, &self.todo, &self.global, &*resources))
     }
 
     /// The same, for the callers whose only two answers are "it ran" and "it poisoned".
     fn on_context_ok(
         &mut self,
         id: ContextId,
-        f: impl FnOnce(&mut Context, &mut Unimplemented, &Global, &dyn ShmResources) -> bool,
+        f: impl FnOnce(&mut Context, &Unimplemented, &Global, &dyn ShmResources) -> bool,
     ) -> Result<(), Error> {
         if self.on_context(id, f)? { Ok(()) } else { Err(Error::Poisoned) }
     }
@@ -1140,6 +1142,112 @@ mod tests {
         v.replay_end(ctx_id()).expect("replay ended");
         until("the promoted ring to consume the batch", || head(&map) != 0);
 
+        v.context_destroy(ctx_id());
+    }
+
+    /// A context blocked inside the driver does not stop another context's ring.
+    ///
+    /// A batch holds the resource table, shared, and its own context's lock, and nothing that
+    /// another context's ring has to wait for. The census in particular is not a batch's to
+    /// hold: it is written once in a context's life, on the way to poisoning, and a lock over it
+    /// held for a batch's length would make one guest's `vkDeviceWaitIdle` every other guest's
+    /// stall. The driver call planted here does not return until told to, which is what a real
+    /// wait looks like from another context's ring: no ending it can see, only locks it can try.
+    #[test]
+    fn a_context_blocked_in_the_driver_does_not_stop_another_contexts_ring() {
+        use crate::venus::cs::{HostHandle, ObjectId};
+        use crate::venus::proto::serialize::{
+            vn_encode_vkDeviceWaitIdle_args, vn_sizeof_vkDeviceWaitIdle_args,
+        };
+        use crate::venus::proto::types::{
+            VkAllocationCallbacks, VkDevice, VkObjectType, VkResult,
+            vn_command_vkDeviceWaitIdle as Args,
+        };
+
+        const DEVICE: u64 = 0xd0;
+        const GUEST_ID: u64 = 0x1d;
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn wait_idle(_device: VkDevice) -> VkResult {
+            ENTERED.store(true, Ordering::Release);
+            while !RELEASE.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            VkResult::VK_SUCCESS
+        }
+        /// Teardown destroys what the context holds, and the planted table owes it the entry.
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        // Process-wide state, so a second run in the same process starts blocked again rather
+        // than finding the door already open and passing without holding anything.
+        ENTERED.store(false, Ordering::Release);
+        RELEASE.store(false, Ordering::Release);
+
+        let (mut v, _map) = vkr();
+        let other = ContextId::new(2).expect("2 is not zero");
+        v.context_create(other, String::new());
+        {
+            let arc = v.contexts.get(&ctx_id()).expect("created by the fixture");
+            let mut ctx = arc.lock().expect("a context lock is never poisoned");
+            let mut fns = crate::vulkan::Device::default();
+            fns.plant_vkDeviceWaitIdle(wait_idle);
+            fns.plant_vkDestroyDevice(destroy_device);
+            ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
+            ctx.objects()
+                .borrow_mut()
+                .add(
+                    ObjectId(GUEST_ID),
+                    VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                    HostHandle(DEVICE),
+                    None,
+                )
+                .expect("a fresh id");
+        }
+
+        // What a ring thread of each context holds: the same claims, without the thread, so the
+        // test decides when each batch is offered rather than racing a loop for the answer.
+        let dispatch = |id: ContextId| RingDispatch {
+            ctx: Arc::downgrade(v.contexts.get(&id).expect("created above")),
+            resources: Arc::clone(&v.resources),
+            todo: Arc::clone(&v.todo),
+            global: Arc::clone(&v.global),
+        };
+        let blocked = dispatch(ctx_id());
+        let free = dispatch(other);
+        let ring = RingId::new(7).expect("7 is not zero");
+
+        let idle = {
+            let args = Args { device: VkDevice(GUEST_ID), ..Default::default() };
+            let proto = crate::venus::cs::AllOfIt;
+            let mut buf = vec![0u8; vn_sizeof_vkDeviceWaitIdle_args(&proto, &args)];
+            let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+            vn_encode_vkDeviceWaitIdle_args(&mut enc, VkFlags(0), &args);
+            buf
+        };
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut reply = None;
+                assert_eq!(
+                    blocked.try_dispatch(ring, &mut reply, &idle),
+                    Verdict::Ran,
+                    "the wait is served once released"
+                );
+            });
+            until("the blocked context to enter the driver", || ENTERED.load(Ordering::Acquire));
+
+            let mut reply = None;
+            let verdict = free.try_dispatch(ring, &mut reply, &wire_ring_work());
+            RELEASE.store(true, Ordering::Release);
+            assert_eq!(
+                verdict,
+                Verdict::Ran,
+                "the other context's ring ran while this one was inside the driver"
+            );
+        });
+
+        v.context_destroy(other);
         v.context_destroy(ctx_id());
     }
 }

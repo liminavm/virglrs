@@ -49,9 +49,9 @@ SABOTAGES = [
     (
         'an unserved command is counted and then continues, as though the host had done it',
         'src/venus/context.rs',
-        """        *self.todo.seen.entry(cmd.0).or_default() += 1;
+        """        self.todo.note(cmd);
         self.reject = Some("is not a command this build serves");""",
-        """        *self.todo.seen.entry(cmd.0).or_default() += 1;""",
+        """        self.todo.note(cmd);""",
         'unserved_command',
     ),
     (
@@ -1260,6 +1260,22 @@ SABOTAGES = [
                 self.dirty.mark(slot - shift);""",
         """                self.dirty.mark(slot);""",
         'a_destroyed_sampler_state_closes_its_gap_and_marks_every_slot_that_moved',
+    ),
+    (
+        'one context holds the unimplemented-command census for its whole batch, so every other ring waits it out',
+        'src/venus/vkr.rs',
+        """        let Ok(mut ctx) = ctx.try_lock() else {
+            return Verdict::Busy;
+        };
+        match ctx.dispatch_ring(""",
+        """        let Ok(mut ctx) = ctx.try_lock() else {
+            return Verdict::Busy;
+        };
+        let Ok(_census) = self.todo.seen.try_lock() else {
+            return Verdict::Busy;
+        };
+        match ctx.dispatch_ring(""",
+        'a_context_blocked_in_the_driver_does_not_stop_another_contexts_ring',
     ),
     (
         "a ring the guest named 0 is quietly renamed instead of refused",

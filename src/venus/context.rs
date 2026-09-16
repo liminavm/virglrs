@@ -487,7 +487,7 @@ impl Context {
     pub fn replay_upto(
         &mut self,
         upto: Seq,
-        todo: &mut Unimplemented,
+        todo: &Unimplemented,
         global: &Global,
         resources: &dyn ShmResources,
     ) -> bool {
@@ -539,7 +539,7 @@ impl Context {
     pub fn submit(
         &mut self,
         buf: &[u8],
-        todo: &mut Unimplemented,
+        todo: &Unimplemented,
         global: &Global,
         resources: &dyn ShmResources,
     ) -> Submitted {
@@ -564,7 +564,7 @@ impl Context {
         on: Option<RingId>,
         reply: &mut Option<ReplyStream>,
         buf: &[u8],
-        todo: &mut Unimplemented,
+        todo: &Unimplemented,
         global: &Global,
         resources: &dyn ShmResources,
     ) -> Submitted {
@@ -647,7 +647,7 @@ impl Context {
         &mut self,
         ring: RingId,
         buf: &[u8],
-        todo: &mut Unimplemented,
+        todo: &Unimplemented,
         global: &Global,
         resources: &dyn ShmResources,
     ) -> bool {
@@ -705,7 +705,7 @@ impl Context {
         ring: RingId,
         reply: &mut Option<ReplyStream>,
         buf: &[u8],
-        todo: &mut Unimplemented,
+        todo: &Unimplemented,
         global: &Global,
         resources: &dyn ShmResources,
     ) -> Submitted {
@@ -1620,9 +1620,52 @@ fn poison(id: ContextId, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
 }
 
 /// The commands a build does not serve yet, counted.
+///
+/// Shared by every context and written by none of them more than once: an unserved command
+/// poisons the context that sent it, so a context contributes at most one count in its life. The
+/// lock is inside, taken for that one increment and for a read-out, so that no batch holds it.
+/// A lock a batch held for its whole length would be one every other context's ring had to try
+/// for before running anything -- a renderer-wide serialisation to guard a write that almost
+/// never happens.
 #[derive(Default)]
 pub struct Unimplemented {
-    pub seen: std::collections::BTreeMap<i32, u64>,
+    pub seen: std::sync::Mutex<std::collections::BTreeMap<i32, u64>>,
+}
+
+impl Unimplemented {
+    /// Count one unserved command.
+    pub fn note(&self, cmd: VkCommandTypeEXT) {
+        *self.seen.lock().expect("the census lock is never poisoned").entry(cmd.0).or_default() +=
+            1;
+    }
+
+    /// Whether nothing unserved has been asked for.
+    pub fn is_empty(&self) -> bool {
+        self.seen.lock().expect("the census lock is never poisoned").is_empty()
+    }
+
+    /// How often `cmd` was asked for and not served.
+    pub fn count(&self, cmd: VkCommandTypeEXT) -> u64 {
+        self.seen
+            .lock()
+            .expect("the census lock is never poisoned")
+            .get(&cmd.0)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The commands a corpus asked for, most-used first -- the order to implement them in.
+    pub fn by_frequency(&self) -> Vec<(&'static str, u64)> {
+        let mut v: Vec<_> = self
+            .seen
+            .lock()
+            .expect("the census lock is never poisoned")
+            .iter()
+            .map(|(c, n)| (vn_command_name(VkCommandTypeEXT(*c)).unwrap_or("?"), *n))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        v
+    }
 }
 
 /// What a command reaches: the object table it registers into, and the tally of what this build
@@ -1640,7 +1683,7 @@ pub struct Unimplemented {
 /// halves of the pairing separately. See `objects`.
 pub struct Handlers<'a> {
     objects: &'a Shared,
-    todo: &'a mut Unimplemented,
+    todo: &'a Unimplemented,
     /// The driver objects this context has stood up: its instance, and its devices.
     driver: &'a mut Driver,
     /// The entry points that exist before an instance does. Owned by the renderer root, because
@@ -2072,7 +2115,7 @@ impl Commands for Handlers<'_> {
     /// wrapper for a command with no handler sets fatal before decoding, whatever the reply flag
     /// says.
     fn unsupported(&mut self, cmd: VkCommandTypeEXT) {
-        *self.todo.seen.entry(cmd.0).or_default() += 1;
+        self.todo.note(cmd);
         self.reject = Some("is not a command this build serves");
     }
 
@@ -5083,19 +5126,6 @@ impl Commands for Handlers<'_> {
     }
 }
 
-impl Unimplemented {
-    /// The commands a corpus asked for, most-used first -- the order to implement them in.
-    pub fn by_frequency(&self) -> Vec<(&'static str, u64)> {
-        let mut v: Vec<_> = self
-            .seen
-            .iter()
-            .map(|(c, n)| (vn_command_name(VkCommandTypeEXT(*c)).unwrap_or("?"), *n))
-            .collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        v
-    }
-}
-
 #[cfg(test)]
 mod tests {
     /// A resource table with nothing in it, for the tests that are not about rings. A ring
@@ -5182,15 +5212,15 @@ mod tests {
             String::new(),
         );
         ctx.replay_begin();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         assert!(
-            !ctx.submit(&header(cmd, 0), &mut todo, &g, &NO_RESOURCES).ran(),
+            !ctx.submit(&header(cmd, 0), &todo, &g, &NO_RESOURCES).ran(),
             "a command with no body must poison"
         );
         assert!(ctx.fatal());
 
         // The poison outlives the batch: a stream we stopped trusting stays untrusted.
-        assert!(!ctx.submit(&header(cmd, 0), &mut todo, &g, &NO_RESOURCES).ran());
+        assert!(!ctx.submit(&header(cmd, 0), &todo, &g, &NO_RESOURCES).ran());
     }
 
     /// A command that wants an answer has nowhere to be answered into, so it poisons -- but only
@@ -5198,7 +5228,7 @@ mod tests {
     #[test]
     fn a_reply_request_poisons_only_outside_replay() {
         let cmd = VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT;
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let g = crate::vulkan::global();
 
         let mut ctx = Context::new(
@@ -5210,7 +5240,7 @@ mod tests {
         let mut full = w.clone();
         full.extend_from_slice(&1u64.to_le_bytes()); // instance id
         full.extend_from_slice(&0u64.to_le_bytes()); // no allocator
-        assert!(!ctx.submit(&full, &mut todo, &g, &NO_RESOURCES).ran());
+        assert!(!ctx.submit(&full, &todo, &g, &NO_RESOURCES).ran());
         assert_eq!(ctx.unhandled, 1);
 
         // In replay the flag is stripped, so the command reaches the dispatcher instead of the
@@ -5222,7 +5252,7 @@ mod tests {
             String::new(),
         );
         ctx.replay_begin();
-        assert!(!ctx.submit(&full, &mut todo, &g, &NO_RESOURCES).ran());
+        assert!(!ctx.submit(&full, &todo, &g, &NO_RESOURCES).ran());
         assert_eq!(ctx.dispatched, 1);
         assert_eq!(ctx.unhandled, 0);
     }
@@ -5236,7 +5266,7 @@ mod tests {
     fn a_dispatched_command_reaches_the_recorder() {
         let cmd = VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT;
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -5249,7 +5279,7 @@ mod tests {
         let mut w = header(cmd, 0);
         w.extend_from_slice(&0u64.to_le_bytes()); // a null instance: legal, and destroys nothing
         w.extend_from_slice(&0u64.to_le_bytes()); // no allocator
-        assert!(ctx.submit(&w, &mut todo, &g, &NO_RESOURCES).ran());
+        assert!(ctx.submit(&w, &todo, &g, &NO_RESOURCES).ran());
 
         assert_eq!(ctx.dispatched, 1);
         assert_eq!(ctx.journal_seq(), Seq(1), "the recorder saw the command the dispatcher did");
@@ -5354,7 +5384,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -5367,7 +5397,7 @@ mod tests {
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire_execute(&[stream_at(STREAM, inner.len())], None));
         batch.extend_from_slice(&wire_seek(0x30, GENERATE_REPLY));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "a served batch does not poison");
+        assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "a served batch does not poison");
 
         let mut got = [0u8; 4];
         assert!(t.1.copy_out(WINDOW + 0x10, &mut got));
@@ -5406,7 +5436,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
 
         // Not waiting: the command is lost, the context lives.
         let mut ctx = Context::new(
@@ -5417,7 +5447,7 @@ mod tests {
         ctx.objects.borrow_mut().add_ghost(ObjectId(GHOST));
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire_cache_data(GHOST, 0));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "absorbed, not poisoned");
+        assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "absorbed, not poisoned");
         assert!(!ctx.fatal());
 
         // Waiting: nothing the host could write is an honest answer, so it writes none and stops.
@@ -5429,7 +5459,7 @@ mod tests {
         ctx.objects.borrow_mut().add_ghost(ObjectId(GHOST));
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire_cache_data(GHOST, GENERATE_REPLY));
-        assert!(!ctx.submit(&batch, &mut todo, &g, &t).ran(), "a reply it cannot give poisons");
+        assert!(!ctx.submit(&batch, &todo, &g, &t).ran(), "a reply it cannot give poisons");
         assert!(ctx.fatal());
         let mut got = [0u8; 4];
         assert!(t.1.copy_out(WINDOW, &mut got));
@@ -5469,7 +5499,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -5485,7 +5515,7 @@ mod tests {
             &[stream_at(A, inner.len()), stream_at(B, inner.len())],
             Some(&[0x40, 0x80]),
         ));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran());
+        assert!(ctx.submit(&batch, &todo, &g, &t).ran());
 
         let mut got = [0u8; 4];
         assert!(t.1.copy_out(WINDOW + 0x40, &mut got));
@@ -5517,7 +5547,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
 
         // Nothing to run, in a resource that is not even mapped: the skip is what keeps this from
         // being an error at all.
@@ -5533,7 +5563,7 @@ mod tests {
             size: 0,
         };
         batch.extend_from_slice(&wire_execute(&[nowhere], Some(&[0x40])));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "an empty stream is not an error");
+        assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "an empty stream is not an error");
 
         // The same empty stream, asked to answer past the end of the window.
         let mut ctx = Context::new(
@@ -5543,10 +5573,7 @@ mod tests {
         );
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire_execute(&[nowhere], Some(&[0x101])));
-        assert!(
-            !ctx.submit(&batch, &mut todo, &g, &t).ran(),
-            "a position past the window is refused"
-        );
+        assert!(!ctx.submit(&batch, &todo, &g, &t).ran(), "a position past the window is refused");
         assert!(ctx.fatal());
     }
 
@@ -5556,7 +5583,7 @@ mod tests {
     fn a_stream_outside_its_resource_is_refused() {
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
 
         for s in [
             stream_at(t.1.len() - 4, 8),
@@ -5573,7 +5600,7 @@ mod tests {
                 String::new(),
             );
             assert!(
-                !ctx.submit(&wire_execute(&[s], None), &mut todo, &g, &t).ran(),
+                !ctx.submit(&wire_execute(&[s], None), &todo, &g, &t).ran(),
                 "{} bytes at {} of resource {} is not a stream this resource holds",
                 s.size,
                 s.offset,
@@ -5597,7 +5624,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -5611,7 +5638,7 @@ mod tests {
 
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire_execute(&[stream_at(B, middle.len())], None));
-        assert!(!ctx.submit(&batch, &mut todo, &g, &t).ran(), "nesting is refused");
+        assert!(!ctx.submit(&batch, &todo, &g, &t).ran(), "nesting is refused");
         assert!(ctx.fatal());
 
         let mut got = [0u8; 4];
@@ -5625,14 +5652,14 @@ mod tests {
     fn an_execute_that_cannot_mean_anything_is_refused() {
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
 
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
             String::new(),
         );
-        assert!(!ctx.submit(&wire_execute(&[], None), &mut todo, &g, &t).ran(), "no streams");
+        assert!(!ctx.submit(&wire_execute(&[], None), &todo, &g, &t).ran(), "no streams");
         assert!(ctx.fatal());
 
         // Positions, and no reply stream was ever set: the guest has said where every answer
@@ -5643,7 +5670,7 @@ mod tests {
             String::new(),
         );
         let w = wire_execute(&[stream_at(0x22000, 4)], Some(&[0]));
-        assert!(!ctx.submit(&w, &mut todo, &g, &t).ran(), "positions with no window");
+        assert!(!ctx.submit(&w, &todo, &g, &t).ran(), "positions with no window");
         assert!(ctx.fatal());
     }
 
@@ -5665,7 +5692,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -5677,7 +5704,7 @@ mod tests {
         // rather than that everything happens to land at zero.
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire_seek(AT, GENERATE_REPLY));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "a served batch does not poison");
+        assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "a served batch does not poison");
 
         let mut got = [0u8; 4];
         assert!(t.1.copy_out(WINDOW + AT, &mut got));
@@ -5700,7 +5727,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -5710,10 +5737,7 @@ mod tests {
         // Two bytes of room for a four-byte answer.
         let mut batch = wire_set_reply(&reply_at(WINDOW, 2));
         batch.extend_from_slice(&wire_seek(0, GENERATE_REPLY));
-        assert!(
-            !ctx.submit(&batch, &mut todo, &g, &t).ran(),
-            "an answer with nowhere to go poisons"
-        );
+        assert!(!ctx.submit(&batch, &todo, &g, &t).ran(), "an answer with nowhere to go poisons");
         assert!(ctx.fatal());
 
         let mut got = [0u8; 4];
@@ -5732,7 +5756,7 @@ mod tests {
         {
             let t = ring_table();
             let g = crate::vulkan::global();
-            let mut todo = Unimplemented::default();
+            let todo = Unimplemented::default();
             let mut ctx = Context::new(
                 ContextKey::for_test(ContextId::new(1).unwrap()),
                 &Budget::with_cap(None, false),
@@ -5742,7 +5766,7 @@ mod tests {
             let mut batch = wire_set_reply(&reply_at(WINDOW, SIZE));
             batch.extend_from_slice(&wire_seek(position, 0));
             assert_eq!(
-                ctx.submit(&batch, &mut todo, &g, &t).ran(),
+                ctx.submit(&batch, &todo, &g, &t).ran(),
                 ok,
                 "seeking to {position:#x} in a {SIZE:#x}-byte window"
             );
@@ -5761,7 +5785,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -5771,7 +5795,7 @@ mod tests {
         // Out of range, and asking for a reply: the seek fails and the answer must not land.
         let mut batch = wire_set_reply(&reply_at(WINDOW, SIZE));
         batch.extend_from_slice(&wire_seek(SIZE + 1, GENERATE_REPLY));
-        assert!(!ctx.submit(&batch, &mut todo, &g, &t).ran(), "a rejected command poisons");
+        assert!(!ctx.submit(&batch, &todo, &g, &t).ran(), "a rejected command poisons");
 
         let mut got = [0u8; 4];
         assert!(t.1.copy_out(WINDOW, &mut got));
@@ -5783,14 +5807,14 @@ mod tests {
     fn a_seek_with_no_stream_is_refused() {
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
             String::new(),
         );
 
-        assert!(!ctx.submit(&wire_seek(0, 0), &mut todo, &g, &t).ran(), "there is nothing to seek");
+        assert!(!ctx.submit(&wire_seek(0, 0), &todo, &g, &t).ran(), "there is nothing to seek");
         assert!(ctx.fatal());
     }
 
@@ -5972,7 +5996,7 @@ mod tests {
         for (name, cmd) in batches {
             let t = ring_table();
             let g = crate::vulkan::global();
-            let mut todo = Unimplemented::default();
+            let todo = Unimplemented::default();
             let mut ctx = Context::new(
                 ContextKey::for_test(ContextId::new(1).unwrap()),
                 &Budget::with_cap(None, false),
@@ -5982,10 +6006,10 @@ mod tests {
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
             batch.extend_from_slice(&cmd);
             assert!(
-                ctx.submit(&batch, &mut todo, &g, &t).ran(),
+                ctx.submit(&batch, &todo, &g, &t).ran(),
                 "{name} is served, so it does not poison"
             );
-            assert!(todo.seen.is_empty(), "{name} reached a handler, so it is off the census");
+            assert!(todo.is_empty(), "{name} reached a handler, so it is off the census");
 
             let mut got = [0u8; 8];
             assert!(t.1.copy_out(WINDOW, &mut got));
@@ -6078,7 +6102,7 @@ mod tests {
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -6086,7 +6110,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -6187,7 +6211,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -6210,7 +6234,7 @@ mod tests {
             ty::vn_command_vkDeviceWaitIdle { device: VkDevice(GUEST_ID), ..Default::default() },
             GENERATE_REPLY
         ));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "a served command does not poison");
+        assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "a served command does not poison");
         CALLS.with_borrow(|c| {
             assert_eq!(*c, [DEVICE], "the driver was called, with the host handle not the guest id")
         });
@@ -6361,7 +6385,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -6444,7 +6468,7 @@ mod tests {
             },
             GENERATE_REPLY
         ));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "three served commands do not poison");
+        assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "three served commands do not poison");
 
         SAW.with_borrow(|s| {
             assert_eq!(
@@ -6511,7 +6535,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -6540,7 +6564,7 @@ mod tests {
             cv,
             GENERATE_REPLY
         ));
-        assert!(!ctx.submit(&batch, &mut todo, &g, &t).ran(), "no device to ask");
+        assert!(!ctx.submit(&batch, &todo, &g, &t).ran(), "no device to ask");
         assert!(ctx.fatal());
     }
 
@@ -6939,7 +6963,7 @@ mod tests {
             for timeline in [false, true] {
                 let t = ring_table();
                 let g = crate::vulkan::global();
-                let mut todo = Unimplemented::default();
+                let todo = Unimplemented::default();
                 let mut ctx = Context::new(
                     ContextKey::for_test(ContextId::new(1).unwrap()),
                     &Budget::with_cap(None, false),
@@ -6997,11 +7021,11 @@ mod tests {
                     made,
                     GENERATE_REPLY
                 ));
-                assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "the create itself is served");
+                assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "the create itself is served");
 
                 let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
                 batch.extend_from_slice(&cmd);
-                let ran = ctx.submit(&batch, &mut todo, &g, &t).ran();
+                let ran = ctx.submit(&batch, &todo, &g, &t).ran();
                 if timeline {
                     assert!(ran, "{name} on a timeline is served");
                     assert!(!ctx.fatal(), "{name} on a timeline poisons nothing");
@@ -7120,7 +7144,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -7165,7 +7189,7 @@ mod tests {
             q,
             GENERATE_REPLY
         ));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "a served query does not poison");
+        assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "a served query does not poison");
         SAW.with_borrow(|v| {
             assert_eq!(
                 *v,
@@ -7241,7 +7265,7 @@ mod tests {
         let t = ring_table();
         let mapped = t.1.len() as u64;
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -7288,10 +7312,7 @@ mod tests {
             q,
             GENERATE_REPLY
         ));
-        assert!(
-            ctx.submit(&batch, &mut todo, &g, &t).ran(),
-            "a resource the guest owns is answered"
-        );
+        assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "a resource the guest owns is answered");
 
         let (mut want_props, mut want_size) = asked();
         want_props.memoryTypeBits = HOST_VISIBLE_MASK;
@@ -7326,7 +7347,7 @@ mod tests {
             GENERATE_REPLY
         ));
         assert!(
-            ctx.submit(&batch, &mut todo, &g, &t).ran(),
+            ctx.submit(&batch, &todo, &g, &t).ran(),
             "an id that names nothing keeps the ring alive"
         );
 
@@ -7361,7 +7382,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let t = ring_table();
 
@@ -7373,7 +7394,7 @@ mod tests {
                 let mut jrnl = Journal::new();
                 let mut h = Handlers {
                     objects: &objects,
-                    todo: &mut todo,
+                    todo: &todo,
                     driver: &mut driver,
                     global: &global,
                     ctx: ContextId::new(1).expect("1 is not zero"),
@@ -7431,7 +7452,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let t = ring_table();
 
@@ -7443,7 +7464,7 @@ mod tests {
                 let mut jrnl = Journal::new();
                 let mut h = Handlers {
                     objects: &objects,
-                    todo: &mut todo,
+                    todo: &todo,
                     driver: &mut driver,
                     global: &global,
                     ctx: ContextId::new(1).expect("1 is not zero"),
@@ -7537,7 +7558,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let t = ring_table();
 
@@ -7550,7 +7571,7 @@ mod tests {
                 let mut jrnl = Journal::new();
                 let mut h = Handlers {
                     objects: &objects,
-                    todo: &mut todo,
+                    todo: &todo,
                     driver: &mut driver,
                     global: &global,
                     ctx: ContextId::new(1).expect("1 is not zero"),
@@ -7639,7 +7660,7 @@ mod tests {
         fns.plant_vkGetPhysicalDeviceQueueFamilyProperties(families);
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(fns);
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
 
         macro_rules! run {
@@ -7650,7 +7671,7 @@ mod tests {
                 let mut jrnl = Journal::new();
                 let mut h = Handlers {
                     objects: &objects,
-                    todo: &mut todo,
+                    todo: &todo,
                     driver: &mut driver,
                     global: &global,
                     ctx: ContextId::new(1).expect("1 is not zero"),
@@ -7761,7 +7782,7 @@ mod tests {
         fns.plant_vkGetPhysicalDeviceToolProperties(tools);
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(fns);
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
 
         macro_rules! run {
@@ -7772,7 +7793,7 @@ mod tests {
                 let mut jrnl = Journal::new();
                 let mut h = Handlers {
                     objects: &objects,
-                    todo: &mut todo,
+                    todo: &todo,
                     driver: &mut driver,
                     global: &global,
                     ctx: ContextId::new(1).expect("1 is not zero"),
@@ -7840,7 +7861,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -7865,7 +7886,7 @@ mod tests {
             q,
             GENERATE_REPLY
         ));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "the handshake does not poison");
+        assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "the handshake does not poison");
 
         let mut want_props = speaks.clone();
         let mut want_n = 2u32;
@@ -7950,7 +7971,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -7990,7 +8011,7 @@ mod tests {
             GENERATE_REPLY
         ));
         assert!(
-            ctx.submit(&batch, &mut todo, &g, &t).ran(),
+            ctx.submit(&batch, &todo, &g, &t).ran(),
             "the driver answered, so the ring lives on"
         );
         SAW.with_borrow(|v| {
@@ -8081,7 +8102,7 @@ mod tests {
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -8089,7 +8110,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -8200,7 +8221,7 @@ mod tests {
     fn a_timeline_command_with_no_struct_is_refused() {
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -8208,7 +8229,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -8248,7 +8269,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -8261,7 +8282,7 @@ mod tests {
             ty::vn_command_vkQueueWaitIdle::default(),
             0
         );
-        assert!(!ctx.submit(&cmd, &mut todo, &g, &t).ran(), "a queue with no device behind it");
+        assert!(!ctx.submit(&cmd, &todo, &g, &t).ran(), "a queue with no device behind it");
         assert!(ctx.fatal());
     }
 
@@ -8308,7 +8329,7 @@ mod tests {
         for reply_wanted in [false, true] {
             let t = ring_table();
             let g = crate::vulkan::global();
-            let mut todo = Unimplemented::default();
+            let todo = Unimplemented::default();
             let mut ctx = Context::new(
                 ContextKey::for_test(ContextId::new(1).unwrap()),
                 &Budget::with_cap(None, false),
@@ -8319,15 +8340,14 @@ mod tests {
             batch.extend_from_slice(&wire_unserved(if reply_wanted { GENERATE_REPLY } else { 0 }));
 
             assert!(
-                !ctx.submit(&batch, &mut todo, &g, &t).ran(),
+                !ctx.submit(&batch, &todo, &g, &t).ran(),
                 "an unserved command, reply wanted: {reply_wanted}"
             );
 
             // Either way it is on the census: refusing to answer is not refusing to notice.
             assert_eq!(
-                todo.seen
-                    .get(&VkCommandTypeEXT::VK_COMMAND_TYPE_vkGetDeferredOperationResultKHR_EXT.0),
-                Some(&1),
+                todo.count(VkCommandTypeEXT::VK_COMMAND_TYPE_vkGetDeferredOperationResultKHR_EXT),
+                1,
                 "the command was counted"
             );
 
@@ -8352,17 +8372,14 @@ mod tests {
         let t = ring_table();
         let info = ring_info();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
             String::new(),
         );
 
-        assert!(
-            ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t).ran(),
-            "ring 7 is accepted"
-        );
+        assert!(ctx.submit(&wire_create_ring(7, &info), &todo, &g, &t).ran(), "ring 7 is accepted");
 
         // Two streams, two windows, set down the stream each belongs to -- the ring's first, so
         // that a context-wide slot would have the context's window in it by the time the ring
@@ -8372,19 +8389,17 @@ mod tests {
         assert!(ctx.submit_ring(
             RingId::new(7).unwrap(),
             &wire_set_reply(&reply_at(RING_WINDOW, 0x100)),
-            &mut todo,
+            &todo,
             &g,
             &t
         ));
-        assert!(
-            ctx.submit(&wire_set_reply(&reply_at(CONTEXT_WINDOW, 0x100)), &mut todo, &g, &t).ran()
-        );
+        assert!(ctx.submit(&wire_set_reply(&reply_at(CONTEXT_WINDOW, 0x100)), &todo, &g, &t).ran());
 
         // The question arrives on the ring, so the answer belongs in the ring's window.
         assert!(ctx.submit_ring(
             RingId::new(7).unwrap(),
             &wire_seek(0, GENERATE_REPLY),
-            &mut todo,
+            &todo,
             &g,
             &t
         ));
@@ -8446,7 +8461,7 @@ mod tests {
     fn a_ring_that_asks_to_be_monitored_gets_its_alive_bit_stamped() {
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -8455,7 +8470,7 @@ mod tests {
         ctx.replay_begin();
 
         assert!(
-            ctx.submit(&wire_monitored_ring(7, 1_000), &mut todo, &g, &t).ran(),
+            ctx.submit(&wire_monitored_ring(7, 1_000), &todo, &g, &t).ran(),
             "a monitor request is part of the protocol, not an unknown chained struct"
         );
 
@@ -8481,7 +8496,7 @@ mod tests {
     fn a_reporting_period_of_zero_is_refused() {
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -8489,7 +8504,7 @@ mod tests {
         );
         ctx.replay_begin();
 
-        assert!(!ctx.submit(&wire_monitored_ring(7, 0), &mut todo, &g, &t).ran(), "refused");
+        assert!(!ctx.submit(&wire_monitored_ring(7, 0), &todo, &g, &t).ran(), "refused");
         assert!(ctx.rings.is_empty(), "and the ring it came with was never registered");
     }
 
@@ -8560,7 +8575,7 @@ mod tests {
     /// A context with one ring, idle, so a batch can be aimed at either stream.
     fn ctx_with_ring(t: &OneShm) -> Context {
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -8568,7 +8583,7 @@ mod tests {
         );
         ctx.replay_begin();
         assert!(
-            ctx.submit(&wire_create_ring(7, &ring_info()), &mut todo, &g, t).ran(),
+            ctx.submit(&wire_create_ring(7, &ring_info()), &todo, &g, t).ran(),
             "the ring was created"
         );
         ctx
@@ -8587,14 +8602,14 @@ mod tests {
     fn a_transport_command_on_the_wrong_stream_is_refused() {
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
 
         // Ring-only, sent on the context's own stream. Poisoned specifically, not merely "did
         // not finish": a build that took the wrong stream's command and *suspended* on it would
         // also fail a `ran()` check, while having invented a ring for a command that names none.
         let mut ctx = ctx_with_ring(&t);
         assert_eq!(
-            ctx.submit(&wire_wait_vq(1), &mut todo, &g, &t),
+            ctx.submit(&wire_wait_vq(1), &todo, &g, &t),
             Submitted::Poisoned,
             "a virtqueue wait names no ring, so the context's own stream cannot send it"
         );
@@ -8607,7 +8622,7 @@ mod tests {
         ] {
             let mut ctx = ctx_with_ring(&t);
             assert!(
-                !ctx.submit_ring(RingId::new(7).unwrap(), &batch, &mut todo, &g, &t),
+                !ctx.submit_ring(RingId::new(7).unwrap(), &batch, &todo, &g, &t),
                 "{what} reaches the ring table, which a ring's own dispatch is inside"
             );
         }
@@ -8622,9 +8637,9 @@ mod tests {
     fn a_ring_seqno_wait_on_a_ring_that_is_not_reading_is_refused() {
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = ctx_with_ring(&t);
-        assert!(!ctx.submit(&wire_wait_ring(7, 1), &mut todo, &g, &t).ran(), "refused");
+        assert!(!ctx.submit(&wire_wait_ring(7, 1), &todo, &g, &t).ran(), "refused");
     }
 
     /// The `extra` region is a door of a fixed size, and the offset comes from the guest at write
@@ -8634,11 +8649,11 @@ mod tests {
     fn a_ring_extra_write_stays_inside_the_extra_region() {
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
 
         let mut ctx = ctx_with_ring(&t);
         assert!(
-            ctx.submit(&wire_write_extra(7, 0, 0xfeed), &mut todo, &g, &t).ran(),
+            ctx.submit(&wire_write_extra(7, 0, 0xfeed), &todo, &g, &t).ran(),
             "the one word `extra` holds is the guest's to write"
         );
         assert_eq!(
@@ -8650,7 +8665,7 @@ mod tests {
         for (what, offset) in [("one word past the end", 4), ("far past the end", 0x1000)] {
             let mut ctx = ctx_with_ring(&t);
             assert!(
-                !ctx.submit(&wire_write_extra(7, offset, 1), &mut todo, &g, &t).ran(),
+                !ctx.submit(&wire_write_extra(7, offset, 1), &todo, &g, &t).ran(),
                 "{what} is outside the region and is refused"
             );
         }
@@ -8668,7 +8683,7 @@ mod tests {
         let t = ring_table();
         let info = ring_info();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -8678,7 +8693,7 @@ mod tests {
 
         for ring in [7u64, 9] {
             assert!(
-                ctx.submit(&wire_create_ring(ring, &info), &mut todo, &g, &t).ran(),
+                ctx.submit(&wire_create_ring(ring, &info), &todo, &g, &t).ran(),
                 "ring {ring} is one we accept"
             );
         }
@@ -8687,7 +8702,7 @@ mod tests {
         for (ring, offset) in [(7u64, 0x21000usize), (9, 0x22000)] {
             let d = reply_at(offset, 0x100);
             assert!(
-                ctx.submit_ring(RingId::new(ring).unwrap(), &wire_set_reply(&d), &mut todo, &g, &t),
+                ctx.submit_ring(RingId::new(ring).unwrap(), &wire_set_reply(&d), &todo, &g, &t),
                 "ring {ring}'s window fits its resource"
             );
         }
@@ -8723,7 +8738,7 @@ mod tests {
         let t = ring_table();
         let info = ring_info();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -8731,11 +8746,11 @@ mod tests {
         );
         ctx.replay_begin();
         for ring in [7u64, 9] {
-            assert!(ctx.submit(&wire_create_ring(ring, &info), &mut todo, &g, &t).ran());
+            assert!(ctx.submit(&wire_create_ring(ring, &info), &todo, &g, &t).ran());
         }
         for (ring, seqno) in [(7u64, 40u64), (9, 55)] {
             assert!(
-                ctx.submit(&wire_submit_vq(ring, seqno), &mut todo, &g, &t).ran(),
+                ctx.submit(&wire_submit_vq(ring, seqno), &todo, &g, &t).ran(),
                 "ring {ring}'s seqno is accepted on the context's own stream"
             );
         }
@@ -8752,7 +8767,7 @@ mod tests {
         // The whole journal must replay. Routing the seqno to its own ring instead of the
         // context's decoder fails HERE, because the handler refuses it on a ring's own stream and
         // one refused entry abandons every entry after it.
-        assert!(back.replay_upto(Seq(u64::MAX), &mut todo, &g, &t), "every journal entry replayed");
+        assert!(back.replay_upto(Seq(u64::MAX), &todo, &g, &t), "every journal entry replayed");
 
         let seqno =
             |c: &Context, ring: u64| c.rings[&RingId::new(ring).unwrap()].idle().virtqueue_seqno;
@@ -8768,16 +8783,16 @@ mod tests {
         let t = ring_table();
         let info = ring_info();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
             String::new(),
         );
         ctx.replay_begin();
-        assert!(ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t).ran());
+        assert!(ctx.submit(&wire_create_ring(7, &info), &todo, &g, &t).ran());
         for seqno in [40u64, 12] {
-            assert!(ctx.submit(&wire_submit_vq(7, seqno), &mut todo, &g, &t).ran());
+            assert!(ctx.submit(&wire_submit_vq(7, seqno), &todo, &g, &t).ran());
         }
         assert_eq!(
             ctx.rings[&RingId::new(7).unwrap()].idle().virtqueue_seqno,
@@ -8793,7 +8808,7 @@ mod tests {
         );
         back.replay_begin();
         back.journal_restore(&blob).expect("the blob parses");
-        back.replay_upto(Seq(u64::MAX), &mut todo, &g, &t);
+        back.replay_upto(Seq(u64::MAX), &todo, &g, &t);
         assert_eq!(
             back.rings[&RingId::new(7).unwrap()].idle().virtqueue_seqno,
             40,
@@ -8808,7 +8823,7 @@ mod tests {
         let t = ring_table();
         let info = ring_info();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -8816,10 +8831,10 @@ mod tests {
         );
         ctx.replay_begin();
 
-        assert!(ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t).ran());
+        assert!(ctx.submit(&wire_create_ring(7, &info), &todo, &g, &t).ran());
 
         let d = reply_at(0x21000, 0x100);
-        assert!(ctx.submit(&wire_set_reply(&d), &mut todo, &g, &t).ran());
+        assert!(ctx.submit(&wire_set_reply(&d), &todo, &g, &t).ran());
 
         assert_eq!(
             ctx.reply.as_ref().expect("the context was given a stream").window().begin(),
@@ -8840,7 +8855,7 @@ mod tests {
 
         let t = ring_table();
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
@@ -8850,7 +8865,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -8898,7 +8913,7 @@ mod tests {
 
         for (asked, taken) in cases {
             let objects = Shared::new();
-            let mut todo = Unimplemented::default();
+            let todo = Unimplemented::default();
             let global = crate::vulkan::global();
             let mut driver = Driver::new(Account::for_test(None));
             let mut rings = BTreeMap::new();
@@ -8907,7 +8922,7 @@ mod tests {
             let mut jrnl = Journal::new();
             let mut h = Handlers {
                 objects: &objects,
-                todo: &mut todo,
+                todo: &todo,
                 driver: &mut driver,
                 global: &global,
                 ctx: ContextId::new(1).expect("1 is not zero"),
@@ -8944,7 +8959,7 @@ mod tests {
         use super::super::proto::types::vn_command_vkSetReplyCommandStreamMESA as SetReply;
 
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
@@ -8953,7 +8968,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -8986,7 +9001,7 @@ mod tests {
         let t = ring_table();
         let info = ring_info();
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
@@ -8995,7 +9010,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -9030,7 +9045,7 @@ mod tests {
     #[test]
     fn a_submission_for_a_ring_that_is_not_here_fails_without_poisoning() {
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -9039,14 +9054,11 @@ mod tests {
         ctx.replay_begin();
 
         assert!(
-            !ctx.submit_ring(RingId::new(7).unwrap(), &[], &mut todo, &g, &NO_RESOURCES),
+            !ctx.submit_ring(RingId::new(7).unwrap(), &[], &todo, &g, &NO_RESOURCES),
             "there is no ring 7 to submit to"
         );
         assert!(!ctx.fatal(), "and the context is still usable");
-        assert!(
-            ctx.submit(&[], &mut todo, &g, &NO_RESOURCES).ran(),
-            "so its own stream still works"
-        );
+        assert!(ctx.submit(&[], &todo, &g, &NO_RESOURCES).ran(), "so its own stream still works");
     }
 
     /// The witness the RingId split owed: two rings whose ids differ only above bit 32 are two
@@ -9059,7 +9071,7 @@ mod tests {
         let t = ring_table();
         let info = ring_info();
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
@@ -9073,7 +9085,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -9113,7 +9125,7 @@ mod tests {
         let t = ring_table();
         let info = ring_info();
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
@@ -9122,7 +9134,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -9213,7 +9225,7 @@ mod tests {
         }
 
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut driver = Driver::new(Account::for_test(Some(CAP)));
         let mut fns = crate::vulkan::Device::default();
@@ -9228,7 +9240,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -9292,7 +9304,7 @@ mod tests {
 
         let info = ring_info();
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
@@ -9301,7 +9313,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -9331,7 +9343,7 @@ mod tests {
 
         let t = ring_table();
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
@@ -9340,7 +9352,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -9372,7 +9384,7 @@ mod tests {
 
         let t = ring_table();
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
@@ -9381,7 +9393,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -9450,7 +9462,7 @@ mod tests {
 
         let t = ring_table();
         let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let mut ctx = Context::new(
             ContextKey::for_test(ContextId::new(1).unwrap()),
             &Budget::with_cap(None, false),
@@ -9484,8 +9496,8 @@ mod tests {
         w.extend_from_slice(&1u64.to_le_bytes()); // pFence: present
         w.extend_from_slice(&FENCE.to_le_bytes()); // the id the guest chose
 
-        assert!(ctx.submit(&w, &mut todo, &g, &t).ran(), "the first create is served");
-        assert!(!ctx.submit(&w, &mut todo, &g, &t).ran(), "the second, under a live id, poisons");
+        assert!(ctx.submit(&w, &todo, &g, &t).ran(), "the first create is served");
+        assert!(!ctx.submit(&w, &todo, &g, &t).ran(), "the second, under a live id, poisons");
         CREATES.with_borrow(|c| assert_eq!(c.len(), 1, "the driver was asked once: {c:x?}"));
         assert_eq!(
             ctx.objects.lookup(ObjectId(FENCE), VkObjectType::VK_OBJECT_TYPE_FENCE.0),
@@ -9574,7 +9586,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(inst);
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -9582,7 +9594,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -9665,7 +9677,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(inst);
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -9673,7 +9685,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -9772,7 +9784,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -9780,7 +9792,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -9907,7 +9919,7 @@ mod tests {
         args.plant_pFeatures(&mut asked);
 
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -9915,7 +9927,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10031,7 +10043,7 @@ mod tests {
         args.plant_pMemoryProperties(&mut asked);
 
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -10039,7 +10051,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10109,7 +10121,7 @@ mod tests {
         args.plant_pProperties(&mut asked);
 
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -10117,7 +10129,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10169,7 +10181,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10214,7 +10226,7 @@ mod tests {
         use super::super::proto::types::vn_command_vkEnumerateInstanceVersion as Cmd;
 
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut driver = Driver::new(Account::for_test(None));
 
@@ -10228,7 +10240,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10262,7 +10274,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10336,7 +10348,7 @@ mod tests {
         fns.plant_vkEnumeratePhysicalDeviceGroups(groups);
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(fns);
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
 
         let mut props = [VkPhysicalDeviceGroupProperties::default(); 1];
@@ -10352,7 +10364,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10393,7 +10405,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10523,7 +10535,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_extensions(VkPhysicalDevice(1), &["VK_KHR_external_memory_fd"]);
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
 
         let mut n = 0u32;
@@ -10538,7 +10550,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10601,7 +10613,7 @@ mod tests {
         driver.plant_instance(fns);
 
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
 
         // The count call: a count member, no array behind it.
@@ -10615,7 +10627,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10650,7 +10662,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10701,7 +10713,7 @@ mod tests {
         args.plant_pProperties(&mut props);
 
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -10709,7 +10721,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10750,7 +10762,7 @@ mod tests {
         driver.plant_instance(crate::vulkan::Instance::default());
         let mut args = vn_command_vkGetPhysicalDeviceFeatures2::default();
         let objects = Shared::new();
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -10758,7 +10770,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10791,7 +10803,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -10959,7 +10971,7 @@ mod tests {
         // A driver with no instance refuses every device without reaching Vulkan, which is the
         // refusal this test wants: the interesting half is what happens after the `Err`.
         let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -10967,7 +10979,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -11043,7 +11055,7 @@ mod tests {
             .unwrap();
 
         let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -11051,7 +11063,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -11183,7 +11195,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(inst);
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -11191,7 +11203,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -11360,7 +11372,7 @@ mod tests {
             &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
         );
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -11368,7 +11380,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -11522,7 +11534,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -11530,7 +11542,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -11672,7 +11684,7 @@ mod tests {
             ],
         );
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -11680,7 +11692,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -11876,7 +11888,7 @@ mod tests {
         );
         driver.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -11884,7 +11896,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -12021,7 +12033,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -12029,7 +12041,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -12109,7 +12121,7 @@ mod tests {
         // The object table has the device; the driver does not. That is exactly the split the
         // re-check exists for -- a guest that destroyed a device and then created against it.
         let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -12117,7 +12129,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -12175,7 +12187,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -12183,7 +12195,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -12369,7 +12381,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -12377,7 +12389,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -12480,7 +12492,7 @@ mod tests {
             &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
         );
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -12488,7 +12500,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -12566,7 +12578,7 @@ mod tests {
             .expect("a device for it to hang off");
 
         let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -12574,7 +12586,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -12753,7 +12765,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
         driver.plant_pool(VkDevice(DEVICE), VkCommandPool(0x20), &[(CB, ObjectId(9))]);
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -12761,7 +12773,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -12977,7 +12989,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -12985,7 +12997,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -13176,7 +13188,7 @@ mod tests {
             Lookup::Found(HostHandle(11))
         );
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -13184,7 +13196,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -13274,7 +13286,7 @@ mod tests {
             &[(VkDescriptorSet(SURVIVOR.0), ObjectId(SURVIVOR.1))],
         );
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -13282,7 +13294,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -13445,7 +13457,7 @@ mod tests {
             MINE.iter().map(|(_, id)| t.key_of(ObjectId(*id)).expect("just added")).collect()
         };
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -13453,7 +13465,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -13593,7 +13605,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -13601,7 +13613,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -13753,7 +13765,7 @@ mod tests {
             t.add(ObjectId(FENCE), FENCE_TY, HostHandle(0xfeed), Some(ObjectId(DEVICE))).unwrap();
         }
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -13761,7 +13773,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -13841,7 +13853,7 @@ mod tests {
             Lookup::Found(HostHandle(FENCE_HOST))
         );
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -13849,7 +13861,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -14002,7 +14014,7 @@ mod tests {
             &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
         );
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -14010,7 +14022,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -14268,7 +14280,7 @@ mod tests {
             &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
         );
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -14276,7 +14288,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -14416,7 +14428,7 @@ mod tests {
             &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
         );
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -14424,7 +14436,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -14535,7 +14547,7 @@ mod tests {
         fn handlers<'a>(
             objects: &'a Shared,
             driver: &'a mut Driver,
-            todo: &'a mut Unimplemented,
+            todo: &'a Unimplemented,
             global: &'a crate::vulkan::Global,
             rings: &'a mut BTreeMap<RingId, RingSlot>,
             monitor: &'a mut Option<Monitor>,
@@ -14591,12 +14603,12 @@ mod tests {
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkCmdSetAttachmentFeedbackLoopEnableEXT(set_feedback_loop);
         let mut driver = driver_with(fns);
-        let (mut todo, mut rings, mut monitor, mut reply, mut jrnl) =
+        let (todo, mut rings, mut monitor, mut reply, mut jrnl) =
             (Unimplemented::default(), BTreeMap::new(), None, None, Journal::new());
         let mut h = handlers(
             &objects,
             &mut driver,
-            &mut todo,
+            &todo,
             &global,
             &mut rings,
             &mut monitor,
@@ -14610,12 +14622,12 @@ mod tests {
 
         // The device does not: the context dies and the process does not.
         let mut driver = driver_with(crate::vulkan::Device::default());
-        let (mut todo, mut rings, mut monitor, mut reply, mut jrnl) =
+        let (todo, mut rings, mut monitor, mut reply, mut jrnl) =
             (Unimplemented::default(), BTreeMap::new(), None, None, Journal::new());
         let mut h = handlers(
             &objects,
             &mut driver,
-            &mut todo,
+            &todo,
             &global,
             &mut rings,
             &mut monitor,
@@ -14692,7 +14704,7 @@ mod tests {
         driver.plant_device(VkDevice(DEVICE), fns);
         driver.plant_pool(VkDevice(DEVICE), VkCommandPool(POOL), &[]);
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -14700,7 +14712,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -14834,7 +14846,7 @@ mod tests {
             &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
         );
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -14842,7 +14854,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -14996,7 +15008,7 @@ mod tests {
             &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
         );
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -15004,7 +15016,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -15175,7 +15187,7 @@ mod tests {
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -15183,7 +15195,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
@@ -15314,10 +15326,9 @@ mod tests {
         }
 
         let mut driver = driver_with(true);
-        let (mut todo, mut rings, mut reply, mut monitor, mut jrnl) =
+        let (todo, mut rings, mut reply, mut monitor, mut jrnl) =
             (Unimplemented::default(), BTreeMap::new(), None, None, Journal::new());
-        let mut h =
-            handlers!(&mut driver, &mut todo, &mut rings, &mut reply, &mut monitor, &mut jrnl);
+        let mut h = handlers!(&mut driver, &todo, &mut rings, &mut reply, &mut monitor, &mut jrnl);
 
         // One submit signalling the timeline to 7, and a fence beside it. Both halves are the
         // guest's and both have to arrive: the fence is what every later wait in the frame is
@@ -15361,10 +15372,9 @@ mod tests {
         // The same command to a device that exports no `vkQueueSubmit2`: a rejection naming
         // itself, and NOT the one a bad queue gets -- the two are different guest mistakes.
         let mut driver = driver_with(false);
-        let (mut todo, mut rings, mut reply, mut monitor, mut jrnl) =
+        let (todo, mut rings, mut reply, mut monitor, mut jrnl) =
             (Unimplemented::default(), BTreeMap::new(), None, None, Journal::new());
-        let mut h =
-            handlers!(&mut driver, &mut todo, &mut rings, &mut reply, &mut monitor, &mut jrnl);
+        let mut h = handlers!(&mut driver, &todo, &mut rings, &mut reply, &mut monitor, &mut jrnl);
         let mut args = vn_command_vkQueueSubmit2::default();
         args.queue = VkQueue(QUEUE);
         args.plant_pSubmits(&submits);
@@ -15487,7 +15497,7 @@ mod tests {
         driver.plant_device(VkDevice(DEVICE), fns);
         driver.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
 
-        let mut todo = Unimplemented::default();
+        let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
@@ -15495,7 +15505,7 @@ mod tests {
         let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
-            todo: &mut todo,
+            todo: &todo,
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),

@@ -1533,10 +1533,7 @@ impl Renderer {
     /// intuition: the commands a real desktop leans on are not the ones a reading of the Vulkan
     /// spec would rank first.
     pub fn venus_todo(&self) -> Vec<(&'static str, u64)> {
-        self.venus
-            .as_ref()
-            .map(|v| v.todo.lock().expect("the census lock is never poisoned").by_frequency())
-            .unwrap_or_default()
+        self.venus.as_ref().map(|v| v.todo.by_frequency()).unwrap_or_default()
     }
 
     /// One venus context's live device memory.
