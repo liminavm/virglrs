@@ -93,10 +93,9 @@ struct Armed {
     /// Calls to `resource_sync_surface`: one blocking wait on the surface's shared event each.
     presents: u64,
     /// Draws that reached program selection, and how many of them ran it. A draw runs the
-    /// nine-pass selection when a shader is dirty or when the bound framebuffer needs a
-    /// red-blue swizzle or a manual sRGB encode -- the latter two are state, not dirt, so a
-    /// BGRA framebuffer reselects on every draw. `selects / draws` says how often that path is
-    /// taken and `select_busy / selects` what one costs; neither is visible in `us/cmd`.
+    /// nine-pass selection when a shader or the vertex layout is dirty. `selects / draws` says
+    /// how often that path is taken and `select_busy / selects` what one costs; neither is
+    /// visible in `us/cmd`, and the first is what a change to the dirty marks moves.
     draws: u64,
     selects: u64,
     select_busy: Duration,

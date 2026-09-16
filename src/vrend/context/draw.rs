@@ -1531,11 +1531,13 @@ impl Context {
         let mut new_program = false;
         let mut selected = None;
         let sub = self.sub();
-        if sub.shader_dirty
-            || sub.swizzle_output_rgb_to_bgr != 0
-            || sub.needs_manual_srgb_encode != 0
-            || sub.vbo_dirty
-        {
+        // The C also reselects on every draw while the framebuffer needs a red-blue swizzle or
+        // a manual sRGB encode. Both are inputs to the fragment key, but both change only in
+        // `set_framebuffer_state`, which marks the shader dirty -- so the C's test is nine key
+        // passes per draw on any BGRA target, which is every desktop draw here, for a program
+        // that comes back the same. Every other key input marks dirt where it changes, and
+        // the flatshade and sampler fixtures are what say so.
+        if sub.shader_dirty || sub.vbo_dirty {
             selected = host.tally.mark();
             new_program = self.select_linked_program(host, cmd)?;
         }

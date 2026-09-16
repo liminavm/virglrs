@@ -551,6 +551,17 @@ pub struct View {
     pub gl_swizzle: [GLint; 4],
 }
 
+impl View {
+    /// What the shader key reads of a bound view: a rectangle served by a 2D texture, a 2D
+    /// texture under a sampler that may be an array, and a buffer. Two views with the same
+    /// bits select the same program, so a bind that keeps them marks nothing.
+    fn key_bits(&self) -> u8 {
+        u8::from(self.emulated_rect)
+            | u8::from(self.target == GL_TEXTURE_2D) << 1
+            | u8::from(self.target == GL_TEXTURE_BUFFER) << 2
+    }
+}
+
 pub struct Sampler {
     pub state: SamplerState,
     /// Two sampler objects: one skipping sRGB decode, one decoding.
@@ -3507,20 +3518,56 @@ impl Context {
         views: &[Option<ObjectHandle>],
     ) -> Result<(), Fault> {
         let cmd = Cmd::SetSamplerViews;
+        let end = start_slot + views.len() as u32;
+        // The shader key reads a few bits of every bound view (`View::key_bits`), so a slot
+        // whose bits change needs the next draw to reselect. Compared as bits rather than
+        // handles: a desktop rebinds a texture on nearly every draw, and marking on the handle
+        // would reselect the program for every one of them. The C marks only for a buffer view
+        // and would draw a texture-target change through the old program; nothing recorded
+        // reaches that, and this is the structural answer rather than the accidental one the
+        // per-draw reselect on a BGRA target used to give.
+        let bits_at = |sub: &SubContext, slot: u32| -> u8 {
+            sub.units[stage.index()]
+                .view(slot)
+                .and_then(|h| match sub.objects.get(&h) {
+                    Some(Object::SamplerView(v)) => Some(v.key_bits()),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        {
+            let sub = self.sub_mut();
+            let dropped: Vec<u32> = sub.units[stage.index()]
+                .views()
+                .filter(|(slot, _)| *slot >= end)
+                .map(|(slot, _)| slot)
+                .collect();
+            if dropped.iter().any(|slot| bits_at(sub, *slot) != 0) {
+                sub.shader_dirty = true;
+            }
+        }
         for (i, h) in views.iter().enumerate() {
             let slot = start_slot + i as u32;
             let Some(h) = h else {
-                self.sub_mut().units[stage.index()].set_view(slot, None);
+                let sub = self.sub_mut();
+                if bits_at(sub, slot) != 0 {
+                    sub.shader_dirty = true;
+                }
+                sub.units[stage.index()].set_view(slot, None);
                 continue;
             };
             let sub = self.sub_mut();
             let Some(Object::SamplerView(view)) = sub.objects.get(h) else {
+                if bits_at(sub, slot) != 0 {
+                    sub.shader_dirty = true;
+                }
                 sub.units[stage.index()].set_view(slot, None);
                 return Err(Fault::IllegalHandle { cmd, handle: *h });
             };
             if sub.units[stage.index()].holds_view(slot, *h) {
                 continue;
             }
+            let key_changed = bits_at(sub, slot) != view.key_bits();
             let (gl, features, formats) = (host.gl, host.features, host.formats);
             let mut buffer_view = false;
             let res = host.resource_mut(cmd, view.resource)?;
@@ -3580,11 +3627,12 @@ impl Context {
             }
             let sub = self.sub_mut();
             sub.units[stage.index()].set_view(slot, Some(*h));
-            if buffer_view {
+            // A buffer view marks on its own even when the bits agree: the key also carries
+            // the swizzle of a buffer view's format.
+            if buffer_view || key_changed {
                 sub.shader_dirty = true;
             }
         }
-        let end = start_slot + views.len() as u32;
         self.sub_mut().units[stage.index()].drop_views_from(end);
         Ok(())
     }
