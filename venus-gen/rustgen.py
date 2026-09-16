@@ -2901,15 +2901,19 @@ class RustGen:
                     '}', '']
             return out
         # The wire carries a chain head-first and bodies last, so decoding it is a recursion of
-        # the chain's own depth -- which the guest chooses. A chain may not name a struct twice
-        # (VUID sType-unique), so a legal one holds at most one link per struct this chain admits,
-        # and a link past that count is refused before it can recurse. The bound is the length of
-        # the match below, not a number anyone picked.
+        # the chain's own depth -- which the guest chooses. A chain names each struct at most
+        # once (VUID sType-unique) bar the few the spec lets repeat, so a legal one holds at most
+        # one link per struct this chain admits, plus its repeats. The bound is the length of the
+        # match below, not a number anyone picked: exact for a chain that admits no repeatable
+        # struct, and for the one that does (`VkDevicePrivateDataCreateInfo`, under
+        # `VkDeviceCreateInfo`) room for a hundred-odd repeats before a legal chain is refused
+        # that the C decoder would take. A link past the bound is refused before it can recurse.
         out += ['    vn_decode_%s_pnext%s_temp_at(dec, 0)' % (n, v),
                 '}', '',
-                '/// One link of the chain, `depth` links in. A chain may not name a struct twice, so it',
-                '/// holds at most as many links as there are structs it admits; a longer one is refused',
-                '/// here rather than allowed to choose how deep this thread\'s stack goes.',
+                '/// One link of the chain, `depth` links in. A chain names each struct at most once, bar',
+                '/// the few the spec lets repeat, so it holds about as many links as there are structs it',
+                '/// admits; a longer one is refused here rather than allowed to choose how deep this',
+                '/// thread\'s stack goes.',
                 'fn vn_decode_%s_pnext%s_temp_at<\'a>(dec: &mut Decoder<\'a>, depth: usize) -> *mut c_void {' % (n, v),
                 '    if !dec.decode_simple_pointer() {',
                 '        return core::ptr::null_mut();',
