@@ -1194,11 +1194,43 @@ SABOTAGES = [
     (
         'a create under a live id reaches the driver, and the object it makes is nobody\'s',
         'src/venus/context.rs',
-        """    fn object_creating(&mut self, _ty: VkObjectType, id: ObjectId) -> bool {
-        if self.objects.borrow().get(id).is_some() {""",
-        """    fn object_creating(&mut self, _ty: VkObjectType, id: ObjectId) -> bool {
-        if false && self.objects.borrow().get(id).is_some() {""",
+        """        if self.objects.borrow().get(id).is_some() {
+            self.reject = Some("created an object under an id that is already an object");""",
+        """        if false && self.objects.borrow().get(id).is_some() {
+            self.reject = Some("created an object under an id that is already an object");""",
         'a_create_under_a_live_id_never_reaches_the_driver',
+    ),
+    (
+        'an object the driver hands back is refused the second time it is asked for',
+        'src/venus/context.rs',
+        """        if handed_back(ty) {
+            return true;
+        }""",
+        """        if false && handed_back(ty) {
+            return true;
+        }""",
+        'an_object_handed_back_again_keeps_its_first_name',
+    ),
+    (
+        'a live id handed a different object keeps the first one quietly',
+        'src/venus/context.rs',
+        'if host.0 != 0 && (have.ty != ty || have.handle != host) {',
+        'if false && host.0 != 0 && (have.ty != ty || have.handle != host) {',
+        'an_object_handed_back_again_keeps_its_first_name',
+    ),
+    (
+        'an object already named is registered again under a second id',
+        'src/venus/context.rs',
+        '&& objects.id_of_handle(ty, host).is_some_and(|first| first != id)',
+        '&& objects.id_of_handle(ty, host).is_some_and(|first| first == id)',
+        'an_object_handed_back_under_a_second_name_is_refused',
+    ),
+    (
+        'a queue is a create, and asking for it twice is refused',
+        'src/venus/context.rs',
+        'ty == VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE || ty == VkObjectType::VK_OBJECT_TYPE_QUEUE',
+        'ty == VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE',
+        'a_queue_asked_for_again_keeps_its_first_name',
     ),
     (
         'a pNext chain is decoded as deep as the guest cares to make it',

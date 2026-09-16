@@ -2052,6 +2052,14 @@ fn cap_api_version(version: u32) -> u32 {
     }
 }
 
+/// Whether `ty` is an object the driver owns and only hands back -- a physical device, a queue
+/// -- rather than one a create makes on request. Naming one is not creating it: the guest may
+/// ask for it again, and Vulkan answers with the same handle each time, so a repeat is judged by
+/// whether the name agrees with the first rather than refused for being a repeat.
+fn handed_back(ty: VkObjectType) -> bool {
+    ty == VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE || ty == VkObjectType::VK_OBJECT_TYPE_QUEUE
+}
+
 impl Commands for Handlers<'_> {
     /// No handler ran: the command is counted for the census and nothing else. There is no
     /// version of that which is safe to continue from. When the guest wanted a reply, the
@@ -2075,7 +2083,15 @@ impl Commands for Handlers<'_> {
     /// would be a host object nothing names and nothing will ever destroy, behind a reply that
     /// said the create succeeded. A ghost or a fiction is not an object: the guest may create
     /// for real under an id the host once refused, or that no handler decided.
-    fn object_creating(&mut self, _ty: VkObjectType, id: ObjectId) -> bool {
+    ///
+    /// An object the driver only hands back is created by nobody, so there is nothing to refuse
+    /// before the handler: the guest may ask for it as often as it likes. Whether it named it
+    /// the way it named it before is judged in `object_created`, once the handle that came
+    /// back says which object the id was meant for.
+    fn object_creating(&mut self, ty: VkObjectType, id: ObjectId) -> bool {
+        if handed_back(ty) {
+            return true;
+        }
         if self.objects.borrow().get(id).is_some() {
             self.reject = Some("created an object under an id that is already an object");
             return false;
@@ -2095,12 +2111,34 @@ impl Commands for Handlers<'_> {
         // the driver refused". So a handler that already decided is not second-guessed here:
         // registered stands, and a ghost stands. Only an id with no decision behind it gets the
         // unserved command's fiction, where the id stands in for a handle so the rest of the
-        // stream still decodes. A live id here is one the handler registered itself -- a run
-        // allocated from a pool -- since `object_creating` refused every other live id before
-        // the handler ran.
+        // stream still decodes.
         {
             let objects = self.objects.borrow();
-            if objects.get(id).is_some() || objects.is_ghost(id) || objects.is_fiction(id) {
+            if let Some(have) = objects.get(id) {
+                // A live id here is one of two things. The handler registered it itself -- a run
+                // allocated from a pool -- and the shadow holds the handle it registered. Or it
+                // names an object the driver only hands back, which `object_creating` let
+                // through so the guest could ask for it again; then the handle that came back
+                // has to be the one the id already holds. One of the guest's names for two host
+                // objects is what the table exists to make impossible, and the C renderer
+                // refuses it the same way.
+                if host.0 != 0 && (have.ty != ty || have.handle != host) {
+                    self.reject = Some("named by a live id an object that id does not name");
+                }
+                return;
+            }
+            if objects.is_ghost(id) || objects.is_fiction(id) {
+                return;
+            }
+            // And the other way about: a handed-back object the guest has already named, under
+            // a fresh id. Two names for one object, refused as the C refuses it. Only for what
+            // is handed back: a created object's handle is the driver's to choose, and Vulkan
+            // lets two live non-dispatchable objects share one value.
+            if handed_back(ty)
+                && host.0 != 0
+                && objects.id_of_handle(ty, host).is_some_and(|first| first != id)
+            {
+                self.reject = Some("named under a second id an object it had already named");
                 return;
             }
         }
@@ -9454,6 +9492,324 @@ mod tests {
             Lookup::Found(HostHandle(FIRST)),
             "the id still names the object it named first"
         );
+    }
+
+    /// The two physical devices every handed-back test enumerates, by host handle.
+    const HANDED: [u64; 2] = [0x9100, 0x9200];
+
+    unsafe extern "C" fn hand_back_two(
+        _instance: super::super::proto::types::VkInstance,
+        n: *mut u32,
+        out: *mut super::super::proto::types::VkPhysicalDevice,
+    ) -> VkResult {
+        // SAFETY: the wrapper passes its slice's own length and pointer.
+        let room = unsafe { *n } as usize;
+        assert_eq!(room, HANDED.len(), "the guest sized for two");
+        // SAFETY: `out` has room for `room` elements, which the count just said.
+        let out = unsafe { core::slice::from_raw_parts_mut(out, room) };
+        for (e, h) in out.iter_mut().zip(HANDED) {
+            *e = super::super::proto::types::VkPhysicalDevice(h);
+        }
+        VkResult::VK_SUCCESS
+    }
+
+    unsafe extern "C" fn no_extensions(
+        _pd: super::super::proto::types::VkPhysicalDevice,
+        _layer: *const core::ffi::c_char,
+        n: *mut u32,
+        _props: *mut super::super::proto::types::VkExtensionProperties,
+    ) -> VkResult {
+        // SAFETY: the caller's own local.
+        unsafe { *n = 0 };
+        VkResult::VK_SUCCESS
+    }
+
+    /// Dispatch one `vkEnumeratePhysicalDevices` naming `ids`, as the wire would carry it.
+    fn enumerate_as(h: &mut dyn Commands, objects: &Shared, instance: u64, ids: &[u64]) {
+        let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT, 0);
+        w.extend_from_slice(&instance.to_le_bytes());
+        w.extend_from_slice(&1u64.to_le_bytes()); // pPhysicalDeviceCount: present
+        w.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        w.extend_from_slice(&(ids.len() as u64).to_le_bytes()); // pPhysicalDevices: the array size
+        for id in ids {
+            w.extend_from_slice(&id.to_le_bytes());
+        }
+        let temp = Bump::new();
+        let hard = AtomicBool::new(false);
+        let mut dec = Decoder::new(&w, &temp, objects, &hard);
+        let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+        let _flags = dec.decode_scalar::<VkFlags>();
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, h), Dispatched::Served);
+        assert!(!dec.fatal(), "a repeat is not a protocol error, whatever the handler made of it");
+    }
+
+    /// A physical device is the driver's: handed back on request, never made, and Vulkan hands
+    /// back the same handle each time it is asked. So a guest may ask again, and naming what
+    /// came back by the id it used before is served, with no second object for it in the table.
+    /// Naming it by an id that already holds something else is the guest's two names disagreeing
+    /// about one object, which the C renderer refuses and so does this one. The refusal comes
+    /// after the handler, because only the handle that came back says which object the id was
+    /// meant for -- the id alone is a legal repeat.
+    #[test]
+    fn an_object_handed_back_again_keeps_its_first_name() {
+        use super::super::cs::{Lookup, Objects};
+
+        const INSTANCE: u64 = 2;
+        const IDS: [u64; 2] = [21, 22];
+        const PD: VkObjectType = VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE;
+
+        let objects = Shared::new();
+        objects
+            .borrow_mut()
+            .add(
+                ObjectId(INSTANCE),
+                VkObjectType::VK_OBJECT_TYPE_INSTANCE,
+                HostHandle(INSTANCE),
+                None,
+            )
+            .unwrap();
+        let mut inst = crate::vulkan::Instance::default();
+        inst.plant_vkEnumeratePhysicalDevices(hand_back_two);
+        inst.plant_vkEnumerateDeviceExtensionProperties(no_extensions);
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_instance(inst);
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        for why in ["the first enumeration", "asking again under the same names"] {
+            enumerate_as(&mut h, &objects, INSTANCE, &IDS);
+            assert!(h.reject.is_none(), "{why} is served");
+        }
+        for (id, host) in IDS.iter().zip(HANDED) {
+            assert_eq!(
+                objects.lookup(ObjectId(*id), PD.0),
+                Lookup::Found(HostHandle(host)),
+                "id {id} holds the handle it was first given"
+            );
+        }
+        assert_eq!(
+            objects.borrow().of_type(PD).count(),
+            IDS.len(),
+            "asked twice, each device is still one object"
+        );
+
+        // The same two devices, each under the other's id: a live id handed a different object.
+        enumerate_as(&mut h, &objects, INSTANCE, &[IDS[1], IDS[0]]);
+        assert!(
+            h.reject.take().is_some(),
+            "a live id handed an object it does not name is refused"
+        );
+        for (id, host) in IDS.iter().zip(HANDED) {
+            assert_eq!(
+                objects.lookup(ObjectId(*id), PD.0),
+                Lookup::Found(HostHandle(host)),
+                "and id {id} still holds what it held"
+            );
+        }
+
+        h.driver.abandon_planted();
+    }
+
+    /// The other direction: an object the guest has already named, asked for again under a fresh
+    /// id. One host object under two of the guest's names is refused, as the C renderer refuses
+    /// it, and the fresh name becomes nothing -- not a second object, not a ghost.
+    ///
+    /// Only for what the driver hands back. A created object's handle is the driver's to choose,
+    /// and Vulkan lets two live non-dispatchable objects share one value, so a create is judged
+    /// by its id alone, before the handler.
+    #[test]
+    fn an_object_handed_back_under_a_second_name_is_refused() {
+        use super::super::cs::{Lookup, Objects};
+
+        const INSTANCE: u64 = 2;
+        const IDS: [u64; 2] = [21, 22];
+        const AGAIN: [u64; 2] = [31, 32];
+        const PD: VkObjectType = VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE;
+
+        let objects = Shared::new();
+        objects
+            .borrow_mut()
+            .add(
+                ObjectId(INSTANCE),
+                VkObjectType::VK_OBJECT_TYPE_INSTANCE,
+                HostHandle(INSTANCE),
+                None,
+            )
+            .unwrap();
+        let mut inst = crate::vulkan::Instance::default();
+        inst.plant_vkEnumeratePhysicalDevices(hand_back_two);
+        inst.plant_vkEnumerateDeviceExtensionProperties(no_extensions);
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_instance(inst);
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        enumerate_as(&mut h, &objects, INSTANCE, &IDS);
+        assert!(h.reject.is_none(), "the first enumeration is served");
+        enumerate_as(&mut h, &objects, INSTANCE, &AGAIN);
+        assert!(h.reject.take().is_some(), "a second name for an object already named is refused");
+        for id in AGAIN {
+            assert_eq!(
+                objects.lookup(ObjectId(id), PD.0),
+                Lookup::Missing,
+                "id {id} names nothing"
+            );
+        }
+        for (id, host) in IDS.iter().zip(HANDED) {
+            assert_eq!(
+                objects.lookup(ObjectId(*id), PD.0),
+                Lookup::Found(HostHandle(host)),
+                "id {id} still holds the handle it was first given"
+            );
+        }
+
+        h.driver.abandon_planted();
+    }
+
+    /// A queue the same way, reached through its device: a second `vkGetDeviceQueue2` under the
+    /// id used before is served and registers nothing new, and one under a fresh id is refused.
+    #[test]
+    fn a_queue_asked_for_again_keeps_its_first_name() {
+        use super::super::cs::{Lookup, Objects};
+        use super::super::proto::types::{VkDeviceQueueInfo2, VkQueue, VkStructureType};
+
+        const DEVICE: u64 = 0x5000;
+        const GUEST_DEVICE: u64 = 0x5001;
+        const QUEUE: u64 = 0x7100;
+        const ID: u64 = 40;
+        const AGAIN: u64 = 41;
+        const Q: VkObjectType = VkObjectType::VK_OBJECT_TYPE_QUEUE;
+
+        unsafe extern "C" fn get_queue(
+            _d: VkDevice,
+            _i: *const VkDeviceQueueInfo2,
+            out: *mut VkQueue,
+        ) {
+            // SAFETY: the driver wrapper passes its own local.
+            unsafe { *out = VkQueue(QUEUE) };
+        }
+
+        fn ask(h: &mut dyn Commands, objects: &Shared, id: u64) {
+            let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkGetDeviceQueue2_EXT, 0);
+            w.extend_from_slice(&GUEST_DEVICE.to_le_bytes());
+            w.extend_from_slice(&1u64.to_le_bytes()); // pQueueInfo: present
+            w.extend_from_slice(
+                &(VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2.0).to_le_bytes(),
+            );
+            w.extend_from_slice(&0u64.to_le_bytes()); // pNext: absent
+            w.extend_from_slice(&0u32.to_le_bytes()); // flags
+            w.extend_from_slice(&0u32.to_le_bytes()); // queueFamilyIndex
+            w.extend_from_slice(&0u32.to_le_bytes()); // queueIndex
+            w.extend_from_slice(&1u64.to_le_bytes()); // pQueue: present
+            w.extend_from_slice(&id.to_le_bytes()); // the id the guest chose
+            let temp = Bump::new();
+            let hard = AtomicBool::new(false);
+            let mut dec = Decoder::new(&w, &temp, objects, &hard);
+            let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+            let _flags = dec.decode_scalar::<VkFlags>();
+            assert_eq!(vn_dispatch_command(&mut dec, None, cmd, h), Dispatched::Served);
+            assert!(!dec.fatal(), "asking for a queue is never a protocol error");
+        }
+
+        let objects = Shared::new();
+        objects
+            .borrow_mut()
+            .add(
+                ObjectId(GUEST_DEVICE),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                HostHandle(DEVICE),
+                None,
+            )
+            .unwrap();
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkGetDeviceQueue2(get_queue);
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        ask(&mut h, &objects, ID);
+        assert!(h.reject.is_none(), "the first ask is served");
+        ask(&mut h, &objects, ID);
+        assert!(h.reject.is_none(), "asking again is how a guest works, not a repeat create");
+        assert_eq!(objects.lookup(ObjectId(ID), Q.0), Lookup::Found(HostHandle(QUEUE)));
+        assert_eq!(objects.borrow().of_type(Q).count(), 1, "one queue, asked for twice");
+
+        ask(&mut h, &objects, AGAIN);
+        assert!(h.reject.take().is_some(), "a second name for the same queue is refused");
+        assert_eq!(objects.lookup(ObjectId(AGAIN), Q.0), Lookup::Missing, "and names nothing");
+        assert_eq!(objects.lookup(ObjectId(ID), Q.0), Lookup::Found(HostHandle(QUEUE)));
+
+        h.driver.abandon_planted();
     }
 
     /// Nothing in this file's handlers reaches for `unsafe`, and this is what keeps it that way.
