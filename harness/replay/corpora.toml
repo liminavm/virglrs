@@ -34,6 +34,12 @@ size = 19152
 generated = "harness/replay/make-sampler-corpus.py"
 
 [[corpus]]
+name = "flatshade.bin"
+sha256 = "f9020907ef1f7efe9c13b6d553fd22978dfe64de89fdd01f5d3d8d16829d8d2f"
+size = 1928
+generated = "harness/replay/make-flatshade-corpus.py"
+
+[[corpus]]
 name = "surface.bin"
 sha256 = "553dc965a760df48a9a1e6b532f65fa641b4a6c4bf9f7fd806d49e644d7b0a7c"
 size = 67568

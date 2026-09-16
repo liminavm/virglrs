@@ -101,6 +101,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 - `make-sampler-corpus.py` — writes a synthetic classic corpus that changes only the sampler
   state between two draws through one view (see `fixtures/sampler.score` below).
   `--no-destroy` writes the arming control.
+- `make-flatshade-corpus.py` — writes a synthetic classic corpus that changes only the
+  rasterizer between two draws into one target (see `fixtures/flatshade.score` below).
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
   then the whole stream in execution order through the limina replay ABI, and scores the result.
@@ -699,6 +701,20 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   and the two destinations, which must differ from each other. The corpus is deliberately narrow:
   anything else between the draws would re-bind the unit on its own and the fixture would be
   measuring that instead.
+
+  `flatshade.score` gates a rasterizer bind marking the shader dirty. Flat shading is not a GL
+  state on this host; it is the `flat` qualifier the translator puts on a colour varying when
+  the rasterizer's bit is in the fragment shader's key, so a rasterizer bind has to make the
+  next draw reselect its program, and the C marks the shader dirty on every one. The mark was
+  invisible on every recorded corpus because the draw path also reselects on every draw while
+  a BGRA target is bound -- and the scanout here is BGRX -- which covered for a bind that did
+  not mark. So `make-flatshade-corpus.py` writes `vm/captures/flatshade.bin`: one RGBA target,
+  one program, one triangle with a different colour at each corner, drawn once under a smooth
+  rasterizer and once under a flat one with nothing but the rasterizer bind between the draws.
+  The target reads back at its unref as the flat triangle, or as the gradient of the first
+  draw when the second ran through the first draw's program. RGBA and one target are both
+  load-bearing: a BGRA target or a second framebuffer bind would mark the shader dirty for its
+  own reason and the fixture would be measuring that instead.
 
   `teardown.score` gates two lifetimes a real guest reaches constantly and no oracle here was
   watching: a program destroyed out from under the one that is bound, and a sub-context destroyed

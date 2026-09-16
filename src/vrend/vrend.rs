@@ -1440,6 +1440,61 @@ mod tests {
         v.context_destroy(ctx, &NoGuest);
     }
 
+    /// A rasterizer bind marks the shader dirty on its own, with nothing else changing.
+    ///
+    /// Flat shading, two-sided colour and polygon stipple are shader work on this host, so the
+    /// rasterizer is a shader-key input; the C marks the key dirty on every rasterizer bind. A
+    /// port that only stores the state draws the next triangle through the program selected
+    /// for the previous rasterizer. `flatshade.score` pins the pixels; this pins the mark.
+    #[test]
+    fn binding_a_rasterizer_marks_the_shader_dirty() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Ignore;
+        impl crate::fence::FenceSink for Ignore {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Ignore));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+        )
+        .expect("vrend comes up");
+        let ctx = ContextId::new(1).expect("a context id");
+        v.context_create(ctx, &NoGuest).expect("a context");
+        assert!(!v.contexts[&ctx].shader_dirty(), "a fresh context has nothing to reselect");
+
+        // `cmd | obj << 8 | len << 16`, then the payload -- see `proto`. A rasterizer that does
+        // nothing but let a triangle through: front-CCW and the half-pixel centre, point size and
+        // line width 1.0, and no offset.
+        use crate::vrend::proto::{Cmd, ObjectType};
+        let rasterizer = ObjectType::Rasterizer as u32;
+        let handle = 7u32;
+        let create = [
+            Cmd::CreateObject as u32 | rasterizer << 8 | 9 << 16,
+            handle,
+            (1 << 15) | (1 << 29),
+            1.0f32.to_bits(),
+            0,
+            0,
+            1.0f32.to_bits(),
+            0,
+            0,
+            0,
+        ];
+        v.submit(ctx, &create, &NoGuest).expect("the context takes the batch").expect("created");
+        assert!(!v.contexts[&ctx].shader_dirty(), "creating an object binds nothing");
+
+        let bind = [Cmd::BindObject as u32 | rasterizer << 8 | 1 << 16, handle];
+        v.submit(ctx, &bind, &NoGuest).expect("the context takes the batch").expect("bound");
+        assert!(v.contexts[&ctx].shader_dirty(), "the bind alone marks the shader dirty");
+
+        v.context_destroy(ctx, &NoGuest);
+    }
+
     #[test]
     fn the_version_string_parses_the_way_epoxy_reads_it() {
         assert_eq!(parse_gles_version("OpenGL ES 3.1 Mesa 26.0.0"), 31);

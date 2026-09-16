@@ -63,7 +63,7 @@ PIPE_MASK_RGBA = 0xF
 PIPE_MASK_Z = 0x10
 PIPE_CLEAR_COLOR0 = 1 << 2
 FILTER_NEAREST, FILTER_LINEAR = 0, 1
-PRIM_TRIANGLE_STRIP = 5
+PRIM_TRIANGLES, PRIM_TRIANGLE_STRIP = 4, 5
 
 CTX = 1
 
@@ -150,10 +150,11 @@ class Corpus:
         self.emit(CCMD_CREATE_OBJECT, OBJ_SHADER,
                   [handle, stage, len(blob), text.count("\n") + 2, 0] + dw)
 
-    def rasterizer(self, handle):
+    def rasterizer(self, handle, flatshade=False):
         """A rasterizer that does nothing but let the quad through: no cull, filled, and the
-        half-pixel centre and front-CCW winding a full-viewport quad is written for."""
-        s0 = (1 << 15) | (1 << 29)   # front_ccw, half_pixel_center
+        half-pixel centre and front-CCW winding a full-viewport quad is written for.
+        `flatshade` is the one bit a corpus varies: it reaches the fragment shader's key."""
+        s0 = (1 << 15) | (1 << 29) | int(flatshade)   # front_ccw, half_pixel_center, flatshade
         self.emit(CCMD_CREATE_OBJECT, OBJ_RASTERIZER,
                   [handle, s0, f32(1.0), 0, 0, f32(1.0), 0, 0, 0])
 

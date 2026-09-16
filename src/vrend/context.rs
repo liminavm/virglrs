@@ -1003,6 +1003,16 @@ impl SubContext {
         self.rs.unwrap_or(ZERO_RS)
     }
 
+    /// `vrend_bind_object`'s rasterizer half, less the GL it emits. The rasterizer feeds the
+    /// shader key -- flat shading, two-sided colour, polygon stipple and the clip planes are
+    /// all shader work on this host -- so a bind marks the shader dirty, as the C does. An
+    /// unbind marks it too: the key reads the zero state then, and the C, which does not mark
+    /// there, leaves a program selected for a rasterizer that is gone.
+    fn bind_rasterizer(&mut self, state: Option<RasterizerState>) {
+        self.rs = state;
+        self.shader_dirty = true;
+    }
+
     fn object(&self, cmd: Cmd, handle: ObjectHandle, kind: ObjectType) -> Result<&Object, Fault> {
         match self.objects.get(&handle) {
             Some(o) if o.kind() == kind => Ok(o),
@@ -1302,6 +1312,12 @@ impl Context {
     /// Which sub-context this context's commands are running against.
     pub fn current_sub(&self) -> SubContextId {
         self.subs.id()
+    }
+
+    /// Whether the next draw will reselect its program. For tests of what marks it.
+    #[cfg(test)]
+    pub(super) fn shader_dirty(&self) -> bool {
+        self.sub().shader_dirty
     }
 
     fn sub(&self) -> &SubContext {
@@ -2157,14 +2173,15 @@ impl Context {
             }
             ObjectType::Rasterizer => {
                 let Some(h) = handle else {
-                    self.sub_mut().rs = None;
+                    self.sub_mut().bind_rasterizer(None);
                     return Ok(());
                 };
                 let Object::Rasterizer(s) = self.sub().object(cmd, h, ObjectType::Rasterizer)?
                 else {
                     unreachable!()
                 };
-                self.sub_mut().rs = Some(*s);
+                let s = *s;
+                self.sub_mut().bind_rasterizer(Some(s));
                 self.emit_rs(host);
                 Ok(())
             }

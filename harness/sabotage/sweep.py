@@ -1254,6 +1254,14 @@ SABOTAGES = [
         'binding_a_sampler_state_marks_its_unit',
     ),
     (
+        'a rasterizer bind stores the state and never marks the shader dirty',
+        'src/vrend/context.rs',
+        """        self.rs = state;
+        self.shader_dirty = true;""",
+        """        self.rs = state;""",
+        'binding_a_rasterizer_marks_the_shader_dirty',
+    ),
+    (
         'a destroyed sampler state shifts the ones after it down without a re-bind',
         'src/vrend/context/units.rs',
         """                self.dirty.mark(slot);
