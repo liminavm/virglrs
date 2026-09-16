@@ -1407,7 +1407,10 @@ thirty-seven builds at about 350 us each are 14% and 6% of it.
 
 The `[virglrs] vrend transfers:` line prices transfers by door -- the VMM's, through
 `virgl_renderer_transfer_*_iov` and outside the command path's clock, and the stream's, inside
-it -- and `[virglrs] vrend attaches:` says how scattered the page lists were. That second line is
+it -- and `[virglrs] vrend attaches:` says how scattered the page lists were. Under a replay the
+VMM is the replayer, so the API door carries its zero-fill of each resource at create and the
+score's own readbacks: a per-call cost on that door is real, but its share of wall prices the
+harness, not a desktop. That second line is
 the caveat on the first: **a replay hands every resource one entry, and a guest never does.** A
 Linux guest attaches a resource as the scatter list its allocator produced (a 3.6 MB framebuffer
 arrived as 225 entries), and a transfer walks the list per row, so the one-entry replay is the

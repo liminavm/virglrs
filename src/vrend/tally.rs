@@ -114,7 +114,9 @@ struct Armed {
     /// wall; the stream's (`TRANSFER3D`, `COPY_TRANSFER3D`, `RESOURCE_INLINE_WRITE`) run inside
     /// a batch and are already in `busy`, so their share is of it. Bytes are the box's, tight,
     /// so `MB/s` says how far a transfer is from a copy at memory speed -- which is the number
-    /// a change to the page walk moves.
+    /// a change to the page walk moves. Under a replay the VMM is the replayer, and this door
+    /// carries its zero-fill of each resource at create and the score's own readbacks: a
+    /// per-call cost there is real, its share of wall says nothing about a desktop.
     api_transfers: u64,
     api_transfer_bytes: u64,
     api_transfer_busy: Duration,
