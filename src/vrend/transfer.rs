@@ -214,6 +214,19 @@ pub fn level_span(res: &Resource, level: u32) -> Option<u64> {
     Some(stride * rows * res.depth_at(level).max(1) as u64)
 }
 
+/// The bytes a transfer's box spans laid out tight: what a transfer of it moves, whatever the
+/// strides in the pages. Zero for a format this tree cannot describe, which the transfer will
+/// refuse anyway.
+pub fn box_bytes(res: &Resource, info: &Info) -> u64 {
+    let Some(desc) = res.args.format.describe() else {
+        return 0;
+    };
+    let r = &info.region;
+    desc.stride(r.width.max(0) as u32) as u64
+        * desc.blocks_high(r.height.max(0) as u32) as u64
+        * r.depth.max(0) as u64
+}
+
 /// The whole of a level, as the box a capture reads and a restore writes.
 pub fn level_region(res: &Resource, level: u32) -> Box3 {
     Box3 {

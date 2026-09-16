@@ -1117,6 +1117,7 @@ impl Vrend {
     /// A freshly created resource owes nothing, and that is what keeps this from racing the
     /// guest -- see [`resource::Shadow`].
     pub fn resource_attached(&mut self, handle: ResourceHandle, pages: &Iov<'_>) {
+        self.tally.attached(pages.entries());
         if let Some(Resource { storage: resource::Storage::Host(shadow), .. }) =
             self.resources.sync().get_mut(&handle).and_then(resource::Slot::resource_mut)
             && !shadow.mirror_into(pages)
@@ -1175,13 +1176,15 @@ impl Vrend {
         if pages.is_empty() {
             return Err(transfer::Error::NoPages);
         }
+        let began = self.tally.mark();
         let res = self
             .resources
             .sync()
             .get_mut(&handle)
             .and_then(resource::Slot::resource_mut)
             .ok_or(transfer::Error::NoPages)?;
-        if to_host {
+        let bytes = transfer::box_bytes(res, info);
+        let r = if to_host {
             transfer::write(&self.gl, self.current.program(), &self.formats, res, own, pages, info)
         } else {
             transfer::read(
@@ -1194,7 +1197,9 @@ impl Vrend {
                 pages,
                 info,
             )
-        }
+        };
+        self.tally.transfer(began, tally::TransferDoor::Api, bytes);
+        r
     }
 }
 

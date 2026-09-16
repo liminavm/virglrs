@@ -280,6 +280,11 @@ impl<'a> Iov<'a> {
         Iov(entries)
     }
 
+    /// How many entries the list has: the multiplier on every row a transfer walks.
+    pub fn entries(&self) -> usize {
+        self.0.len()
+    }
+
     /// The total bytes the list describes.
     pub fn len(&self) -> u64 {
         self.0.iter().map(|e| e.len as u64).sum()

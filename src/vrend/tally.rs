@@ -109,6 +109,24 @@ struct Armed {
     select_busy: Duration,
     builds: u64,
     build_busy: Duration,
+    /// Transfers by the door they came through. The VMM's (`virgl_renderer_transfer_*_iov`)
+    /// run outside `submit`, so `us/cmd` and `busy` are blind to them and their share is of
+    /// wall; the stream's (`TRANSFER3D`, `COPY_TRANSFER3D`, `RESOURCE_INLINE_WRITE`) run inside
+    /// a batch and are already in `busy`, so their share is of it. Bytes are the box's, tight,
+    /// so `MB/s` says how far a transfer is from a copy at memory speed -- which is the number
+    /// a change to the page walk moves.
+    api_transfers: u64,
+    api_transfer_bytes: u64,
+    api_transfer_busy: Duration,
+    stream_transfers: u64,
+    stream_transfer_bytes: u64,
+    stream_transfer_busy: Duration,
+    /// Attached page lists, and how scattered: the walk a transfer does is per row *and* per
+    /// entry, so a list's length is the multiplier on every transfer into it. A replay hands
+    /// every resource one entry (or `--pages` worth); a guest hands what its allocator gave.
+    attaches: u64,
+    attach_entries: u64,
+    attach_entries_max: u64,
     /// Wall time inside `Vrend::submit`. Against the window's own length this also says what
     /// share of the worker's second the command path took, which is the other half of the
     /// question: a cheap command path that is still 90% of the thread has not finished the job.
@@ -139,6 +157,15 @@ impl Armed {
             select_busy: Duration::ZERO,
             builds: 0,
             build_busy: Duration::ZERO,
+            api_transfers: 0,
+            api_transfer_bytes: 0,
+            api_transfer_busy: Duration::ZERO,
+            stream_transfers: 0,
+            stream_transfer_bytes: 0,
+            stream_transfer_busy: Duration::ZERO,
+            attaches: 0,
+            attach_entries: 0,
+            attach_entries_max: 0,
             busy: Duration::ZERO,
         }
     }
@@ -220,6 +247,36 @@ impl Tally {
         }
     }
 
+    /// One transfer ran, through `door`, over `bytes` of box. `began` is the mark taken before
+    /// it, or `None` when unarmed.
+    #[inline]
+    pub fn transfer(&mut self, began: Option<Instant>, door: TransferDoor, bytes: u64) {
+        let (Some(a), Some(began)) = (&mut self.on, began) else { return };
+        let took = Instant::now() - began;
+        match door {
+            TransferDoor::Api => {
+                a.api_transfers += 1;
+                a.api_transfer_bytes += bytes;
+                a.api_transfer_busy += took;
+            }
+            TransferDoor::Stream => {
+                a.stream_transfers += 1;
+                a.stream_transfer_bytes += bytes;
+                a.stream_transfer_busy += took;
+            }
+        }
+    }
+
+    /// The VMM attached a page list of `entries` entries to a resource.
+    #[inline]
+    pub fn attached(&mut self, entries: usize) {
+        if let Some(a) = &mut self.on {
+            a.attaches += 1;
+            a.attach_entries += entries as u64;
+            a.attach_entries_max = a.attach_entries_max.max(entries as u64);
+        }
+    }
+
     /// One surface-backed resource was made whole for a present.
     #[inline]
     pub fn present(&mut self) {
@@ -251,12 +308,21 @@ impl Tally {
     }
 }
 
+/// Which door a transfer came through; see `Armed::api_transfers`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferDoor {
+    /// `virgl_renderer_transfer_{read,write}_iov`: the VMM's, outside any batch.
+    Api,
+    /// A command in a batch: inside `submit`, and already in its clock.
+    Stream,
+}
+
 impl Drop for Tally {
     /// Flush the partial window, so a run shorter than the interval -- a corpus replay -- still
     /// reports once, for the whole of it.
     fn drop(&mut self) {
         if let Some(a) = &mut self.on
-            && a.submits > 0
+            && (a.submits > 0 || a.api_transfers > 0 || a.attaches > 0)
         {
             a.report(Instant::now(), ", teardown");
         }
@@ -340,6 +406,39 @@ impl Armed {
                 a.selects,
             );
         }
+        // Transfers, by door, printed only for a window that had one. The API door's share is
+        // of wall and the stream door's of submit busy: they are different denominators, and
+        // adding the two shares would be the mistake the labels exist to prevent.
+        if a.api_transfers + a.stream_transfers > 0 {
+            let mb_s = |bytes: u64, d: Duration| {
+                if d.is_zero() { 0.0 } else { bytes as f64 / 1e6 / d.as_secs_f64() }
+            };
+            let submit_share = if a.busy.is_zero() {
+                0.0
+            } else {
+                100.0 * a.stream_transfer_busy.as_secs_f64() / a.busy.as_secs_f64()
+            };
+            eprintln!(
+                "[virglrs] vrend transfers: {} api at {:.1} us  {:.0} MB/s  {:.1}% of wall  \
+                 {} in-stream at {:.1} us  {:.0} MB/s  {submit_share:.1}% of submit busy  \
+                 (over {secs:.1}s{note})",
+                a.api_transfers,
+                us(a.api_transfer_busy, a.api_transfers),
+                mb_s(a.api_transfer_bytes, a.api_transfer_busy),
+                100.0 * a.api_transfer_busy.as_secs_f64() / secs,
+                a.stream_transfers,
+                us(a.stream_transfer_busy, a.stream_transfers),
+                mb_s(a.stream_transfer_bytes, a.stream_transfer_busy),
+            );
+        }
+        if a.attaches > 0 {
+            eprintln!(
+                "[virglrs] vrend attaches: {} lists  {:.1} entries each  max {}  (over {secs:.1}s{note})",
+                a.attaches,
+                a.attach_entries as f64 / a.attaches as f64,
+                a.attach_entries_max,
+            );
+        }
         if a.hops > 0 {
             let mut by_index = String::new();
             for at in 0..HOPS {
@@ -397,8 +496,16 @@ mod tests {
             t.batch_ended(b, 512);
         }
         t.draw(t.mark(), true);
+        t.transfer(t.mark(), TransferDoor::Api, 4096);
+        t.transfer(t.mark(), TransferDoor::Stream, 64);
+        t.transfer(t.mark(), TransferDoor::Stream, 64);
+        t.attached(1);
+        t.attached(225);
         let a = t.on.as_ref().expect("armed");
         assert_eq!((a.draws, a.selects), (21, 11), "a draw that skipped selection is a draw");
+        assert_eq!((a.api_transfers, a.api_transfer_bytes), (1, 4096), "the VMM's door");
+        assert_eq!((a.stream_transfers, a.stream_transfer_bytes), (2, 128), "the stream's door");
+        assert_eq!((a.attaches, a.attach_entries, a.attach_entries_max), (2, 226, 225));
         assert_eq!(a.builds, 1, "a selection that built is a selection too, counted apart");
         assert!(a.build_busy <= a.select_busy, "a build's clock is part of the selection's");
         assert_eq!(a.commands, 1000);
@@ -434,6 +541,15 @@ mod tests {
             a.select_busy = Duration::from_millis(1);
             a.builds = 1;
             a.build_busy = Duration::from_millis(1);
+            a.api_transfers = 2;
+            a.api_transfer_bytes = 9;
+            a.api_transfer_busy = Duration::from_millis(1);
+            a.stream_transfers = 3;
+            a.stream_transfer_bytes = 8;
+            a.stream_transfer_busy = Duration::from_millis(1);
+            a.attaches = 4;
+            a.attach_entries = 7;
+            a.attach_entries_max = 6;
             a.busy = Duration::from_millis(5);
         }
         let b = t.batch_began();
@@ -462,6 +578,15 @@ mod tests {
             (Duration::ZERO, Duration::ZERO),
             "the selection clocks with them"
         );
+        assert_eq!(
+            (a.api_transfers, a.api_transfer_bytes, a.api_transfer_busy),
+            (0, 0, Duration::ZERO)
+        );
+        assert_eq!(
+            (a.stream_transfers, a.stream_transfer_bytes, a.stream_transfer_busy),
+            (0, 0, Duration::ZERO)
+        );
+        assert_eq!((a.attaches, a.attach_entries, a.attach_entries_max), (0, 0, 0), "the max too");
         assert_eq!(a.every, Duration::ZERO, "the interval is not a counter and must survive");
     }
 }

@@ -36,6 +36,7 @@ use super::pipe::slots::{
 use super::pipe::*;
 use super::proto::{self, *};
 use super::resource::{self, Limits, Resource, Storage, Texture, ViewKey};
+use super::tally::TransferDoor;
 use super::transfer::{self, Info};
 use super::{debug, shader, tgsi, video};
 use crate::decode;
@@ -4302,8 +4303,10 @@ impl Context {
         let Some(pages) = guest.pages(ctx, t.resource) else {
             return Err(Fault::IllegalResource { cmd, handle: t.resource });
         };
+        let began = host.tally.mark();
         let (res, bound) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, offset as u64, false);
+        let bytes = transfer::box_bytes(res, &info);
         let r = match direction {
             TransferDirection::ToHost => {
                 transfer::write(gl, bound, formats, res, Some(&pages), &pages, &info)
@@ -4312,6 +4315,7 @@ impl Context {
                 transfer::read(gl, bound, features, formats, res, Some(&pages), &pages, &info)
             }
         };
+        host.tally.transfer(began, TransferDoor::Stream, bytes);
         r.map_err(|error| Fault::Transfer { cmd, error })
     }
 
@@ -4335,8 +4339,10 @@ impl Context {
             return Err(Fault::IllegalResource { cmd, handle: staging });
         };
         let own = guest.pages(ctx, t.resource);
+        let began = host.tally.mark();
         let (res, bound) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, staging_offset as u64, synchronized);
+        let bytes = transfer::box_bytes(res, &info);
         let r = match direction {
             CopyDirection::ToHost => {
                 transfer::write(gl, bound, formats, res, own.as_ref(), &staging_pages, &info)
@@ -4352,6 +4358,7 @@ impl Context {
                 &info,
             ),
         };
+        host.tally.transfer(began, TransferDoor::Stream, bytes);
         r.map_err(|error| Fault::Transfer { cmd, error })
     }
 
@@ -4370,10 +4377,13 @@ impl Context {
         let bytes: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
         let span = HostSpan::new(&bytes);
         let own = guest.pages(ctx, t.resource);
+        let began = host.tally.mark();
         let (res, bound) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, 0, false);
-        transfer::write(gl, bound, formats, res, own.as_ref(), &span.iov(), &info)
-            .map_err(|error| Fault::Transfer { cmd, error })
+        let bytes = transfer::box_bytes(res, &info);
+        let r = transfer::write(gl, bound, formats, res, own.as_ref(), &span.iov(), &info);
+        host.tally.transfer(began, TransferDoor::Stream, bytes);
+        r.map_err(|error| Fault::Transfer { cmd, error })
     }
 }
 
