@@ -2540,6 +2540,43 @@ class RustGen:
         out += self._handler_trait(commands, gaps)
         return out
 
+    def _admission(self, ty):
+        """The ids a command would create, as one expression asking the renderer about each.
+
+        Read out of the same out-handle members `_lifecycle` reads after the handler, but before
+        it: the out member holds the id the guest chose from the moment it is decoded, and the
+        shadow beside it is still null. Asking here is what lets a refused id never reach the
+        driver. An out handle of a shape the lifecycle cannot read is not asked about either;
+        `_lifecycle` names those as gaps.
+        """
+        terms = []
+        for var, shape in self.out_handles(ty):
+            objtype = 'VkObjectType::%s' % var.ty.base.attrs['c_objtype']
+            m = 'val.%s' % self.field_name(var.name)
+            if shape[0] == 'pointer':
+                terms.append([
+                    '%s.is_null()' % m,
+                    '    // SAFETY: non-null, and the decoder allocated it in the arena, one element.',
+                    '    || h.object_creating(%s, ObjectId(unsafe { (*%s).0 }))' % (objtype, m),
+                ])
+            elif shape[0] == 'dynamic':
+                terms.append([
+                    '%s.is_null()' % m,
+                    '    || (0..(%s) as usize).all(|i| {' % shape[1],
+                    '        // SAFETY: the decoder allocated that many elements, from this count.',
+                    '        h.object_creating(%s, ObjectId(unsafe { (*%s.add(i)).0 }))' % (objtype, m),
+                    '    })',
+                ])
+        if len(terms) == 1:
+            return terms[0]
+        out = []
+        for i, term in enumerate(terms):
+            # Each term is an `||` that must bind tighter than the `&&` joining them.
+            lead = '(' if i == 0 else '    && ('
+            out += [lead + term[0]] + [('    ' if i else '') + l for l in term[1:-1]] \
+                + [('    ' if i else '') + term[-1] + ')']
+        return out
+
     def _lifecycle(self, ty, gaps):
         """The objects a command creates or destroys, read out of its decoded arguments.
 
@@ -2627,6 +2664,15 @@ class RustGen:
                '    /// renderer decides whether that is a poisoned context or a logged no-op.',
                '    fn unsupported(&mut self, cmd: VkCommandTypeEXT);',
                '',
+               '    /// A command is about to create an object under this id. Asked before the',
+               '    /// handler runs, once per out handle, and a `false` skips the handler: an id',
+               '    /// the renderer cannot register is refused before the driver makes anything',
+               '    /// under it, so there is never a host object with no entry to hold it.',
+               '    fn object_creating(&mut self, ty: VkObjectType, id: ObjectId) -> bool {',
+               '        let _ = (ty, id);',
+               '        true',
+               '    }',
+               '',
                '    /// A command created this object: the id the guest chose, and the handle',
                '    /// the driver returned into the shadow member beside it.',
                '    ///',
@@ -2683,6 +2729,7 @@ class RustGen:
         for ty in commands:
             n = ty.name
             life = self._lifecycle(ty, gaps)
+            admit = self._admission(ty)
             out += [
                 '        VkCommandTypeEXT::%s => {' % ty.attrs['c_type'],
                 '            let mut args = vn_command_%s::default();' % n,
@@ -2690,8 +2737,17 @@ class RustGen:
                 '            if dec.fatal() {',
                 '                return dec.verdict();',
                 '            }',
-                '            h.%s(&mut args);' % n,
-            ] + (['            let val = &args;']
+            ] + (['            // Every id this command would create, asked about before the handler',
+                  '            // can hand the driver a create: one the renderer refuses skips it.',
+                  '            let admitted = {',
+                  '                let val = &args;']
+                 + ['                ' + l for l in admit]
+                 + ['            };',
+                    '            if admitted {',
+                    '                h.%s(&mut args);' % n,
+                    '            }'] if admit else
+                 ['            h.%s(&mut args);' % n]
+            ) + (['            let val = &args;']
                  + ['            ' + l for l in life] if life else []) + [
                 '            if let Some(enc) = enc {',
                 '                vn_encode_%s_reply(enc, &args);' % n,

@@ -1192,6 +1192,15 @@ SABOTAGES = [
         'an_allocation_the_host_refuses_poisons_instead_of_aborting',
     ),
     (
+        'a create under a live id reaches the driver, and the object it makes is nobody\'s',
+        'src/venus/context.rs',
+        """    fn object_creating(&mut self, _ty: VkObjectType, id: ObjectId) -> bool {
+        if self.objects.borrow().get(id).is_some() {""",
+        """    fn object_creating(&mut self, _ty: VkObjectType, id: ObjectId) -> bool {
+        if false && self.objects.borrow().get(id).is_some() {""",
+        'a_create_under_a_live_id_never_reaches_the_driver',
+    ),
+    (
         'a pNext chain is decoded as deep as the guest cares to make it',
         'venus-gen/rustgen.py',
         """                '    if depth >= %d {' % len(next_types),

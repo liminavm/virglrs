@@ -2068,6 +2068,21 @@ impl Commands for Handlers<'_> {
         self.reject = Some("is not a command this build serves");
     }
 
+    /// A create naming an id that already names an object is refused before the handler runs.
+    ///
+    /// Refused here, and not after: the handler would ask the driver for the object, and the
+    /// table could then hold only one of the two under that id. Whichever it kept, the other
+    /// would be a host object nothing names and nothing will ever destroy, behind a reply that
+    /// said the create succeeded. A ghost or a fiction is not an object: the guest may create
+    /// for real under an id the host once refused, or that no handler decided.
+    fn object_creating(&mut self, _ty: VkObjectType, id: ObjectId) -> bool {
+        if self.objects.borrow().get(id).is_some() {
+            self.reject = Some("created an object under an id that is already an object");
+            return false;
+        }
+        true
+    }
+
     fn object_created(
         &mut self,
         ty: VkObjectType,
@@ -2080,7 +2095,9 @@ impl Commands for Handlers<'_> {
         // the driver refused". So a handler that already decided is not second-guessed here:
         // registered stands, and a ghost stands. Only an id with no decision behind it gets the
         // unserved command's fiction, where the id stands in for a handle so the rest of the
-        // stream still decodes.
+        // stream still decodes. A live id here is one the handler registered itself -- a run
+        // allocated from a pool -- since `object_creating` refused every other live id before
+        // the handler ran.
         {
             let objects = self.objects.borrow();
             if objects.get(id).is_some() || objects.is_ghost(id) || objects.is_fiction(id) {
@@ -9346,6 +9363,97 @@ mod tests {
         h.vkCreateRingMESA(&mut args);
         assert_eq!(h.reject, Some("named ring 0, which is no ring"));
         assert!(rings.is_empty());
+    }
+
+    /// A create under an id that already names an object never reaches the driver.
+    ///
+    /// Refused after the driver had made the object, the table could hold only one of the two
+    /// under that id, and the other would be a host object nothing names and nothing destroys,
+    /// behind a reply that said the create succeeded. So the id is asked about before the
+    /// handler runs, and what the driver was asked is the evidence: once, and only once.
+    #[test]
+    fn a_create_under_a_live_id_never_reaches_the_driver() {
+        use super::super::cs::{Lookup, Objects};
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkFence, VkFenceCreateInfo, VkStructureType,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 0x5000;
+        const GUEST_DEVICE: u64 = 0x5001;
+        const FENCE: u64 = 4;
+        const FIRST: u64 = 0xfeed_0001;
+
+        thread_local! {
+            static CREATES: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn create_fence(
+            _d: VkDevice,
+            _i: *const VkFenceCreateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkFence,
+        ) -> VkResult {
+            let handle = FIRST + CREATES.with_borrow(|c| c.len() as u64);
+            CREATES.with_borrow_mut(|c| c.push(handle));
+            unsafe { *out = VkFence(handle) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_fence(
+            _d: VkDevice,
+            _f: VkFence,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+        /// Teardown waits on and destroys what the context created; the planted table owes both.
+        unsafe extern "C" fn wait_idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(
+            ContextKey::for_test(ContextId::new(1).unwrap()),
+            &Budget::with_cap(None, false),
+            String::new(),
+        );
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateFence(create_fence);
+        fns.plant_vkDestroyFence(destroy_fence);
+        fns.plant_vkDeviceWaitIdle(wait_idle);
+        fns.plant_vkDestroyDevice(destroy_device);
+        ctx.driver.plant_device(VkDevice(DEVICE), fns);
+        ctx.objects
+            .borrow_mut()
+            .add(
+                ObjectId(GUEST_DEVICE),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                HostHandle(DEVICE),
+                None,
+            )
+            .expect("a fresh id");
+
+        let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateFence_EXT, 0);
+        w.extend_from_slice(&GUEST_DEVICE.to_le_bytes());
+        w.extend_from_slice(&1u64.to_le_bytes()); // pCreateInfo: present
+        w.extend_from_slice(
+            &(VkStructureType::VK_STRUCTURE_TYPE_FENCE_CREATE_INFO.0).to_le_bytes(),
+        );
+        w.extend_from_slice(&0u64.to_le_bytes()); // pNext: absent
+        w.extend_from_slice(&0u32.to_le_bytes()); // flags
+        w.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: absent
+        w.extend_from_slice(&1u64.to_le_bytes()); // pFence: present
+        w.extend_from_slice(&FENCE.to_le_bytes()); // the id the guest chose
+
+        assert!(ctx.submit(&w, &mut todo, &g, &t).ran(), "the first create is served");
+        assert!(!ctx.submit(&w, &mut todo, &g, &t).ran(), "the second, under a live id, poisons");
+        CREATES.with_borrow(|c| assert_eq!(c.len(), 1, "the driver was asked once: {c:x?}"));
+        assert_eq!(
+            ctx.objects.lookup(ObjectId(FENCE), VkObjectType::VK_OBJECT_TYPE_FENCE.0),
+            Lookup::Found(HostHandle(FIRST)),
+            "the id still names the object it named first"
+        );
     }
 
     /// Nothing in this file's handlers reaches for `unsafe`, and this is what keeps it that way.
