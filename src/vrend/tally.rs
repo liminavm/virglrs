@@ -94,11 +94,21 @@ struct Armed {
     presents: u64,
     /// Draws that reached program selection, and how many of them ran it. A draw runs the
     /// nine-pass selection when a shader or the vertex layout is dirty. `selects / draws` says
-    /// how often that path is taken and `select_busy / selects` what one costs; neither is
-    /// visible in `us/cmd`, and the first is what a change to the dirty marks moves.
+    /// how often that path is taken; neither it nor what a selection costs is visible in
+    /// `us/cmd`, and the first is what a change to the dirty marks moves.
+    ///
+    /// A selection that translates a variant, compiles it or links a program is a *build*, and
+    /// pays the driver; the rest fill the keys, compare them and find the program, which costs
+    /// under a microsecond. The two are counted apart because an average of them is a number
+    /// about the workload's length, not about the draw path: a short replay builds every
+    /// program it meets and reads as a per-draw cost that no desktop pays. Measured 2026-09-16
+    /// on the desktop and WebGL corpora, builds were 88% and 81% of the selection clock at
+    /// about 350 us each, and a reselect was 0.45 us on both.
     draws: u64,
     selects: u64,
     select_busy: Duration,
+    builds: u64,
+    build_busy: Duration,
     /// Wall time inside `Vrend::submit`. Against the window's own length this also says what
     /// share of the worker's second the command path took, which is the other half of the
     /// question: a cheap command path that is still 90% of the thread has not finished the job.
@@ -127,6 +137,8 @@ impl Armed {
             draws: 0,
             selects: 0,
             select_busy: Duration::ZERO,
+            builds: 0,
+            build_busy: Duration::ZERO,
             busy: Duration::ZERO,
         }
     }
@@ -194,12 +206,17 @@ impl Tally {
     /// One draw reached program selection. `selected` is the [`Tally::mark`] taken before the
     /// selection ran, or `None` when the draw skipped it.
     #[inline]
-    pub fn draw(&mut self, selected: Option<Instant>) {
+    pub fn draw(&mut self, selected: Option<Instant>, built: bool) {
         let Some(a) = &mut self.on else { return };
         a.draws += 1;
         if let Some(began) = selected {
+            let took = Instant::now() - began;
             a.selects += 1;
-            a.select_busy += Instant::now() - began;
+            a.select_busy += took;
+            if built {
+                a.builds += 1;
+                a.build_busy += took;
+            }
         }
     }
 
@@ -299,21 +316,26 @@ impl Armed {
         // when there were hops: a window with none has nothing to say here and a row of zeroes
         // reads like an answer.
         let us = |d: Duration, n: u64| if n == 0 { 0.0 } else { d.as_secs_f64() * 1e6 / n as f64 };
-        // Program selection per draw, printed only for a window that drew. The share is of the
-        // command path's own busy time, not of wall: that is the number a change to the draw's
-        // reselect gate moves, and the one that says whether it was worth moving.
+        // Program selection per draw, printed only for a window that drew. The shares are of
+        // the command path's own busy time, not of wall: the reselect share is the number a
+        // change to the draw's reselect gate or the key fill moves, and the build share is what
+        // the driver's compiles and links took, which no change to the draw path moves.
         if a.draws > 0 {
-            let share = if a.busy.is_zero() {
-                0.0
-            } else {
-                100.0 * a.select_busy.as_secs_f64() / a.busy.as_secs_f64()
+            let share = |d: Duration| {
+                if a.busy.is_zero() { 0.0 } else { 100.0 * d.as_secs_f64() / a.busy.as_secs_f64() }
             };
+            let reselect_busy = a.select_busy.saturating_sub(a.build_busy);
             eprintln!(
-                "[virglrs] vrend draws: {:.0} draw/s  {:.2} select/draw  {:.1} us/select  \
-                 {share:.1}% of submit busy  (n={} draw, {} select over {secs:.1}s{note})",
+                "[virglrs] vrend draws: {:.0} draw/s  {:.2} select/draw  {:.2} us/reselect  \
+                 {:.1}% of submit busy  {} builds at {:.1} us  {:.1}% of submit busy  \
+                 (n={} draw, {} select over {secs:.1}s{note})",
                 a.draws as f64 / secs,
                 a.selects as f64 / a.draws as f64,
-                us(a.select_busy, a.selects),
+                us(reselect_busy, a.selects - a.builds),
+                share(reselect_busy),
+                a.builds,
+                us(a.build_busy, a.builds),
+                share(a.build_busy),
                 a.draws,
                 a.selects,
             );
@@ -370,12 +392,15 @@ mod tests {
             }
             t.fence(&super::super::waiter::Answer::Ordered, None);
             t.present();
-            t.draw(t.mark());
-            t.draw(None);
+            t.draw(t.mark(), false);
+            t.draw(None, false);
             t.batch_ended(b, 512);
         }
+        t.draw(t.mark(), true);
         let a = t.on.as_ref().expect("armed");
-        assert_eq!((a.draws, a.selects), (20, 10), "a draw that skipped selection is a draw");
+        assert_eq!((a.draws, a.selects), (21, 11), "a draw that skipped selection is a draw");
+        assert_eq!(a.builds, 1, "a selection that built is a selection too, counted apart");
+        assert!(a.build_busy <= a.select_busy, "a build's clock is part of the selection's");
         assert_eq!(a.commands, 1000);
         assert_eq!(a.dwords, 5120);
         assert_eq!(a.submits, 10, "the window has not elapsed, so nothing was flushed");
@@ -407,6 +432,8 @@ mod tests {
             a.draws = 4;
             a.selects = 3;
             a.select_busy = Duration::from_millis(1);
+            a.builds = 1;
+            a.build_busy = Duration::from_millis(1);
             a.busy = Duration::from_millis(5);
         }
         let b = t.batch_began();
@@ -429,8 +456,12 @@ mod tests {
         assert_eq!((a.hops, a.drained), (0, 0));
         assert_eq!(a.hop_busy[0], Duration::ZERO);
         assert_eq!(a.hop_n[0], 0, "the per-index buckets as well");
-        assert_eq!((a.draws, a.selects), (0, 0));
-        assert_eq!(a.select_busy, Duration::ZERO, "the selection clock with them");
+        assert_eq!((a.draws, a.selects, a.builds), (0, 0, 0));
+        assert_eq!(
+            (a.select_busy, a.build_busy),
+            (Duration::ZERO, Duration::ZERO),
+            "the selection clocks with them"
+        );
         assert_eq!(a.every, Duration::ZERO, "the interval is not a counter and must survive");
     }
 }

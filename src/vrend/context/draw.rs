@@ -767,16 +767,25 @@ fn add_shader_program(
     Ok(prog)
 }
 
+/// What a program selection did, for the draw that asked and the tally that prices it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Selected {
+    /// The sub-context's program is not the one it had.
+    pub changed: bool,
+    /// A variant was translated or compiled, or a program linked: the selection paid the driver,
+    /// and its cost is a build's, not a reselect's.
+    pub built: bool,
+}
+
 impl Context {
     /// `vrend_select_program`, the program half: the variants selected and compiled by
-    /// [`Context::select_program`], then the program that links them found or made. Answers
-    /// whether the sub-context's program changed.
+    /// [`Context::select_program`], then the program that links them found or made.
     pub(super) fn select_linked_program(
         &mut self,
         host: &mut Host<'_>,
         cmd: Cmd,
-    ) -> Result<bool, Fault> {
-        self.select_program(host, cmd)?;
+    ) -> Result<Selected, Fault> {
+        let mut built = self.select_program(host, cmd)?;
         let sub = self.sub();
         let dual_src = sub.blend.as_ref().is_some_and(|b| blend_is_dual(b, 0));
         let linked = match sub.linked_stages() {
@@ -797,7 +806,7 @@ impl Context {
             // The selection is settled either way; a flag left standing here would run the
             // nine key passes again on every draw of this program.
             self.sub_mut().shader_dirty = false;
-            return Ok(false);
+            return Ok(Selected { changed: false, built });
         }
         let found = sub
             .programs
@@ -807,6 +816,7 @@ impl Context {
         let slot = match found {
             Some(s) => s,
             None => {
+                built = true;
                 let serial = sub.mint_program_serial();
                 let prog = add_shader_program(host, cmd, serial, &linked, dual_src)?;
                 let sub = self.sub_mut();
@@ -825,7 +835,7 @@ impl Context {
             }
         }
         sub.shader_dirty = false;
-        Ok(changed)
+        Ok(Selected { changed, built })
     }
 
     /// `vrend_patch_blend_state` and `vrend_hw_emit_blend`: the blend state as bound, patched
@@ -1530,6 +1540,7 @@ impl Context {
 
         let mut new_program = false;
         let mut selected = None;
+        let mut built = false;
         let sub = self.sub();
         // The C also reselects on every draw while the framebuffer needs a red-blue swizzle or
         // a manual sRGB encode. Both are inputs to the fragment key, but both change only in
@@ -1539,9 +1550,11 @@ impl Context {
         // the flatshade and sampler fixtures are what say so.
         if sub.shader_dirty || sub.vbo_dirty {
             selected = host.tally.mark();
-            new_program = self.select_linked_program(host, cmd)?;
+            let s = self.select_linked_program(host, cmd)?;
+            new_program = s.changed;
+            built = s.built;
         }
-        host.tally.draw(selected);
+        host.tally.draw(selected, built);
         // The C drops the draw with a warning; a draw with nothing to run it is a fault here.
         // Resolved once for the whole draw: `select_linked_program` above is the last thing that
         // can move the program list, and everything below is handed the slot rather than asking

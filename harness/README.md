@@ -1396,6 +1396,15 @@ ring loop; and a corpus holds one command per record, so every per-batch cost la
 command and `cmd/batch` reads 1.0. The module doc of `src/venus/tally.rs` says what each field
 is. Under a boot the same knob reports on the interval, for venus and the classic path together.
 
+The classic path's `[virglrs] vrend draws:` line prices program selection in two parts, and
+under a replay the split is the whole reading: a corpus meets every program once, so most of its
+selections translate, compile and link -- the `builds`, whose cost is the driver's and amortises
+to nothing on a desktop -- while the reselects, which fill and compare keys and find the program,
+are the per-draw cost a change to the draw path can move. An average of the two is a number
+about the corpus's length. Measured 2026-09-16 on the rs leg: a reselect is 0.45 us on both
+`vrend.bin` and `vrend-webgl.bin`, under 2% of the command path's busy time, and the ten and
+thirty-seven builds at about 350 us each are 14% and 6% of it.
+
 **`vrend-av1.score` is stale.** It predates scoring at the format's own bytes per texel and cannot
 be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
 

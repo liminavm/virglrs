@@ -467,13 +467,20 @@ impl Context {
         translate(host, cmd, shader, key, id)
     }
 
-    /// `vrend_shader_select` on the shader bound at `stage`.
-    fn select_bound(&mut self, host: &Host<'_>, cmd: Cmd, stage: ShaderStage) -> Result<(), Fault> {
+    /// `vrend_shader_select` on the shader bound at `stage`. Answers whether a variant had to be
+    /// translated, which is the expensive case; a key the chain already holds costs a fill and a
+    /// compare.
+    fn select_bound(
+        &mut self,
+        host: &Host<'_>,
+        cmd: Cmd,
+        stage: ShaderStage,
+    ) -> Result<bool, Fault> {
         let sub = self.sub();
         let handle = match sub.shaders[stage.index()].as_ref() {
             Some(Bound::Object(h)) => Some(*h),
             Some(Bound::Owned(_)) => None,
-            None => return Ok(()),
+            None => return Ok(false),
         };
         let key = sub.fill_shader_key(host, handle, stage);
         let sub = self.sub_mut();
@@ -483,16 +490,18 @@ impl Context {
             return Err(Fault::IllegalHandle { cmd, handle });
         };
         if select_variant(shader, &key) {
-            return Ok(());
+            return Ok(false);
         }
-        translate(host, cmd, shader, key, id)
+        translate(host, cmd, shader, key, id)?;
+        Ok(true)
     }
 
     /// `vrend_select_program`, as far as the variants: every bound stage selected under the
     /// state of the moment, in the C's order -- the fragment stage last, then each again, since
     /// a stage's key reads its neighbours' newest variants -- and compiled. The program that
-    /// links them is `Context::select_linked_program`'s.
-    pub(super) fn select_program(&mut self, host: &mut Host<'_>, cmd: Cmd) -> Result<(), Fault> {
+    /// links them is `Context::select_linked_program`'s. Answers whether any stage was
+    /// translated or compiled.
+    pub(super) fn select_program(&mut self, host: &mut Host<'_>, cmd: Cmd) -> Result<bool, Fault> {
         use ShaderStage::*;
         let bound = |s: &Context, stage: ShaderStage| s.sub().shaders[stage.index()].is_some();
         if !bound(self, Vertex) || !bound(self, Fragment) {
@@ -501,9 +510,9 @@ impl Context {
                 what: "a program without a vertex and a fragment shader",
             });
         }
-        self.select_bound(host, cmd, Vertex)?;
+        let mut built = self.select_bound(host, cmd, Vertex)?;
         if bound(self, TessCtrl) {
-            self.select_bound(host, cmd, TessCtrl)?;
+            built |= self.select_bound(host, cmd, TessCtrl)?;
         } else if bound(self, TessEval) {
             host.todo.note("tessellation without a control shader");
             return Err(Fault::Unimplemented {
@@ -511,14 +520,14 @@ impl Context {
                 what: "an injected tessellation control shader",
             });
         }
-        self.select_bound(host, cmd, TessEval)?;
-        self.select_bound(host, cmd, Geometry)?;
-        self.select_bound(host, cmd, Fragment)?;
+        built |= self.select_bound(host, cmd, TessEval)?;
+        built |= self.select_bound(host, cmd, Geometry)?;
+        built |= self.select_bound(host, cmd, Fragment)?;
         // The C's second round, its workaround for duplicated compilation (#180).
-        self.select_bound(host, cmd, Geometry)?;
-        self.select_bound(host, cmd, TessEval)?;
-        self.select_bound(host, cmd, TessCtrl)?;
-        self.select_bound(host, cmd, Vertex)?;
+        built |= self.select_bound(host, cmd, Geometry)?;
+        built |= self.select_bound(host, cmd, TessEval)?;
+        built |= self.select_bound(host, cmd, TessCtrl)?;
+        built |= self.select_bound(host, cmd, Vertex)?;
 
         for stage in [Vertex, Fragment, Geometry, TessCtrl, TessEval] {
             let gl = host.gl;
@@ -531,11 +540,17 @@ impl Context {
             let Some(current) = program.variants.first_mut() else {
                 return Err(Fault::Shader { cmd, what: "a stage with no variant to compile" });
             };
-            if current.gl.is_none() && !compile(gl, stage, current) {
-                return Err(Fault::Shader { cmd, what: "a shader the driver refused to compile" });
+            if current.gl.is_none() {
+                built = true;
+                if !compile(gl, stage, current) {
+                    return Err(Fault::Shader {
+                        cmd,
+                        what: "a shader the driver refused to compile",
+                    });
+                }
             }
         }
-        Ok(())
+        Ok(built)
     }
 
     /// `vrend_link_program_hook`: the program the handles name, assembled now rather than at
