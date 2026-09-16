@@ -25,6 +25,11 @@
 //                 together -- a video player draws in one and decodes in another, and
 //                 either alone replays half the operation.
 //   --loops N     replay the captured stream N times (default 1)
+//   --pages N     hand every resource its backing as N-byte entries instead of one. A guest
+//                 attaches a resource as the scatter list its allocator produced -- a 3.6 MB
+//                 framebuffer arrived from a Linux guest as 225 entries -- and a transfer walks
+//                 that list once per row, so one entry is the shape no boot has. The bytes are
+//                 the same; the score must not move.
 //   --nofeed      positive control for blob content: land the recorded bytes in the backing
 //                 store as usual, but never carry them into the texture. What inks a blob's
 //                 window then is the renderer reading the guest's pages for itself, which is
@@ -153,7 +158,10 @@ struct backing {
    uint32_t handle;
    uint8_t *mem;
    size_t   size;
-   struct iovec iov;
+   /* The backing as the renderer sees it: one entry, or --pages worth. Allocated once with the
+    * backing and never moved (see below). */
+   struct iovec *iovs;
+   int      num_iovs;
    bool     live;
    /* A blob is registered UNTYPED and carries no format or extent of its own: the stream's
     * PIPE_RESOURCE_SET_TYPE is what says which. These three are that command's answer, kept so
@@ -180,6 +188,8 @@ struct backing {
  * copy, and then fail every submit and readback after it in silence. */
 static struct backing **backings;
 static uint32_t backing_n, backing_cap;
+/* --pages: bytes per iovec entry, 0 for one entry per backing. */
+static size_t page_bytes;
 
 static struct backing *backing_find(uint32_t handle)
 {
@@ -203,8 +213,15 @@ static struct backing *backing_add(uint32_t handle, size_t size)
    b->size = size ? size : 4096;
    b->mem = calloc(1, b->size);
    if (!b->mem) { fprintf(stderr, "OOM\n"); exit(2); }
-   b->iov.iov_base = b->mem;
-   b->iov.iov_len = b->size;
+   size_t each = page_bytes ? page_bytes : b->size;
+   b->num_iovs = (int)((b->size + each - 1) / each);
+   b->iovs = calloc((size_t)b->num_iovs, sizeof *b->iovs);
+   if (!b->iovs) { fprintf(stderr, "OOM\n"); exit(2); }
+   for (int i = 0; i < b->num_iovs; i++) {
+      size_t at = (size_t)i * each;
+      b->iovs[i].iov_base = b->mem + at;
+      b->iovs[i].iov_len = b->size - at < each ? b->size - at : each;
+   }
    b->live = true;
    return b;
 }
@@ -802,10 +819,9 @@ static uint32_t blob_feed(int ctx)
          b->declined = true;
          continue;
       }
-      struct iovec biov = { .iov_base = b->mem, .iov_len = b->size };
       struct virgl_box box = { .x = 0, .y = 0, .z = 0, .w = w, .h = h, .d = 1 };
       if (!virgl_renderer_transfer_write_iov(b->handle, (uint32_t)ctx, 0, stride, 0, &box,
-                                             0, &biov, 1))
+                                             0, b->iovs, (unsigned)b->num_iovs))
          fed++;
       b->dirty = false;
    }
@@ -1279,6 +1295,7 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--until") && i + 1 < argc)
          until = strtoull(argv[++i], NULL, 10);
       else if (!strcmp(argv[i], "--loops") && i + 1 < argc) loops = atoi(argv[++i]);
+      else if (!strcmp(argv[i], "--pages") && i + 1 < argc) page_bytes = strtoull(argv[++i], NULL, 10);
       else if (!strcmp(argv[i], "--nodraw")) nodraw = true;
       else if (!strcmp(argv[i], "--nofeed")) nofeed = true;
       else if (!strcmp(argv[i], "--smoke")) smoke = true;
@@ -1305,7 +1322,7 @@ int main(int argc, char **argv)
          flag_override = (long)strtoul(argv[++i], NULL, 0);
       else if (argv[i][0] != '-') path = argv[i];
    }
-   if (!path) { fprintf(stderr, "usage: vrend-replay <dump> [--ctx N[,N...]] [--loops N] [--nodraw] [--draws-from SEQ] [--until SEQ]\n"); return 2; }
+   if (!path) { fprintf(stderr, "usage: vrend-replay <dump> [--ctx N[,N...]] [--loops N] [--pages N] [--nodraw] [--draws-from SEQ] [--until SEQ]\n"); return 2; }
 
    FILE *f = fopen(path, "rb");
    if (!f) { perror(path); return 2; }
@@ -1644,7 +1661,7 @@ int main(int argc, char **argv)
                   .res_handle = r->handle, .ctx_id = r->flags,
                   .blob_mem = VIRGL_RENDERER_BLOB_MEM_GUEST, .blob_flags = r->bind,
                   .blob_id = ((uint64_t)r->array_size << 32) | r->depth,
-                  .size = b->size, .iovecs = &b->iov, .num_iovs = 1,
+                  .size = b->size, .iovecs = b->iovs, .num_iovs = (uint32_t)b->num_iovs,
                };
                int cr = virgl_renderer_resource_create_blob(&a);
                if (cr) {
@@ -1700,7 +1717,7 @@ int main(int argc, char **argv)
              * TRANSFER3D touching it fails check_transfer_iovec -- reported as the very same
              * "Illegal resource" as a handle the context has never heard of. */
             if (r->kind != RES_BLOB)
-               virgl_renderer_resource_attach_iov((int)r->handle, &b->iov, 1);
+               virgl_renderer_resource_attach_iov((int)r->handle, b->iovs, b->num_iovs);
             for (int i = 0; i < n_ctx; i++)
                virgl_renderer_ctx_attach_resource(ctx_list[i], (int)r->handle);
             /* After the attach, which is what gives vrend the resource a transfer can reach. */

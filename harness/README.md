@@ -1405,6 +1405,17 @@ about the corpus's length. Measured 2026-09-16 on the rs leg: a reselect is 0.45
 `vrend.bin` and `vrend-webgl.bin`, under 2% of the command path's busy time, and the ten and
 thirty-seven builds at about 350 us each are 14% and 6% of it.
 
+The `[virglrs] vrend transfers:` line prices transfers by door -- the VMM's, through
+`virgl_renderer_transfer_*_iov` and outside the command path's clock, and the stream's, inside
+it -- and `[virglrs] vrend attaches:` says how scattered the page lists were. That second line is
+the caveat on the first: **a replay hands every resource one entry, and a guest never does.** A
+Linux guest attaches a resource as the scatter list its allocator produced (a 3.6 MB framebuffer
+arrived as 225 entries), and a transfer walks the list per row, so the one-entry replay is the
+shape whose cost no boot pays. `--pages N` on the classic replayer splits every backing into
+N-byte entries and is what a transfer-path number must be taken at; 16384 is the observed guest
+average and 4096 the worst case. The score does not move with it, on either leg, which is what
+`--expect` asserts.
+
 **`vrend-av1.score` is stale.** It predates scoring at the format's own bytes per texel and cannot
 be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
 
