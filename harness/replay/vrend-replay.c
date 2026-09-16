@@ -1745,6 +1745,7 @@ int main(int argc, char **argv)
       printf("smoke: created %u failed %u contexts 1 iosurface-backed %u -- "
              "init, contexts and resources %s\n",
              made_total, failed_total, iosurf_backed, failed_total ? "FAILED" : "OK");
+      virgl_renderer_cleanup(&cookie);
       return failed_total ? 1 : 0;
    }
 
@@ -2110,5 +2111,9 @@ int main(int argc, char **argv)
    free(rb_buf);
 
    free(text);
+   /* Tear the renderer down rather than leak it to exit: an instrument that reports at teardown
+    * (VIRGLRS_SUBMIT_STATS) prints nothing for a process that never tears down, and the C leg's
+    * cleanup is part of the ABI both legs are scored through. */
+   virgl_renderer_cleanup(&cookie);
    return ok ? 0 : 1;
 }
