@@ -821,7 +821,7 @@ impl Context {
             // Every constant buffer and view is re-bound for a new program.
             for stage in [ShaderStage::Vertex, ShaderStage::Fragment] {
                 sub.ubos_dirty[stage.index()] = Dirty::all();
-                sub.views_dirty[stage.index()] = Dirty::all();
+                sub.units[stage.index()].mark_all();
             }
         }
         sub.shader_dirty = false;
@@ -1114,7 +1114,7 @@ impl Context {
         // that was never in conflict. The C reaches its equivalents through a pointer
         // (`vrend_renderer.c:5795,5816`) for the same reason.
         let prog = sub.program_at(at);
-        let dirty = sub.views_dirty[s];
+        let dirty = sub.units[s].dirty();
         let mut mask = prog.samplers_used_mask[s];
         let shadow_mask = prog.shadow_samp_mask[s];
         let sampler_locs = &prog.sampler_locs[s];
@@ -1131,7 +1131,7 @@ impl Context {
         while mask != 0 {
             let i = mask.trailing_zeros();
             mask &= mask - 1;
-            let view = sub.views[s].get(&i).and_then(|h| match sub.objects.get(h) {
+            let view = sub.units[s].view(i).and_then(|h| match sub.objects.get(&h) {
                 Some(Object::SamplerView(v)) => Some(v),
                 _ => None,
             });
@@ -1201,7 +1201,7 @@ impl Context {
                     // multisampled texture takes no sampler.
                     if !is_buffer && !multisampled {
                         let sampler =
-                            sub.samplers[s].get(&i).and_then(|h| match sub.objects.get(h) {
+                            sub.units[s].sampler(i).and_then(|h| match sub.objects.get(&h) {
                                 Some(Object::SamplerState(st)) => st.ids,
                                 _ => None,
                             });
@@ -1229,7 +1229,7 @@ impl Context {
                 tl[i] = *l;
             }
         }
-        sub.views_dirty[s].clear();
+        sub.units[s].bound();
         // A later glBindTexture for another reason must not disturb the units just bound.
         gl.active_texture(TextureUnit::at(max_units.saturating_sub(1)));
         next_sampler_id

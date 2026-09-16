@@ -1244,6 +1244,24 @@ SABOTAGES = [
         'a_pnext_chain_deeper_than_the_structs_it_may_name_is_refused',
     ),
     (
+        'a sampler state bound under an unchanged view is never re-bound',
+        'src/vrend/context/units.rs',
+        """            None => self.samplers.remove(&slot),
+        };
+        self.dirty.mark(slot);""",
+        """            None => self.samplers.remove(&slot),
+        };""",
+        'binding_a_sampler_state_marks_its_unit',
+    ),
+    (
+        'a destroyed sampler state shifts the ones after it down without a re-bind',
+        'src/vrend/context/units.rs',
+        """                self.dirty.mark(slot);
+                self.dirty.mark(slot - shift);""",
+        """                self.dirty.mark(slot);""",
+        'a_destroyed_sampler_state_closes_its_gap_and_marks_every_slot_that_moved',
+    ),
+    (
         "a ring the guest named 0 is quietly renamed instead of refused",
         'src/ids.rs',
         """    pub const fn new(raw: u64) -> Option<RingId> {

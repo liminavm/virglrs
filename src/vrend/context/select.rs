@@ -363,8 +363,8 @@ impl SubContext {
         if stage == Geometry {
             key.gs.emit_clip_distance = rs.clip_plane_enable != 0;
         }
-        for (&slot, h) in &self.views[stage.index()] {
-            let Some(Object::SamplerView(view)) = self.objects.get(h) else {
+        for (slot, h) in self.units[stage.index()].views() {
+            let Some(Object::SamplerView(view)) = self.objects.get(&h) else {
                 continue;
             };
             let i = slot as usize;

@@ -53,9 +53,12 @@ mod blit;
 mod draw;
 #[path = "context/select.rs"]
 mod select;
+#[path = "context/units.rs"]
+mod units;
 
 pub use draw::{HwBlend, LinkedProgram, ProgramSerial, ProgramSlot, Sysval, Tracked, Xfb};
 pub use select::{Bound, Program, Variant, VariantId};
+use units::Units;
 
 const PIPE_CLEAR_DEPTH: u32 = 1 << 0;
 const PIPE_CLEAR_STENCIL: u32 = 1 << 1;
@@ -859,15 +862,12 @@ pub struct SubContext {
     const_dirty: [bool; ShaderStage::COUNT],
     ubos: [BTreeMap<u32, Ubo>; ShaderStage::COUNT],
     ubos_dirty: [Dirty<MAX_CONSTANT_BUFFERS>; ShaderStage::COUNT],
-    views: [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT],
-    /// The view slots re-bound at the next draw, one bit each.
-    /// A sampler unit is what a shader names, and there are [`MAX_SAMPLERS`] of them -- fewer
-    /// than the view slots the decoder admits. A view set above them is held and never sampled.
-    views_dirty: [Dirty<MAX_SAMPLERS>; ShaderStage::COUNT],
+    /// Each stage's sampler units: the views, the sampler states, and which units the next draw
+    /// binds again.
+    units: [Units; ShaderStage::COUNT],
     /// The level count of each view the last draw bound, in sampler order, for the GLES
     /// `textureQueryLevels` emulation.
     texture_levels: [Vec<GLint>; ShaderStage::COUNT],
-    samplers: [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT],
     shaders: [Option<Bound>; ShaderStage::COUNT],
     /// A stage was bound or its key's inputs changed: the draw re-selects the variants.
     shader_dirty: bool,
@@ -939,10 +939,8 @@ impl SubContext {
             const_dirty: [false; ShaderStage::COUNT],
             ubos: Default::default(),
             ubos_dirty: [Dirty::none(); ShaderStage::COUNT],
-            views: Default::default(),
-            views_dirty: [Dirty::none(); ShaderStage::COUNT],
+            units: Default::default(),
             texture_levels: Default::default(),
-            samplers: Default::default(),
             shaders: Default::default(),
             shader_dirty: false,
             prim_mode: PrimType::Points,
@@ -1053,27 +1051,6 @@ pub(super) fn trace_scanout_write(
          (IOSurface {surface:?}) from {src:?}",
         host.ctx,
     );
-}
-
-/// Empty every view slot naming `handle` and mark each for rebinding. Whether any did.
-fn evict_view(
-    views: &mut [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT],
-    views_dirty: &mut [Dirty<MAX_SAMPLERS>; ShaderStage::COUNT],
-    handle: ObjectHandle,
-) -> bool {
-    let mut held = false;
-    for (stage, slots) in views.iter_mut().enumerate() {
-        let gone: Vec<u32> = slots.iter().filter(|(_, h)| **h == handle).map(|(s, _)| *s).collect();
-        for slot in gone {
-            slots.remove(&slot);
-            // A view above the sampler units is held but never sampled, so nothing rebinds it.
-            if (slot as usize) < MAX_SAMPLERS {
-                views_dirty[stage].mark(slot);
-            }
-            held = true;
-        }
-    }
-    held
 }
 
 /// Release an object's GL side. The sub-context that made it is current.
@@ -2073,25 +2050,18 @@ impl Context {
                 // old texture on the unit. Every slot holding it is emptied and marked, so
                 // the next draw rebinds the unit and reselects the key the view fed.
                 let sub = self.sub_mut();
-                if evict_view(&mut sub.views, &mut sub.views_dirty, handle) {
+                let mut held = false;
+                for units in &mut sub.units {
+                    held |= units.evict_view(handle);
+                }
+                if held {
                     sub.shader_dirty = true;
                 }
             }
             Object::SamplerState(_) => {
                 // The C nulls every slot holding it and compacts the slots after each down.
-                for stage in self.sub_mut().samplers.iter_mut() {
-                    let slots: Vec<(u32, ObjectHandle)> =
-                        stage.iter().map(|(k, v)| (*k, *v)).collect();
-                    let mut rebuilt = BTreeMap::new();
-                    let mut shift = 0;
-                    for (slot, h) in slots {
-                        if h == handle {
-                            shift += 1;
-                        } else {
-                            rebuilt.insert(slot - shift, h);
-                        }
-                    }
-                    *stage = rebuilt;
+                for units in &mut self.sub_mut().units {
+                    units.forget_sampler(handle);
                 }
             }
             // The framebuffer holds its own copy of every surface it attached, so a destroy
@@ -3523,20 +3493,16 @@ impl Context {
         for (i, h) in views.iter().enumerate() {
             let slot = start_slot + i as u32;
             let Some(h) = h else {
-                self.sub_mut().views[stage.index()].remove(&slot);
+                self.sub_mut().units[stage.index()].set_view(slot, None);
                 continue;
             };
             let sub = self.sub_mut();
             let Some(Object::SamplerView(view)) = sub.objects.get(h) else {
-                sub.views[stage.index()].remove(&slot);
+                sub.units[stage.index()].set_view(slot, None);
                 return Err(Fault::IllegalHandle { cmd, handle: *h });
             };
-            if sub.views[stage.index()].get(&slot) == Some(h) {
+            if sub.units[stage.index()].holds_view(slot, *h) {
                 continue;
-            }
-            // A view above the sampler units is held but never sampled.
-            if (slot as usize) < MAX_SAMPLERS {
-                sub.views_dirty[stage.index()].mark(slot);
             }
             let (gl, features, formats) = (host.gl, host.features, host.formats);
             let mut buffer_view = false;
@@ -3596,24 +3562,18 @@ impl Context {
                 }
             }
             let sub = self.sub_mut();
-            sub.views[stage.index()].insert(slot, *h);
+            sub.units[stage.index()].set_view(slot, Some(*h));
             if buffer_view {
                 sub.shader_dirty = true;
             }
         }
         let end = start_slot + views.len() as u32;
-        self.sub_mut().views[stage.index()].retain(|slot, _| *slot < end);
+        self.sub_mut().units[stage.index()].drop_views_from(end);
         Ok(())
     }
 
     /// `vrend_bind_sampler_states`: a handle that is not a sampler state binds nothing, with a
-    /// warning, as in the C.
-    ///
-    /// Every slot named is marked for re-binding at the next draw, whatever it now holds: the
-    /// draw binds a unit's sampler parameters only for the units in `views_dirty`, and a guest
-    /// that changes the sampler under an unchanged view -- the wrap mode between two draws, say
-    /// -- has changed what that unit must sample with. The slots are within [`MAX_SAMPLERS`] by
-    /// the decoder's check, so marking one cannot fail.
+    /// warning, as in the C. The slots are within [`MAX_SAMPLERS`] by the decoder's check.
     fn bind_sampler_states(
         &mut self,
         stage: ShaderStage,
@@ -3623,19 +3583,15 @@ impl Context {
         let sub = self.sub_mut();
         for (i, h) in states.iter().enumerate() {
             let slot = start_slot + i as u32;
-            match h {
-                Some(h) if matches!(sub.objects.get(h), Some(Object::SamplerState(_))) => {
-                    sub.samplers[stage.index()].insert(slot, *h);
-                }
+            let state = match h {
+                Some(h) if matches!(sub.objects.get(h), Some(Object::SamplerState(_))) => Some(*h),
                 Some(h) => {
                     eprintln!("[virglrs] vrend: no sampler state under handle {h}");
-                    sub.samplers[stage.index()].remove(&slot);
+                    None
                 }
-                None => {
-                    sub.samplers[stage.index()].remove(&slot);
-                }
-            }
-            sub.views_dirty[stage.index()].mark(slot);
+                None => None,
+            };
+            sub.units[stage.index()].bind_sampler(slot, state);
         }
     }
 
@@ -4823,26 +4779,6 @@ mod tests {
             read_shader(b"VERT\nDCL IN[80]\n0: END\n\0", 20),
             Err(Fault::Tgsi { error: tgsi::Refusal::Scan(_), .. })
         ));
-    }
-
-    #[test]
-    fn a_destroyed_view_leaves_every_slot_it_held_and_marks_them() {
-        let h = |n| ObjectHandle::new(n).unwrap();
-        let mut views: [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT] = Default::default();
-        views[0].insert(3, h(9));
-        views[1].insert(0, h(9));
-        views[1].insert(1, h(4));
-        views[1].insert(7, h(9));
-        let mut dirty = [Dirty::<MAX_SAMPLERS>::none(); ShaderStage::COUNT];
-        assert!(evict_view(&mut views, &mut dirty, h(9)));
-        assert!(views[0].is_empty());
-        assert_eq!(views[1].keys().copied().collect::<Vec<_>>(), vec![1]);
-        assert!(dirty[0].contains(3));
-        assert!(dirty[1].contains(0) && dirty[1].contains(7) && !dirty[1].contains(1));
-        assert!(dirty[2..].iter().all(|d| d.is_empty()));
-        // A handle the guest reuses for a new view then binds afresh, instead of reading as
-        // already bound.
-        assert!(!evict_view(&mut views, &mut dirty, h(9)));
     }
 
     fn bound(view: Option<ViewKey>, textures: &Arc<resource::Texture>) -> BoundSurface {
