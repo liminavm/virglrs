@@ -45,6 +45,7 @@ generator_for() {
     case "$1" in
         blit.bin)    echo "harness/replay/make-blit-corpus.py" ;;
         sampled.bin) echo "harness/replay/make-sampled-corpus.py" ;;
+        sampler.bin) echo "harness/replay/make-sampler-corpus.py" ;;
         surface.bin) echo "harness/replay/make-surface-corpus.py" ;;
         teardown.bin) echo "harness/replay/make-teardown-corpus.py" ;;
         *)           echo "" ;;

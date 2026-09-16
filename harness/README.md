@@ -684,6 +684,19 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   it, and a clear must already know its colour fixup rather than ask a resource that is no longer
   there. Still unmeasured: *re-binding* a surface whose resource was freed, which the C serves from
   its refcount and this tree refuses.
+  `sampler.score` gates a sampler state bound under an unchanged view. A draw re-binds a unit's
+  texture and sampler parameters only for the units marked dirty, and the C marks a unit in
+  `vrend_bind_sampler_states` as well as when its view changes; a renderer that marks only on the
+  view draws the second of two quads through the first quad's sampler. No recorded session
+  isolates this -- a desktop changes a sampler beside a view, a shader or a framebuffer, any of
+  which marks the unit for its own reason -- so `make-sampler-corpus.py` writes
+  `vm/captures/sampler.bin`: one view, one program, one vertex buffer, and two draws between which
+  the stream carries only the second destination's framebuffer and a `BIND_SAMPLER_STATES` from
+  clamp-to-edge to repeat, with texture coordinates running to 2.0 so the wrap mode decides three
+  quarters of the pixels. The three lines are the source, as the control that the pattern landed,
+  and the two destinations, which must differ from each other. The corpus is deliberately narrow:
+  anything else between the draws would re-bind the unit on its own and the fixture would be
+  measuring that instead.
 
   `teardown.score` gates two lifetimes a real guest reaches constantly and no oracle here was
   watching: a program destroyed out from under the one that is bound, and a sub-context destroyed

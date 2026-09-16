@@ -3608,6 +3608,12 @@ impl Context {
 
     /// `vrend_bind_sampler_states`: a handle that is not a sampler state binds nothing, with a
     /// warning, as in the C.
+    ///
+    /// Every slot named is marked for re-binding at the next draw, whatever it now holds: the
+    /// draw binds a unit's sampler parameters only for the units in `views_dirty`, and a guest
+    /// that changes the sampler under an unchanged view -- the wrap mode between two draws, say
+    /// -- has changed what that unit must sample with. The slots are within [`MAX_SAMPLERS`] by
+    /// the decoder's check, so marking one cannot fail.
     fn bind_sampler_states(
         &mut self,
         stage: ShaderStage,
@@ -3629,6 +3635,7 @@ impl Context {
                     sub.samplers[stage.index()].remove(&slot);
                 }
             }
+            sub.views_dirty[stage.index()].mark(slot);
         }
     }
 

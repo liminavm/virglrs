@@ -28,6 +28,12 @@ size = 255328
 generated = "harness/replay/make-sampled-corpus.py"
 
 [[corpus]]
+name = "sampler.bin"
+sha256 = "41a7fad521d677be66be9c9e6b6cfcbed4fac10fb94e815c74f29cb2bbdcc8a6"
+size = 19152
+generated = "harness/replay/make-sampler-corpus.py"
+
+[[corpus]]
 name = "surface.bin"
 sha256 = "553dc965a760df48a9a1e6b532f65fa641b4a6c4bf9f7fd806d49e644d7b0a7c"
 size = 67568
