@@ -285,12 +285,22 @@ pub struct Iov<'a> {
 
 /// Where a walk ended: the entry it stopped in and how many bytes precede that entry. Rows
 /// arrive in ascending order, so the next walk resumes there and the list is crossed once per
-/// transfer rather than once per row; a walk that starts before the cursor restarts from the
-/// head, so a cursor is never wrong, only sometimes unhelpful.
-#[derive(Clone, Copy, Default, Debug)]
+/// transfer rather than once per row; a walk that starts before the cursor, or on a list other
+/// than the one that advanced it, restarts from the head, so a cursor is never wrong, only
+/// sometimes unhelpful.
+#[derive(Clone, Copy, Debug)]
 pub struct Cursor {
+    /// The list the cursor was advanced on, by identity: an `entry` is meaningless in any
+    /// other, and could lie past its end.
+    list: *const crate::abi::GuestIov,
     entry: usize,
     base: u64,
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Cursor { list: std::ptr::null(), entry: 0, base: 0 }
+    }
 }
 
 impl<'a> Iov<'a> {
@@ -339,7 +349,7 @@ impl<'a> Iov<'a> {
         if end > self.len {
             return false;
         }
-        if at < cursor.base {
+        if at < cursor.base || cursor.list != self.entries.as_ptr() {
             *cursor = Cursor::default();
         }
         // Skip the entries wholly before `at`, from wherever the last walk left the cursor.
@@ -351,7 +361,7 @@ impl<'a> Iov<'a> {
             base += e.len as u64;
             i += 1;
         }
-        *cursor = Cursor { entry: i, base };
+        *cursor = Cursor { list: self.entries.as_ptr(), entry: i, base };
         let mut skip = (at - base) as usize;
         let mut done = 0usize;
         for e in &self.entries[i..] {
@@ -955,5 +965,23 @@ mod tests {
         assert!(iov.copy_out_from(&mut cursor, 7, &mut got));
         assert!(!iov.copy_out_from(&mut cursor, 11, &mut got), "the cursor does not loosen it");
         assert!(!iov.copy_out(u64::MAX, &mut got), "an offset that would overflow is refused");
+    }
+
+    /// A cursor advanced deep into one list names an entry a shorter list does not have, at a
+    /// base the shorter list's own offsets can still exceed.
+    #[test]
+    fn a_cursor_from_another_list_restarts_on_this_one() {
+        let mut long = numbered(&[1; 40]);
+        let long_entries = scattered(&mut long);
+        let long_iov = Iov::new(&long_entries);
+        let mut cursor = Cursor::default();
+        let mut got = [0u8; 4];
+        assert!(long_iov.copy_out_from(&mut cursor, 30, &mut got));
+        assert_eq!(got, [31, 32, 33, 34]);
+        let mut short = numbered(&[20, 20]);
+        let short_entries = scattered(&mut short);
+        let short_iov = Iov::new(&short_entries);
+        assert!(short_iov.copy_out_from(&mut cursor, 30, &mut got));
+        assert_eq!(got, [31, 32, 33, 34], "the short list's bytes, walked from its head");
     }
 }

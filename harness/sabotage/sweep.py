@@ -1364,13 +1364,20 @@ SABOTAGES = [
     (
         'a row before the cursor resumes from it instead of restarting, and reads the wrong pages',
         'src/guest_mem.rs',
-        """        if at < cursor.base {
+        """        if at < cursor.base || cursor.list != self.entries.as_ptr() {
             *cursor = Cursor::default();
         }""",
-        """        if at < cursor.base && false {
+        """        if (at < cursor.base || cursor.list != self.entries.as_ptr()) && false {
             *cursor = Cursor::default();
         }""",
         'ascending_rows_carry_the_cursor_and_a_backwards_row_restarts',
+    ),
+    (
+        'a cursor from another list is trusted on this one, and indexes past its end',
+        'src/guest_mem.rs',
+        '        if at < cursor.base || cursor.list != self.entries.as_ptr() {\n',
+        '        if at < cursor.base {\n',
+        'a_cursor_from_another_list_restarts_on_this_one',
     ),
 ]
 
