@@ -98,6 +98,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   framebuffer is still drawing through (see `fixtures/surface.score` below).
 - `make-teardown-corpus.py` — writes a synthetic classic corpus that destroys a program and a
   sub-context while the renderer still holds them (see `fixtures/teardown.score` below).
+- `make-sampler-corpus.py` — writes a synthetic classic corpus that changes only the sampler
+  state between two draws through one view (see `fixtures/sampler.score` below).
   `--no-destroy` writes the arming control.
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
