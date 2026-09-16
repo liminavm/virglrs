@@ -1307,4 +1307,28 @@ mod tests {
         }
         assert!(failures.is_empty(), "shaders differing from the C: {failures:?}");
     }
+
+    /// A `LOAD` names whatever image slot the guest wrote, and `Context::images` has exactly
+    /// `MAX_SHADER_IMAGES` of them. The slot one past the last is the one a `>` lets through: its
+    /// mask bit wraps onto slot 0's, so a shader that declares image 0 reaches the array with an
+    /// index it does not hold. Out of range loads zero, which is what the C emits for any slot
+    /// past the array.
+    #[test]
+    fn an_image_load_past_the_last_slot_loads_zero() {
+        let tgsi = format!(
+            "FRAG\nDCL IMAGE[0], 2D, PIPE_FORMAT_R32_FLOAT, WR\nDCL OUT[0], COLOR\nDCL TEMP[0]\n\
+             IMM[0] INT32 {{0, 0, 0, 0}}\n  0: LOAD TEMP[0], IMAGE[{MAX_SHADER_IMAGES}], IMM[0].xyyy\n\
+             \x20 1: MOV OUT[0], TEMP[0]\n  2: END\n"
+        );
+        let shader = tgsi::text::parse(tgsi.as_bytes(), u32::MAX).expect("the shader parses");
+        let program = tgsi::Program::scan(shader).expect("the shader scans");
+        let (strings, _, _) =
+            convert(&corpus_cfg(), &program, 0, &Key::default(), &StreamOutput::default())
+                .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            strings.source().contains("= vec4(0.0, 0.0, 0.0, 0.0)"),
+            "a load past the last slot loads zero:\n{}",
+            strings.source()
+        );
+    }
 }

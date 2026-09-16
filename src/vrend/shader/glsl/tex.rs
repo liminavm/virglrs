@@ -1261,8 +1261,10 @@ pub(super) fn translate_load(
 ) -> bool {
     let src = &inst.src[0];
     if src.file == File::Image {
-        // A load from an image that is not used is dropped.
-        if sinfo.sreg_index < 0 || sinfo.sreg_index as usize > MAX_SHADER_IMAGES {
+        // A load from an image that is not used is dropped. The C tests `>` here, which admits
+        // the slot one past the array; its mask bit then wraps onto slot 0's and the read runs
+        // off the end. The store path has `>=`, and so does this.
+        if sinfo.sreg_index < 0 || sinfo.sreg_index as usize >= MAX_SHADER_IMAGES {
             return false;
         }
         if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {

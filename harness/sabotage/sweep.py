@@ -1142,6 +1142,13 @@ SABOTAGES = [
         'a_reset_frees_the_handles_vrend_held',
     ),
     (
+        'an image load one past the last slot is let through to the image array',
+        'src/vrend/shader/glsl/tex.rs',
+        'if sinfo.sreg_index < 0 || sinfo.sreg_index as usize >= MAX_SHADER_IMAGES {\n            return false;\n        }\n        if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {',
+        'if sinfo.sreg_index < 0 || sinfo.sreg_index as usize > MAX_SHADER_IMAGES {\n            return false;\n        }\n        if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {',
+        'an_image_load_past_the_last_slot_loads_zero',
+    ),
+    (
         'the sample-count ceiling is ignored and the host maximum advertised anyway',
         'virglrs/src/vrend/caps.rs',
         'Some(c) if max_samples > c => {',
