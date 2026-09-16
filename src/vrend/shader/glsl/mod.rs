@@ -1337,14 +1337,24 @@ mod tests {
     /// stores them; the C promotes to `int` for the sum and this does not, so two counts that add
     /// past a byte are an overflow rather than a shader GL would refuse. Neither count can exceed
     /// the eight slots the hardware has, so past that is refused at the property.
+    ///
+    /// One shader per property, each with the other count in range: a shader with both past the
+    /// limit is refused by whichever check is left, and says nothing about the one removed.
     #[test]
     fn a_clip_or_cull_count_past_the_hardware_limit_is_refused() {
-        let tgsi = "VERT\nPROPERTY NUM_CLIPDIST_ENABLED 200\nPROPERTY NUM_CULLDIST_ENABLED 100\n\
-                    DCL IN[0]\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n";
-        let shader = tgsi::text::parse(tgsi.as_bytes(), u32::MAX).expect("the shader parses");
-        let program = tgsi::Program::scan(shader).expect("the shader scans");
-        let refused =
-            convert(&corpus_cfg(), &program, 0, &Key::default(), &StreamOutput::default());
-        assert!(refused.is_err(), "a count past the hardware limit is refused, not summed");
+        for (clip, cull) in [(255, 1), (1, 255)] {
+            let tgsi = format!(
+                "VERT\nPROPERTY NUM_CLIPDIST_ENABLED {clip}\nPROPERTY NUM_CULLDIST_ENABLED {cull}\n\
+                 DCL IN[0]\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n"
+            );
+            let shader = tgsi::text::parse(tgsi.as_bytes(), u32::MAX).expect("the shader parses");
+            let program = tgsi::Program::scan(shader).expect("the shader scans");
+            let refused =
+                convert(&corpus_cfg(), &program, 0, &Key::default(), &StreamOutput::default());
+            assert!(
+                refused.is_err(),
+                "clip {clip}, cull {cull}: a count past the hardware limit is refused, not summed"
+            );
+        }
     }
 }

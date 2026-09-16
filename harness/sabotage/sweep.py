@@ -1165,6 +1165,20 @@ SABOTAGES = [
         'a_clip_or_cull_count_past_the_hardware_limit_is_refused',
     ),
     (
+        "a cull distance count past the hardware limit is stored a byte wide and summed",
+        'src/vrend/shader/glsl/decl.rs',
+        """        Property::NumCulldistEnabled => {
+            if data > MAX_CLIP_OR_CULL_DISTANCES {
+                return fail(format!(
+                    "Cull distance count {data} exceeds the limit of {MAX_CLIP_OR_CULL_DISTANCES}"
+                ));
+            }
+            ctx.num_cull_dist_prop = data as u8;
+        }""",
+        """        Property::NumCulldistEnabled => ctx.num_cull_dist_prop = data as u8,""",
+        'a_clip_or_cull_count_past_the_hardware_limit_is_refused',
+    ),
+    (
         'an array the host allocator refuses aborts the process instead of poisoning the stream',
         'src/venus/cs.rs',
         """        match self.temp.try_alloc_slice_fill_with(count, |_| T::default()) {
