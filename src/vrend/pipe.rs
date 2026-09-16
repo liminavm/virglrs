@@ -20,6 +20,8 @@
 pub mod slots {
     /// `PIPE_MAX_ATTRIBS`.
     pub const MAX_ATTRIBS: usize = 32;
+    /// `PIPE_MAX_CLIP_OR_CULL_DISTANCE_COUNT`: clip and cull distances share these eight slots.
+    pub const MAX_CLIP_OR_CULL_DISTANCES: u32 = 8;
     /// `PIPE_MAX_COLOR_BUFS`.
     pub const MAX_COLOR_BUFS: usize = 8;
     /// `PIPE_MAX_CONSTANT_BUFFERS`.

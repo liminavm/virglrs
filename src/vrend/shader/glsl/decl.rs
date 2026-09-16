@@ -11,7 +11,9 @@ use super::{
 };
 use crate::vrend::pipe::Swizzle;
 use crate::vrend::proto::Format;
-use crate::vrend::shader::{Array, MAX_COMBINED_SSBO_BINDING_POINTS, MAX_SHADER_IMAGES};
+use crate::vrend::shader::{
+    Array, MAX_CLIP_OR_CULL_DISTANCES, MAX_COMBINED_SSBO_BINDING_POINTS, MAX_SHADER_IMAGES,
+};
 use crate::vrend::tgsi::{
     Declaration, File, ImageInfo, ImmType, Immediate, Instruction, Interpolate, Location, Opcode,
     Processor, Property, PropertyToken, ReturnType, Semantic, Texture,
@@ -987,11 +989,27 @@ pub(super) fn iter_property(ctx: &mut Context<'_>, prop: &PropertyToken) -> Resu
             ctx.gs_num_invocations = data;
             ctx.shader_req_bits |= req::GPU_SHADER5;
         }
+        // Both counts are a byte wide, as the C keeps them, and are summed wherever the
+        // translator asks whether either was set. The C promotes that sum to `int`; here it
+        // stays a byte, so the guest's value is bounded at the one place it is read. Eight is
+        // the hardware's ceiling for the two together, so either one past it is nonsense.
         Property::NumClipdistEnabled => {
+            if data > MAX_CLIP_OR_CULL_DISTANCES {
+                return fail(format!(
+                    "Clip distance count {data} exceeds the limit of {MAX_CLIP_OR_CULL_DISTANCES}"
+                ));
+            }
             ctx.shader_req_bits |= req::CLIP_DISTANCE;
             ctx.num_clip_dist_prop = data as u8;
         }
-        Property::NumCulldistEnabled => ctx.num_cull_dist_prop = data as u8,
+        Property::NumCulldistEnabled => {
+            if data > MAX_CLIP_OR_CULL_DISTANCES {
+                return fail(format!(
+                    "Cull distance count {data} exceeds the limit of {MAX_CLIP_OR_CULL_DISTANCES}"
+                ));
+            }
+            ctx.num_cull_dist_prop = data as u8;
+        }
         Property::TcsVerticesOut => ctx.tcs_vertices_out = data,
         Property::TesPrimMode => ctx.tes_prim_mode = data,
         Property::TesSpacing => ctx.tes_spacing = data,

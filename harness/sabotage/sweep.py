@@ -1149,6 +1149,20 @@ SABOTAGES = [
         'an_image_load_past_the_last_slot_loads_zero',
     ),
     (
+        "a clip distance count past the hardware limit is stored a byte wide and summed",
+        'src/vrend/shader/glsl/decl.rs',
+        """        Property::NumClipdistEnabled => {
+            if data > MAX_CLIP_OR_CULL_DISTANCES {
+                return fail(format!(
+                    "Clip distance count {data} exceeds the limit of {MAX_CLIP_OR_CULL_DISTANCES}"
+                ));
+            }
+            ctx.shader_req_bits |= req::CLIP_DISTANCE;""",
+        """        Property::NumClipdistEnabled => {
+            ctx.shader_req_bits |= req::CLIP_DISTANCE;""",
+        'a_clip_or_cull_count_past_the_hardware_limit_is_refused',
+    ),
+    (
         'the sample-count ceiling is ignored and the host maximum advertised anyway',
         'virglrs/src/vrend/caps.rs',
         'Some(c) if max_samples > c => {',
