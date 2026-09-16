@@ -1529,14 +1529,17 @@ impl Context {
         }
 
         let mut new_program = false;
+        let mut selected = None;
         let sub = self.sub();
         if sub.shader_dirty
             || sub.swizzle_output_rgb_to_bgr != 0
             || sub.needs_manual_srgb_encode != 0
             || sub.vbo_dirty
         {
+            selected = host.tally.mark();
             new_program = self.select_linked_program(host, cmd)?;
         }
+        host.tally.draw(selected);
         // The C drops the draw with a warning; a draw with nothing to run it is a fault here.
         // Resolved once for the whole draw: `select_linked_program` above is the last thing that
         // can move the program list, and everything below is handed the slot rather than asking

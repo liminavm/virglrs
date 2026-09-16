@@ -92,6 +92,14 @@ struct Armed {
     drained: u64,
     /// Calls to `resource_sync_surface`: one blocking wait on the surface's shared event each.
     presents: u64,
+    /// Draws that reached program selection, and how many of them ran it. A draw runs the
+    /// nine-pass selection when a shader is dirty or when the bound framebuffer needs a
+    /// red-blue swizzle or a manual sRGB encode -- the latter two are state, not dirt, so a
+    /// BGRA framebuffer reselects on every draw. `selects / draws` says how often that path is
+    /// taken and `select_busy / selects` what one costs; neither is visible in `us/cmd`.
+    draws: u64,
+    selects: u64,
+    select_busy: Duration,
     /// Wall time inside `Vrend::submit`. Against the window's own length this also says what
     /// share of the worker's second the command path took, which is the other half of the
     /// question: a cheap command path that is still 90% of the thread has not finished the job.
@@ -117,6 +125,9 @@ impl Armed {
             hop_n: [0; HOPS],
             drained: 0,
             presents: 0,
+            draws: 0,
+            selects: 0,
+            select_busy: Duration::ZERO,
             busy: Duration::ZERO,
         }
     }
@@ -181,6 +192,18 @@ impl Tally {
         }
     }
 
+    /// One draw reached program selection. `selected` is the [`Tally::mark`] taken before the
+    /// selection ran, or `None` when the draw skipped it.
+    #[inline]
+    pub fn draw(&mut self, selected: Option<Instant>) {
+        let Some(a) = &mut self.on else { return };
+        a.draws += 1;
+        if let Some(began) = selected {
+            a.selects += 1;
+            a.select_busy += Instant::now() - began;
+        }
+    }
+
     /// One surface-backed resource was made whole for a present.
     #[inline]
     pub fn present(&mut self) {
@@ -203,11 +226,32 @@ impl Tally {
         a.dwords += dwords as u64;
         let now = Instant::now();
         a.busy += now - began;
-        let window = now - a.window_began;
-        if window < a.every {
+        if now - a.window_began < a.every {
             return;
         }
-        let secs = window.as_secs_f64();
+        a.report(now, "");
+        *a = Armed::new(a.every);
+        a.window_began = now;
+    }
+}
+
+impl Drop for Tally {
+    /// Flush the partial window, so a run shorter than the interval -- a corpus replay -- still
+    /// reports once, for the whole of it.
+    fn drop(&mut self) {
+        if let Some(a) = &mut self.on
+            && a.submits > 0
+        {
+            a.report(Instant::now(), ", teardown");
+        }
+    }
+}
+
+impl Armed {
+    /// Print the window that ends at `now`. The caller resets the counters; this only reads.
+    fn report(&mut self, now: Instant, note: &str) {
+        let a = self;
+        let secs = (now - a.window_began).as_secs_f64().max(1e-9);
         // Per *command*, because that is the unit a change to the command path moves. Per batch
         // would move when the guest changed how it packs them, which is not us.
         let per_cmd_us =
@@ -219,7 +263,7 @@ impl Tally {
         eprintln!(
             "[virglrs] vrend submit: {:.0} cmd/s  {:.0} dw/s  {:.0} batch/s  \
              {per_cmd_us:.2} us/cmd  {:.1}% of wall  \
-             (n={} cmd in {} batch over {secs:.1}s)",
+             (n={} cmd in {} batch over {secs:.1}s{note})",
             a.commands as f64 / secs,
             a.dwords as f64 / secs,
             a.submits as f64 / secs,
@@ -255,9 +299,27 @@ impl Tally {
         // The decomposition, and the line that exists to choose between two fixes. Printed only
         // when there were hops: a window with none has nothing to say here and a row of zeroes
         // reads like an answer.
+        let us = |d: Duration, n: u64| if n == 0 { 0.0 } else { d.as_secs_f64() * 1e6 / n as f64 };
+        // Program selection per draw, printed only for a window that drew. The share is of the
+        // command path's own busy time, not of wall: that is the number a change to the draw's
+        // reselect gate moves, and the one that says whether it was worth moving.
+        if a.draws > 0 {
+            let share = if a.busy.is_zero() {
+                0.0
+            } else {
+                100.0 * a.select_busy.as_secs_f64() / a.busy.as_secs_f64()
+            };
+            eprintln!(
+                "[virglrs] vrend draws: {:.0} draw/s  {:.2} select/draw  {:.1} us/select  \
+                 {share:.1}% of submit busy  (n={} draw, {} select over {secs:.1}s{note})",
+                a.draws as f64 / secs,
+                a.selects as f64 / a.draws as f64,
+                us(a.select_busy, a.selects),
+                a.draws,
+                a.selects,
+            );
+        }
         if a.hops > 0 {
-            let us =
-                |d: Duration, n: u64| if n == 0 { 0.0 } else { d.as_secs_f64() * 1e6 / n as f64 };
             let mut by_index = String::new();
             for at in 0..HOPS {
                 if a.hop_n[at] == 0 {
@@ -279,8 +341,6 @@ impl Tally {
                 a.drained as f64 / secs,
             );
         }
-        *a = Armed::new(a.every);
-        a.window_began = now;
     }
 }
 
@@ -311,9 +371,12 @@ mod tests {
             }
             t.fence(&super::super::waiter::Answer::Ordered, None);
             t.present();
+            t.draw(t.mark());
+            t.draw(None);
             t.batch_ended(b, 512);
         }
         let a = t.on.as_ref().expect("armed");
+        assert_eq!((a.draws, a.selects), (20, 10), "a draw that skipped selection is a draw");
         assert_eq!(a.commands, 1000);
         assert_eq!(a.dwords, 5120);
         assert_eq!(a.submits, 10, "the window has not elapsed, so nothing was flushed");
@@ -342,6 +405,9 @@ mod tests {
             a.hop_n[0] = 9;
             a.drained = 1;
             a.presents = 2;
+            a.draws = 4;
+            a.selects = 3;
+            a.select_busy = Duration::from_millis(1);
             a.busy = Duration::from_millis(5);
         }
         let b = t.batch_began();
@@ -364,6 +430,8 @@ mod tests {
         assert_eq!((a.hops, a.drained), (0, 0));
         assert_eq!(a.hop_busy[0], Duration::ZERO);
         assert_eq!(a.hop_n[0], 0, "the per-index buckets as well");
+        assert_eq!((a.draws, a.selects), (0, 0));
+        assert_eq!(a.select_busy, Duration::ZERO, "the selection clock with them");
         assert_eq!(a.every, Duration::ZERO, "the interval is not a counter and must survive");
     }
 }
