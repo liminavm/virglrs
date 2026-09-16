@@ -189,6 +189,8 @@ pub struct Host<'a> {
     pub todo: &'a mut Todo,
     /// Per-command cost accounting, inert unless armed.
     pub tally: &'a mut super::tally::Tally,
+    /// The renderer's transfer staging buffer, one for every context.
+    pub staging: &'a mut transfer::Staging,
     /// The shader blitter, built on the first blit that needs it.
     pub blitter: &'a mut Option<Blitter>,
     /// What this host decodes in hardware, or `None` when the caller did not ask for video.
@@ -290,7 +292,7 @@ impl Host<'_> {
         &mut self,
         cmd: Cmd,
         handle: ResourceHandle,
-    ) -> Result<(&mut Resource, &mut BoundProgram), Fault> {
+    ) -> Result<(&mut Resource, &mut BoundProgram, &mut transfer::Staging), Fault> {
         if !self.guest.attached(self.ctx, handle) {
             return Err(Fault::IllegalResource { cmd, handle });
         }
@@ -300,7 +302,7 @@ impl Host<'_> {
             .ok_or(Fault::IllegalResource { cmd, handle })?
             .resource_mut()
             .ok_or(Fault::UntypedResource { cmd, handle })?;
-        Ok((res, self.current.program()))
+        Ok((res, self.current.program(), self.staging))
     }
 
     fn has(&self, f: Feature) -> bool {
@@ -4304,16 +4306,24 @@ impl Context {
             return Err(Fault::IllegalResource { cmd, handle: t.resource });
         };
         let began = host.tally.mark();
-        let (res, bound) = host.resource_to_transfer(cmd, t.resource)?;
+        let (res, bound, staging) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, offset as u64, false);
         let bytes = transfer::box_bytes(res, &info);
         let r = match direction {
             TransferDirection::ToHost => {
-                transfer::write(gl, bound, formats, res, Some(&pages), &pages, &info)
+                transfer::write(gl, bound, formats, staging, res, Some(&pages), &pages, &info)
             }
-            TransferDirection::FromHost => {
-                transfer::read(gl, bound, features, formats, res, Some(&pages), &pages, &info)
-            }
+            TransferDirection::FromHost => transfer::read(
+                gl,
+                bound,
+                features,
+                formats,
+                staging,
+                res,
+                Some(&pages),
+                &pages,
+                &info,
+            ),
         };
         host.tally.transfer(began, TransferDoor::Stream, bytes);
         r.map_err(|error| Fault::Transfer { cmd, error })
@@ -4340,18 +4350,26 @@ impl Context {
         };
         let own = guest.pages(ctx, t.resource);
         let began = host.tally.mark();
-        let (res, bound) = host.resource_to_transfer(cmd, t.resource)?;
+        let (res, bound, staging) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, staging_offset as u64, synchronized);
         let bytes = transfer::box_bytes(res, &info);
         let r = match direction {
-            CopyDirection::ToHost => {
-                transfer::write(gl, bound, formats, res, own.as_ref(), &staging_pages, &info)
-            }
+            CopyDirection::ToHost => transfer::write(
+                gl,
+                bound,
+                formats,
+                staging,
+                res,
+                own.as_ref(),
+                &staging_pages,
+                &info,
+            ),
             CopyDirection::FromHost => transfer::read(
                 gl,
                 bound,
                 features,
                 formats,
+                staging,
                 res,
                 own.as_ref(),
                 &staging_pages,
@@ -4378,10 +4396,10 @@ impl Context {
         let span = HostSpan::new(&bytes);
         let own = guest.pages(ctx, t.resource);
         let began = host.tally.mark();
-        let (res, bound) = host.resource_to_transfer(cmd, t.resource)?;
+        let (res, bound, staging) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, 0, false);
         let bytes = transfer::box_bytes(res, &info);
-        let r = transfer::write(gl, bound, formats, res, own.as_ref(), &span.iov(), &info);
+        let r = transfer::write(gl, bound, formats, staging, res, own.as_ref(), &span.iov(), &info);
         host.tally.transfer(began, TransferDoor::Stream, bytes);
         r.map_err(|error| Fault::Transfer { cmd, error })
     }

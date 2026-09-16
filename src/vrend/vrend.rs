@@ -95,6 +95,8 @@ pub struct Vrend {
     /// What the command path costs per guest command. Inert unless armed -- see
     /// [`tally::Tally`], which says why a profiler cannot answer this.
     tally: tally::Tally,
+    /// The buffer every texture transfer stages through; see [`transfer::Staging`].
+    staging: transfer::Staging,
     /// The shader blitter and its GL context, built on the first blit that needs one. A renderer
     /// that never takes the blitter's path never pays for it.
     blitter: Option<blitter::Blitter>,
@@ -311,6 +313,7 @@ impl Vrend {
             contexts: crate::Map::default(),
             todo: Todo::default(),
             tally: tally::Tally::from_env(),
+            staging: transfer::Staging::default(),
             blitter: None,
             waiter,
             fences,
@@ -378,12 +381,14 @@ impl Vrend {
             budget,
             // Neither belongs to a context's commands: the waiter is a thread, and the handle is
             // where a fence goes once answered.
+            staging,
             waiter: _,
             fences: _,
         } = self;
         let host = Host {
             batch: *batch,
             tally,
+            staging,
             budget,
             gl,
             winsys,
@@ -1185,13 +1190,23 @@ impl Vrend {
             .ok_or(transfer::Error::NoPages)?;
         let bytes = transfer::box_bytes(res, info);
         let r = if to_host {
-            transfer::write(&self.gl, self.current.program(), &self.formats, res, own, pages, info)
+            transfer::write(
+                &self.gl,
+                self.current.program(),
+                &self.formats,
+                &mut self.staging,
+                res,
+                own,
+                pages,
+                info,
+            )
         } else {
             transfer::read(
                 &self.gl,
                 self.current.program(),
                 &self.features,
                 &self.formats,
+                &mut self.staging,
                 res,
                 own,
                 pages,

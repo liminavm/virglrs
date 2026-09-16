@@ -327,15 +327,56 @@ fn upload_y(res: &Resource, b: &Box3, invert: bool) -> GLint {
     }
 }
 
+/// The buffer a texture transfer stages its box in, kept from one transfer to the next.
+///
+/// A texture write gathers the box out of the pages tight, converts it in place and hands GL the
+/// result; a readback is the same in reverse. The C mallocs that buffer per transfer, and so did
+/// this tree. On this host a fresh buffer that size is mapped lazily, so the first pass over it
+/// paid a page fault per 4 KiB on top of the copy. Kept, the pages stay mapped and the copy
+/// runs at memory speed.
+///
+/// The kept buffer only grows, so what stays resident is the largest box staged so far, up to
+/// [`Staging::KEEP`]: a box past that stages in a buffer of its own, freed at the next transfer,
+/// and never pins its size on the renderer. The cap is a 4K BGRA frame, which is the largest
+/// transfer a desktop makes routinely; the win is per page faulted, so a rare larger one losing
+/// it costs the least.
+#[derive(Default)]
+pub struct Staging {
+    buf: Vec<u8>,
+    spill: Vec<u8>,
+}
+
+impl Staging {
+    /// The largest box the kept buffer grows to, in bytes.
+    pub const KEEP: usize = 32 << 20;
+
+    /// `total` bytes to stage in. They hold whatever the last transfer left, never zeros: every
+    /// caller fills the whole span before it reads any of it, a gather by row and a readback by
+    /// layer, and a readback that fails partway is abandoned rather than scattered.
+    fn take(&mut self, total: usize) -> &mut [u8] {
+        self.spill = Vec::new();
+        if total > Self::KEEP {
+            self.spill = vec![0u8; total];
+            return &mut self.spill;
+        }
+        if self.buf.len() < total {
+            self.buf.resize(total, 0);
+        }
+        &mut self.buf[..total]
+    }
+}
+
 /// Copy the box from the pages into the resource: `vrend_renderer_transfer_write_iov`.
 ///
 /// `pages` is where the bytes come from -- the resource's own pages for a `TRANSFER3D`, another
 /// resource's for a `COPY_TRANSFER3D`; `own` is the resource's own pages, which a host-side
 /// buffer mirrors.
+#[allow(clippy::too_many_arguments)]
 pub fn write(
     gl: &Gl,
     bound: &mut BoundProgram,
     formats: &Table,
+    staging: &mut Staging,
     res: &mut Resource,
     own: Option<&Iov<'_>>,
     pages: &Iov<'_>,
@@ -425,19 +466,19 @@ pub fn write(
             let format_name = res.args.format.name();
             let l = l.as_gl(entry, b.width as u64, b.height as u64);
             let total = usize::try_from(l.total()).map_err(|_| Error::IovOutOfRange)?;
-            let mut data = vec![0u8; total];
-            if !gather(pages, info, &l, &mut data) {
+            let data = staging.take(total);
+            if !gather(pages, info, &l, data) {
                 return Err(Error::IovOutOfRange);
             }
             let invert = res.y_0_top();
             if invert {
-                flip_rows(&mut data, &l);
+                flip_rows(data, &l);
             }
             if res.is_bgra() {
-                swizzle_bgra(&mut data);
+                swizzle_bgra(data);
             }
             if format_name == "Z24X8_UNORM" {
-                scale_depth(&mut data, 256.0);
+                scale_depth(data, 256.0);
             }
             let (x, y) = (b.x, upload_y(res, &b, invert));
             let (w, h, d) = (b.width, b.height, b.depth);
@@ -464,7 +505,7 @@ pub fn write(
                             w,
                             h,
                             ifmt,
-                            &data,
+                            &*data,
                         )
                     } else {
                         gl.tex_sub_image_2d(
@@ -476,24 +517,26 @@ pub fn write(
                             h,
                             glformat,
                             gltype,
-                            &data,
+                            &*data,
                         )
                     }
                 }
                 GL_TEXTURE_3D | GL_TEXTURE_2D_ARRAY | GL_TEXTURE_CUBE_MAP_ARRAY => {
                     let lv = info.level as GLint;
                     if l.compressed {
-                        gl.compressed_tex_sub_image_3d(target, lv, x, y, b.z, w, h, d, ifmt, &data)
+                        gl.compressed_tex_sub_image_3d(target, lv, x, y, b.z, w, h, d, ifmt, &*data)
                     } else {
-                        gl.tex_sub_image_3d(target, lv, x, y, b.z, w, h, d, glformat, gltype, &data)
+                        gl.tex_sub_image_3d(
+                            target, lv, x, y, b.z, w, h, d, glformat, gltype, &*data,
+                        )
                     }
                 }
                 _ => {
                     let lv = info.level as GLint;
                     if l.compressed {
-                        gl.compressed_tex_sub_image_2d(target, lv, x, y, w, h, ifmt, &data)
+                        gl.compressed_tex_sub_image_2d(target, lv, x, y, w, h, ifmt, &*data)
                     } else {
-                        gl.tex_sub_image_2d(target, lv, x, y, w, h, glformat, gltype, &data)
+                        gl.tex_sub_image_2d(target, lv, x, y, w, h, glformat, gltype, &*data)
                     }
                 }
             };
@@ -689,6 +732,7 @@ pub fn read(
     bound: &mut BoundProgram,
     features: &Features,
     formats: &Table,
+    staging: &mut Staging,
     res: &Resource,
     own: Option<&Iov<'_>>,
     pages: &Iov<'_>,
@@ -756,7 +800,7 @@ pub fn read(
             let invert = res.y_0_top();
             let l = l.as_gl(entry, b.width as u64, b.height as u64);
             let total = usize::try_from(l.total()).map_err(|_| Error::IovOutOfRange)?;
-            let mut data = vec![0u8; total];
+            let data = staging.take(total);
             let layer = l.layer() as usize;
             let y = if invert { res.height_at(info.level) as GLint - b.y - b.height } else { b.y };
             gl.use_program(bound, None);
@@ -784,15 +828,15 @@ pub fn read(
                 }
             }
             if res.is_bgra() {
-                swizzle_bgra(&mut data);
+                swizzle_bgra(data);
             }
             if format_name == "Z24X8_UNORM" {
-                scale_depth(&mut data, 1.0 / 256.0);
+                scale_depth(data, 1.0 / 256.0);
             }
             if invert {
-                flip_rows(&mut data, &l);
+                flip_rows(data, &l);
             }
-            if !scatter(pages, info, &l, &data) {
+            if !scatter(pages, info, &l, data) {
                 return Err(Error::IovOutOfRange);
             }
             Ok(())
@@ -803,6 +847,26 @@ pub fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kept buffer serves every box up to the cap from the same pages, and a box past it
+    /// neither grows the kept buffer nor pins its own size past the next transfer.
+    #[test]
+    fn staging_keeps_one_buffer_up_to_the_cap_and_spills_past_it() {
+        let mut staging = Staging::default();
+        let first = staging.take(4096).as_ptr();
+        assert_eq!(staging.take(64).len(), 64, "a smaller box is a prefix of the same buffer");
+        assert_eq!(staging.take(64).as_ptr(), first);
+        assert_eq!(staging.take(8192).len(), 8192, "a larger box grows it");
+        assert_eq!(staging.buf.len(), 8192);
+        let huge = Staging::KEEP + 1;
+        let spilled = staging.take(huge);
+        assert_eq!(spilled.len(), huge);
+        assert_ne!(spilled.as_ptr(), staging.buf.as_ptr(), "not the kept buffer");
+        assert_eq!(staging.buf.len(), 8192, "which did not grow for it");
+        assert_eq!(staging.spill.len(), huge);
+        staging.take(16);
+        assert!(staging.spill.is_empty(), "and the spill is freed by the next transfer");
+    }
 
     /// The row reversal both readback paths share.
     ///
