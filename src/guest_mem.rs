@@ -273,57 +273,94 @@ impl GuestMap {
 ///
 /// Copies only, for the reason [`GuestMap`] gives: the guest writes these pages whenever it
 /// likes, so a reference into them cannot be sound.
-pub struct Iov<'a>(&'a [crate::abi::GuestIov]);
+///
+/// A guest attaches a resource as whatever scatter list its allocator produced -- a 3.6 MB
+/// framebuffer has arrived as 225 entries -- and a transfer copies it a row at a time, so the
+/// walk is per row *and* per entry. The total is summed once here, so the bounds check is not a
+/// pass over the list per row, and a [`Cursor`] lets a row start where the last one ended.
+pub struct Iov<'a> {
+    entries: &'a [crate::abi::GuestIov],
+    len: u64,
+}
+
+/// Where a walk ended: the entry it stopped in and how many bytes precede that entry. Rows
+/// arrive in ascending order, so the next walk resumes there and the list is crossed once per
+/// transfer rather than once per row; a walk that starts before the cursor restarts from the
+/// head, so a cursor is never wrong, only sometimes unhelpful.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Cursor {
+    entry: usize,
+    base: u64,
+}
 
 impl<'a> Iov<'a> {
     pub fn new(entries: &'a [crate::abi::GuestIov]) -> Iov<'a> {
-        Iov(entries)
+        Iov { entries, len: entries.iter().map(|e| e.len as u64).sum() }
     }
 
     /// How many entries the list has: the multiplier on every row a transfer walks.
     pub fn entries(&self) -> usize {
-        self.0.len()
+        self.entries.len()
     }
 
     /// The total bytes the list describes.
     pub fn len(&self) -> u64 {
-        self.0.iter().map(|e| e.len as u64).sum()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.iter().all(|e| e.len == 0)
+        self.len == 0
     }
 
     /// Whether the entries are the same pages, in the same order, as `other`'s.
     pub fn same_pages(&self, other: &Iov<'_>) -> bool {
-        self.0.len() == other.0.len()
-            && self.0.iter().zip(other.0).all(|(a, b)| a.base == b.base && a.len == b.len)
+        self.entries.len() == other.entries.len()
+            && self
+                .entries
+                .iter()
+                .zip(other.entries)
+                .all(|(a, b)| a.base == b.base && a.len == b.len)
     }
 
     /// Walk `len` bytes from `at`, handing each contiguous piece to `f` as a host pointer and a
     /// length. `false`, with nothing visited, if the range is not wholly inside the list.
-    fn walk(&self, at: u64, len: usize, mut f: impl FnMut(*mut u8, usize, usize)) -> bool {
+    /// Resumes from `cursor` when `at` is not before it, and leaves the cursor at the entry the
+    /// range began in.
+    fn walk_from(
+        &self,
+        cursor: &mut Cursor,
+        at: u64,
+        len: usize,
+        mut f: impl FnMut(*mut u8, usize, usize),
+    ) -> bool {
         let Some(end) = at.checked_add(len as u64) else {
             return false;
         };
-        if end > self.len() {
+        if end > self.len {
             return false;
         }
-        let mut skip = at;
+        if at < cursor.base {
+            *cursor = Cursor::default();
+        }
+        // Skip the entries wholly before `at`, from wherever the last walk left the cursor.
+        let mut i = cursor.entry;
+        let mut base = cursor.base;
+        while let Some(e) = self.entries.get(i)
+            && base + e.len as u64 <= at
+        {
+            base += e.len as u64;
+            i += 1;
+        }
+        *cursor = Cursor { entry: i, base };
+        let mut skip = (at - base) as usize;
         let mut done = 0usize;
-        for e in self.0 {
+        for e in &self.entries[i..] {
             if done == len {
                 break;
             }
-            let elen = e.len as u64;
-            if skip >= elen {
-                skip -= elen;
-                continue;
-            }
-            let start = skip as usize;
-            let take = (e.len - start).min(len - done);
-            // The entry's base is the VMM's host address for the page; `start` is inside it.
-            f(e.base.0.cast::<u8>().wrapping_add(start), done, take);
+            let take = (e.len - skip).min(len - done);
+            // The entry's base is the VMM's host address for the page; `skip` is inside it.
+            f(e.base.0.cast::<u8>().wrapping_add(skip), done, take);
             done += take;
             skip = 0;
         }
@@ -333,11 +370,18 @@ impl<'a> Iov<'a> {
     /// Copy bytes out of the guest pages into `dst`. Returns whether the range was inside them.
     #[must_use]
     pub fn copy_out(&self, at: u64, dst: &mut [u8]) -> bool {
-        self.walk(at, dst.len(), |src, into, n| {
+        self.copy_out_from(&mut Cursor::default(), at, dst)
+    }
+
+    /// [`Iov::copy_out`] for one of a run of ascending rows: `cursor` carries where the last
+    /// row was, so the list is not walked from its head for each.
+    #[must_use]
+    pub fn copy_out_from(&self, cursor: &mut Cursor, at: u64, dst: &mut [u8]) -> bool {
+        self.walk_from(cursor, at, dst.len(), |src, into, n| {
             // SAFETY: the VMM's contract for an attached iov is that every entry addresses `len`
             // bytes of live guest memory until it detaches the list, and this renderer holds no
-            // list past a detach. `walk` proved the piece is inside its entry; `dst` is a host
-            // slice the caller owns, so the two cannot overlap.
+            // list past a detach. `walk_from` proved the piece is inside its entry; `dst` is a
+            // host slice the caller owns, so the two cannot overlap.
             unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr().add(into), n) };
         })
     }
@@ -345,9 +389,15 @@ impl<'a> Iov<'a> {
     /// Copy `src` into the guest pages at `at`. Returns whether the range was inside them.
     #[must_use]
     pub fn copy_in(&self, at: u64, src: &[u8]) -> bool {
-        self.walk(at, src.len(), |dst, from, n| {
-            // SAFETY: as `copy_out`, with the direction reversed; the VMM maps the pages writable
-            // because a transfer from the host is what they are for.
+        self.copy_in_from(&mut Cursor::default(), at, src)
+    }
+
+    /// [`Iov::copy_in`] for one of a run of ascending rows; see [`Iov::copy_out_from`].
+    #[must_use]
+    pub fn copy_in_from(&self, cursor: &mut Cursor, at: u64, src: &[u8]) -> bool {
+        self.walk_from(cursor, at, src.len(), |dst, from, n| {
+            // SAFETY: as `copy_out_from`, with the direction reversed; the VMM maps the pages
+            // writable because a transfer from the host is what they are for.
             unsafe { std::ptr::copy_nonoverlapping(src.as_ptr().add(from), dst, n) };
         })
     }
@@ -378,7 +428,7 @@ impl<'a> HostSpan<'a> {
     /// which is the borrowed slice, live for `'a`. A `copy_in` would write through a shared
     /// borrow; no transfer writes to the pages it was given as a source.
     pub fn iov(&self) -> Iov<'_> {
-        Iov(&self.entry)
+        Iov::new(&self.entry)
     }
 }
 
@@ -405,7 +455,7 @@ impl<'a> HostSpanMut<'a> {
     }
 
     pub fn iov(&self) -> Iov<'_> {
-        Iov(&self.entry)
+        Iov::new(&self.entry)
     }
 }
 
@@ -639,8 +689,14 @@ impl PixelSource<'_> {
     /// the source -- the bounds check belongs here because this is the only place that knows
     /// how far the source runs.
     pub fn copy_out(&self, at: u64, dst: &mut [u8]) -> bool {
+        self.copy_out_from(&mut Cursor::default(), at, dst)
+    }
+
+    /// [`PixelSource::copy_out`] for one of a run of ascending rows. Only a scattered source
+    /// has a list to walk; the cursor is carried for it and ignored by the rest.
+    pub fn copy_out_from(&self, cursor: &mut Cursor, at: u64, dst: &mut [u8]) -> bool {
         match self {
-            PixelSource::Scattered(iov) => iov.copy_out(at, dst),
+            PixelSource::Scattered(iov) => iov.copy_out_from(cursor, at, dst),
             PixelSource::Mapped(map) => usize::try_from(at).is_ok_and(|at| map.copy_out(at, dst)),
             PixelSource::Foreign(m) => m.copy_out(at, dst),
         }
@@ -810,5 +866,94 @@ mod tests {
     fn an_empty_resource_is_refused_rather_than_mapped() {
         let fd = shm_fd(0x1000);
         assert!(GuestMap::shm(fd.as_fd(), 0).is_err(), "mmap of zero bytes is an error, not a map");
+    }
+
+    /// A scatter list over host buffers, the way the VMM hands one over: one entry per piece.
+    fn scattered(pieces: &mut [Vec<u8>]) -> Vec<crate::abi::GuestIov> {
+        pieces
+            .iter_mut()
+            .map(|b| crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(b.as_mut_ptr().cast()),
+                len: b.len(),
+            })
+            .collect()
+    }
+
+    /// Byte `i` of the concatenation holds `i`, so a copy can be checked by position.
+    fn numbered(sizes: &[usize]) -> Vec<Vec<u8>> {
+        let mut n = 0u8;
+        sizes
+            .iter()
+            .map(|&size| {
+                (0..size)
+                    .map(|_| {
+                        n = n.wrapping_add(1);
+                        n
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A range that straddles entries reads and writes the pieces in list order.
+    #[test]
+    fn a_walk_crosses_entries_in_order() {
+        let mut pieces = numbered(&[5, 3, 12]);
+        let entries = scattered(&mut pieces);
+        let iov = Iov::new(&entries);
+        assert_eq!((iov.entries(), iov.len()), (3, 20));
+        let mut got = [0u8; 10];
+        assert!(iov.copy_out(3, &mut got));
+        assert_eq!(got, [4, 5, 6, 7, 8, 9, 10, 11, 12, 13], "bytes 3..13 of the concatenation");
+        assert!(iov.copy_in(4, &[0xa0, 0xa1, 0xa2, 0xa3, 0xa4]));
+        assert_eq!(&pieces[0][4..], [0xa0], "the tail of the first piece");
+        assert_eq!(pieces[1], [0xa1, 0xa2, 0xa3], "the whole second");
+        assert_eq!(pieces[2][0], 0xa4, "the head of the third");
+    }
+
+    /// Ascending rows resume from the entry the last row ended in rather than the head of the
+    /// list, and a row that goes backwards is served correctly by restarting.
+    #[test]
+    fn ascending_rows_carry_the_cursor_and_a_backwards_row_restarts() {
+        let mut pieces = numbered(&[4; 40]);
+        let entries = scattered(&mut pieces);
+        let iov = Iov::new(&entries);
+        let flat: Vec<u8> = pieces.iter().flatten().copied().collect();
+        let mut cursor = Cursor::default();
+        let mut last_entry = 0;
+        for row in 0..18u64 {
+            let at = row * 8 + 1;
+            let mut got = [0u8; 6];
+            assert!(iov.copy_out_from(&mut cursor, at, &mut got), "row {row} is inside");
+            assert_eq!(got, flat[at as usize..at as usize + 6], "row {row}");
+            assert!(cursor.entry >= last_entry, "the cursor never goes back on an ascending row");
+            assert_eq!(cursor.base, (cursor.entry as u64) * 4, "and names the bytes before it");
+            last_entry = cursor.entry;
+        }
+        assert_eq!(last_entry, 34, "row 17 begins at byte 137, entry 34");
+        let mut got = [0u8; 6];
+        assert!(iov.copy_out_from(&mut cursor, 2, &mut got), "a backwards row is still inside");
+        assert_eq!(got, flat[2..8], "and reads what is there, from the head again");
+        assert_eq!(cursor.entry, 0);
+        assert!(iov.copy_in_from(&mut cursor, 158, &[7, 7]), "a write at the very end");
+        assert_eq!(pieces[39][2..], [7, 7]);
+    }
+
+    /// A range that leaves the list is refused whole with nothing visited, from a fresh walk
+    /// and from a cursor alike; an empty range at the very end is inside.
+    #[test]
+    fn a_range_past_a_scattered_list_is_refused_whole() {
+        let mut pieces = numbered(&[6, 6]);
+        let entries = scattered(&mut pieces);
+        let iov = Iov::new(&entries);
+        let mut got = [0u8; 2];
+        assert!(!iov.copy_out(11, &mut got), "straddles the end");
+        assert_eq!(got, [0, 0], "and nothing was visited");
+        assert!(!iov.copy_in(12, b"x"), "one byte past the end");
+        assert!(iov.copy_out(12, &mut []), "an empty range at the very end is inside it");
+        let mut cursor = Cursor::default();
+        assert!(iov.copy_out_from(&mut cursor, 7, &mut got));
+        assert!(!iov.copy_out_from(&mut cursor, 11, &mut got), "the cursor does not loosen it");
+        assert!(!iov.copy_out(u64::MAX, &mut got), "an offset that would overflow is refused");
     }
 }

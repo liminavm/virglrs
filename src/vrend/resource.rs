@@ -2286,13 +2286,14 @@ fn fill_texture(
     }
     staging.clear();
     staging.resize(total, 0);
+    let mut cursor = crate::guest_mem::Cursor::default();
     for y in 0..a.height as u64 {
         let at = u64::from(plane.offset) + y * stride;
         let dst = y as usize * row;
         // Checked whole above, so a row that misses now is this renderer's arithmetic and not the
         // guest's description.
         assert!(
-            src.copy_out(at, &mut staging[dst..dst + row]),
+            src.copy_out_from(&mut cursor, at, &mut staging[dst..dst + row]),
             "the layout was reconciled against {} bytes of storage before any row was read",
             src.len(),
         );

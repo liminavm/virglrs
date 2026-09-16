@@ -1361,6 +1361,17 @@ SABOTAGES = [
         'Ok(0) => None,\n        Ok(n) => Some(n),',
         'sample_ceiling',
     ),
+    (
+        'a row before the cursor resumes from it instead of restarting, and reads the wrong pages',
+        'src/guest_mem.rs',
+        """        if at < cursor.base {
+            *cursor = Cursor::default();
+        }""",
+        """        if at < cursor.base && false {
+            *cursor = Cursor::default();
+        }""",
+        'ascending_rows_carry_the_cursor_and_a_backwards_row_restarts',
+    ),
 ]
 
 # Not here, and deliberately: "a ring-seqno wake is never sent". Deleting any single

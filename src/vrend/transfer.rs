@@ -20,7 +20,7 @@ use super::gl::gles::*;
 use super::gl::{BoundProgram, GLenum, GLint, GLsizei, Gl, TextureName, pixel_bytes};
 use super::proto::Box3;
 use super::resource::{Resource, Storage};
-use crate::guest_mem::Iov;
+use crate::guest_mem::{Cursor, Iov};
 use std::fmt;
 
 /// Where a transfer lands in the resource, and how the guest laid it out in the pages.
@@ -243,11 +243,13 @@ pub fn level_region(res: &Resource, level: u32) -> Box3 {
 /// pages. `false` if a row fell outside the pages, which `layout` has already ruled out.
 fn gather(pages: &Iov<'_>, info: &Info, l: &Layout, out: &mut [u8]) -> bool {
     let row = l.row() as usize;
+    // Rows ascend through the pages, so one cursor crosses the list once for the whole box.
+    let mut cursor = Cursor::default();
     for d in 0..l.depth {
         for r in 0..l.blocks_high {
             let at = info.offset + d * l.layer_stride + r * l.stride;
             let into = ((d * l.blocks_high + r) as usize) * row;
-            if !pages.copy_out(at, &mut out[into..into + row]) {
+            if !pages.copy_out_from(&mut cursor, at, &mut out[into..into + row]) {
                 return false;
             }
         }
@@ -258,11 +260,12 @@ fn gather(pages: &Iov<'_>, info: &Info, l: &Layout, out: &mut [u8]) -> bool {
 /// Scatter a tight buffer into the pages, the inverse of [`gather`].
 fn scatter(pages: &Iov<'_>, info: &Info, l: &Layout, data: &[u8]) -> bool {
     let row = l.row() as usize;
+    let mut cursor = Cursor::default();
     for d in 0..l.depth {
         for r in 0..l.blocks_high {
             let at = info.offset + d * l.layer_stride + r * l.stride;
             let from = ((d * l.blocks_high + r) as usize) * row;
-            if !pages.copy_in(at, &data[from..from + row]) {
+            if !pages.copy_in_from(&mut cursor, at, &data[from..from + row]) {
                 return false;
             }
         }
