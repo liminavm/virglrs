@@ -11,7 +11,7 @@
 //! Conversion is deliberately explicit and one-directional at the boundary: the FFI shim wraps a
 //! raw value on the way in and unwraps on the way out, and nothing between them can confuse two.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
 macro_rules! id {
     ($(#[$m:meta])* $name:ident($inner:ty)) => {
@@ -46,14 +46,38 @@ id!(
     /// types replaces.
     RingIdx(u32)
 );
-id!(
-    /// The object id a guest gives a ring in `vkCreateRingMESA`.
-    ///
-    /// A venus object id, 64 bits, from the same space as every other object the guest names.
-    /// Distinct from [`RingIdx`]: this one identifies *which ring object*, that one identifies
-    /// which fence timeline.
-    RingId(u64)
-);
+/// The object id a guest gives a ring in `vkCreateRingMESA`.
+///
+/// A venus object id, 64 bits, from the same space as every other object the guest names.
+/// Distinct from [`RingIdx`]: this one identifies *which ring object*, that one identifies
+/// which fence timeline.
+///
+/// Never zero. Zero is `VK_NULL_HANDLE` in the space the guest names objects from, and it is
+/// what the journal and the replay ABI write where a command belongs to no ring at all -- the
+/// context's own stream. A ring the guest called 0 would replay on the wrong decoder, so the
+/// integer is parsed here, by [`RingId::new`], at the boundary that receives it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[repr(transparent)]
+pub struct RingId(NonZeroU64);
+
+impl RingId {
+    pub const fn new(raw: u64) -> Option<RingId> {
+        match NonZeroU64::new(raw) {
+            Some(n) => Some(RingId(n)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Display for RingId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 id!(
     /// A global IOSurface id, which another process resolves to the surface itself.
     ///

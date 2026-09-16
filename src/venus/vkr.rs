@@ -851,7 +851,7 @@ mod tests {
             v.contexts[&ctx_id()]
                 .lock()
                 .expect("not poisoned")
-                .ring_waiter(RingId(7), 1)
+                .ring_waiter(RingId::new(7).unwrap(), 1)
                 .is_some_and(|_| true)
         });
         // The ring is asleep on a seqno nobody has published. Give it a moment to be certainly

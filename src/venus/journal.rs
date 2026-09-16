@@ -35,6 +35,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::objects::ObjectKey;
+use crate::ids::RingId;
 
 /// Where a command sat in the stream. The VMM fences its own rebuilding against these.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
@@ -88,17 +89,31 @@ enum About {
     /// `vkCreateRingMESA` is owned by the ring it makes and must replay on the context's decoder,
     /// because at the moment it replays that ring does not exist yet. Keeping the two apart is why
     /// this holds an owner and `Entry::ring_key` holds a route.
-    Ring(u64),
+    Ring(RingId),
+    /// It is the context's own stream state -- a reply window set on the context's decoder rather
+    /// than on a ring's -- and is true as long as the context is.
+    Context,
+}
+
+/// Whose latest-wins state an entry is: the context's own stream, or one ring's.
+///
+/// The context's reply window is state too, and it dies with nothing but the context. That is an
+/// owner, not the absence of one, which is why this is an enum rather than an `Option<RingId>`
+/// whose `None` would have to be read as "the context" in one place and "no route" in another.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Owner {
+    Context,
+    Ring(RingId),
 }
 
 #[derive(Clone, Debug)]
 struct Entry {
     seq: Seq,
     cmd_type: u32,
-    /// The ring this must replay *on*, or 0 for the context's own decoder. The one classification
-    /// the wire format still carries, because it is the only one replay acts on. Not the same
-    /// question as which ring the entry belongs to -- see [`About::Ring`].
-    ring_key: u64,
+    /// The ring this must replay *on*, or `None` for the context's own decoder. The one
+    /// classification the wire format still carries, because it is the only one replay acts on.
+    /// Not the same question as which ring the entry belongs to -- see [`About::Ring`].
+    ring_key: Option<RingId>,
     wire: Vec<u8>,
     about: About,
     /// Objects the command named but does not own. Only creates need dragging in, so this holds
@@ -129,7 +144,7 @@ struct Recorded {
 struct Out<'a> {
     seq: Seq,
     cmd_type: u32,
-    ring_key: u64,
+    ring_key: Option<RingId>,
     wire: &'a [u8],
 }
 
@@ -157,7 +172,7 @@ impl<'a> Item<'a> {
                 Out { seq: e.seq, cmd_type: e.cmd_type, ring_key: e.ring_key, wire: &e.wire }
             }
             Item::Recording(_, r) => {
-                Out { seq: r.seq, cmd_type: r.cmd_type, ring_key: 0, wire: &r.wire }
+                Out { seq: r.seq, cmd_type: r.cmd_type, ring_key: None, wire: &r.wire }
             }
         }
     }
@@ -166,7 +181,7 @@ impl<'a> Item<'a> {
 /// A latest-wins slot: state a later command replaces rather than adds to.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct RingSlot {
-    ring: u64,
+    owner: Owner,
     cmd_type: u32,
 }
 
@@ -237,7 +252,7 @@ impl Journal {
         keys: Vec<ObjectKey>,
         refs: Vec<ObjectKey>,
     ) {
-        self.push(cmd_type, 0, wire, About::Created(keys), refs);
+        self.push(cmd_type, None, wire, About::Created(keys), refs);
     }
 
     /// Retain a command as part of a command buffer's recording.
@@ -286,7 +301,7 @@ impl Journal {
         keys: Vec<ObjectKey>,
         refs: Vec<ObjectKey>,
     ) {
-        self.push(cmd_type, 0, wire, About::Mutated(keys), refs);
+        self.push(cmd_type, None, wire, About::Mutated(keys), refs);
     }
 
     /// Retain a command that freed objects, against the creates it undoes.
@@ -297,17 +312,17 @@ impl Journal {
         freed: Vec<ObjectKey>,
         refs: Vec<ObjectKey>,
     ) {
-        self.push(cmd_type, 0, wire, About::Undoes(freed), refs);
+        self.push(cmd_type, None, wire, About::Undoes(freed), refs);
     }
 
     /// Retain a ring-scoped command, replayed on that ring's own decoder.
-    pub fn ring(&mut self, cmd_type: u32, wire: &[u8], ring: u64) {
-        self.push(cmd_type, ring, wire, About::Ring(ring), Vec::new());
+    pub fn ring(&mut self, cmd_type: u32, wire: &[u8], ring: RingId) {
+        self.push(cmd_type, Some(ring), wire, About::Ring(ring), Vec::new());
     }
 
     /// Retain the command that made a ring: owned by it, and replayed before it exists.
-    pub fn ring_created(&mut self, cmd_type: u32, wire: &[u8], ring: u64) {
-        self.push(cmd_type, 0, wire, About::Ring(ring), Vec::new());
+    pub fn ring_created(&mut self, cmd_type: u32, wire: &[u8], ring: RingId) {
+        self.push(cmd_type, None, wire, About::Ring(ring), Vec::new());
     }
 
     /// Retain ring state that a later command of the same kind replaces.
@@ -320,30 +335,28 @@ impl Journal {
     /// into that refusal and abandons the rest of the journal. Keying the slot by `owner` is what
     /// keeps two rings' state apart, and what lets [`Self::ring_gone`] take it away with its ring.
     /// Same split, same reason, as [`About::Ring`] against [`Entry::ring_key`].
-    pub fn ring_latest(&mut self, cmd_type: u32, wire: &[u8], owner: u64, route: u64) {
+    pub fn ring_latest(&mut self, cmd_type: u32, wire: &[u8], owner: Owner, route: Option<RingId>) {
         let seq = self.seq.advance();
-        let entry = Entry {
-            seq,
-            cmd_type,
-            ring_key: route,
-            wire: wire.to_vec(),
-            about: About::Ring(owner),
-            refs: Vec::new(),
+        let about = match owner {
+            Owner::Context => About::Context,
+            Owner::Ring(ring) => About::Ring(ring),
         };
-        self.ring_state.insert(RingSlot { ring: owner, cmd_type }, entry);
+        let entry =
+            Entry { seq, cmd_type, ring_key: route, wire: wire.to_vec(), about, refs: Vec::new() };
+        self.ring_state.insert(RingSlot { owner, cmd_type }, entry);
     }
 
     /// Forget everything a ring owned. Called when the ring is destroyed: unlike an object, a ring
     /// has no key whose generation can answer for it.
-    pub fn ring_gone(&mut self, ring: u64) {
+    pub fn ring_gone(&mut self, ring: RingId) {
         self.entries.retain(|e| !matches!(e.about, About::Ring(r) if r == ring));
-        self.ring_state.retain(|slot, _| slot.ring != ring);
+        self.ring_state.retain(|slot, _| slot.owner != Owner::Ring(ring));
     }
 
     fn push(
         &mut self,
         cmd_type: u32,
-        ring_key: u64,
+        ring_key: Option<RingId>,
         wire: &[u8],
         about: About,
         refs: Vec<ObjectKey>,
@@ -475,7 +488,7 @@ impl Journal {
                 Item::Recording(b, _) => live.holds(*b),
                 Item::Kept(e) => match &e.about {
                     About::Created(keys) | About::Mutated(keys) => alive(keys),
-                    About::Ring(_) => true,
+                    About::Ring(_) | About::Context => true,
                     // Decided below, once it is known which creates survived.
                     About::Undoes(_) => false,
                 },
@@ -501,7 +514,7 @@ impl Journal {
                     // A free names only objects that are gone; the creates that would remake them
                     // are exactly the ones it depends on, and they are kept on their own account
                     // or the free is not kept at all.
-                    About::Undoes(_) | About::Ring(_) => &[],
+                    About::Undoes(_) | About::Ring(_) | About::Context => &[],
                 },
             };
             for r in it.refs().iter().chain(subject) {
@@ -562,9 +575,9 @@ impl Journal {
         for e in entries {
             out.extend_from_slice(&e.seq.0.to_le_bytes());
             out.extend_from_slice(&e.cmd_type.to_le_bytes());
-            out.push(if e.ring_key != 0 { KLASS_RING_STREAM } else { 0 });
+            out.push(if e.ring_key.is_some() { KLASS_RING_STREAM } else { 0 });
             out.extend_from_slice(&[0; 3]);
-            out.extend_from_slice(&e.ring_key.to_le_bytes());
+            out.extend_from_slice(&e.ring_key.map_or(0, RingId::get).to_le_bytes());
             out.extend_from_slice(&(e.wire.len() as u32).to_le_bytes());
             out.extend_from_slice(e.wire);
             out.resize(out.len() + (4 - (e.wire.len() % 4)) % 4, 0);
@@ -577,7 +590,8 @@ impl Journal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Parsed {
     pub seq: Seq,
-    pub ring_key: u64,
+    /// The ring to replay on, or `None` for the context's own decoder: the blob writes 0 there.
+    pub ring_key: Option<RingId>,
     pub wire: Vec<u8>,
 }
 
@@ -621,7 +635,7 @@ pub fn parse(data: &[u8]) -> Result<Vec<Parsed>, &'static str> {
         let seq = Seq(c.u64()?);
         let _cmd_type = c.u32()?;
         let _klass_and_pad = c.u32()?;
-        let ring_key = c.u64()?;
+        let ring_key = RingId::new(c.u64()?);
         let size = c.u32()? as usize;
         let wire = c.take(size)?.to_vec();
         c.take((4 - (size % 4)) % 4)?;
@@ -633,6 +647,10 @@ pub fn parse(data: &[u8]) -> Result<Vec<Parsed>, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn r(id: u64) -> RingId {
+        RingId::new(id).expect("a test names no ring 0")
+    }
 
     /// A `Live` that answers from a set, so retention can be tested without a driver.
     struct Some_(Vec<ObjectKey>);
@@ -912,13 +930,13 @@ mod tests {
     #[test]
     fn a_rings_create_routes_to_the_context_and_dies_with_the_ring() {
         let mut j = Journal::new();
-        j.ring_created(1, &[1; 4], 0xaa);
-        j.ring(2, &[2; 4], 0xaa);
+        j.ring_created(1, &[1; 4], r(0xaa));
+        j.ring(2, &[2; 4], r(0xaa));
         let out = j.retained(&Some_(vec![]));
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].ring_key, 0, "the create replays before the ring exists");
-        assert_eq!(out[1].ring_key, 0xaa);
-        j.ring_gone(0xaa);
+        assert!(out[0].ring_key.is_none(), "the create replays before the ring exists");
+        assert_eq!(out[1].ring_key, Some(r(0xaa)));
+        j.ring_gone(r(0xaa));
         assert!(j.retained(&Some_(vec![])).is_empty(), "both belong to the ring");
     }
 
@@ -935,14 +953,14 @@ mod tests {
     #[test]
     fn ring_state_is_latest_wins_and_dies_with_its_ring() {
         let mut j = Journal::new();
-        j.ring_latest(7, &[1; 4], 0xaa, 0xaa);
-        j.ring_latest(7, &[2; 4], 0xaa, 0xaa);
-        j.ring_latest(7, &[3; 4], 0xbb, 0xbb);
+        j.ring_latest(7, &[1; 4], Owner::Ring(r(0xaa)), Some(r(0xaa)));
+        j.ring_latest(7, &[2; 4], Owner::Ring(r(0xaa)), Some(r(0xaa)));
+        j.ring_latest(7, &[3; 4], Owner::Ring(r(0xbb)), Some(r(0xbb)));
         assert_eq!(j.retained(&Some_(vec![])).len(), 2);
-        j.ring_gone(0xaa);
+        j.ring_gone(r(0xaa));
         let out = j.retained(&Some_(vec![]));
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].ring_key, 0xbb);
+        assert_eq!(out[0].ring_key, Some(r(0xbb)));
     }
 
     /// Two rings' state, both replaying on the context's decoder, must stay two slots.
@@ -953,11 +971,11 @@ mod tests {
     #[test]
     fn ring_state_of_two_rings_sharing_a_route_stays_apart() {
         let mut j = Journal::new();
-        j.ring_latest(7, &[0xaa; 4], 0xaa, 0);
-        j.ring_latest(7, &[0xbb; 4], 0xbb, 0);
+        j.ring_latest(7, &[0xaa; 4], Owner::Ring(r(0xaa)), None);
+        j.ring_latest(7, &[0xbb; 4], Owner::Ring(r(0xbb)), None);
         let out = j.retained(&Some_(vec![]));
         assert_eq!(out.len(), 2, "one slot per owner, not per route");
-        assert!(out.iter().all(|e| e.ring_key == 0), "both replay on the context: {out:?}");
+        assert!(out.iter().all(|e| e.ring_key.is_none()), "both replay on the context: {out:?}");
     }
 
     /// ...and each still dies with its own ring, which is what stops a slot outliving the ring it
@@ -965,9 +983,9 @@ mod tests {
     #[test]
     fn ring_state_sharing_a_route_still_dies_with_its_own_ring() {
         let mut j = Journal::new();
-        j.ring_latest(7, &[0xaa; 4], 0xaa, 0);
-        j.ring_latest(7, &[0xbb; 4], 0xbb, 0);
-        j.ring_gone(0xaa);
+        j.ring_latest(7, &[0xaa; 4], Owner::Ring(r(0xaa)), None);
+        j.ring_latest(7, &[0xbb; 4], Owner::Ring(r(0xbb)), None);
+        j.ring_gone(r(0xaa));
         let out = j.retained(&Some_(vec![]));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].wire, vec![0xbb; 4], "the surviving ring's own state");
@@ -978,13 +996,13 @@ mod tests {
         let k = keys(1);
         let mut j = Journal::new();
         j.created(1, &[1, 2, 3, 4, 5, 6], vec![k[0]], Vec::new());
-        j.ring(2, &[9; 8], 0xdead_beef);
+        j.ring(2, &[9; 8], r(0xdead_beef));
         let blob = j.export(&Some_(vec![k[0]])).expect("something to say");
         let back = parse(&blob).expect("parses");
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].wire, vec![1, 2, 3, 4, 5, 6]);
-        assert_eq!(back[0].ring_key, 0);
-        assert_eq!(back[1].ring_key, 0xdead_beef);
+        assert!(back[0].ring_key.is_none());
+        assert_eq!(back[1].ring_key, Some(r(0xdead_beef)));
     }
 
     /// The exported stream is in `seq` order whichever container an entry came out of.
@@ -1005,7 +1023,7 @@ mod tests {
         j.created(20, &[2; 4], vec![k[0]], Vec::new()); // seq 2
         j.recorded(11, &[3; 4], buf_b, true, Vec::new()); // seq 3
         j.recorded(12, &[4; 4], buf_a, false, Vec::new()); // seq 4
-        j.ring(30, &[5; 4], 0xfeed); // seq 5
+        j.ring(30, &[5; 4], r(0xfeed)); // seq 5
 
         let back = parse(&j.export(&Some_(vec![k[0], buf_a, buf_b])).expect("something to say"))
             .expect("parses");
@@ -1013,11 +1031,11 @@ mod tests {
         assert_eq!(seqs, vec![1, 2, 3, 4, 5], "the stream is in the order the guest spoke");
         let wires: Vec<&[u8]> = back.iter().map(|p| &p.wire[..]).collect();
         assert_eq!(wires, vec![&[1; 4][..], &[2; 4], &[3; 4], &[4; 4], &[5; 4]]);
-        assert_eq!(
-            back[0].ring_key, 0,
+        assert!(
+            back[0].ring_key.is_none(),
             "a recording replays on the context's own decoder, and carries the 0 to say so"
         );
-        assert_eq!(back[4].ring_key, 0xfeed);
+        assert_eq!(back[4].ring_key, Some(r(0xfeed)));
     }
 
     /// A journal with every kind of entry in it, for the compaction tests.
@@ -1039,8 +1057,8 @@ mod tests {
         j.recorded(10, &[10; 4], k[6], true, Vec::new());
         j.recorded(11, &[11; 4], k[6], false, vec![k[0]]);
         j.recorded(12, &[12; 4], k[7], true, Vec::new());
-        j.ring_created(13, &[13; 4], 0xaa);
-        j.ring_latest(14, &[14; 4], 0xaa, 0xaa);
+        j.ring_created(13, &[13; 4], r(0xaa));
+        j.ring_latest(14, &[14; 4], Owner::Ring(r(0xaa)), Some(r(0xaa)));
         j
     }
 

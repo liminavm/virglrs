@@ -22,7 +22,7 @@ use super::cs::{Guest, HostHandle, ObjectId};
 use super::driver::{
     self, Driver, ExportError, Exported, MemoryError, NoSubmit2, NoSyncFd, NotATimeline,
 };
-use super::journal::{self, Journal, Seq};
+use super::journal::{self, Journal, Owner, Seq};
 use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{COMMAND_TYPES, Commands, vn_command_name, vn_dispatch_command};
@@ -498,10 +498,12 @@ impl Context {
             }
             let entry = self.restoring.pop_front().expect("just looked at it");
             let ok = match entry.ring_key {
-                0 => matches!(self.submit(&entry.wire, todo, global, resources), Submitted::Done),
+                None => {
+                    matches!(self.submit(&entry.wire, todo, global, resources), Submitted::Done)
+                }
                 // A ring the journal itself created earlier in this same feed: the create was
                 // routed to the context's decoder precisely so it would exist by now.
-                key => self.submit_ring(RingId(key), &entry.wire, todo, global, resources),
+                Some(key) => self.submit_ring(key, &entry.wire, todo, global, resources),
             };
             if !ok {
                 eprintln!(
@@ -1286,7 +1288,7 @@ fn record(
         Some(Note::RingSeqno(ring)) => {
             // Owned by the ring it names, routed to the context's decoder -- the stream it came
             // in on, and the only one that will accept it. See `Journal::ring_latest`.
-            h.journal.ring_latest(cmd_type, &wire, ring, 0);
+            h.journal.ring_latest(cmd_type, &wire, Owner::Ring(ring), None);
             return;
         }
         Some(Note::PoolReset(buffers)) => {
@@ -1300,8 +1302,8 @@ fn record(
     }
 
     // Everything a running ring's stream carries replays on that ring's decoder. A command that
-    // arrived on the context's own stream replays there, which is `ring_key` 0.
-    let route = h.current_ring.map_or(0, |r| r.0);
+    // arrived on the context's own stream replays there, which is no ring at all.
+    let route = h.current_ring;
 
     // Where a ring's answers go: state a later command of the same kind replaces outright, rather
     // than adding to. Kept per ring and per command, so a set followed by a seek keeps both.
@@ -1310,10 +1312,11 @@ fn record(
         VkCommandTypeEXT::VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT
             | VkCommandTypeEXT::VK_COMMAND_TYPE_vkSeekReplyCommandStreamMESA_EXT
     ) {
-        // Owner and route are the same ring here: a reply stream is set on the ring it is about,
-        // and is legal on either stream. `vkSubmitVirtqueueSeqnoMESA` is the case where they
-        // differ, and it comes through `Note::RingSeqno` above.
-        h.journal.ring_latest(cmd_type, &wire, route, route);
+        // Owner and route are the same stream here: a reply window is set on the stream it is
+        // about, and is legal on either -- the context's own window is the context's state.
+        // `vkSubmitVirtqueueSeqnoMESA` is the case where they differ, and it comes through
+        // `Note::RingSeqno` above.
+        h.journal.ring_latest(cmd_type, &wire, route.map_or(Owner::Context, Owner::Ring), route);
         return;
     }
 
@@ -1694,9 +1697,9 @@ pub struct Handlers<'a> {
 enum Note {
     /// It made this ring. Owned by the ring, and replayed on the context's own decoder, because
     /// when it replays the ring does not exist yet.
-    RingCreated(u64),
+    RingCreated(RingId),
     /// It destroyed this ring, and everything the ring owned goes with it.
-    RingGone(u64),
+    RingGone(RingId),
     /// It raised this ring's published virtqueue seqno.
     ///
     /// The ring is named here because the recorder cannot find it any other way: this command
@@ -1704,7 +1707,7 @@ enum Note {
     /// the route is the context's own decoder. Only sent when the value actually rose -- a submit
     /// that raised nothing is state the guest already had, and keeping it would let a lower seqno
     /// supersede the higher one in the latest-wins slot.
-    RingSeqno(u64),
+    RingSeqno(RingId),
     /// It reset this command pool, discarding every recording made from it without invalidating a
     /// single buffer -- so no key changes and only the journal can be told.
     ///
@@ -1721,6 +1724,18 @@ enum Note {
 }
 
 impl Handlers<'_> {
+    /// The ring a command named, or a rejection. Zero is no ring: it is `VK_NULL_HANDLE` in the
+    /// space the guest names objects from, and it is what the journal writes for the context's
+    /// own stream, so a ring called 0 would replay on the wrong decoder. The integer is parsed
+    /// here, once, and the ring handlers hold a [`RingId`] that cannot be 0.
+    fn named_ring(&mut self, raw: u64) -> Option<RingId> {
+        let id = RingId::new(raw);
+        if id.is_none() {
+            self.reject = Some("named ring 0, which is no ring");
+        }
+        id
+    }
+
     /// The guest id a single out-handle carries, or None when the guest asked for no object.
     fn out_id<T: Handle>(&self, out: Option<&Guest<T>>) -> Option<ObjectId> {
         Some(out?.id())
@@ -2804,7 +2819,9 @@ impl Commands for Handlers<'_> {
             self.reject = Some("created a ring from inside a ring's own stream");
             return;
         }
-        let id = RingId(args.ring);
+        let Some(id) = self.named_ring(args.ring) else {
+            return;
+        };
         let Some(info) = args.pCreateInfo else {
             self.reject = Some("asked to create a ring with no description of it");
             return;
@@ -2864,7 +2881,7 @@ impl Commands for Handlers<'_> {
         // where the caller knows whether it was replaying -- and doing it there rather than in the
         // handler is why a handler never needs to reach the renderer's locks. See `Vkr::promote`.
         self.rings.insert(id, RingSlot::Idle(ring));
-        self.note = Some(Note::RingCreated(args.ring));
+        self.note = Some(Note::RingCreated(id));
     }
 
     fn vkDestroyRingMESA(&mut self, args: &mut vn_command_vkDestroyRingMESA<'_>) {
@@ -2872,7 +2889,9 @@ impl Commands for Handlers<'_> {
             self.reject = Some("destroyed a ring from inside a ring's own stream");
             return;
         }
-        let id = RingId(args.ring);
+        let Some(id) = self.named_ring(args.ring) else {
+            return;
+        };
         // Dropping the entry is the teardown: it releases this ring's share of the resource's
         // mapping, and the mapping goes when the last share does. A running ring is stopped
         // first, which joins its thread -- safe from here only because the refusal above means
@@ -2880,10 +2899,10 @@ impl Commands for Handlers<'_> {
         // context lock this dispatch is holding.
         match self.rings.remove(&id) {
             None => self.reject = Some("destroyed a ring that was never created"),
-            Some(RingSlot::Idle(_)) => self.note = Some(Note::RingGone(args.ring)),
+            Some(RingSlot::Idle(_)) => self.note = Some(Note::RingGone(id)),
             Some(RingSlot::Running(t)) => {
                 drop(t.stop());
-                self.note = Some(Note::RingGone(args.ring));
+                self.note = Some(Note::RingGone(id));
             }
         }
     }
@@ -2897,7 +2916,10 @@ impl Commands for Handlers<'_> {
             self.reject = Some("rang a ring's doorbell from inside a ring's own stream");
             return;
         }
-        match self.rings.get(&RingId(args.ring)) {
+        let Some(id) = self.named_ring(args.ring) else {
+            return;
+        };
+        match self.rings.get(&id) {
             None => self.reject = Some("rang the doorbell of a ring that was never created"),
             // Not yet reading, so there is nothing to wake. Harmless to miss: promotion happens
             // at the end of this batch, and a fresh thread reads the tail before it can park.
@@ -2915,7 +2937,10 @@ impl Commands for Handlers<'_> {
             self.reject = Some("wrote a ring's extra word from inside a ring's own stream");
             return;
         }
-        match self.rings.get(&RingId(args.ring)) {
+        let Some(id) = self.named_ring(args.ring) else {
+            return;
+        };
+        match self.rings.get(&id) {
             None => self.reject = Some("wrote the extra word of a ring that was never created"),
             Some(slot) => {
                 if !slot.control().write_extra(args.offset, args.value) {
@@ -2938,19 +2963,22 @@ impl Commands for Handlers<'_> {
             self.reject = Some("submitted a virtqueue seqno from inside a ring's own stream");
             return;
         }
-        match self.rings.get_mut(&RingId(args.ring)) {
+        let Some(id) = self.named_ring(args.ring) else {
+            return;
+        };
+        match self.rings.get_mut(&id) {
             None => {
                 self.reject = Some("submitted a virtqueue seqno for a ring that was never created")
             }
             Some(RingSlot::Idle(r)) => {
                 if args.seqno > r.virtqueue_seqno {
                     r.virtqueue_seqno = args.seqno;
-                    self.note = Some(Note::RingSeqno(args.ring));
+                    self.note = Some(Note::RingSeqno(id));
                 }
             }
             Some(RingSlot::Running(t)) => {
                 if t.submit_virtqueue_seqno(args.seqno) {
-                    self.note = Some(Note::RingSeqno(args.ring));
+                    self.note = Some(Note::RingSeqno(id));
                 }
             }
         }
@@ -3007,7 +3035,10 @@ impl Commands for Handlers<'_> {
             self.reject = Some("waited on a ring seqno too large to be a position in a ring");
             return;
         };
-        match self.rings.get(&RingId(args.ring)) {
+        let Some(id) = self.named_ring(args.ring) else {
+            return;
+        };
+        match self.rings.get(&id) {
             None => self.reject = Some("waited on the seqno of a ring that was never created"),
             // Nothing advances an idle ring's head -- it has no thread yet, and promotion happens
             // only once this batch is over, which this command is inside. Suspending on it would
@@ -3018,7 +3049,7 @@ impl Commands for Handlers<'_> {
             Some(RingSlot::Running(t)) => {
                 t.notify();
                 if !seqno_ge(t.control().head(), seqno) {
-                    self.wait = Some(Wait::Ring { ring: RingId(args.ring), seqno });
+                    self.wait = Some(Wait::Ring { ring: id, seqno });
                 }
             }
         }
@@ -8284,7 +8315,7 @@ mod tests {
         // single shared slot would just carry the ring's window, and the answer would still land
         // in the right place for the wrong reason.
         assert!(ctx.submit_ring(
-            RingId(7),
+            RingId::new(7).unwrap(),
             &wire_set_reply(&reply_at(RING_WINDOW, 0x100)),
             &mut todo,
             &g,
@@ -8295,7 +8326,13 @@ mod tests {
         );
 
         // The question arrives on the ring, so the answer belongs in the ring's window.
-        assert!(ctx.submit_ring(RingId(7), &wire_seek(0, GENERATE_REPLY), &mut todo, &g, &t));
+        assert!(ctx.submit_ring(
+            RingId::new(7).unwrap(),
+            &wire_seek(0, GENERATE_REPLY),
+            &mut todo,
+            &g,
+            &t
+        ));
 
         let mut got = [0u8; 4];
         assert!(t.1.copy_out(RING_WINDOW, &mut got));
@@ -8515,7 +8552,7 @@ mod tests {
         ] {
             let mut ctx = ctx_with_ring(&t);
             assert!(
-                !ctx.submit_ring(RingId(7), &batch, &mut todo, &g, &t),
+                !ctx.submit_ring(RingId::new(7).unwrap(), &batch, &mut todo, &g, &t),
                 "{what} reaches the ring table, which a ring's own dispatch is inside"
             );
         }
@@ -8595,13 +8632,13 @@ mod tests {
         for (ring, offset) in [(7u64, 0x21000usize), (9, 0x22000)] {
             let d = reply_at(offset, 0x100);
             assert!(
-                ctx.submit_ring(RingId(ring), &wire_set_reply(&d), &mut todo, &g, &t),
+                ctx.submit_ring(RingId::new(ring).unwrap(), &wire_set_reply(&d), &mut todo, &g, &t),
                 "ring {ring}'s window fits its resource"
             );
         }
 
         let window = |ring: u64| {
-            ctx.rings[&RingId(ring)]
+            ctx.rings[&RingId::new(ring).unwrap()]
                 .idle()
                 .reply
                 .as_ref()
@@ -8662,7 +8699,8 @@ mod tests {
         // one refused entry abandons every entry after it.
         assert!(back.replay_upto(Seq(u64::MAX), &mut todo, &g, &t), "every journal entry replayed");
 
-        let seqno = |c: &Context, ring: u64| c.rings[&RingId(ring)].idle().virtqueue_seqno;
+        let seqno =
+            |c: &Context, ring: u64| c.rings[&RingId::new(ring).unwrap()].idle().virtqueue_seqno;
         assert_eq!(seqno(&back, 7), 40, "ring 7 came back with ring 7's seqno");
         assert_eq!(seqno(&back, 9), 55, "ring 9 came back with ring 9's seqno");
     }
@@ -8686,7 +8724,11 @@ mod tests {
         for seqno in [40u64, 12] {
             assert!(ctx.submit(&wire_submit_vq(7, seqno), &mut todo, &g, &t).ran());
         }
-        assert_eq!(ctx.rings[&RingId(7)].idle().virtqueue_seqno, 40, "live value only rises");
+        assert_eq!(
+            ctx.rings[&RingId::new(7).unwrap()].idle().virtqueue_seqno,
+            40,
+            "live value only rises"
+        );
 
         let blob = ctx.journal_export().expect("something to rebuild");
         let mut back = Context::new(
@@ -8698,7 +8740,7 @@ mod tests {
         back.journal_restore(&blob).expect("the blob parses");
         back.replay_upto(Seq(u64::MAX), &mut todo, &g, &t);
         assert_eq!(
-            back.rings[&RingId(7)].idle().virtqueue_seqno,
+            back.rings[&RingId::new(7).unwrap()].idle().virtqueue_seqno,
             40,
             "the restore reproduces the high-water mark, not the last thing said"
         );
@@ -8729,7 +8771,7 @@ mod tests {
             0x21000
         );
         assert!(
-            ctx.rings[&RingId(7)].idle().reply.is_none(),
+            ctx.rings[&RingId::new(7).unwrap()].idle().reply.is_none(),
             "the ring was not the one that asked"
         );
     }
@@ -8917,13 +8959,13 @@ mod tests {
         h.vkCreateRingMESA(&mut Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() });
         assert_eq!(h.reject, None, "on the context's stream, creating is fine");
 
-        h.current_ring = Some(RingId(7));
+        h.current_ring = Some(RingId::new(7).unwrap());
         h.vkCreateRingMESA(&mut Create { ring: 8, pCreateInfo: Some(&info), ..Default::default() });
         assert_eq!(h.reject.take(), Some("created a ring from inside a ring's own stream"));
         h.vkDestroyRingMESA(&mut Destroy { ring: 7, ..Default::default() });
         assert_eq!(h.reject.take(), Some("destroyed a ring from inside a ring's own stream"));
 
-        assert!(h.rings.contains_key(&RingId(7)), "the refusals changed nothing");
+        assert!(h.rings.contains_key(&RingId::new(7).unwrap()), "the refusals changed nothing");
         assert_eq!(h.rings.len(), 1);
     }
 
@@ -8942,7 +8984,7 @@ mod tests {
         ctx.replay_begin();
 
         assert!(
-            !ctx.submit_ring(RingId(7), &[], &mut todo, &g, &NO_RESOURCES),
+            !ctx.submit_ring(RingId::new(7).unwrap(), &[], &mut todo, &g, &NO_RESOURCES),
             "there is no ring 7 to submit to"
         );
         assert!(!ctx.fatal(), "and the context is still usable");
@@ -8998,7 +9040,10 @@ mod tests {
             assert_eq!(h.reject, None, "ring {ring:#x} is a layout we accept");
         }
         assert_eq!(rings.len(), 2, "two ids, two rings");
-        assert!(rings.contains_key(&RingId(low)) && rings.contains_key(&RingId(high)));
+        assert!(
+            rings.contains_key(&RingId::new(low).unwrap())
+                && rings.contains_key(&RingId::new(high).unwrap())
+        );
     }
 
     /// A ring id the guest is already using is the guest contradicting itself. Refusing rather
@@ -9042,14 +9087,14 @@ mod tests {
         let mut first = Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() };
         h.vkCreateRingMESA(&mut first);
         assert_eq!(h.reject, None);
-        h.rings[&RingId(7)].idle().set_head(0x1234);
+        h.rings[&RingId::new(7).unwrap()].idle().set_head(0x1234);
 
         let mut again = Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() };
         h.vkCreateRingMESA(&mut again);
         assert!(h.reject.is_some(), "the second create under the same id is refused");
         assert_eq!(h.rings.len(), 1, "and did not add a second entry");
         assert_eq!(
-            h.rings[&RingId(7)].idle().map.load_u32(0),
+            h.rings[&RingId::new(7).unwrap()].idle().map.load_u32(0),
             Some(0x1234),
             "the ring that was already there is untouched"
         );
@@ -9259,6 +9304,47 @@ mod tests {
         let mut args = Create { ring: 1, pCreateInfo: None, ..Default::default() };
         h.vkCreateRingMESA(&mut args);
         assert!(h.reject.is_some());
+        assert!(rings.is_empty());
+    }
+
+    /// Ring 0 is what the journal writes for "no ring": a command on the context's own stream.
+    /// A ring the guest called 0 would have its commands replay on the context's decoder, so the
+    /// name is refused where it arrives -- refused, not renamed, since a ring quietly moved to
+    /// another id is a ring the guest cannot find.
+    #[test]
+    fn a_ring_named_zero_is_refused() {
+        use super::super::proto::types::vn_command_vkCreateRingMESA as Create;
+
+        let t = ring_table();
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut driver = Driver::new(Account::for_test(None));
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &t,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let mut args = Create { ring: 0, pCreateInfo: None, ..Default::default() };
+        h.vkCreateRingMESA(&mut args);
+        assert_eq!(h.reject, Some("named ring 0, which is no ring"));
         assert!(rings.is_empty());
     }
 

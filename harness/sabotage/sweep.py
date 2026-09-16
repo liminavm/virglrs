@@ -1176,6 +1176,15 @@ SABOTAGES = [
         'an_allocation_the_host_refuses_poisons_instead_of_aborting',
     ),
     (
+        "a ring the guest named 0 is quietly renamed instead of refused",
+        'src/ids.rs',
+        """    pub const fn new(raw: u64) -> Option<RingId> {
+        match NonZeroU64::new(raw) {""",
+        """    pub const fn new(raw: u64) -> Option<RingId> {
+        match NonZeroU64::new(if raw == 0 { 1 } else { raw }) {""",
+        'a_ring_named_zero_is_refused',
+    ),
+    (
         'the sample-count ceiling is ignored and the host maximum advertised anyway',
         'virglrs/src/vrend/caps.rs',
         'Some(c) if max_samples > c => {',

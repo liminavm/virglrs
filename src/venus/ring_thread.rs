@@ -487,7 +487,7 @@ pub fn spawn(
         let park = Arc::clone(&park);
         let started = Arc::clone(&started);
         std::thread::Builder::new()
-            .name(format!("virglrs-ring-{}", id.0))
+            .name(format!("virglrs-ring-{id}"))
             .spawn(move || run(id, ring, &park, &started, dispatch.as_ref(), &fatal, &wait_ring))
             .expect("the host can start a ring thread")
     };
@@ -764,7 +764,7 @@ mod tests {
     fn spawn_with(rec: Arc<Recorder>, r: Ring) -> (RingThread, Arc<AtomicBool>, Arc<WaitRing>) {
         let fatal = Arc::new(AtomicBool::new(false));
         let wait_ring = Arc::new(WaitRing::default());
-        let t = spawn(RingId(7), r, rec, Arc::clone(&fatal), Arc::clone(&wait_ring));
+        let t = spawn(RingId::new(7).unwrap(), r, rec, Arc::clone(&fatal), Arc::clone(&wait_ring));
         (t, fatal, wait_ring)
     }
 

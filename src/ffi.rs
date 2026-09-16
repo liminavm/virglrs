@@ -2100,7 +2100,11 @@ pub extern "C" fn virgl_renderer_limina_replay_ring_cmd(
     // The ring object the guest named, at its full width. This used to narrow into a `RingIdx`,
     // which is a fence timeline index and a different concept -- two rings whose ids differed
     // only above bit 32 became the same ring, silently.
-    let ring = RingId(ring_id);
+    // Ring 0 is the context's own stream, which `virgl_renderer_limina_replay_cmd` feeds; a
+    // journal entry never carries it here.
+    let Some(ring) = RingId::new(ring_id) else {
+        return EINVAL;
+    };
     let Some(ctx) = ContextId::new(ctx_id) else {
         return EINVAL;
     };
