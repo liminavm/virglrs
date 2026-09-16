@@ -3876,7 +3876,12 @@ impl Driver {
         ret
     }
 
-    /// `vkWaitForFences`. Blocks for up to `timeout` nanoseconds, as the guest asked.
+    /// `vkWaitForFences`. Blocks for up to `timeout` nanoseconds.
+    ///
+    /// The batch calls this with a timeout of 0, as a probe: a wait the driver cannot answer
+    /// at once is handed back as a [`DriverWait`] (see [`Driver::fence_wait`]) and run with no
+    /// lock held. Only a wait that must block inline -- a replay, or a nested stream -- spends the
+    /// guest's whole timeout here.
     pub fn wait_for_fences(
         &self,
         device: VkDevice,
@@ -4242,10 +4247,11 @@ impl Driver {
     ///
     /// The timeout is passed exactly as it arrived, `UINT64_MAX` included, and nothing here
     /// shortens it. A clamp would come back `VK_TIMEOUT` from a wait that did not time out, which
-    /// the guest cannot tell from a real one -- it would loop, and the loop would be ours. Blocking
-    /// this thread for as long as the guest asked is the same bargain [`Driver::wait_for_fences`]
-    /// already makes, and it is the guest's own thread being spent. A host that needs a bound on
-    /// how long a wait may sit here wants it in the replayer, never in the renderer.
+    /// the guest cannot tell from a real one -- it would loop, and the loop would be ours. The
+    /// batch calls this with a timeout of 0, as a probe, and hands a wait it cannot answer back
+    /// as a [`DriverWait`] (see [`Driver::semaphore_wait`]); only a replay or a nested stream
+    /// spends the guest's whole timeout here, on the guest's own thread. A host that needs a
+    /// bound on how long a wait may sit wants it in the replayer, never in the renderer.
     pub fn dev_op_info_timeout<I>(
         &self,
         device: VkDevice,

@@ -308,10 +308,12 @@ impl Vkr {
     /// promote: its rings wait for `replay_end`, which is the C's `ctx->replaying` check moved to
     /// the place that knows the answer.
     /// Returns how the batch ended, because it may not have ended: a `vkWaitRingSeqnoMESA` stops
-    /// it partway, and the caller has to wait *with no lock of this renderer held* and come back
-    /// with the rest. It cannot be waited on here -- `on_context` holds the context and the
-    /// resource table, and the ring whose head we would be waiting for needs the first of those
-    /// to advance it. See [`Submitted`].
+    /// it partway, and so does a driver wait the driver cannot answer at once, and the caller has
+    /// to wait *with no lock of this renderer held* and come back with the rest -- here again
+    /// after a transport wait, through [`Vkr::resume`] with the answer after a driver wait. It
+    /// cannot be waited on here -- `on_context` holds the context and the resource table, and the
+    /// ring whose head we would be waiting for needs the first of those to advance it, and a
+    /// driver wait would hold both against every ring of the context. See [`Submitted`].
     ///
     /// Rings are promoted whether the batch finished or suspended. A `vkCreateRingMESA` before the
     /// wait has to start reading, or the wait is on a ring that will never run.

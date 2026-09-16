@@ -1196,9 +1196,12 @@ impl Renderer {
     /// renderer we have, or a stream that poisoned the one it named.
     ///
     /// A submission does not always finish: a `vkWaitRingSeqnoMESA` in the stream suspends it,
-    /// and the answer says how much ran. The caller waits -- holding none of this renderer, which
-    /// is the whole reason the wait is not taken here -- and comes back with the remainder. See
-    /// [`Submitted`] and [`Renderer::ring_waiter`].
+    /// and so does a driver wait the driver cannot answer at once (`vkWaitForFences` and its
+    /// kin); the answer says how much ran and what to wait for. The caller waits -- holding none
+    /// of this renderer, which is the whole reason the wait is not taken here -- and comes back
+    /// with the remainder: through [`Renderer::submit_cmd`] again after a transport wait, through
+    /// [`Renderer::resume_cmd`] with the driver's answer after a driver wait. See [`Submitted`]
+    /// and [`Renderer::ring_waiter`].
     pub fn submit_cmd(&mut self, ctx: ContextId, buf: &[u8]) -> Result<Submitted, Error> {
         let Some(c) = self.contexts.get(&ctx) else {
             return Err(Error::NoContext);

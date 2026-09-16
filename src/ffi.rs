@@ -1566,8 +1566,10 @@ pub extern "C" fn virgl_renderer_submit_cmd(
 /// `vkWaitRingSeqnoMESA` that blocked inside `submit_cmd` would hold it for the whole wait --
 /// against a ring thread that needs the context under it to advance the very head being waited
 /// for, and against every other ABI entry point in the process, scanout and fence retirement
-/// included. So the renderer hands the wait back instead: it says how much of the buffer ran and
-/// what to wait for, this drops the guard, waits, and comes back with the remainder.
+/// included. A `vkWaitForFences` the driver cannot answer at once would do the same. So the
+/// renderer hands the wait back instead: it says how much of the buffer ran and what to wait
+/// for, this drops the guard, waits, and comes back with the remainder -- through `submit_cmd`
+/// after a transport wait, through `resume_cmd` with the driver's answer after a driver wait.
 ///
 /// The C has no equivalent because it has no such lock -- its ring threads dispatch against the
 /// context with nothing held at all, which is the design this rewrite exists to replace.
