@@ -277,6 +277,17 @@ argv carries `--vmm-bin ...limina-vmm`. Use `pgrep -f '[l]imina-vmm --cpus'`, th
 subtree from the call graph; the whole-process leaf list is dominated by idle threads waiting and
 says almost nothing.
 
+**A profile of a saturated thread cannot see a throughput win.** It reports proportions, and a
+cheaper command path leaves the thread as pegged as before, doing more per second with every
+percentage roughly where it was. The number that moves is microseconds per command, and
+`VIRGLRS_SUBMIT_STATS=1` in the renderer's environment prints it every 5 s (any other positive
+integer is the interval in seconds) for both paths: `[virglrs] vrend submit:` for the classic
+path and `[virglrs] venus ring:` / `[virglrs] venus context:` for venus, the latter split by
+where the batch arrived from because a desktop's `vkCmd*` traffic is all on rings. Venus reports
+busy as thread-seconds per second, which sums past one when several rings are busy. The module
+docs of `src/vrend/tally.rs` and `src/venus/tally.rs` say what each field covers and what it
+does not; the fence path, for one, is outside the classic line.
+
 **The gpu worker looking busy is not the workload running.** It is busy for the compositor, for
 the browser's own UI, for a page that has merely loaded. This is the proxy that will cost a cycle:
 a profile taken while a benchmark sat behind its Start button was full of plausible draw work.

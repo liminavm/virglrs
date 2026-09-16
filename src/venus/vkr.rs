@@ -37,6 +37,7 @@ use super::driver::Answered;
 use super::journal::Seq;
 use super::ring::{ReplyStream, Ring, ShmResources};
 use super::ring_thread::{self, Dispatch, RingWaiter, Verdict};
+use super::tally::{Origin, Tally};
 use crate::budget::Budget;
 use crate::vulkan::Global;
 
@@ -74,6 +75,10 @@ pub struct Vkr {
     /// because it answers a question about the build, not about a guest. Its lock is its own, and
     /// a leaf: a batch reaches it for one increment on the way to poisoning, never for its length.
     pub todo: Arc<Unimplemented>,
+    /// What a batch costs per command, when `VIRGLRS_SUBMIT_STATS` arms it. Shared the same way
+    /// as the census and for the same reason -- every ring thread adds to it -- but lock-free,
+    /// because a batch touches it on every run and not only on the way to poisoning.
+    tally: Arc<Tally>,
     /// The entry points that exist before any instance does. One per renderer rather than one per
     /// context: they are the loader's, identical for every guest, and immutable once resolved.
     global: Arc<Global>,
@@ -140,7 +145,27 @@ struct RingDispatch {
     ctx: Weak<Mutex<Context>>,
     resources: SharedResources,
     todo: Arc<Unimplemented>,
+    tally: Arc<Tally>,
     global: Arc<Global>,
+}
+
+/// Run one batch against a locked context with the tally around it.
+///
+/// The command count is the delta of the context's own dispatch count, so it includes the
+/// commands of nested execute streams; the byte count is the batch's buffer. Unarmed, this is
+/// two reads of an `Option` and no clock.
+fn timed<T>(
+    tally: &Tally,
+    origin: Origin,
+    ctx: &mut Context,
+    buf: &[u8],
+    f: impl FnOnce(&mut Context) -> T,
+) -> T {
+    let began = tally.batch_began();
+    let before = ctx.dispatched;
+    let out = f(ctx);
+    tally.batch_ended(began, origin, ctx.dispatched - before, buf.len());
+    out
 }
 
 impl Dispatch for RingDispatch {
@@ -172,7 +197,10 @@ impl Dispatch for RingDispatch {
         };
         // Only now, with the batch about to run: an answer taken before a `Busy` would be lost.
         let answer = answer.take();
-        match ctx.dispatch_ring(ring, reply, buf, answer, &self.todo, &self.global, &*resources) {
+        let out = timed(&self.tally, Origin::Ring, &mut ctx, buf, |ctx| {
+            ctx.dispatch_ring(ring, reply, buf, answer, &self.todo, &self.global, &*resources)
+        });
+        match out {
             Submitted::Done => Verdict::Ran,
             Submitted::Poisoned => Verdict::Poisoned,
             // A ring's own stream may only wait on a virtqueue seqno; the handler for the other
@@ -197,6 +225,7 @@ impl Vkr {
             contexts: BTreeMap::new(),
             generations: 0,
             todo: Arc::new(Unimplemented::default()),
+            tally: Arc::new(Tally::from_env()),
             global: Arc::new(crate::vulkan::global()),
             resources,
             budget: Arc::clone(budget),
@@ -274,8 +303,12 @@ impl Vkr {
             return;
         };
         let weak = Arc::downgrade(arc);
-        let (resources, todo, global) =
-            (Arc::clone(&self.resources), Arc::clone(&self.todo), Arc::clone(&self.global));
+        let (resources, todo, global, tally) = (
+            Arc::clone(&self.resources),
+            Arc::clone(&self.todo),
+            Arc::clone(&self.global),
+            Arc::clone(&self.tally),
+        );
         let mut ctx = arc.lock().expect("a context lock is never poisoned");
         // The C's `if (!ctx->replaying) vkr_ring_start(ring)`, asked at the one place that starts
         // a ring. A journal is still being fed to these rings; they start at `replay_end`.
@@ -289,6 +322,7 @@ impl Vkr {
                 ctx: Weak::clone(&weak),
                 resources: Arc::clone(&resources),
                 todo: Arc::clone(&todo),
+                tally: Arc::clone(&tally),
                 global: Arc::clone(&global),
             };
             ring_thread::spawn(
@@ -319,7 +353,9 @@ impl Vkr {
     /// wait has to start reading, or the wait is on a ring that will never run.
     pub fn submit(&mut self, id: ContextId, buf: &[u8]) -> Result<Submitted, Error> {
         let out = self.on_context(id, |ctx, todo, global, resources| {
-            ctx.submit(buf, todo, global, resources)
+            timed(&self.tally, Origin::Context, ctx, buf, |ctx| {
+                ctx.submit(buf, todo, global, resources)
+            })
         })?;
         self.promote(id);
         Ok(out)
@@ -335,7 +371,9 @@ impl Vkr {
         answered: Answered,
     ) -> Result<Submitted, Error> {
         let out = self.on_context(id, |ctx, todo, global, resources| {
-            ctx.resume(buf, answered, todo, global, resources)
+            timed(&self.tally, Origin::Context, ctx, buf, |ctx| {
+                ctx.resume(buf, answered, todo, global, resources)
+            })
         })?;
         self.promote(id);
         Ok(out)
@@ -361,7 +399,9 @@ impl Vkr {
     /// Feed one journal entry to a ring's stream. Replay only, so nothing is promoted here.
     pub fn submit_ring(&mut self, id: ContextId, ring: RingId, buf: &[u8]) -> Result<(), Error> {
         self.on_context_ok(id, |ctx, todo, global, resources| {
-            ctx.submit_ring(ring, buf, todo, global, resources)
+            timed(&self.tally, Origin::Ring, ctx, buf, |ctx| {
+                ctx.submit_ring(ring, buf, todo, global, resources)
+            })
         })
     }
 
@@ -371,7 +411,7 @@ impl Vkr {
     /// its own. `false` from the closure is a poisoned stream, which is the only way a submission
     /// fails once the context has been found.
     fn on_context<T>(
-        &mut self,
+        &self,
         id: ContextId,
         f: impl FnOnce(&mut Context, &Unimplemented, &Global, &dyn ShmResources) -> T,
     ) -> Result<T, Error> {
@@ -383,7 +423,7 @@ impl Vkr {
 
     /// The same, for the callers whose only two answers are "it ran" and "it poisoned".
     fn on_context_ok(
-        &mut self,
+        &self,
         id: ContextId,
         f: impl FnOnce(&mut Context, &Unimplemented, &Global, &dyn ShmResources) -> bool,
     ) -> Result<(), Error> {
@@ -1246,6 +1286,7 @@ mod tests {
             ctx: Arc::downgrade(v.contexts.get(&id).expect("created above")),
             resources: Arc::clone(&v.resources),
             todo: Arc::clone(&v.todo),
+            tally: Arc::clone(&v.tally),
             global: Arc::clone(&v.global),
         };
         let blocked = dispatch(ctx_id());

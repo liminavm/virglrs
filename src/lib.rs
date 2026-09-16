@@ -62,6 +62,7 @@ pub mod ids;
 #[cfg(target_os = "macos")]
 pub mod metal;
 pub mod renderer;
+pub mod stats;
 pub mod surface;
 pub mod venus;
 pub mod vrend;

@@ -1372,6 +1372,14 @@ pinned corpora the scores already use. No new corpus is needed for it: measured 
 those two and not from `venus.vkrc`, which is much the largest corpus at 578,868 commands and
 begins only 436 buffers.
 
+Until that row exists, `VIRGLRS_SUBMIT_STATS` is the instrument: set to a number of seconds
+longer than the replay it prints one `[virglrs] venus ring:` and one `[virglrs] venus context:`
+line at teardown with microseconds per command for the whole run, per origin. A replay's number
+covers decode, dispatch, the driver and the journal record, and nothing of the reply path or the
+ring loop; and a corpus holds one command per record, so every per-batch cost lands on each
+command and `cmd/batch` reads 1.0. The module doc of `src/venus/tally.rs` says what each field
+is. Under a boot the same knob reports on the interval, for venus and the classic path together.
+
 **`vrend-av1.score` is stale.** It predates scoring at the format's own bytes per texel and cannot
 be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
 

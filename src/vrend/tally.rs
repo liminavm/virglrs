@@ -36,8 +36,7 @@
 //! path and measure the logging. Nothing is printed until the reporting interval has elapsed, and
 //! that deadline is checked once per submit.
 //!
-//! Armed by `VIRGLRS_SUBMIT_STATS`: `1` reports every 5 s, any other positive integer is the
-//! interval in seconds. Unset, this is inert.
+//! Armed by `VIRGLRS_SUBMIT_STATS`, the knob [`crate::stats`] describes; unset, this is inert.
 
 use std::time::{Duration, Instant};
 
@@ -124,33 +123,10 @@ impl Armed {
 }
 
 impl Tally {
-    /// Read the environment once, at renderer construction.
-    ///
-    /// Deliberately not a lazy `OnceLock` consulted on the hot path: this hangs off the renderer
-    /// like every other piece of state, so there is no global to race on and no per-command
-    /// `getenv` to regret. A renderer built without the variable set can never start reporting.
+    /// Read the environment once, at renderer construction. The knob and its parsing are
+    /// [`crate::stats`], shared with the venus tally.
     pub fn from_env() -> Self {
-        let Ok(v) = std::env::var("VIRGLRS_SUBMIT_STATS") else {
-            return Self { on: None };
-        };
-        let secs = match v.trim() {
-            "" | "0" => return Self { on: None },
-            "1" => 5,
-            other => match other.parse::<u64>() {
-                Ok(n) if n > 0 => n,
-                // A misspelled interval must not read as "off" -- that is a silent needle, and a
-                // needle nothing arms is worse than no needle. Take the default and say so.
-                _ => {
-                    eprintln!(
-                        "[virglrs] vrend: VIRGLRS_SUBMIT_STATS={other:?} is not a positive \
-                         number of seconds; reporting every 5s"
-                    );
-                    5
-                }
-            },
-        };
-        eprintln!("[virglrs] vrend: submit stats on, reporting every {secs}s");
-        Self { on: Some(Armed::new(Duration::from_secs(secs))) }
+        Self { on: crate::stats::report_interval("vrend").map(Armed::new) }
     }
 
     /// One guest command ran. The whole per-command cost of this instrument.
@@ -389,15 +365,5 @@ mod tests {
         assert_eq!(a.hop_busy[0], Duration::ZERO);
         assert_eq!(a.hop_n[0], 0, "the per-index buckets as well");
         assert_eq!(a.every, Duration::ZERO, "the interval is not a counter and must survive");
-    }
-
-    /// A junk interval arms at the default rather than silently disarming.
-    #[test]
-    fn a_junk_interval_still_arms() {
-        // SAFETY: single-threaded test, and the variable is read once, below.
-        unsafe { std::env::set_var("VIRGLRS_SUBMIT_STATS", "banana") };
-        let t = Tally::from_env();
-        unsafe { std::env::remove_var("VIRGLRS_SUBMIT_STATS") };
-        assert!(t.on.is_some(), "a misspelled interval must not read as off");
     }
 }
