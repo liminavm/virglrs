@@ -1324,6 +1324,13 @@ SABOTAGES = [
         'a_destroyed_ring_releases_what_its_wait_was_reading',
     ),
     (
+        'a timed driver wait is made in one call, so a ring cannot be stopped until the GPU signals',
+        'src/venus/driver.rs',
+        """            let slice = left.min(DriverWait::SLICE);""",
+        """            let slice = left;""",
+        'a_context_with_a_ring_inside_an_endless_wait_is_destroyed_promptly',
+    ),
+    (
         "a ring the guest named 0 is quietly renamed instead of refused",
         'src/ids.rs',
         """    pub const fn new(raw: u64) -> Option<RingId> {

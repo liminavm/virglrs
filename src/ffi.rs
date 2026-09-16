@@ -1599,7 +1599,7 @@ fn submit_all(id: ContextId, buf: &[u8]) -> c_int {
             // thread is what is spent on it, and nothing else in the process waits behind it.
             Ok(Submitted::Waiting { consumed, on: Wait::Driver(wait) }) => {
                 at += consumed;
-                answer = Some(wait.run());
+                answer = Some(wait.run(|| true).expect("nothing stops a virtqueue-side wait"));
                 continue;
             }
             // A virtqueue wait is legal only on a ring's own stream, and this is the context's.

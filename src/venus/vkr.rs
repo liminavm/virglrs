@@ -1413,4 +1413,119 @@ mod tests {
         until("the ring to consume the wait once released", || head(&map) == work.len() as u32);
         v.context_destroy(ctx_id());
     }
+
+    /// A context whose ring is inside a wait the guest gave forever to is still torn down
+    /// promptly: the wait is made in slices, and the stop lands between them.
+    ///
+    /// Teardown joins every ring thread. A thread inside one driver call with the guest's whole
+    /// timeout would be joined only when the GPU signalled -- for a fence nothing will signal,
+    /// never -- and `context_destroy` runs on the VMM's control thread with the renderer held.
+    /// The planted driver sleeps for the timeout it is handed, so a wait made in one call would
+    /// hold the teardown for seconds and a sliced one for one slice. The deadline is the
+    /// assertion.
+    #[test]
+    fn a_context_with_a_ring_inside_an_endless_wait_is_destroyed_promptly() {
+        use crate::venus::cs::{HostHandle, ObjectId};
+        use crate::venus::proto::serialize::{
+            vn_encode_vkWaitForFences_args, vn_sizeof_vkWaitForFences_args,
+        };
+        use crate::venus::proto::types::{
+            VkAllocationCallbacks, VkBool32, VkDevice, VkFence, VkObjectType, VkResult,
+            vn_command_vkWaitForFences as Args,
+        };
+
+        const DEVICE: u64 = 0xd0;
+        const GUEST_DEV: u64 = 0x1d;
+        const FENCE: u64 = 0xf0;
+        const GUEST_FENCE: u64 = 0x1f;
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+
+        /// Never signalled: a probe says so at once, and a real wait sleeps for what it was
+        /// handed -- capped, so that a wait made in one call fails this test instead of
+        /// wedging it.
+        unsafe extern "C" fn wait(
+            _d: VkDevice,
+            _count: u32,
+            _p: *const VkFence,
+            _all: VkBool32,
+            timeout: u64,
+        ) -> VkResult {
+            if timeout > 0 {
+                ENTERED.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_nanos(timeout.min(8_000_000_000)));
+            }
+            VkResult::VK_TIMEOUT
+        }
+        unsafe extern "C" fn idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_fence(
+            _d: VkDevice,
+            _f: VkFence,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        ENTERED.store(false, Ordering::Release);
+
+        let (mut v, map) = vkr();
+        {
+            let arc = v.contexts.get(&ctx_id()).expect("created by the fixture");
+            let mut ctx = arc.lock().expect("a context lock is never poisoned");
+            let mut fns = crate::vulkan::Device::default();
+            fns.plant_vkWaitForFences(wait);
+            fns.plant_vkDeviceWaitIdle(idle);
+            fns.plant_vkDestroyFence(destroy_fence);
+            fns.plant_vkDestroyDevice(destroy_device);
+            ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
+            let mut table = ctx.objects().borrow_mut();
+            table
+                .add(
+                    ObjectId(GUEST_DEV),
+                    VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                    HostHandle(DEVICE),
+                    None,
+                )
+                .expect("a fresh id");
+            table
+                .add(
+                    ObjectId(GUEST_FENCE),
+                    VkObjectType::VK_OBJECT_TYPE_FENCE,
+                    HostHandle(FENCE),
+                    None,
+                )
+                .expect("a fresh id");
+        }
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+
+        let work = {
+            let fences = [VkFence(GUEST_FENCE)];
+            let mut args = Args::default();
+            args.device = VkDevice(GUEST_DEV);
+            args.waitAll = VkBool32(1);
+            args.timeout = u64::MAX;
+            args.plant_pFences(&fences);
+            let proto = crate::venus::cs::AllOfIt;
+            let mut buf = vec![0u8; vn_sizeof_vkWaitForFences_args(&proto, &args)];
+            let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+            vn_encode_vkWaitForFences_args(&mut enc, VkFlags(0), &args);
+            buf
+        };
+        guest_writes(&map, &work);
+        until("the ring thread to enter the driver", || ENTERED.load(Ordering::Acquire));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let out = std::thread::scope(|s| {
+            s.spawn(|| {
+                v.context_destroy(ctx_id());
+                let _ = tx.send(());
+            });
+            rx.recv_timeout(Duration::from_secs(3))
+        });
+        out.expect("the teardown waited out a wait the guest gave forever to");
+    }
 }

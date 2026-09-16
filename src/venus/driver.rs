@@ -559,7 +559,42 @@ impl DriverWait {
     }
 
     /// Make the call, with nothing of the renderer held.
-    pub fn run(&self) -> Answered {
+    ///
+    /// A timed wait is made in slices of [`DriverWait::SLICE`], with `keep_going` asked between
+    /// them, and `None` is a stop before the wait ended: the ring thread that was running it is
+    /// being stopped, and the batch it belonged to is never offered again. Without the slices a
+    /// `vkDestroyRingMESA`, or the context's own teardown, would join a thread inside a wait the
+    /// guest gave forever to. The slicing is not a clamp: `VK_TIMEOUT` comes back only once the
+    /// guest's whole timeout is spent, so the guest sees exactly the wait it asked for. An idle
+    /// wait has no timeout to slice and is waited out whole; the GPU bounds it, not the guest.
+    pub fn run(&self, keep_going: impl Fn() -> bool) -> Option<Answered> {
+        let timeout = match &self.kind {
+            WaitKind::Fences { timeout, .. } | WaitKind::Semaphores { timeout, .. } => *timeout,
+            WaitKind::DeviceIdle | WaitKind::QueueIdle(_) => return Some(Answered(self.call(0))),
+        };
+        let mut left = timeout;
+        loop {
+            let slice = left.min(DriverWait::SLICE);
+            let ret = self.call(slice);
+            if ret != VkResult::VK_TIMEOUT {
+                return Some(Answered(ret));
+            }
+            left -= slice;
+            if left == 0 {
+                return Some(Answered(VkResult::VK_TIMEOUT));
+            }
+            if !keep_going() {
+                return None;
+            }
+        }
+    }
+
+    /// How long one slice of a timed wait is, in nanoseconds: long enough that a wait the GPU
+    /// finishes in a frame costs a handful of calls, short enough that a stop lands promptly.
+    pub const SLICE: u64 = 10_000_000;
+
+    /// One call into the driver, with `timeout` where the call takes one.
+    fn call(&self, timeout: u64) -> VkResult {
         let device = self.device.handle;
         let fns: &DeviceFns = &self.device;
         // SAFETY: `device` is live for as long as this value holds its share of `LiveDevice`.
@@ -567,18 +602,18 @@ impl DriverWait {
         // are held against destruction by the context's in-flight record until that batch is
         // offered again with the answer; the arrays are this value's own vectors, alive for the
         // call, and each count is its vector's length.
-        let ret = unsafe {
+        unsafe {
             match &self.kind {
-                WaitKind::Fences { fences, wait_all, timeout } => (fns.vkWaitForFences())(
+                WaitKind::Fences { fences, wait_all, .. } => (fns.vkWaitForFences())(
                     device,
                     fences.len() as u32,
                     fences.as_ptr(),
                     *wait_all,
-                    *timeout,
+                    timeout,
                 ),
-                WaitKind::Semaphores { semaphores, values, flags, timeout } => {
+                WaitKind::Semaphores { semaphores, values, flags, .. } => {
                     let Some(f) = fns.try_vkWaitSemaphores() else {
-                        return Answered(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT);
+                        return VkResult::VK_ERROR_EXTENSION_NOT_PRESENT;
                     };
                     let info = VkSemaphoreWaitInfo {
                         sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
@@ -588,13 +623,12 @@ impl DriverWait {
                         pSemaphores: semaphores.as_ptr(),
                         pValues: values.as_ptr(),
                     };
-                    f(device, &info, *timeout)
+                    f(device, &info, timeout)
                 }
                 WaitKind::DeviceIdle => (fns.vkDeviceWaitIdle())(device),
                 WaitKind::QueueIdle(queue) => (fns.vkQueueWaitIdle())(*queue),
             }
-        };
-        Answered(ret)
+        }
     }
 }
 

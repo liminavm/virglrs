@@ -6375,9 +6375,13 @@ mod tests {
         let Some(Wait::Driver(wait)) = h.wait.take() else {
             panic!("an idle wait suspends the batch");
         };
-        assert_eq!(wait.run().result(), SENTINEL, "the driver's answer, not one of ours");
+        assert_eq!(
+            wait.run(|| true).expect("nothing stops this wait").result(),
+            SENTINEL,
+            "the driver's answer, not one of ours"
+        );
         SAW.with_borrow(|s| assert_eq!(s.waited, [DEVICE]));
-        h.answer = Some(wait.run());
+        h.answer = Some(wait.run(|| true).expect("nothing stops this wait"));
         SAW.with_borrow_mut(|s| s.waited.clear());
         h.vkDeviceWaitIdle(&mut args);
         assert_eq!(args.ret, SENTINEL, "the resumed command reports what the wait answered");
@@ -6497,7 +6501,7 @@ mod tests {
         assert!(t.1.copy_out(WINDOW, &mut got));
         assert_eq!(got, [0; 8], "no answer reaches the guest before there is one");
 
-        let answered = wait.run();
+        let answered = wait.run(|| true).expect("nothing stops this wait");
         CALLS.with_borrow(|c| {
             assert_eq!(*c, [DEVICE], "the driver was called, with the host handle not the guest id")
         });
@@ -16013,7 +16017,9 @@ mod tests {
         args.device = VkDevice(DEVICE);
         args.plant_pFences(&fences[..2]);
         args.waitAll = VkBool32(1);
-        args.timeout = u64::MAX;
+        // Two slices' worth, against a driver that never signals: the wait is made in slices
+        // and reports a timeout only once the guest's whole timeout has been spent on them.
+        args.timeout = 2 * DriverWait::SLICE;
         h.vkWaitForFences(&mut args);
         // Probed with no timeout first; the driver said not yet, so the batch suspends on a wait
         // that carries the guest's own timeout, and only running that wait spends it.
@@ -16022,11 +16028,17 @@ mod tests {
             panic!("a wait the driver could not answer at once suspends the batch");
         };
         assert_eq!(
-            wait.run().result(),
+            wait.run(|| true).expect("nothing stops this wait").result(),
             VkResult::VK_TIMEOUT,
             "a timeout is an answer, not a failure"
         );
-        SAW.with_borrow(|s| assert_eq!(s.waited, [(2, 1, 0), (2, 1, u64::MAX)]));
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                s.waited,
+                [(2, 1, 0), (2, 1, DriverWait::SLICE), (2, 1, DriverWait::SLICE)],
+                "the guest's timeout, spent whole and in slices"
+            )
+        });
 
         // The import that stands in for a signal the host never saw.
         let info =
@@ -16356,8 +16368,10 @@ mod tests {
             assert_eq!(consumed, 0, "the wait command itself is not consumed");
             SAW.with_borrow(|s| assert_eq!(s.waits, [0], "only the probe ran under the lock"));
 
-            let answered = wait.run();
-            SAW.with_borrow(|s| assert_eq!(s.waits, [0, u64::MAX], "the guest's timeout, whole"));
+            let answered = wait.run(|| true).expect("nothing stops this wait");
+            SAW.with_borrow(|s| {
+                assert_eq!(s.waits, [0, DriverWait::SLICE], "made in slices, and one sufficed")
+            });
             assert!(ctx.resume(&batch[consumed..], answered, &todo, &g, &NO_RESOURCES).ran());
             SAW.with_borrow(|s| assert_eq!(s.waits.len(), 2, "the resumed command asks nothing"));
         }
@@ -16380,7 +16394,7 @@ mod tests {
             else {
                 panic!("the ring's wait suspends");
             };
-            let answered = wait.run();
+            let answered = wait.run(|| true).expect("nothing stops this wait");
             assert!(on_ring(&mut ctx, &batch[consumed..], Some(answered), &todo, &g, &t).ran());
             assert!(ctx.submit(&wire_destroy_fence(GUEST_FENCE_A), &todo, &g, &t).ran());
             SAW.with_borrow(|s| {
@@ -16461,7 +16475,7 @@ mod tests {
             else {
                 panic!("the ring's wait suspends");
             };
-            let answered = wait.run();
+            let answered = wait.run(|| true).expect("nothing stops this wait");
             let _ = ctx.resume(&wire_destroy_fence(GUEST_FENCE_B), answered, &todo, &g, &t);
         }
     }

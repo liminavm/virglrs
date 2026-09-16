@@ -607,7 +607,12 @@ fn run(
                 pending.drain(..consumed);
                 wait_ring.changed();
                 assert!(answer.is_none(), "a driver wait suspended a batch already answered");
-                answer = Some(wait.run());
+                // Stopped mid-wait is stopped: the batch is never offered again, and the
+                // context's record of what the wait was reading goes with the ring.
+                let Some(answered) = wait.run(|| started.load(Ordering::Acquire)) else {
+                    break;
+                };
+                answer = Some(answered);
                 last_work = Instant::now();
                 iter = 0;
             }
