@@ -46,6 +46,7 @@ generator_for() {
         blit.bin)    echo "harness/replay/make-blit-corpus.py" ;;
         sampled.bin) echo "harness/replay/make-sampled-corpus.py" ;;
         surface.bin) echo "harness/replay/make-surface-corpus.py" ;;
+        teardown.bin) echo "harness/replay/make-teardown-corpus.py" ;;
         *)           echo "" ;;
     esac
 }

@@ -34,6 +34,12 @@ size = 67568
 generated = "harness/replay/make-surface-corpus.py"
 
 [[corpus]]
+name = "teardown.bin"
+sha256 = "3200520712308f35c5ce464bcc62f81e07440be28a192fb1aad06f53f53845ea"
+size = 104616
+generated = "harness/replay/make-teardown-corpus.py"
+
+[[corpus]]
 name = "vrend-av1.bin"
 sha256 = "6217130591b58a688f25fe6c2ab9373d1a845f5e39d1a2d57fda2c230a4a574a"
 size = 296629848
