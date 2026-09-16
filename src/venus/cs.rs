@@ -365,9 +365,20 @@ impl<'a> Decoder<'a> {
     }
 
     /// Allocate zeroed storage for one `T`, or `None` (poisoning) if the arena is exhausted.
+    ///
+    /// Exhausted means either bound: the cap the guest is held to, or what the host allocator
+    /// will actually give. The second is the guest's problem too -- an implausible size that
+    /// clears the cap is still the guest's size -- so it poisons the stream where the arena's
+    /// infallible allocators would abort the process.
     pub fn alloc_temp<T: Default>(&self) -> Option<&'a mut T> {
         self.charge(size_of::<T>())?;
-        Some(self.temp.alloc(T::default()))
+        match self.temp.try_alloc(T::default()) {
+            Ok(p) => Some(p),
+            Err(_) => {
+                self.set_fatal();
+                None
+            }
+        }
     }
 
     /// Allocate a zeroed array of `count` `T`, or `None` (poisoning) if the size is implausible or
@@ -385,7 +396,13 @@ impl<'a> Decoder<'a> {
             // enough that this is the common path, not a corner.
             return Some(&mut []);
         }
-        Some(self.temp.alloc_slice_fill_with(count, |_| T::default()))
+        match self.temp.try_alloc_slice_fill_with(count, |_| T::default()) {
+            Ok(a) => Some(a),
+            Err(_) => {
+                self.set_fatal();
+                None
+            }
+        }
     }
 
     fn charge(&self, bytes: usize) -> Option<()> {
@@ -897,6 +914,26 @@ mod tests {
         let empty = dec.alloc_temp_array::<u64>(0).unwrap();
         assert!(empty.is_empty());
         assert_eq!(empty.as_ptr().align_offset(align_of::<u64>()), 0);
+    }
+
+    /// The arena's cap bounds what a guest may ask for; it is not a promise the host can pay it.
+    /// A request the allocator refuses is the guest's problem, and it costs the stream, never the
+    /// process.
+    #[test]
+    fn an_allocation_the_host_refuses_poisons_instead_of_aborting() {
+        let temp = Bump::new();
+        temp.set_allocation_limit(Some(64));
+        let hard = AtomicBool::new(false);
+        let dec = Decoder::new(&[], &temp, &IdentityObjects, &hard);
+        assert!(dec.alloc_temp_array::<u64>(1024).is_none());
+        assert!(dec.hard_fatal());
+
+        let temp = Bump::new();
+        temp.set_allocation_limit(Some(0));
+        let hard = AtomicBool::new(false);
+        let dec = Decoder::new(&[], &temp, &IdentityObjects, &hard);
+        assert!(dec.alloc_temp::<u64>().is_none());
+        assert!(dec.hard_fatal());
     }
 
     #[test]

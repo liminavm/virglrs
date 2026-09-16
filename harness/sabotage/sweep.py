@@ -1163,6 +1163,19 @@ SABOTAGES = [
         'a_clip_or_cull_count_past_the_hardware_limit_is_refused',
     ),
     (
+        'an array the host allocator refuses aborts the process instead of poisoning the stream',
+        'src/venus/cs.rs',
+        """        match self.temp.try_alloc_slice_fill_with(count, |_| T::default()) {
+            Ok(a) => Some(a),
+            Err(_) => {
+                self.set_fatal();
+                None
+            }
+        }""",
+        """        Some(self.temp.alloc_slice_fill_with(count, |_| T::default()))""",
+        'an_allocation_the_host_refuses_poisons_instead_of_aborting',
+    ),
+    (
         'the sample-count ceiling is ignored and the host maximum advertised anyway',
         'virglrs/src/vrend/caps.rs',
         'Some(c) if max_samples > c => {',
