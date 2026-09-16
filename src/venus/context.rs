@@ -20,7 +20,8 @@ use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
 use super::driver::{
-    self, Driver, ExportError, Exported, MemoryError, NoSubmit2, NoSyncFd, NotATimeline,
+    self, Answered, Driver, DriverWait, ExportError, Exported, MemoryError, NoSubmit2, NoSyncFd,
+    NotATimeline,
 };
 use super::journal::{self, Journal, Owner, Seq};
 use super::monitor::Monitor;
@@ -208,6 +209,10 @@ pub struct Context {
     /// counts, and a feed that resumed from the wrong one would replay a command twice. Popping
     /// from the front makes "what is left" and "where we are" the same fact.
     restoring: VecDeque<journal::Parsed>,
+    /// The driver waits this context's streams have suspended on and not yet resumed, by stream.
+    /// See [`InFlight`]. A stream has at most one, because a suspended stream runs nothing else
+    /// until it is offered its batch again.
+    in_flight: BTreeMap<Waiter, InFlight>,
 }
 
 /// The object table, answering the journal's one question about it.
@@ -244,11 +249,13 @@ const _: () = {
 
 /// What a suspended batch is waiting for.
 ///
-/// The two are never interchangeable and never both reachable from one stream: a virtqueue wait is
-/// legal only on a ring's own stream and a ring wait only on the context's, and the handlers
-/// refuse the other way round. They share a type because they share a mechanism -- a batch that
-/// stops partway through and is offered again -- not because a caller ever has to tell them apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The transport waits are never interchangeable and never both reachable from one stream: a
+/// virtqueue wait is legal only on a ring's own stream and a ring wait only on the context's, and
+/// the handlers refuse the other way round. A driver wait is legal on either. They share a type
+/// because they share a mechanism -- a batch that stops partway through and is offered again --
+/// and differ in what the caller does meanwhile: the transport waits are slept on, the driver
+/// wait is run, and its answer comes back with the remainder of the batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Wait {
     /// `vkWaitVirtqueueSeqnoMESA`: the ring this batch arrived on must sleep until the context
     /// publishes this seqno for it. Strictly increasing and never wrapped -- it is a guest-side
@@ -257,6 +264,34 @@ pub enum Wait {
     /// `vkWaitRingSeqnoMESA`: the caller must sleep until `ring`'s head reaches `seqno`. A byte
     /// position in that ring's buffer, so every comparison against it is wrap-aware.
     Ring { ring: RingId, seqno: u32 },
+    /// A blocking driver call -- `vkWaitForFences`, `vkWaitSemaphores`, `vkDeviceWaitIdle`,
+    /// `vkQueueWaitIdle` -- whose answer was not ready when the batch reached it. The caller runs
+    /// it with nothing held and resumes with what it answered: [`Context::resume`] on the
+    /// context's stream, the ring thread on its own.
+    Driver(DriverWait),
+}
+
+/// Who a batch that suspended on a driver wait was: the context's own stream, or one ring's.
+///
+/// The key under which the wait's handles are recorded as in flight, and the thing whose death
+/// releases them -- a ring that is destroyed mid-wait never offers its batch again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Waiter {
+    Context,
+    Ring(RingId),
+}
+
+/// The handles one suspended driver wait is reading, while nothing of the renderer is held.
+///
+/// This record is what makes releasing the context lock during the call legal. Vulkan forbids
+/// destroying a fence, a semaphore or a device that another thread is waiting on, and with the
+/// lock held that could not happen; without it the context's stream can reach the destroy while
+/// the wait is inside the driver. So a destroy that names a handle here is refused and poisons:
+/// the guest broke Vulkan's own rule, and the alternative is undefined behaviour in the driver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InFlight {
+    device: VkDevice,
+    handles: Vec<u64>,
 }
 
 /// How a submission ended.
@@ -264,7 +299,7 @@ pub enum Wait {
 /// `Waiting` is the reason this is not a `bool`. A batch can stop partway through, and the caller
 /// has to know both that it must wait and how much of its buffer has already run -- passing the
 /// remainder back in is the resume. Losing either half loses commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "a suspended batch that is not resumed loses every command after the wait"]
 pub enum Submitted {
     /// The whole batch ran.
@@ -357,6 +392,7 @@ impl Context {
             monitor: None,
             journal: Journal::new(),
             restoring: VecDeque::new(),
+            in_flight: BTreeMap::new(),
         }
     }
 
@@ -543,10 +579,35 @@ impl Context {
         global: &Global,
         resources: &dyn ShmResources,
     ) -> Submitted {
+        self.submit_answering(buf, None, todo, global, resources)
+    }
+
+    /// Offer the remainder of a submission that suspended on a driver wait, with what the wait
+    /// answered. `buf` starts at the wait command, which is decoded again and answers with
+    /// `answered` instead of calling the driver a second time.
+    pub fn resume(
+        &mut self,
+        buf: &[u8],
+        answered: Answered,
+        todo: &Unimplemented,
+        global: &Global,
+        resources: &dyn ShmResources,
+    ) -> Submitted {
+        self.submit_answering(buf, Some(answered), todo, global, resources)
+    }
+
+    fn submit_answering(
+        &mut self,
+        buf: &[u8],
+        answer: Option<Answered>,
+        todo: &Unimplemented,
+        global: &Global,
+        resources: &dyn ShmResources,
+    ) -> Submitted {
         // The context lends its own reply slot for the length of the batch. Taking it out and
         // putting it back is what keeps one owner: nothing else can reach it while it is lent.
         let mut reply = self.reply.take();
-        let out = self.submit_on(None, &mut reply, buf, todo, global, resources);
+        let out = self.submit_on(None, &mut reply, buf, answer, todo, global, resources);
         self.reply = reply;
         out
     }
@@ -559,11 +620,13 @@ impl Context {
     /// one in the body it owns. Lending rather than looking it up is what lets the same loop serve
     /// all three without knowing where the stream lives -- and it means there is no lookup here
     /// that a destroyed ring could make wrong.
+    #[allow(clippy::too_many_arguments)]
     fn submit_on(
         &mut self,
         on: Option<RingId>,
         reply: &mut Option<ReplyStream>,
         buf: &[u8],
+        answer: Option<Answered>,
         todo: &Unimplemented,
         global: &Global,
         resources: &dyn ShmResources,
@@ -593,11 +656,21 @@ impl Context {
             current_ring: on,
             reply,
             replaying: replay,
+            nested: false,
+            answer,
+            in_flight: std::mem::take(&mut self.in_flight),
             note: None,
             journal: &mut self.journal,
         };
 
         let suspended = run_batch(&mut h, buf, fatal, &mut counts, 0);
+        // An answer is for the wait command a resumed batch begins with, and that command takes
+        // it. One still here after a batch that ran is an answer nothing asked for: the caller
+        // resumed a batch that had not suspended, or from the wrong position. That is host code
+        // -- the ring thread re-offers the bytes it kept, the VMM the buffer it was handed --
+        // so it is asserted, not rejected.
+        let unclaimed = h.answer.take();
+        self.in_flight = std::mem::take(&mut h.in_flight);
 
         self.dispatched += counts.dispatched;
         self.unhandled += counts.unhandled;
@@ -608,6 +681,11 @@ impl Context {
         if self.fatal.load(Ordering::Acquire) {
             return Submitted::Poisoned;
         }
+        assert!(
+            unclaimed.is_none(),
+            "ctx {}: a batch was resumed with an answer, and did not begin with the wait it answers",
+            self.id().get()
+        );
         // Here and nowhere inside the loop: measuring what is still live reads the object table,
         // and a handler may be holding it. The batch is over, so nothing is.
         self.collect_journal();
@@ -673,7 +751,7 @@ impl Context {
             Some(RingSlot::Idle(r)) => r.reply.take(),
             _ => None,
         };
-        let out = self.submit_on(Some(ring), &mut reply, buf, todo, global, resources);
+        let out = self.submit_on(Some(ring), &mut reply, buf, None, todo, global, resources);
         if let Some(RingSlot::Idle(r)) = self.rings.get_mut(&ring) {
             r.reply = reply;
         }
@@ -700,16 +778,21 @@ impl Context {
     /// The counterpart of [`Context::submit_ring`] for a running ring: same loop, same context,
     /// but the reply stream is lent by the caller rather than found here -- because the caller is
     /// the thread that owns the ring body, and no entry in `rings` holds it while it runs.
+    ///
+    /// `answer` is what a driver wait this batch suspended on answered, when the thread is
+    /// offering the batch again; see [`Context::resume`].
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_ring(
         &mut self,
         ring: RingId,
         reply: &mut Option<ReplyStream>,
         buf: &[u8],
+        answer: Option<Answered>,
         todo: &Unimplemented,
         global: &Global,
         resources: &dyn ShmResources,
     ) -> Submitted {
-        self.submit_on(Some(ring), reply, buf, todo, global, resources)
+        self.submit_on(Some(ring), reply, buf, answer, todo, global, resources)
     }
 
     /// Start every ring that is not running yet, and say how many that was.
@@ -757,6 +840,9 @@ impl Context {
                 drop(t.stop());
             }
         }
+        // A stopped ring never offers its batch again, so whatever it was waiting on is no
+        // longer being read.
+        self.in_flight.retain(|w, _| *w == Waiter::Context);
     }
 
     /// The driver state, for the teardown that has to destroy what it holds.
@@ -1600,7 +1686,9 @@ fn run_streams(
             "a copy the bounds check above admitted did not fit",
         );
 
+        h.nested = true;
         let suspended = run_batch(h, &bytes, fatal, counts, depth + 1);
+        h.nested = false;
         assert!(suspended.is_none(), "a nested batch suspended, which its own depth guard refuses",);
         if fatal.load(Ordering::Acquire) {
             return;
@@ -1722,6 +1810,19 @@ pub struct Handlers<'a> {
     /// A created ring reads it: replay restores head and status words the host would otherwise
     /// insist on owning, and resumes the read cursor from them.
     replaying: bool,
+    /// Whether this batch is a command stream being executed from inside another.
+    ///
+    /// A driver wait reads it: a nested batch has nowhere to suspend to -- its position names a
+    /// byte of a copy -- so the wait blocks in the handler there, as it does under replay, where
+    /// there is no thread to offer the batch again.
+    nested: bool,
+    /// What the driver wait this batch suspended on answered, when the batch is being offered
+    /// again. Taken by the wait command the batch begins with, which is the same command that
+    /// suspended it; the loop asserts that nothing else was offered one.
+    answer: Option<Answered>,
+    /// The context's record of driver waits in flight, keyed by stream, lent to the batch and
+    /// taken back after it. See [`InFlight`].
+    in_flight: BTreeMap<Waiter, InFlight>,
     /// What the recorder could not work out for itself, left by the handler that knows.
     ///
     /// A message, like `wait` and `execute`, and for a narrower version of the same reason: the
@@ -1988,6 +2089,53 @@ impl Handlers<'_> {
 
     fn no_recorder(&mut self) {
         self.reject = Some("recorded into a command buffer with no device behind it");
+    }
+
+    /// Which stream this batch is, as the in-flight record keys it.
+    fn waiter(&self) -> Waiter {
+        self.current_ring.map_or(Waiter::Context, Waiter::Ring)
+    }
+
+    /// Whether a driver wait has to block in the handler because the batch cannot suspend: a
+    /// replay has no thread to offer it again, and a nested stream has no position to resume from.
+    fn blocks_inline(&self) -> bool {
+        self.replaying || self.nested
+    }
+
+    /// The answer this batch was resumed with, if it was, and the end of the wait it answers:
+    /// the handles it read are no longer in flight.
+    fn answered(&mut self) -> Option<VkResult> {
+        let answered = self.answer.take()?;
+        self.in_flight.remove(&self.waiter());
+        Some(answered.result())
+    }
+
+    /// Suspend the batch on a driver wait, recording what it reads so that nothing destroys it
+    /// while the context lock is not held.
+    fn suspend_on(&mut self, wait: DriverWait) {
+        let record = InFlight { device: wait.device(), handles: wait.handles() };
+        let stale = self.in_flight.insert(self.waiter(), record);
+        assert!(stale.is_none(), "a stream suspended on a driver wait while one was in flight");
+        self.wait = Some(Wait::Driver(wait));
+    }
+
+    /// Whether a driver wait in flight on any of this context's streams is reading `handle`.
+    fn waited_on(&self, handle: u64) -> bool {
+        self.in_flight.values().any(|w| w.handles.contains(&handle))
+    }
+
+    /// Whether a driver wait in flight on any of this context's streams is on `device`.
+    fn waited_device(&self, device: VkDevice) -> bool {
+        self.in_flight.values().any(|w| w.device == device)
+    }
+
+    /// The three refusals a timeline command has, said once.
+    fn refuse_timeline(&mut self, e: NotATimeline) {
+        self.reject = Some(match e {
+            NotATimeline::Binary => "waited on a binary semaphore",
+            NotATimeline::Unrecorded => "named an unrecorded semaphore",
+            NotATimeline::Malformed => "waited on semaphores it did not send",
+        });
     }
 
     /// The verdict on a sync-fd command. Neither carries a result the guest can read, so the ring
@@ -2288,6 +2436,12 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkDestroyDevice(&mut self, args: &mut vn_command_vkDestroyDevice<'_>) {
+        // Any wait on the device, not only one reading a handle: the cascade below destroys every
+        // child the guest left, which is where a fence still being waited on would go.
+        if self.waited_device(args.device) {
+            self.reject = Some("destroyed a device one of its streams is waiting on");
+            return;
+        }
         // Taken out before the driver call, because destroying them afterwards would be destroying
         // them on a device that no longer exists. Nothing else names these: the guest sent no
         // command for any of them, which is why the table hands them back rather than dropping
@@ -2347,6 +2501,10 @@ impl Commands for Handlers<'_> {
     /// a record of whether a submit is outstanding on it, and a record that outlived its fence
     /// would answer for whatever handle Vulkan hands out next.
     fn vkDestroyFence(&mut self, args: &mut vn_command_vkDestroyFence<'_>) {
+        if self.waited_on(args.fence.0) {
+            self.reject = Some("destroyed a fence one of its streams is waiting on");
+            return;
+        }
         self.driver.destroy_object(
             args.device,
             |d| d.vkDestroyFence(),
@@ -2369,6 +2527,10 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkDestroySemaphore(&mut self, args: &mut vn_command_vkDestroySemaphore<'_>) {
+        if self.waited_on(args.semaphore.0) {
+            self.reject = Some("destroyed a semaphore one of its streams is waiting on");
+            return;
+        }
         self.driver.destroy_object(
             args.device,
             |d| d.vkDestroySemaphore(),
@@ -3003,6 +3165,10 @@ impl Commands for Handlers<'_> {
                 self.note = Some(Note::RingGone(id));
             }
         }
+        // A ring that is gone never offers its batch again, so a driver wait it suspended on is
+        // over as far as the handles are concerned: its thread has been joined, and the call
+        // returned before the join could.
+        self.in_flight.remove(&Waiter::Ring(id));
     }
 
     /// The guest rang a ring's doorbell.
@@ -4913,27 +5079,81 @@ impl Commands for Handlers<'_> {
         args.ret = self.driver.reset_fences(args.device, fences);
     }
 
-    /// Blocks the caller for as long as the guest asked, up to forever. That is the guest's own
-    /// thread being spent on the guest's own wait; answering early would be answering wrongly.
+    // ------------------------------------------------------------------- the driver waits
+    //
+    // Four commands block on the GPU, and none of them blocks in here. A handler runs with the
+    // context locked and the resource table read-locked; a wait that slept in it would hold both
+    // for as long as the GPU took, against every other ring of this context and every VMM
+    // resource write -- and behind that writer, every other context's ring. So a wait whose
+    // answer is not ready suspends the batch with a `DriverWait`, which whoever owns the stream
+    // runs with nothing held, and the batch is offered again with the answer. The command is
+    // decoded a second time on that pass and takes the answer instead of asking the driver.
+    //
+    // Mesa's venus sends `vkWaitForFences` and `vkWaitSemaphores` with an infinite timeout on the
+    // ring once its guest-side feedback slot reports the signal, so the common case is a wait
+    // that is over before it is asked: the probe with a zero timeout answers it without
+    // suspending, and the suspension is only paid when the GPU is genuinely still busy.
+    //
+    // Two places cannot suspend and block instead, as before: a replayed batch, which has no
+    // thread to offer it again, and a batch being executed from inside another, whose position
+    // names a byte of a copy. Neither is a path a live guest's wait arrives on.
+
     fn vkWaitForFences(&mut self, args: &mut vn_command_vkWaitForFences<'_>) {
+        if let Some(ret) = self.answered() {
+            args.ret = ret;
+            return;
+        }
         let fences = args.pFences();
-        args.ret = self.driver.wait_for_fences(args.device, fences, args.waitAll, args.timeout);
+        let probe = self.driver.wait_for_fences(args.device, fences, args.waitAll, 0);
+        if probe != VkResult::VK_TIMEOUT || args.timeout == 0 {
+            args.ret = probe;
+            return;
+        }
+        if self.blocks_inline() {
+            args.ret = self.driver.wait_for_fences(args.device, fences, args.waitAll, args.timeout);
+            return;
+        }
+        match self.driver.fence_wait(args.device, fences, args.waitAll, args.timeout) {
+            Some(wait) => self.suspend_on(wait),
+            // The probe just found the device; only a device that is not there answers `None`.
+            None => args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED,
+        }
     }
 
-    /// Wait for everything on a device, or on one queue, to finish.
-    ///
-    /// Blocking, like `vkWaitForFences` above: the guest's own thread is what is being spent, and
-    /// answering before the driver is idle would be answering wrongly.
+    /// Wait for everything on a device, or on one queue, to finish. Neither has a timeout, so
+    /// there is nothing to probe with: both suspend outright.
     fn vkDeviceWaitIdle(&mut self, args: &mut vn_command_vkDeviceWaitIdle<'_>) {
-        args.ret = self.driver.device_op(args.device, |d| d.vkDeviceWaitIdle());
+        if let Some(ret) = self.answered() {
+            args.ret = ret;
+            return;
+        }
+        if self.blocks_inline() {
+            args.ret = self.driver.device_op(args.device, |d| d.vkDeviceWaitIdle());
+            return;
+        }
+        match self.driver.device_idle_wait(args.device) {
+            Some(wait) => self.suspend_on(wait),
+            None => args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED,
+        }
     }
 
     fn vkQueueWaitIdle(&mut self, args: &mut vn_command_vkQueueWaitIdle<'_>) {
-        let Some(ret) = self.driver.queue_op(args.queue, |d| d.vkQueueWaitIdle()) else {
-            self.reject = Some("waited on a queue with no device behind it");
+        if let Some(ret) = self.answered() {
+            args.ret = ret;
             return;
-        };
-        args.ret = ret;
+        }
+        if self.blocks_inline() {
+            let Some(ret) = self.driver.queue_op(args.queue, |d| d.vkQueueWaitIdle()) else {
+                self.reject = Some("waited on a queue with no device behind it");
+                return;
+            };
+            args.ret = ret;
+            return;
+        }
+        match self.driver.queue_idle_wait(args.queue) {
+            Some(wait) => self.suspend_on(wait),
+            None => self.reject = Some("waited on a queue with no device behind it"),
+        }
     }
 
     /// The event and fence states, and the two commands that set an event from the host side.
@@ -5012,17 +5232,33 @@ impl Commands for Handlers<'_> {
     /// and it is the guest's thread being spent. The timeout crosses untouched -- see
     /// [`Driver::dev_op_info_timeout`] for why shortening it would be worse than blocking.
     fn vkWaitSemaphores(&mut self, args: &mut vn_command_vkWaitSemaphores<'_>) {
+        if let Some(ret) = self.answered() {
+            args.ret = ret;
+            return;
+        }
         let Some(info) = args.pWaitInfo else {
             self.reject = Some("waited on semaphores it did not name");
             return;
         };
-        match self.driver.wait_semaphores(args.device, info, args.timeout) {
-            Err(NotATimeline::Binary) => self.reject = Some("waited on a binary semaphore"),
-            Err(NotATimeline::Unrecorded) => self.reject = Some("named an unrecorded semaphore"),
-            Err(NotATimeline::Malformed) => {
-                self.reject = Some("waited on semaphores it did not send")
+        let probe = match self.driver.wait_semaphores(args.device, info, 0) {
+            Err(e) => return self.refuse_timeline(e),
+            Ok(ret) => ret,
+        };
+        if probe != VkResult::VK_TIMEOUT || args.timeout == 0 {
+            args.ret = probe;
+            return;
+        }
+        if self.blocks_inline() {
+            match self.driver.wait_semaphores(args.device, info, args.timeout) {
+                Err(e) => self.refuse_timeline(e),
+                Ok(ret) => args.ret = ret,
             }
-            Ok(ret) => args.ret = ret,
+            return;
+        }
+        match self.driver.semaphore_wait(args.device, info, args.timeout) {
+            Err(e) => self.refuse_timeline(e),
+            Ok(Some(wait)) => self.suspend_on(wait),
+            Ok(None) => args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED,
         }
     }
 
@@ -6121,6 +6357,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -6128,10 +6367,21 @@ mod tests {
         };
         let device = VkDevice(DEVICE);
 
+        // An idle wait has no timeout to probe with, so it suspends outright; the driver is asked
+        // by whoever runs the wait, and its answer is what the resumed command reports.
         let mut args = vn_command_vkDeviceWaitIdle { device, ..Default::default() };
         h.vkDeviceWaitIdle(&mut args);
-        assert_eq!(args.ret, SENTINEL, "the driver's answer, not one of ours");
+        SAW.with_borrow(|s| assert!(s.waited.is_empty(), "nothing was asked under the lock"));
+        let Some(Wait::Driver(wait)) = h.wait.take() else {
+            panic!("an idle wait suspends the batch");
+        };
+        assert_eq!(wait.run().result(), SENTINEL, "the driver's answer, not one of ours");
         SAW.with_borrow(|s| assert_eq!(s.waited, [DEVICE]));
+        h.answer = Some(wait.run());
+        SAW.with_borrow_mut(|s| s.waited.clear());
+        h.vkDeviceWaitIdle(&mut args);
+        assert_eq!(args.ret, SENTINEL, "the resumed command reports what the wait answered");
+        SAW.with_borrow(|s| assert!(s.waited.is_empty(), "and asks the driver nothing again"));
 
         let mut args =
             vn_command_vkSetEvent { device, event: VkEvent(0x111), ..Default::default() };
@@ -6234,10 +6484,29 @@ mod tests {
             ty::vn_command_vkDeviceWaitIdle { device: VkDevice(GUEST_ID), ..Default::default() },
             GENERATE_REPLY
         ));
-        assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "a served command does not poison");
+        // The wait suspends the batch rather than blocking in it; the driver is asked by whoever
+        // runs the wait, with nothing held, and the answer comes back with the remainder.
+        let Submitted::Waiting { consumed, on: Wait::Driver(wait) } =
+            ctx.submit(&batch, &todo, &g, &t)
+        else {
+            panic!("a driver wait suspends the batch");
+        };
+        assert_eq!(consumed, wire_set_reply(&reply_at(WINDOW, 0x100)).len(), "up to the wait");
+        CALLS.with_borrow(|c| assert!(c.is_empty(), "the driver was not asked under the lock"));
+        let mut got = [0u8; 8];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(got, [0; 8], "no answer reaches the guest before there is one");
+
+        let answered = wait.run();
         CALLS.with_borrow(|c| {
             assert_eq!(*c, [DEVICE], "the driver was called, with the host handle not the guest id")
         });
+        assert!(
+            ctx.resume(&batch[consumed..], answered, &todo, &g, &t).ran(),
+            "resumed with the answer, the batch runs to its end"
+        );
+        CALLS
+            .with_borrow(|c| assert_eq!(c.len(), 1, "the resumed command asks the driver nothing"));
 
         let mut got = [0u8; 8];
         assert!(t.1.copy_out(WINDOW, &mut got));
@@ -6478,9 +6747,10 @@ mod tests {
                     flags: 0x1,
                     semaphores: vec![HOST_SEM_A, HOST_SEM_B],
                     values: vec![0x77, 0x99],
-                    timeout: u64::MAX,
+                    timeout: 0,
                 }],
-                "host handles in order, each still against its own value, and the timeout whole"
+                "host handles in order, each still against its own value; the driver answered \
+                 the zero-timeout probe, so the guest's timeout was never spent"
             );
             assert_eq!(
                 s.signalled,
@@ -7405,6 +7675,9 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
+                    nested: false,
+                    answer: None,
+                    in_flight: BTreeMap::new(),
                     current_ring: None,
                     reply: &mut ctx_reply,
                     note: None,
@@ -7475,6 +7748,9 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
+                    nested: false,
+                    answer: None,
+                    in_flight: BTreeMap::new(),
                     current_ring: None,
                     reply: &mut ctx_reply,
                     note: None,
@@ -7582,6 +7858,9 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
+                    nested: false,
+                    answer: None,
+                    in_flight: BTreeMap::new(),
                     current_ring: None,
                     reply: &mut ctx_reply,
                     note: None,
@@ -7682,6 +7961,9 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
+                    nested: false,
+                    answer: None,
+                    in_flight: BTreeMap::new(),
                     current_ring: None,
                     reply: &mut ctx_reply,
                     note: None,
@@ -7804,6 +8086,9 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
+                    nested: false,
+                    answer: None,
+                    in_flight: BTreeMap::new(),
                     current_ring: None,
                     reply: &mut ctx_reply,
                     note: None,
@@ -8121,6 +8406,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -8240,6 +8528,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -8876,6 +9167,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -8933,6 +9227,9 @@ mod tests {
                 wait: None,
                 execute: None,
                 replaying: false,
+                nested: false,
+                answer: None,
+                in_flight: BTreeMap::new(),
                 current_ring: None,
                 reply: &mut ctx_reply,
                 note: None,
@@ -8979,6 +9276,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9021,6 +9321,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9096,6 +9399,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9145,6 +9451,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9251,6 +9560,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9324,6 +9636,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9363,6 +9678,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9404,6 +9722,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9605,6 +9926,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9696,6 +10020,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9803,6 +10130,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9938,6 +10268,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10062,6 +10395,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10140,6 +10476,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10192,6 +10531,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10251,6 +10593,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10285,6 +10630,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10375,6 +10723,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10416,6 +10767,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10561,6 +10915,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10638,6 +10995,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10673,6 +11033,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10732,6 +11095,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10781,6 +11147,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10814,6 +11183,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10990,6 +11362,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11074,6 +11449,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11214,6 +11592,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11391,6 +11772,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11553,6 +11937,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11703,6 +12090,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11907,6 +12297,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12052,6 +12445,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12140,6 +12536,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12206,6 +12605,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12400,6 +12802,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12511,6 +12916,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12597,6 +13005,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12784,6 +13195,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13008,6 +13422,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13207,6 +13624,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13305,6 +13725,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13476,6 +13899,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13624,6 +14050,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13784,6 +14213,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13872,6 +14304,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -14033,6 +14468,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -14299,6 +14737,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -14447,6 +14888,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -14567,6 +15011,9 @@ mod tests {
                 wait: None,
                 execute: None,
                 replaying: false,
+                nested: false,
+                answer: None,
+                in_flight: BTreeMap::new(),
                 current_ring: None,
                 reply,
                 note: None,
@@ -14723,6 +15170,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -14865,6 +15315,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -15027,6 +15480,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -15206,6 +15662,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -15317,6 +15776,9 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
+                    nested: false,
+                    answer: None,
+                    in_flight: BTreeMap::new(),
                     current_ring: None,
                     reply: $reply,
                     note: None,
@@ -15516,6 +15978,9 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
+            nested: false,
+            answer: None,
+            in_flight: BTreeMap::new(),
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -15550,8 +16015,18 @@ mod tests {
         args.waitAll = VkBool32(1);
         args.timeout = u64::MAX;
         h.vkWaitForFences(&mut args);
-        assert_eq!(args.ret, VkResult::VK_TIMEOUT, "a timeout is an answer, not a failure");
-        SAW.with_borrow(|s| assert_eq!(s.waited, [(2, 1, u64::MAX)]));
+        // Probed with no timeout first; the driver said not yet, so the batch suspends on a wait
+        // that carries the guest's own timeout, and only running that wait spends it.
+        SAW.with_borrow(|s| assert_eq!(s.waited, [(2, 1, 0)], "the probe, and nothing more"));
+        let Some(Wait::Driver(wait)) = h.wait.take() else {
+            panic!("a wait the driver could not answer at once suspends the batch");
+        };
+        assert_eq!(
+            wait.run().result(),
+            VkResult::VK_TIMEOUT,
+            "a timeout is an answer, not a failure"
+        );
+        SAW.with_borrow(|s| assert_eq!(s.waited, [(2, 1, 0), (2, 1, u64::MAX)]));
 
         // The import that stands in for a signal the host never saw.
         let info =
@@ -15705,6 +16180,289 @@ mod tests {
         fn a_wire_too_short_to_have_flags_is_left_alone() {
             assert_eq!(strip_reply_flag(&[1, 2, 3]), vec![1, 2, 3]);
             assert_eq!(strip_reply_flag(&[]), Vec::<u8>::new());
+        }
+    }
+
+    /// The blocking driver calls, taken out of the batch that asked for them.
+    ///
+    /// What these pin is the contract between a suspended batch and the world around it: the
+    /// driver is not asked under the lock, the answer reaches the resumed command and nothing
+    /// else, and the handles a wait is reading stay alive until it is over -- however the stream
+    /// that asked fares meanwhile.
+    mod driver_waits {
+        use super::*;
+        use crate::venus::proto::serialize as ser;
+        use crate::venus::proto::types as ty;
+        use crate::venus::proto::types::{VkAllocationCallbacks, VkBool32, VkFence, VkObjectType};
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const GUEST_DEV: u64 = 0x5001;
+        const HOST_FENCE_A: u64 = 0xf1;
+        const GUEST_FENCE_A: u64 = 0x6001;
+        const HOST_FENCE_B: u64 = 0xf2;
+        const GUEST_FENCE_B: u64 = 0x6002;
+
+        #[derive(Default)]
+        struct Saw {
+            /// The timeout of every `vkWaitForFences` the driver was handed.
+            waits: Vec<u64>,
+            /// The fences the driver was told to destroy.
+            destroyed: Vec<u64>,
+            /// Whether the fences are signalled: a zero-timeout probe answers `VK_TIMEOUT`
+            /// until this is set. A real wait always returns, so a test never hangs.
+            ready: bool,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        unsafe extern "C" fn wait(
+            _d: VkDevice,
+            _count: u32,
+            _p: *const VkFence,
+            _all: VkBool32,
+            timeout: u64,
+        ) -> VkResult {
+            SAW.with_borrow_mut(|s| {
+                s.waits.push(timeout);
+                if timeout == 0 && !s.ready { VkResult::VK_TIMEOUT } else { VkResult::VK_SUCCESS }
+            })
+        }
+        unsafe extern "C" fn destroy_fence(
+            _d: VkDevice,
+            fence: VkFence,
+            _a: *const VkAllocationCallbacks,
+        ) {
+            SAW.with_borrow_mut(|s| s.destroyed.push(fence.0));
+        }
+        unsafe extern "C" fn idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        /// A context with a planted device and two fences the guest can name.
+        fn context() -> Context {
+            SAW.with_borrow_mut(|s| *s = Saw::default());
+            let mut ctx = Context::new(
+                ContextKey::for_test(ContextId::new(1).unwrap()),
+                &Budget::with_cap(None, false),
+                String::new(),
+            );
+            let mut fns = crate::vulkan::Device::default();
+            fns.plant_vkWaitForFences(wait);
+            fns.plant_vkDestroyFence(destroy_fence);
+            fns.plant_vkDeviceWaitIdle(idle);
+            fns.plant_vkDestroyDevice(destroy_device);
+            ctx.driver.plant_device(VkDevice(DEVICE), fns);
+            let mut table = ctx.objects.borrow_mut();
+            for (id, host, kind) in [
+                (GUEST_DEV, DEVICE, VkObjectType::VK_OBJECT_TYPE_DEVICE),
+                (GUEST_FENCE_A, HOST_FENCE_A, VkObjectType::VK_OBJECT_TYPE_FENCE),
+                (GUEST_FENCE_B, HOST_FENCE_B, VkObjectType::VK_OBJECT_TYPE_FENCE),
+            ] {
+                table.add(ObjectId(id), kind, HostHandle(host), None).expect("a fresh id");
+            }
+            drop(table);
+            ctx
+        }
+
+        fn wire_wait(fence: u64) -> Vec<u8> {
+            let fences = [VkFence(fence)];
+            let mut args = ty::vn_command_vkWaitForFences::default();
+            args.device = VkDevice(GUEST_DEV);
+            args.waitAll = VkBool32(1);
+            args.timeout = u64::MAX;
+            args.plant_pFences(&fences);
+            wire!(ser::vn_sizeof_vkWaitForFences_args, ser::vn_encode_vkWaitForFences_args, args, 0)
+        }
+        fn wire_destroy_fence(fence: u64) -> Vec<u8> {
+            wire!(
+                ser::vn_sizeof_vkDestroyFence_args,
+                ser::vn_encode_vkDestroyFence_args,
+                ty::vn_command_vkDestroyFence {
+                    device: VkDevice(GUEST_DEV),
+                    fence: VkFence(fence),
+                    ..Default::default()
+                },
+                0
+            )
+        }
+        fn wire_destroy_device() -> Vec<u8> {
+            wire!(
+                ser::vn_sizeof_vkDestroyDevice_args,
+                ser::vn_encode_vkDestroyDevice_args,
+                ty::vn_command_vkDestroyDevice {
+                    device: VkDevice(GUEST_DEV),
+                    ..Default::default()
+                },
+                0
+            )
+        }
+        fn wire_destroy_ring(ring: u64) -> Vec<u8> {
+            wire!(
+                ser::vn_sizeof_vkDestroyRingMESA_args,
+                ser::vn_encode_vkDestroyRingMESA_args,
+                ty::vn_command_vkDestroyRingMESA { ring, ..Default::default() },
+                0
+            )
+        }
+        fn ring() -> RingId {
+            RingId::new(7).unwrap()
+        }
+
+        /// Run `buf` as ring 7's stream, the way a ring thread would offer it.
+        fn on_ring(
+            ctx: &mut Context,
+            buf: &[u8],
+            answer: Option<Answered>,
+            todo: &Unimplemented,
+            g: &Global,
+            t: &dyn ShmResources,
+        ) -> Submitted {
+            let mut reply = None;
+            ctx.dispatch_ring(ring(), &mut reply, buf, answer, todo, g, t)
+        }
+
+        /// A fence the driver reports signalled at once costs one call and no suspension.
+        ///
+        /// The common case, by a wide margin: mesa sends its `vkWaitForFences` once its own
+        /// feedback slot says the fence is signalled, so almost every wait is over before it is
+        /// asked. Suspending unconditionally would pass every other test here and turn each of
+        /// those into a round trip through the ring loop.
+        #[test]
+        fn a_fence_the_driver_answers_at_once_never_suspends() {
+            let (todo, g) = (Unimplemented::default(), crate::vulkan::global());
+            let mut ctx = context();
+            SAW.with_borrow_mut(|s| s.ready = true);
+
+            assert!(ctx.submit(&wire_wait(GUEST_FENCE_A), &todo, &g, &NO_RESOURCES).ran());
+            SAW.with_borrow(|s| assert_eq!(s.waits, [0], "one probe, and the answer was in it"));
+        }
+
+        /// A fence the driver cannot answer at once suspends the batch; the wait carries the
+        /// guest's own timeout, and its answer is what the resumed command reports.
+        #[test]
+        fn a_fence_wait_the_driver_cannot_answer_suspends_and_resumes_with_its_answer() {
+            let (todo, g) = (Unimplemented::default(), crate::vulkan::global());
+            let mut ctx = context();
+
+            let batch = wire_wait(GUEST_FENCE_A);
+            let Submitted::Waiting { consumed, on: Wait::Driver(wait) } =
+                ctx.submit(&batch, &todo, &g, &NO_RESOURCES)
+            else {
+                panic!("a wait the driver could not answer suspends the batch");
+            };
+            assert_eq!(consumed, 0, "the wait command itself is not consumed");
+            SAW.with_borrow(|s| assert_eq!(s.waits, [0], "only the probe ran under the lock"));
+
+            let answered = wait.run();
+            SAW.with_borrow(|s| assert_eq!(s.waits, [0, u64::MAX], "the guest's timeout, whole"));
+            assert!(ctx.resume(&batch[consumed..], answered, &todo, &g, &NO_RESOURCES).ran());
+            SAW.with_borrow(|s| assert_eq!(s.waits.len(), 2, "the resumed command asks nothing"));
+        }
+
+        /// A fence a ring is waiting on cannot be destroyed from the context's stream until the
+        /// wait is over; once it is, the destroy is served.
+        ///
+        /// With the context lock released for the wait, this is what stops the guest pulling the
+        /// fence out from under the driver -- undefined behaviour Vulkan forbids the guest and
+        /// the lock used to make impossible.
+        #[test]
+        fn a_fence_being_waited_on_cannot_be_destroyed_until_the_wait_is_over() {
+            let (todo, g, t) = (Unimplemented::default(), crate::vulkan::global(), ring_table());
+            let mut ctx = context();
+
+            // Over: waited, answered, resumed. The destroy that follows is ordinary.
+            let batch = wire_wait(GUEST_FENCE_A);
+            let Submitted::Waiting { consumed, on: Wait::Driver(wait) } =
+                on_ring(&mut ctx, &batch, None, &todo, &g, &t)
+            else {
+                panic!("the ring's wait suspends");
+            };
+            let answered = wait.run();
+            assert!(on_ring(&mut ctx, &batch[consumed..], Some(answered), &todo, &g, &t).ran());
+            assert!(ctx.submit(&wire_destroy_fence(GUEST_FENCE_A), &todo, &g, &t).ran());
+            SAW.with_borrow(|s| {
+                assert_eq!(s.destroyed, [HOST_FENCE_A], "served once the wait was")
+            });
+
+            // In flight: the ring is inside the driver with this fence, and the destroy poisons.
+            let Submitted::Waiting { on: Wait::Driver(_), .. } =
+                on_ring(&mut ctx, &wire_wait(GUEST_FENCE_B), None, &todo, &g, &t)
+            else {
+                panic!("the ring's wait suspends");
+            };
+            assert_eq!(
+                ctx.submit(&wire_destroy_fence(GUEST_FENCE_B), &todo, &g, &t),
+                Submitted::Poisoned,
+                "a fence being waited on is not the guest's to destroy"
+            );
+            SAW.with_borrow(|s| {
+                assert_eq!(s.destroyed, [HOST_FENCE_A], "and the driver was not told")
+            });
+        }
+
+        /// A device with a wait in flight on it cannot be destroyed either: its destroy cascades
+        /// through every child the guest left, which is where the fence would go.
+        #[test]
+        fn a_device_with_a_wait_in_flight_cannot_be_destroyed() {
+            let (todo, g, t) = (Unimplemented::default(), crate::vulkan::global(), ring_table());
+            let mut ctx = context();
+
+            let Submitted::Waiting { on: Wait::Driver(_), .. } =
+                on_ring(&mut ctx, &wire_wait(GUEST_FENCE_A), None, &todo, &g, &t)
+            else {
+                panic!("the ring's wait suspends");
+            };
+            assert_eq!(
+                ctx.submit(&wire_destroy_device(), &todo, &g, &t),
+                Submitted::Poisoned,
+                "a device being waited on is not the guest's to destroy"
+            );
+            SAW.with_borrow(|s| assert!(s.destroyed.is_empty(), "nothing was destroyed"));
+        }
+
+        /// A ring destroyed mid-wait never offers its batch again, so what its wait was reading
+        /// is released with it: the fence is the guest's to destroy once more.
+        ///
+        /// Without this a ring that dies inside a wait would pin its fence for the life of the
+        /// context, and every later destroy of it would poison a guest that did nothing wrong.
+        #[test]
+        fn a_destroyed_ring_releases_what_its_wait_was_reading() {
+            let (todo, g, t) = (Unimplemented::default(), crate::vulkan::global(), ring_table());
+            let mut ctx = context();
+            assert!(ctx.submit(&wire_create_ring(7, &ring_info()), &todo, &g, &t).ran());
+
+            let Submitted::Waiting { on: Wait::Driver(_), .. } =
+                on_ring(&mut ctx, &wire_wait(GUEST_FENCE_A), None, &todo, &g, &t)
+            else {
+                panic!("the ring's wait suspends");
+            };
+            assert!(ctx.submit(&wire_destroy_ring(7), &todo, &g, &t).ran(), "the ring is gone");
+            assert!(
+                ctx.submit(&wire_destroy_fence(GUEST_FENCE_A), &todo, &g, &t).ran(),
+                "and with it the claim its wait had on the fence"
+            );
+            SAW.with_borrow(|s| assert_eq!(s.destroyed, [HOST_FENCE_A]));
+        }
+
+        /// An answer is for the wait command a resumed batch begins with. Offering one to a
+        /// batch that begins with anything else is a caller resuming from the wrong place, which
+        /// is host code and a host invariant.
+        #[test]
+        #[should_panic(expected = "did not begin with the wait it answers")]
+        fn an_answer_offered_to_a_batch_that_did_not_suspend_is_a_host_bug() {
+            let (todo, g, t) = (Unimplemented::default(), crate::vulkan::global(), ring_table());
+            let mut ctx = context();
+
+            let Submitted::Waiting { on: Wait::Driver(wait), .. } =
+                on_ring(&mut ctx, &wire_wait(GUEST_FENCE_A), None, &todo, &g, &t)
+            else {
+                panic!("the ring's wait suspends");
+            };
+            let answered = wait.run();
+            let _ = ctx.resume(&wire_destroy_fence(GUEST_FENCE_B), answered, &todo, &g, &t);
         }
     }
 }

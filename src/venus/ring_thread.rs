@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use crate::ids::{ContextId, RingId};
 
+use super::driver::{Answered, DriverWait};
 use super::proto::types::VkRingStatusFlagBitsMESA;
 use super::ring::{ReplyStream, Ring, RingControl};
 
@@ -47,7 +48,7 @@ const STATUS_IDLE: u32 = VkRingStatusFlagBitsMESA::VK_RING_STATUS_IDLE_BIT_MESA.
 const STATUS_FATAL: u32 = VkRingStatusFlagBitsMESA::VK_RING_STATUS_FATAL_BIT_MESA.0 as u32;
 
 /// How a batch handed to the seam turned out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Dispatched. The bytes are consumed and the position may advance.
     Ran,
@@ -65,6 +66,10 @@ pub enum Verdict {
     /// answer on the pass that proceeds, which is after the wait was satisfied, exactly as a
     /// handler that had blocked would have. It costs the command being decoded twice.
     Wait { consumed: usize, seqno: u64 },
+    /// The batch stopped at a driver wait whose answer was not ready. The first `consumed` bytes
+    /// ran; the thread runs `wait` with nothing held and offers the rest again with the answer,
+    /// which the re-decoded wait command takes instead of asking the driver.
+    WaitDriver { consumed: usize, wait: DriverWait },
 }
 
 /// Running one batch, wherever the state to run it against actually lives.
@@ -76,7 +81,17 @@ pub trait Dispatch: Send + Sync {
     ///
     /// Must never block. Whatever lock this needs is taken with a try, and a failure to get it is
     /// [`Verdict::Busy`] -- see the module docs for why that is load-bearing rather than lazy.
-    fn try_dispatch(&self, ring: RingId, reply: &mut Option<ReplyStream>, buf: &[u8]) -> Verdict;
+    ///
+    /// `answer` is what a [`Verdict::WaitDriver`] this batch produced was answered with, when the
+    /// batch is being offered again. Taken only once the batch actually runs, so a `Busy` leaves
+    /// it for the retry.
+    fn try_dispatch(
+        &self,
+        ring: RingId,
+        reply: &mut Option<ReplyStream>,
+        buf: &[u8],
+        answer: &mut Option<Answered>,
+    ) -> Verdict;
 }
 
 /// Everything a sleeping ring waits on, and how it is woken.
@@ -515,6 +530,9 @@ fn run(
     // retry and not a re-read -- and, more importantly, so the position never advances past work
     // that has not run.
     let mut pending: Vec<u8> = Vec::new();
+    // What the driver wait at the front of `pending` answered, when there is one. Kept beside
+    // the bytes it belongs to, for the same reason they are kept: a `Busy` retry offers both.
+    let mut answer: Option<Answered> = None;
     let mut last_work = Instant::now();
     let mut iter = 0u32;
 
@@ -549,7 +567,7 @@ fn run(
 
         // The reply slot is lent to the batch, exactly as a context lends its own. The thread
         // owns the body, so this is the one place that slot can be reached at all.
-        match dispatch.try_dispatch(id, &mut ring.reply, &pending) {
+        match dispatch.try_dispatch(id, &mut ring.reply, &pending, &mut answer) {
             Verdict::Ran => {
                 // Only now does the position move. Until the bytes have actually run, the ring
                 // still says they are unread -- which is what a `Busy` answer depends on.
@@ -575,6 +593,21 @@ fn run(
                 if wait_virtqueue_seqno(park, started, wait_ring, seqno) {
                     break;
                 }
+                last_work = Instant::now();
+                iter = 0;
+            }
+            Verdict::WaitDriver { consumed, wait } => {
+                // The prefix is published exactly as for a virtqueue wait, and for the same
+                // reason. What differs is what happens next: nothing sleeps on a seqno, so
+                // `blocked_on_vq` stays clear, and the thread makes the call itself, holding
+                // nothing of the renderer -- which is the whole point of having got here rather
+                // than blocking inside the dispatch.
+                cur = cur.wrapping_add(consumed as u32);
+                ring.set_head(cur);
+                pending.drain(..consumed);
+                wait_ring.changed();
+                assert!(answer.is_none(), "a driver wait suspended a batch already answered");
+                answer = Some(wait.run());
                 last_work = Instant::now();
                 iter = 0;
             }
@@ -745,7 +778,13 @@ mod tests {
     }
 
     impl Dispatch for Recorder {
-        fn try_dispatch(&self, _: RingId, _: &mut Option<ReplyStream>, buf: &[u8]) -> Verdict {
+        fn try_dispatch(
+            &self,
+            _: RingId,
+            _: &mut Option<ReplyStream>,
+            buf: &[u8],
+            _: &mut Option<Answered>,
+        ) -> Verdict {
             if self.poison {
                 return Verdict::Poisoned;
             }

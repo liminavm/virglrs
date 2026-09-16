@@ -33,6 +33,7 @@ use crate::config::Config;
 use crate::ids::{ContextId, RingId};
 
 use super::context::{Context, Submitted, Unimplemented, Wait};
+use super::driver::Answered;
 use super::journal::Seq;
 use super::ring::{ReplyStream, Ring, ShmResources};
 use super::ring_thread::{self, Dispatch, RingWaiter, Verdict};
@@ -153,7 +154,13 @@ impl Dispatch for RingDispatch {
     /// The census is not taken here. It is one context's lock in no sense -- every context's
     /// rings would contend on it -- and the batch only reaches it on the way to poisoning, where
     /// it takes its own lock for one increment.
-    fn try_dispatch(&self, ring: RingId, reply: &mut Option<ReplyStream>, buf: &[u8]) -> Verdict {
+    fn try_dispatch(
+        &self,
+        ring: RingId,
+        reply: &mut Option<ReplyStream>,
+        buf: &[u8],
+        answer: &mut Option<Answered>,
+    ) -> Verdict {
         let Some(ctx) = self.ctx.upgrade() else {
             return Verdict::Poisoned;
         };
@@ -163,13 +170,18 @@ impl Dispatch for RingDispatch {
         let Ok(mut ctx) = ctx.try_lock() else {
             return Verdict::Busy;
         };
-        match ctx.dispatch_ring(ring, reply, buf, &self.todo, &self.global, &*resources) {
+        // Only now, with the batch about to run: an answer taken before a `Busy` would be lost.
+        let answer = answer.take();
+        match ctx.dispatch_ring(ring, reply, buf, answer, &self.todo, &self.global, &*resources) {
             Submitted::Done => Verdict::Ran,
             Submitted::Poisoned => Verdict::Poisoned,
             // A ring's own stream may only wait on a virtqueue seqno; the handler for the other
             // wait refuses this origin outright, so there is no ring wait to translate here.
             Submitted::Waiting { consumed, on: Wait::Virtqueue(seqno) } => {
                 Verdict::Wait { consumed, seqno }
+            }
+            Submitted::Waiting { consumed, on: Wait::Driver(wait) } => {
+                Verdict::WaitDriver { consumed, wait }
             }
             Submitted::Waiting { on: Wait::Ring { .. }, .. } => {
                 unreachable!("a ring stream's vkWaitRingSeqnoMESA is refused by its handler")
@@ -306,6 +318,22 @@ impl Vkr {
     pub fn submit(&mut self, id: ContextId, buf: &[u8]) -> Result<Submitted, Error> {
         let out = self.on_context(id, |ctx, todo, global, resources| {
             ctx.submit(buf, todo, global, resources)
+        })?;
+        self.promote(id);
+        Ok(out)
+    }
+
+    /// Offer the remainder of a submission that suspended on a `Wait::Driver`, with what the
+    /// caller got from running it. Everything [`Vkr::submit`] says holds here too: the batch may
+    /// suspend again, and rings it created are promoted either way.
+    pub fn resume(
+        &mut self,
+        id: ContextId,
+        buf: &[u8],
+        answered: Answered,
+    ) -> Result<Submitted, Error> {
+        let out = self.on_context(id, |ctx, todo, global, resources| {
+            ctx.resume(buf, answered, todo, global, resources)
         })?;
         self.promote(id);
         Ok(out)
@@ -1153,8 +1181,13 @@ mod tests {
     /// held for a batch's length would make one guest's `vkDeviceWaitIdle` every other guest's
     /// stall. The driver call planted here does not return until told to, which is what a real
     /// wait looks like from another context's ring: no ending it can see, only locks it can try.
+    ///
+    /// The wait arrives inside an executed command stream, which is the one place a driver wait
+    /// still blocks in the handler with the context locked: a top-level one suspends the batch
+    /// instead and holds nothing, which is a different test.
     #[test]
     fn a_context_blocked_in_the_driver_does_not_stop_another_contexts_ring() {
+        const STREAM: usize = 0x22000;
         use crate::venus::cs::{HostHandle, ObjectId};
         use crate::venus::proto::serialize::{
             vn_encode_vkDeviceWaitIdle_args, vn_sizeof_vkDeviceWaitIdle_args,
@@ -1184,7 +1217,7 @@ mod tests {
         ENTERED.store(false, Ordering::Release);
         RELEASE.store(false, Ordering::Release);
 
-        let (mut v, _map) = vkr();
+        let (mut v, map) = vkr();
         let other = ContextId::new(2).expect("2 is not zero");
         v.context_create(other, String::new());
         {
@@ -1225,12 +1258,14 @@ mod tests {
             vn_encode_vkDeviceWaitIdle_args(&mut enc, VkFlags(0), &args);
             buf
         };
+        assert!(map.copy_in(STREAM, &idle), "the stream is inside the mapping");
+        let execute = wire_execute(STREAM, idle.len());
 
         std::thread::scope(|s| {
             s.spawn(|| {
                 let mut reply = None;
                 assert_eq!(
-                    blocked.try_dispatch(ring, &mut reply, &idle),
+                    blocked.try_dispatch(ring, &mut reply, &execute, &mut None),
                     Verdict::Ran,
                     "the wait is served once released"
                 );
@@ -1238,7 +1273,7 @@ mod tests {
             until("the blocked context to enter the driver", || ENTERED.load(Ordering::Acquire));
 
             let mut reply = None;
-            let verdict = free.try_dispatch(ring, &mut reply, &wire_ring_work());
+            let verdict = free.try_dispatch(ring, &mut reply, &wire_ring_work(), &mut None);
             RELEASE.store(true, Ordering::Release);
             assert_eq!(
                 verdict,
@@ -1248,6 +1283,134 @@ mod tests {
         });
 
         v.context_destroy(other);
+        v.context_destroy(ctx_id());
+    }
+
+    /// A ring inside a driver wait holds nothing: the context's own stream keeps being served.
+    ///
+    /// The gate for the wait being taken out of the batch. A `vkWaitForFences` the driver cannot
+    /// answer at once used to block inside the ring's dispatch with the context locked and the
+    /// resource table read-locked -- for as long as the guest's timeout, which mesa sets to
+    /// forever. The submission on the context's stream below would then wait out the fence.
+    /// Here the ring suspends the batch, runs the wait with nothing held, and the submission
+    /// returns while the driver is still inside the wait. The deadline is the assertion.
+    #[test]
+    fn a_ring_inside_a_driver_wait_does_not_hold_its_context() {
+        use crate::venus::cs::{HostHandle, ObjectId};
+        use crate::venus::proto::serialize::{
+            vn_encode_vkWaitForFences_args, vn_sizeof_vkWaitForFences_args,
+        };
+        use crate::venus::proto::types::{
+            VkAllocationCallbacks, VkBool32, VkDevice, VkFence, VkObjectType, VkResult,
+            vn_command_vkWaitForFences as Args,
+        };
+
+        const DEVICE: u64 = 0xd0;
+        const GUEST_DEV: u64 = 0x1d;
+        const FENCE: u64 = 0xf0;
+        const GUEST_FENCE: u64 = 0x1f;
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+
+        /// Not signalled for a probe; a real wait blocks until the test lets it go.
+        unsafe extern "C" fn wait(
+            _d: VkDevice,
+            _count: u32,
+            _p: *const VkFence,
+            _all: VkBool32,
+            timeout: u64,
+        ) -> VkResult {
+            if timeout == 0 {
+                return VkResult::VK_TIMEOUT;
+            }
+            ENTERED.store(true, Ordering::Release);
+            while !RELEASE.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_fence(
+            _d: VkDevice,
+            _f: VkFence,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        ENTERED.store(false, Ordering::Release);
+        RELEASE.store(false, Ordering::Release);
+
+        let (mut v, map) = vkr();
+        {
+            let arc = v.contexts.get(&ctx_id()).expect("created by the fixture");
+            let mut ctx = arc.lock().expect("a context lock is never poisoned");
+            let mut fns = crate::vulkan::Device::default();
+            fns.plant_vkWaitForFences(wait);
+            fns.plant_vkDeviceWaitIdle(idle);
+            fns.plant_vkDestroyFence(destroy_fence);
+            fns.plant_vkDestroyDevice(destroy_device);
+            ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
+            let mut table = ctx.objects().borrow_mut();
+            table
+                .add(
+                    ObjectId(GUEST_DEV),
+                    VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                    HostHandle(DEVICE),
+                    None,
+                )
+                .expect("a fresh id");
+            table
+                .add(
+                    ObjectId(GUEST_FENCE),
+                    VkObjectType::VK_OBJECT_TYPE_FENCE,
+                    HostHandle(FENCE),
+                    None,
+                )
+                .expect("a fresh id");
+        }
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+
+        let work = {
+            let fences = [VkFence(GUEST_FENCE)];
+            let mut args = Args::default();
+            args.device = VkDevice(GUEST_DEV);
+            args.waitAll = VkBool32(1);
+            args.timeout = u64::MAX;
+            args.plant_pFences(&fences);
+            let proto = crate::venus::cs::AllOfIt;
+            let mut buf = vec![0u8; vn_sizeof_vkWaitForFences_args(&proto, &args)];
+            let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+            vn_encode_vkWaitForFences_args(&mut enc, VkFlags(0), &args);
+            buf
+        };
+        guest_writes(&map, &work);
+        until("the ring thread to enter the driver", || ENTERED.load(Ordering::Acquire));
+
+        // The ring is inside the wait. Its context's lock is free, so a submission on the
+        // context's own stream returns -- on a helper thread, so that a lock still held shows
+        // up as a timeout here rather than a hung suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let out = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _ = tx.send(v.submit(ctx_id(), &wire_submit_vq(7, 1)));
+            });
+            let out = rx.recv_timeout(Duration::from_secs(5));
+            // Released before the verdict, whatever it was: a ring that did hold the lock has
+            // to be let out for the helper to return and the scope to join, or a failure here
+            // would be a hang rather than a report.
+            RELEASE.store(true, Ordering::Release);
+            out
+        });
+        let out = out.expect("the context's stream was held by a ring inside the driver");
+        assert_eq!(out, Ok(Submitted::Done), "served while the ring was inside the wait");
+
+        until("the ring to consume the wait once released", || head(&map) == work.len() as u32);
         v.context_destroy(ctx_id());
     }
 }

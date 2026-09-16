@@ -34,6 +34,7 @@ use crate::ids::{BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, Ring
 use crate::renderer::{self, BlobMem, FdType, ImportDesc, Renderer};
 use crate::venus::context::{Submitted, Wait};
 use crate::venus::cs::ObjectId;
+use crate::venus::driver::Answered;
 use crate::vrend::egl::{self, GlContexts};
 use crate::vrend::pipe::TextureTarget;
 use crate::vrend::proto::{self, Format};
@@ -1572,8 +1573,13 @@ pub extern "C" fn virgl_renderer_submit_cmd(
 /// context with nothing held at all, which is the design this rewrite exists to replace.
 fn submit_all(id: ContextId, buf: &[u8]) -> c_int {
     let mut at = 0usize;
+    // What the driver wait the remainder begins with answered, on the pass after one ran.
+    let mut answer: Option<Answered> = None;
     loop {
-        let out = with(Err(renderer::Error::NoContext), |r| r.submit_cmd(id, &buf[at..]));
+        let out = match answer.take() {
+            None => with(Err(renderer::Error::NoContext), |r| r.submit_cmd(id, &buf[at..])),
+            Some(a) => with(Err(renderer::Error::NoContext), |r| r.resume_cmd(id, &buf[at..], a)),
+        };
         let waiter = match out {
             Err(e) => return errno(e),
             Ok(Submitted::Done) => return 0,
@@ -1588,6 +1594,13 @@ fn submit_all(id: ContextId, buf: &[u8]) -> c_int {
                     // running. Either way nothing will ever advance that head.
                     Err(e) => return errno(e),
                 }
+            }
+            // A blocking driver call, run here with the renderer lock dropped: the guest's own
+            // thread is what is spent on it, and nothing else in the process waits behind it.
+            Ok(Submitted::Waiting { consumed, on: Wait::Driver(wait) }) => {
+                at += consumed;
+                answer = Some(wait.run());
+                continue;
             }
             // A virtqueue wait is legal only on a ring's own stream, and this is the context's.
             // Its handler refuses that origin, so the stream poisons rather than arriving here.

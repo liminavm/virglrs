@@ -17,7 +17,7 @@ use crate::ids::{
 use crate::venus;
 use crate::venus::context::Submitted;
 use crate::venus::cs::ObjectId;
-use crate::venus::driver::{Allocation, Exported, MemoryError, Storage};
+use crate::venus::driver::{Allocation, Answered, Exported, MemoryError, Storage};
 use crate::venus::objects::ObjectKey;
 use crate::venus::ring::ResourceBytes;
 use crate::venus::vkr::ContextKey;
@@ -1220,6 +1220,28 @@ impl Renderer {
                     Some(Err(_fault)) => Ok(Submitted::Poisoned),
                 }
             }
+            CapsetId::Unknown(_) => Err(Error::RendererUnimplemented),
+        }
+    }
+
+    /// Offer the remainder of a submission that suspended on a driver wait, with what running it
+    /// answered. `buf` starts at the wait command, exactly as `Submitted::Waiting` said.
+    ///
+    /// Only a venus stream suspends on one; a classic stream never suspends at all, so a resume of
+    /// one answers nothing. Refused rather than asserted because the VMM is the caller: a wrong
+    /// call there should fail its submission, not the process.
+    pub fn resume_cmd(
+        &mut self,
+        ctx: ContextId,
+        buf: &[u8],
+        answered: Answered,
+    ) -> Result<Submitted, Error> {
+        let Some(c) = self.contexts.get(&ctx) else {
+            return Err(Error::NoContext);
+        };
+        match c.capset {
+            CapsetId::Venus => self.venus_mut()?.resume(ctx, buf, answered).map_err(venus_error),
+            CapsetId::Virgl | CapsetId::Virgl2 => Err(Error::Poisoned),
             CapsetId::Unknown(_) => Err(Error::RendererUnimplemented),
         }
     }

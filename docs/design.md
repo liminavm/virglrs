@@ -382,6 +382,23 @@ buildable throughout as the A-side reference.
   makes a reply-carrying wait truthful with no special case: the answer is encoded on the
   pass that proceeds.
 
+  **A driver wait suspends the batch the same way.** `vkWaitForFences`, `vkWaitSemaphores`,
+  `vkDeviceWaitIdle` and `vkQueueWaitIdle` block on the GPU, and mesa's venus sends the
+  first two with an infinite timeout on the ring once its own feedback slot reports the
+  signal. A handler that blocked would hold the context and the resource table's read lock
+  for the GPU's time, against every other ring of the context and every VMM resource write.
+  So the handler probes with a zero timeout -- the common case is a wait that is already
+  over -- and otherwise suspends with a `Wait::Driver` that owns everything the call needs;
+  the ring thread or the VMM runs it with nothing held and offers the remainder with the
+  answer, which the re-decoded command reports instead of calling again. Releasing the lock
+  opens what the lock used to close: the guest destroying the fence, semaphore or device
+  another of its streams is inside the driver with. The context records what each
+  suspended wait reads, a destroy that names one is refused and poisons (Vulkan forbids
+  the guest that too), and a ring destroyed mid-wait releases its record. Two places still
+  block in the handler, deliberately: a replayed batch, which has no thread to offer it
+  again, and a stream being executed from inside another, which has no position to resume
+  from.
+
   **A recorded command stream is copied out one at a time, and a wait inside one is
   refused.** `vkExecuteCommandStreamsMESA` is how every recorded `vkCmd*` arrives: mesa
   fills a resource and names it rather than sending the commands inline. `streamCount` is

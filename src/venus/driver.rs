@@ -46,9 +46,9 @@ use super::proto::types::{
     VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
     VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
     VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
-    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
-    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassContents, VkTimelineSemaphoreSubmitInfo,
-    VkViewport, VkWriteDescriptorSet,
+    VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags,
+    VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo, VkSubmitInfo2,
+    VkSubpassContents, VkTimelineSemaphoreSubmitInfo, VkViewport, VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
@@ -483,6 +483,118 @@ impl Drop for LiveDevice {
         // SAFETY: a handle this renderer created on the instance still held above, destroyed once
         // -- being the last holder of the `Arc` is what makes it once.
         unsafe { (self.fns.vkDestroyDevice())(self.handle, core::ptr::null()) };
+    }
+}
+
+/// One blocking driver call, taken out of the batch that asked for it.
+///
+/// Everything the call needs is owned here: a share of the device's entry points -- which is also
+/// what keeps the device alive until the call returns, however the context fares meanwhile -- and
+/// copies of the handles. The pointer-and-count pairs Vulkan reads reappear only as the arguments
+/// of the call itself, rebuilt from the vectors at that moment.
+#[derive(Clone)]
+pub struct DriverWait {
+    device: Arc<LiveDevice>,
+    kind: WaitKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WaitKind {
+    Fences {
+        fences: Vec<VkFence>,
+        wait_all: VkBool32,
+        timeout: u64,
+    },
+    Semaphores {
+        semaphores: Vec<VkSemaphore>,
+        values: Vec<u64>,
+        flags: VkSemaphoreWaitFlags,
+        timeout: u64,
+    },
+    DeviceIdle,
+    QueueIdle(VkQueue),
+}
+
+impl PartialEq for DriverWait {
+    fn eq(&self, other: &DriverWait) -> bool {
+        Arc::ptr_eq(&self.device, &other.device) && self.kind == other.kind
+    }
+}
+impl Eq for DriverWait {}
+
+impl core::fmt::Debug for DriverWait {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DriverWait")
+            .field("device", &self.device.handle.0)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+/// What a [`DriverWait`] answered. Only [`DriverWait::run`] makes one, so a batch resumed with an
+/// answer was resumed by whoever ran the wait and by nobody who guessed at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Answered(VkResult);
+
+impl Answered {
+    pub fn result(self) -> VkResult {
+        self.0
+    }
+}
+
+impl DriverWait {
+    /// The device the call is on, for the record of what must not be destroyed under it.
+    pub fn device(&self) -> VkDevice {
+        self.device.handle
+    }
+
+    /// The handles the call reads, as raw values, for the same record.
+    pub fn handles(&self) -> Vec<u64> {
+        match &self.kind {
+            WaitKind::Fences { fences, .. } => fences.iter().map(|f| f.0).collect(),
+            WaitKind::Semaphores { semaphores, .. } => semaphores.iter().map(|s| s.0).collect(),
+            WaitKind::DeviceIdle => Vec::new(),
+            WaitKind::QueueIdle(q) => vec![q.0],
+        }
+    }
+
+    /// Make the call, with nothing of the renderer held.
+    pub fn run(&self) -> Answered {
+        let device = self.device.handle;
+        let fns: &DeviceFns = &self.device;
+        // SAFETY: `device` is live for as long as this value holds its share of `LiveDevice`.
+        // The handles were resolved through the object table by the batch that built this and
+        // are held against destruction by the context's in-flight record until that batch is
+        // offered again with the answer; the arrays are this value's own vectors, alive for the
+        // call, and each count is its vector's length.
+        let ret = unsafe {
+            match &self.kind {
+                WaitKind::Fences { fences, wait_all, timeout } => (fns.vkWaitForFences())(
+                    device,
+                    fences.len() as u32,
+                    fences.as_ptr(),
+                    *wait_all,
+                    *timeout,
+                ),
+                WaitKind::Semaphores { semaphores, values, flags, timeout } => {
+                    let Some(f) = fns.try_vkWaitSemaphores() else {
+                        return Answered(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT);
+                    };
+                    let info = VkSemaphoreWaitInfo {
+                        sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                        pNext: core::ptr::null(),
+                        flags: *flags,
+                        semaphoreCount: semaphores.len() as u32,
+                        pSemaphores: semaphores.as_ptr(),
+                        pValues: values.as_ptr(),
+                    };
+                    f(device, &info, *timeout)
+                }
+                WaitKind::DeviceIdle => (fns.vkDeviceWaitIdle())(device),
+                WaitKind::QueueIdle(queue) => (fns.vkQueueWaitIdle())(*queue),
+            }
+        };
+        Answered(ret)
     }
 }
 
@@ -3751,6 +3863,81 @@ impl Driver {
                 timeout,
             )
         }
+    }
+
+    // -------------------------------------------------------------- waits taken out of the batch
+    //
+    // The four commands that block on the GPU are not run inside the batch that asked for them.
+    // A batch holds its context and the renderer's resource table, and a wait inside it would
+    // hold both for as long as the GPU took: every other ring of that context, and every VMM
+    // resource write queued behind that read lock -- and, on this platform's writer-preferring
+    // lock, every other context's ring behind the writer. The handler probes with a zero timeout,
+    // and when the answer is not ready it builds a `DriverWait` out of what the call needs and
+    // suspends the batch. Whoever owns the stream runs the wait with nothing held and offers the
+    // batch again with the answer. See `Context::in_flight` for what keeps the handles valid
+    // while the context lock is not held.
+
+    /// `vkWaitForFences`, to be run outside the batch. `None` is a device this context never
+    /// created, which the probe before it already answered for.
+    pub fn fence_wait(
+        &self,
+        device: VkDevice,
+        fences: &[VkFence],
+        wait_all: VkBool32,
+        timeout: u64,
+    ) -> Option<DriverWait> {
+        let d = self.devices.get(&device)?;
+        Some(DriverWait {
+            device: Arc::clone(&d.fns),
+            kind: WaitKind::Fences { fences: fences.to_vec(), wait_all, timeout },
+        })
+    }
+
+    /// `vkWaitSemaphores`, to be run outside the batch. The same checks as
+    /// [`Driver::wait_semaphores`], because the arrays are read here and only here.
+    pub fn semaphore_wait(
+        &self,
+        device: VkDevice,
+        info: &VkSemaphoreWaitInfo,
+        timeout: u64,
+    ) -> Result<Option<DriverWait>, NotATimeline> {
+        // SAFETY: as `wait_semaphores`.
+        let named: Option<&[VkSemaphore]> =
+            unsafe { crate::venus::cs::wire_array(info.semaphoreCount as usize, info.pSemaphores) };
+        let named = named.ok_or(NotATimeline::Malformed)?;
+        // SAFETY: as above, for the values array that travels beside the semaphores at the same
+        // count -- the decoder sized both from `semaphoreCount`.
+        let values: Option<&[u64]> =
+            unsafe { crate::venus::cs::wire_array(info.semaphoreCount as usize, info.pValues) };
+        let values = values.ok_or(NotATimeline::Malformed)?;
+        for sem in named {
+            self.as_timeline(device, *sem)?;
+        }
+        let Some(d) = self.devices.get(&device) else {
+            return Ok(None);
+        };
+        Ok(Some(DriverWait {
+            device: Arc::clone(&d.fns),
+            kind: WaitKind::Semaphores {
+                semaphores: named.to_vec(),
+                values: values.to_vec(),
+                flags: info.flags,
+                timeout,
+            },
+        }))
+    }
+
+    /// `vkDeviceWaitIdle`, to be run outside the batch.
+    pub fn device_idle_wait(&self, device: VkDevice) -> Option<DriverWait> {
+        let d = self.devices.get(&device)?;
+        Some(DriverWait { device: Arc::clone(&d.fns), kind: WaitKind::DeviceIdle })
+    }
+
+    /// `vkQueueWaitIdle`, to be run outside the batch. `None` is a queue this context never
+    /// retrieved, the same answer [`Driver::queue_op`] gives.
+    pub fn queue_idle_wait(&self, queue: VkQueue) -> Option<DriverWait> {
+        let d = self.devices.get(self.queues.get(&queue)?)?;
+        Some(DriverWait { device: Arc::clone(&d.fns), kind: WaitKind::QueueIdle(queue) })
     }
 
     /// `vkWaitSemaphoreResourceMESA`: export the semaphore's payload to a sync fd, then drop it.

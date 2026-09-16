@@ -1267,15 +1267,61 @@ SABOTAGES = [
         """        let Ok(mut ctx) = ctx.try_lock() else {
             return Verdict::Busy;
         };
-        match ctx.dispatch_ring(""",
+        // Only now, with the batch about to run""",
         """        let Ok(mut ctx) = ctx.try_lock() else {
             return Verdict::Busy;
         };
         let Ok(_census) = self.todo.seen.try_lock() else {
             return Verdict::Busy;
         };
-        match ctx.dispatch_ring(""",
+        // Only now, with the batch about to run""",
         'a_context_blocked_in_the_driver_does_not_stop_another_contexts_ring',
+    ),
+    (
+        'a fence the driver reports signalled at once still suspends the batch and round-trips the ring loop',
+        'src/venus/context.rs',
+        """        let probe = self.driver.wait_for_fences(args.device, fences, args.waitAll, 0);
+        if probe != VkResult::VK_TIMEOUT || args.timeout == 0 {""",
+        """        let probe = self.driver.wait_for_fences(args.device, fences, args.waitAll, 0);
+        if args.timeout == 0 {""",
+        'a_fence_the_driver_answers_at_once_never_suspends',
+    ),
+    (
+        'a driver wait blocks inside the batch with the context and the resource table locked',
+        'src/venus/context.rs',
+        """        self.replaying || self.nested
+    }""",
+        """        true
+    }""",
+        'a_ring_inside_a_driver_wait_does_not_hold_its_context',
+    ),
+    (
+        'a fence a ring is waiting on inside the driver can be destroyed from the context stream',
+        'src/venus/context.rs',
+        """        if self.waited_on(args.fence.0) {
+            self.reject = Some("destroyed a fence one of its streams is waiting on");
+            return;
+        }""",
+        '',
+        'a_fence_being_waited_on_cannot_be_destroyed_until_the_wait_is_over',
+    ),
+    (
+        'a device with a wait in flight can be destroyed, cascading through the fence being waited on',
+        'src/venus/context.rs',
+        """        if self.waited_device(args.device) {
+            self.reject = Some("destroyed a device one of its streams is waiting on");
+            return;
+        }""",
+        '',
+        'a_device_with_a_wait_in_flight_cannot_be_destroyed',
+    ),
+    (
+        'a ring destroyed mid-wait pins its fence for the life of the context',
+        'src/venus/context.rs',
+        """        self.in_flight.remove(&Waiter::Ring(id));
+    }""",
+        """    }""",
+        'a_destroyed_ring_releases_what_its_wait_was_reading',
     ),
     (
         "a ring the guest named 0 is quietly renamed instead of refused",
