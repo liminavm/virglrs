@@ -742,7 +742,7 @@ SABOTAGES = [
     (
         'an executed stream may execute streams of its own, as deep as the guest likes',
         'src/venus/context.rs',
-        """            if depth > 0 {
+        """            if h.depth > 0 {
                 poison(
                     id,
                     &dec,
@@ -1076,7 +1076,7 @@ SABOTAGES = [
     (
         'a transport wait inside an executed stream suspends a batch it cannot resume',
         'src/venus/context.rs',
-        """            if depth > 0 {
+        """            if h.depth > 0 {
                 poison(
                     id,
                     &dec,
@@ -1325,7 +1325,7 @@ SABOTAGES = [
     (
         'a driver wait blocks inside the batch with the context and the resource table locked',
         'src/venus/context.rs',
-        """        self.replaying || self.nested
+        """        self.replaying || self.depth > 0
     }""",
         """        true
     }""",
