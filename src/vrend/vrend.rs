@@ -1620,4 +1620,49 @@ mod tests {
         );
         v.context_destroy(ctx, &NoGuest);
     }
+
+    /// A second `replay_begin` keeps the span open with the journal the first was handed,
+    /// rather than starting over with an empty one.
+    #[test]
+    fn a_classic_replay_begun_twice_keeps_the_journal_it_was_handed() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+        )
+        .expect("vrend comes up");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &NoGuest).expect("a context");
+        v.submit(ctx, &[(1 << 16) | 29, 1], &NoGuest)
+            .expect("the context is here")
+            .expect("a sub-context");
+        let journal = v.journal_export(ctx).expect("a live context exports its journal");
+        let entries = |bytes: &[u8]| crate::vrend::journal::parse(bytes).map(|e| e.len());
+        let retained = entries(&journal).expect("this renderer reads its own journal");
+        assert!(retained > 0, "a context with a sub-context retains something");
+        v.context_destroy(ctx, &NoGuest);
+
+        v.context_create(ctx, &NoGuest).expect("a fresh context to rebuild");
+        assert!(v.replay_begin(ctx));
+        assert_eq!(v.journal_restore(ctx, &journal), Ok(retained));
+        assert!(v.replay_begin(ctx));
+        v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)).expect("the context is replaying");
+        assert!(v.replay_end(ctx));
+        let rebuilt = v.journal_export(ctx).expect("the rebuilt context exports its journal");
+        assert_eq!(
+            entries(&rebuilt),
+            Ok(retained),
+            "the journal the first replay_begin was handed is what the rebuild fed"
+        );
+        v.context_destroy(ctx, &NoGuest);
+    }
 }

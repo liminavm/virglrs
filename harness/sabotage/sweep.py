@@ -1218,6 +1218,13 @@ SABOTAGES = [
         'a_replay_begun_twice_keeps_the_journal_it_was_handed',
     ),
     (
+        'a second classic replay_begin drops the journal the first was handed',
+        'src/vrend/context.rs',
+        '        self.replay.get_or_insert_with(Replay::default);',
+        '        self.replay = Some(Replay::default());',
+        'a_classic_replay_begun_twice_keeps_the_journal_it_was_handed',
+    ),
+    (
         'an image load one past the last slot is let through to the image array',
         'src/vrend/shader/glsl/tex.rs',
         'if sinfo.sreg_index < 0 || sinfo.sreg_index as usize >= MAX_SHADER_IMAGES {\n            return false;\n        }\n        if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {',

@@ -1415,8 +1415,11 @@ impl Context {
     /// a rebuild the same fault means one retained command could not be used. Poisoning there
     /// would throw away every command after it and land exactly where doing nothing lands -- a
     /// black screen -- so a replay drops the command, names it, and goes on.
+    ///
+    /// A span already open stays open, with the journal it was handed: a second `replay_begin`
+    /// is the VMM repeating itself, not asking for the restore to be thrown away.
     pub fn replay_begin(&mut self) {
-        self.replay = Some(Replay::default());
+        self.replay.get_or_insert_with(Replay::default);
     }
 
     /// Take the journal a rebuild will be fed from.
