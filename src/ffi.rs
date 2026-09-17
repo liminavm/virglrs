@@ -218,6 +218,7 @@ fn errno(e: renderer::Error) -> c_int {
         | ContentLargerThanAllocation
         | MalformedContent(_)
         | MalformedSync(_)
+        | JournalRefused(_)
         | ClassicRefused(_)
         | ClaimRefused(_) => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
@@ -1929,16 +1930,10 @@ pub extern "C" fn virgl_renderer_limina_journal_export(
         let Some(ctx) = ContextId::new(ctx_id) else {
             return EINVAL;
         };
-        // A context belongs to one renderer and each keeps its own journal, in its own format.
         // `ENOENT` is the answer for a context with nothing retained, which is deliberately not an
         // empty blob: a VMM that stored zero bytes and restored them later would have rebuilt
         // nothing and been told it succeeded.
-        let exported = if r.is_classic(ctx) {
-            r.vrend_journal_export(ctx)
-        } else {
-            r.venus_journal_export(ctx)
-        };
-        let Some(bytes) = exported else {
+        let Some(bytes) = r.journal_export(ctx) else {
             return ENOENT;
         };
         match malloc_bytes(&bytes) {
@@ -2017,16 +2012,9 @@ pub extern "C" fn virgl_renderer_limina_replay_begin(ctx_id: u32) -> c_int {
     let Some(ctx) = ContextId::new(ctx_id) else {
         return EINVAL;
     };
-    with(EINVAL, |r| {
-        // A context belongs to one renderer, and each keeps its own journal. Asking which is the
-        // same split the C makes by having its classic lookup answer NULL for a venus capset.
-        if r.is_classic(ctx) {
-            return if r.vrend_replay_begin(ctx) { 0 } else { EINVAL };
-        }
-        match Some(r.venus_replay_begin(ctx)) {
-            Some(Ok(())) => 0,
-            _ => EINVAL,
-        }
+    with(EINVAL, |r| match r.replay_begin(ctx) {
+        Ok(()) => 0,
+        Err(e) => errno(e),
     })
 }
 
@@ -2044,24 +2032,10 @@ pub extern "C" fn virgl_renderer_limina_journal_restore(
         return EINVAL;
     };
     with_bytes(data.cast_mut(), size as usize, |buf| {
-        with(EINVAL, |r| {
-            let classic = r.is_classic(ctx);
-            let restored = if classic {
-                r.vrend_journal_restore(ctx, buf)
-            } else {
-                r.venus_journal_restore(ctx, buf)
-            };
-            match restored {
-                Ok(_) => 0,
-                Err(why) => {
-                    // The blob has been through a snapshot file since we wrote it. Saying which
-                    // way it is wrong is the difference between a bug we can find and a resume
-                    // that is merely black.
-                    let which = if classic { "vrend" } else { "venus" };
-                    eprintln!("[virglrs] {which}: ctx {ctx_id}: journal refused: {why}");
-                    EINVAL
-                }
-            }
+        // A refused journal says so itself, naming the renderer that refused it.
+        with(EINVAL, |r| match r.journal_restore(ctx, buf) {
+            Ok(_) => 0,
+            Err(e) => errno(e),
         })
     })
     .unwrap_or(EINVAL)
@@ -2073,16 +2047,11 @@ pub extern "C" fn virgl_renderer_limina_journal_replay_upto(ctx_id: u32, upto: u
     let Some(ctx) = ContextId::new(ctx_id) else {
         return EINVAL;
     };
-    with(EINVAL, |r| {
-        if r.is_classic(ctx) {
-            return if r.vrend_replay_upto(ctx, upto) { 0 } else { EINVAL };
-        }
-        match r.venus_replay_upto(ctx, upto) {
-            Ok(()) => 0,
-            Err(why) => {
-                eprintln!("[virglrs] venus: ctx {ctx_id}: replay to {upto} failed: {why:?}");
-                EINVAL
-            }
+    with(EINVAL, |r| match r.replay_upto(ctx, upto) {
+        Ok(()) => 0,
+        Err(why) => {
+            eprintln!("[virglrs] ctx {ctx_id}: replay to {upto} failed: {why}");
+            errno(why)
         }
     })
 }
@@ -2137,14 +2106,9 @@ pub extern "C" fn virgl_renderer_limina_replay_end(ctx_id: u32) -> c_int {
     let Some(ctx) = ContextId::new(ctx_id) else {
         return EINVAL;
     };
-    with(EINVAL, |r| {
-        if r.is_classic(ctx) {
-            return if r.vrend_replay_end(ctx) { 0 } else { EINVAL };
-        }
-        match Some(r.venus_replay_end(ctx)) {
-            Some(Ok(())) => 0,
-            _ => EINVAL,
-        }
+    with(EINVAL, |r| match r.replay_end(ctx) {
+        Ok(()) => 0,
+        Err(e) => errno(e),
     })
 }
 

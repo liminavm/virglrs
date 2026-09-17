@@ -96,6 +96,8 @@ pub enum Error {
     MalformedContent(content::Malformed),
     /// A restore was handed something that is not a venus sync blob.
     MalformedSync(venus::sync::Malformed),
+    /// A restore was handed a journal its renderer would not read, for the reason given.
+    JournalRefused(&'static str),
 }
 
 /// A read or a write of an allocation's bytes, in the renderer's vocabulary. One function for
@@ -157,6 +159,7 @@ impl std::fmt::Display for Error {
             Error::Transfer(e) => return write!(f, "the transfer failed: {e}"),
             Error::MalformedContent(m) => return write!(f, "the contents were refused: {m}"),
             Error::MalformedSync(m) => return write!(f, "the sync state was refused: {m}"),
+            Error::JournalRefused(why) => return write!(f, "the journal was refused: {why}"),
         };
         f.write_str(s)
     }
@@ -554,6 +557,59 @@ pub struct Context {
     pub last_fence: BTreeMap<RingIdx, FenceId>,
 }
 
+/// A context resolved to the renderer that serves it.
+///
+/// A context binds one renderer for its whole life -- the capset is fixed at create -- so the
+/// resolution is made once, at this renderer's table, and travels from there as a witness. Every
+/// vrend entry point that acts on a context takes a [`ClassicCtx`] and every venus one a
+/// [`VenusCtx`]: a call site holding a bare [`ContextId`] has to resolve it and match, and the
+/// arm for the other renderer has no witness to hand over. The C keeps the same split with a
+/// per-context vtable (`ctx->attach_resource`, `ctx->submit_cmd`); this is that dispatch, checked
+/// when the tree builds rather than remembered at each site. A site that forgets is how vrend
+/// came to hold a share of every venus blob (2d8436b).
+///
+/// The witness carries no borrow. The kind cannot change, and the only way a witness goes stale
+/// is its context being destroyed, which each renderer already answers from its own table.
+#[derive(Clone, Copy, Debug)]
+pub enum Bound {
+    Classic(ClassicCtx),
+    Venus(VenusCtx),
+    /// A capset this build serves with nothing: the context exists and answers no command.
+    Unserved,
+}
+
+/// A context the classic renderer serves; see [`Bound`]. Only [`Renderer::bound`] makes one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassicCtx(ContextId);
+
+impl ClassicCtx {
+    pub fn id(self) -> ContextId {
+        self.0
+    }
+
+    /// A witness with no table behind it, for a test that stands up vrend on its own.
+    #[cfg(test)]
+    pub fn for_test(id: ContextId) -> Self {
+        Self(id)
+    }
+}
+
+/// A context the venus renderer serves; see [`Bound`]. Only [`Renderer::bound`] makes one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VenusCtx(ContextId);
+
+impl VenusCtx {
+    pub fn id(self) -> ContextId {
+        self.0
+    }
+
+    /// A witness with no table behind it, for a test that stands up venus on its own.
+    #[cfg(test)]
+    pub fn for_test(id: ContextId) -> Self {
+        Self(id)
+    }
+}
+
 /// One capset, as the guest reads it: which one decides both its layout and the version a
 /// caller may ask for.
 // A capset is built once per request and copied straight out to the caller's buffer; the size
@@ -766,17 +822,17 @@ impl Renderer {
                 Some(shm) => BlobStorage::Minted(shm),
                 None => BlobStorage::Guest,
             },
-            BlobSource::InContext { ctx, id } => match self.blob_capset(ctx)? {
-                CapsetId::Virgl | CapsetId::Virgl2 => {
+            BlobSource::InContext { ctx, id } => match self.bound(ctx)? {
+                Bound::Classic(ctx) => {
                     return self.claim_described(handle, ctx, id, desc, iov);
                 }
                 // A context whose capset names no renderer we have holds nothing, so its ids
                 // name nothing either.
-                CapsetId::Unknown(_) => return Err(Error::RendererUnimplemented),
+                Bound::Unserved => return Err(Error::RendererUnimplemented),
                 // The id is a `VkDeviceMemory` the guest allocated. Every way this can fail is
                 // a distinct `Error` and the caller is told which; the C ABI's single errno for
                 // all of them is `ffi.rs`'s problem and not this function's.
-                CapsetId::Venus => {
+                Bound::Venus(ctx) => {
                     // What the guest asked for travels *into* the export, because the export is
                     // what spends the allocation's one publication. A guest that asks to map
                     // memory the host has no address for would otherwise create the blob, map it,
@@ -808,12 +864,6 @@ impl Renderer {
         Ok(())
     }
 
-    /// Which renderer a blob's id is to be read by. `Err` for a context that is not here, which
-    /// is a guest naming a context it never created.
-    fn blob_capset(&self, ctx: ContextId) -> Result<CapsetId, Error> {
-        self.contexts.get(&ctx).map(|c| c.capset).ok_or(Error::NoContext)
-    }
-
     /// The classic half of a nonzero `blob_id`: adopt the resource `ctx`'s command stream
     /// described under it, and publish its pages.
     ///
@@ -824,7 +874,7 @@ impl Renderer {
     fn claim_described(
         &mut self,
         handle: ResourceHandle,
-        ctx: ContextId,
+        ctx: ClassicCtx,
         id: BlobId,
         desc: BlobDesc,
         iov: Vec<GuestIov>,
@@ -1017,14 +1067,17 @@ impl Renderer {
                 );
             }
         }
-        if let Some(c) = ctx {
-            if !self.contexts.contains_key(&c) {
-                return Err(Error::NoContext);
+        // A transfer runs on the named context's GL context, so only a classic one can be named;
+        // a venus context has none, and naming it is answered as naming no context at all.
+        let ctx = match ctx {
+            Some(c) => {
+                if !attached.contains(&c) {
+                    return Err(Error::NoResource);
+                }
+                Some(self.classic_ctx(c)?)
             }
-            if !attached.contains(&c) {
-                return Err(Error::NoResource);
-            }
-        }
+            None => None,
+        };
         let v = self.vrend.as_mut().ok_or(Error::RendererAbsent)?;
         let own = Iov::new(&own);
         let given = Iov::new(&iov);
@@ -1054,16 +1107,16 @@ impl Renderer {
             .insert(id, Context { id, capset, name: name.clone(), last_fence: BTreeMap::new() });
         // A venus context gets venus state, a classic one vrend's; anything else gets a context
         // and nothing behind it, and finds out when it submits.
-        match capset {
-            CapsetId::Venus => {
+        match self.bound(id).expect("inserted just above") {
+            Bound::Venus(ctx) => {
                 if let Some(v) = self.venus.as_mut() {
-                    v.context_create(id, name);
+                    v.context_create(ctx, name);
                 }
             }
-            CapsetId::Virgl | CapsetId::Virgl2 => {
+            Bound::Classic(ctx) => {
                 let table = self.resources.read().expect("the resource lock is never poisoned");
                 if let Some(v) = self.vrend.as_mut()
-                    && let Err(e) = v.context_create(id, &*table)
+                    && let Err(e) = v.context_create(ctx, &*table)
                 {
                     drop(table);
                     eprintln!("[virglrs] ctx {}: no GL context: {e}", id.get());
@@ -1071,21 +1124,30 @@ impl Renderer {
                     return Err(Error::RendererAbsent);
                 }
             }
-            CapsetId::Unknown(_) => {}
+            Bound::Unserved => {}
         }
         Ok(())
     }
 
     pub fn context_destroy(&mut self, id: ContextId) {
-        if self.contexts.remove(&id).is_none() {
+        let Ok(bound) = self.bound(id) else {
             return;
-        }
-        if let Some(v) = self.venus.as_mut() {
-            v.context_destroy(id);
-        }
-        if let Some(v) = self.vrend.as_mut() {
-            let table = self.resources.read().expect("the resource lock is never poisoned");
-            v.context_destroy(id, &*table);
+        };
+        self.contexts.remove(&id);
+        // The renderer that served it tears its half down; the other never had one.
+        match bound {
+            Bound::Venus(ctx) => {
+                if let Some(v) = self.venus.as_mut() {
+                    v.context_destroy(ctx);
+                }
+            }
+            Bound::Classic(ctx) => {
+                if let Some(v) = self.vrend.as_mut() {
+                    let table = self.resources.read().expect("the resource lock is never poisoned");
+                    v.context_destroy(ctx, &*table);
+                }
+            }
+            Bound::Unserved => {}
         }
         // A destroyed context releases its claim on every resource; the resources themselves
         // survive, because the VMM unrefs them separately and may still be holding one.
@@ -1119,9 +1181,9 @@ impl Renderer {
     }
 
     pub fn ctx_attach_resource(&mut self, ctx: ContextId, handle: ResourceHandle) {
-        if !self.contexts.contains_key(&ctx) {
+        let Ok(bound) = self.bound(ctx) else {
             return;
-        }
+        };
         self.with_resource_mut(handle, |r| {
             if !r.attached.contains(&ctx) {
                 r.attached.push(ctx);
@@ -1129,12 +1191,12 @@ impl Renderer {
         });
         // Only a classic context's attach reaches vrend, as the C's does: its attach dispatches
         // to the attaching context's own renderer, so vrend never hears of a venus context
-        // attaching its own blob. Telling it anyway would park a share of every venus blob in
-        // vrend's table, and those slots are only swept ahead of classic work -- a venus-only
-        // guest would hold every freed window buffer until its context died.
-        if !self.is_classic(ctx) {
+        // attaching its own blob. Told anyway it would park a share of every venus blob in its
+        // table, and those slots are only swept ahead of classic work -- a venus-only guest
+        // would hold every freed window buffer until its context died.
+        let Bound::Classic(classic) = bound else {
             return;
-        }
+        };
         // A blob has no host side until something types it, so this is where vrend hears about
         // one. The share travels rather than an id: an id stops naming this surface the moment
         // the surface dies, and the whole point of holding storage across contexts is that it
@@ -1152,7 +1214,7 @@ impl Renderer {
         if let Some(held) = blob
             && let Some(v) = self.vrend.as_mut()
         {
-            v.resource_attach_blob(handle, held);
+            v.resource_attach_blob(classic, handle, held);
         }
     }
 
@@ -1175,12 +1237,12 @@ impl Renderer {
         // A venus fence carries its waits inside the command stream, so reaching here is already
         // its answer, and it retires straight away. A classic one does not: `Vrend` takes a sync
         // for the work and retires the fence behind it, off this thread.
-        let classic = self.is_classic(ctx);
-        match self.vrend.as_mut().filter(|_| classic) {
-            Some(v) => v.fence_context(ctx, ring, fence),
+        let bound = self.bound(ctx).expect("found just above");
+        match (bound, self.vrend.as_mut()) {
+            (Bound::Classic(classic), Some(v)) => v.fence_context(classic, ring, fence),
             // Retirement goes through the thread whatever satisfied the fence: the asynchrony is
             // the contract, not an optimization.
-            None => self.fences.retire_context(ctx, ring, fence),
+            _ => self.fences.retire_context(ctx, ring, fence),
         }
         Ok(())
     }
@@ -1192,6 +1254,12 @@ impl Renderer {
     /// instead. The C ignores this argument and syncs on whatever context happens to be current,
     /// which is the implicit-global habit this renderer exists to be rid of.
     pub fn create_fence(&mut self, fence: ClientFenceId, on: Option<ContextId>) {
+        // A context vrend does not serve has no GL work to sync on, so a fence naming one is
+        // answered the way one naming no context is: by its place in the queue.
+        let on = on.and_then(|c| match self.bound(c) {
+            Ok(Bound::Classic(classic)) => Some(classic),
+            _ => None,
+        });
         match self.vrend.as_mut() {
             Some(v) => v.fence_global(on, fence),
             None => self.fences.retire_global(fence),
@@ -1211,12 +1279,9 @@ impl Renderer {
     /// [`Renderer::resume_cmd`] with the driver's answer after a driver wait. See [`Submitted`]
     /// and [`Renderer::ring_waiter`].
     pub fn submit_cmd(&mut self, ctx: ContextId, buf: &[u8]) -> Result<Submitted, Error> {
-        let Some(c) = self.contexts.get(&ctx) else {
-            return Err(Error::NoContext);
-        };
-        match c.capset {
-            CapsetId::Venus => self.venus_mut()?.submit(ctx, buf).map_err(venus_error),
-            CapsetId::Virgl | CapsetId::Virgl2 => {
+        match self.bound(ctx)? {
+            Bound::Venus(ctx) => self.venus_mut()?.submit(ctx, buf).map_err(venus_error),
+            Bound::Classic(ctx) => {
                 // The classic wire is dwords; a stream that is not whole dwords is not a stream.
                 if !buf.len().is_multiple_of(4) {
                     return Err(Error::Poisoned);
@@ -1231,7 +1296,7 @@ impl Renderer {
                     Some(Err(_fault)) => Ok(Submitted::Poisoned),
                 }
             }
-            CapsetId::Unknown(_) => Err(Error::RendererUnimplemented),
+            Bound::Unserved => Err(Error::RendererUnimplemented),
         }
     }
 
@@ -1247,13 +1312,10 @@ impl Renderer {
         buf: &[u8],
         answered: Answered,
     ) -> Result<Submitted, Error> {
-        let Some(c) = self.contexts.get(&ctx) else {
-            return Err(Error::NoContext);
-        };
-        match c.capset {
-            CapsetId::Venus => self.venus_mut()?.resume(ctx, buf, answered).map_err(venus_error),
-            CapsetId::Virgl | CapsetId::Virgl2 => Err(Error::Poisoned),
-            CapsetId::Unknown(_) => Err(Error::RendererUnimplemented),
+        match self.bound(ctx)? {
+            Bound::Venus(ctx) => self.venus_mut()?.resume(ctx, buf, answered).map_err(venus_error),
+            Bound::Classic(_) => Err(Error::Poisoned),
+            Bound::Unserved => Err(Error::RendererUnimplemented),
         }
     }
 
@@ -1265,6 +1327,7 @@ impl Renderer {
         ring: RingId,
         seqno: u32,
     ) -> Result<venus::ring_thread::RingWaiter, Error> {
+        let ctx = self.venus_ctx(ctx)?;
         self.venus
             .as_ref()
             .ok_or(Error::RendererAbsent)?
@@ -1285,6 +1348,7 @@ impl Renderer {
     pub fn venus_replay_cmd(&mut self, ctx: ContextId, buf: &[u8]) -> Result<(), Error> {
         // A journal entry never suspends: `Context::submit_ring` and the replay path refuse a
         // wait outright, because there is no thread on the other side of one during a replay.
+        let ctx = self.venus_ctx(ctx)?;
         match self.venus_mut()?.submit(ctx, buf).map_err(venus_error)? {
             Submitted::Done => Ok(()),
             Submitted::Poisoned => Err(Error::Poisoned),
@@ -1299,32 +1363,121 @@ impl Renderer {
         ring: RingId,
         buf: &[u8],
     ) -> Result<(), Error> {
+        let ctx = self.venus_ctx(ctx)?;
         self.venus_mut()?.submit_ring(ctx, ring, buf).map_err(venus_error)
     }
 
-    pub fn venus_replay_begin(&mut self, ctx: ContextId) -> Result<(), Error> {
-        self.venus.as_mut().ok_or(Error::RendererAbsent)?.replay_begin(ctx).map_err(venus_error)
-    }
-
-    pub fn venus_replay_end(&mut self, ctx: ContextId) -> Result<(), Error> {
-        self.venus.as_mut().ok_or(Error::RendererAbsent)?.replay_end(ctx).map_err(venus_error)
-    }
-
-    /// Whether this context is served by the classic renderer.
+    /// Which renderer serves a context. `Err` for an id the guest never created.
     ///
-    /// The snapshot entry points ask because the two renderers keep separate journals and a
-    /// context belongs to exactly one of them. This is the same split the C makes by having
-    /// `limina_classic_ctx_lookup` answer NULL for a venus capset -- said once, as a question
-    /// about the context, rather than rediscovered at each entry point.
-    pub fn is_classic(&self, ctx: ContextId) -> bool {
-        self.contexts
-            .get(&ctx)
-            .is_some_and(|c| matches!(c.capset, CapsetId::Virgl | CapsetId::Virgl2))
+    /// The one place a context's capset is read for dispatch; see [`Bound`] for what the answer
+    /// is good for. This is the split the C makes by having `limina_classic_ctx_lookup` answer
+    /// NULL for a venus capset, said once as a question about the context rather than
+    /// rediscovered at each entry point.
+    pub fn bound(&self, ctx: ContextId) -> Result<Bound, Error> {
+        let c = self.contexts.get(&ctx).ok_or(Error::NoContext)?;
+        Ok(match c.capset {
+            CapsetId::Virgl | CapsetId::Virgl2 => Bound::Classic(ClassicCtx(ctx)),
+            CapsetId::Venus => Bound::Venus(VenusCtx(ctx)),
+            CapsetId::Unknown(_) => Bound::Unserved,
+        })
     }
 
-    /// One classic context's journal, for the VMM to store beside its own.
-    pub fn vrend_journal_export(&mut self, id: ContextId) -> Option<Vec<u8>> {
-        self.vrend.as_mut()?.journal_export(id)
+    /// The classic witness for `ctx`, or `NoContext` for a context vrend does not serve: to the
+    /// classic renderer, a venus context is not there.
+    fn classic_ctx(&self, ctx: ContextId) -> Result<ClassicCtx, Error> {
+        match self.bound(ctx)? {
+            Bound::Classic(c) => Ok(c),
+            Bound::Venus(_) | Bound::Unserved => Err(Error::NoContext),
+        }
+    }
+
+    /// The venus witness for `ctx`, by the same rule.
+    fn venus_ctx(&self, ctx: ContextId) -> Result<VenusCtx, Error> {
+        match self.bound(ctx)? {
+            Bound::Venus(c) => Ok(c),
+            Bound::Classic(_) | Bound::Unserved => Err(Error::NoContext),
+        }
+    }
+
+    // ---- journals ----
+
+    /// One context's journal, for the VMM to store beside its own -- from whichever renderer
+    /// keeps it. `None` for a context that is not here or has nothing retained, which is
+    /// deliberately not an empty blob: a VMM that stored zero bytes and restored them later would
+    /// have rebuilt nothing and been told it succeeded.
+    pub fn journal_export(&mut self, ctx: ContextId) -> Option<Vec<u8>> {
+        match self.bound(ctx).ok()? {
+            Bound::Classic(c) => self.vrend.as_mut()?.journal_export(c),
+            Bound::Venus(c) => self.venus.as_ref()?.journal_export(c),
+            Bound::Unserved => None,
+        }
+    }
+
+    /// Hand a context the journal it will be rebuilt from, in the format of the renderer that
+    /// keeps it. `Ok` is how many entries it read.
+    pub fn journal_restore(&mut self, ctx: ContextId, bytes: &[u8]) -> Result<usize, Error> {
+        let (which, restored) = match self.bound(ctx)? {
+            Bound::Classic(c) => (
+                "vrend",
+                self.vrend.as_mut().ok_or(Error::RendererAbsent)?.journal_restore(c, bytes),
+            ),
+            Bound::Venus(c) => ("venus", self.venus_mut()?.journal_restore(c, bytes)),
+            Bound::Unserved => return Err(Error::RendererUnimplemented),
+        };
+        restored.map_err(|why| {
+            // The blob has been through a snapshot file since it was written. Saying which way it
+            // is wrong is the difference between a bug that can be found and a resume that is
+            // merely black.
+            eprintln!("[virglrs] {which}: ctx {}: journal refused: {why}", ctx.get());
+            Error::JournalRefused(why)
+        })
+    }
+
+    /// Begin rebuilding a context from its journal.
+    pub fn replay_begin(&mut self, ctx: ContextId) -> Result<(), Error> {
+        match self.bound(ctx)? {
+            Bound::Classic(c) => self.vrend_answered(|v| v.replay_begin(c)),
+            Bound::Venus(c) => self.venus_mut()?.replay_begin(c).map_err(venus_error),
+            Bound::Unserved => Err(Error::RendererUnimplemented),
+        }
+    }
+
+    /// Feed a context's retained commands up to `upto`.
+    pub fn replay_upto(&mut self, ctx: ContextId, upto: u64) -> Result<(), Error> {
+        match self.bound(ctx)? {
+            Bound::Classic(c) => {
+                let table = self.resources.read().expect("the resource lock is never poisoned");
+                let v = self.vrend.as_mut().ok_or(Error::RendererAbsent)?;
+                if v.replay_upto(c, &*table, crate::vrend::journal::Seq(upto)) {
+                    Ok(())
+                } else {
+                    Err(Error::NoContext)
+                }
+            }
+            Bound::Venus(c) => self
+                .venus_mut()?
+                .replay_upto(c, crate::venus::journal::Seq(upto))
+                .map_err(venus_error),
+            Bound::Unserved => Err(Error::RendererUnimplemented),
+        }
+    }
+
+    /// Finish rebuilding a context, and start whatever the journal built.
+    pub fn replay_end(&mut self, ctx: ContextId) -> Result<(), Error> {
+        match self.bound(ctx)? {
+            Bound::Classic(c) => self.vrend_answered(|v| v.replay_end(c)),
+            Bound::Venus(c) => self.venus_mut()?.replay_end(c).map_err(venus_error),
+            Bound::Unserved => Err(Error::RendererUnimplemented),
+        }
+    }
+
+    /// Run a classic replay step whose only refusal is "that context is not here".
+    fn vrend_answered(
+        &mut self,
+        f: impl FnOnce(&mut vrend::vrend::Vrend) -> bool,
+    ) -> Result<(), Error> {
+        let v = self.vrend.as_mut().ok_or(Error::RendererAbsent)?;
+        if f(v) { Ok(()) } else { Err(Error::NoContext) }
     }
 
     /// One classic context's resource contents, for the VMM to store beside its journal.
@@ -1337,9 +1490,7 @@ impl Renderer {
     /// too. What it costs is a full readback of every level of every attached resource; that is
     /// the price of the textures whose only copy is on the host, and a snapshot is not a hot path.
     pub fn vrend_content_export(&mut self, ctx: ContextId) -> Option<(Vec<u8>, content::Account)> {
-        if !self.is_classic(ctx) {
-            return None;
-        }
+        let classic = self.classic_ctx(ctx).ok()?;
         let handles: Vec<ResourceHandle> = self
             .resources
             .read()
@@ -1369,7 +1520,7 @@ impl Renderer {
                     synchronized: true,
                 };
                 let v = self.vrend.as_mut().expect("a classic context needs vrend");
-                match v.transfer(Some(ctx), handle, false, Some(&own), &span.iov(), &info) {
+                match v.transfer(Some(classic), handle, false, Some(&own), &span.iov(), &info) {
                     // Counted, and nothing written: a level that could not be read back has no
                     // bytes, and zeros in its place would restore over whatever the guest still
                     // holds. The C writes them, having called `calloc` so at least they are
@@ -1435,9 +1586,7 @@ impl Renderer {
         ctx: ContextId,
         blob: &[u8],
     ) -> Result<content::Account, Error> {
-        if !self.is_classic(ctx) {
-            return Err(Error::NoContext);
-        }
+        let classic = self.classic_ctx(ctx)?;
         let entries = content::entries(blob).map_err(Error::MalformedContent)?;
         let mut account = content::Account::default();
         for e in entries {
@@ -1460,23 +1609,12 @@ impl Renderer {
                 synchronized: true,
             };
             let v = self.vrend.as_mut().expect("a classic context needs vrend");
-            match v.transfer(Some(ctx), e.res, true, Some(&own), &span.iov(), &info) {
+            match v.transfer(Some(classic), e.res, true, Some(&own), &span.iov(), &info) {
                 Ok(()) => account.entries += 1,
                 Err(_) => account.skipped += 1,
             }
         }
         Ok(account)
-    }
-
-    /// One venus context's journal.
-    ///
-    /// The held set is the reachability the object table cannot see. A blob resource holds a share
-    /// of the storage a venus allocation was published from, and that share keeps the bytes alive
-    /// after the guest has freed the allocation -- so the resource goes on working, and a restore
-    /// that did not rebuild the allocation would produce a dead blob where the original had a live
-    /// one. Collected here because this is the only layer that can see both tables at once.
-    pub fn venus_journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
-        self.venus.as_ref()?.journal_export(id)
     }
 
     /// How many of `ctx`'s allocations a resource still holds a share of.
@@ -1488,59 +1626,23 @@ impl Renderer {
     /// exercise. Better to decline the comparison and say why than to report a difference that is
     /// the gate's own gap.
     pub fn venus_held_allocations(&self, ctx: ContextId) -> usize {
+        let Ok(ctx) = self.venus_ctx(ctx) else {
+            return 0;
+        };
         self.venus.as_ref().map_or(0, |v| v.held_allocations(ctx))
     }
 
-    /// How far a venus context's journal has been written, for the VMM's fence.
+    /// How far a venus context's journal has been written, for the VMM's fence. `None` for a
+    /// context venus does not serve: a classic journal is fenced on its own sequence numbers,
+    /// through [`Renderer::replay_upto`].
     pub fn venus_journal_seq(&self, id: ContextId) -> Option<u64> {
-        Some(self.venus.as_ref()?.journal_seq(id)?.0)
-    }
-
-    /// Hand a venus context the journal it will be rebuilt from.
-    pub fn venus_journal_restore(
-        &mut self,
-        ctx: ContextId,
-        bytes: &[u8],
-    ) -> Result<usize, &'static str> {
-        self.venus.as_mut().ok_or("no venus renderer")?.journal_restore(ctx, bytes)
-    }
-
-    /// Feed a venus context's retained commands up to `upto`.
-    pub fn venus_replay_upto(&mut self, ctx: ContextId, upto: u64) -> Result<(), Error> {
-        self.venus_mut()?.replay_upto(ctx, crate::venus::journal::Seq(upto)).map_err(venus_error)
+        let ctx = self.venus_ctx(id).ok()?;
+        Some(self.venus.as_ref()?.journal_seq(ctx)?.0)
     }
 
     /// What the venus recorder dropped, by command name, most-dropped first.
     pub fn venus_journal_transient(&self) -> Vec<(&'static str, u64)> {
         self.venus.as_ref().map(|v| v.journal_transient()).unwrap_or_default()
-    }
-
-    /// Begin rebuilding a classic context from its journal.
-    pub fn vrend_replay_begin(&mut self, ctx: ContextId) -> bool {
-        self.vrend.as_mut().is_some_and(|v| v.replay_begin(ctx))
-    }
-
-    /// Hand a classic context the journal it will be rebuilt from.
-    pub fn vrend_journal_restore(
-        &mut self,
-        ctx: ContextId,
-        bytes: &[u8],
-    ) -> Result<usize, &'static str> {
-        self.vrend.as_mut().ok_or("no classic renderer")?.journal_restore(ctx, bytes)
-    }
-
-    /// Feed a classic context's retained commands up to `upto`.
-    pub fn vrend_replay_upto(&mut self, ctx: ContextId, upto: u64) -> bool {
-        let table = self.resources.read().expect("the resource lock is never poisoned");
-        let Some(v) = self.vrend.as_mut() else {
-            return false;
-        };
-        v.replay_upto(ctx, &*table, crate::vrend::journal::Seq(upto))
-    }
-
-    /// Finish rebuilding a classic context, and report what it could not use.
-    pub fn vrend_replay_end(&mut self, ctx: ContextId) -> bool {
-        self.vrend.as_mut().is_some_and(|v| v.replay_end(ctx))
     }
 
     /// Each classic context's journal size and entry count, round-tripped.
@@ -1587,7 +1689,7 @@ impl Renderer {
     /// object by, which an id alone cannot do once the guest reuses it.
     pub fn venus_memory_export(
         &mut self,
-        ctx_id: ContextId,
+        ctx_id: VenusCtx,
         mem: BlobId,
         blob_size: u64,
         route: venus::driver::Route,
@@ -1937,8 +2039,9 @@ impl Renderer {
         ctx_id: ContextId,
         blob: &[u8],
     ) -> Result<venus::sync::Account, Error> {
+        let ctx = self.venus_ctx(ctx_id)?;
         let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
-        v.with_context_mut(ctx_id, |ctx| ctx.sync_restore(blob))
+        v.with_context_mut(ctx, |ctx| ctx.sync_restore(blob))
             .ok_or(Error::NoContext)?
             .map_err(Error::MalformedSync)
     }
@@ -1950,8 +2053,9 @@ impl Renderer {
         ctx_id: ContextId,
         f: impl FnOnce(&venus::context::Context) -> R,
     ) -> Result<R, Error> {
+        let ctx = self.venus_ctx(ctx_id)?;
         let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
-        v.with_context(ctx_id, f).ok_or(Error::NoContext)
+        v.with_context(ctx, f).ok_or(Error::NoContext)
     }
 }
 
@@ -2778,7 +2882,7 @@ mod tests {
         let first = r
             .venus
             .as_ref()
-            .and_then(|v| v.with_context(two, |c| c.key()))
+            .and_then(|v| v.with_context(VenusCtx::for_test(two), |c| c.key()))
             .expect("the context was just created");
 
         let blob = ResourceHandle::new(5).unwrap();
@@ -2789,7 +2893,7 @@ mod tests {
         r.venus
             .as_ref()
             .expect("venus is configured")
-            .with_context_mut(two, |c| c.plant_export(key, &pages))
+            .with_context_mut(VenusCtx::for_test(two), |c| c.plant_export(key, &pages))
             .expect("the context was just created");
         r.insert(
             blob,

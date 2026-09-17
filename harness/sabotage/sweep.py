@@ -1144,13 +1144,10 @@ SABOTAGES = [
         'a_reset_frees_the_handles_vrend_held',
     ),
     (
-        "a venus context's own attach hands vrend a share of its blob",
+        "a venus context resolves to the classic renderer, so vrend gets its blob attach",
         'src/renderer.rs',
-        """        if !self.is_classic(ctx) {
-            return;
-        }
-        // A blob has no host side until something types it, so this is where vrend hears about""",
-        """        // A blob has no host side until something types it, so this is where vrend hears about""",
+        """            CapsetId::Venus => Bound::Venus(VenusCtx(ctx)),""",
+        """            CapsetId::Venus => Bound::Classic(ClassicCtx(ctx)),""",
         'a_venus_contexts_own_blob_is_released_by_its_unref_without_classic_work',
     ),
     (

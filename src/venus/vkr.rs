@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::config::Config;
 use crate::ids::{ContextId, RingId};
+use crate::renderer::VenusCtx;
 
 use super::context::{Context, Submitted, Unimplemented, Wait};
 use super::driver::Answered;
@@ -242,7 +243,8 @@ impl Vkr {
     /// `name` is what the guest called this context; it goes to the budget ledger, which is the
     /// only thing that reads it, and reaches it as an argument from here -- the one place a
     /// context is stood up.
-    pub fn context_create(&mut self, id: ContextId, name: String) {
+    pub fn context_create(&mut self, ctx: VenusCtx, name: String) {
+        let id = ctx.id();
         // Checked before the new context is built: building it opens the id's budget account,
         // which is one per live id too.
         assert!(!self.contexts.contains_key(&id), "{id:?} already had a venus context");
@@ -253,7 +255,8 @@ impl Vkr {
 
     /// Tear a context down. Every host handle it still holds dies with it -- a guest that leaks is
     /// not a guest that gets to keep host memory after it is gone.
-    pub fn context_destroy(&mut self, id: ContextId) {
+    pub fn context_destroy(&mut self, ctx: VenusCtx) {
+        let id = ctx.id();
         // Stop the rings before letting go of the context, and do it in that order deliberately.
         // A ring thread upgrades a weak claim on this context for the length of one dispatch, so
         // a thread still running when the last strong reference goes could be holding the last
@@ -276,18 +279,18 @@ impl Vkr {
     ///
     /// Scoped rather than returning a `&Context`, because the reference is only sound while the
     /// lock is held and a signature that hands one out cannot say that.
-    pub fn with_context<R>(&self, id: ContextId, f: impl FnOnce(&Context) -> R) -> Option<R> {
-        let ctx = self.contexts.get(&id)?;
+    pub fn with_context<R>(&self, ctx: VenusCtx, f: impl FnOnce(&Context) -> R) -> Option<R> {
+        let ctx = self.contexts.get(&ctx.id())?;
         Some(f(&ctx.lock().expect("a context lock is never poisoned")))
     }
 
     /// The same, for the paths that change a context rather than read one.
     pub fn with_context_mut<R>(
         &self,
-        id: ContextId,
+        ctx: VenusCtx,
         f: impl FnOnce(&mut Context) -> R,
     ) -> Option<R> {
-        let ctx = self.contexts.get(&id)?;
+        let ctx = self.contexts.get(&ctx.id())?;
         Some(f(&mut ctx.lock().expect("a context lock is never poisoned")))
     }
 
@@ -351,7 +354,8 @@ impl Vkr {
     ///
     /// Rings are promoted whether the batch finished or suspended. A `vkCreateRingMESA` before the
     /// wait has to start reading, or the wait is on a ring that will never run.
-    pub fn submit(&mut self, id: ContextId, buf: &[u8]) -> Result<Submitted, Error> {
+    pub fn submit(&mut self, ctx: VenusCtx, buf: &[u8]) -> Result<Submitted, Error> {
+        let id = ctx.id();
         let out = self.on_context(id, |ctx, todo, global, resources| {
             timed(&self.tally, Origin::Context, ctx, buf, |ctx| {
                 ctx.submit(buf, todo, global, resources)
@@ -366,10 +370,11 @@ impl Vkr {
     /// suspend again, and rings it created are promoted either way.
     pub fn resume(
         &mut self,
-        id: ContextId,
+        ctx: VenusCtx,
         buf: &[u8],
         answered: Answered,
     ) -> Result<Submitted, Error> {
+        let id = ctx.id();
         let out = self.on_context(id, |ctx, todo, global, resources| {
             timed(&self.tally, Origin::Context, ctx, buf, |ctx| {
                 ctx.resume(buf, answered, todo, global, resources)
@@ -387,18 +392,18 @@ impl Vkr {
     /// is waiting for needs the locks the waiter would otherwise still be holding.
     pub fn ring_waiter(
         &self,
-        id: ContextId,
+        ctx: VenusCtx,
         ring: RingId,
         seqno: u32,
     ) -> Result<RingWaiter, Error> {
-        let arc = self.contexts.get(&id).ok_or(Error::NoContext)?;
+        let arc = self.contexts.get(&ctx.id()).ok_or(Error::NoContext)?;
         let ctx = arc.lock().expect("a context lock is never poisoned");
         ctx.ring_waiter(ring, seqno).ok_or(Error::NoRing)
     }
 
     /// Feed one journal entry to a ring's stream. Replay only, so nothing is promoted here.
-    pub fn submit_ring(&mut self, id: ContextId, ring: RingId, buf: &[u8]) -> Result<(), Error> {
-        self.on_context_ok(id, |ctx, todo, global, resources| {
+    pub fn submit_ring(&mut self, ctx: VenusCtx, ring: RingId, buf: &[u8]) -> Result<(), Error> {
+        self.on_context_ok(ctx.id(), |ctx, todo, global, resources| {
             timed(&self.tally, Origin::Ring, ctx, buf, |ctx| {
                 ctx.submit_ring(ring, buf, todo, global, resources)
             })
@@ -430,36 +435,36 @@ impl Vkr {
         if self.on_context(id, f)? { Ok(()) } else { Err(Error::Poisoned) }
     }
 
-    pub fn replay_begin(&mut self, id: ContextId) -> Result<(), Error> {
-        self.with_context_mut(id, Context::replay_begin).ok_or(Error::NoContext)?;
+    pub fn replay_begin(&mut self, ctx: VenusCtx) -> Result<(), Error> {
+        self.with_context_mut(ctx, Context::replay_begin).ok_or(Error::NoContext)?;
         Ok(())
     }
 
     /// One context's journal, for the VMM to store beside its own.
-    pub fn journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
-        let ctx = self.contexts.get(&id)?;
+    pub fn journal_export(&self, ctx: VenusCtx) -> Option<Vec<u8>> {
+        let ctx = self.contexts.get(&ctx.id())?;
         let ctx = ctx.lock().expect("a context lock is never poisoned");
         ctx.journal_export()
     }
 
     /// How many of a context's exported allocations a share is still held of.
-    pub fn held_allocations(&self, id: ContextId) -> usize {
-        let Some(ctx) = self.contexts.get(&id) else {
+    pub fn held_allocations(&self, ctx: VenusCtx) -> usize {
+        let Some(ctx) = self.contexts.get(&ctx.id()) else {
             return 0;
         };
         ctx.lock().expect("a context lock is never poisoned").held_allocations()
     }
 
     /// How far a context's journal has been written.
-    pub fn journal_seq(&self, id: ContextId) -> Option<Seq> {
-        let ctx = self.contexts.get(&id)?;
+    pub fn journal_seq(&self, ctx: VenusCtx) -> Option<Seq> {
+        let ctx = self.contexts.get(&ctx.id())?;
         let ctx = ctx.lock().expect("a context lock is never poisoned");
         Some(ctx.journal_seq())
     }
 
     /// Hand a context the journal it will be rebuilt from.
-    pub fn journal_restore(&mut self, id: ContextId, bytes: &[u8]) -> Result<usize, &'static str> {
-        let ctx = self.contexts.get(&id).ok_or("no such context")?;
+    pub fn journal_restore(&mut self, ctx: VenusCtx, bytes: &[u8]) -> Result<usize, &'static str> {
+        let ctx = self.contexts.get(&ctx.id()).ok_or("no such context")?;
         let mut ctx = ctx.lock().expect("a context lock is never poisoned");
         ctx.journal_restore(bytes)
     }
@@ -468,8 +473,8 @@ impl Vkr {
     ///
     /// Nothing is promoted here: a ring the journal creates stays idle until `replay_end`, which is
     /// what stops it reading a guest's buffer while the rest of the journal is still going in.
-    pub fn replay_upto(&mut self, id: ContextId, upto: Seq) -> Result<(), Error> {
-        self.on_context_ok(id, |ctx, todo, global, resources| {
+    pub fn replay_upto(&mut self, ctx: VenusCtx, upto: Seq) -> Result<(), Error> {
+        self.on_context_ok(ctx.id(), |ctx, todo, global, resources| {
             ctx.replay_upto(upto, todo, global, resources)
         })
     }
@@ -492,11 +497,11 @@ impl Vkr {
     ///
     /// The order matters and matches the C: the rings start first, then `replaying` clears. A ring
     /// promoted here resumes at the head its snapshot restored, not at the start of its buffer.
-    pub fn replay_end(&mut self, id: ContextId) -> Result<(), Error> {
-        self.with_context_mut(id, Context::replay_end).ok_or(Error::NoContext)?;
+    pub fn replay_end(&mut self, ctx: VenusCtx) -> Result<(), Error> {
+        self.with_context_mut(ctx, Context::replay_end).ok_or(Error::NoContext)?;
         // After the flag clears, not before: promotion refuses to start a ring while the context
         // is still replaying, which is the single check both paths go through.
-        self.promote(id);
+        self.promote(ctx.id());
         Ok(())
     }
 }
@@ -513,8 +518,8 @@ mod tests {
     const RES: ResourceHandle = ResourceHandle::new(449).unwrap();
     const BUF_AT: usize = 0xc0;
     const BUF_SIZE: usize = 0x20000;
-    fn ctx_id() -> ContextId {
-        ContextId::new(1).expect("1 is not zero")
+    fn ctx_id() -> VenusCtx {
+        VenusCtx::for_test(ContextId::new(1).expect("1 is not zero"))
     }
 
     /// A resource table with exactly one mapped shm resource, which is all a ring needs.
@@ -920,7 +925,7 @@ mod tests {
 
         guest_writes(&map, &wire_wait_vq(1));
         until("the ring to block on the virtqueue seqno", || {
-            v.contexts[&ctx_id()]
+            v.contexts[&ctx_id().id()]
                 .lock()
                 .expect("not poisoned")
                 .ring_waiter(RingId::new(7).unwrap(), 1)
@@ -1260,10 +1265,10 @@ mod tests {
         RELEASE.store(false, Ordering::Release);
 
         let (mut v, map) = vkr();
-        let other = ContextId::new(2).expect("2 is not zero");
+        let other = VenusCtx::for_test(ContextId::new(2).expect("2 is not zero"));
         v.context_create(other, String::new());
         {
-            let arc = v.contexts.get(&ctx_id()).expect("created by the fixture");
+            let arc = v.contexts.get(&ctx_id().id()).expect("created by the fixture");
             let mut ctx = arc.lock().expect("a context lock is never poisoned");
             let mut fns = crate::vulkan::Device::default();
             fns.plant_vkDeviceWaitIdle(wait_idle);
@@ -1282,8 +1287,8 @@ mod tests {
 
         // What a ring thread of each context holds: the same claims, without the thread, so the
         // test decides when each batch is offered rather than racing a loop for the answer.
-        let dispatch = |id: ContextId| RingDispatch {
-            ctx: Arc::downgrade(v.contexts.get(&id).expect("created above")),
+        let dispatch = |ctx: VenusCtx| RingDispatch {
+            ctx: Arc::downgrade(v.contexts.get(&ctx.id()).expect("created above")),
             resources: Arc::clone(&v.resources),
             todo: Arc::clone(&v.todo),
             tally: Arc::clone(&v.tally),
@@ -1388,7 +1393,7 @@ mod tests {
 
         let (mut v, map) = vkr();
         {
-            let arc = v.contexts.get(&ctx_id()).expect("created by the fixture");
+            let arc = v.contexts.get(&ctx_id().id()).expect("created by the fixture");
             let mut ctx = arc.lock().expect("a context lock is never poisoned");
             let mut fns = crate::vulkan::Device::default();
             fns.plant_vkWaitForFences(wait);
@@ -1514,7 +1519,7 @@ mod tests {
 
         let (mut v, map) = vkr();
         {
-            let arc = v.contexts.get(&ctx_id()).expect("created by the fixture");
+            let arc = v.contexts.get(&ctx_id().id()).expect("created by the fixture");
             let mut ctx = arc.lock().expect("a context lock is never poisoned");
             let mut fns = crate::vulkan::Device::default();
             fns.plant_vkWaitForFences(wait);

@@ -32,6 +32,7 @@ use crate::config::Config;
 use crate::decode;
 use crate::guest_mem::{Iov, PixelSource};
 use crate::ids::{BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, RingIdx};
+use crate::renderer::ClassicCtx;
 use crate::surface;
 use std::fmt;
 use std::sync::Arc;
@@ -431,7 +432,11 @@ impl Vrend {
     /// `None` for a context that is not here. An empty journal still serializes: a context that
     /// built nothing is a fact worth restoring accurately, and the alternative -- answering
     /// "no journal" -- is what the VMM reads as "this context is not mine to rebuild".
-    pub fn journal_export(&mut self, id: ContextId) -> Option<Vec<u8>> {
+    pub fn journal_export(&mut self, ctx: ClassicCtx) -> Option<Vec<u8>> {
+        self.journal_of(ctx.id())
+    }
+
+    fn journal_of(&mut self, id: ContextId) -> Option<Vec<u8>> {
         // Named separately, because one is read while the other is reconciled: a `&mut self`
         // method could not hold both.
         let Vrend { contexts, resources, .. } = self;
@@ -451,7 +456,7 @@ impl Vrend {
         let ids: Vec<ContextId> = self.contexts.keys().copied().collect();
         ids.into_iter()
             .filter_map(|id| {
-                let bytes = self.journal_export(id)?;
+                let bytes = self.journal_of(id)?;
                 let read_back = crate::vrend::journal::parse(&bytes).map(|e| e.len());
                 Some((id, bytes.len(), read_back))
             })
@@ -459,8 +464,8 @@ impl Vrend {
     }
 
     /// Begin rebuilding a classic context. `false` if it is not here.
-    pub fn replay_begin(&mut self, id: ContextId) -> bool {
-        match self.contexts.get_mut(&id) {
+    pub fn replay_begin(&mut self, ctx: ClassicCtx) -> bool {
+        match self.contexts.get_mut(&ctx.id()) {
             Some(c) => {
                 c.replay_begin();
                 true
@@ -470,12 +475,17 @@ impl Vrend {
     }
 
     /// Hand a classic context the journal it will be rebuilt from.
-    pub fn journal_restore(&mut self, id: ContextId, bytes: &[u8]) -> Result<usize, &'static str> {
-        self.contexts.get_mut(&id).ok_or("no such context")?.replay_restore(bytes)
+    pub fn journal_restore(
+        &mut self,
+        ctx: ClassicCtx,
+        bytes: &[u8],
+    ) -> Result<usize, &'static str> {
+        self.contexts.get_mut(&ctx.id()).ok_or("no such context")?.replay_restore(bytes)
     }
 
     /// Feed a classic context's retained commands up to `upto`.
-    pub fn replay_upto(&mut self, id: ContextId, guest: &dyn Guest, upto: Seq) -> bool {
+    pub fn replay_upto(&mut self, ctx: ClassicCtx, guest: &dyn Guest, upto: Seq) -> bool {
+        let id = ctx.id();
         if !self.contexts.contains_key(&id) {
             return false;
         }
@@ -485,8 +495,8 @@ impl Vrend {
     }
 
     /// Finish rebuilding a classic context, and report what it could not use.
-    pub fn replay_end(&mut self, id: ContextId) -> bool {
-        match self.contexts.get_mut(&id) {
+    pub fn replay_end(&mut self, ctx: ClassicCtx) -> bool {
+        match self.contexts.get_mut(&ctx.id()) {
             Some(c) => {
                 c.replay_end();
                 true
@@ -497,14 +507,16 @@ impl Vrend {
 
     // ---- contexts ----
 
-    pub fn context_create(&mut self, id: ContextId, guest: &dyn Guest) -> Result<(), EglError> {
+    pub fn context_create(&mut self, ctx: ClassicCtx, guest: &dyn Guest) -> Result<(), EglError> {
+        let id = ctx.id();
         let (mut host, contexts) = self.split(id, guest);
         let c = Context::new(&mut host)?;
         contexts.insert(id, c);
         Ok(())
     }
 
-    pub fn context_destroy(&mut self, id: ContextId, guest: &dyn Guest) {
+    pub fn context_destroy(&mut self, ctx: ClassicCtx, guest: &dyn Guest) {
+        let id = ctx.id();
         let (mut host, contexts) = self.split(id, guest);
         if let Some(c) = contexts.remove(&id) {
             c.destroy(&mut host);
@@ -515,17 +527,14 @@ impl Vrend {
         self.sweep_doomed();
     }
 
-    pub fn has_context(&self, id: ContextId) -> bool {
-        self.contexts.contains_key(&id)
-    }
-
     /// Run a batch on a context. `None` for a context this renderer does not have.
     pub fn submit(
         &mut self,
-        id: ContextId,
+        ctx: ClassicCtx,
         words: &[u32],
         guest: &dyn Guest,
     ) -> Option<Result<(), Fault>> {
+        let id = ctx.id();
         // One tick per batch, before anything in it runs. It is what says a guest has had no
         // opportunity to rewrite its pages since a copy of them was taken -- see
         // [`resource::GuestPixels`] -- so it must move exactly when that stops being true.
@@ -578,7 +587,7 @@ impl Vrend {
     /// its address space. Refused, never clamped.
     pub fn claim_described(
         &mut self,
-        ctx: ContextId,
+        ctx: ClassicCtx,
         blob: BlobId,
         handle: ResourceHandle,
         size: u64,
@@ -590,7 +599,7 @@ impl Vrend {
         );
         let mut res = self
             .contexts
-            .get_mut(&ctx)
+            .get_mut(&ctx.id())
             .and_then(|c| c.claim_described(blob))
             .ok_or(ClaimRefused::NotDescribed)?;
         let args = res.args;
@@ -635,8 +644,13 @@ impl Vrend {
     ///
     /// Idempotent: the guest may attach one resource to several contexts, and a later attach
     /// must not un-type what an earlier one's `SET_TYPE` already settled.
+    ///
+    /// The witness is the proof that a classic context is the one attaching. Attachment itself
+    /// lives in the renderer's table, so nothing here is keyed by it -- what it settles is that a
+    /// venus context attaching its own blob cannot reach this and leave a share parked here.
     pub fn resource_attach_blob(
         &mut self,
+        _by: ClassicCtx,
         handle: ResourceHandle,
         storage: Option<surface::Adoptable>,
     ) {
@@ -825,7 +839,8 @@ impl Vrend {
     /// Retirement is queued behind the work rather than taken here, so this returns as soon as the
     /// fence is *taken* -- the caller is holding the renderer, and waiting under it is what made
     /// one heavy client slow down every other context.
-    pub fn fence_context(&mut self, ctx: ContextId, ring: RingIdx, id: FenceId) {
+    pub fn fence_context(&mut self, ctx: ClassicCtx, ring: RingIdx, id: FenceId) {
+        let ctx = ctx.id();
         // With no waiter there is no queue to retire behind, so the fence is answered inline --
         // the way this renderer did before there was one. Taking a sync and dropping it unwaited
         // would retire the fence early, which is the whole hazard this path exists to prevent.
@@ -851,7 +866,8 @@ impl Vrend {
     /// `on` is the context whose work the fence is for. `None` -- or a context this renderer does
     /// not have -- means it cannot be attributed to one, and the fence is answered by its place in
     /// the waiter's queue instead; see [`Self::take_fence`].
-    pub fn fence_global(&mut self, on: Option<ContextId>, id: ClientFenceId) {
+    pub fn fence_global(&mut self, on: Option<ClassicCtx>, id: ClientFenceId) {
+        let on = on.map(ClassicCtx::id);
         if self.waiter.is_none() {
             self.finish_all();
             self.fences.retire_global(id);
@@ -1160,14 +1176,14 @@ impl Vrend {
     /// ones when the caller gave none.
     pub fn transfer(
         &mut self,
-        ctx: Option<ContextId>,
+        ctx: Option<ClassicCtx>,
         handle: ResourceHandle,
         to_host: bool,
         own: Option<&Iov<'_>>,
         pages: &Iov<'_>,
         info: &Info,
     ) -> Result<(), transfer::Error> {
-        match ctx {
+        match ctx.map(ClassicCtx::id) {
             Some(id) => {
                 if !self.contexts.contains_key(&id) {
                     return Err(transfer::Error::NoPages);
@@ -1384,7 +1400,7 @@ mod tests {
             "without a waiter no sync is ever taken and this tests nothing"
         );
 
-        let ctx = ContextId::new(1).expect("a context id");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
         v.context_create(ctx, &NoGuest).expect("a context");
 
         // Each of the three shapes a classic fence comes in: named by a context, named by the
@@ -1432,7 +1448,7 @@ mod tests {
         )
         .expect("vrend comes up");
 
-        let ctx = ContextId::new(1).expect("a context id");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
         v.context_create(ctx, &NoGuest).expect("a context");
 
         // `cmd | obj << 8 | len << 16`, then the payload -- see `proto`. Two more sub-contexts, so
@@ -1447,7 +1463,7 @@ mod tests {
             .expect("a sub-context is created");
         }
 
-        let answer = v.decide_fence(Some(ctx));
+        let answer = v.decide_fence(Some(ctx.id()));
         let Answer::Syncs(syncs) = answer else {
             panic!("a context with queued sub-contexts is answered by syncs, got {}", answer.name())
         };
@@ -1483,9 +1499,9 @@ mod tests {
             crate::vrend::resource::Condemned::default(),
         )
         .expect("vrend comes up");
-        let ctx = ContextId::new(1).expect("a context id");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
         v.context_create(ctx, &NoGuest).expect("a context");
-        assert!(!v.contexts[&ctx].shader_dirty(), "a fresh context has nothing to reselect");
+        assert!(!v.contexts[&ctx.id()].shader_dirty(), "a fresh context has nothing to reselect");
 
         // `cmd | obj << 8 | len << 16`, then the payload -- see `proto`. A rasterizer that does
         // nothing but let a triangle through: front-CCW and the half-pixel centre, point size and
@@ -1506,11 +1522,11 @@ mod tests {
             0,
         ];
         v.submit(ctx, &create, &NoGuest).expect("the context takes the batch").expect("created");
-        assert!(!v.contexts[&ctx].shader_dirty(), "creating an object binds nothing");
+        assert!(!v.contexts[&ctx.id()].shader_dirty(), "creating an object binds nothing");
 
         let bind = [Cmd::BindObject as u32 | rasterizer << 8 | 1 << 16, handle];
         v.submit(ctx, &bind, &NoGuest).expect("the context takes the batch").expect("bound");
-        assert!(v.contexts[&ctx].shader_dirty(), "the bind alone marks the shader dirty");
+        assert!(v.contexts[&ctx.id()].shader_dirty(), "the bind alone marks the shader dirty");
 
         v.context_destroy(ctx, &NoGuest);
     }
