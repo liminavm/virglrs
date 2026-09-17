@@ -656,7 +656,7 @@ fn export_query(q: &mut abi::ExportQuery) -> c_int {
     };
     // More planes than the ABI has room for cannot be described at all, and describing the first
     // few would be a layout the caller would read as whole.
-    let planes = layout.plane_count as usize;
+    let planes = layout.planes.len();
     if planes == 0 || planes > q.out_fds.len() {
         return EINVAL;
     }
@@ -667,7 +667,7 @@ fn export_query(q: &mut abi::ExportQuery) -> c_int {
     // the caller is left owing nothing rather than owning a short count it has to infer.
     let mut offsets = Vec::with_capacity(planes);
     let mut dups = Vec::with_capacity(planes);
-    for plane in layout.planes.iter().take(planes) {
+    for plane in layout.planes.iter() {
         // The layout's offset is 64-bit and the ABI's field is 32. A narrowing at a boundary is
         // refused, not truncated: a wrapped offset names a row that is not the plane's.
         let Ok(offset) = u32::try_from(plane.offset) else {

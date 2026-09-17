@@ -46,6 +46,7 @@ use crate::ids::SurfaceId;
 use crate::surface::PlaneShape;
 pub use crate::surface::{
     BadLayout, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, Layout, MAX_PLANES, PlaneLayout,
+    PlaneLayouts,
 };
 
 /// A DRM `fourcc`, as the kernel and every importer spell a pixel format.
@@ -413,7 +414,7 @@ impl Surface {
     }
 
     pub fn plane_count(&self) -> u32 {
-        self.layout.plane_count
+        self.layout.planes.len() as u32
     }
 
     /// One plane's shape and where it starts.
@@ -422,10 +423,7 @@ impl Surface {
     /// laid out -- see [`PlaneLayout`]. `bytes_per_element` is the only field that is a property
     /// of the format rather than of the allocation.
     pub fn plane(&self, plane: u32) -> Option<(PlaneShape, u32)> {
-        if plane >= self.layout.plane_count {
-            return None;
-        }
-        let p = self.layout.planes[plane as usize];
+        let p = *self.layout.planes.get(plane as usize)?;
         // How a plane is *sampled* is a property of the FourCC, never of how many planes the
         // allocation has. A second plane means half-resolution two-byte chroma in NV12 and
         // something else entirely under a compressed modifier, which carries an auxiliary plane
@@ -539,7 +537,7 @@ impl std::fmt::Debug for Surface {
             .field("height", &self.layout.height)
             .field("fourcc", &format_args!("{:#010x}", self.layout.fourcc))
             .field("modifier", &format_args!("{:#018x}", self.layout.modifier))
-            .field("planes", &self.layout.plane_count)
+            .field("planes", &self.layout.planes.len())
             .finish()
     }
 }
@@ -672,11 +670,10 @@ impl Descriptor {
             return Err(BadLayout::Modifier(layout.modifier));
         }
         let (wants, bytes) = plane_rule(layout.fourcc).ok_or(BadLayout::Fourcc(layout.fourcc))?;
-        if layout.plane_count != wants {
-            return Err(BadLayout::PlaneCount { said: layout.plane_count, wants });
+        if layout.planes.len() as u32 != wants {
+            return Err(BadLayout::PlaneCount { said: layout.planes.len() as u32, wants });
         }
-        for at in 0..wants {
-            let p = layout.planes[at as usize];
+        for (at, p) in (0u32..).zip(layout.planes.iter().copied()) {
             // A subsampled plane rounds *up*: an odd-sized NV12 image still has a chroma row for
             // its last luma row, and rounding down would bound the buffer one row short. Only a
             // planar layout has a plane past the first, so the rule and the subsampling are the
@@ -772,8 +769,7 @@ mod tests {
                 height,
                 fourcc: PixelFormat::Bgra.fourcc(),
                 modifier: DRM_FORMAT_MOD_LINEAR,
-                planes: [PlaneLayout { offset: 0, pitch }; MAX_PLANES],
-                plane_count: 1,
+                planes: PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch }]).expect("one plane"),
                 alloc_size: size,
             },
         )
@@ -833,14 +829,12 @@ mod tests {
                 height: 8,
                 fourcc: PlanarFormat::BiPlanar420.fourcc(),
                 modifier: DRM_FORMAT_MOD_LINEAR,
-                planes: [
+                planes: PlaneLayouts::new(&[
                     PlaneLayout { offset: 0, pitch: 64 },
                     // Neither tight (32) nor at the tight offset (256).
                     PlaneLayout { offset: 512, pitch: 64 },
-                    PlaneLayout { offset: 0, pitch: 0 },
-                    PlaneLayout { offset: 0, pitch: 0 },
-                ],
-                plane_count: 2,
+                ])
+                .expect("two planes"),
                 alloc_size: size as u64,
             },
         );
@@ -865,13 +859,11 @@ mod tests {
                 height: 8,
                 fourcc: PlanarFormat::BiPlanar420.fourcc(),
                 modifier: DRM_FORMAT_MOD_LINEAR,
-                planes: [
+                planes: PlaneLayouts::new(&[
                     PlaneLayout { offset: 0, pitch: 64 },
                     PlaneLayout { offset: 512, pitch: 64 },
-                    PlaneLayout { offset: 0, pitch: 0 },
-                    PlaneLayout { offset: 0, pitch: 0 },
-                ],
-                plane_count: 2,
+                ])
+                .expect("two planes"),
                 alloc_size: size as u64,
             },
         );
@@ -897,8 +889,8 @@ mod tests {
                 height: 0,
                 fourcc: PixelFormat::Bgra.fourcc(),
                 modifier: DRM_FORMAT_MOD_INVALID,
-                planes: [PlaneLayout { offset: 0, pitch: 0 }; MAX_PLANES],
-                plane_count: 1,
+                planes: PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch: 0 }])
+                    .expect("one plane"),
                 alloc_size: 0,
             },
         );
@@ -934,8 +926,8 @@ mod tests {
                 height: 16,
                 fourcc: PixelFormat::Bgra.fourcc(),
                 modifier: X_TILED,
-                planes: [PlaneLayout { offset: 0, pitch: 64 }; MAX_PLANES],
-                plane_count: 1,
+                planes: PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch: 64 }])
+                    .expect("one plane"),
                 alloc_size: size as u64,
             },
         );
@@ -968,8 +960,7 @@ mod tests {
             height,
             fourcc: PixelFormat::Bgra.fourcc(),
             modifier: DRM_FORMAT_MOD_LINEAR,
-            planes: [PlaneLayout { offset: 0, pitch }; MAX_PLANES],
-            plane_count: 1,
+            planes: PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch }]).expect("one plane"),
             alloc_size: 0,
         }
     }
@@ -1021,18 +1012,25 @@ mod tests {
         );
         // The same overrun reached by the offset rather than by the height.
         let mut shifted = bgra(16, 16, 64);
-        shifted.planes[0].offset = 3200;
+        shifted.planes =
+            PlaneLayouts::new(&[PlaneLayout { offset: 3200, pitch: 64 }]).expect("one plane");
         assert_eq!(
             d.describe(shifted).err(),
             Some(BadLayout::Overrun { plane: 0, end: 4224, size: 4096 })
         );
         // Arithmetic that would wrap is an overrun, not a pass.
         let mut huge = bgra(16, u32::MAX, 64);
-        huge.planes[0].offset = u64::MAX - 16;
+        huge.planes = PlaneLayouts::new(&[PlaneLayout { offset: u64::MAX - 16, pitch: 64 }])
+            .expect("one plane");
         assert!(matches!(d.describe(huge), Err(BadLayout::Overrun { .. })));
 
         assert_eq!(
-            d.describe(Layout { plane_count: 2, ..bgra(16, 16, 64) }).err(),
+            d.describe(Layout {
+                planes: PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch: 64 }; 2])
+                    .expect("two planes"),
+                ..bgra(16, 16, 64)
+            })
+            .err(),
             Some(BadLayout::PlaneCount { said: 2, wants: 1 }),
             "a plane count the fourcc does not have"
         );
@@ -1069,8 +1067,11 @@ mod tests {
             let d = Descriptor::exported(memfd(size)).expect("a sized buffer");
             let mut l = bgra(16, height, 16);
             l.fourcc = PlanarFormat::BiPlanar420.fourcc();
-            l.plane_count = 2;
-            l.planes[1] = PlaneLayout { offset, pitch: 16 };
+            l.planes = PlaneLayouts::new(&[
+                PlaneLayout { offset: 0, pitch: 16 },
+                PlaneLayout { offset, pitch: 16 },
+            ])
+            .expect("two planes");
             d.describe(l).map(|_| ())
         };
         // 5 luma rows of 16, then 3 chroma rows of 16 at offset 80: 128 bytes in all.
@@ -1132,8 +1133,11 @@ mod tests {
                     height: 4,
                     fourcc: code.get(),
                     modifier: DRM_FORMAT_MOD_LINEAR,
-                    planes: [PlaneLayout { offset: 0, pitch: 64 }; MAX_PLANES],
-                    plane_count: planes,
+                    planes: PlaneLayouts::new(&vec![
+                        PlaneLayout { offset: 0, pitch: 64 };
+                        planes as usize
+                    ])
+                    .expect("a real format's planes fit"),
                     alloc_size: 4096,
                 },
             );

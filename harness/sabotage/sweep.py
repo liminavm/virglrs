@@ -1172,6 +1172,17 @@ SABOTAGES = [
         'an_execute_inside_an_executed_stream_is_refused',
     ),
     (
+        'a layout with more planes than it holds is trimmed to fit',
+        'src/surface.rs',
+        """        if planes.len() > MAX_PLANES {
+            return Err(BadLayout::TooManyPlanes { said: planes.len(), max: MAX_PLANES });
+        }
+        let mut at""",
+        """        let planes = &planes[..planes.len().min(MAX_PLANES)];
+        let mut at""",
+        'a_layout_the_guest_got_wrong_is_refused_by_name_and_never_trimmed',
+    ),
+    (
         'an image load one past the last slot is let through to the image array',
         'src/vrend/shader/glsl/tex.rs',
         'if sinfo.sreg_index < 0 || sinfo.sreg_index as usize >= MAX_SHADER_IMAGES {\n            return false;\n        }\n        if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {',

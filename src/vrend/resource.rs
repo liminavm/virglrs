@@ -762,32 +762,25 @@ fn describe(
     planes: &[Plane],
     modifier: u64,
 ) -> Result<Arc<dyn Held>, crate::surface::BadLayout> {
-    use crate::surface::{Layout, MAX_PLANES, PlaneLayout};
+    use crate::surface::{Layout, PlaneLayout, PlaneLayouts};
 
     let fourcc = super::formats::scanout_fourcc(args.format)
         .map(|c| c.get())
         .ok_or(crate::surface::BadLayout::NoFourcc(args.format.name()))?;
     // The guest's count, refused above what a layout holds rather than trimmed to it. Trimming
-    // would describe a buffer the guest did not send and then check that one instead.
-    if planes.len() > MAX_PLANES {
-        return Err(crate::surface::BadLayout::TooManyPlanes {
-            said: planes.len(),
-            max: MAX_PLANES,
-        });
-    }
-    let mut layout = [PlaneLayout { offset: 0, pitch: 0 }; MAX_PLANES];
-    for (at, p) in planes.iter().enumerate() {
-        layout[at] = PlaneLayout { offset: u64::from(p.offset), pitch: p.stride };
-    }
+    // would describe a buffer the guest did not send and then check that one instead. Whether
+    // the count agrees with the FourCC is `describe`'s question -- one rule, in one place.
+    let planes: Vec<PlaneLayout> = planes
+        .iter()
+        .map(|p| PlaneLayout { offset: u64::from(p.offset), pitch: p.stride })
+        .collect();
+    let planes = PlaneLayouts::new(&planes)?;
     Arc::clone(storage).describe(Layout {
         width: args.width,
         height: args.height,
         fourcc,
         modifier,
-        planes: layout,
-        // The guest's own count, refused above. `describe` is what says whether it agrees with
-        // the FourCC -- one rule, in one place, over both halves.
-        plane_count: planes.len() as u32,
+        planes,
         // The buffer's extent is the kernel's and the descriptor holds it; whatever is put here
         // is replaced by `describe` with what `lseek` said.
         alloc_size: 0,
@@ -2721,7 +2714,7 @@ mod tests {
             "the storage had the last word, so it was reached"
         );
         let asked = spy.0.lock().expect("no panics").expect("the storage was asked");
-        assert_eq!(asked.plane_count, 1, "the guest's own count");
+        assert_eq!(asked.planes.len(), 1, "the guest's own count");
         assert_eq!(asked.planes[0].pitch, 256);
         assert_eq!((asked.width, asked.height), (64, 48));
     }

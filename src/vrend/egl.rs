@@ -859,7 +859,9 @@ impl Winsys {
         height: u32,
         format: crate::surface::PixelFormat,
     ) -> Result<(core::ffi::c_int, crate::surface::Layout), EglError> {
-        use crate::surface::{DRM_FORMAT_MOD_INVALID, Layout, MAX_PLANES, PlaneLayout};
+        use crate::surface::{
+            DRM_FORMAT_MOD_INVALID, Layout, MAX_PLANES, PlaneLayout, PlaneLayouts,
+        };
         use std::os::fd::{AsFd, IntoRawFd};
 
         let (mut fourcc, mut planes, mut modifier) = (0, 0, 0u64);
@@ -982,8 +984,8 @@ impl Winsys {
                 // Zero is a real modifier (`LINEAR`), so it is passed through as reported. Only a
                 // query that failed leaves `INVALID`, and that is caught above.
                 modifier: if modifier == u64::MAX { DRM_FORMAT_MOD_INVALID } else { modifier },
-                planes: plane_layout,
-                plane_count: count as u32,
+                planes: PlaneLayouts::new(&plane_layout[..count])
+                    .expect("count was bounded by MAX_PLANES above"),
                 alloc_size,
             },
         ))
@@ -1053,13 +1055,7 @@ impl Winsys {
                 };
                 (idx, 1, p.fourcc(), shape.width, shape.height)
             }
-            None => (
-                0,
-                layout.plane_count as usize,
-                layout.fourcc as EGLint,
-                layout.width,
-                layout.height,
-            ),
+            None => (0, layout.planes.len(), layout.fourcc as EGLint, layout.width, layout.height),
         };
         if count == 0 || first + count > crate::dmabuf::MAX_PLANES {
             return Err(self.shared.error("an exported layout with no planes to import"));
@@ -1322,7 +1318,7 @@ mod tests {
         // SAFETY: the descriptor the call handed back, owned here so the test closes it.
         drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
 
-        assert_eq!(layout.plane_count, 2, "both planes are described");
+        assert_eq!(layout.planes.len(), 2, "both planes are described");
         assert_eq!(layout.planes[0], crate::surface::PlaneLayout { offset: 0, pitch: 1024 });
         assert_eq!(layout.planes[1], crate::surface::PlaneLayout { offset: 65536, pitch: 128 });
         assert_eq!(layout.modifier, Y_TILED_CCS);

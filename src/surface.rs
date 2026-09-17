@@ -56,6 +56,36 @@ pub struct PlaneLayout {
     pub pitch: u32,
 }
 
+/// The planes an allocation was described with, at most [`MAX_PLANES`] of them.
+///
+/// The count and the array are reconciled once, here, and read as one slice: a reader is never
+/// handed a count beside an array it has to trust to match it. More planes than fit are refused
+/// at construction, never trimmed, because a trimmed count describes a different buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlaneLayouts {
+    at: [PlaneLayout; MAX_PLANES],
+    count: usize,
+}
+
+impl PlaneLayouts {
+    pub fn new(planes: &[PlaneLayout]) -> Result<PlaneLayouts, BadLayout> {
+        if planes.len() > MAX_PLANES {
+            return Err(BadLayout::TooManyPlanes { said: planes.len(), max: MAX_PLANES });
+        }
+        let mut at = [PlaneLayout { offset: 0, pitch: 0 }; MAX_PLANES];
+        at[..planes.len()].copy_from_slice(planes);
+        Ok(PlaneLayouts { at, count: planes.len() })
+    }
+}
+
+impl std::ops::Deref for PlaneLayouts {
+    type Target = [PlaneLayout];
+
+    fn deref(&self) -> &[PlaneLayout] {
+        &self.at[..self.count]
+    }
+}
+
 /// What the exporting driver said about the allocation, as an importer needs it.
 ///
 /// One value rather than six arguments threaded through the export path: an importer needs every
@@ -70,16 +100,16 @@ pub struct Layout {
     /// `DRM_FORMAT_MOD_INVALID` when the driver would not say. An importer must then be told the
     /// modifier is unknown rather than handed `LINEAR`, which is a different claim.
     pub modifier: u64,
-    pub planes: [PlaneLayout; MAX_PLANES],
-    pub plane_count: u32,
+    pub planes: PlaneLayouts,
     /// The whole allocation, which is what a mapping covers and what the budget was charged.
     pub alloc_size: u64,
 }
 
 impl Layout {
-    /// The first plane's pitch, for the many callers that only ever have one plane.
+    /// The first plane's pitch, for the many callers that only ever have one plane; zero for a
+    /// layout with none, which is what `describe` refuses.
     pub fn bytes_per_row(&self) -> u32 {
-        self.planes[0].pitch
+        self.planes.first().map_or(0, |p| p.pitch)
     }
 }
 

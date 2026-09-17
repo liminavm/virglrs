@@ -6349,6 +6349,7 @@ fn export_dmabuf(
 ) -> Result<Surface, NoSurface> {
     use crate::dmabuf::{
         DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, Layout, MAX_PLANES, PlaneLayout,
+        PlaneLayouts,
     };
 
     let format = pixel_format(facts.format).ok_or(NoSurface::Format(facts.format))?;
@@ -6459,8 +6460,8 @@ fn export_dmabuf(
             height: facts.height,
             fourcc: format.fourcc(),
             modifier,
-            planes,
-            plane_count,
+            planes: PlaneLayouts::new(&planes[..plane_count as usize])
+                .expect("one plane fits a layout"),
             alloc_size: size,
         },
     ))
@@ -7187,7 +7188,7 @@ mod tests {
     #[test]
     fn a_share_with_no_host_address_is_refused_rather_than_imported_at_null() {
         use super::super::proto::types::VkImportMemoryResourceInfoMESA;
-        use crate::surface::{DRM_FORMAT_MOD_INVALID, Layout, PlaneLayout, Surface};
+        use crate::surface::{DRM_FORMAT_MOD_INVALID, Layout, PlaneLayout, PlaneLayouts, Surface};
 
         const DEVICE: VkDevice = VkDevice(3);
         const LEN: u64 = 16384;
@@ -7210,8 +7211,8 @@ mod tests {
         // A descriptor of storage that is not ours: tiled, so no CPU path opens it, and the fd
         // is never mapped -- which is the whole point, and why any fd will do here.
         let fd = std::fs::File::open("/dev/null").expect("every host has one").into();
-        let mut planes = [PlaneLayout { offset: 0, pitch: 0 }; crate::surface::MAX_PLANES];
-        planes[0] = PlaneLayout { offset: 0, pitch: 256 };
+        let planes =
+            PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch: 256 }]).expect("one plane");
         let tiled = Surface::exported(
             fd,
             Layout {
@@ -7221,7 +7222,6 @@ mod tests {
                 // Anything but LINEAR: the modifier is what says the bytes are not rows.
                 modifier: 0x0100_0000_0000_0001,
                 planes,
-                plane_count: 1,
                 alloc_size: LEN,
             },
         );
@@ -7266,7 +7266,7 @@ mod tests {
     #[test]
     fn a_linear_descriptor_has_an_address_and_is_still_not_a_host_allocation() {
         use super::super::proto::types::VkImportMemoryResourceInfoMESA;
-        use crate::surface::{DRM_FORMAT_MOD_LINEAR, Layout, PlaneLayout, Surface};
+        use crate::surface::{DRM_FORMAT_MOD_LINEAR, Layout, PlaneLayout, PlaneLayouts, Surface};
 
         const DEVICE: VkDevice = VkDevice(3);
         const WIDTH: u32 = 64;
@@ -7300,8 +7300,8 @@ mod tests {
         // SAFETY: a descriptor this scope owns and hands over exactly once.
         let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
 
-        let mut planes = [PlaneLayout { offset: 0, pitch: 0 }; crate::surface::MAX_PLANES];
-        planes[0] = PlaneLayout { offset: 0, pitch: PITCH };
+        let planes =
+            PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch: PITCH }]).expect("one plane");
         let linear = Surface::exported(
             fd,
             Layout {
@@ -7310,7 +7310,6 @@ mod tests {
                 fourcc: crate::surface::PixelFormat::Bgra.fourcc(),
                 modifier: DRM_FORMAT_MOD_LINEAR,
                 planes,
-                plane_count: 1,
                 alloc_size: LEN,
             },
         );
