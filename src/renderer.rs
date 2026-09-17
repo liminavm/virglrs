@@ -96,7 +96,8 @@ pub enum Error {
     MalformedContent(content::Malformed),
     /// A restore was handed something that is not a venus sync blob.
     MalformedSync(venus::sync::Malformed),
-    /// A restore was handed a journal its renderer would not read, for the reason given.
+    /// A restore was handed a journal its renderer would not read, or fed one to a context that
+    /// is not being rebuilt, for the reason given.
     JournalRefused(&'static str),
 }
 
@@ -129,6 +130,7 @@ fn venus_error(e: venus::vkr::Error) -> Error {
         venus::vkr::Error::NoContext => Error::NoContext,
         venus::vkr::Error::NoRing => Error::NoRing,
         venus::vkr::Error::Poisoned => Error::Poisoned,
+        venus::vkr::Error::NotReplaying => Error::JournalRefused(venus::context::NOT_REPLAYING),
     }
 }
 

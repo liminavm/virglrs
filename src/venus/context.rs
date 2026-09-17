@@ -141,6 +141,30 @@ use crate::vulkan::Global;
 /// `VK_COMMAND_GENERATE_REPLY_BIT_EXT`: the guest wants an answer to this command.
 const GENERATE_REPLY: u32 = 0x1;
 
+/// A rebuild in progress: the span between `replay_begin` and `replay_end`.
+///
+/// The journal's entries are fed straight to the dispatcher with their reply flag stripped, so
+/// rings are never started and no reply is ever encoded. Holding the entries here, rather than
+/// beside a flag, is what makes a feed outside the span unrepresentable: there is nowhere to
+/// put them.
+#[derive(Default)]
+struct Replay {
+    /// Entries a restore handed over and the fence has not yet released.
+    ///
+    /// A queue rather than an index beside a vector: the two would be a count and the thing it
+    /// counts, and a feed that resumed from the wrong one would replay a command twice. Popping
+    /// from the front makes "what is left" and "where we are" the same fact.
+    restoring: VecDeque<journal::Parsed>,
+}
+
+/// A journal was fed to a context that is not being rebuilt. The VMM's mistake, never a guest's:
+/// only the replay ABI reaches the feed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NotReplaying;
+
+/// [`NotReplaying`], in the words the journal's other refusals use.
+pub const NOT_REPLAYING: &str = "the context is not replaying";
+
 pub struct Context {
     /// Which context this is: the id the VMM gave it, and which occupant of that id it is. The
     /// key and not the id alone, because a record made against this context outlives it -- see
@@ -171,9 +195,9 @@ pub struct Context {
     /// The driver objects this context has stood up. Per context, because a context owns its
     /// instance tree and shares nothing with another guest.
     driver: Driver,
-    /// Replay mode. The journal's entries are fed straight to the dispatcher with their reply flag
-    /// stripped, so rings are never started and no reply is ever encoded.
-    replay: bool,
+    /// The rebuild this context is in the middle of, if any. See [`Replay`]: a journal can only be
+    /// handed to, or fed into, a context that is between `replay_begin` and `replay_end`.
+    replay: Option<Replay>,
     /// Commands dispatched, and how many of those reached a handler this build does not have.
     /// The second number is what says how far a corpus actually got.
     pub dispatched: u64,
@@ -203,12 +227,6 @@ pub struct Context {
     /// What this context would have to be told again to be itself. Written by the dispatch loop as
     /// commands go by; read only by an export.
     journal: Journal,
-    /// Entries a restore handed over and the fence has not yet released.
-    ///
-    /// A queue rather than an index beside a vector: the two would be a count and the thing it
-    /// counts, and a feed that resumed from the wrong one would replay a command twice. Popping
-    /// from the front makes "what is left" and "where we are" the same fact.
-    restoring: VecDeque<journal::Parsed>,
     /// The driver waits this context's streams have suspended on and not yet resumed, by stream.
     /// See [`InFlight`]. A stream has at most one, because a suspended stream runs nothing else
     /// until it is offered its batch again.
@@ -382,7 +400,7 @@ impl Context {
             objects: Shared::new(),
             exports: BTreeMap::new(),
             driver: Driver::new(Account::open(budget, key, name)),
-            replay: false,
+            replay: None,
             dispatched: 0,
             unhandled: 0,
             replay_ghosted: 0,
@@ -391,7 +409,6 @@ impl Context {
             wait_ring: Arc::new(WaitRing::default()),
             monitor: None,
             journal: Journal::new(),
-            restoring: VecDeque::new(),
             in_flight: BTreeMap::new(),
         }
     }
@@ -439,13 +456,20 @@ impl Context {
 
     /// Enter replay mode: the journal is about to be fed in, so nothing may answer it.
     pub fn replay_begin(&mut self) {
-        self.replay = true;
+        self.replay = Some(Replay::default());
     }
 
     /// Leave replay mode. The rings the journal built are started by the caller straight after,
     /// which is the C's loop at the end of `vkr_renderer_replay_end`.
     pub fn replay_end(&mut self) {
-        self.replay = false;
+        let Some(r) = self.replay.take() else { return };
+        if !r.restoring.is_empty() {
+            eprintln!(
+                "[virglrs] ctx {}: replay ended with {} entries never fed",
+                self.id().get(),
+                r.restoring.len()
+            );
+        }
     }
 
     /// Whether this context is being rebuilt from a journal rather than driven by a guest.
@@ -453,7 +477,7 @@ impl Context {
     /// Read by the promotion path: a replayed ring must not start reading while the journal is
     /// still being fed to it. This is the C's `ctx->replaying`, consulted at the same decision.
     pub fn replaying(&self) -> bool {
-        self.replay
+        self.replay.is_some()
     }
 
     /// Everything this context would have to be told again, as bytes for the VMM to store.
@@ -508,31 +532,43 @@ impl Context {
     /// Stored, not fed. Nothing replays until [`Context::replay_upto`] says how far, because what
     /// the entries name is created on the VMM's side as its own rebuild walks on -- the fence is
     /// the whole reason these are two calls.
+    ///
+    /// Refused outside a replay. A context that is not being rebuilt has a guest on the other
+    /// side of its rings, and a journal that creates a ring on such a context leaves the thread
+    /// reading the guest's buffer before the rest of the journal is in. The C's
+    /// `vkr_renderer_replay_submit` does not check; this does.
     pub fn journal_restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        let Some(r) = self.replay.as_mut() else { return Err(NOT_REPLAYING) };
         let entries = journal::parse(bytes)?;
         let n = entries.len();
-        self.restoring = entries.into();
+        r.restoring = entries.into();
         Ok(n)
     }
 
     /// Feed every restored entry up to and including `upto`, in the order they were recorded.
     ///
     /// Entries are consumed from the front, so a second call resumes where the first stopped and
-    /// nothing is replayed twice. A poisoned context stops the feed: the remaining entries name a
-    /// world we no longer built, and running them would be building on a lie.
+    /// nothing is replayed twice. `Ok(false)` is a poisoned context, which stops the feed: the
+    /// remaining entries name a world we no longer built, and running them would be building on
+    /// a lie. `Err` is a feed outside a replay, refused for the reason
+    /// [`Context::journal_restore`] gives.
     pub fn replay_upto(
         &mut self,
         upto: Seq,
         todo: &Unimplemented,
         global: &Global,
         resources: &dyn ShmResources,
-    ) -> bool {
+    ) -> Result<bool, NotReplaying> {
+        let Some(r) = self.replay.as_mut() else { return Err(NotReplaying) };
+        // Taken out for the loop, because feeding an entry borrows the whole context; what the
+        // fence did not release goes back at the end.
+        let mut restoring = std::mem::take(&mut r.restoring);
         let ghosted_before = self.replay_ghosted;
-        while let Some(entry) = self.restoring.front() {
+        while let Some(entry) = restoring.front() {
             if entry.seq > upto {
                 break;
             }
-            let entry = self.restoring.pop_front().expect("just looked at it");
+            let entry = restoring.pop_front().expect("just looked at it");
             let ok = match entry.ring_key {
                 None => {
                     matches!(self.submit(&entry.wire, todo, global, resources), Submitted::Done)
@@ -546,12 +582,13 @@ impl Context {
                     "[virglrs] ctx {}: journal entry {} did not replay; {} entries abandoned",
                     self.id().get(),
                     entry.seq,
-                    self.restoring.len()
+                    restoring.len()
                 );
-                self.restoring.clear();
-                return false;
+                return Ok(false);
             }
         }
+        self.replay.as_mut().expect("no command ends the replay it is fed in").restoring =
+            restoring;
         // Every entry was accepted, which is not the same as every entry having worked. A command
         // skipped because its object could not be rebuilt leaves a hole nothing above can see, and
         // reporting success here is how a black screen after a resume becomes a mystery.
@@ -562,9 +599,9 @@ impl Context {
                  produce; the restored context is not the one that was snapshotted",
                 self.id().get()
             );
-            return false;
+            return Ok(false);
         }
-        true
+        Ok(true)
     }
 
     /// Drain one submission, dispatching every command in it.
@@ -638,7 +675,7 @@ impl Context {
         // Read out what the poison path needs before the handlers borrow the rest of the
         // context: they hold the driver mutably for as long as the loop runs.
         let id = self.id();
-        let replay = self.replay;
+        let replay = self.replay.is_some();
         let fatal = &self.fatal;
         let mut counts = Counts::default();
         let mut h = Handlers {
@@ -9064,7 +9101,10 @@ mod tests {
         // The whole journal must replay. Routing the seqno to its own ring instead of the
         // context's decoder fails HERE, because the handler refuses it on a ring's own stream and
         // one refused entry abandons every entry after it.
-        assert!(back.replay_upto(Seq(u64::MAX), &todo, &g, &t), "every journal entry replayed");
+        assert!(
+            back.replay_upto(Seq(u64::MAX), &todo, &g, &t).expect("the context is replaying"),
+            "every journal entry replayed"
+        );
 
         let seqno =
             |c: &Context, ring: u64| c.rings[&RingId::new(ring).unwrap()].idle().virtqueue_seqno;
@@ -9105,7 +9145,7 @@ mod tests {
         );
         back.replay_begin();
         back.journal_restore(&blob).expect("the blob parses");
-        back.replay_upto(Seq(u64::MAX), &todo, &g, &t);
+        back.replay_upto(Seq(u64::MAX), &todo, &g, &t).expect("the context is replaying");
         assert_eq!(
             back.rings[&RingId::new(7).unwrap()].idle().virtqueue_seqno,
             40,

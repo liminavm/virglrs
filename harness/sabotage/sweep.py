@@ -1183,6 +1183,20 @@ SABOTAGES = [
         'a_layout_the_guest_got_wrong_is_refused_by_name_and_never_trimmed',
     ),
     (
+        'a journal handed to a live context opens a replay of its own',
+        'src/venus/context.rs',
+        '        let Some(r) = self.replay.as_mut() else { return Err(NOT_REPLAYING) };',
+        '        let r = self.replay.get_or_insert_with(Replay::default);',
+        'a_journal_fed_to_a_live_context_is_refused',
+    ),
+    (
+        'a journal fed to a live context opens a replay of its own',
+        'src/venus/context.rs',
+        '        let Some(r) = self.replay.as_mut() else { return Err(NotReplaying) };',
+        '        let r = self.replay.get_or_insert_with(Replay::default);',
+        'a_journal_fed_to_a_live_context_is_refused',
+    ),
+    (
         'an image load one past the last slot is let through to the image array',
         'src/vrend/shader/glsl/tex.rs',
         'if sinfo.sreg_index < 0 || sinfo.sreg_index as usize >= MAX_SHADER_IMAGES {\n            return false;\n        }\n        if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {',

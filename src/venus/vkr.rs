@@ -33,7 +33,7 @@ use crate::config::Config;
 use crate::ids::{ContextId, RingId};
 use crate::renderer::VenusCtx;
 
-use super::context::{Context, Submitted, Unimplemented, Wait};
+use super::context::{Context, NotReplaying, Submitted, Unimplemented, Wait};
 use super::driver::Answered;
 use super::journal::Seq;
 use super::ring::{ReplyStream, Ring, ShmResources};
@@ -52,6 +52,8 @@ pub enum Error {
     /// guest -- a ring destroyed while a wait on it was in flight.
     NoRing,
     Poisoned,
+    /// A journal was fed to a context that is not between `replay_begin` and `replay_end`.
+    NotReplaying,
 }
 
 /// Everything venus owns. Present exactly when the renderer was initialized to serve venus, which
@@ -473,10 +475,16 @@ impl Vkr {
     ///
     /// Nothing is promoted here: a ring the journal creates stays idle until `replay_end`, which is
     /// what stops it reading a guest's buffer while the rest of the journal is still going in.
+    /// Refused on a context that is not replaying, for the same reason: there, the ring would
+    /// start at once.
     pub fn replay_upto(&mut self, ctx: VenusCtx, upto: Seq) -> Result<(), Error> {
-        self.on_context_ok(ctx.id(), |ctx, todo, global, resources| {
+        match self.on_context(ctx.id(), |ctx, todo, global, resources| {
             ctx.replay_upto(upto, todo, global, resources)
-        })
+        })? {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Error::Poisoned),
+            Err(NotReplaying) => Err(Error::NotReplaying),
+        }
     }
 
     /// What every context's recorder dropped, by command name, most-dropped first.
@@ -511,6 +519,7 @@ mod tests {
     use super::*;
     use crate::guest_mem::GuestMap;
     use crate::ids::ResourceHandle;
+    use crate::venus::context::NOT_REPLAYING;
     use crate::venus::proto::types::{VkFlags, VkRingCreateInfoMESA};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -1216,6 +1225,48 @@ mod tests {
 
         v.replay_end(ctx_id()).expect("replay ended");
         until("the promoted ring to consume the batch", || head(&map) != 0);
+
+        v.context_destroy(ctx_id());
+    }
+
+    /// A journal handed to, or fed into, a context that is not replaying is refused.
+    ///
+    /// Outside `replay_begin`..`replay_end` a context has a guest on the other side of its
+    /// rings, so a ring the journal creates would start reading the guest's buffer at once,
+    /// before the rest of the journal is in. The C's `vkr_renderer_replay_submit` feeds without
+    /// checking `ctx->replaying`; only a VMM bug reaches this, and it is answered with a refusal
+    /// rather than a second reader of one buffer. The same journal is then accepted inside a
+    /// span, so this is a refusal and not a feed that never works.
+    #[test]
+    fn a_journal_fed_to_a_live_context_is_refused() {
+        let (mut v, _map) = vkr();
+        v.replay_begin(ctx_id()).expect("replay began");
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+        let blob = v.journal_export(ctx_id()).expect("a ring to rebuild");
+        v.replay_end(ctx_id()).expect("replay ended");
+
+        // Live now: the ring thread is running.
+        assert_eq!(
+            v.journal_restore(ctx_id(), &blob),
+            Err(NOT_REPLAYING),
+            "a live context takes no journal"
+        );
+        assert_eq!(
+            v.replay_upto(ctx_id(), Seq(u64::MAX)),
+            Err(Error::NotReplaying),
+            "a live context feeds no journal"
+        );
+
+        // The resume the VMM does: a fresh context under the same id, rebuilt inside a span.
+        v.context_destroy(ctx_id());
+        v.context_create(ctx_id(), String::new());
+        v.replay_begin(ctx_id()).expect("replay began again");
+        assert_eq!(v.journal_restore(ctx_id(), &blob), Ok(1), "inside a span the journal is taken");
+        assert_eq!(v.replay_upto(ctx_id(), Seq(u64::MAX)), Ok(()), "inside a span it is fed");
+        v.replay_end(ctx_id()).expect("replay ended");
 
         v.context_destroy(ctx_id());
     }
