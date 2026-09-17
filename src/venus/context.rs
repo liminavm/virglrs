@@ -656,14 +656,14 @@ impl Context {
             current_ring: on,
             reply,
             replaying: replay,
-            nested: false,
+            depth: 0,
             answer,
             in_flight: std::mem::take(&mut self.in_flight),
             note: None,
             journal: &mut self.journal,
         };
 
-        let suspended = run_batch(&mut h, buf, fatal, &mut counts, 0);
+        let suspended = run_batch(&mut h, buf, fatal, &mut counts);
         // An answer is for the wait command a resumed batch begins with, and that command takes
         // it. One still here after a batch that ran is an answer nothing asked for: the caller
         // resumed a batch that had not suspended, or from the wrong position. That is host code
@@ -1118,16 +1118,15 @@ struct Execute {
 /// Returns where the batch stopped when a handler asked to be suspended, and `None` otherwise --
 /// including when it was poisoned, which the caller reads from `fatal`.
 ///
-/// `depth` is 0 for a submission and 1 for the streams a `vkExecuteCommandStreamsMESA` names.
-/// Where the C saves and restores its one decoder's state around the nested run, this needs
-/// nothing: each level builds its own decoder, arena and reply scratch, so the outer decode is
-/// untouched by construction and cannot be left half-restored.
+/// `h.depth` is 0 for a submission and 1 for the streams a `vkExecuteCommandStreamsMESA` names;
+/// see [`Handlers::nested`]. Where the C saves and restores its one decoder's state around the
+/// nested run, this needs nothing: each level builds its own decoder, arena and reply scratch,
+/// so the outer decode is untouched by construction and cannot be left half-restored.
 fn run_batch(
     h: &mut Handlers<'_>,
     buf: &[u8],
     fatal: &AtomicBool,
     counts: &mut Counts,
-    depth: u32,
 ) -> Option<(usize, Wait)> {
     let id = h.ctx;
     let replay = h.replaying;
@@ -1267,7 +1266,7 @@ fn run_batch(
             // block here because it blocks in the handler; we cannot, so this is a deviation
             // and is logged as one. Mesa's execute streams carry recorded `vkCmd*` work and no
             // transport waits, which is why nothing real is expected to reach this line.
-            if depth > 0 {
+            if h.depth > 0 {
                 poison(
                     id,
                     &dec,
@@ -1283,7 +1282,7 @@ fn run_batch(
         // A handler asking for streams to be executed. Same message shape as `wait`, for the
         // same reason: the nested dispatch needs a decoder, and a handler has none.
         if let Some(exec) = h.execute.take() {
-            if depth > 0 {
+            if h.depth > 0 {
                 poison(
                     id,
                     &dec,
@@ -1292,7 +1291,7 @@ fn run_batch(
                 );
                 break;
             }
-            run_streams(h, &exec, fatal, counts, depth);
+            run_streams(h, &exec, fatal, counts);
             if fatal.load(Ordering::Acquire) {
                 break;
             }
@@ -1619,13 +1618,7 @@ fn mutates(cmd: VkCommandTypeEXT) -> Option<&'static [VkObjectType]> {
 ///
 /// Poisons through `fatal` rather than returning a reason: every refusal here names a stream
 /// index, which the one-line `poison` does not carry.
-fn run_streams(
-    h: &mut Handlers<'_>,
-    exec: &Execute,
-    fatal: &AtomicBool,
-    counts: &mut Counts,
-    depth: u32,
-) {
+fn run_streams(h: &mut Handlers<'_>, exec: &Execute, fatal: &AtomicBool, counts: &mut Counts) {
     let id = h.ctx;
     for (i, s) in exec.streams.iter().enumerate() {
         // Before the empty-stream skip, exactly as in the C: a zero-sized stream is still a
@@ -1686,9 +1679,7 @@ fn run_streams(
             "a copy the bounds check above admitted did not fit",
         );
 
-        h.nested = true;
-        let suspended = run_batch(h, &bytes, fatal, counts, depth + 1);
-        h.nested = false;
+        let suspended = h.nested(|h| run_batch(h, &bytes, fatal, counts));
         assert!(suspended.is_none(), "a nested batch suspended, which its own depth guard refuses",);
         if fatal.load(Ordering::Acquire) {
             return;
@@ -1810,12 +1801,14 @@ pub struct Handlers<'a> {
     /// A created ring reads it: replay restores head and status words the host would otherwise
     /// insist on owning, and resumes the read cursor from them.
     replaying: bool,
-    /// Whether this batch is a command stream being executed from inside another.
+    /// How many command streams deep this batch runs: 0 for a submission, 1 for a stream a
+    /// `vkExecuteCommandStreamsMESA` names. Moved only by [`Handlers::nested`].
     ///
     /// A driver wait reads it: a nested batch has nowhere to suspend to -- its position names a
     /// byte of a copy -- so the wait blocks in the handler there, as it does under replay, where
-    /// there is no thread to offer the batch again.
-    nested: bool,
+    /// there is no thread to offer the batch again. The batch loop reads it too, to refuse a
+    /// suspension or a further execute from inside a stream.
+    depth: u32,
     /// What the driver wait this batch suspended on answered, when the batch is being offered
     /// again. Taken by the wait command the batch begins with, which is the same command that
     /// suspended it; the loop asserts that nothing else was offered one.
@@ -2099,7 +2092,16 @@ impl Handlers<'_> {
     /// Whether a driver wait has to block in the handler because the batch cannot suspend: a
     /// replay has no thread to offer it again, and a nested stream has no position to resume from.
     fn blocks_inline(&self) -> bool {
-        self.replaying || self.nested
+        self.replaying || self.depth > 0
+    }
+
+    /// Run `f` one command stream deeper, as the streams an execute names run. The depth is
+    /// counted here and nowhere else, so a nested run cannot forget to come back up.
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.depth += 1;
+        let out = f(self);
+        self.depth -= 1;
+        out
     }
 
     /// The answer this batch was resumed with, if it was, and the end of the wait it answers:
@@ -6357,7 +6359,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -7679,7 +7681,7 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
-                    nested: false,
+                    depth: 0,
                     answer: None,
                     in_flight: BTreeMap::new(),
                     current_ring: None,
@@ -7752,7 +7754,7 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
-                    nested: false,
+                    depth: 0,
                     answer: None,
                     in_flight: BTreeMap::new(),
                     current_ring: None,
@@ -7862,7 +7864,7 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
-                    nested: false,
+                    depth: 0,
                     answer: None,
                     in_flight: BTreeMap::new(),
                     current_ring: None,
@@ -7965,7 +7967,7 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
-                    nested: false,
+                    depth: 0,
                     answer: None,
                     in_flight: BTreeMap::new(),
                     current_ring: None,
@@ -8090,7 +8092,7 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
-                    nested: false,
+                    depth: 0,
                     answer: None,
                     in_flight: BTreeMap::new(),
                     current_ring: None,
@@ -8410,7 +8412,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -8532,7 +8534,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -9171,7 +9173,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -9231,7 +9233,7 @@ mod tests {
                 wait: None,
                 execute: None,
                 replaying: false,
-                nested: false,
+                depth: 0,
                 answer: None,
                 in_flight: BTreeMap::new(),
                 current_ring: None,
@@ -9280,7 +9282,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -9325,7 +9327,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -9403,7 +9405,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -9455,7 +9457,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -9564,7 +9566,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -9640,7 +9642,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -9682,7 +9684,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -9726,7 +9728,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -9930,7 +9932,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10024,7 +10026,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10134,7 +10136,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10272,7 +10274,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10399,7 +10401,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10480,7 +10482,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10535,7 +10537,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10597,7 +10599,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10634,7 +10636,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10727,7 +10729,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10771,7 +10773,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10919,7 +10921,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -10999,7 +11001,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -11037,7 +11039,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -11099,7 +11101,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -11151,7 +11153,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -11187,7 +11189,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -11366,7 +11368,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -11453,7 +11455,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -11596,7 +11598,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -11776,7 +11778,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -11941,7 +11943,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -12094,7 +12096,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -12301,7 +12303,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -12449,7 +12451,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -12540,7 +12542,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -12609,7 +12611,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -12806,7 +12808,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -12920,7 +12922,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -13009,7 +13011,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -13199,7 +13201,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -13426,7 +13428,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -13628,7 +13630,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -13729,7 +13731,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -13903,7 +13905,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -14054,7 +14056,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -14217,7 +14219,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -14308,7 +14310,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -14472,7 +14474,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -14741,7 +14743,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -14892,7 +14894,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -15015,7 +15017,7 @@ mod tests {
                 wait: None,
                 execute: None,
                 replaying: false,
-                nested: false,
+                depth: 0,
                 answer: None,
                 in_flight: BTreeMap::new(),
                 current_ring: None,
@@ -15174,7 +15176,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -15319,7 +15321,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -15484,7 +15486,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -15666,7 +15668,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,
@@ -15780,7 +15782,7 @@ mod tests {
                     wait: None,
                     execute: None,
                     replaying: false,
-                    nested: false,
+                    depth: 0,
                     answer: None,
                     in_flight: BTreeMap::new(),
                     current_ring: None,
@@ -15982,7 +15984,7 @@ mod tests {
             wait: None,
             execute: None,
             replaying: false,
-            nested: false,
+            depth: 0,
             answer: None,
             in_flight: BTreeMap::new(),
             current_ring: None,

@@ -1162,6 +1162,16 @@ SABOTAGES = [
         'a_refused_switch_leaves_the_shadow_on_the_context_the_thread_kept',
     ),
     (
+        'an executed stream runs at the depth of the batch that named it',
+        'src/venus/context.rs',
+        """        self.depth += 1;
+        let out = f(self);
+        self.depth -= 1;
+        out""",
+        """        f(self)""",
+        'an_execute_inside_an_executed_stream_is_refused',
+    ),
+    (
         'an image load one past the last slot is let through to the image array',
         'src/vrend/shader/glsl/tex.rs',
         'if sinfo.sreg_index < 0 || sinfo.sreg_index as usize >= MAX_SHADER_IMAGES {\n            return false;\n        }\n        if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {',
