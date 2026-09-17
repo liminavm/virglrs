@@ -455,8 +455,11 @@ impl Context {
     }
 
     /// Enter replay mode: the journal is about to be fed in, so nothing may answer it.
+    ///
+    /// A begin inside a span is the same span: what a restore already handed over stays, as the
+    /// C's `ctx->replaying = true` leaves everything else alone.
     pub fn replay_begin(&mut self) {
-        self.replay = Some(Replay::default());
+        self.replay.get_or_insert_with(Replay::default);
     }
 
     /// Leave replay mode. The rings the journal built are started by the caller straight after,
@@ -9150,6 +9153,43 @@ mod tests {
             back.rings[&RingId::new(7).unwrap()].idle().virtqueue_seqno,
             40,
             "the restore reproduces the high-water mark, not the last thing said"
+        );
+    }
+
+    /// A second `replay_begin` inside a span keeps what the restore handed over.
+    ///
+    /// The span is one value holding the queue, so opening it again could mean a fresh queue;
+    /// that would drop a restored journal without a word, and the feed after it would report
+    /// success on nothing.
+    #[test]
+    fn a_replay_begun_twice_keeps_the_journal_it_was_handed() {
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let todo = Unimplemented::default();
+        let mut ctx = Context::new(
+            ContextKey::for_test(ContextId::new(1).unwrap()),
+            &Budget::with_cap(None, false),
+            String::new(),
+        );
+        ctx.replay_begin();
+        assert!(ctx.submit(&wire_create_ring(7, &ring_info()), &todo, &g, &t).ran());
+        let blob = ctx.journal_export().expect("a ring to rebuild");
+
+        let mut back = Context::new(
+            ContextKey::for_test(ContextId::new(1).unwrap()),
+            &Budget::with_cap(None, false),
+            String::new(),
+        );
+        back.replay_begin();
+        back.journal_restore(&blob).expect("the blob parses");
+        back.replay_begin();
+        assert!(
+            back.replay_upto(Seq(u64::MAX), &todo, &g, &t).expect("the context is replaying"),
+            "the journal replayed"
+        );
+        assert!(
+            back.rings.contains_key(&RingId::new(7).unwrap()),
+            "the ring the restored journal creates is there"
         );
     }
 
