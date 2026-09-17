@@ -107,11 +107,60 @@ fn needs_swizzle(formats: &Table, a: Format, b: Format) -> bool {
 }
 
 /// A texture as one end of a blit: the resource's own, or a view reinterpreting it.
-struct End {
-    name: TextureName,
-    target: GLenum,
-    /// Made for this blit, deleted after it.
-    temporary: bool,
+enum End {
+    /// The resource's own texture, which outlives the blit.
+    Own { name: TextureName, target: GLenum },
+    /// A view made for this blit, which [`with_ends`] deletes after it.
+    View { name: TextureName, target: GLenum },
+}
+
+impl End {
+    fn name(&self) -> TextureName {
+        match self {
+            End::Own { name, .. } | End::View { name, .. } => *name,
+        }
+    }
+
+    fn target(&self) -> GLenum {
+        match self {
+            End::Own { target, .. } | End::View { target, .. } => *target,
+        }
+    }
+
+    /// Delete what was made for the blit, on the GL context it was made in.
+    fn release(self, gl: &Gl) {
+        match self {
+            End::Own { .. } => {}
+            End::View { name, .. } => gl.delete_texture(name),
+        }
+    }
+}
+
+/// Resolve both ends of `b`, run the blit between them, and release them afterwards -- on every
+/// path out, a refused destination included, so that no caller can forget the delete.
+///
+/// A scope rather than a `Drop` on [`End`]: a drop cannot know which GL context is current, and
+/// this one relies on `run` having put the sub-context's back before it returns.
+fn with_ends<T>(
+    host: &mut Host<'_>,
+    cmd: Cmd,
+    b: &Blit,
+    run: impl FnOnce(&mut Host<'_>, &End, &End) -> Result<T, Fault>,
+) -> Result<T, Fault> {
+    let (gl, features, formats) = (host.gl, host.features, host.formats);
+    let src_res = host.resource(cmd, b.src.resource)?;
+    let dst_res = host.resource(cmd, b.dst.resource)?;
+    let Some(src) = make_view(gl, features, formats, src_res, b.src.format) else {
+        return Err(Fault::IllegalResource { cmd, handle: b.dst.resource });
+    };
+    let Some(dst) = make_view(gl, features, formats, dst_res, b.dst.format) else {
+        src.release(gl);
+        return Err(Fault::IllegalResource { cmd, handle: b.dst.resource });
+    };
+    let r = run(host, &src, &dst);
+    src.release(host.gl);
+    dst.release(host.gl);
+    r
 }
 
 /// `vrend_make_view`: a view of the resource in `format`, or the resource itself when the
@@ -127,7 +176,7 @@ fn make_view(
         return None;
     };
     let (name, target) = (t.name, t.target);
-    let base = End { name, target, temporary: false };
+    let base = End::Own { name, target };
     if res.args.format == format || !features.has(Feature::texture_view) || !res.supports_view() {
         return Some(base);
     }
@@ -154,7 +203,7 @@ fn make_view(
         0,
         res.args.array_size,
     );
-    Some(End { name: view, target, temporary: true })
+    Some(End::View { name: view, target })
 }
 
 fn unattachable(cmd: Cmd, handle: ResourceHandle, e: transfer::Unattachable) -> Fault {
@@ -174,8 +223,16 @@ fn bind_fb_texture(
     layer: Option<GLint>,
 ) -> Result<(), Fault> {
     let attachment = transfer::attachment_for(res, host.formats);
-    transfer::attach_texture(host.gl, host.features, end.target, end.name, attachment, level, layer)
-        .map_err(|feature| Fault::NoFeature { cmd, feature })
+    transfer::attach_texture(
+        host.gl,
+        host.features,
+        end.target(),
+        end.name(),
+        attachment,
+        level,
+        layer,
+    )
+    .map_err(|feature| Fault::NoFeature { cmd, feature })
 }
 
 fn detach_all(gl: &Gl) {
@@ -335,22 +392,6 @@ impl Context {
                 s.needs_redblue_swizzle(b.src.format) != d.needs_redblue_swizzle(b.dst.format);
             ((s.args, s.y_0_top()), (d.args, d.y_0_top()), redblue)
         };
-        let (gl, features) = (host.gl, host.features);
-        let src_end =
-            make_view(gl, features, formats, host.resource(cmd, b.src.resource)?, b.src.format);
-        let dst_end =
-            make_view(gl, features, formats, host.resource(cmd, b.dst.resource)?, b.dst.format);
-        let (Some(src_end), Some(dst_end)) = (src_end, dst_end) else {
-            return Err(Fault::IllegalResource { cmd, handle: b.dst.resource });
-        };
-        let cleanup = |host: &mut Host<'_>| {
-            if src_end.temporary {
-                host.gl.delete_texture(src_end.name);
-            }
-            if dst_end.temporary {
-                host.gl.delete_texture(dst_end.name);
-            }
-        };
         // `vrend_renderer_prepare_blit_extra_info`.
         let mut can_fbo = true;
         let mut gl_filter = if b.filter == TexFilter::Nearest { GL_NEAREST } else { GL_LINEAR };
@@ -405,15 +446,20 @@ impl Context {
         if b.src.region.depth != b.dst.region.depth {
             can_fbo = false;
         }
-        if !can_fbo {
-            let r = self.blit_shader(host, b, &src_end, &dst_end, redblue);
-            cleanup(host);
-            return r;
-        }
-        let r =
-            self.blit_fbo(host, b, &src_end, &dst_end, gl_filter, [src_y1, src_y2, dst_y1, dst_y2]);
-        cleanup(host);
-        r
+        with_ends(host, cmd, b, |host, src_end, dst_end| {
+            if !can_fbo {
+                self.blit_shader(host, b, src_end, dst_end, redblue)
+            } else {
+                self.blit_fbo(
+                    host,
+                    b,
+                    src_end,
+                    dst_end,
+                    gl_filter,
+                    [src_y1, src_y2, dst_y1, dst_y2],
+                )
+            }
+        })
     }
 
     /// `vrend_renderer_blit_gl`'s caller half: resolve both ends into a [`blitter::Job`], run it
@@ -459,8 +505,8 @@ impl Context {
         let has_srgb_write_control = host.has(Feature::srgb_write_control);
         let has_texture_srgb_decode = host.has(Feature::texture_srgb_decode);
         let job = blitter::Job {
-            src: src_end.name,
-            src_gl_target: src_end.target,
+            src: src_end.name(),
+            src_gl_target: src_end.target(),
             src_target: src_res.args.target,
             src_w: src_res.width_at(b.src.level),
             src_h: src_res.height_at(b.src.level),
@@ -480,9 +526,9 @@ impl Context {
             src_z: b.src.region.z,
             src_depth: b.src.region.depth,
             src_texture_depth: src_res.depth_at(b.src.level),
-            dst: dst_end.name,
+            dst: dst_end.name(),
             color,
-            dst_gl_target: dst_end.target,
+            dst_gl_target: dst_end.target(),
             dst_attachment: transfer::attachment_for(dst_res, formats),
             dst_target: dst_res.args.target,
             dst_w: dst_res.width_at(b.dst.level),
@@ -872,7 +918,7 @@ impl Context {
                 t.view_texture(key).ok_or(Fault::IllegalResource { cmd, handle: resource })?
             }
         };
-        let end = End { name, target, temporary: false };
+        let end = End::Own { name, target };
         bind_fb_texture(host, cmd, res, &end, level as GLint, layer)?;
         let colorf = color.map(f32::from_bits);
         let depth = f64::from_bits(color[0] as u64 | (color[1] as u64) << 32);
