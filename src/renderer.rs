@@ -1047,7 +1047,7 @@ impl Renderer {
         &mut self,
         handle: ResourceHandle,
         ctx: Option<ContextId>,
-        to_host: bool,
+        direction: transfer::Direction,
         info: &transfer::Info,
         iov: Vec<GuestIov>,
     ) -> Result<(), Error> {
@@ -1058,7 +1058,9 @@ impl Renderer {
         // through: the context stream's transfer is traced in `vrend::context`, and a transfer
         // named by the VMM never touches it. Both have to be silent for "nothing wrote it" to
         // mean anything.
-        if to_host && std::env::var_os("LIMINA_READBACK_TRACE").is_some() {
+        if direction == transfer::Direction::ToHost
+            && std::env::var_os("LIMINA_READBACK_TRACE").is_some()
+        {
             // Filtered on the resource resolving to a classic IOSurface, the same resolution the
             // blank-readback trace makes -- so the two name the same surfaces or neither does.
             if let Some(surface) = self.classic_surface(handle) {
@@ -1084,7 +1086,7 @@ impl Renderer {
         let own = Iov::new(&own);
         let given = Iov::new(&iov);
         let pages = if iov.is_empty() { &own } else { &given };
-        v.transfer(ctx, handle, to_host, Some(&own), pages, info).map_err(Error::Transfer)
+        v.transfer(ctx, handle, direction, Some(&own), pages, info).map_err(Error::Transfer)
     }
 
     // ---- contexts ----
@@ -1522,7 +1524,14 @@ impl Renderer {
                     synchronized: true,
                 };
                 let v = self.vrend.as_mut().expect("a classic context needs vrend");
-                match v.transfer(Some(classic), handle, false, Some(&own), &span.iov(), &info) {
+                match v.transfer(
+                    Some(classic),
+                    handle,
+                    transfer::Direction::ToGuest,
+                    Some(&own),
+                    &span.iov(),
+                    &info,
+                ) {
                     // Counted, and nothing written: a level that could not be read back has no
                     // bytes, and zeros in its place would restore over whatever the guest still
                     // holds. The C writes them, having called `calloc` so at least they are
@@ -1611,7 +1620,14 @@ impl Renderer {
                 synchronized: true,
             };
             let v = self.vrend.as_mut().expect("a classic context needs vrend");
-            match v.transfer(Some(classic), e.res, true, Some(&own), &span.iov(), &info) {
+            match v.transfer(
+                Some(classic),
+                e.res,
+                transfer::Direction::ToHost,
+                Some(&own),
+                &span.iov(),
+                &info,
+            ) {
                 Ok(()) => account.entries += 1,
                 Err(_) => account.skipped += 1,
             }

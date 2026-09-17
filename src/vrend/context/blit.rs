@@ -17,11 +17,20 @@ const PIPE_MASK_RGBA: u8 = 0xf;
 const PIPE_MASK_Z: u8 = 0x10;
 const PIPE_MASK_S: u8 = 0x20;
 
+/// Whether a copy may span two compressed formats. The C's `VREND_COPY_COMPAT_FLAG_ALLOW_COMPRESSED`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Compressed {
+    /// A blit: a compressed pair goes through the blitter, never `glCopyImageSubData`.
+    Refused,
+    /// A resource copy: a compressed pair is copyable when GL's view classes say so.
+    ByViewClass,
+}
+
 /// `format_is_copy_compatible`: whether `glCopyImageSubData` may move pixels between the two.
 ///
 /// Plain pairs follow gallium's `util_is_format_compatible`; compressed pairs follow GL's view
 /// classes, which is the rule the driver enforces and the C's hand-written list approximates.
-fn copy_compatible(formats: &Table, src: Format, dst: Format, allow_compressed: bool) -> bool {
+fn copy_compatible(formats: &Table, src: Format, dst: Format, compressed: Compressed) -> bool {
     if src == dst {
         return true;
     }
@@ -31,7 +40,7 @@ fn copy_compatible(formats: &Table, src: Format, dst: Format, allow_compressed: 
     if sd.is_plain() && dd.is_plain() {
         return plain_compatible(sd, dd);
     }
-    if !allow_compressed {
+    if compressed == Compressed::Refused {
         return false;
     }
     let (Some(se), Some(de)) = (formats.get(src), formats.get(dst)) else {
@@ -241,7 +250,7 @@ impl Context {
             !(src_res.needs_srgb_decode(src.format) || dst_res.needs_srgb_encode(dst.format));
         let copy_path = host.has(Feature::copy_image)
             && condition_free
-            && copy_compatible(formats, src.format, dst.format, false)
+            && copy_compatible(formats, src.format, dst.format, Compressed::Refused)
             && eglimage_copy_compatible
             && !b.scissor_enable
             && b.filter == TexFilter::Nearest
@@ -751,7 +760,7 @@ impl Context {
         }
         let (sf, df) = (src_res.args.format, dst_res.args.format);
         if host.has(Feature::copy_image)
-            && copy_compatible(formats, sf, df, true)
+            && copy_compatible(formats, sf, df, Compressed::ByViewClass)
             && src_res.args.nr_samples == dst_res.args.nr_samples
         {
             let origin = [dst_origin[0] as i32, dst_origin[1] as i32, dst_origin[2] as i32];
@@ -904,7 +913,8 @@ mod tests {
     #[test]
     fn plain_formats_are_copy_compatible_when_gallium_says_so() {
         let t = Table::empty();
-        let compat = |a: &str, b: &str| copy_compatible(&t, format(a), format(b), false);
+        let compat =
+            |a: &str, b: &str| copy_compatible(&t, format(a), format(b), Compressed::Refused);
         assert!(compat("R8G8B8A8_UNORM", "R8G8B8A8_UNORM"));
         // An X channel is a swizzle of 1, which the compare skips.
         assert!(compat("R8G8B8A8_UNORM", "R8G8B8X8_UNORM"));

@@ -38,6 +38,19 @@ pub struct Info {
     pub synchronized: bool,
 }
 
+/// Which way a transfer moves the bytes.
+///
+/// One body serves both ways and branches on this once. The C spells it as two entry points
+/// sharing a flag; a flag is a value a caller can hand over backwards, and the compiler cannot
+/// say so. A name can only be the way it says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction {
+    /// Guest pages into the resource: `virgl_renderer_transfer_write_iov`.
+    ToHost,
+    /// The resource into guest pages: `virgl_renderer_transfer_read_iov`.
+    ToGuest,
+}
+
 /// Why a transfer did not happen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {

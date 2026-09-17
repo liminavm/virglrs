@@ -27,7 +27,7 @@ use super::pipe::TextureTarget;
 use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::shader;
 use super::tally;
-use super::transfer::{self, Info};
+use super::transfer::{self, Direction, Info};
 use super::waiter::{self, Answer};
 use crate::config::Config;
 use crate::decode;
@@ -1183,7 +1183,7 @@ impl Vrend {
         &mut self,
         ctx: Option<ClassicCtx>,
         handle: ResourceHandle,
-        to_host: bool,
+        direction: Direction,
         own: Option<&Iov<'_>>,
         pages: &Iov<'_>,
         info: &Info,
@@ -1210,8 +1210,8 @@ impl Vrend {
             .and_then(resource::Slot::resource_mut)
             .ok_or(transfer::Error::NoPages)?;
         let bytes = transfer::box_bytes(res, info);
-        let r = if to_host {
-            transfer::write(
+        let r = match direction {
+            Direction::ToHost => transfer::write(
                 &self.gl,
                 self.current.program(),
                 &self.formats,
@@ -1220,9 +1220,8 @@ impl Vrend {
                 own,
                 pages,
                 info,
-            )
-        } else {
-            transfer::read(
+            ),
+            Direction::ToGuest => transfer::read(
                 &self.gl,
                 self.current.program(),
                 &self.features,
@@ -1232,7 +1231,7 @@ impl Vrend {
                 own,
                 pages,
                 info,
-            )
+            ),
         };
         self.tally.transfer(began, tally::TransferDoor::Api, bytes);
         r

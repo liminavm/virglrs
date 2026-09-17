@@ -1457,7 +1457,18 @@ pub extern "C" fn virgl_renderer_transfer_read_iov(
     let Ok(n) = u32::try_from(iovec_cnt) else {
         return TRANSFER_EINVAL;
     };
-    transfer_iov(handle, ctx_id, level, stride, layer_stride, box_, offset, iov, n, false)
+    transfer_iov(
+        handle,
+        ctx_id,
+        level,
+        stride,
+        layer_stride,
+        box_,
+        offset,
+        iov,
+        n,
+        transfer::Direction::ToGuest,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -1476,7 +1487,18 @@ pub extern "C" fn virgl_renderer_transfer_write_iov(
     let Ok(level) = u32::try_from(level) else {
         return TRANSFER_EINVAL;
     };
-    transfer_iov(handle, ctx_id, level, stride, layer_stride, box_, offset, iovec, iovec_cnt, true)
+    transfer_iov(
+        handle,
+        ctx_id,
+        level,
+        stride,
+        layer_stride,
+        box_,
+        offset,
+        iovec,
+        iovec_cnt,
+        transfer::Direction::ToHost,
+    )
 }
 
 /// virglrenderer answers a transfer with a POSITIVE errno, unlike almost everything else in its
@@ -1511,7 +1533,7 @@ fn transfer_iov(
     offset: u64,
     iov: *mut libc::iovec,
     iovec_cnt: u32,
-    to_host: bool,
+    direction: transfer::Direction,
 ) -> c_int {
     let (Some(handle), false) = (ResourceHandle::new(handle), box_.is_null()) else {
         return TRANSFER_EINVAL;
@@ -1539,7 +1561,7 @@ fn transfer_iov(
         AbiCtx::Context(id) => Some(id),
     };
     let iov = read_iov(iov, iovec_cnt);
-    with(TRANSFER_EINVAL, |r| match r.transfer(handle, ctx, to_host, &info, iov) {
+    with(TRANSFER_EINVAL, |r| match r.transfer(handle, ctx, direction, &info, iov) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("[virglrs] transfer on resource {}: {e}", handle.get());
