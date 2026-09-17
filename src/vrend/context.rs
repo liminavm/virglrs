@@ -1018,7 +1018,7 @@ pub(super) fn trace_scanout_write(
         return;
     }
     let surface = match &res.storage {
-        Storage::Texture(t) => t.image.as_ref().map(|i| i.surface().id().0),
+        Storage::Texture(t) => t.minted().map(|i| i.surface().id().0),
         _ => None,
     };
     eprintln!(
@@ -2570,7 +2570,7 @@ impl Context {
                 if first_layer > 0 || first_level > 0 {
                     reinterprets = true;
                 }
-                let image = res.texture().and_then(|t| t.image.as_ref());
+                let image = res.texture().and_then(|t| t.minted());
                 let minted = match view_route(ViewNeed {
                     reinterprets,
                     private,
@@ -3385,7 +3385,7 @@ impl Context {
         // a rotation of surfaces is the compositor's framebuffers or a client's swapchain, and
         // reading a compositor into one was how this trace was misread once already.
         if std::env::var_os("LIMINA_READBACK_TRACE").is_some()
-            && let Some(image) = s.textures.image.as_ref()
+            && let Some(image) = s.textures.minted()
         {
             let id = image.surface().id().0;
             let (w, h, bind) = host

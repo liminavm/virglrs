@@ -692,7 +692,7 @@ impl Untyped {
         // An adopted surface is the exporter's bytes and needs neither a fill nor a re-read.
         let mut guest_pixels = None;
         let mut staging = Vec::new();
-        if !matches!(&storage, Storage::Texture(t) if t.image.is_some()) {
+        if !matches!(&storage, Storage::Texture(t) if t.minted().is_some()) {
             if pixels.is_some_and(|src| {
                 fill_texture(gl, formats, &args, &storage, src, plane, &mut staging, true)
             }) {
@@ -1182,27 +1182,36 @@ enum Presented<'a> {
     Planar(&'a Planes),
 }
 
+/// Whose bytes a texture's storage is.
+///
+/// The two hosts go in opposite directions -- one mints storage the texture adopts, the other
+/// exports a descriptor of storage the driver gave it -- and a texture is only ever one of them,
+/// which is a property of the host rather than of the resource. One field holds the choice so
+/// that no texture can carry both, and the read side ([`Resource::presented`]) matches on it
+/// instead of checking one and then the other.
+pub enum Pixels {
+    /// Ordinary GL storage the driver allocated, which nothing outside the texture names.
+    Own,
+    /// An EGL image this renderer minted and the texture adopted as its storage, when that
+    /// storage is an IOSurface: a scanout or a shared buffer, rendered into directly and
+    /// presented from without a copy. The image owns the surface, so the surface's id is good
+    /// exactly as long as the texture is.
+    Minted(Image),
+    /// A descriptor of the storage the driver gave this texture, on a host that exports rather
+    /// than mints.
+    Exported(Arc<dyn Held>),
+}
+
 pub struct Texture {
     pub name: TextureName,
-    /// A descriptor of this texture's own storage, on a host that exports rather than mints.
-    ///
-    /// Separate from `image` because they are opposite directions, not two spellings of one
-    /// thing: `image` is storage this renderer minted that the texture *adopted*, and this is a
-    /// descriptor of storage the texture already had. Only one of them is ever `Some`, and which
-    /// one is a property of the host rather than of the resource -- so folding them into one
-    /// field would need a flag saying which way round it is.
-    pub exported: Option<Arc<dyn Held>>,
     /// The GL target -- not the pipe target: on GLES a 1D texture is a 2D one, a 1D array a
     /// 2D array, and a RECT a 2D.
     pub target: GLenum,
     /// The driver's word that this texture has immutable-format storage, which is what
     /// `glTextureView` requires of its source. `None` is a texture no view may be taken of.
     pub immutable: Option<Immutable>,
-    /// The EGL image that is the texture's storage, when that storage is an IOSurface: a
-    /// scanout or a shared buffer, rendered into directly and presented from without a copy.
-    /// The image owns the surface, so the surface's id is good exactly as long as the
-    /// texture is.
-    pub image: Option<Image>,
+    /// Whose bytes the storage is. See [`Pixels`].
+    pub pixels: Pixels,
     /// The planes, when this resource is a composite decode target. See [`Planes`].
     pub planes: Option<Planes>,
     /// The render-target views taken of this texture, one per distinct [`ViewKey`].
@@ -1458,13 +1467,11 @@ impl Resource {
     /// would have a surface to publish an id from and nothing to hand a holder.
     fn presented(&self) -> Option<Presented<'_>> {
         let Storage::Texture(t) = &self.storage else { return None };
-        if let Some(image) = t.image.as_ref() {
-            return Some(Presented::Minted(image));
+        match &t.pixels {
+            Pixels::Minted(image) => Some(Presented::Minted(image)),
+            Pixels::Exported(held) => Some(Presented::Exported(held)),
+            Pixels::Own => Some(Presented::Planar(t.planes.as_ref()?)),
         }
-        if let Some(held) = t.exported.as_ref() {
-            return Some(Presented::Exported(held));
-        }
-        Some(Presented::Planar(t.planes.as_ref()?))
     }
 
     /// A share of that surface, for a holder outside the classic side.
@@ -1659,8 +1666,7 @@ impl Texture {
             name,
             target: 0,
             immutable: Some(Immutable::unbacked(name)),
-            exported: None,
-            image: None,
+            pixels: Pixels::Own,
             planes: None,
             views: Mutex::default(),
         }
@@ -1674,6 +1680,14 @@ impl fmt::Debug for Texture {
 }
 
 impl Texture {
+    /// The image this renderer minted and the texture adopted, when that is what its storage is.
+    pub fn minted(&self) -> Option<&Image> {
+        match &self.pixels {
+            Pixels::Minted(image) => Some(image),
+            Pixels::Own | Pixels::Exported(_) => None,
+        }
+    }
+
     /// The render-target view for `key`, minted the first time it is asked for.
     ///
     /// `src` is this texture's own witness, from [`Texture::immutable`]. `internalformat` is the
@@ -2436,10 +2450,9 @@ fn alloc_texture(
             name,
             target,
             immutable,
-            // Storage this renderer minted and the texture adopted; there is nothing to export a
-            // descriptor of, because the surface *is* the storage and is already held.
-            exported: None,
-            image: Some(image),
+            // There is nothing to export a descriptor of: the surface *is* the storage, and is
+            // already held.
+            pixels: Pixels::Minted(image),
             planes,
             views: Mutex::default(),
         })));
@@ -2535,13 +2548,15 @@ fn alloc_texture(
     gl.bind_texture(target, None);
     // The texture has storage now, which is the earliest a descriptor of it can describe
     // anything -- and the latest, because the resource is about to be handed out.
-    let exported = export_surface(winsys, a, name);
+    let pixels = match export_surface(winsys, a, name) {
+        Some(held) => Pixels::Exported(held),
+        None => Pixels::Own,
+    };
     Ok(Storage::Texture(Arc::new(Texture {
         name,
         target,
         immutable,
-        exported,
-        image: None,
+        pixels,
         planes,
         views: Mutex::default(),
     })))
