@@ -1127,6 +1127,14 @@ impl Renderer {
                 r.attached.push(ctx);
             }
         });
+        // Only a classic context's attach reaches vrend, as the C's does: its attach dispatches
+        // to the attaching context's own renderer, so vrend never hears of a venus context
+        // attaching its own blob. Telling it anyway would park a share of every venus blob in
+        // vrend's table, and those slots are only swept ahead of classic work -- a venus-only
+        // guest would hold every freed window buffer until its context died.
+        if !self.is_classic(ctx) {
+            return;
+        }
         // A blob has no host side until something types it, so this is where vrend hears about
         // one. The share travels rather than an id: an id stops naming this surface the moment
         // the surface dies, and the whole point of holding storage across contexts is that it
@@ -2085,6 +2093,66 @@ mod tests {
         // still holds, so a reset that freed only the table aborts here rather than failing.
         r.resource_create(handle, args(), Vec::new())
             .expect("the handle is free again, on both halves");
+    }
+
+    /// A venus blob attached only to the venus context that created it is released by its
+    /// unref, with vrend around and no classic work ever run.
+    ///
+    /// Every exportable window buffer a Vulkan client allocates is attached to its own
+    /// context, and the C's attach dispatches to that context's own renderer, so vrend never
+    /// hears of it. Told anyway, vrend keeps a share of the storage in a slot it only sweeps
+    /// ahead of classic work; a guest with no classic context -- a Vulkan client whose
+    /// compositor is gone -- then holds one IOSurface per freed buffer until the budget
+    /// refuses the context. A minted surface is the storage that matters here: pages carry no
+    /// adoptable share, so vrend would have held nothing of them either way.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_venus_contexts_own_blob_is_released_by_its_unref_without_classic_work() {
+        use crate::budget::Account;
+
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut r = Renderer::new(
+            Box::new(NoSink),
+            Config { vrend: true, venus: true, ..Config::default() },
+            None,
+        )
+        .expect("vrend comes up");
+        let one = ContextId::new(1).unwrap();
+        r.context_create(one, CapsetId::Venus, "client".into()).expect("a fresh id");
+
+        let surface =
+            crate::surface::Surface::scanout(64, 8, crate::surface::PixelFormat::Bgra, 256)
+                .expect("the system minted a surface");
+        let account = Account::for_test(None);
+        let share = Storage::minted_for_test(surface, &account);
+        let witness = share.witness();
+
+        let blob = ResourceHandle::new(5).unwrap();
+        r.insert(
+            blob,
+            Backing::Blob {
+                desc: BlobDesc {
+                    blob_mem: crate::abi::BLOB_MEM_HOST3D,
+                    blob_flags: 1,
+                    source: BlobSource::InContext { ctx: one, id: BlobId(66) },
+                    size: 2048,
+                },
+                storage: BlobStorage::Shared {
+                    storage: share,
+                    published: Published::Mapped { caching: Caching::Cached },
+                    from: Exporter { ctx: ContextKey::for_test(one), key: any_key() },
+                },
+            },
+            Vec::new(),
+        );
+        r.ctx_attach_resource(one, blob);
+        r.resource_unref(blob);
+
+        assert!(
+            !witness.held(),
+            "the resource was the last holder of the share; vrend was never a party to a venus \
+             context attaching its own blob"
+        );
     }
 
     /// A present is only handed to the caller to fence when exactly one context could have

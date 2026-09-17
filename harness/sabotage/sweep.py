@@ -1144,6 +1144,16 @@ SABOTAGES = [
         'a_reset_frees_the_handles_vrend_held',
     ),
     (
+        "a venus context's own attach hands vrend a share of its blob",
+        'src/renderer.rs',
+        """        if !self.is_classic(ctx) {
+            return;
+        }
+        // A blob has no host side until something types it, so this is where vrend hears about""",
+        """        // A blob has no host side until something types it, so this is where vrend hears about""",
+        'a_venus_contexts_own_blob_is_released_by_its_unref_without_classic_work',
+    ),
+    (
         'an image load one past the last slot is let through to the image array',
         'src/vrend/shader/glsl/tex.rs',
         'if sinfo.sreg_index < 0 || sinfo.sreg_index as usize >= MAX_SHADER_IMAGES {\n            return false;\n        }\n        if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {',
