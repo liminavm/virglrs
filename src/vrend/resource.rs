@@ -14,7 +14,9 @@ use super::egl::{Image, Winsys};
 use super::features::{Feature, Features};
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
-use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, TextureName};
+use super::gl::{
+    BufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, Immutable, TextureName,
+};
 use super::pipe::TextureTarget;
 use super::proto::{Format, Plane};
 use super::video;
@@ -1193,7 +1195,9 @@ pub struct Texture {
     /// The GL target -- not the pipe target: on GLES a 1D texture is a 2D one, a 1D array a
     /// 2D array, and a RECT a 2D.
     pub target: GLenum,
-    pub immutable: bool,
+    /// The driver's word that this texture has immutable-format storage, which is what
+    /// `glTextureView` requires of its source. `None` is a texture no view may be taken of.
+    pub immutable: Option<Immutable>,
     /// The EGL image that is the texture's storage, when that storage is an IOSurface: a
     /// scanout or a shared buffer, rendered into directly and presented from without a copy.
     /// The image owns the surface, so the surface's id is good exactly as long as the
@@ -1654,7 +1658,7 @@ impl Texture {
         Texture {
             name,
             target: 0,
-            immutable: true,
+            immutable: Some(Immutable::unbacked(name)),
             exported: None,
             image: None,
             planes: None,
@@ -1672,16 +1676,25 @@ impl fmt::Debug for Texture {
 impl Texture {
     /// The render-target view for `key`, minted the first time it is asked for.
     ///
-    /// `internalformat` is the format table's answer for `key.format`, and `levels` the texture's
-    /// mip count: the caller has the format table and the resource's args, and this has neither.
-    pub fn view(&self, gl: &Gl, key: ViewKey, internalformat: GLenum, levels: u32) -> TextureName {
+    /// `src` is this texture's own witness, from [`Texture::immutable`]. `internalformat` is the
+    /// format table's answer for `key.format`, and `levels` the texture's mip count: the caller
+    /// has the format table and the resource's args, and this has neither.
+    pub fn view(
+        &self,
+        gl: &Gl,
+        src: Immutable,
+        key: ViewKey,
+        internalformat: GLenum,
+        levels: u32,
+    ) -> TextureName {
+        assert_eq!(src.name(), self.name, "a view is taken of the texture whose witness it is");
         let mut views = self.views.lock().expect("the classic side never panics under this lock");
         *views.entry(key).or_insert_with(|| {
             let v = gl.gen_texture();
             gl.texture_view(
                 v,
                 self.target,
-                self.name,
+                src,
                 internalformat,
                 0,
                 levels,
@@ -2412,13 +2425,12 @@ fn alloc_texture(
             a.format.name()
         );
         // Ask the driver, rather than believing the entry point we chose. `glEGLImageTargetTexStorageEXT`
-        // is specified to leave the texture immutable-format, but the recorded flag decides whether
+        // is specified to leave the texture immutable-format, but the witness decides whether
         // `glTextureView` may be called on this texture, and `glTextureView` refuses a source that
         // is not immutable-format by putting the context in `GL_INVALID_OPERATION` for the rest of
-        // its life. A flag we predicted and a flag the driver would report are two copies of one
+        // its life. A witness we predicted and one the driver would report are two copies of one
         // fact; this makes the driver the only owner of it.
-        let immutable =
-            gl.get_tex_parameter_i(target, GL_TEXTURE_IMMUTABLE_FORMAT) == GL_TRUE as GLint;
+        let immutable = gl.immutable_format(target, name);
         gl.bind_texture(target, None);
         return Ok(Storage::Texture(Arc::new(Texture {
             name,
@@ -2519,7 +2531,7 @@ fn alloc_texture(
     // of it. They agree by construction here -- `glTexStorage*` is specified to leave the texture
     // immutable-format and `glTexImage*` not to -- and asking anyway is what keeps the field
     // meaning one thing whichever branch above created the texture.
-    let immutable = gl.get_tex_parameter_i(target, GL_TEXTURE_IMMUTABLE_FORMAT) == GL_TRUE as GLint;
+    let immutable = gl.immutable_format(target, name);
     gl.bind_texture(target, None);
     // The texture has storage now, which is the earliest a descriptor of it can describe
     // anything -- and the latest, because the resource is about to be handed out.

@@ -26,7 +26,7 @@ use super::formats::{Description, Table};
 use super::gl::gles::*;
 use super::gl::{
     BindingPoint, BoundProgram, BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei,
-    GLuint, Gl, ImageUnit, ProgramName, QueryName, SamplerName, ShaderName, TextureName,
+    GLuint, Gl, ImageUnit, Immutable, ProgramName, QueryName, SamplerName, ShaderName, TextureName,
     TextureUnit, TransformFeedbackName, UniformLocation, VertexArrayName,
 };
 use super::journal::{self, Census, Entry, Retained, Seq, StateKey, Step, order, state_key};
@@ -2437,9 +2437,9 @@ impl Context {
         let formats = host.formats;
         let res = host.resource(cmd, v.resource)?;
         let entry = formats.get(v.format).ok_or(Fault::IllegalFormat { cmd, format: v.format })?;
-        let (is_buffer, tex_name, tex_target, immutable) = match &res.storage {
-            Storage::Buffer { .. } => (true, None, GL_TEXTURE_BUFFER, false),
-            Storage::Texture(t) => (false, Some(t.name), t.target, t.immutable),
+        let (is_buffer, tex_target, immutable) = match &res.storage {
+            Storage::Buffer { .. } => (true, GL_TEXTURE_BUFFER, None),
+            Storage::Texture(t) => (false, t.target, t.immutable),
             Storage::Guest | Storage::Host(_) => {
                 return Err(Fault::IllegalResource { cmd, handle: v.resource });
             }
@@ -2481,7 +2481,7 @@ impl Context {
         }
         let mut gl_swizzle = swizzle.map(|s| to_gl_swizzle(s) as GLint);
         let mut view = None;
-        if let Some(tex) = tex_name {
+        if !is_buffer {
             let res_format = res.args.format;
             let supports_view = res.supports_view();
             let res_is_ds = res_format.describe().is_some_and(|d| d.is_depth_or_stencil());
@@ -2576,7 +2576,7 @@ impl Context {
                     private,
                     supports_view,
                     has_image: image.is_some(),
-                    can_view: immutable && features.has(Feature::texture_view),
+                    can_view: immutable.filter(|_| features.has(Feature::texture_view)),
                 }) {
                     Route::Shared => None,
                     Route::Reimport => {
@@ -2588,7 +2588,7 @@ impl Context {
                         probe("egl_image_target_texture_2d for a private sampler view");
                         Some(name)
                     }
-                    Route::View => {
+                    Route::View(src) => {
                         let levels = last_level.wrapping_sub(first_level).wrapping_add(1);
                         let layers = last_layer as i64 - first_layer as i64 + 1;
                         // The guest chose these. `glTextureView` refuses a range past the texture's
@@ -2633,7 +2633,7 @@ impl Context {
                         gl.texture_view(
                             name,
                             target,
-                            tex,
+                            src,
                             ifmt,
                             first_level,
                             levels,
@@ -2643,13 +2643,14 @@ impl Context {
                         if std::env::var_os("LIMINA_GL_TRACE").is_some() {
                             eprintln!(
                                 "[virglrs] vrend: sampler view: texture_view of resource {:?} \
-                             ({}x{} {}, immutable {immutable}, surface {}, supports_view \
+                             ({}x{} {}, immutable {}, surface {}, supports_view \
                              {supports_view}) as {} target {target:#x} internalformat {ifmt:#x} \
                              levels {first_level}+{levels} layers {first_layer}+{layers}",
                                 v.resource,
                                 res.args.width,
                                 res.args.height,
                                 res.args.format.name(),
+                                immutable.is_some(),
                                 res.surface().is_some(),
                                 view_format.name(),
                             );
@@ -2743,7 +2744,7 @@ impl Context {
         };
         let mut view = None;
         if let Storage::Texture(t) = &res.storage
-            && t.immutable
+            && let Some(src) = t.immutable
             && host.features.has(Feature::texture_view)
         {
             let max_layer = res.depth_at(level).saturating_sub(1);
@@ -2773,7 +2774,7 @@ impl Context {
                 let key = ViewKey { format: s.format, first_layer: fl, layers: layers as u32 };
                 // Minted now rather than at the first attach, so a driver that refuses the view
                 // is a fault on the command that asked for it.
-                t.view(gl, key, internalformat, res.args.last_level + 1);
+                t.view(gl, src, key, internalformat, res.args.last_level + 1);
                 view = Some(key);
             }
         }
@@ -2831,8 +2832,9 @@ struct ViewNeed {
     supports_view: bool,
     /// The texture's storage is an EGL image, so the same image can be imported a second time.
     has_image: bool,
-    /// `glTextureView` can be called at all: the texture is immutable and the host has the entry.
-    can_view: bool,
+    /// `glTextureView` can be called at all: the texture's immutability witness, when the host
+    /// has the entry.
+    can_view: Option<Immutable>,
 }
 
 /// How a sampler view gets its own object, or whether it needs one.
@@ -2841,8 +2843,9 @@ enum Route {
     /// Share the resource's texture. The view asks for nothing another view could overwrite, or
     /// there is no way to give it an object and the shared one is better than none.
     Shared,
-    /// `glTextureView`. The general route, and the only one that can reinterpret.
-    View,
+    /// `glTextureView` of the witnessed texture. The general route, and the only one that can
+    /// reinterpret.
+    View(Immutable),
     /// Import the texture's EGL image a second time, into a fresh name.
     Reimport,
 }
@@ -2897,7 +2900,10 @@ fn view_route(n: ViewNeed) -> Route {
         // available at all, and goes unserved rather than refused.
         return if n.private && n.has_image { Route::Reimport } else { Route::Shared };
     }
-    if n.can_view { Route::View } else { Route::Shared }
+    match n.can_view {
+        Some(src) => Route::View(src),
+        None => Route::Shared,
+    }
 }
 
 /// Undo the red/blue exchange an IOSurface-backed BGR* texture reads with.
@@ -4531,6 +4537,9 @@ fn video_result(cmd: Cmd, result: Result<(), video::Refusal>) -> Result<(), Faul
 mod tests {
     use super::*;
 
+    /// The immutable texture every route test is about.
+    const VIEWABLE: Immutable = Immutable::unbacked(TextureName::unbacked(7));
+
     /// An ordinary immutable texture: both needs go to a view, which is what the C does for the
     /// first and what the `vl_compositor` fix added for the second.
     const ORDINARY: ViewNeed = ViewNeed {
@@ -4538,7 +4547,7 @@ mod tests {
         private: false,
         supports_view: true,
         has_image: false,
-        can_view: true,
+        can_view: Some(VIEWABLE),
     };
 
     /// An IOSurface-backed BGR* texture: `glTextureView` over it is `GL_RGBA8` over BGRA8 storage
@@ -4572,7 +4581,7 @@ mod tests {
     #[test]
     fn a_swizzle_over_an_ordinary_texture_still_gets_an_object_of_its_own() {
         let n = ViewNeed { private: true, ..ORDINARY };
-        assert_eq!(view_route(n), Route::View);
+        assert_eq!(view_route(n), Route::View(VIEWABLE));
     }
 
     /// The regression, and the shape a compositor sampling a Vulkan client's window takes: an
@@ -4592,7 +4601,7 @@ mod tests {
     /// is an image to import.
     #[test]
     fn reinterpreting_asks_for_a_view_only_where_one_can_be_taken() {
-        assert_eq!(view_route(ViewNeed { reinterprets: true, ..ORDINARY }), Route::View);
+        assert_eq!(view_route(ViewNeed { reinterprets: true, ..ORDINARY }), Route::View(VIEWABLE));
         assert_eq!(view_route(ViewNeed { reinterprets: true, ..UNVIEWABLE }), Route::Shared);
         assert_eq!(view_route(ViewNeed { reinterprets: true, ..IMPORTED }), Route::Shared);
         let n = ViewNeed { reinterprets: true, private: true, ..IMPORTED };
@@ -4603,7 +4612,7 @@ mod tests {
     /// texture is worse than a private one and far better than a refusal.
     #[test]
     fn a_host_that_cannot_view_falls_back_rather_than_refusing() {
-        let n = ViewNeed { private: true, reinterprets: true, can_view: false, ..ORDINARY };
+        let n = ViewNeed { private: true, reinterprets: true, can_view: None, ..ORDINARY };
         assert_eq!(view_route(n), Route::Shared);
     }
 

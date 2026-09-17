@@ -83,6 +83,29 @@ impl Drop for Fence {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TextureName(GLuint);
 
+/// A texture the driver reported as immutable-format, which is the only source `glTextureView`
+/// accepts: given any other it puts the context in `GL_INVALID_OPERATION` for the rest of its
+/// life. Minted only by [`Gl::immutable_format`], from the driver's answer, so a view can only be
+/// asked of a texture the driver itself said would take one.
+///
+/// Necessary, not sufficient: a texture whose storage is an imported EGL image reports itself
+/// immutable and refuses a view all the same. That rule is the resource's (`supports_view`), and
+/// is checked beside this one, never instead of it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Immutable(TextureName);
+
+impl Immutable {
+    pub fn name(self) -> TextureName {
+        self.0
+    }
+
+    /// A witness no driver issued, for tests that never call GL with it.
+    #[cfg(test)]
+    pub const fn unbacked(name: TextureName) -> Immutable {
+        Immutable(name)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BufferName(GLuint);
 
@@ -200,7 +223,7 @@ impl TextureName {
 
     /// A name no driver handed out, for tests that never call GL with it.
     #[cfg(test)]
-    pub fn unbacked(id: GLuint) -> TextureName {
+    pub const fn unbacked(id: GLuint) -> TextureName {
         TextureName(id)
     }
 }
@@ -1184,13 +1207,14 @@ impl Gl {
     }
 
     /// `glTextureView`: `view` becomes a view of `levels` levels from `first_level` and
-    /// `layers` layers from `first_layer` of `tex`.
+    /// `layers` layers from `first_layer` of `tex`, which only an immutable-format texture can
+    /// be -- hence the witness rather than a name.
     #[allow(clippy::too_many_arguments)]
     pub fn texture_view(
         &self,
         view: TextureName,
         target: GLenum,
-        tex: TextureName,
+        tex: Immutable,
         internalformat: GLenum,
         first_level: GLuint,
         levels: GLuint,
@@ -1200,8 +1224,17 @@ impl Gl {
         let f = promised(procs::texture_view(&self.t), Feature::texture_view, "glTextureView");
         // SAFETY: plain scalars.
         unsafe {
-            f(view.0, target, tex.0, internalformat, first_level, levels, first_layer, layers)
+            f(view.0, target, tex.0.0, internalformat, first_level, levels, first_layer, layers)
         };
+    }
+
+    /// Whether `name`, bound to `target` here, has immutable-format storage: the driver's
+    /// answer, as the witness `glTextureView` takes. Asked rather than predicted from the
+    /// storage call that was made, so that the flag has one owner.
+    pub fn immutable_format(&self, target: GLenum, name: TextureName) -> Option<Immutable> {
+        self.bind_texture(target, Some(name));
+        (self.get_tex_parameter_i(target, GL_TEXTURE_IMMUTABLE_FORMAT) == GL_TRUE as GLint)
+            .then_some(Immutable(name))
     }
 
     /// `glEGLImageTargetTexStorageEXT`: the bound texture takes `image` as immutable storage.

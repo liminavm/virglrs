@@ -126,7 +126,7 @@ fn make_view(
     let Storage::Texture(t) = &res.storage else {
         return None;
     };
-    let (name, target, immutable) = (t.name, t.target, t.immutable);
+    let (name, target) = (t.name, t.target);
     let base = End { name, target, temporary: false };
     if res.args.format == format || !features.has(Feature::texture_view) || !res.supports_view() {
         return Some(base);
@@ -137,15 +137,17 @@ fn make_view(
     if te.gl.internalformat == ve.gl.internalformat
         || te.gl.view_class != ve.gl.view_class
         || te.gl.view_class == super::super::formats::ViewClass::Unsupported
-        || !immutable
     {
         return Some(base);
     }
+    let Some(src) = t.immutable else {
+        return Some(base);
+    };
     let view = gl.gen_texture();
     gl.texture_view(
         view,
         target,
-        name,
+        src,
         ve.gl.internalformat,
         0,
         res.args.last_level + 1,
