@@ -15,7 +15,7 @@
 
 use super::blitter;
 use super::caps;
-use super::context::{Context, Fault, Guest, Host, Todo};
+use super::context::{Context, Fault, Guest, Host, NotReplaying, Todo};
 use super::current::{Current, GlContext};
 use super::egl::{self, EglError, Flavour, GlContexts, Version, Winsys};
 use super::features::{Feature, Features};
@@ -148,6 +148,16 @@ pub enum ClaimRefused {
     Oversize { asked: u64, allocated: u32 },
     /// The driver refused the persistent mapping, or the storage never admitted one.
     Unmappable,
+}
+
+/// Why a replay step did not run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReplayRefused {
+    /// No classic context stands under that id.
+    NoContext,
+    /// The context is not between `replay_begin` and `replay_end`, so it is live and a journal
+    /// fed to it would be replayed over what the guest has built since.
+    NotReplaying,
 }
 
 /// Whether a blob of `size` bytes may be published from a resource of `width` bytes.
@@ -486,14 +496,22 @@ impl Vrend {
     }
 
     /// Feed a classic context's retained commands up to `upto`.
-    pub fn replay_upto(&mut self, ctx: ClassicCtx, guest: &dyn Guest, upto: Seq) -> bool {
+    pub fn replay_upto(
+        &mut self,
+        ctx: ClassicCtx,
+        guest: &dyn Guest,
+        upto: Seq,
+    ) -> Result<(), ReplayRefused> {
         let id = ctx.id();
         if !self.contexts.contains_key(&id) {
-            return false;
+            return Err(ReplayRefused::NoContext);
         }
         let (mut host, contexts) = self.split(id, guest);
-        contexts.get_mut(&id).expect("checked above").replay_upto(&mut host, upto);
-        true
+        contexts
+            .get_mut(&id)
+            .expect("checked above")
+            .replay_upto(&mut host, upto)
+            .map_err(|NotReplaying| ReplayRefused::NotReplaying)
     }
 
     /// Finish rebuilding a classic context, and report what it could not use.
@@ -1540,5 +1558,66 @@ mod tests {
         assert_eq!(parse_gles_version("OpenGL ES 3.1 Mesa 26.0.0"), 31);
         assert_eq!(parse_gles_version("OpenGL ES 3.2 Mesa 26.0.0-devel (git-abc)"), 32);
         assert_eq!(parse_gles_version(""), 0);
+    }
+
+    /// A journal reaches a classic context only between `replay_begin` and `replay_end`. Handed
+    /// to a live context, it would be replayed over what the guest has built since.
+    #[test]
+    fn a_journal_fed_to_a_live_classic_context_is_refused() {
+        use crate::vrend::context::NOT_REPLAYING;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+        )
+        .expect("vrend comes up");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &NoGuest).expect("a context");
+        // `CREATE_SUB_CTX 1`: the smallest thing a journal retains, so this one is not empty.
+        v.submit(ctx, &[(1 << 16) | 29, 1], &NoGuest)
+            .expect("the context is here")
+            .expect("a sub-context");
+        let journal = v.journal_export(ctx).expect("a live context exports its journal");
+        let entries = |bytes: &[u8]| crate::vrend::journal::parse(bytes).map(|e| e.len());
+        let retained = entries(&journal).expect("this renderer reads its own journal");
+        assert!(retained > 0, "a context with a sub-context retains something");
+
+        assert_eq!(
+            v.journal_restore(ctx, &journal),
+            Err(NOT_REPLAYING),
+            "handed outside a replay span, the journal is refused"
+        );
+        assert_eq!(
+            v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)),
+            Err(ReplayRefused::NotReplaying),
+            "and nothing is fed"
+        );
+
+        v.context_destroy(ctx, &NoGuest);
+        v.context_create(ctx, &NoGuest).expect("a fresh context to rebuild");
+        assert!(v.replay_begin(ctx));
+        assert_eq!(
+            v.journal_restore(ctx, &journal),
+            Ok(retained),
+            "inside the span the same journal is taken"
+        );
+        v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)).expect("and fed");
+        assert!(v.replay_end(ctx));
+        let rebuilt = v.journal_export(ctx).expect("the rebuilt context exports its journal");
+        assert_eq!(
+            entries(&rebuilt),
+            Ok(retained),
+            "what was fed is what the rebuilt context retains"
+        );
+        v.context_destroy(ctx, &NoGuest);
     }
 }

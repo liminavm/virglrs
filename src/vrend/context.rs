@@ -583,6 +583,14 @@ struct Replay {
     dropped: BTreeMap<&'static str, u64>,
 }
 
+/// A journal was handed to, or fed through, a context that is not being rebuilt. The VMM's
+/// mistake, never a guest's: only the replay ABI reaches either.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NotReplaying;
+
+/// [`NotReplaying`], in the words the journal's other refusals use.
+pub const NOT_REPLAYING: &str = "the context is not replaying";
+
 /// A sub-context's objects, each holding the commands that created it.
 ///
 /// A plain map plus a second map of retained dwords would be two records of one fact, and the
@@ -1412,10 +1420,14 @@ impl Context {
     }
 
     /// Take the journal a rebuild will be fed from.
+    ///
+    /// Refused outside a [`replay_begin`](Context::replay_begin) span: a context that is not
+    /// being rebuilt is live, and a journal fed to it would be replayed over what the guest has
+    /// built since.
     pub fn replay_restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        let Some(r) = self.replay.as_mut() else { return Err(NOT_REPLAYING) };
         let entries = journal::parse(bytes)?;
         let n = entries.len();
-        let r = self.replay.get_or_insert_with(Replay::default);
         r.entries = entries;
         r.fed = 0;
         Ok(n)
@@ -1426,17 +1438,20 @@ impl Context {
     /// Called more than once, with a rising watermark, because the VMM interleaves its own
     /// rebuilding with this one: some of what these commands name is created on its side, and it
     /// knows where in this order that happens.
-    pub fn replay_upto(&mut self, host: &mut Host<'_>, upto: Seq) {
+    pub fn replay_upto(&mut self, host: &mut Host<'_>, upto: Seq) -> Result<(), NotReplaying> {
+        if self.replay.is_none() {
+            return Err(NotReplaying);
+        }
         loop {
-            let Some(r) = self.replay.as_ref() else { return };
-            let Some(e) = r.entries.get(r.fed) else { return };
+            let r = self.replay.as_ref().expect("no command ends the replay it is fed in");
+            let Some(e) = r.entries.get(r.fed) else { return Ok(()) };
             if e.seq > upto {
-                return;
+                return Ok(());
             }
             // Cloned out of the journal rather than borrowed: running the command needs `self`
             // mutably, and an entry is one command, not a frame's worth of data.
             let (sub, chunks) = (e.sub, e.chunks.clone());
-            self.replay.as_mut().expect("just read").fed += 1;
+            self.replay.as_mut().expect("no command ends the replay it is fed in").fed += 1;
             self.replay_one(host, sub, &chunks);
         }
     }

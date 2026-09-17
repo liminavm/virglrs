@@ -27,7 +27,7 @@ use crate::vrend::context::Guest;
 use crate::vrend::proto::Box3;
 use crate::vrend::resource::{Args as ClassicArgs, Refusal};
 use crate::vrend::transfer;
-use crate::vrend::vrend::ClaimRefused;
+use crate::vrend::vrend::{ClaimRefused, ReplayRefused};
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(test)]
@@ -1452,11 +1452,12 @@ impl Renderer {
             Bound::Classic(c) => {
                 let table = self.resources.read().expect("the resource lock is never poisoned");
                 let v = self.vrend.as_mut().ok_or(Error::RendererAbsent)?;
-                if v.replay_upto(c, &*table, crate::vrend::journal::Seq(upto)) {
-                    Ok(())
-                } else {
-                    Err(Error::NoContext)
-                }
+                v.replay_upto(c, &*table, crate::vrend::journal::Seq(upto)).map_err(|e| match e {
+                    ReplayRefused::NoContext => Error::NoContext,
+                    ReplayRefused::NotReplaying => {
+                        Error::JournalRefused(vrend::context::NOT_REPLAYING)
+                    }
+                })
             }
             Bound::Venus(c) => self
                 .venus_mut()?

@@ -1197,6 +1197,20 @@ SABOTAGES = [
         'a_journal_fed_to_a_live_context_is_refused',
     ),
     (
+        'a journal handed to a live classic context opens a replay of its own',
+        'src/vrend/context.rs',
+        '        let Some(r) = self.replay.as_mut() else { return Err(NOT_REPLAYING) };',
+        '        let r = self.replay.get_or_insert_with(Replay::default);',
+        'a_journal_fed_to_a_live_classic_context_is_refused',
+    ),
+    (
+        'a journal fed to a live classic context is fed as though it were replaying',
+        'src/vrend/context.rs',
+        '        if self.replay.is_none() {\n            return Err(NotReplaying);\n        }',
+        '        if self.replay.is_none() {\n            return Ok(());\n        }',
+        'a_journal_fed_to_a_live_classic_context_is_refused',
+    ),
+    (
         'a second replay_begin drops the journal the first was handed',
         'src/venus/context.rs',
         '        self.replay.get_or_insert_with(Replay::default);',
