@@ -1151,6 +1151,17 @@ SABOTAGES = [
         'a_venus_contexts_own_blob_is_released_by_its_unref_without_classic_work',
     ),
     (
+        'a switch records the context before the winsys has made it current',
+        'src/vrend/current.rs',
+        """        winsys.make_current(ctx)?;
+        self.switched_to(on);
+        Ok(())""",
+        """        self.switched_to(on);
+        winsys.make_current(ctx)?;
+        Ok(())""",
+        'a_refused_switch_leaves_the_shadow_on_the_context_the_thread_kept',
+    ),
+    (
         'an image load one past the last slot is let through to the image array',
         'src/vrend/shader/glsl/tex.rs',
         'if sinfo.sreg_index < 0 || sinfo.sreg_index as usize >= MAX_SHADER_IMAGES {\n            return false;\n        }\n        if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {',

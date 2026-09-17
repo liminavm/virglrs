@@ -19,6 +19,7 @@ pub mod blitter;
 pub mod caps;
 pub mod content;
 pub mod context;
+pub mod current;
 pub mod debug;
 pub mod decode;
 pub mod dirty;

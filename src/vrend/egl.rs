@@ -1427,6 +1427,8 @@ mod tests {
         destroyed: std::sync::Mutex<Vec<usize>>,
         bound: std::sync::Mutex<Vec<usize>>,
         shared_asked: std::sync::Mutex<Vec<bool>>,
+        /// Refuse every bind from now on, as a display that lost its contexts would.
+        refuse: std::sync::atomic::AtomicBool,
     }
 
     impl GlContexts for FakeEmbedder {
@@ -1445,6 +1447,12 @@ mod tests {
         }
 
         fn make_current(&self, ctx: EGLContext) -> Result<(), EglError> {
+            if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(EglError {
+                    call: "eglMakeCurrent",
+                    code: proc::EGL_BAD_ACCESS as EGLint,
+                });
+            }
             self.bound.lock().expect("test").push(ctx.addr());
             Ok(())
         }
@@ -1452,6 +1460,52 @@ mod tests {
         fn destroy(&self, ctx: EGLContext) {
             self.destroyed.lock().expect("test").push(ctx.addr());
         }
+    }
+
+    /// The shadow of the current context moves only with the switch that makes it true. A
+    /// switch the winsys refuses leaves the thread on the context it was on, and a record that
+    /// moved anyway would have the next bind skipped on the belief that the program shadow is
+    /// the new context's.
+    #[test]
+    fn a_refused_switch_leaves_the_shadow_on_the_context_the_thread_kept() {
+        use super::super::current::{Current, GlContext};
+        use super::super::proto::SubContextId;
+        use std::sync::atomic::Ordering;
+
+        let fake = Arc::new(FakeEmbedder::default());
+        let embedder = Arc::clone(&fake);
+
+        struct Lent(Arc<FakeEmbedder>);
+        impl GlContexts for Lent {
+            fn display(&self) -> Option<EGLDisplay> {
+                self.0.display()
+            }
+            fn create(&self, version: Version, shared: bool) -> Option<EGLContext> {
+                self.0.create(version, shared)
+            }
+            fn make_current(&self, ctx: EGLContext) -> Result<(), EglError> {
+                self.0.make_current(ctx)
+            }
+            fn destroy(&self, ctx: EGLContext) {
+                self.0.destroy(ctx);
+            }
+        }
+
+        let v = Version { major: 3, minor: 2 };
+        let (winsys, ctx0, _) = Winsys::embedded(Flavour::Gles, Box::new(Lent(fake)), &[v])
+            .expect("a display the embedder vouched for");
+        let sub_ctx = winsys.create_context(v, Some(&ctx0)).expect("a second context");
+        let sub = GlContext::Sub(crate::ids::ContextId::new(1).expect("non-zero"), SubContextId(0));
+
+        let mut current = Current::ctx0();
+        current.switch_to(&winsys, &sub_ctx, sub).expect("the embedder binds it");
+        assert_eq!(current.on(), sub);
+
+        embedder.refuse.store(true, Ordering::Relaxed);
+        current
+            .switch_to(&winsys, &ctx0, GlContext::Ctx0)
+            .expect_err("the embedder refused the bind");
+        assert_eq!(current.on(), sub, "the thread never left the context it was on");
     }
 
     /// Every context of an embedder-backed winsys is the embedder's, and goes back to it.

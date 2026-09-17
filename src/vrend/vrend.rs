@@ -15,7 +15,8 @@
 
 use super::blitter;
 use super::caps;
-use super::context::{Context, Current, Fault, GlContext, Guest, Host, Todo};
+use super::context::{Context, Fault, Guest, Host, Todo};
+use super::current::{Current, GlContext};
 use super::egl::{self, EglError, Flavour, GlContexts, Version, Winsys};
 use super::features::{Feature, Features};
 use super::formats::Table;
@@ -344,8 +345,9 @@ impl Vrend {
 
     /// Make ctx0 current.
     fn switch_ctx0(&mut self) {
-        self.winsys.make_current(&self.ctx0).expect("ctx0 was current once and still exists");
-        self.current.switched_to(GlContext::Ctx0);
+        self.current
+            .switch_to(&self.winsys, &self.ctx0, GlContext::Ctx0)
+            .expect("ctx0 was current once and still exists");
     }
 
     /// The host a context's commands run against, and the contexts beside it: two disjoint
@@ -934,8 +936,9 @@ impl Vrend {
         if let Some(ctx) = self.contexts.get(&id) {
             for (sub, gl_ctx) in ctx.gl_contexts() {
                 let began = self.tally.mark();
-                self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
-                self.current.switched_to(GlContext::Sub(id, sub));
+                self.current
+                    .switch_to(&self.winsys, gl_ctx, GlContext::Sub(id, sub))
+                    .expect("a sub-context's GL context exists");
                 let switched = self.tally.mark();
                 let taken = self.gl.fence();
                 let marks = began.zip(switched).zip(self.tally.mark()).map(|((b, s), t)| (b, s, t));
@@ -1054,8 +1057,9 @@ impl Vrend {
         for id in which {
             let Some(ctx) = self.contexts.get(id) else { continue };
             for (sub, gl_ctx) in ctx.gl_contexts() {
-                self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
-                self.current.switched_to(GlContext::Sub(*id, sub));
+                self.current
+                    .switch_to(&self.winsys, gl_ctx, GlContext::Sub(*id, sub))
+                    .expect("a sub-context's GL context exists");
                 self.gl.finish();
             }
         }
@@ -1080,8 +1084,9 @@ impl Vrend {
     pub fn finish_all(&mut self) {
         for (id, ctx) in &self.contexts {
             for (sub, gl_ctx) in ctx.gl_contexts() {
-                self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
-                self.current.switched_to(GlContext::Sub(*id, sub));
+                self.current
+                    .switch_to(&self.winsys, gl_ctx, GlContext::Sub(*id, sub))
+                    .expect("a sub-context's GL context exists");
                 self.gl.finish();
             }
         }

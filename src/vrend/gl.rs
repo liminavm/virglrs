@@ -39,7 +39,7 @@ use core::ffi::CStr;
 /// bind a program without recording what it bound -- which is what makes skipping a redundant bind
 /// safe rather than a bet on every present and future caller. GL's current program is per-context
 /// state, so exactly one of these is ever the right one: the current context's, which
-/// [`super::context::Current`] owns and clears on a switch.
+/// [`super::current::Current`] owns and clears on a switch.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct BoundProgram(Option<ProgramName>);
 
