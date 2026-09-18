@@ -26,18 +26,21 @@ use super::proto::types::{
     VkDependencyInfo, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
     VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
     VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties,
-    VkExternalFenceHandleTypeFlagBits, VkExternalMemoryHandleTypeFlagBits,
-    VkExternalMemoryImageCreateInfo, VkExternalSemaphoreHandleTypeFlagBits, VkFence,
-    VkFenceGetFdInfoKHR, VkFilter, VkFormat, VkFramebuffer, VkFrontFace,
-    VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlags, VkImageBlit, VkImageCopy,
-    VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties, VkImageLayout,
-    VkImageMemoryBarrier, VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy, VkImageType,
-    VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
-    VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance,
-    VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo,
-    VkMemoryMapFlags, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
-    VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy, VkMemoryToImageCopyMESA,
-    VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType, VkPhysicalDevice,
+    VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
+    VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
+    VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
+    VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
+    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceGetFdInfoKHR, VkFilter, VkFormat,
+    VkFramebuffer, VkFrontFace, VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlags,
+    VkImageBlit, VkImageCopy, VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties,
+    VkImageFormatProperties2, VkImageLayout, VkImageMemoryBarrier, VkImageSubresourceRange,
+    VkImageTiling, VkImageToMemoryCopy, VkImageType, VkImageUsageFlags, VkImageView,
+    VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR,
+    VkIndexType, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier,
+    VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags, VkMemoryPropertyFlagBits,
+    VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy,
+    VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType,
+    VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo, VkPhysicalDeviceImageFormatInfo2,
     VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties, VkPipeline,
     VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
     VkPipelineStageFlags, VkPipelineStageFlags2, VkPrimitiveTopology, VkQueryControlFlags,
@@ -925,12 +928,24 @@ impl Driver {
         // available. `EMULATED_ON_THE_HOST` is the other half of the same decision: advertised
         // here, and stripped from the list the device is created with, because the driver would
         // fail `vkCreateDevice` outright for an extension it does not have.
-        if self.supports(pd, "VK_EXT_external_memory_metal")
-            && !self.supports(pd, "VK_KHR_external_memory_fd")
-        {
+        if self.emulates_fd_external_memory(pd) {
             out.extend(EMULATED_ON_THE_HOST.iter().filter_map(|n| extension_properties(n)));
         }
         out
+    }
+
+    /// Whether `EMULATED_ON_THE_HOST` on this physical device means this renderer rather than the
+    /// driver: the driver has the Metal interop the emulation is built on, and none of the
+    /// fd-flavoured external memory itself.
+    ///
+    /// One value rather than the same conjunction written wherever it is needed (CLAUDE.md).
+    /// Advertising the pair and answering a query about it are two halves of one promise:
+    /// [`Driver::advertised_extensions`] keeps the first and
+    /// [`Driver::image_format_properties2`] the second, and a device that keeps only the first
+    /// is told it has dma-buf images and then told no format supports them.
+    fn emulates_fd_external_memory(&self, pd: VkPhysicalDevice) -> bool {
+        self.supports(pd, "VK_EXT_external_memory_metal")
+            && !self.supports(pd, "VK_KHR_external_memory_fd")
     }
 
     fn supports(&self, pd: VkPhysicalDevice, name: &str) -> bool {
@@ -1116,6 +1131,82 @@ impl Driver {
         let f = self.instance().and_then(pick).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `pd_query`; `info` borrows an arena struct live for the call.
         Ok(unsafe { f(pd, info, out) })
+    }
+
+    /// `vkGetPhysicalDeviceImageFormatProperties2`, with the external-memory half answered here
+    /// wherever this renderer is what that half means.
+    ///
+    /// Not a `pd_query_info` like its neighbours, because on a device whose fd-flavoured external
+    /// memory is [emulated][`Driver::emulates_fd_external_memory`] the driver is the wrong thing
+    /// to ask. It has no dma-buf and no opaque fd, so it answers a query about either with
+    /// `VK_ERROR_FORMAT_NOT_SUPPORTED` -- correctly, for a question that was never about it. The
+    /// IOSurface backing an image shared this way is minted by this renderer, so the question is
+    /// this renderer's to answer: ask the driver only what the image itself costs, with the
+    /// external-image link unchained, and fill in the external properties afterwards.
+    ///
+    /// The features are flat `EXPORTABLE | IMPORTABLE` and the handle type is the one asked
+    /// about. Nothing finer is worth computing: guest venus overwrites `compatibleHandleTypes`
+    /// from its own supported set and masks the features against what virtgpu can import, so a
+    /// more careful answer here would be discarded before any application saw it.
+    ///
+    /// A device the driver really does have the extensions for is untouched -- the query goes
+    /// through as it came, and whatever the driver says is the answer.
+    pub fn image_format_properties2(
+        &self,
+        pd: VkPhysicalDevice,
+        info: &VkPhysicalDeviceImageFormatInfo2,
+        out: &mut VkImageFormatProperties2,
+    ) -> Result<VkResult, VkResult> {
+        let f = self
+            .instance()
+            .and_then(|i| i.try_vkGetPhysicalDeviceImageFormatProperties2())
+            .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+
+        let Some(handle) = self.emulated_external_image(pd, info) else {
+            // SAFETY: as `pd_query_info`; both structs borrow arena entries live for the call.
+            return Ok(unsafe { f(pd, info, out) });
+        };
+
+        let ret = without_external_image_info(info, |asked| {
+            // SAFETY: as above, and `asked` is the guest's own request with one link unchained.
+            unsafe { f(pd, asked, out) }
+        });
+        if ret == VkResult::VK_SUCCESS
+            && let Some(props) = chained_mut::<VkExternalImageFormatProperties>(&mut out.pNext)
+        {
+            let features =
+                VkExternalMemoryFeatureFlagBits::VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT.0
+                    | VkExternalMemoryFeatureFlagBits::VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT.0;
+            props.externalMemoryProperties = VkExternalMemoryProperties {
+                externalMemoryFeatures: VkExternalMemoryFeatureFlags(features as u32),
+                exportFromImportedHandleTypes: VkExternalMemoryHandleTypeFlags(handle.0 as u32),
+                compatibleHandleTypes: VkExternalMemoryHandleTypeFlags(handle.0 as u32),
+            };
+        }
+        Ok(ret)
+    }
+
+    /// The handle type an image-format query asks about that this renderer answers for, or `None`
+    /// if the driver is the one to ask.
+    ///
+    /// A chained link naming no handle type asks about nothing, and one naming a handle type this
+    /// renderer does not emulate -- Metal's own, a Windows handle -- is the driver's question to
+    /// answer or refuse. Only the two `EMULATED_ON_THE_HOST` names are ours.
+    fn emulated_external_image(
+        &self,
+        pd: VkPhysicalDevice,
+        info: &VkPhysicalDeviceImageFormatInfo2,
+    ) -> Option<VkExternalMemoryHandleTypeFlagBits> {
+        const FD_FLAVOURED: i32 =
+            VkExternalMemoryHandleTypeFlagBits::VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT.0
+                | VkExternalMemoryHandleTypeFlagBits::VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+                    .0;
+
+        if !self.emulates_fd_external_memory(pd) {
+            return None;
+        }
+        let handle = chained::<VkPhysicalDeviceExternalImageFormatInfo>(&info.pNext)?.handleType;
+        (handle.0 & FD_FLAVOURED != 0).then_some(handle)
     }
 
     /// A physical-device query whose request is six loose scalars: only
@@ -6088,6 +6179,64 @@ pub fn chained<T: InStruct>(head: &*const core::ffi::c_void) -> Option<&T> {
     None
 }
 
+/// Run `f` on the guest's image-format request with the external-image link out of its chain.
+///
+/// The one place a `pNext` chain is taken apart rather than read, and it exists because the
+/// driver must not see a link that describes memory the driver knows nothing about --
+/// [`Driver::image_format_properties2`] says why. Everything else the guest chained goes through
+/// untouched and in its own order: a format list, a stencil usage, a DRM modifier each change
+/// what the answer is, and dropping the chain wholesale would ask a different question.
+///
+/// The link at the head of the chain is spliced out by copying the request, because the request
+/// itself is borrowed shared and is the guest's. A link further along is reached only through
+/// raw `pNext` pointers, so the predecessor is written directly and put back before `f` returns.
+fn without_external_image_info<R>(
+    info: &VkPhysicalDeviceImageFormatInfo2,
+    f: impl FnOnce(&VkPhysicalDeviceImageFormatInfo2) -> R,
+) -> R {
+    const TAG: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
+
+    let head = info.pNext.cast::<VkBaseInStructure>();
+    if head.is_null() {
+        return f(info);
+    }
+    // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one of
+    // them begins with the `sType`/`pNext` header `VkBaseInStructure` names.
+    if unsafe { (*head).sType } == TAG {
+        let mut asked = *info;
+        // SAFETY: as above.
+        asked.pNext = unsafe { (*head).pNext }.cast();
+        return f(&asked);
+    }
+
+    let mut prev = head.cast_mut();
+    let skipped = loop {
+        // SAFETY: as above.
+        let next = unsafe { (*prev).pNext }.cast_mut();
+        if next.is_null() {
+            return f(info);
+        }
+        // SAFETY: as above.
+        if unsafe { (*next).sType } == TAG {
+            break next;
+        }
+        prev = next;
+    };
+    // SAFETY: `prev` and `skipped` are two arena entries the decoder allocated from `*mut`
+    // pointers and reached here only through the chain's own raw `pNext` fields -- never through
+    // the shared borrow of the request, which covers its own bytes and nothing further. One
+    // context's batch is decoded and dispatched on one thread, and the link is back in place
+    // before this returns, so nothing downstream sees a chain with a hole in it.
+    let rest = unsafe { (*skipped).pNext };
+    // SAFETY: as above.
+    unsafe { (*prev).pNext = rest };
+    let answered = f(info);
+    // SAFETY: as above.
+    unsafe { (*prev).pNext = skipped };
+    answered
+}
+
 /// Why a timeline entry point was refused without being forwarded.
 ///
 /// Not a `VkResult`: Vulkan has no error for this, because it is not an error the driver reports
@@ -6162,6 +6311,13 @@ unsafe impl InStruct for VkRingMonitorInfoMESA {
     const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA;
 }
 
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkPhysicalDeviceExternalImageFormatInfo {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
+}
+
 pub fn chained_mut<T: OutStruct>(head: &mut *mut core::ffi::c_void) -> Option<&mut T> {
     let mut node = (*head).cast::<VkBaseOutStructure>();
     while !node.is_null() {
@@ -6189,6 +6345,12 @@ unsafe impl OutStruct for VkMemoryResourceAllocationSizePropertiesMESA {
 unsafe impl OutStruct for VkPhysicalDeviceMemoryBudgetPropertiesEXT {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+}
+
+// SAFETY: as above -- generated `repr(C)` from vk.xml for exactly this tag.
+unsafe impl OutStruct for VkExternalImageFormatProperties {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
 }
 
 /// The create info the driver is handed for an image, which is the guest's unless the guest
@@ -6792,6 +6954,184 @@ mod tests {
                 "{want} is not claimed where nothing emulates it",
             );
         }
+    }
+
+    /// The query half of the same promise: a guest told it has dma-buf images must not then be
+    /// told no format supports one.
+    ///
+    /// `advertised_extensions` injects the fd pair on a Metal driver, and that driver has neither
+    /// -- so asked about either handle type it refuses the whole format query. That is the right
+    /// answer to a question about memory it cannot make, and the wrong answer to the question the
+    /// guest asked, because the storage behind such an image is this renderer's IOSurface and
+    /// never the driver's. Advertised and unanswerable is the half-kept promise the injection
+    /// comment warns about, and it costs a spec-incorrect reply plus three validation errors per
+    /// dma-buf image.
+    ///
+    /// The planted driver is that driver. Both chain positions are exercised because the guest
+    /// writes the chain in whatever order its application did, and a handler that only found the
+    /// link at the head would pass here and fail on a real desktop.
+    #[test]
+    fn an_emulated_external_image_query_is_answered_by_the_renderer() {
+        use super::super::proto::types::{
+            VkImageFormatListCreateInfo, VkImageStencilUsageCreateInfo,
+        };
+
+        const METAL: VkPhysicalDevice = VkPhysicalDevice(1);
+        const NATIVE: VkPhysicalDevice = VkPhysicalDevice(2);
+        const DMA_BUF: VkExternalMemoryHandleTypeFlagBits =
+            VkExternalMemoryHandleTypeFlagBits::VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        const MIP_LEVELS: u32 = 11;
+
+        /// KosmicKrisp's own answer: a handle type its switch has no case for refuses the query.
+        unsafe extern "C" fn image_format(
+            _pd: VkPhysicalDevice,
+            info: *const VkPhysicalDeviceImageFormatInfo2,
+            out: *mut VkImageFormatProperties2,
+        ) -> VkResult {
+            // SAFETY: the caller passed pointers to live structs it borrows for the call.
+            let (info, out) = unsafe { (&*info, &mut *out) };
+            if chained::<VkPhysicalDeviceExternalImageFormatInfo>(&info.pNext).is_some() {
+                return VkResult::VK_ERROR_FORMAT_NOT_SUPPORTED;
+            }
+            out.imageFormatProperties.maxMipLevels = MIP_LEVELS;
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = InstanceFns::default();
+        fns.plant_vkGetPhysicalDeviceImageFormatProperties2(image_format);
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_instance(fns);
+        driver.plant_extensions(METAL, &["VK_EXT_external_memory_metal"]);
+        driver.plant_extensions(
+            NATIVE,
+            &["VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf"],
+        );
+
+        let mut external = VkPhysicalDeviceExternalImageFormatInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+            handleType: DMA_BUF,
+            ..Default::default()
+        };
+        let mut info = VkPhysicalDeviceImageFormatInfo2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+            pNext: (&raw mut external).cast(),
+            ..Default::default()
+        };
+
+        /// The answer the guest hung off its query, and the properties struct behind it.
+        fn answer(props: &mut VkExternalImageFormatProperties) -> VkImageFormatProperties2 {
+            props.sType = VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
+            VkImageFormatProperties2 {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+                pNext: (&raw mut *props).cast(),
+                ..Default::default()
+            }
+        }
+
+        let synthesized = VkExternalMemoryProperties {
+            externalMemoryFeatures: VkExternalMemoryFeatureFlags(
+                (VkExternalMemoryFeatureFlagBits::VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT.0
+                    | VkExternalMemoryFeatureFlagBits::VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT.0)
+                    as u32,
+            ),
+            exportFromImportedHandleTypes: VkExternalMemoryHandleTypeFlags(DMA_BUF.0 as u32),
+            compatibleHandleTypes: VkExternalMemoryHandleTypeFlags(DMA_BUF.0 as u32),
+        };
+
+        // The link at the head of the chain.
+        let mut props = VkExternalImageFormatProperties::default();
+        let mut out = answer(&mut props);
+        assert_eq!(
+            driver.image_format_properties2(METAL, &info, &mut out),
+            Ok(VkResult::VK_SUCCESS),
+            "a dma-buf image is what this renderer mints, so the query is not the driver's to refuse",
+        );
+        assert_eq!(
+            out.imageFormatProperties.maxMipLevels, MIP_LEVELS,
+            "and the part that really is the driver's came from the driver",
+        );
+        assert_eq!(
+            props.externalMemoryProperties.externalMemoryFeatures,
+            synthesized.externalMemoryFeatures,
+            "the image can be exported and imported",
+        );
+        assert_eq!(
+            props.externalMemoryProperties.compatibleHandleTypes, synthesized.compatibleHandleTypes,
+            "as the handle type asked about",
+        );
+        assert_eq!(
+            props.externalMemoryProperties.exportFromImportedHandleTypes,
+            synthesized.exportFromImportedHandleTypes,
+            "in both directions",
+        );
+        assert_eq!(info.pNext, (&raw mut external).cast(), "the guest's chain is as it sent it");
+
+        // The same link further along one, which is where an application's own chain puts it.
+        let mut tail = VkImageStencilUsageCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO,
+            ..Default::default()
+        };
+        external.pNext = (&raw mut tail).cast();
+        let mut first = VkImageFormatListCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+            pNext: (&raw mut external).cast(),
+            ..Default::default()
+        };
+        info.pNext = (&raw mut first).cast();
+
+        let mut props = VkExternalImageFormatProperties::default();
+        let mut out = answer(&mut props);
+        assert_eq!(
+            driver.image_format_properties2(METAL, &info, &mut out),
+            Ok(VkResult::VK_SUCCESS),
+            "the link is found wherever the guest hung it, not only at the head",
+        );
+        assert_eq!(
+            props.externalMemoryProperties.compatibleHandleTypes, synthesized.compatibleHandleTypes,
+            "and answered the same way",
+        );
+        assert_eq!(
+            first.pNext,
+            (&raw mut external).cast::<core::ffi::c_void>().cast_const(),
+            "the chain the driver did not see is put back",
+        );
+        assert_eq!(
+            external.pNext,
+            (&raw mut tail).cast::<core::ffi::c_void>().cast_const(),
+            "with everything that followed it still behind it",
+        );
+
+        // A handle type nothing here emulates stays the driver's question to answer or refuse.
+        let mut metal_handle = VkPhysicalDeviceExternalImageFormatInfo {
+            handleType:
+                VkExternalMemoryHandleTypeFlagBits::VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+            ..external
+        };
+        let metal_asked =
+            VkPhysicalDeviceImageFormatInfo2 { pNext: (&raw mut metal_handle).cast(), ..info };
+        let mut props = VkExternalImageFormatProperties::default();
+        let mut out = answer(&mut props);
+        assert_eq!(
+            driver.image_format_properties2(METAL, &metal_asked, &mut out),
+            Ok(VkResult::VK_ERROR_FORMAT_NOT_SUPPORTED),
+            "Metal's own handle type is not one of the two this renderer stands in for",
+        );
+
+        // Neither is a device whose driver has the real extensions: nothing was injected for it.
+        let mut props = VkExternalImageFormatProperties::default();
+        let mut out = answer(&mut props);
+        assert_eq!(
+            driver.image_format_properties2(NATIVE, &info, &mut out),
+            Ok(VkResult::VK_ERROR_FORMAT_NOT_SUPPORTED),
+            "a driver that really has dma-buf is asked the question the guest sent",
+        );
+        assert_eq!(
+            props.externalMemoryProperties.compatibleHandleTypes,
+            VkExternalMemoryHandleTypeFlags(0),
+            "and nothing is synthesized behind its answer",
+        );
+
+        driver.abandon_planted();
     }
 
     /// The other half of the emulation decision: what the device is actually created with.

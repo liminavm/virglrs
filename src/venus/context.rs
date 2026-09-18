@@ -3522,10 +3522,7 @@ impl Commands for Handlers<'_> {
         let pd = args.physicalDevice;
         let Some(info) = self.names(args.pImageFormatInfo) else { return };
         let Some(out) = self.fills(args.pImageFormatProperties_mut()) else { return };
-        args.ret = self
-            .driver
-            .pd_query_info(pd, info, out, |i| i.try_vkGetPhysicalDeviceImageFormatProperties2())
-            .unwrap_or_else(|e| e);
+        args.ret = self.driver.image_format_properties2(pd, info, out).unwrap_or_else(|e| e);
     }
 
     fn vkGetImageDrmFormatModifierPropertiesEXT(
