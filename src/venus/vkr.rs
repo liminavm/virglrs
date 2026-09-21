@@ -1513,6 +1513,126 @@ mod tests {
         v.context_destroy(ctx_id());
     }
 
+    /// A ring exporting a semaphore's sync payload holds nothing either.
+    ///
+    /// `vkWaitSemaphoreResourceMESA` spells itself as an export, which is why it went on
+    /// blocking inside the handler long after the four named waits stopped. On a driver whose
+    /// sync type cannot make a sync file -- KosmicKrisp, and so every host limina ships on --
+    /// mesa's `vk_sync_binary` export waits the GPU out untimed before answering, so taken
+    /// inline it holds the context lock and the resource read lock for the length of the
+    /// guest's rendering. The planted driver blocks the same way; the deadline is the assertion.
+    #[test]
+    fn a_ring_exporting_a_semaphore_payload_does_not_hold_its_context() {
+        use crate::venus::cs::{HostHandle, ObjectId};
+        use crate::venus::proto::serialize::{
+            vn_encode_vkWaitSemaphoreResourceMESA_args, vn_sizeof_vkWaitSemaphoreResourceMESA_args,
+        };
+        use crate::venus::proto::types::{
+            VkAllocationCallbacks, VkDevice, VkObjectType, VkResult, VkSemaphore,
+            VkSemaphoreGetFdInfoKHR, vn_command_vkWaitSemaphoreResourceMESA as Args,
+        };
+
+        const DEVICE: u64 = 0xd0;
+        const GUEST_DEV: u64 = 0x1d;
+        const SEM: u64 = 0x5e;
+        const GUEST_SEM: u64 = 0x15;
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+
+        /// What `vk_sync_binary_export_sync_file` does on this host: wait the GPU out, then
+        /// answer `VK_SUCCESS` with the already-signalled `-1`.
+        unsafe extern "C" fn export(
+            _d: VkDevice,
+            _info: *const VkSemaphoreGetFdInfoKHR,
+            fd: *mut core::ffi::c_int,
+        ) -> VkResult {
+            ENTERED.store(true, Ordering::Release);
+            while !RELEASE.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // SAFETY: the caller passes a pointer to its own live `c_int`.
+            unsafe { *fd = -1 };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_semaphore(
+            _d: VkDevice,
+            _s: VkSemaphore,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        ENTERED.store(false, Ordering::Release);
+        RELEASE.store(false, Ordering::Release);
+
+        let (mut v, map) = vkr();
+        {
+            let arc = v.contexts.get(&ctx_id().id()).expect("created by the fixture");
+            let mut ctx = arc.lock().expect("a context lock is never poisoned");
+            let mut fns = crate::vulkan::Device::default();
+            fns.plant_vkGetSemaphoreFdKHR(export);
+            fns.plant_vkDeviceWaitIdle(idle);
+            fns.plant_vkDestroySemaphore(destroy_semaphore);
+            fns.plant_vkDestroyDevice(destroy_device);
+            ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
+            let mut table = ctx.objects().borrow_mut();
+            table
+                .add(
+                    ObjectId(GUEST_DEV),
+                    VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                    HostHandle(DEVICE),
+                    None,
+                )
+                .expect("a fresh id");
+            table
+                .add(
+                    ObjectId(GUEST_SEM),
+                    VkObjectType::VK_OBJECT_TYPE_SEMAPHORE,
+                    HostHandle(SEM),
+                    None,
+                )
+                .expect("a fresh id");
+        }
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+
+        let work = {
+            let args = Args {
+                device: VkDevice(GUEST_DEV),
+                semaphore: VkSemaphore(GUEST_SEM),
+                ..Default::default()
+            };
+            let proto = crate::venus::cs::AllOfIt;
+            let mut buf = vec![0u8; vn_sizeof_vkWaitSemaphoreResourceMESA_args(&proto, &args)];
+            let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+            vn_encode_vkWaitSemaphoreResourceMESA_args(&mut enc, VkFlags(0), &args);
+            buf
+        };
+        guest_writes(&map, &work);
+        until("the ring thread to enter the export", || ENTERED.load(Ordering::Acquire));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let out = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _ = tx.send(v.submit(ctx_id(), &wire_submit_vq(7, 1)));
+            });
+            let out = rx.recv_timeout(Duration::from_secs(5));
+            // Released before the verdict, so a failure is a report rather than a hang.
+            RELEASE.store(true, Ordering::Release);
+            out
+        });
+        let out = out.expect("the context's stream was held by a ring inside the export");
+        assert_eq!(out, Ok(Submitted::Done), "served while the ring was inside the export");
+
+        until("the ring to consume the export once released", || head(&map) == work.len() as u32);
+        v.context_destroy(ctx_id());
+    }
+
     /// A context whose ring is inside a wait the guest gave forever to is still torn down
     /// promptly: the wait is made in slices, and the stop lands between them.
     ///

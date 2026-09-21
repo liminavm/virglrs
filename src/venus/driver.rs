@@ -516,6 +516,13 @@ enum WaitKind {
     },
     DeviceIdle,
     QueueIdle(VkQueue),
+    /// `vkGetSemaphoreFdKHR` for a `SYNC_FD` payload, which blocks on this host: KosmicKrisp's
+    /// sync type is timeline-only, so a binary semaphore is wrapped in mesa's `vk_sync_binary`,
+    /// whose `export_sync_file` waits the underlying Metal shared event out untimed before
+    /// handing back the already-signalled `-1`. It reads as an export and costs a GPU wait.
+    ExportSemaphoreSyncFd(VkSemaphore),
+    /// The fence twin, through `vkGetFenceFdKHR` and the same `vk_sync_binary` export.
+    ExportFenceSyncFd(VkFence),
 }
 
 impl PartialEq for DriverWait {
@@ -558,6 +565,8 @@ impl DriverWait {
             WaitKind::Semaphores { semaphores, .. } => semaphores.iter().map(|s| s.0).collect(),
             WaitKind::DeviceIdle => Vec::new(),
             WaitKind::QueueIdle(q) => vec![q.0],
+            WaitKind::ExportSemaphoreSyncFd(s) => vec![s.0],
+            WaitKind::ExportFenceSyncFd(f) => vec![f.0],
         }
     }
 
@@ -573,7 +582,10 @@ impl DriverWait {
     pub fn run(&self, keep_going: impl Fn() -> bool) -> Option<Answered> {
         let timeout = match &self.kind {
             WaitKind::Fences { timeout, .. } | WaitKind::Semaphores { timeout, .. } => *timeout,
-            WaitKind::DeviceIdle | WaitKind::QueueIdle(_) => return Some(Answered(self.call(0))),
+            WaitKind::DeviceIdle
+            | WaitKind::QueueIdle(_)
+            | WaitKind::ExportSemaphoreSyncFd(_)
+            | WaitKind::ExportFenceSyncFd(_) => return Some(Answered(self.call(0))),
         };
         let mut left = timeout;
         loop {
@@ -630,6 +642,21 @@ impl DriverWait {
                 }
                 WaitKind::DeviceIdle => (fns.vkDeviceWaitIdle())(device),
                 WaitKind::QueueIdle(queue) => (fns.vkQueueWaitIdle())(*queue),
+                WaitKind::ExportSemaphoreSyncFd(semaphore) => {
+                    let info = sync_fd_semaphore_info(*semaphore);
+                    let mut fd: core::ffi::c_int = -1;
+                    let r = (fns.vkGetSemaphoreFdKHR())(device, &info, &mut fd);
+                    // Closed when this binding goes out of scope -- see [`exported_fd`].
+                    let _closed = exported_fd(fd);
+                    r
+                }
+                WaitKind::ExportFenceSyncFd(fence) => {
+                    let info = sync_fd_fence_info(*fence);
+                    let mut fd: core::ffi::c_int = -1;
+                    let r = (fns.vkGetFenceFdKHR())(device, &info, &mut fd);
+                    let _closed = exported_fd(fd);
+                    r
+                }
             }
         }
     }
@@ -651,6 +678,31 @@ struct DeviceState {
 // hundred handlers `context.rs` will grow, which is the opposite of keeping unsafe in a named
 // module. This is that module (CLAUDE.md); the handlers stay safe Rust.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+/// The descriptor a `SYNC_FD` semaphore export asks for.
+///
+/// One builder for both callers -- the inline export and the [`DriverWait`] that runs it out of
+/// the batch -- because two spellings of one descriptor is two chances to name a different
+/// handle type.
+fn sync_fd_semaphore_info(semaphore: VkSemaphore) -> VkSemaphoreGetFdInfoKHR {
+    VkSemaphoreGetFdInfoKHR {
+        sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+        pNext: core::ptr::null(),
+        semaphore,
+        handleType:
+            VkExternalSemaphoreHandleTypeFlagBits::VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+    }
+}
+
+/// The fence twin of the descriptor above.
+fn sync_fd_fence_info(fence: VkFence) -> VkFenceGetFdInfoKHR {
+    VkFenceGetFdInfoKHR {
+        sType: VkStructureType::VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+        pNext: core::ptr::null(),
+        fence,
+        handleType: VkExternalFenceHandleTypeFlagBits::VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+    }
+}
+
 /// A borrowed argument as the pointer the entry point below it wants.
 ///
 /// This is the whole of the conversion, and it lives here because here is where the C ABI starts.
@@ -4081,17 +4133,13 @@ impl Driver {
         semaphore: VkSemaphore,
     ) -> Result<VkResult, NoSyncFd> {
         let d = self.sync_fd_device(device, |f| f.has_vkGetSemaphoreFdKHR())?;
-        let info = VkSemaphoreGetFdInfoKHR {
-            sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
-            pNext: core::ptr::null(),
-            semaphore,
-            handleType:
-                VkExternalSemaphoreHandleTypeFlagBits::VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-        };
+        let info = sync_fd_semaphore_info(semaphore);
         // KosmicKrisp answers `VK_SUCCESS` with no descriptor at all -- measured over the venus
-        // corpus, 71568 exports and not one non-negative fd. Handled rather than asserted: what
-        // the guest asked for is that the payload move, and a driver is free to have moved it
-        // somewhere that is not a file.
+        // corpus, 71568 exports and not one non-negative fd. That is mesa working as designed
+        // rather than a hole: KosmicKrisp registers a timeline-only sync type, so every binary
+        // semaphore is wrapped in `vk_sync_binary`, whose `export_sync_file` waits the Metal
+        // shared event out untimed and then hands back `-1`, the already-signalled sync file.
+        // The payload did move; it moved into a completed wait.
         let mut fd: core::ffi::c_int = -1;
         // SAFETY: `device` is a handle in this table; `info` and `fd` are ours and outlive the
         // call.
@@ -4099,6 +4147,50 @@ impl Driver {
         // Closed when this binding goes out of scope -- see [`exported_fd`].
         let _closed = exported_fd(fd);
         Ok(r)
+    }
+
+    /// The same export, to be run outside the batch.
+    ///
+    /// Which is where it belongs on this host, because the export blocks on the GPU -- see the
+    /// comment above. Taken inline it holds the context lock and the resource read lock for as
+    /// long as the guest's own rendering takes, against every other ring of this context and,
+    /// behind the resource writer, every other context's.
+    pub fn export_semaphore_wait(
+        &self,
+        device: VkDevice,
+        semaphore: VkSemaphore,
+    ) -> Result<DriverWait, NoSyncFd> {
+        self.sync_fd_device(device, |f| f.has_vkGetSemaphoreFdKHR())?;
+        let d = self.devices.get(&device).ok_or(NoSyncFd::NoDevice)?;
+        Ok(DriverWait {
+            device: Arc::clone(&d.fns),
+            kind: WaitKind::ExportSemaphoreSyncFd(semaphore),
+        })
+    }
+
+    /// The fence twin of the export above, likewise to be run outside the batch.
+    ///
+    /// The ledger move that makes the export a *reset* does not happen here: this value carries
+    /// no `&mut Driver` and the wait runs with nothing held. The caller applies it on the pass
+    /// that comes back with the answer, through [`Driver::fence_resource_reset_done`].
+    pub fn export_fence_wait(
+        &self,
+        device: VkDevice,
+        fence: VkFence,
+    ) -> Result<DriverWait, NoSyncFd> {
+        self.sync_fd_device(device, |f| f.has_vkGetFenceFdKHR())?;
+        let d = self.devices.get(&device).ok_or(NoSyncFd::NoDevice)?;
+        Ok(DriverWait { device: Arc::clone(&d.fns), kind: WaitKind::ExportFenceSyncFd(fence) })
+    }
+
+    /// Move the ledger for a `vkResetFenceResourceMESA` whose export ran as a [`DriverWait`].
+    ///
+    /// The export is the reset, so the ledger's idea of which fences have a submit outstanding
+    /// moves with it -- or a later capture reports this fence as still promised.
+    pub fn fence_resource_reset_done(&mut self, fence: VkFence, ret: VkResult) {
+        if ret == VkResult::VK_SUCCESS {
+            self.unpend_fence(fence);
+        }
     }
 
     /// `vkResetFenceResourceMESA`: put a fence back to unsignalled by exporting its payload.
@@ -4119,13 +4211,7 @@ impl Driver {
     ) -> Result<VkResult, NoSyncFd> {
         // Copied out so the table's borrow ends before the ledger is touched below.
         let get_fd = self.sync_fd_device(device, |f| f.has_vkGetFenceFdKHR())?.vkGetFenceFdKHR();
-        let info = VkFenceGetFdInfoKHR {
-            sType: VkStructureType::VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
-            pNext: core::ptr::null(),
-            fence,
-            handleType:
-                VkExternalFenceHandleTypeFlagBits::VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
-        };
+        let info = sync_fd_fence_info(fence);
         let mut fd: core::ffi::c_int = -1;
         // SAFETY: `device` is a handle in this table; `info` and `fd` are ours and outlive the
         // call.

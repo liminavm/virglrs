@@ -5358,12 +5358,30 @@ impl Commands for Handlers<'_> {
         }
     }
 
+    /// `vkWaitSemaphoreResourceMESA`: move the semaphore's payload out to a sync fd.
+    ///
+    /// A fifth driver wait, and it took until 2026-09-21 to be read as one, because it spells
+    /// itself as an export. On this host the export blocks on the GPU -- see
+    /// [`Driver::export_semaphore_sync_fd`] -- so it suspends out of the batch like the four
+    /// above rather than holding the context lock and the resource read lock for the length of
+    /// the guest's own rendering.
     fn vkWaitSemaphoreResourceMESA(
         &mut self,
         args: &mut vn_command_vkWaitSemaphoreResourceMESA<'_>,
     ) {
-        let done = self.driver.export_semaphore_sync_fd(args.device, args.semaphore);
-        self.synced("vkWaitSemaphoreResourceMESA", done);
+        if let Some(ret) = self.answered() {
+            self.synced("vkWaitSemaphoreResourceMESA", Ok(ret));
+            return;
+        }
+        if self.blocks_inline() {
+            let done = self.driver.export_semaphore_sync_fd(args.device, args.semaphore);
+            self.synced("vkWaitSemaphoreResourceMESA", done);
+            return;
+        }
+        match self.driver.export_semaphore_wait(args.device, args.semaphore) {
+            Ok(wait) => self.suspend_on(wait),
+            Err(e) => self.synced("vkWaitSemaphoreResourceMESA", Err(e)),
+        }
     }
 
     /// `vkResetFenceResourceMESA`: unsignal a fence mesa has already exported.
@@ -5377,8 +5395,23 @@ impl Commands for Handlers<'_> {
     /// carries no reply, so the generated default could only poison the ring, and the next
     /// `vkQueueSubmit` on that ring returns `VK_ERROR_DEVICE_LOST` with nothing naming the cause.
     fn vkResetFenceResourceMESA(&mut self, args: &mut vn_command_vkResetFenceResourceMESA<'_>) {
-        let done = self.driver.reset_fence_resource(args.device, args.fence);
-        self.synced("vkResetFenceResourceMESA", done);
+        // The sixth driver wait, for the same reason as the fifth above: the export blocks.
+        // The ledger move the reset *is* happens here rather than in the wait, which runs with
+        // nothing of this renderer held.
+        if let Some(ret) = self.answered() {
+            self.driver.fence_resource_reset_done(args.fence, ret);
+            self.synced("vkResetFenceResourceMESA", Ok(ret));
+            return;
+        }
+        if self.blocks_inline() {
+            let done = self.driver.reset_fence_resource(args.device, args.fence);
+            self.synced("vkResetFenceResourceMESA", done);
+            return;
+        }
+        match self.driver.export_fence_wait(args.device, args.fence) {
+            Ok(wait) => self.suspend_on(wait),
+            Err(e) => self.synced("vkResetFenceResourceMESA", Err(e)),
+        }
     }
 
     fn vkImportSemaphoreResourceMESA(
@@ -15761,6 +15794,15 @@ mod tests {
         };
         h.vkResetFenceResourceMESA(&mut args);
         assert!(h.reject.is_none(), "a served command does not stop the ring");
+        EXPORTED.with_borrow(|e| {
+            assert!(e.is_empty(), "the export blocks on the GPU, so it is taken out of the batch")
+        });
+
+        let Some(Wait::Driver(wait)) = h.wait.take() else {
+            panic!("an export that blocks on the GPU suspends the batch");
+        };
+        let answered = wait.run(|| true).expect("nothing stops this wait");
+        assert_eq!(answered.result(), VkResult::VK_SUCCESS);
 
         let read_end = EXPORTED.with_borrow(|e| {
             assert_eq!(e.len(), 1, "the reset is an export, and it happened once");
@@ -15772,6 +15814,14 @@ mod tests {
         assert_eq!(n, 0, "the exported descriptor must not outlive the command that made it");
         // SAFETY: the read end, which nothing else holds.
         unsafe { libc::close(read_end) };
+
+        // The pass that comes back with the answer takes it, and does not export a second time --
+        // the export is a payload *move*, so running it twice would unsignal a fence the guest
+        // has signalled again since.
+        h.answer = Some(answered);
+        h.vkResetFenceResourceMESA(&mut args);
+        assert!(h.reject.is_none(), "the resumed pass is served too");
+        EXPORTED.with_borrow(|e| assert_eq!(e.len(), 1, "and asks the driver nothing"));
 
         // A device the guest never made. The handle is the guest's, so this is a rejection and
         // never an assert.
@@ -16106,8 +16156,9 @@ mod tests {
         let Some(Wait::Driver(wait)) = h.wait.take() else {
             panic!("a wait the driver could not answer at once suspends the batch");
         };
+        let answered = wait.run(|| true).expect("nothing stops this wait");
         assert_eq!(
-            wait.run(|| true).expect("nothing stops this wait").result(),
+            answered.result(),
             VkResult::VK_TIMEOUT,
             "a timeout is an answer, not a failure"
         );
@@ -16118,6 +16169,14 @@ mod tests {
                 "the guest's timeout, spent whole and in slices"
             )
         });
+
+        // The batch is offered again with the answer, which the handler takes instead of asking
+        // the driver a fourth time. That pass is also what ends the wait's claim on the handles
+        // it read, so the stream is free to suspend on the next one.
+        h.answer = Some(answered);
+        h.vkWaitForFences(&mut args);
+        assert_eq!(args.ret, VkResult::VK_TIMEOUT, "the resumed pass takes the answer");
+        SAW.with_borrow(|s| assert_eq!(s.waited.len(), 3, "and asks the driver nothing"));
 
         // The import that stands in for a signal the host never saw.
         let info =
@@ -16141,6 +16200,17 @@ mod tests {
         };
         h.vkWaitSemaphoreResourceMESA(&mut args);
         assert!(h.reject.is_none());
+        SAW.with_borrow(|s| {
+            assert!(
+                s.exported.is_empty(),
+                "the export blocks on the GPU, so it is taken out of the batch"
+            )
+        });
+        let Some(Wait::Driver(wait)) = h.wait.take() else {
+            panic!("an export that blocks on the GPU suspends the batch");
+        };
+        let answered = wait.run(|| true).expect("nothing stops this wait");
+        assert_eq!(answered.result(), VkResult::VK_SUCCESS);
         let read_end = SAW.with_borrow(|s| {
             assert_eq!(s.exported.len(), 1);
             s.exported[0]
@@ -16151,6 +16221,13 @@ mod tests {
         assert_eq!(n, 0, "the exported descriptor must not outlive the command that made it");
         // SAFETY: the read end, which nothing else holds.
         unsafe { libc::close(read_end) };
+
+        // The resumed pass takes the answer rather than exporting again: the export moves the
+        // payload, so a second one would move a payload the guest has since put back.
+        h.answer = Some(answered);
+        h.vkWaitSemaphoreResourceMESA(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| assert_eq!(s.exported.len(), 1, "and asks the driver nothing"));
 
         // A resource id the C asserts on. The number is the guest's, so it is a rejection here --
         // an assert would hand a guest the power to abort the process.
