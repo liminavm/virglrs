@@ -393,6 +393,15 @@ impl Context {
         self.key.id()
     }
 
+    /// Give this context's driver the queues its ring fences are ordered against.
+    ///
+    /// Called by [`Vkr::context_create`](super::vkr::Vkr::context_create), which is the one
+    /// place a context is stood up for a guest. A context made without it -- a unit test --
+    /// retires its ring fences on arrival, which is what every venus fence used to get.
+    pub fn attach_ring_queues(&mut self, queues: super::driver::RingQueues) {
+        self.driver.attach_ring_queues(queues);
+    }
+
     pub fn new(key: ContextKey, budget: &Arc<Budget>, name: String) -> Context {
         Context {
             key,

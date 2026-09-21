@@ -13,6 +13,9 @@
 //! other object gets.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
+
+use crate::ids::{ContextId, FenceId, RingIdx};
 
 use super::cs::{Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
 use super::objects::Doomed;
@@ -25,16 +28,17 @@ use super::proto::types::{
     VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags,
     VkDependencyInfo, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
     VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
-    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties,
-    VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
+    VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo,
+    VkExtensionProperties, VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
     VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
-    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceGetFdInfoKHR, VkFilter, VkFormat,
-    VkFramebuffer, VkFrontFace, VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlags,
-    VkImageBlit, VkImageCopy, VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties,
-    VkImageFormatProperties2, VkImageLayout, VkImageMemoryBarrier, VkImageSubresourceRange,
-    VkImageTiling, VkImageToMemoryCopy, VkImageType, VkImageUsageFlags, VkImageView,
+    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceCreateFlags, VkFenceCreateInfo,
+    VkFenceGetFdInfoKHR, VkFilter, VkFormat, VkFramebuffer, VkFrontFace,
+    VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlags, VkImageBlit, VkImageCopy,
+    VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties, VkImageFormatProperties2,
+    VkImageLayout, VkImageMemoryBarrier, VkImageSubresourceRange, VkImageTiling,
+    VkImageToMemoryCopy, VkImageType, VkImageUsageFlags, VkImageView,
     VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR,
     VkIndexType, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier,
     VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags, VkMemoryPropertyFlagBits,
@@ -385,7 +389,12 @@ pub struct Driver {
     /// device already owns -- but `vkQueueSubmit` carries only the queue, so this is the way back
     /// to the entry points. The same problem [`Pools::device_of`] solves for a command buffer, and
     /// kept apart from it because a queue owns nothing and takes nothing with it when it goes.
-    queues: BTreeMap<VkQueue, VkDevice>,
+    /// Every queue this context retrieved, each with the lock Vulkan wants around operations on
+    /// it. See [`HostQueue`]: until ring fences existed, the context lock was what serialised
+    /// them, and it no longer is.
+    queues: BTreeMap<VkQueue, Arc<HostQueue>>,
+    /// Which queue each ring's fences are ordered against. See [`RingQueues`].
+    ring_queues: RingQueues,
 }
 
 /// The last stand: a driver may not be dropped while it still owes Vulkan a destroy.
@@ -489,6 +498,286 @@ impl Drop for LiveDevice {
     }
 }
 
+/// One `VkQueue`, with the lock Vulkan requires around every operation on it.
+///
+/// Queue operations are externally synchronised on the queue. Until ring fences existed the
+/// context lock was what provided that -- every route to a queue ran on a ring thread holding it
+/// -- and [`RingQueues::fence`] is the first that does not: it runs on the VMM's virtio-gpu
+/// thread, which must not take the context lock or a batch in flight would stall every
+/// virtio-gpu command behind a whole guest frame. So the lock moves onto the queue, which is
+/// what the C has always done (`vkr_queue::vk_mutex`).
+pub struct HostQueue {
+    handle: VkQueue,
+    /// The device that handed this queue out, for the per-device sweeps.
+    device: VkDevice,
+    fns: Arc<LiveDevice>,
+    vk: Mutex<()>,
+    /// Fences to reuse, rather than one `vkCreateFence`/`vkDestroyFence` per guest fence. The
+    /// sync thread puts each one back reset; whoever fences next takes it.
+    spare: Mutex<Vec<VkFence>>,
+}
+
+impl HostQueue {
+    fn new(handle: VkQueue, device: VkDevice, fns: Arc<LiveDevice>) -> HostQueue {
+        HostQueue { handle, device, fns, vk: Mutex::new(()), spare: Mutex::new(Vec::new()) }
+    }
+
+    /// The queue, held for one operation on it.
+    fn held(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.vk.lock().expect("a queue lock is never held across a panic")
+    }
+
+    /// A fence to submit with: one this queue has finished with, or a new one.
+    ///
+    /// `None` is a driver that refused to make one, which is a host out of something rather than
+    /// a guest mistake -- the caller retires the guest's fence rather than leaving it unanswered.
+    fn take_fence(&self) -> Option<VkFence> {
+        if let Some(f) = self.spare.lock().expect("the spare lock is never poisoned").pop() {
+            return Some(f);
+        }
+        let info = VkFenceCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            pNext: core::ptr::null(),
+            flags: VkFenceCreateFlags::default(),
+        };
+        let mut out = VkFence(0);
+        // SAFETY: the device is live for as long as this queue holds its share of it, and both
+        // the info and the out-handle are ours for the call.
+        let r = unsafe {
+            (self.fns.vkCreateFence())(self.fns.handle, &info, core::ptr::null(), &mut out)
+        };
+        (r == VkResult::VK_SUCCESS && out.0 != 0).then_some(out)
+    }
+
+    /// Put a signalled fence back, unsignalled, for the next submit to take.
+    fn put_fence(&self, fence: VkFence) {
+        // SAFETY: a fence this queue made, on the device that made it.
+        let r = unsafe { (self.fns.vkResetFences())(self.fns.handle, 1, &fence) };
+        if r != VkResult::VK_SUCCESS {
+            // A fence that would not reset is one nothing can wait on again. Destroyed rather
+            // than kept: a spare that is permanently signalled would answer every later fence
+            // at once, which is the bug this whole path exists to close.
+            // SAFETY: as above.
+            unsafe { (self.fns.vkDestroyFence())(self.fns.handle, fence, core::ptr::null()) };
+            return;
+        }
+        self.spare.lock().expect("the spare lock is never poisoned").push(fence);
+    }
+}
+
+impl Drop for HostQueue {
+    fn drop(&mut self) {
+        for fence in self.spare.get_mut().expect("the spare lock is never poisoned").drain(..) {
+            // SAFETY: a fence this queue made, on a device it still holds a share of.
+            unsafe { (self.fns.vkDestroyFence())(self.fns.handle, fence, core::ptr::null()) };
+        }
+    }
+}
+
+impl core::fmt::Debug for HostQueue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HostQueue").field("queue", &self.handle.0).finish()
+    }
+}
+
+/// The queue each of a context's rings has its fences ordered against.
+///
+/// A venus ring fence is the guest's "this ring's work is done", and a Wayland client's present
+/// rides it: the client fences its render, hands the compositor the buffer, and the compositor
+/// samples it. Retiring that fence on arrival says the work is done when it has only been
+/// submitted, so the compositor reads an image whose render is still in flight -- which is what
+/// a stale frame on the seat was. Instead an empty submit carrying a real `VkFence` goes on the
+/// queue the ring names, where Vulkan's own queue ordering puts it behind everything the guest
+/// already submitted, and the guest's fence retires when that signals.
+///
+/// Shared out of the context rather than reached through it, because the VMM asks for a ring
+/// fence on its virtio-gpu thread and that thread must not take the context lock.
+#[derive(Clone)]
+pub struct RingQueues {
+    inner: Arc<RingQueuesInner>,
+}
+
+struct RingQueuesInner {
+    ctx: ContextId,
+    /// Where a waited-out fence goes, or `None` for a `Driver` no context owns -- see
+    /// [`RingQueues::detached`].
+    retire: Option<crate::fence::Handle>,
+    bound: Mutex<BTreeMap<RingIdx, RingSync>>,
+}
+
+/// One ring's queue and the thread that waits its fences out.
+///
+/// One thread per ring, as the C has one per queue. A single thread for every ring would put a
+/// ring whose GPU work is slow in front of one whose is not, and the guest reads each ring's
+/// seqno separately -- so the delay would be visible as a stall on a ring that had nothing to
+/// wait for.
+struct RingSync {
+    queue: Arc<HostQueue>,
+    jobs: Option<std::sync::mpsc::Sender<SyncJob>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// One guest fence, and the host fence that answers it.
+struct SyncJob {
+    id: FenceId,
+    /// `None` is a submit that never happened -- no fence to make, or the driver refused it. The
+    /// guest's fence still retires: a fence a guest is waiting on must never be dropped, and a
+    /// host that cannot order it is not a reason to wedge the guest.
+    fence: Option<VkFence>,
+}
+
+impl Drop for RingSync {
+    fn drop(&mut self) {
+        // The sender first: the thread ends when the channel closes, and it drains what is
+        // queued before it does -- a fence the guest is still waiting on must not die with it.
+        self.jobs = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl RingQueues {
+    pub fn new(ctx: ContextId, retire: crate::fence::Handle) -> RingQueues {
+        RingQueues {
+            inner: Arc::new(RingQueuesInner {
+                ctx,
+                retire: Some(retire),
+                bound: Mutex::new(BTreeMap::new()),
+            }),
+        }
+    }
+
+    /// One with nowhere to retire to, for a [`Driver`] no context owns.
+    ///
+    /// That is a unit test and nothing else: a real `Driver` is made inside a `Context`, which
+    /// gives it the real one. It binds no ring, so [`RingQueues::fence`] answers `false` and the
+    /// caller retires the fence itself -- which is exactly what a test standing a driver up on
+    /// its own wants, and is what every venus fence got before this existed.
+    pub fn detached() -> RingQueues {
+        RingQueues {
+            inner: Arc::new(RingQueuesInner {
+                ctx: ContextId::new(1).expect("1 is not zero"),
+                retire: None,
+                bound: Mutex::new(BTreeMap::new()),
+            }),
+        }
+    }
+
+    /// Bind a ring to the queue whose work its fences order against.
+    ///
+    /// The guest says which through `VkDeviceQueueTimelineInfoMESA` when it retrieves the queue.
+    /// A ring already bound keeps its binding: the C refuses a second bind outright, and the same
+    /// reasoning applies -- one ring's fences have one order, so a second queue for it would be a
+    /// second answer.
+    fn bind(&self, ring: RingIdx, queue: Arc<HostQueue>) {
+        let Some(retire) = self.inner.retire.clone() else {
+            return;
+        };
+        let mut bound = self.inner.bound.lock().expect("the ring-queue lock is never poisoned");
+        if bound.contains_key(&ring) {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (q, ctx) = (Arc::clone(&queue), self.inner.ctx);
+        let thread = std::thread::Builder::new()
+            .name(format!("virglrs-ring{}-sync", ring.0))
+            .spawn(move || sync_thread(&q, ring, ctx, &retire, &rx))
+            .expect("spawning a ring's fence thread");
+        bound.insert(ring, RingSync { queue, jobs: Some(tx), thread: Some(thread) });
+    }
+
+    /// Forget every ring bound to a queue of `device`, so the device can be destroyed.
+    ///
+    /// Joins each thread, which is what makes the destroy safe: a thread inside `vkWaitForFences`
+    /// on a device being destroyed is undefined behaviour, and the fences it holds are the
+    /// device's too.
+    fn forget_device(&self, device: VkDevice) {
+        let mut bound = self.inner.bound.lock().expect("the ring-queue lock is never poisoned");
+        bound.retain(|_, s| s.queue.device != device);
+    }
+
+    /// Order a ring's fence behind the work the guest has submitted on that ring's queue.
+    ///
+    /// `false` is a ring with no queue bound to it -- the guest never named it in a
+    /// `VkDeviceQueueTimelineInfoMESA` -- and the caller retires the fence itself, which is what
+    /// every venus fence used to get.
+    pub fn fence(&self, ring: RingIdx, id: FenceId) -> bool {
+        let bound = self.inner.bound.lock().expect("the ring-queue lock is never poisoned");
+        let Some(sync) = bound.get(&ring) else {
+            return false;
+        };
+        let Some(jobs) = sync.jobs.as_ref() else {
+            return false;
+        };
+        let fence = sync.queue.take_fence().filter(|fence| {
+            let _vk = sync.queue.held();
+            // SAFETY: a queue and a fence this renderer owns, and an empty submit -- which is
+            // what Vulkan's own "signal this fence behind everything already on the queue" is.
+            let r = unsafe {
+                (sync.queue.fns.vkQueueSubmit())(sync.queue.handle, 0, core::ptr::null(), *fence)
+            };
+            if r != VkResult::VK_SUCCESS {
+                eprintln!(
+                    "[virglrs] ring {} fence {}: the queue refused an empty submit ({r:?}); \
+                     retiring it unordered",
+                    ring.0, id.0
+                );
+            }
+            r == VkResult::VK_SUCCESS
+        });
+        // Queued whatever happened above: a job with no fence retires at once, and that is how a
+        // host that could not order this fence still answers it.
+        jobs.send(SyncJob { id, fence }).is_ok()
+    }
+}
+
+/// Wait each of a ring's fences out, in the order they were submitted, and retire the guest's.
+///
+/// Holds nothing of the renderer: a share of the queue, which is a share of its device, and the
+/// retirement handle. The wait is made in slices so that a queue whose work never completes does
+/// not keep this thread -- and with it a device destroy -- forever.
+fn sync_thread(
+    queue: &Arc<HostQueue>,
+    ring: RingIdx,
+    ctx: ContextId,
+    retire: &crate::fence::Handle,
+    jobs: &std::sync::mpsc::Receiver<SyncJob>,
+) {
+    while let Ok(job) = jobs.recv() {
+        if let Some(fence) = job.fence {
+            let device = queue.fns.handle;
+            loop {
+                // SAFETY: a fence this thread's queue made, on the device that made it.
+                let r = unsafe {
+                    (queue.fns.vkWaitForFences())(device, 1, &fence, VkBool32(1), DriverWait::SLICE)
+                };
+                if r != VkResult::VK_TIMEOUT {
+                    if r != VkResult::VK_SUCCESS {
+                        eprintln!(
+                            "[virglrs] ring {} fence {}: the device would not wait it out \
+                             ({r:?}); retiring it",
+                            ring.0, job.id.0
+                        );
+                    }
+                    break;
+                }
+            }
+            queue.put_fence(fence);
+        }
+        retire.retire_context(ctx, ring, job.id);
+    }
+}
+
+/// The rings a queue may carry fences for.
+///
+/// Ring 0 is the context's own stream, which retires on the CPU timeline as the C does. The C's
+/// table is 64 entries wide, so that is the width a guest may name; anything else is a guest
+/// naming a ring that cannot exist.
+fn fenceable_ring(ring_idx: u32) -> Option<RingIdx> {
+    (ring_idx != 0 && ring_idx < 64).then_some(RingIdx(ring_idx))
+}
+
 /// One blocking driver call, taken out of the batch that asked for it.
 ///
 /// Everything the call needs is owned here: a share of the device's entry points -- which is also
@@ -501,7 +790,7 @@ pub struct DriverWait {
     kind: WaitKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 enum WaitKind {
     Fences {
         fences: Vec<VkFence>,
@@ -515,7 +804,7 @@ enum WaitKind {
         timeout: u64,
     },
     DeviceIdle,
-    QueueIdle(VkQueue),
+    QueueIdle(Arc<HostQueue>),
     /// `vkGetSemaphoreFdKHR` for a `SYNC_FD` payload, which blocks on this host: KosmicKrisp's
     /// sync type is timeline-only, so a binary semaphore is wrapped in mesa's `vk_sync_binary`,
     /// whose `export_sync_file` waits the underlying Metal shared event out untimed before
@@ -524,6 +813,30 @@ enum WaitKind {
     /// The fence twin, through `vkGetFenceFdKHR` and the same `vk_sync_binary` export.
     ExportFenceSyncFd(VkFence),
 }
+
+/// Two waits are the same wait when they would make the same call. A queue compares by identity
+/// rather than by handle: the slot is what carries the lock, and two slots for one handle would
+/// be the bug [`HostQueue`] exists to prevent rather than two equal waits.
+impl PartialEq for WaitKind {
+    fn eq(&self, other: &WaitKind) -> bool {
+        match (self, other) {
+            (
+                WaitKind::Fences { fences: a, wait_all: aw, timeout: at },
+                WaitKind::Fences { fences: b, wait_all: bw, timeout: bt },
+            ) => a == b && aw == bw && at == bt,
+            (
+                WaitKind::Semaphores { semaphores: a, values: av, flags: af, timeout: at },
+                WaitKind::Semaphores { semaphores: b, values: bv, flags: bf, timeout: bt },
+            ) => a == b && av == bv && af == bf && at == bt,
+            (WaitKind::DeviceIdle, WaitKind::DeviceIdle) => true,
+            (WaitKind::QueueIdle(a), WaitKind::QueueIdle(b)) => Arc::ptr_eq(a, b),
+            (WaitKind::ExportSemaphoreSyncFd(a), WaitKind::ExportSemaphoreSyncFd(b)) => a == b,
+            (WaitKind::ExportFenceSyncFd(a), WaitKind::ExportFenceSyncFd(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for WaitKind {}
 
 impl PartialEq for DriverWait {
     fn eq(&self, other: &DriverWait) -> bool {
@@ -564,7 +877,7 @@ impl DriverWait {
             WaitKind::Fences { fences, .. } => fences.iter().map(|f| f.0).collect(),
             WaitKind::Semaphores { semaphores, .. } => semaphores.iter().map(|s| s.0).collect(),
             WaitKind::DeviceIdle => Vec::new(),
-            WaitKind::QueueIdle(q) => vec![q.0],
+            WaitKind::QueueIdle(q) => vec![q.handle.0],
             WaitKind::ExportSemaphoreSyncFd(s) => vec![s.0],
             WaitKind::ExportFenceSyncFd(f) => vec![f.0],
         }
@@ -641,7 +954,10 @@ impl DriverWait {
                     f(device, &info, timeout)
                 }
                 WaitKind::DeviceIdle => (fns.vkDeviceWaitIdle())(device),
-                WaitKind::QueueIdle(queue) => (fns.vkQueueWaitIdle())(*queue),
+                WaitKind::QueueIdle(queue) => {
+                    let _vk = queue.held();
+                    (fns.vkQueueWaitIdle())(queue.handle)
+                }
                 WaitKind::ExportSemaphoreSyncFd(semaphore) => {
                     let info = sync_fd_semaphore_info(*semaphore);
                     let mut fd: core::ffi::c_int = -1;
@@ -793,7 +1109,21 @@ impl Driver {
             pending_fences: std::collections::BTreeSet::new(),
             pools: Pools::default(),
             queues: BTreeMap::new(),
+            ring_queues: RingQueues::detached(),
         }
+    }
+
+    /// Give this driver the context's ring-fence queues, which is what makes its fences real.
+    ///
+    /// Set once, by [`Context::new`](super::context::Context::new). A `Driver` starts detached
+    /// so that the ninety tests that stand one up on its own need no retirement thread.
+    pub(super) fn attach_ring_queues(&mut self, queues: RingQueues) {
+        self.ring_queues = queues;
+    }
+
+    /// The queues this context's rings are fenced against, for the VMM's fence path.
+    pub fn ring_queues(&self) -> &RingQueues {
+        &self.ring_queues
     }
 
     /// The instance table, or None when this context has not created an instance.
@@ -839,8 +1169,9 @@ impl Driver {
         // -- so a device an allocation's storage still holds outlives this teardown, exactly as
         // Vulkan requires and exactly as long as the blob over it lives.
         for (handle, _) in core::mem::take(&mut self.devices) {
+            self.ring_queues.forget_device(handle);
             self.pools.close_device(handle);
-            self.queues.retain(|_, owner| *owner != handle);
+            self.queues.retain(|_, q| q.device != handle);
         }
         // A fallback, not the path that retires the census: `empty_device` does that, per device,
         // as it frees. What can be left here is an allocation the object table could name no
@@ -1537,7 +1868,7 @@ impl Driver {
     /// A queue of `device` to put a fast-forward submit on, or `None` for a device the guest never
     /// took a queue from -- which is a device it also never submitted to.
     fn first_queue(&self, device: VkDevice) -> Option<VkQueue> {
-        self.queues.iter().find(|(_, owner)| **owner == device).map(|(q, _)| *q)
+        self.queues.values().find(|q| q.device == device).map(|q| q.handle)
     }
 
     /// Signal a fence, a binary semaphore, or both, with an empty submit.
@@ -2176,8 +2507,23 @@ impl Driver {
             return None;
         }
         // Asking twice for the same queue is how a guest works, not a mistake: Vulkan hands back
-        // the same handle each time, and the answer recorded here is the same both times.
-        self.queues.insert(out, device);
+        // the same handle each time, and the answer recorded here is the same both times -- so
+        // the slot is kept rather than replaced, or the second ask would hand out a second lock
+        // for one queue and the two would guard nothing.
+        let slot = Arc::clone(
+            self.queues
+                .entry(out)
+                .or_insert_with(|| Arc::new(HostQueue::new(out, device, Arc::clone(&d.fns)))),
+        );
+        // `VkDeviceQueueTimelineInfoMESA` in the chain names the ring whose fences this queue
+        // orders. Without it a ring has no queue to fence against and its fences retire as soon
+        // as they are asked for, which is what left a compositor sampling a client's image
+        // before the render into it had run.
+        if let Some(ring) = chain_find::<VkDeviceQueueTimelineInfoMESA>(info.pNext)
+            .and_then(|t| fenceable_ring(t.ringIdx))
+        {
+            self.ring_queues.bind(ring, slot);
+        }
         Some(out)
     }
 
@@ -2362,9 +2708,12 @@ impl Driver {
         // behind that vouch for its objects.
         // Ahead of everything else, and while the device is still in the map: its objects have to
         // be destroyed before it is, and `empty_device` needs the entry points to do it.
+        // Before anything else that frees: a ring's sync thread waits on fences of this device
+        // and holds a share of it, so it has to be joined while the device is still whole.
+        self.ring_queues.forget_device(device);
         self.empty_device(device, doomed);
         let orphans = self.pools.close_device(device);
-        self.queues.retain(|_, owner| *owner != device);
+        self.queues.retain(|_, q| q.device != device);
         // Taking it out of the map drops this driver's share of it. That is the destroy, when it
         // is the last one; a device whose memory a live blob still names goes when that does.
         self.devices.remove(&device);
@@ -2777,6 +3126,9 @@ impl Driver {
             core::mem::forget(d);
         }
         core::mem::forget(self.instance.take());
+        // The ring threads first: each holds a share of a device, and a thread inside
+        // `vkWaitForFences` on a table about to be forgotten would outlive what it is calling.
+        self.ring_queues = RingQueues::detached();
         self.memory.clear();
         self.pools = Pools::default();
         self.queues.clear();
@@ -2835,7 +3187,8 @@ impl Driver {
     /// the tests want to ask about is what a submit does once the answer is in.
     #[cfg(test)]
     pub(super) fn plant_queue(&mut self, device: VkDevice, queue: VkQueue) {
-        self.queues.insert(queue, device);
+        let fns = Arc::clone(&self.devices.get(&device).expect("a planted device").fns);
+        self.queues.insert(queue, Arc::new(HostQueue::new(queue, device, fns)));
     }
 
     /// Create a pool, and start tracking what will be allocated from it.
@@ -3957,8 +4310,8 @@ impl Driver {
     /// `None` is a queue this context never retrieved -- a guest naming one it does not have. The
     /// object table is what usually stops that; this is the second answer for when the two
     /// disagree, so it is a rejection and never an assert. See [`Driver::recorder`].
-    fn submitter(&self, queue: VkQueue) -> Option<&DeviceFns> {
-        self.devices.get(self.queues.get(&queue)?).map(|d| &d.fns.fns)
+    fn submitter(&self, queue: VkQueue) -> Option<&Arc<HostQueue>> {
+        self.queues.get(&queue)
     }
 
     /// `vkQueueSubmit`. Every handle inside a `VkSubmitInfo` -- the wait and signal semaphores,
@@ -3972,12 +4325,15 @@ impl Driver {
     ) -> Option<VkResult> {
         self.submitter(queue)?;
         self.note_submit(submits, fence);
-        let d = self.submitter(queue)?;
+        let q = self.submitter(queue)?;
+        let _vk = q.held();
         // Submitting no work to signal a fence is a normal thing for a guest to do, and Vulkan
         // takes a null array for it -- so the slice's own pointer is passed either way.
         // SAFETY: a queue this context retrieved, and `submits` is an arena allocation live for
         // the call whose count is its own length.
-        Some(unsafe { (d.vkQueueSubmit())(queue, submits.len() as u32, submits.as_ptr(), fence) })
+        Some(unsafe {
+            (q.fns.vkQueueSubmit())(queue, submits.len() as u32, submits.as_ptr(), fence)
+        })
     }
 
     /// `vkQueueSubmit2`, the synchronization2 form of the submit above.
@@ -3990,12 +4346,10 @@ impl Driver {
         submits: &[VkSubmitInfo2],
         fence: VkFence,
     ) -> Result<VkResult, NoSubmit2> {
-        let f = self
-            .submitter(queue)
-            .ok_or(NoSubmit2::Queue)?
-            .try_vkQueueSubmit2()
-            .ok_or(NoSubmit2::EntryPoint)?;
+        let q = Arc::clone(self.submitter(queue).ok_or(NoSubmit2::Queue)?);
+        let f = q.fns.try_vkQueueSubmit2().ok_or(NoSubmit2::EntryPoint)?;
         self.note_submit2(submits, fence);
+        let _vk = q.held();
         // Submitting no work to signal a fence is as normal here as it is for v1, and Vulkan takes
         // a null array for it -- so the slice's own pointer is passed either way.
         // SAFETY: a queue this context retrieved, and `submits` is an arena allocation live for
@@ -4118,8 +4472,8 @@ impl Driver {
     /// `vkQueueWaitIdle`, to be run outside the batch. `None` is a queue this context never
     /// retrieved, the same answer [`Driver::queue_op`] gives.
     pub fn queue_idle_wait(&self, queue: VkQueue) -> Option<DriverWait> {
-        let d = self.devices.get(self.queues.get(&queue)?)?;
-        Some(DriverWait { device: Arc::clone(&d.fns), kind: WaitKind::QueueIdle(queue) })
+        let q = self.queues.get(&queue)?;
+        Some(DriverWait { device: Arc::clone(&q.fns), kind: WaitKind::QueueIdle(Arc::clone(q)) })
     }
 
     /// `vkWaitSemaphoreResourceMESA`: export the semaphore's payload to a sync fd, then drop it.
@@ -4301,9 +4655,10 @@ impl Driver {
         queue: VkQueue,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkQueue) -> VkResult,
     ) -> Option<VkResult> {
-        let d = self.submitter(queue)?;
+        let q = self.submitter(queue)?;
+        let _vk = q.held();
         // SAFETY: a queue this context retrieved, on the device that produced it.
-        Some(unsafe { proc(d)(queue) })
+        Some(unsafe { proc(&q.fns)(queue) })
     }
 
     /// A device entry point that names one object and nothing else: the event and fence states.
@@ -6505,6 +6860,10 @@ impl Chained for VkMemoryDedicatedAllocateInfo {
 impl Chained for VkImportMemoryResourceInfoMESA {
     const S_TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA;
+}
+impl Chained for VkDeviceQueueTimelineInfoMESA {
+    const S_TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA;
 }
 
 /// The link of type `T` in a `pNext` chain, if there is one -- copied out, so nothing holds a
@@ -9353,6 +9712,149 @@ mod tests {
     #[cfg(target_os = "macos")]
     /// A scanout is charged at the surface's own extent, not at the number in the request.
     ///
+    /// A venus ring fence waits for the GPU, rather than retiring the moment it is asked for.
+    ///
+    /// The gate for the whole ring-fence path, written as the bug it closes. A ring fence is the
+    /// guest's "this ring's work is done" and a Wayland client's present rides it: the client
+    /// fences its render, hands the compositor the buffer, and the compositor samples it. This
+    /// renderer used to retire that fence on arrival -- the work had been *submitted*, not done
+    /// -- so a compositor could read an image whose render was still in flight, which is what a
+    /// stale frame on the seat was.
+    ///
+    /// The planted device holds its fence unsignalled until the test lets it go. With the fence
+    /// retiring on arrival the recorder sees it immediately and the first assertion fails; with
+    /// the empty submit ordered on the queue it arrives only after the release.
+    #[test]
+    fn a_ring_fence_retires_only_once_its_queue_has_finished() {
+        use crate::fence::{FenceSink, Retirement};
+        use crate::ids::{ClientFenceId, RingIdx};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::mpsc::{Sender, channel};
+        use std::time::Duration;
+
+        const DEVICE: u64 = 0xd0;
+        const QUEUE: u64 = 0x90;
+        const FENCE: u64 = 0xf0;
+        const RING: u32 = 3;
+        static SUBMITS: AtomicU32 = AtomicU32::new(0);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+
+        struct Recorder(Sender<(u32, u32, u64)>);
+        impl FenceSink for Recorder {
+            fn context_fence(&mut self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
+                let _ = self.0.send((ctx.get(), ring.0, fence.0));
+            }
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+
+        unsafe extern "C" fn get_queue(
+            _d: VkDevice,
+            _i: *const VkDeviceQueueInfo2,
+            out: *mut VkQueue,
+        ) {
+            // SAFETY: the caller passes a pointer to its own live handle.
+            unsafe { *out = VkQueue(QUEUE) };
+        }
+        unsafe extern "C" fn create_fence(
+            _d: VkDevice,
+            _i: *const VkFenceCreateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkFence,
+        ) -> VkResult {
+            // SAFETY: as above.
+            unsafe { *out = VkFence(FENCE) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn submit(
+            _q: VkQueue,
+            count: u32,
+            _p: *const VkSubmitInfo,
+            fence: VkFence,
+        ) -> VkResult {
+            assert_eq!(count, 0, "a ring fence is an EMPTY submit; work would be the guest's");
+            assert_eq!(fence.0, FENCE, "and it carries the fence the wait is on");
+            SUBMITS.fetch_add(1, Ordering::AcqRel);
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn wait(
+            _d: VkDevice,
+            _c: u32,
+            _p: *const VkFence,
+            _all: VkBool32,
+            _timeout: u64,
+        ) -> VkResult {
+            if RELEASE.load(Ordering::Acquire) {
+                VkResult::VK_SUCCESS
+            } else {
+                VkResult::VK_TIMEOUT
+            }
+        }
+        unsafe extern "C" fn reset(_d: VkDevice, _c: u32, _p: *const VkFence) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_fence(
+            _d: VkDevice,
+            _f: VkFence,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+
+        SUBMITS.store(0, Ordering::Release);
+        RELEASE.store(false, Ordering::Release);
+
+        let (tx, rx) = channel();
+        let retire = Retirement::start(Box::new(Recorder(tx))).handle();
+        let ctx = ContextId::new(4).expect("4 is not zero");
+
+        let mut d = Driver::new(Account::for_test(None));
+        d.attach_ring_queues(RingQueues::new(ctx, retire));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkGetDeviceQueue2(get_queue);
+        fns.plant_vkCreateFence(create_fence);
+        fns.plant_vkQueueSubmit(submit);
+        fns.plant_vkWaitForFences(wait);
+        fns.plant_vkResetFences(reset);
+        fns.plant_vkDestroyFence(destroy_fence);
+        d.plant_device(VkDevice(DEVICE), fns);
+
+        // The guest names the ring its fences belong to in the queue's own pNext chain. Without
+        // this link there is no queue to order against, which is the `false` case below.
+        let timeline = VkDeviceQueueTimelineInfoMESA {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA,
+            pNext: core::ptr::null(),
+            ringIdx: RING,
+        };
+        let info = VkDeviceQueueInfo2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
+            pNext: (&raw const timeline).cast(),
+            ..Default::default()
+        };
+        assert_eq!(d.device_queue(VkDevice(DEVICE), &info), Some(VkQueue(QUEUE)));
+
+        assert!(d.ring_queues().fence(RingIdx(RING), FenceId(11)), "the ring has a queue");
+        assert_eq!(SUBMITS.load(Ordering::Acquire), 1, "ordered by an empty submit on the queue");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "a fence whose queue has not finished must not retire"
+        );
+
+        RELEASE.store(true, Ordering::Release);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok((4, RING, 11)),
+            "and it retires once the queue has"
+        );
+
+        // A ring the guest bound no queue to. There is nothing to order against, so this answers
+        // `false` and the renderer retires the fence itself -- which is what every venus fence
+        // got before this path existed.
+        assert!(!d.ring_queues().fence(RingIdx(RING + 1), FenceId(12)));
+        assert_eq!(SUBMITS.load(Ordering::Acquire), 1, "and nothing was submitted for it");
+
+        d.abandon_planted();
+    }
+
     /// The surface is the commitment: IOSurface rounds an allocation up to whole pages, and those
     /// pages are the host memory that is actually gone. The `VkDeviceMemory` on top of it is a
     /// host-pointer import of those same pages and commits nothing further -- so the guest's

@@ -741,7 +741,9 @@ impl Renderer {
             resources: Arc::clone(&resources),
             condemned,
             contexts: crate::Map::default(),
-            venus: config.venus.then(|| venus::vkr::Vkr::new(config, resources.clone(), &budget)),
+            venus: config
+                .venus
+                .then(|| venus::vkr::Vkr::new(config, resources.clone(), &budget, fences.handle())),
             budget,
             vrend,
             fences,
@@ -1238,15 +1240,27 @@ impl Renderer {
             return Err(Error::NoContext);
         };
         c.last_fence.insert(ring, fence);
-        // A venus fence carries its waits inside the command stream, so reaching here is already
-        // its answer, and it retires straight away. A classic one does not: `Vrend` takes a sync
-        // for the work and retires the fence behind it, off this thread.
+        // Each renderer orders the fence behind the work it answers for, and each does it off
+        // this thread: `Vrend` takes a sync for the GL work, venus puts an empty submit on the
+        // queue the ring names. Retirement going through a thread whatever satisfied the fence
+        // is the contract, not an optimization.
+        //
+        // What is left is the fence neither can order: a venus ring the guest never bound a
+        // queue to -- ring 0, which is the context's own stream and retires on the CPU timeline
+        // as the C does, and the VMM's own present ring. Those retire here.
         let bound = self.bound(ctx).expect("found just above");
-        match (bound, self.vrend.as_mut()) {
-            (Bound::Classic(classic), Some(v)) => v.fence_context(classic, ring, fence),
-            // Retirement goes through the thread whatever satisfied the fence: the asynchrony is
-            // the contract, not an optimization.
-            _ => self.fences.retire_context(ctx, ring, fence),
+        let ordered = match (bound, self.vrend.as_mut()) {
+            (Bound::Classic(classic), Some(v)) => {
+                v.fence_context(classic, ring, fence);
+                true
+            }
+            (Bound::Venus(vctx), _) => {
+                self.venus.as_ref().is_some_and(|v| v.ring_fence(vctx, ring, fence))
+            }
+            _ => false,
+        };
+        if !ordered {
+            self.fences.retire_context(ctx, ring, fence);
         }
         Ok(())
     }

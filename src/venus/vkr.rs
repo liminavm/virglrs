@@ -30,11 +30,11 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::config::Config;
-use crate::ids::{ContextId, RingId};
+use crate::ids::{ContextId, FenceId, RingId, RingIdx};
 use crate::renderer::VenusCtx;
 
 use super::context::{Context, NotReplaying, Submitted, Unimplemented, Wait};
-use super::driver::Answered;
+use super::driver::{Answered, RingQueues};
 use super::journal::Seq;
 use super::ring::{ReplyStream, Ring, ShmResources};
 use super::ring_thread::{self, Dispatch, RingWaiter, Verdict};
@@ -66,7 +66,10 @@ pub struct Vkr {
     /// One lock per context, not one over the table: a context is exactly the unit a ring thread
     /// needs exclusively, so two guests' rings dispatch at the same time. The `Arc` is what lets a
     /// ring thread hold a claim on its own context without holding the renderer.
-    contexts: BTreeMap<ContextId, Arc<Mutex<Context>>>,
+    contexts: BTreeMap<ContextId, Arc<ContextSlot>>,
+    /// Where a ring's fence goes once its queue has finished the work it orders. Held here
+    /// because a context's [`RingQueues`] is made at context create and needs it then.
+    retire: crate::fence::Handle,
     /// The next context's generation. See [`ContextKey`]: it counts occupants of context ids, so
     /// that a key made for one occupant cannot name the next one to arrive under the same id.
     ///
@@ -95,6 +98,36 @@ pub struct Vkr {
     /// one -- see [`crate::budget`]. Each context gets a key to it and can reach nothing else,
     /// which is what makes billing structural.
     budget: Arc<Budget>,
+}
+
+/// A context, and the part of it that is reached without locking it.
+///
+/// The ring-fence queues are that part. A guest asks for a ring fence on the VMM's virtio-gpu
+/// thread, which must not take the context lock -- a batch in flight would stall every
+/// virtio-gpu command behind a whole guest frame -- so the queues sit beside the lock rather
+/// than inside it. Everything else still goes through [`ContextSlot::lock`], which is the
+/// context's only door.
+pub struct ContextSlot {
+    ctx: Mutex<Context>,
+    fences: RingQueues,
+}
+
+impl ContextSlot {
+    /// The context, for as long as the guard lives. Never blocks a ring thread: see
+    /// [`ContextSlot::try_lock`].
+    pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Context>> {
+        self.ctx.lock()
+    }
+
+    /// The context if it is free, for a ring thread, which must never block on it.
+    pub fn try_lock(&self) -> std::sync::TryLockResult<std::sync::MutexGuard<'_, Context>> {
+        self.ctx.try_lock()
+    }
+
+    /// The queues this context's rings are fenced against.
+    pub fn fences(&self) -> &RingQueues {
+        &self.fences
+    }
 }
 
 /// One context, as something outside this module may hold it: which id, and which occupant of
@@ -145,7 +178,7 @@ pub type SharedResources = Arc<RwLock<dyn ShmResources + Send + Sync>>;
 /// nothing and `Drop for Context`, which is the actual teardown, never runs. A failed upgrade is
 /// a context that is gone, which is a ring that should stop, so it reports `Poisoned`.
 struct RingDispatch {
-    ctx: Weak<Mutex<Context>>,
+    ctx: Weak<ContextSlot>,
     resources: SharedResources,
     todo: Arc<Unimplemented>,
     tally: Arc<Tally>,
@@ -222,9 +255,15 @@ impl Dispatch for RingDispatch {
 }
 
 impl Vkr {
-    pub fn new(config: Config, resources: SharedResources, budget: &Arc<Budget>) -> Vkr {
+    pub fn new(
+        config: Config,
+        resources: SharedResources,
+        budget: &Arc<Budget>,
+        retire: crate::fence::Handle,
+    ) -> Vkr {
         Vkr {
             config,
+            retire,
             contexts: BTreeMap::new(),
             generations: 0,
             todo: Arc::new(Unimplemented::default()),
@@ -252,7 +291,29 @@ impl Vkr {
         assert!(!self.contexts.contains_key(&id), "{id:?} already had a venus context");
         let key = ContextKey { id, generation: self.generations };
         self.generations += 1;
-        self.contexts.insert(id, Arc::new(Mutex::new(Context::new(key, &self.budget, name))));
+        let fences = RingQueues::new(id, self.retire.clone());
+        let mut context = Context::new(key, &self.budget, name);
+        // The one place a context's driver is given real fence queues. Without them every ring
+        // fence retires the moment it is asked for, which is what a compositor sampling a
+        // client's image before its render had run came down to.
+        context.attach_ring_queues(fences.clone());
+        self.contexts.insert(id, Arc::new(ContextSlot { ctx: Mutex::new(context), fences }));
+    }
+
+    /// Order a ring's fence behind the work the guest submitted on that ring's queue.
+    ///
+    /// `false` is a fence this renderer cannot order: a context it does not have, or a ring the
+    /// guest never bound a queue to with `VkDeviceQueueTimelineInfoMESA`. The caller retires it
+    /// itself, which is what every venus fence used to get.
+    ///
+    /// Deliberately takes no context lock. The VMM asks for this on its virtio-gpu thread, and a
+    /// batch in flight would otherwise stall every virtio-gpu command behind a whole guest
+    /// frame -- see [`ContextSlot`].
+    pub fn ring_fence(&self, ctx: VenusCtx, ring: RingIdx, fence: FenceId) -> bool {
+        let Some(slot) = self.contexts.get(&ctx.id()) else {
+            return false;
+        };
+        slot.fences().fence(ring, fence)
     }
 
     /// Tear a context down. Every host handle it still holds dies with it -- a guest that leaks is
@@ -541,13 +602,23 @@ mod tests {
     }
 
     /// A renderer with one venus context and the memory a ring lives in.
+    /// A fence sink for the fixtures, which are about dispatch and never about retirement.
+    struct Nowhere;
+    impl crate::fence::FenceSink for Nowhere {
+        fn context_fence(&mut self, _: ContextId, _: crate::ids::RingIdx, _: FenceId) {}
+        fn global_fence(&mut self, _: crate::ids::ClientFenceId) {}
+    }
+
     fn vkr() -> (Vkr, Arc<GuestMap>) {
         let (fd, map) =
             crate::guest_mem::anonymous_shm(0x24000, "virglrs-vkrtest").expect("minted");
         drop(fd);
         let map = Arc::new(map);
         let table: SharedResources = Arc::new(RwLock::new(OneShm(Arc::clone(&map))));
-        let mut v = Vkr::new(Config::default(), table, &Budget::with_cap(None, false));
+        // A retirement to hang ring fences off. The handle keeps the thread alive on its own,
+        // so the `Retirement` itself need not be held here.
+        let retire = crate::fence::Retirement::start(Box::new(Nowhere)).handle();
+        let mut v = Vkr::new(Config::default(), table, &Budget::with_cap(None, false), retire);
         v.context_create(ctx_id(), String::new());
         (v, map)
     }

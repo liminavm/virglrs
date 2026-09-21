@@ -64,7 +64,12 @@ build is diffed against.
 
 Behavioural contract, not just symbols: `RENDER_SERVER | THREAD_SYNC |
 ASYNC_FENCE_CB` must retire venus fences **asynchronously** through
-`write_context_fence`, or the guest hangs in `vkQueueWaitIdle`. `virgl_renderer_init`
+`write_context_fence`, or the guest hangs in `vkQueueWaitIdle`. Asynchronously is not
+enough on its own: a fence on a ring the guest bound a queue to must also retire only
+once that queue has *finished*, which an empty `vkQueueSubmit` carrying a real `VkFence`
+is what buys. It is the whole of the host's contribution to ordering one context's
+rendering against another's read of it -- mesa's cross-context handshake is a CPU wait on
+this fence, and `vkImportSemaphoreResourceMESA` after it is only "signalled now". `virgl_renderer_init`
 must accept the flag word libkrun passes (`VENUS | USE_EGL | USE_GLES |
 USE_SURFACELESS | THREAD_SYNC | ASYNC_FENCE_CB | RENDER_SERVER | USE_VIDEO`) and
 advertise exactly the capsets those flags imply.
@@ -383,9 +388,13 @@ buildable throughout as the A-side reference.
   pass that proceeds.
 
   **A driver wait suspends the batch the same way.** `vkWaitForFences`, `vkWaitSemaphores`,
-  `vkDeviceWaitIdle` and `vkQueueWaitIdle` block on the GPU, and mesa's venus sends the
-  first two with an infinite timeout on the ring once its own feedback slot reports the
-  signal. A handler that blocked would hold the context and the resource table's read lock
+  `vkDeviceWaitIdle`, `vkQueueWaitIdle`, `vkWaitSemaphoreResourceMESA` and
+  `vkResetFenceResourceMESA` block on the GPU, and mesa's venus sends the first two with an
+  infinite timeout on the ring once its own feedback slot reports the signal. The last two
+  spell themselves as sync-fd *exports* and were missed for it: on a driver whose sync type
+  cannot make a sync file -- KosmicKrisp, and so every host limina ships on -- mesa wraps
+  binary semaphores in `vk_sync_binary`, whose `export_sync_file` waits the GPU out untimed
+  before handing back the already-signalled `-1`. A handler that blocked would hold the context and the resource table's read lock
   for the GPU's time, against every other ring of the context and every VMM resource write.
   So the handler probes with a zero timeout -- the common case is a wait that is already
   over -- and otherwise suspends with a `Wait::Driver` that owns everything the call needs;
