@@ -1074,10 +1074,9 @@ SABOTAGES = [
     (
         'the emulated external memory is advertised on drivers that emulate nothing',
         'src/venus/driver.rs',
-        """        if self.supports(pd, "VK_EXT_external_memory_metal")
-            && !self.supports(pd, "VK_KHR_external_memory_fd")
-        {""",
-        """        {""",
+        """        self.supports(pd, "VK_EXT_external_memory_metal")
+            && !self.supports(pd, "VK_KHR_external_memory_fd")""",
+        """        self.supports(pd, "VK_EXT_external_memory_metal")""",
         '',
     ),
     (
