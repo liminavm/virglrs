@@ -80,7 +80,17 @@ fn config_of(flags: c_int) -> Config {
 enum Retired {
     Context(ContextId, RingIdx, FenceId),
     Global(ClientFenceId),
+    /// A present fence: neither a context nor a ring, because a present has neither. Delivered
+    /// through the callback [`virgl_renderer_limina_set_present_fence_callback`] registers, which
+    /// is a virglrs extension and not in the versioned C table.
+    Present(FenceId),
 }
+
+/// Where a retired present fence is delivered.
+///
+/// `u64` and not `u32`: a present fence id is a [`FenceId`], which the Rust API sizes, and
+/// narrowing it here to match the older `write_fence` would lose ids this renderer can mint.
+pub type PresentFenceCb = extern "C" fn(*mut c_void, u64);
 
 /// The VMM's callback table, and *when* it has agreed to be called through it.
 ///
@@ -104,6 +114,11 @@ struct Sink {
     cookie: VmmPtr,
     write_fence: Option<extern "C" fn(*mut c_void, u32)>,
     write_context_fence: Option<extern "C" fn(*mut c_void, u32, u32, u64)>,
+    /// Where a present fence goes. Not in the C callbacks table and so not read from it: the
+    /// table is versioned by a header we do not own, and a present fence is this renderer's
+    /// extension. Registered separately, after init, hence the lock -- taken once per presented
+    /// frame at most, never on the path an ordinary fence takes.
+    write_present_fence: Mutex<Option<PresentFenceCb>>,
     /// Retired fences the VMM has not been told of yet, or `None` when it asked to be told at once.
     deferred: Option<Mutex<VecDeque<Retired>>>,
 }
@@ -117,6 +132,7 @@ impl Sink {
                     format!("context ctx={ctx:?} ring={ring:?} id={}", fence.0)
                 }
                 Retired::Global(fence) => format!("global id={}", fence.0),
+                Retired::Present(fence) => format!("present id={}", fence.0),
             };
             let how = if self.deferred.is_some() { "from poll" } else { "at once" };
             eprintln!("[virglrs] fence: handing {what} to the VMM, {how}");
@@ -129,6 +145,15 @@ impl Sink {
             }
             Retired::Global(fence) => {
                 if let Some(f) = self.write_fence {
+                    f(self.cookie.0, fence.0);
+                }
+            }
+            Retired::Present(fence) => {
+                let cb = *self
+                    .write_present_fence
+                    .lock()
+                    .expect("the present callback is never held across a panic");
+                if let Some(f) = cb {
                     f(self.cookie.0, fence.0);
                 }
             }
@@ -178,17 +203,15 @@ impl fence::FenceSink for VmmFences {
         self.0.retire(Retired::Global(fence));
     }
 
-    /// Unreachable, and an assertion rather than a translation on purpose.
+    /// A present fence has retired: hand it to whoever registered for them.
     ///
-    /// A present fence is asked for through [`crate::Renderer::resource_present_fence`], which
-    /// this ABI does not export and has no callback to answer: the VMM that wants one consumes
-    /// the Rust crate directly. Nothing reachable from C can create one, so one retiring here is
-    /// a host invariant broken, not a caller's mistake -- and inventing a ring to deliver it on
-    /// would be the smuggling this entry point exists to replace.
+    /// It carries no context and no ring because a present has neither, so it cannot travel on
+    /// the versioned table's `write_context_fence` without inventing one -- which is the
+    /// smuggling [`crate::Renderer::resource_present_fence`] exists to replace. It rides the same
+    /// deferred queue as every other retirement, so a VMM that asked to be told only from `poll`
+    /// is told only from `poll` here too.
     fn present_fence(&mut self, fence: FenceId) {
-        unreachable!(
-            "a present fence retired through the C ABI, which cannot create one: {fence:?}"
-        )
+        self.0.retire(Retired::Present(fence));
     }
 }
 
@@ -375,6 +398,8 @@ pub extern "C" fn virgl_renderer_init(
             cookie: VmmPtr(cookie),
             write_fence: (&raw const (*cb).write_fence).read(),
             write_context_fence: (&raw const (*cb).write_context_fence).read(),
+            // Not in the table: registered afterwards, by a caller that wants present fences.
+            write_present_fence: Mutex::new(None),
             // The VMM that did not ask to be called out of band is told through `poll` instead.
             deferred: (flags & abi::ASYNC_FENCE_CB == 0).then(|| Mutex::new(VecDeque::new())),
         })
@@ -2167,6 +2192,52 @@ fn with_bytes<R>(p: *mut c_void, len: usize, f: impl FnOnce(&[u8]) -> R) -> Opti
     Some(f(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), len) }))
 }
 
+/// Register where retired present fences are delivered. A virglrs extension.
+///
+/// Separate from `virgl_renderer_init`'s callbacks table because that table is versioned by a
+/// header this renderer does not own: adding a field to it would make every caller's `version`
+/// a claim about a layout upstream never defined. A caller that wants present fences asks for
+/// them here, after init, and one that does not is unaffected.
+///
+/// `ENOENT` before `virgl_renderer_init`, which is when the sink this registers into is made.
+/// Passing no callback unregisters, and a present fence retiring with none registered is then
+/// dropped -- the same contract the C table gives every other fence whose callback is absent.
+#[unsafe(no_mangle)]
+pub extern "C" fn virgl_renderer_limina_set_present_fence_callback(
+    cb: Option<PresentFenceCb>,
+) -> c_int {
+    let Some(sink) = current_sink() else {
+        return ENOENT;
+    };
+    *sink.write_present_fence.lock().expect("the present callback is never held across a panic") =
+        cb;
+    0
+}
+
+/// Ask for a fence that retires when the work behind a flushed resource has finished.
+///
+/// A virglrs extension, and the C ABI's translation of
+/// [`crate::Renderer::resource_present_fence`]. The caller names the resource it is presenting
+/// and nothing else: which context drew it is derived from what the guest attached it to, so
+/// there is no context argument for the two to disagree about, and no ring index reserved by a
+/// convention nothing enforces.
+///
+/// `0` means a fence is coming and the frame may be parked on it. `ENOENT` means this present
+/// cannot be answered by a fence -- no such resource, nothing has it attached, several contexts
+/// do, or no queue was ever bound -- and the caller shows the frame the way it would have
+/// without this call, rather than waiting for a fence that will never arrive. `EINVAL` is a
+/// handle that is not one.
+#[unsafe(no_mangle)]
+pub extern "C" fn virgl_renderer_limina_resource_present_fence(
+    res_handle: u32,
+    fence_id: u64,
+) -> c_int {
+    let Some(handle) = ResourceHandle::new(res_handle) else {
+        return EINVAL;
+    };
+    if with(false, |r| r.resource_present_fence(handle, FenceId(fence_id))) { 0 } else { ENOENT }
+}
+
 /// One venus context's sync state, as a blob the caller frees.
 ///
 /// `ENOENT` for a context this renderer does not serve as a venus one, the way the journal export
@@ -2553,6 +2624,7 @@ mod tests {
             cookie: VmmPtr::NULL,
             write_fence: Some(count),
             write_context_fence: None,
+            write_present_fence: Mutex::new(None),
             deferred: Some(Mutex::new(VecDeque::new())),
         };
 
@@ -2575,6 +2647,7 @@ mod tests {
             cookie: VmmPtr::NULL,
             write_fence: Some(count),
             write_context_fence: None,
+            write_present_fence: Mutex::new(None),
             deferred: None,
         };
         CALLS.store(0, Ordering::SeqCst);
@@ -2582,6 +2655,82 @@ mod tests {
         assert_eq!(CALLS.load(Ordering::SeqCst), 1, "an async VMM is called as the fence retires");
         at_once.drain();
         assert_eq!(CALLS.load(Ordering::SeqCst), 1, "and poll then owes it nothing");
+    }
+
+    /// A present fence reaches the VMM through the callback registered for it, and obeys the
+    /// same deferral contract every other retirement does.
+    ///
+    /// It has no context and no ring, so it cannot ride `write_context_fence` without inventing
+    /// one -- which is the smuggling the resource-named entry point replaces. A VMM that
+    /// registered nothing is not called, and is not a panic: that is the contract the C table
+    /// gives every fence whose callback is absent.
+    #[test]
+    fn a_present_fence_reaches_the_callback_registered_for_it() {
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn present(_cookie: *mut c_void, fence: u64) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            LAST.store(fence, Ordering::SeqCst);
+        }
+
+        let deferring = Sink {
+            cookie: VmmPtr::NULL,
+            write_fence: None,
+            write_context_fence: None,
+            write_present_fence: Mutex::new(Some(present)),
+            deferred: Some(Mutex::new(VecDeque::new())),
+        };
+
+        CALLS.store(0, Ordering::SeqCst);
+        deferring.retire(Retired::Present(FenceId(1_700)));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0, "a deferring VMM is told from poll, not here");
+        deferring.drain();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "the drain hands it over");
+        assert_eq!(LAST.load(Ordering::SeqCst), 1_700, "with the id it was asked for");
+
+        // Wider than `write_fence`'s u32 on purpose: a present id is a `FenceId`, and narrowing
+        // it to match the older callback would lose ids this renderer can mint.
+        deferring.retire(Retired::Present(FenceId(u64::from(u32::MAX) + 9)));
+        deferring.drain();
+        assert_eq!(
+            LAST.load(Ordering::SeqCst),
+            u64::from(u32::MAX) + 9,
+            "an id past 32 bits survives the trip"
+        );
+
+        // Registered nothing: not called, and not a panic.
+        let silent = Sink {
+            cookie: VmmPtr::NULL,
+            write_fence: None,
+            write_context_fence: None,
+            write_present_fence: Mutex::new(None),
+            deferred: None,
+        };
+        CALLS.store(0, Ordering::SeqCst);
+        silent.retire(Retired::Present(FenceId(3)));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0, "a VMM that wants none is not called");
+    }
+
+    /// The two present entry points refuse before there is anything to answer them with.
+    ///
+    /// `ENOENT` and not a panic: asking a renderer that has not been initialized is a fair
+    /// question with a negative answer, the way the context entry points treat one.
+    #[test]
+    fn the_present_entry_points_refuse_a_handle_and_a_renderer_they_do_not_have() {
+        assert_eq!(
+            virgl_renderer_limina_resource_present_fence(0, 1),
+            EINVAL,
+            "a resource handle of zero is not a handle"
+        );
+        // Whatever else is true of the shared renderer while the suite runs, a resource nothing
+        // has attached cannot be fenced -- which is the same answer an uninitialized one gives.
+        assert_eq!(
+            virgl_renderer_limina_resource_present_fence(u32::MAX, 1),
+            ENOENT,
+            "a resource this renderer does not serve cannot be presented against"
+        );
     }
 
     /// `get_cap_set` answers before `virgl_renderer_init`, because its callers ask before then.

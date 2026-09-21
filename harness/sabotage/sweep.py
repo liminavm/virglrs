@@ -671,6 +671,13 @@ SABOTAGES = [
         '',
     ),
     (
+        "a present barrier inherits the context stream's deadlock verdict",
+        'src/venus/ring_thread.rs',
+        '''        matches!(self.inner.run(), Stop::Reached)''',
+        '''        self.inner.wait()''',
+        'a_present_barrier',
+    ),
+    (
         'a ring wait past everything the guest wrote is waited through',
         'src/venus/ring_thread.rs',
         '''            if head == tail && !seqno_ge(tail, self.seqno) {''',
