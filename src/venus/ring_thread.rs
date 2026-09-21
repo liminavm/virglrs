@@ -185,65 +185,44 @@ fn wait_warn() -> Duration {
     Duration::from_millis(ms)
 }
 
+/// Why a wait stopped.
+///
+/// Both stalls are states no amount of further waiting can change; what they *mean* depends
+/// entirely on who was waiting, which is why this says what happened and nothing about what to
+/// do about it. See [`RingWaiter`] and [`BarrierWaiter`].
+enum Stop {
+    /// The head reached the seqno.
+    Reached,
+    /// The ring is asleep on a virtqueue seqno that has not been published, and holds the
+    /// unreachable seqno.
+    Stalled(u64),
+    /// The ring has consumed everything the guest wrote and is still short of the seqno.
+    Drained(u32),
+    /// The context is already poisoned.
+    Fatal,
+}
+
 impl RingWaiter {
-    /// Sleep until the ring's head reaches the seqno. `false` means the context is poisoned.
+    /// Sleep until the ring's head reaches the seqno, or until it provably never will.
     ///
-    /// Two of the three ways out are refusals, and both are deadlocks caught rather than waited
-    /// through. They are checked before the first sleep and again on every wake, because the
+    /// Both refusals are checked before the first sleep and again on every wake, because the
     /// state that makes them true can arrive either side of the sleep beginning.
-    pub fn wait(self) -> bool {
+    fn run(&self) -> Stop {
         let warn = wait_warn();
         let mut logged = false;
         loop {
             if self.fatal.load(Ordering::Acquire) {
-                return false;
+                return Stop::Fatal;
             }
             if seqno_ge(self.control.head(), self.seqno) {
-                return true;
+                return Stop::Reached;
             }
-
-            // The ring is asleep on a virtqueue seqno nobody has published. The only command that
-            // publishes one arrives on *this* stream, and this stream is here -- so the ring
-            // cannot advance, this wait cannot end, and neither can be rescued by waiting longer.
-            // Left to sleep, the two hold the virtio-gpu control queue between them, which is one
-            // queue for the whole device: every other context's submissions, every scanout flush
-            // and every fence would stop with them. The C's guard runs only in the ring thread's
-            // idle branch and never sees this pair at all.
             if let Some(want) = self.park.stalled_on() {
-                // head/tail/status are here because the pair alone does not say which side is
-                // wrong. A head just short of the wanted seqno is a lost wake; a head at zero
-                // against a large wanted seqno is a counter that did not survive whatever
-                // rebuilt this ring, and the two want opposite fixes.
-                eprintln!(
-                    "[virglrs] ctx {}: {} waits for ring seqno {} while {} sleeps for virtqueue \
-                     seqno {}, which only this stream can publish -- neither can proceed \
-                     (ring head {} tail {} status {:#x})",
-                    self.ctx,
-                    self.id,
-                    self.seqno,
-                    self.id,
-                    want,
-                    self.control.head(),
-                    self.control.tail(),
-                    self.control.status(),
-                );
-                self.die();
-                return false;
+                return Stop::Stalled(want);
             }
-
-            // The ring has consumed everything the guest wrote and is still short of the seqno
-            // asked for, so no head this ring can reach will ever satisfy it: the guest asked to
-            // be told about bytes it never sent. This is the C's guard, asked from the waiting
-            // side rather than from the ring's idle branch -- the head advancing to meet the tail
-            // is itself a wake, so the re-check that sees this always happens.
             let (head, tail) = (self.control.head(), self.control.tail());
             if head == tail && !seqno_ge(tail, self.seqno) {
-                eprintln!(
-                    "[virglrs] ctx {}: {} is drained at {head} and cannot reach ring seqno {}",
-                    self.ctx, self.id, self.seqno,
-                );
-                self.die();
-                return false;
+                return Stop::Drained(head);
             }
 
             if self.wait_ring.wait(warn) && !logged {
@@ -266,12 +245,91 @@ impl RingWaiter {
         }
     }
 
+    /// Sleep until the ring's head reaches the seqno. `false` means the context is poisoned.
+    ///
+    /// Two of the three ways out are refusals, and both are deadlocks caught rather than waited
+    /// through -- because *this* waiter is the context's own stream. See [`BarrierWaiter`] for
+    /// the waiter that is not, and for which neither stall is a deadlock at all.
+    pub fn wait(self) -> bool {
+        match self.run() {
+            Stop::Reached => true,
+            Stop::Fatal => false,
+            // The ring is asleep on a virtqueue seqno nobody has published. The only command that
+            // publishes one arrives on *this* stream, and this stream is here -- so the ring
+            // cannot advance, this wait cannot end, and neither can be rescued by waiting longer.
+            // Left to sleep, the two hold the virtio-gpu control queue between them, which is one
+            // queue for the whole device: every other context's submissions, every scanout flush
+            // and every fence would stop with them. The C's guard runs only in the ring thread's
+            // idle branch and never sees this pair at all.
+            Stop::Stalled(want) => {
+                // head/tail/status are here because the pair alone does not say which side is
+                // wrong. A head just short of the wanted seqno is a lost wake; a head at zero
+                // against a large wanted seqno is a counter that did not survive whatever
+                // rebuilt this ring, and the two want opposite fixes.
+                eprintln!(
+                    "[virglrs] ctx {}: {} waits for ring seqno {} while {} sleeps for virtqueue \
+                     seqno {}, which only this stream can publish -- neither can proceed \
+                     (ring head {} tail {} status {:#x})",
+                    self.ctx,
+                    self.id,
+                    self.seqno,
+                    self.id,
+                    want,
+                    self.control.head(),
+                    self.control.tail(),
+                    self.control.status(),
+                );
+                self.die();
+                false
+            }
+            // The ring has consumed everything the guest wrote and is still short of the seqno
+            // asked for, so no head this ring can reach will ever satisfy it: the guest asked to
+            // be told about bytes it never sent. This is the C's guard, asked from the waiting
+            // side rather than from the ring's idle branch -- the head advancing to meet the tail
+            // is itself a wake, so the re-check that sees this always happens.
+            Stop::Drained(head) => {
+                eprintln!(
+                    "[virglrs] ctx {}: {} is drained at {head} and cannot reach ring seqno {}",
+                    self.ctx, self.id, self.seqno,
+                );
+                self.die();
+                false
+            }
+        }
+    }
+
     /// Kill the ring and the context with it. The guest is told through the status word, because
     /// a wait that ends this way has no reply to carry the news.
     fn die(&self) {
         self.control.set_bits(STATUS_FATAL);
         self.fatal.store(true, Ordering::Release);
         self.wait_ring.changed();
+    }
+}
+
+/// A wait on a ring's head taken by something that is *not* that context's stream.
+///
+/// A present's decode barrier waits for rings to finish reading what the guest has already
+/// written, and it runs on the present thread while the context's stream is free. That one
+/// difference is the whole reason this is a separate type rather than a flag on [`RingWaiter`]:
+/// every refusal `RingWaiter` makes is a deadlock verdict that rests on the waiter being the
+/// stream, and none of them is sound here. A ring parked on a virtqueue seqno is waiting for a
+/// `vkSubmitVirtqueueSeqnoMESA` the stream can still send, so it is an ordinary pause, not a
+/// deadlock -- and poisoning the context over it kills a guest that was working.
+///
+/// So this one never poisons anything. It gives up, and the present retires unfenced: a frame
+/// shown without having waited is a frame that may be a beat stale, which is a far smaller
+/// thing than a context that refuses every submission for the life of the VM.
+#[must_use = "a barrier that is never waited on orders nothing"]
+pub struct BarrierWaiter {
+    inner: RingWaiter,
+}
+
+impl BarrierWaiter {
+    /// Sleep until the ring has read up to the barrier. `false` means it could not be reached
+    /// and the present it belongs to should be answered anyway.
+    pub fn wait(self) -> bool {
+        matches!(self.inner.run(), Stop::Reached)
     }
 }
 
@@ -361,6 +419,20 @@ impl RingThread {
             wait_ring,
             fatal,
         }
+    }
+
+    /// The same wait, for a present's decode barrier rather than the context's own stream.
+    ///
+    /// Separate from [`Self::waiter`] so the caller cannot pick the wrong refusals by accident:
+    /// the type it hands back is the one whose guards suit a waiter that is not the stream.
+    pub fn barrier_waiter(
+        &self,
+        ctx: ContextId,
+        seqno: u32,
+        wait_ring: Arc<WaitRing>,
+        fatal: Arc<AtomicBool>,
+    ) -> BarrierWaiter {
+        BarrierWaiter { inner: self.waiter(ctx, seqno, wait_ring, fatal) }
     }
 
     /// Stop the ring and take its body back.

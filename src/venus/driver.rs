@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::ring_thread::RingWaiter;
+use super::ring_thread::BarrierWaiter;
 use crate::ids::{ContextId, FenceId, RingIdx};
 
 use super::cs::{Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
@@ -630,7 +630,7 @@ struct PresentSync {
 /// One present fence: the decode barrier to clear first, then the id to answer.
 struct PresentJob {
     id: FenceId,
-    waiters: Vec<RingWaiter>,
+    waiters: Vec<BarrierWaiter>,
 }
 
 impl Drop for PresentSync {
@@ -830,7 +830,7 @@ impl RingQueues {
     /// `false` means this context cannot answer the present -- no queue was ever bound to any of
     /// its rings, so there is nothing to fence -- and the caller shows the frame the old way
     /// instead of waiting for a fence that would never come.
-    pub fn present_fence(&self, waiters: Vec<RingWaiter>, id: FenceId) -> bool {
+    pub fn present_fence(&self, waiters: Vec<BarrierWaiter>, id: FenceId) -> bool {
         let Some(retire) = self.inner.retire.clone() else {
             return false;
         };

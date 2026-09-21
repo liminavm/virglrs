@@ -602,6 +602,7 @@ mod tests {
     use crate::ids::ResourceHandle;
     use crate::venus::context::NOT_REPLAYING;
     use crate::venus::proto::types::{VkFlags, VkRingCreateInfoMESA};
+    use crate::venus::ring_thread::BarrierWaiter;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -838,6 +839,16 @@ mod tests {
             .expect("the wait never ended: the guard that should have refused it is gone")
     }
 
+    /// The same deadline for a present barrier's waiter, which is a different type on purpose.
+    fn barrier_waited(waiter: BarrierWaiter) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(waiter.wait());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the barrier wait never ended: it is waiting for a ring that cannot move")
+    }
+
     /// Wait for something a ring thread does, or fail rather than hang the suite.
     fn until(what: &str, mut pred: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1045,6 +1056,54 @@ mod tests {
             other => panic!("expected a suspended ring wait, got {other:?}"),
         };
         assert!(!waited(waiter), "the pair is refused, not waited through");
+        v.context_destroy(ctx_id());
+    }
+
+    /// A present barrier meeting a parked ring gives up; it never poisons the context.
+    ///
+    /// The barrier is assembled the way [`Vkr::present_fence`] assembles it, and the ring it
+    /// covers is asleep on a virtqueue seqno nobody has published. The guard that makes that
+    /// pair fatal for the context's own stream does not hold here: the stream is free, and it
+    /// is the stream -- not this barrier -- that publishes the seqno. So the wait ends without
+    /// a verdict on the context, and the context goes on taking work.
+    ///
+    /// The regression this pins cost a dogfood desktop: the barrier inherited the stream's
+    /// guard, poisoned ctx 3 on the first frame flushed while a ring happened to be parked, and
+    /// every later `SUBMIT_3D` was refused for the life of the VM.
+    #[test]
+    fn a_present_barrier_gives_up_on_a_parked_ring_instead_of_poisoning() {
+        let (mut v, map) = vkr();
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+
+        guest_writes(&map, &wire_wait_vq(1));
+        until("the ring to block on the virtqueue seqno", || {
+            v.contexts[&ctx_id().id()]
+                .lock()
+                .expect("not poisoned")
+                .ring_waiter(RingId::new(7).unwrap(), 1)
+                .is_some_and(|_| true)
+        });
+        // Certainly parked rather than merely about to be, as the deadlock test above.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let waiters = {
+            let c = v.contexts[&ctx_id().id()].lock().expect("not poisoned");
+            c.decode_barrier()
+        };
+        assert_eq!(waiters.len(), 1, "the barrier covers the one running ring");
+        for w in waiters {
+            assert!(!barrier_waited(w), "the barrier gives up on a parked ring");
+        }
+
+        // The claim. A poisoned context refuses this, which is exactly what the desktop saw.
+        assert!(
+            v.submit(ctx_id(), &wire_submit_vq(7, 1)).expect("accepted").ran(),
+            "the context still takes work after the barrier gave up"
+        );
+        until("the released ring to run the wait through", || head(&map) > 0);
         v.context_destroy(ctx_id());
     }
 

@@ -132,7 +132,7 @@ use super::proto::types::{
 use super::ring::{
     ReplyStream, ReplyStreamError, ResourceBytes, Ring, RingControl, RingError, ShmResources,
 };
-use super::ring_thread::{RingThread, RingWaiter, WaitRing, seqno_ge};
+use super::ring_thread::{BarrierWaiter, RingThread, RingWaiter, WaitRing, seqno_ge};
 use super::sync;
 use super::vkr::ContextKey;
 use crate::budget::{Account, Budget};
@@ -470,13 +470,13 @@ impl Context {
     ///
     /// Assembled here under the context lock and waited on after it is released; see
     /// [`RingWaiter`], which holds nothing of the renderer for that reason.
-    pub fn decode_barrier(&self) -> Vec<RingWaiter> {
+    pub fn decode_barrier(&self) -> Vec<BarrierWaiter> {
         self.rings
             .values()
             .filter_map(|slot| match slot {
                 RingSlot::Running(t) => {
                     let tail = t.control().tail();
-                    Some(t.waiter(self.id(), tail, self.wait_ring(), self.fatal_flag()))
+                    Some(t.barrier_waiter(self.id(), tail, self.wait_ring(), self.fatal_flag()))
                 }
                 RingSlot::Idle(_) => None,
             })
