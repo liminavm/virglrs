@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::ids::{ContextId, FenceId, RingIdx};
 
@@ -585,10 +586,14 @@ impl core::fmt::Debug for HostQueue {
 /// A venus ring fence is the guest's "this ring's work is done", and a Wayland client's present
 /// rides it: the client fences its render, hands the compositor the buffer, and the compositor
 /// samples it. Retiring that fence on arrival says the work is done when it has only been
-/// submitted, so the compositor reads an image whose render is still in flight -- which is what
-/// a stale frame on the seat was. Instead an empty submit carrying a real `VkFence` goes on the
-/// queue the ring names, where Vulkan's own queue ordering puts it behind everything the guest
-/// already submitted, and the guest's fence retires when that signals.
+/// submitted, so the compositor can read an image whose render is still in flight. Instead an
+/// empty submit carrying a real `VkFence` goes on the queue the ring names, where Vulkan's own
+/// queue ordering puts it behind everything the guest already submitted, and the guest's fence
+/// retires when that signals.
+///
+/// This is the ring-fence route only. The other route a guest can order two contexts by -- a
+/// `SYNC_FD` export through `vkWaitSemaphoreResourceMESA` -- does order on this host already,
+/// by blocking; see [`Driver::export_semaphore_sync_fd`].
 ///
 /// Shared out of the context rather than reached through it, because the VMM asks for a ring
 /// fence on its virtio-gpu thread and that thread must not take the context lock.
@@ -603,6 +608,8 @@ struct RingQueuesInner {
     /// [`RingQueues::detached`].
     retire: Option<crate::fence::Handle>,
     bound: Mutex<BTreeMap<RingIdx, RingSync>>,
+    /// How many fences this context has actually ordered on a queue. See [`RingQueues::fence`].
+    ordered: AtomicU64,
 }
 
 /// One ring's queue and the thread that waits its fences out.
@@ -615,6 +622,11 @@ struct RingSync {
     queue: Arc<HostQueue>,
     jobs: Option<std::sync::mpsc::Sender<SyncJob>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Cleared to stop the thread between slices of a wait. Closing the channel is not enough:
+    /// a fence nothing will ever signal would keep the thread inside `vkWaitForFences`, and the
+    /// join below runs from `vkDestroyDevice` on a ring thread holding the context lock -- so a
+    /// guest with one hung queue would hang its whole context and everything behind it.
+    going: Arc<AtomicBool>,
 }
 
 /// One guest fence, and the host fence that answers it.
@@ -628,8 +640,10 @@ struct SyncJob {
 
 impl Drop for RingSync {
     fn drop(&mut self) {
-        // The sender first: the thread ends when the channel closes, and it drains what is
-        // queued before it does -- a fence the guest is still waiting on must not die with it.
+        // The flag first, so a thread inside a wait leaves it at the next slice; then the
+        // sender, which is what ends the loop. It drains what is queued either way -- a fence
+        // the guest is still waiting on must not die with the thread.
+        self.going.store(false, Ordering::Release);
         self.jobs = None;
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -644,6 +658,7 @@ impl RingQueues {
                 ctx,
                 retire: Some(retire),
                 bound: Mutex::new(BTreeMap::new()),
+                ordered: AtomicU64::new(0),
             }),
         }
     }
@@ -660,6 +675,7 @@ impl RingQueues {
                 ctx: ContextId::new(1).expect("1 is not zero"),
                 retire: None,
                 bound: Mutex::new(BTreeMap::new()),
+                ordered: AtomicU64::new(0),
             }),
         }
     }
@@ -679,12 +695,23 @@ impl RingQueues {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        let (q, ctx) = (Arc::clone(&queue), self.inner.ctx);
+        let going = Arc::new(AtomicBool::new(true));
+        let (q, ctx, g) = (Arc::clone(&queue), self.inner.ctx, Arc::clone(&going));
         let thread = std::thread::Builder::new()
             .name(format!("virglrs-ring{}-sync", ring.0))
-            .spawn(move || sync_thread(&q, ring, ctx, &retire, &rx))
+            .spawn(move || sync_thread(&q, ring, ctx, &retire, &rx, &g))
             .expect("spawning a ring's fence thread");
-        bound.insert(ring, RingSync { queue, jobs: Some(tx), thread: Some(thread) });
+        // Said once per ring, unprompted. A build where no ring is ever bound retires every
+        // fence unordered and looks, from a frame count alone, exactly like one where the
+        // ordering is working -- so the binding says so itself rather than leaving a later
+        // measurement to be read as evidence of something it cannot see.
+        eprintln!(
+            "[virglrs] ctx {}: ring {} fences are ordered on queue {:#x}",
+            ctx.get(),
+            ring.0,
+            queue.handle.0
+        );
+        bound.insert(ring, RingSync { queue, jobs: Some(tx), thread: Some(thread), going });
     }
 
     /// Forget every ring bound to a queue of `device`, so the device can be destroyed.
@@ -710,22 +737,48 @@ impl RingQueues {
         let Some(jobs) = sync.jobs.as_ref() else {
             return false;
         };
-        let fence = sync.queue.take_fence().filter(|fence| {
-            let _vk = sync.queue.held();
-            // SAFETY: a queue and a fence this renderer owns, and an empty submit -- which is
-            // what Vulkan's own "signal this fence behind everything already on the queue" is.
-            let r = unsafe {
-                (sync.queue.fns.vkQueueSubmit())(sync.queue.handle, 0, core::ptr::null(), *fence)
-            };
-            if r != VkResult::VK_SUCCESS {
-                eprintln!(
-                    "[virglrs] ring {} fence {}: the queue refused an empty submit ({r:?}); \
-                     retiring it unordered",
-                    ring.0, id.0
-                );
+        let fence = match sync.queue.take_fence() {
+            None => None,
+            Some(fence) => {
+                let submitted = {
+                    let _vk = sync.queue.held();
+                    // SAFETY: a queue and a fence this renderer owns, and an empty submit --
+                    // which is Vulkan's own "signal this fence behind everything already on the
+                    // queue".
+                    unsafe {
+                        (sync.queue.fns.vkQueueSubmit())(
+                            sync.queue.handle,
+                            0,
+                            core::ptr::null(),
+                            fence,
+                        )
+                    }
+                };
+                if submitted == VkResult::VK_SUCCESS {
+                    Some(fence)
+                } else {
+                    eprintln!(
+                        "[virglrs] ring {} fence {}: the queue refused an empty submit \
+                         ({submitted:?}); retiring it unordered",
+                        ring.0, id.0
+                    );
+                    // Nothing will signal it, so it goes back to the pool rather than being
+                    // dropped on the floor: one leaked `VkFence` per request is what a queue
+                    // that has gone device-lost would otherwise cost.
+                    sync.queue.put_fence(fence);
+                    None
+                }
             }
-            r == VkResult::VK_SUCCESS
-        });
+        };
+        // Counted so a run can say the ordering was live rather than leaving it to be inferred
+        // from the frames. First and every thousandth, which is enough to tell a working path
+        // from a silent one without a per-fence line in the present path.
+        if fence.is_some() {
+            let n = self.inner.ordered.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(1000) {
+                eprintln!("[virglrs] ring fences ordered on their queue: {n}");
+            }
+        }
         // Queued whatever happened above: a job with no fence retires at once, and that is how a
         // host that could not order this fence still answers it.
         jobs.send(SyncJob { id, fence }).is_ok()
@@ -743,30 +796,58 @@ fn sync_thread(
     ctx: ContextId,
     retire: &crate::fence::Handle,
     jobs: &std::sync::mpsc::Receiver<SyncJob>,
+    going: &AtomicBool,
 ) {
     while let Ok(job) = jobs.recv() {
-        if let Some(fence) = job.fence {
-            let device = queue.fns.handle;
-            loop {
-                // SAFETY: a fence this thread's queue made, on the device that made it.
-                let r = unsafe {
-                    (queue.fns.vkWaitForFences())(device, 1, &fence, VkBool32(1), DriverWait::SLICE)
-                };
-                if r != VkResult::VK_TIMEOUT {
-                    if r != VkResult::VK_SUCCESS {
-                        eprintln!(
-                            "[virglrs] ring {} fence {}: the device would not wait it out \
-                             ({r:?}); retiring it",
-                            ring.0, job.id.0
-                        );
-                    }
-                    break;
-                }
-            }
+        if let Some(fence) = job.fence
+            && wait_out(queue, ring, job.id, fence, going)
+        {
             queue.put_fence(fence);
         }
         retire.retire_context(ctx, ring, job.id);
     }
+}
+
+/// Wait one fence out, in slices, and say whether it can be reused.
+///
+/// `false` is a fence still outstanding when the thread was stopped. It is neither destroyed nor
+/// pooled: destroying a pending fence is undefined, and a spare that is never signalled would
+/// answer every later fence at once. It is left for the device's own destroy, which is the only
+/// point at which it is certainly no longer in flight.
+fn wait_out(
+    queue: &Arc<HostQueue>,
+    ring: RingIdx,
+    id: FenceId,
+    fence: VkFence,
+    going: &AtomicBool,
+) -> bool {
+    let device = queue.fns.handle;
+    while going.load(Ordering::Acquire) {
+        // SAFETY: a fence this thread's queue made, on the device that made it.
+        let r = unsafe {
+            (queue.fns.vkWaitForFences())(device, 1, &fence, VkBool32(1), DriverWait::SLICE)
+        };
+        if r == VkResult::VK_TIMEOUT {
+            continue;
+        }
+        if r != VkResult::VK_SUCCESS {
+            eprintln!(
+                "[virglrs] ring {} fence {}: the device would not wait it out ({r:?}); \
+                 retiring it",
+                ring.0, id.0
+            );
+        }
+        return r == VkResult::VK_SUCCESS;
+    }
+    // Stopped mid-wait. The guest's fence still retires -- a fence it is waiting on must never
+    // be dropped -- but unordered, and that is worth saying: the guest is about to be told work
+    // completed that may not have.
+    eprintln!(
+        "[virglrs] ring {} fence {}: stopped while its queue was still working; \
+         retiring it unordered",
+        ring.0, id.0
+    );
+    false
 }
 
 /// The rings a queue may carry fences for.

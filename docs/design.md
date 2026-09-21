@@ -66,10 +66,10 @@ Behavioural contract, not just symbols: `RENDER_SERVER | THREAD_SYNC |
 ASYNC_FENCE_CB` must retire venus fences **asynchronously** through
 `write_context_fence`, or the guest hangs in `vkQueueWaitIdle`. Asynchronously is not
 enough on its own: a fence on a ring the guest bound a queue to must also retire only
-once that queue has *finished*, which an empty `vkQueueSubmit` carrying a real `VkFence`
-is what buys. It is the whole of the host's contribution to ordering one context's
-rendering against another's read of it -- mesa's cross-context handshake is a CPU wait on
-this fence, and `vkImportSemaphoreResourceMESA` after it is only "signalled now". `virgl_renderer_init`
+once that queue has *finished*, which is what an empty `vkQueueSubmit` carrying a real
+`VkFence` buys. Retired on arrival it says the work is done when it has only been
+submitted, and a guest that hands another context a buffer on the strength of it is
+handing over a render still in flight. `virgl_renderer_init`
 must accept the flag word libkrun passes (`VENUS | USE_EGL | USE_GLES |
 USE_SURFACELESS | THREAD_SYNC | ASYNC_FENCE_CB | RENDER_SERVER | USE_VIDEO`) and
 advertise exactly the capsets those flags imply.

@@ -294,8 +294,8 @@ impl Vkr {
         let fences = RingQueues::new(id, self.retire.clone());
         let mut context = Context::new(key, &self.budget, name);
         // The one place a context's driver is given real fence queues. Without them every ring
-        // fence retires the moment it is asked for, which is what a compositor sampling a
-        // client's image before its render had run came down to.
+        // fence retires the moment it is asked for, saying work is done that has only been
+        // submitted.
         context.attach_ring_queues(fences.clone());
         self.contexts.insert(id, Arc::new(ContextSlot { ctx: Mutex::new(context), fences }));
     }
