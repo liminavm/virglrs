@@ -1976,6 +1976,52 @@ impl Renderer {
         self.vrend.as_mut()?.resource_surface(handle).map(|_| only)
     }
 
+    /// Fence the work that produced `handle`'s current contents, and retire `fence` through
+    /// [`FenceSink::present_fence`] once that work has actually finished on the host.
+    ///
+    /// This is what a VMM parking a frame asks for: it has been told to flush a resource to a
+    /// scanout, and it wants to show the frame when the renders behind it are done rather than
+    /// when the flush arrived. Both the waiting and the fencing happen off this thread, which is
+    /// the entire point -- this thread services virtio-gpu for every guest context, and the
+    /// synchronous alternative ([`Self::resource_sync_surface`]) stalls all of them.
+    ///
+    /// The context is derived from the resource rather than passed in, because the resource is
+    /// what the caller is actually talking about and a context given alongside it would be a
+    /// second value that has to agree. It is the one the guest attached the resource to, which is
+    /// the same rule [`Self::resource_present_waits_on`] answers by.
+    ///
+    /// `false` means this present cannot be answered by a fence, and the caller should present as
+    /// it did before. The reasons are the ones that make a single fence the wrong answer rather
+    /// than a slow one: nothing has the resource attached, or more than one context has -- a
+    /// fence names one context, and picking one of several would answer for work the other still
+    /// has outstanding -- or the named context has nothing that can carry a fence.
+    ///
+    /// **Not a ring fence.** The C asks for this by minting a guest ring fence on a ring index it
+    /// reserves by convention (63) in the guest's own space, which holds only because mesa
+    /// happens to allocate low ones. Nothing here reserves anything: a present fence has no ring
+    /// because it never came from one.
+    pub fn resource_present_fence(&mut self, handle: ResourceHandle, fence: FenceId) -> bool {
+        // Who the guest kernel attached it to is who is allowed to have rendered into it -- the
+        // same rule `resource_sync_surface` finishes by and `resource_present_waits_on` names by.
+        let Some(attached) = self.with_resource(handle, |r| r.attached.clone()) else {
+            return false;
+        };
+        let [ctx] = attached[..] else { return false };
+        let Ok(bound) = self.bound(ctx) else {
+            return false;
+        };
+        match (bound, self.vrend.as_mut()) {
+            (Bound::Classic(classic), Some(v)) => {
+                v.present_fence(classic, fence);
+                true
+            }
+            (Bound::Venus(vctx), _) => {
+                self.venus.as_ref().is_some_and(|v| v.present_fence(vctx, fence))
+            }
+            _ => false,
+        }
+    }
+
     /// Where a blob resource lives in this process, for a VMM about to publish it to the guest.
     ///
     /// The one question the mapping calls ask, in one answer: an address on its own is not enough
@@ -2180,6 +2226,8 @@ mod tests {
     struct NoSink;
     impl FenceSink for NoSink {
         fn context_fence(&mut self, _ctx: ContextId, _ring: RingIdx, _fence: FenceId) {}
+        fn present_fence(&mut self, _: FenceId) {}
+
         fn global_fence(&mut self, _fence: ClientFenceId) {}
     }
 

@@ -881,6 +881,29 @@ impl Vrend {
         w.retire_context(answer, ctx, ring, id);
     }
 
+    /// Answer a present fence for work a classic context queued: make it true that the GL work has
+    /// run, and retire it as a present.
+    ///
+    /// [`Self::fence_context`] with the ring taken away. The work waited for is the same -- one
+    /// sync per GL queue that context could have drawn on -- and only who is told differs, because
+    /// a present fence answers the VMM about a resource rather than the guest about a stream.
+    pub fn present_fence(&mut self, ctx: ClassicCtx, id: FenceId) {
+        let ctx = ctx.id();
+        // Same reasoning as `fence_context`: with no waiter there is no queue to retire behind, so
+        // the work is finished inline rather than the fence being retired unwaited.
+        if self.waiter.is_none() {
+            self.finish_contexts(&[ctx]);
+            self.fences.retire_present(id);
+            return;
+        }
+        let answer = self.take_fence(Some(ctx));
+        if super::debug::enabled(super::debug::Switch::Fence) {
+            eprintln!("[virglrs] fence: present ctx={ctx:?} id={} answer={}", id.0, answer.name());
+        }
+        let w = self.waiter.as_ref().expect("checked just above");
+        w.retire_present(answer, id);
+    }
+
     /// Answer a fence on the legacy global ring, which names its context from outside.
     ///
     /// `on` is the context whose work the fence is for. `None` -- or a context this renderer does
@@ -1312,6 +1335,8 @@ mod tests {
         struct Discard;
         impl crate::fence::FenceSink for Discard {
             fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
         // Declared first so it outlives the renderer: the fence waiter retires through this as it
@@ -1345,6 +1370,8 @@ mod tests {
         struct Discard;
         impl crate::fence::FenceSink for Discard {
             fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
         let retire = crate::fence::Retirement::start(Box::new(Discard));
@@ -1403,6 +1430,8 @@ mod tests {
             fn context_fence(&mut self, _: ContextId, _: RingIdx, f: FenceId) {
                 let _ = self.0.send(f.0);
             }
+            fn present_fence(&mut self, _: FenceId) {}
+
             fn global_fence(&mut self, f: ClientFenceId) {
                 let _ = self.0.send(u64::from(f.0));
             }
@@ -1458,6 +1487,8 @@ mod tests {
         struct Ignore;
         impl crate::fence::FenceSink for Ignore {
             fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
         let retire = crate::fence::Retirement::start(Box::new(Ignore));
@@ -1510,6 +1541,8 @@ mod tests {
         struct Ignore;
         impl crate::fence::FenceSink for Ignore {
             fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
         let retire = crate::fence::Retirement::start(Box::new(Ignore));
@@ -1569,6 +1602,8 @@ mod tests {
         struct Discard;
         impl crate::fence::FenceSink for Discard {
             fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
         let retire = crate::fence::Retirement::start(Box::new(Discard));
@@ -1629,6 +1664,8 @@ mod tests {
         struct Discard;
         impl crate::fence::FenceSink for Discard {
             fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
         let retire = crate::fence::Retirement::start(Box::new(Discard));

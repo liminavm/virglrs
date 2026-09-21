@@ -37,6 +37,14 @@ pub trait FenceSink: Send {
 
     /// A fence on the legacy global path has retired.
     fn global_fence(&mut self, fence: ClientFenceId);
+
+    /// A present fence has retired: the work behind a flushed resource's contents has finished on
+    /// the host, and the frame parked on it may be shown.
+    ///
+    /// It carries no context and no ring because it has neither. This is a fence the *VMM* asked
+    /// for about a resource, not one the guest created on a stream, and the ring it used to be
+    /// smuggled in on was a number reserved by convention in the guest's own index space.
+    fn present_fence(&mut self, fence: FenceId);
 }
 
 enum Job {
@@ -44,6 +52,8 @@ enum Job {
     Context(ContextId, RingIdx, FenceId),
     /// A legacy global fence: retires through `global_fence` with the client's own id.
     Global(ClientFenceId),
+    /// A present fence: retires through `present_fence` with the cookie the VMM parked on.
+    Present(FenceId),
     Stop,
 }
 
@@ -98,6 +108,10 @@ impl Retirement {
         push(&self.inner.q, Job::Global(fence));
     }
 
+    pub fn retire_present(&self, fence: FenceId) {
+        push(&self.inner.q, Job::Present(fence));
+    }
+
     /// A handle for another thread to retire through.
     ///
     /// The classic fence waiter holds one: it decides *when* a fence has been answered, and this
@@ -123,6 +137,10 @@ impl Handle {
 
     pub fn retire_global(&self, fence: ClientFenceId) {
         push(&self.inner.q, Job::Global(fence));
+    }
+
+    pub fn retire_present(&self, fence: FenceId) {
+        push(&self.inner.q, Job::Present(fence));
     }
 }
 
@@ -164,6 +182,7 @@ fn run(mut sink: Box<dyn FenceSink>, q: Arc<(Mutex<Queue>, Condvar)>) {
                     format!("context ctx={ctx:?} ring={ring:?} id={}", fence.0)
                 }
                 Job::Global(id) => format!("global id={}", id.0),
+                Job::Present(id) => format!("present id={}", id.0),
                 Job::Stop => "stop".to_string(),
             };
             eprintln!("[virglrs] fence: delivering {what} to the VMM");
@@ -171,6 +190,7 @@ fn run(mut sink: Box<dyn FenceSink>, q: Arc<(Mutex<Queue>, Condvar)>) {
         match job {
             Job::Context(ctx, ring, fence) => sink.context_fence(ctx, ring, fence),
             Job::Global(id) => sink.global_fence(id),
+            Job::Present(id) => sink.present_fence(id),
             Job::Stop => {
                 m.lock().expect("the fence queue lock is never held across a panic").stopped = true;
                 return;
@@ -191,6 +211,8 @@ mod tests {
         fn context_fence(&mut self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
             let _ = self.0.send((ctx.get(), ring.0, fence.0));
         }
+
+        fn present_fence(&mut self, _: FenceId) {}
 
         fn global_fence(&mut self, fence: ClientFenceId) {
             let _ = self.0.send((0, 0, fence.0 as u64));

@@ -454,6 +454,35 @@ impl Context {
         }
     }
 
+    /// A wait on every running ring having decoded everything the guest has written to it so far.
+    ///
+    /// This is phase one of a present fence, and it is the phase that has nothing to do with the
+    /// GPU. A `RESOURCE_FLUSH` arrives on the virtio-gpu thread, but the commands that drew the
+    /// frame travel by a different road -- the shared-memory ring -- and may not have been read
+    /// yet. Fencing a queue before they are read would fence work that has not been submitted,
+    /// and the fence would signal immediately and mean nothing. An ordinary ring fence needs no
+    /// such phase because it arrives *through* the ring, already behind its own decode.
+    ///
+    /// Each waiter is taken against that ring's current tail, which is exactly what the guest has
+    /// written by now: anything it writes afterwards belongs to a later frame and is not what this
+    /// present is waiting for. Idle rings are skipped -- nothing advances an idle ring's head, so
+    /// waiting on one would be waiting for a number that cannot arrive.
+    ///
+    /// Assembled here under the context lock and waited on after it is released; see
+    /// [`RingWaiter`], which holds nothing of the renderer for that reason.
+    pub fn decode_barrier(&self) -> Vec<RingWaiter> {
+        self.rings
+            .values()
+            .filter_map(|slot| match slot {
+                RingSlot::Running(t) => {
+                    let tail = t.control().tail();
+                    Some(t.waiter(self.id(), tail, self.wait_ring(), self.fatal_flag()))
+                }
+                RingSlot::Idle(_) => None,
+            })
+            .collect()
+    }
+
     /// A share of the place a ring-seqno wait sleeps, for a ring thread that has to wake it.
     ///
     /// One object with many keys, like the poison flag beside it: a ring thread reports a head

@@ -177,6 +177,19 @@ impl fence::FenceSink for VmmFences {
     fn global_fence(&mut self, fence: ClientFenceId) {
         self.0.retire(Retired::Global(fence));
     }
+
+    /// Unreachable, and an assertion rather than a translation on purpose.
+    ///
+    /// A present fence is asked for through [`crate::Renderer::resource_present_fence`], which
+    /// this ABI does not export and has no callback to answer: the VMM that wants one consumes
+    /// the Rust crate directly. Nothing reachable from C can create one, so one retiring here is
+    /// a host invariant broken, not a caller's mistake -- and inventing a ring to deliver it on
+    /// would be the smuggling this entry point exists to replace.
+    fn present_fence(&mut self, fence: FenceId) {
+        unreachable!(
+            "a present fence retired through the C ABI, which cannot create one: {fence:?}"
+        )
+    }
 }
 
 /// The sink the renderer retires through, reachable from `poll` without the renderer lock.

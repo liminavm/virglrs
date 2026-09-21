@@ -51,6 +51,7 @@ const SLICE_NS: u64 = 1_000_000_000;
 enum Retire {
     Context(ContextId, RingIdx, FenceId),
     Global(ClientFenceId),
+    Present(FenceId),
 }
 
 /// What answers a classic fence.
@@ -136,6 +137,11 @@ impl Waiter {
         self.push(Job { fence, retire: Retire::Global(id) });
     }
 
+    /// Queue a present fence to retire once the work behind a flushed surface has run.
+    pub fn retire_present(&self, fence: Answer, id: FenceId) {
+        self.push(Job { fence, retire: Retire::Present(id) });
+    }
+
     fn push(&self, job: Job) {
         let (m, cv) = &*self.q;
         let mut g = m.lock().expect("the waiter queue lock is never held across a panic");
@@ -205,6 +211,7 @@ fn run(
         match job.retire {
             Retire::Context(ctx, ring, id) => sink.retire_context(ctx, ring, id),
             Retire::Global(id) => sink.retire_global(id),
+            Retire::Present(id) => sink.retire_present(id),
         }
     }
 }
@@ -297,6 +304,8 @@ mod tests {
 
     impl crate::fence::FenceSink for Recorder {
         fn context_fence(&mut self, _ctx: ContextId, _ring: RingIdx, _fence: FenceId) {}
+        fn present_fence(&mut self, _: FenceId) {}
+
         fn global_fence(&mut self, fence: ClientFenceId) {
             let _ = self.0.send(fence);
         }

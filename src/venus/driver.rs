@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use super::ring_thread::RingWaiter;
 use crate::ids::{ContextId, FenceId, RingIdx};
 
 use super::cs::{Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
@@ -610,6 +611,38 @@ struct RingQueuesInner {
     bound: Mutex<BTreeMap<RingIdx, RingSync>>,
     /// How many fences this context has actually ordered on a queue. See [`RingQueues::fence`].
     ordered: AtomicU64,
+    /// The thread that answers present fences, made on the first one asked for.
+    ///
+    /// Separate from the per-ring threads because a present is not on a ring: it fences every
+    /// queue this context has, and it must not take its place in one ring's FIFO behind guest
+    /// fences that ring is still waiting out. Nothing observes a present's order against a guest
+    /// fence -- the guest cannot see it at all -- so it needs a queue of its own and no more.
+    present: Mutex<Option<PresentSync>>,
+}
+
+/// The thread that answers present fences, and the channel feeding it.
+struct PresentSync {
+    jobs: Option<std::sync::mpsc::Sender<PresentJob>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    going: Arc<AtomicBool>,
+}
+
+/// One present fence: the decode barrier to clear first, then the id to answer.
+struct PresentJob {
+    id: FenceId,
+    waiters: Vec<RingWaiter>,
+}
+
+impl Drop for PresentSync {
+    fn drop(&mut self) {
+        // Same order and the same reason as [`RingSync`]: the flag frees a thread inside a wait
+        // at the next slice, the sender ends the loop, and what is queued still drains.
+        self.going.store(false, Ordering::Release);
+        self.jobs = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// One ring's queue and the thread that waits its fences out.
@@ -659,6 +692,7 @@ impl RingQueues {
                 retire: Some(retire),
                 bound: Mutex::new(BTreeMap::new()),
                 ordered: AtomicU64::new(0),
+                present: Mutex::new(None),
             }),
         }
     }
@@ -676,6 +710,7 @@ impl RingQueues {
                 retire: None,
                 bound: Mutex::new(BTreeMap::new()),
                 ordered: AtomicU64::new(0),
+                present: Mutex::new(None),
             }),
         }
     }
@@ -783,6 +818,118 @@ impl RingQueues {
         // host that could not order this fence still answers it.
         jobs.send(SyncJob { id, fence }).is_ok()
     }
+
+    /// Order a present fence behind everything this context could have drawn the flushed frame
+    /// with, and retire it when that work has finished on the host.
+    ///
+    /// `waiters` is the decode barrier from [`super::context::Context::decode_barrier`], taken
+    /// while the context was held and waited on here, where nothing is. Both phases run on this
+    /// context's present thread, never on the caller's: the caller is the VMM's virtio-gpu
+    /// thread, and blocking it is the stall the whole parked-present design exists to avoid.
+    ///
+    /// `false` means this context cannot answer the present -- no queue was ever bound to any of
+    /// its rings, so there is nothing to fence -- and the caller shows the frame the old way
+    /// instead of waiting for a fence that would never come.
+    pub fn present_fence(&self, waiters: Vec<RingWaiter>, id: FenceId) -> bool {
+        let Some(retire) = self.inner.retire.clone() else {
+            return false;
+        };
+        // Nothing bound means nothing to fence. Checked before the thread is made, so a context
+        // that never binds a queue never grows one.
+        if self.inner.bound.lock().expect("the ring-queue lock is never poisoned").is_empty() {
+            return false;
+        }
+        let mut slot = self.inner.present.lock().expect("the present lock is never poisoned");
+        let sync = slot.get_or_insert_with(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let going = Arc::new(AtomicBool::new(true));
+            let (inner, g) = (Arc::clone(&self.inner), Arc::clone(&going));
+            let thread = std::thread::Builder::new()
+                .name(format!("virglrs-ctx{}-present", self.inner.ctx.get()))
+                .spawn(move || present_thread(&inner, &retire, &rx, &g))
+                .expect("spawning a context's present thread");
+            eprintln!(
+                "[virglrs] ctx {}: present fences are ordered on this context's queues",
+                self.inner.ctx.get()
+            );
+            PresentSync { jobs: Some(tx), thread: Some(thread), going }
+        });
+        let Some(jobs) = sync.jobs.as_ref() else {
+            return false;
+        };
+        jobs.send(PresentJob { id, waiters }).is_ok()
+    }
+}
+
+/// Answer present fences for one context: clear each one's decode barrier, then fence every queue.
+///
+/// The two phases are not interchangeable and both are load-bearing. A `RESOURCE_FLUSH` reaches
+/// the VMM on the virtio-gpu thread, while the commands that drew the frame are still travelling
+/// through the shared-memory ring -- so without phase one the empty submit below could land on a
+/// queue *ahead* of the frame's own, and signal having waited for nothing. Phase two is then the
+/// same mechanism a ring fence uses: an empty fenced submit is Vulkan's own way to ask when
+/// everything already on a queue has finished.
+///
+/// Every queue the context has, rather than the one that drew: which queue a given resource was
+/// rendered on is not something this renderer is told. Waiting for all of them is broader than
+/// necessary and never wrong.
+fn present_thread(
+    inner: &Arc<RingQueuesInner>,
+    retire: &crate::fence::Handle,
+    jobs: &std::sync::mpsc::Receiver<PresentJob>,
+    going: &AtomicBool,
+) {
+    while let Ok(job) = jobs.recv() {
+        // Phase one. A poisoned context answers `false` and stops the wait; the present still
+        // retires below, because a frame parked on a fence that never comes is a wedged scanout.
+        for w in job.waiters {
+            if !going.load(Ordering::Acquire) {
+                break;
+            }
+            w.wait();
+        }
+        // Phase two. The set is snapshotted rather than held, so a queue bound or forgotten while
+        // this runs does not keep the lock waiting on the GPU.
+        let queues: Vec<Arc<HostQueue>> = {
+            let bound = inner.bound.lock().expect("the ring-queue lock is never poisoned");
+            let mut seen = Vec::new();
+            for s in bound.values() {
+                if !seen.iter().any(|q: &Arc<HostQueue>| q.handle.0 == s.queue.handle.0) {
+                    seen.push(Arc::clone(&s.queue));
+                }
+            }
+            seen
+        };
+        for queue in &queues {
+            if !going.load(Ordering::Acquire) {
+                break;
+            }
+            let Some(fence) = queue.take_fence() else {
+                continue;
+            };
+            let submitted = {
+                let _vk = queue.held();
+                // SAFETY: a queue and a fence this renderer owns, and an empty submit -- Vulkan's
+                // own "signal this fence behind everything already on the queue".
+                unsafe { (queue.fns.vkQueueSubmit())(queue.handle, 0, core::ptr::null(), fence) }
+            };
+            if submitted != VkResult::VK_SUCCESS {
+                eprintln!(
+                    "[virglrs] present fence {}: the queue refused an empty submit \
+                     ({submitted:?}); not waiting on it",
+                    job.id.0
+                );
+                queue.put_fence(fence);
+                continue;
+            }
+            if wait_out(queue, "present", job.id, fence, going) {
+                queue.put_fence(fence);
+            }
+        }
+        // Whatever happened above, the VMM is told: a frame parked on this fence is not shown
+        // until it retires, so losing one costs a scanout that never updates again.
+        retire.retire_present(job.id);
+    }
 }
 
 /// Wait each of a ring's fences out, in the order they were submitted, and retire the guest's.
@@ -800,7 +947,7 @@ fn sync_thread(
 ) {
     while let Ok(job) = jobs.recv() {
         if let Some(fence) = job.fence
-            && wait_out(queue, ring, job.id, fence, going)
+            && wait_out(queue, &format!("ring {}", ring.0), job.id, fence, going)
         {
             queue.put_fence(fence);
         }
@@ -816,7 +963,7 @@ fn sync_thread(
 /// point at which it is certainly no longer in flight.
 fn wait_out(
     queue: &Arc<HostQueue>,
-    ring: RingIdx,
+    what: &str,
     id: FenceId,
     fence: VkFence,
     going: &AtomicBool,
@@ -832,9 +979,9 @@ fn wait_out(
         }
         if r != VkResult::VK_SUCCESS {
             eprintln!(
-                "[virglrs] ring {} fence {}: the device would not wait it out ({r:?}); \
+                "[virglrs] {what} fence {}: the device would not wait it out ({r:?}); \
                  retiring it",
-                ring.0, id.0
+                id.0
             );
         }
         return r == VkResult::VK_SUCCESS;
@@ -843,9 +990,9 @@ fn wait_out(
     // be dropped -- but unordered, and that is worth saying: the guest is about to be told work
     // completed that may not have.
     eprintln!(
-        "[virglrs] ring {} fence {}: stopped while its queue was still working; \
+        "[virglrs] {what} fence {}: stopped while its queue was still working; \
          retiring it unordered",
-        ring.0, id.0
+        id.0
     );
     false
 }
@@ -9825,6 +9972,8 @@ mod tests {
             fn context_fence(&mut self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
                 let _ = self.0.send((ctx.get(), ring.0, fence.0));
             }
+            fn present_fence(&mut self, _: FenceId) {}
+
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
 
@@ -9932,6 +10081,163 @@ mod tests {
         // got before this path existed.
         assert!(!d.ring_queues().fence(RingIdx(RING + 1), FenceId(12)));
         assert_eq!(SUBMITS.load(Ordering::Acquire), 1, "and nothing was submitted for it");
+
+        d.abandon_planted();
+    }
+
+    /// A present fence waits for the queue too, and retires as a present rather than on a ring.
+    ///
+    /// The distinction is the whole point of the entry point: the C asks for this by minting a
+    /// guest ring fence on an index it reserves by convention, so a present arrived at the VMM
+    /// looking exactly like a fence the guest had created. This one carries no ring at all.
+    #[test]
+    fn a_present_fence_retires_as_a_present_once_the_queues_have_finished() {
+        use crate::fence::{FenceSink, Retirement};
+        use crate::ids::{ClientFenceId, RingIdx};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::mpsc::{Sender, channel};
+        use std::time::Duration;
+
+        const DEVICE: u64 = 0xd1;
+        const QUEUE: u64 = 0x91;
+        const FENCE: u64 = 0xf1;
+        const RING: u32 = 2;
+        static SUBMITS: AtomicU32 = AtomicU32::new(0);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+
+        /// Records which *kind* of retirement arrived, so a present retiring as a ring fence
+        /// would fail rather than pass by looking similar.
+        enum Retired {
+            Context(u32, u32, u64),
+            Present(u64),
+        }
+
+        struct Recorder(Sender<Retired>);
+        impl FenceSink for Recorder {
+            fn context_fence(&mut self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
+                let _ = self.0.send(Retired::Context(ctx.get(), ring.0, fence.0));
+            }
+            fn global_fence(&mut self, _: ClientFenceId) {}
+            fn present_fence(&mut self, fence: FenceId) {
+                let _ = self.0.send(Retired::Present(fence.0));
+            }
+        }
+
+        unsafe extern "C" fn get_queue(
+            _d: VkDevice,
+            _i: *const VkDeviceQueueInfo2,
+            out: *mut VkQueue,
+        ) {
+            // SAFETY: the caller passes a pointer to its own live handle.
+            unsafe { *out = VkQueue(QUEUE) };
+        }
+        unsafe extern "C" fn create_fence(
+            _d: VkDevice,
+            _i: *const VkFenceCreateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkFence,
+        ) -> VkResult {
+            // SAFETY: as above.
+            unsafe { *out = VkFence(FENCE) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn submit(
+            _q: VkQueue,
+            count: u32,
+            _p: *const VkSubmitInfo,
+            fence: VkFence,
+        ) -> VkResult {
+            assert_eq!(count, 0, "a present fence is an EMPTY submit, like a ring fence");
+            assert_eq!(fence.0, FENCE, "and it carries the fence the wait is on");
+            SUBMITS.fetch_add(1, Ordering::AcqRel);
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn wait(
+            _d: VkDevice,
+            _c: u32,
+            _p: *const VkFence,
+            _all: VkBool32,
+            _timeout: u64,
+        ) -> VkResult {
+            if RELEASE.load(Ordering::Acquire) {
+                VkResult::VK_SUCCESS
+            } else {
+                VkResult::VK_TIMEOUT
+            }
+        }
+        unsafe extern "C" fn reset(_d: VkDevice, _c: u32, _p: *const VkFence) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_fence(
+            _d: VkDevice,
+            _f: VkFence,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+
+        SUBMITS.store(0, Ordering::Release);
+        RELEASE.store(false, Ordering::Release);
+
+        let (tx, rx) = channel();
+        let retire = Retirement::start(Box::new(Recorder(tx))).handle();
+        let ctx = ContextId::new(7).expect("7 is not zero");
+
+        let mut d = Driver::new(Account::for_test(None));
+        d.attach_ring_queues(RingQueues::new(ctx, retire));
+
+        // Before any queue is bound there is nothing to fence, and the caller is told so rather
+        // than being handed a fence that would never retire and a frame that would never show.
+        assert!(
+            !d.ring_queues().present_fence(Vec::new(), FenceId(20)),
+            "a context with no bound queue cannot answer a present"
+        );
+        assert_eq!(SUBMITS.load(Ordering::Acquire), 0, "and nothing was submitted for it");
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkGetDeviceQueue2(get_queue);
+        fns.plant_vkCreateFence(create_fence);
+        fns.plant_vkQueueSubmit(submit);
+        fns.plant_vkWaitForFences(wait);
+        fns.plant_vkResetFences(reset);
+        fns.plant_vkDestroyFence(destroy_fence);
+        d.plant_device(VkDevice(DEVICE), fns);
+
+        let timeline = VkDeviceQueueTimelineInfoMESA {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA,
+            pNext: core::ptr::null(),
+            ringIdx: RING,
+        };
+        let info = VkDeviceQueueInfo2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
+            pNext: (&raw const timeline).cast(),
+            ..Default::default()
+        };
+        assert_eq!(d.device_queue(VkDevice(DEVICE), &info), Some(VkQueue(QUEUE)));
+
+        // An empty decode barrier: this test is about phase two. Phase one is a wait on ring
+        // threads, which a driver standing on its own has none of.
+        assert!(d.ring_queues().present_fence(Vec::new(), FenceId(21)), "the context has a queue");
+        // Unlike a ring fence, the submit happens on the present thread rather than the caller's:
+        // it must land after the decode barrier, and the caller is the virtio-gpu thread, which
+        // is the one thing this path exists not to block. So it is waited for, not asserted.
+        let began = std::time::Instant::now();
+        while SUBMITS.load(Ordering::Acquire) == 0 && began.elapsed() < Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
+        assert_eq!(SUBMITS.load(Ordering::Acquire), 1, "ordered by an empty submit on the queue");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a present whose queue has not finished must not retire"
+        );
+
+        RELEASE.store(true, Ordering::Release);
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Retired::Present(id)) => assert_eq!(id, 21, "it retires once the queue has"),
+            Ok(Retired::Context(c, r, f)) => {
+                panic!("a present retired as a ring fence: ctx {c} ring {r} id {f}")
+            }
+            Err(e) => panic!("the present never retired: {e}"),
+        }
 
         d.abandon_planted();
     }

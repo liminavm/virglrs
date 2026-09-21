@@ -316,6 +316,26 @@ impl Vkr {
         slot.fences().fence(ring, fence)
     }
 
+    /// Order a present fence behind what this context could have drawn a flushed frame with.
+    ///
+    /// The context lock is taken only to assemble the decode barrier and released before the
+    /// wait: a `RingWaiter` holds nothing of the renderer for exactly this reason, and waiting
+    /// under the lock would block every ring thread on the context whose progress is being
+    /// waited for.
+    ///
+    /// `false` when nothing here can order it -- no such context, or no queue ever bound to any
+    /// of its rings -- and the caller presents the frame the old way.
+    pub fn present_fence(&self, ctx: VenusCtx, fence: FenceId) -> bool {
+        let Some(slot) = self.contexts.get(&ctx.id()) else {
+            return false;
+        };
+        let waiters = {
+            let c = slot.lock().expect("a context lock is never poisoned");
+            c.decode_barrier()
+        };
+        slot.fences().present_fence(waiters, fence)
+    }
+
     /// Tear a context down. Every host handle it still holds dies with it -- a guest that leaks is
     /// not a guest that gets to keep host memory after it is gone.
     pub fn context_destroy(&mut self, ctx: VenusCtx) {
@@ -606,6 +626,8 @@ mod tests {
     struct Nowhere;
     impl crate::fence::FenceSink for Nowhere {
         fn context_fence(&mut self, _: ContextId, _: crate::ids::RingIdx, _: FenceId) {}
+        fn present_fence(&mut self, _: FenceId) {}
+
         fn global_fence(&mut self, _: crate::ids::ClientFenceId) {}
     }
 
