@@ -1380,7 +1380,7 @@ impl Context {
             let slot = state_key(&framed.cmd);
             let wire = framed.wire;
             if let Err(f) = self.run(host, framed.cmd, wire) {
-                if !self.dropped_in_replay(kind, &f) {
+                if !self.dropped_in_replay(host.ctx, kind, &f) {
                     return self.poison(host.ctx, f);
                 }
                 continue;
@@ -1400,7 +1400,7 @@ impl Context {
             let err = host.gl.drain_errors();
             if err != GL_NO_ERROR {
                 let f = Fault::Gl { cmd: kind, error: err, object };
-                if !self.dropped_in_replay(kind, &f) {
+                if !self.dropped_in_replay(host.ctx, kind, &f) {
                     return self.poison(host.ctx, f);
                 }
             }
@@ -1510,12 +1510,27 @@ impl Context {
     }
 
     /// Whether a fault is being dropped rather than poisoning, and count it if so.
-    fn dropped_in_replay(&mut self, cmd: Cmd, f: &Fault) -> bool {
+    fn dropped_in_replay(&mut self, ctx: ContextId, cmd: Cmd, f: &Fault) -> bool {
         let Some(r) = self.replay.as_mut() else { return false };
         // Said once per command kind, not once per drop: a rebuild that loses a thousand binds
-        // to one missing object should not bury the other kinds it lost.
+        // to one missing object should not bury the other kinds it lost. The context and the
+        // journal position are what lets the drop be matched against the live log.
         if !r.dropped.contains_key(cmd.name()) {
-            eprintln!("[virglrs] vrend: replay dropped {}: {f}", cmd.name());
+            let at = r.fed.checked_sub(1).and_then(|i| r.entries.get(i)).map(|e| e.seq);
+            match at {
+                Some(seq) => eprintln!(
+                    "[virglrs] vrend: ctx {} replay dropped {} at seq {seq}: {f}",
+                    ctx.get(),
+                    cmd.name()
+                ),
+                None => {
+                    eprintln!(
+                        "[virglrs] vrend: ctx {} replay dropped {}: {f}",
+                        ctx.get(),
+                        cmd.name()
+                    )
+                }
+            }
         }
         *r.dropped.entry(cmd.name()).or_insert(0) += 1;
         true
