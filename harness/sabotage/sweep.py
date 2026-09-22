@@ -1349,6 +1349,13 @@ SABOTAGES = [
         'binding_a_rasterizer_marks_the_shader_dirty',
     ),
     (
+        'a shader blit leaves the level range it read on its source for the next draw to sample',
+        'src/vrend/blitter.rs',
+        """        restore_tex_param(gl, job.src_gl_target, &prior);""",
+        """        let _ = &prior;""",
+        'a_blit_puts_back_the_level_range_it_confined_its_source_to',
+    ),
+    (
         'a destroyed sampler state shifts the ones after it down without a re-bind',
         'src/vrend/context/units.rs',
         """                self.dirty.mark(slot);

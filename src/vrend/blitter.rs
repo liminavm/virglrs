@@ -1008,6 +1008,88 @@ mod tests {
         near(convert(&mut blitter, 128), [130, 130, 130, 255], "the mid-grey anchor");
     }
 
+    /// A blit out of one level of its source leaves the source's level range as it found it.
+    ///
+    /// The blitter confines its fetch by writing `BASE_LEVEL`/`MAX_LEVEL` on the source texture
+    /// object, and a same-format source is the resource's own texture -- the one a full-range
+    /// sampler view samples, whose bind wrote its range there and is not repeated while the view
+    /// stays bound. The range is set here as that bind sets it, and read back on the renderer's
+    /// context after a blit out of level 1.
+    #[test]
+    fn a_blit_puts_back_the_level_range_it_confined_its_source_to() {
+        use super::super::egl::Flavour;
+
+        let _display = crate::vrend::one_display_at_a_time();
+        const W: u32 = 64;
+
+        let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
+        let version = Version { major: 3, minor: 1 };
+        let ctx = winsys.create_context(version, None).expect("a 3.1 context");
+        winsys.make_current(&ctx).expect("current");
+        let gl = Gl::new(winsys.gles());
+        let features = Features::probe(31, gl.extensions());
+
+        let texture = |levels: GLsizei| {
+            let name = gl.gen_texture();
+            gl.bind_texture(GL_TEXTURE_2D, Some(name));
+            gl.tex_storage_2d(GL_TEXTURE_2D, levels, GL_RGBA8, W as GLsizei, W as GLsizei);
+            name
+        };
+        let src = texture(2);
+        gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 1);
+        let dst = texture(1);
+        gl.bind_texture(GL_TEXTURE_2D, None);
+
+        let mut blitter =
+            Blitter::open(&winsys, &gl, version, &ctx).expect("the blitter's context opens");
+        winsys.make_current(blitter.context()).expect("the blitter's context is current");
+        let rgba = Format::from_wire(67).expect("a format");
+        assert_eq!(rgba.name(), "R8G8B8A8_UNORM");
+        let half = W / 2;
+        let job = Job {
+            src,
+            src_gl_target: GL_TEXTURE_2D,
+            src_target: TextureTarget::Texture2d,
+            src_w: half,
+            src_h: half,
+            src_level: 1,
+            src_samples: 0,
+            src_format: rgba,
+            src_table_swizzle: None,
+            set_srgb_decode: false,
+            filter: TexFilter::Nearest,
+            src_box: (Point { x: 0, y: 0 }, half as i32, half as i32),
+            src_z: 0,
+            src_depth: 1,
+            src_texture_depth: 1,
+            color: true,
+            dst,
+            dst_gl_target: GL_TEXTURE_2D,
+            dst_attachment: GL_COLOR_ATTACHMENT0,
+            dst_target: TextureTarget::Texture2d,
+            dst_w: W,
+            dst_h: W,
+            dst_level: 0,
+            dst_layer: 0,
+            dst_box: (Point { x: 0, y: 0 }, W as i32, W as i32),
+            dst_depth: 1,
+            swizzle: None,
+            manual_srgb_decode: false,
+            manual_srgb_encode: false,
+            framebuffer_srgb: None,
+            scissor: None,
+        };
+        blitter.run(&gl, &features, &mut BoundProgram::default(), &job).expect("the blit runs");
+        gl.finish();
+
+        winsys.make_current(&ctx).expect("current");
+        gl.bind_texture(GL_TEXTURE_2D, Some(src));
+        assert_eq!(gl.get_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL), 0, "base level");
+        assert_eq!(gl.get_tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL), 1, "max level");
+        gl.bind_texture(GL_TEXTURE_2D, None);
+    }
+
     #[test]
     fn an_identity_swizzle_reads_every_channel_where_it_lies() {
         use Swizzle::*;
