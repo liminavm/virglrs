@@ -17,8 +17,16 @@
 //!
 //! **An id is worth nothing after its surface dies.** Ids are recycled immediately, so a stored
 //! one names a stranger's surface as soon as ours is freed, and releasing a stranger's surface
-//! frees storage its owner cannot re-mint. Nothing here stores an id: [`Surface::id`] asks the
-//! live surface every time, and there is no way to name a surface except by holding one.
+//! frees storage its owner cannot re-mint. [`Surface::id`] asks the live surface every time, and
+//! there is no way to name a surface except by holding one. The one table keyed by id is the
+//! registry of published surfaces, and it is safe for the same reason: an entry leaves before its
+//! surface dies.
+//!
+//! **A surface reaches another process by Mach port, not by id.** The embedder installs a
+//! [`Publisher`], and every surface minted under one is created non-global and handed to it as a
+//! [`SurfacePort`]; a global surface can be read by any process on the machine that guesses its
+//! id, which for a guest's screen is a leak. With no publisher installed surfaces are global,
+//! because then an id is the only transport there is.
 //!
 //! Metal is here for one question: the row pitch a linear Metal texture of a given width takes.
 //! The venus scanout path never asks it -- its pitch is the driver's own
@@ -27,9 +35,10 @@
 //! computes its pitch from exactly this alignment. That one Objective-C message lives here and
 //! nowhere else.
 
+use std::collections::BTreeMap;
 use std::ffi::{c_char, c_void};
 use std::ptr::NonNull;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use crate::ids::SurfaceId;
 use crate::surface::PlaneShape;
@@ -55,6 +64,7 @@ const CF_NUMBER_SINT32: CfIndex = 3;
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     static kCFBooleanTrue: CfTypeRef;
+    static kCFBooleanFalse: CfTypeRef;
     static kCFTypeDictionaryKeyCallBacks: CfType;
     static kCFTypeDictionaryValueCallBacks: CfType;
     static kCFTypeArrayCallBacks: CfType;
@@ -94,6 +104,9 @@ unsafe extern "C" {
     static kIOSurfaceAllocSize: CfTypeRef;
 
     fn IOSurfaceCreate(properties: CfTypeRef) -> CfTypeRef;
+    fn IOSurfaceCreateMachPort(surface: CfTypeRef) -> u32;
+    #[cfg(test)]
+    fn IOSurfaceLookupFromMachPort(port: u32) -> CfTypeRef;
     fn IOSurfaceGetID(surface: CfTypeRef) -> u32;
     fn IOSurfaceGetBaseAddress(surface: CfTypeRef) -> *mut c_void;
     fn IOSurfaceGetAllocSize(surface: CfTypeRef) -> usize;
@@ -114,6 +127,13 @@ const LOCK_READ_ONLY: u32 = 1;
 /// `kIOSurfaceLockReadWrite`, the absence of every option. The only writer here is the decode
 /// path putting a picture into a plane; everything else reads.
 const LOCK_READ_WRITE: u32 = 0;
+
+// libSystem: the two Mach calls a surface's send right needs. `mach_task_self` is a macro over
+// this variable in C.
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    fn mach_port_deallocate(task: u32, name: u32) -> i32;
+}
 
 #[link(name = "Metal", kind = "framework")]
 unsafe extern "C" {
@@ -302,6 +322,8 @@ impl PlanarFormat {
 /// surface -- see the module docs on why nothing is cached here, ids least of all.
 pub struct Surface {
     surface: NonNull<CfType>,
+    /// Who it was handed to, if anyone: the one it must be released to.
+    publisher: Option<Arc<dyn Publisher>>,
 }
 
 // SAFETY: an `IOSurfaceRef` is a CoreFoundation object whose accessors are read-only queries of
@@ -341,6 +363,10 @@ impl Surface {
             return Err(SurfaceError::NoPitch);
         }
 
+        // Read once, so the surface is global exactly when it is not handed over.
+        let publisher = publisher();
+        let global = global_for(publisher.as_ref());
+
         // SAFETY: the statics are the framework's exported property keys, and every value is a
         // `CFNumber` this call makes and releases below. `CFDictionaryCreate` copies the array and
         // retains what it holds, so the numbers are ours to release the moment it returns.
@@ -369,11 +395,9 @@ impl Surface {
                 numbers[2].0,
                 numbers[3].0,
                 numbers[4].0,
-                // Global, because a global id is the only way another process can reach this
-                // surface and this crate has no supervisor transport yet. A global surface is
-                // resolvable by any process on the machine, which is a real widening -- it
-                // narrows again when the Mach-port handoff lands, and not before.
-                kCFBooleanTrue,
+                // Global only when there is no publisher to hand it to (or it asked): a global
+                // surface is resolvable by any process on the machine.
+                global,
             ];
             let properties = CFDictionaryCreate(
                 std::ptr::null(),
@@ -394,7 +418,7 @@ impl Surface {
         // SAFETY: `IOSurfaceCreate` returns a +1 reference or null, and `Surface` takes that one
         // reference -- there is no second owner and no second release.
         NonNull::new(surface.cast_mut())
-            .map(|surface| Surface { surface })
+            .map(|surface| Surface { surface, publisher: None }.handed_over(publisher))
             .ok_or(SurfaceError::Refused)
     }
 
@@ -452,6 +476,8 @@ impl Surface {
             .last()
             .and_then(|last| last.offset.checked_add(last.bytes_per_row.checked_mul(last.height)?))
             .ok_or(SurfaceError::NoPitch)?;
+        let publisher = publisher();
+        let global = global_for(publisher.as_ref());
 
         // SAFETY: every object below is one this call creates and owns; each guard releases its
         // own reference on the way out, and the containers retain what they hold, so the guards
@@ -520,8 +546,7 @@ impl Surface {
                 kIOSurfacePlaneInfo,
                 kIOSurfaceIsGlobal,
             ];
-            let values =
-                [numbers[0].0, numbers[1].0, numbers[2].0, numbers[3].0, list.0, kCFBooleanTrue];
+            let values = [numbers[0].0, numbers[1].0, numbers[2].0, numbers[3].0, list.0, global];
             let properties = Cf(CFDictionaryCreate(
                 std::ptr::null(),
                 keys.as_ptr(),
@@ -539,7 +564,7 @@ impl Surface {
         // SAFETY: `IOSurfaceCreate` returns a +1 reference or null, and `Surface` takes that one
         // reference -- there is no second owner and no second release.
         let surface = NonNull::new(surface.cast_mut())
-            .map(|surface| Surface { surface })
+            .map(|surface| Surface { surface, publisher: None })
             .ok_or(SurfaceError::Refused)?;
 
         // What came back has to be what was asked for, plane by plane. A surface the kernel laid
@@ -562,7 +587,7 @@ impl Surface {
                 return Err(SurfaceError::Overridden);
             }
         }
-        Ok(surface)
+        Ok(surface.handed_over(publisher))
     }
 
     /// Copy a decoded plane's rows into one plane of this surface.
@@ -962,8 +987,169 @@ impl Surface {
     }
 }
 
+// ------------------------------------------------------------------ handoff
+
+/// A send right to one surface's Mach port. Owned: dropped unsent, it is deallocated.
+///
+/// This is how a surface reaches another process without a global id. The right is the
+/// capability -- holding it is what lets the receiver look the surface up -- so it travels as a
+/// value that cannot be copied, and whoever ends up with it either sends it on or gives it back.
+pub struct SurfacePort(u32);
+
+impl SurfacePort {
+    /// Give the right up, to be moved into a message or deallocated by the caller.
+    pub fn into_raw(self) -> u32 {
+        let port = self.0;
+        std::mem::forget(self);
+        port
+    }
+
+    /// A right for a surface this thread holds alive, or `None` if the kernel will not make one.
+    ///
+    /// # Safety
+    /// `surface` must be a live IOSurface for the length of the call.
+    unsafe fn of(surface: CfTypeRef) -> Option<SurfacePort> {
+        // SAFETY: the caller keeps the surface alive; the call returns a send right we own, or
+        // `MACH_PORT_NULL`.
+        let port = unsafe { IOSurfaceCreateMachPort(surface) };
+        (port != 0).then_some(SurfacePort(port))
+    }
+
+    /// Whether this right names the surface `id` -- the receiver's half, done in-process.
+    #[cfg(test)]
+    fn resolves_to(&self, id: u32) -> bool {
+        // SAFETY: the lookup returns a +1 reference or null, released before returning; the
+        // right itself is only borrowed.
+        unsafe {
+            let found = IOSurfaceLookupFromMachPort(self.0);
+            if found.is_null() {
+                return false;
+            }
+            let same = IOSurfaceGetID(found) == id;
+            CFRelease(found);
+            same
+        }
+    }
+}
+
+impl Drop for SurfacePort {
+    fn drop(&mut self) {
+        // SAFETY: the one send right this value owns, deallocated once, in our own task.
+        unsafe { mach_port_deallocate(mach_task_self_, self.0) };
+    }
+}
+
+/// Where minted surfaces go when another process has to present them.
+///
+/// The embedder's to install, because the crate knows how to make a surface reachable and not
+/// who should reach it: on limina the answer is a supervisor's Mach receiver, found by a name
+/// the crate has no business knowing. Without one, surfaces are minted global, which leaves any
+/// process on the machine able to read them by guessing ids -- tolerable for a harness, not for
+/// a guest's screen.
+pub trait Publisher: Send + Sync {
+    /// Hand over `port` for the surface `id`. Called when a surface is minted, and again from
+    /// [`republish`] when the receiver has let go of it and asks for it back.
+    fn publish(&self, id: u32, port: SurfacePort);
+
+    /// The surface `id` is about to die. Called while it is still alive, so the id cannot yet
+    /// name anything else -- the receiver would otherwise drop a stranger that inherited it.
+    fn release(&self, id: u32);
+
+    /// Also mark surfaces global. A debug widening for an oracle that reads surfaces by id from
+    /// another process; the handover happens either way.
+    fn also_global(&self) -> bool {
+        false
+    }
+}
+
+static PUBLISHER: RwLock<Option<Arc<dyn Publisher>>> = RwLock::new(None);
+
+/// Install the publisher every surface minted from now on is handed to, or take it out.
+///
+/// Surfaces already minted keep the publisher they were minted under, so each one is released
+/// to whoever it was published to.
+pub fn set_publisher(publisher: Option<Arc<dyn Publisher>>) {
+    *PUBLISHER.write().unwrap_or_else(|e| e.into_inner()) = publisher;
+}
+
+fn publisher() -> Option<Arc<dyn Publisher>> {
+    PUBLISHER.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// A published surface, as the registry holds it: the address it can be reached at while it is
+/// alive, and the publisher it answers to.
+struct Published {
+    surface: usize,
+    publisher: Arc<dyn Publisher>,
+}
+
+/// Every published surface that is still alive, by id -- the one place this module keeps an id,
+/// and safe for one reason: an entry leaves in [`Surface::drop`], under this lock, before the
+/// surface's reference is released. No entry can outlive the surface it names, so no id here can
+/// have been recycled. The receiver needs it: a surface it evicted cannot be looked up again from
+/// its side, and asking by id is the only way it can get one back.
+static PUBLISHED: Mutex<BTreeMap<u32, Published>> = Mutex::new(BTreeMap::new());
+
+fn published() -> MutexGuard<'static, BTreeMap<u32, Published>> {
+    PUBLISHED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Hand the surface `id` to its publisher again. `false` if no live published surface has it.
+pub fn republish(id: u32) -> bool {
+    let published = published();
+    let Some(entry) = published.get(&id) else {
+        return false;
+    };
+    // SAFETY: the entry is only removed under this lock, before the surface is released, so the
+    // surface is alive for as long as the lock is held.
+    let Some(port) = (unsafe { SurfacePort::of(entry.surface as CfTypeRef) }) else {
+        return false;
+    };
+    entry.publisher.publish(id, port);
+    true
+}
+
+/// `kIOSurfaceIsGlobal`'s value for a surface about to be minted under `publisher`.
+fn global_for(publisher: Option<&Arc<dyn Publisher>>) -> CfTypeRef {
+    let global = publisher.is_none_or(|p| p.also_global());
+    // SAFETY: two framework constants, read.
+    unsafe { if global { kCFBooleanTrue } else { kCFBooleanFalse } }
+}
+
+impl Surface {
+    /// Hand a freshly minted surface over to the publisher it was minted under, if any.
+    ///
+    /// Last, after every check a mint makes: a surface refused for its layout is never published,
+    /// so the receiver is never told about one that will not be used.
+    fn handed_over(mut self, publisher: Option<Arc<dyn Publisher>>) -> Surface {
+        self.publisher = publisher;
+        let surface = self;
+        if let Some(publisher) = &surface.publisher {
+            let id = surface.id().0;
+            let mut published = published();
+            published.insert(
+                id,
+                Published { surface: surface.as_ref() as usize, publisher: publisher.clone() },
+            );
+            // SAFETY: the surface is ours and alive.
+            match unsafe { SurfacePort::of(surface.as_ref()) } {
+                Some(port) => publisher.publish(id, port),
+                None => eprintln!(
+                    "[virglrs] metal: no Mach port for surface {id}; it cannot be presented"
+                ),
+            }
+        }
+        surface
+    }
+}
+
 impl Drop for Surface {
     fn drop(&mut self) {
+        if let Some(publisher) = &self.publisher {
+            let id = self.id().0;
+            published().remove(&id);
+            publisher.release(id);
+        }
         // SAFETY: the one reference `scanout` took, released once. `self` is gone after this, so
         // nothing can reach the surface through it again.
         unsafe { CFRelease(self.as_ref()) };
@@ -1244,6 +1430,135 @@ mod tests {
 
         drop(surface);
         assert!(!looks_up(id), "and cannot the moment we let go");
+    }
+
+    /// Whether a *different* process can reach `id`. A surface is always resolvable by the
+    /// process holding it, global or not, so hiding is only observable from outside: this
+    /// re-runs the test binary as [`stranger_role`] to ask.
+    fn a_stranger_finds(id: SurfaceId) -> bool {
+        let exe = std::env::current_exe().expect("the test binary");
+        std::process::Command::new(exe)
+            .args(["--exact", "metal::tests::stranger_role"])
+            .env("VIRGLRS_STRANGER_LOOKS_UP", id.0.to_string())
+            .status()
+            .expect("a stranger process")
+            .success()
+    }
+
+    /// The stranger: exits 0 if it finds the surface it was asked about, 1 if not. A normal run
+    /// has nothing to ask and passes.
+    #[test]
+    fn stranger_role() {
+        let Ok(id) = std::env::var("VIRGLRS_STRANGER_LOOKS_UP") else {
+            return;
+        };
+        let id = SurfaceId(id.parse().expect("an id"));
+        std::process::exit(i32::from(!looks_up(id)));
+    }
+
+    /// What a test publisher was told, in order. Other tests mint concurrently without the mint
+    /// lock and are published too, so every assertion filters by the id it minted.
+    #[derive(Default)]
+    struct Recorder {
+        events: std::sync::Mutex<Vec<(&'static str, u32, bool)>>,
+        also_global: bool,
+    }
+
+    impl Publisher for Recorder {
+        fn publish(&self, id: u32, port: SurfacePort) {
+            // The right has to name the surface it was minted for, or the supervisor would
+            // present a stranger's pixels under this id.
+            let names_it = port.resolves_to(id);
+            self.events.lock().unwrap().push(("publish", id, names_it));
+        }
+
+        fn release(&self, id: u32) {
+            // Sent while the surface is alive -- the ordering that keeps a recycled id from
+            // releasing someone else's surface on the supervisor's side.
+            self.events.lock().unwrap().push(("release", id, looks_up(SurfaceId(id))));
+        }
+
+        fn also_global(&self) -> bool {
+            self.also_global
+        }
+    }
+
+    impl Recorder {
+        fn about(&self, id: SurfaceId) -> Vec<(&'static str, bool)> {
+            let events = self.events.lock().unwrap();
+            events.iter().filter(|e| e.1 == id.0).map(|e| (e.0, e.2)).collect()
+        }
+    }
+
+    /// Installed for the length of one test, and taken out again however the test ends.
+    struct Installed;
+
+    impl Installed {
+        fn new(recorder: &std::sync::Arc<Recorder>) -> Installed {
+            set_publisher(Some(recorder.clone()));
+            Installed
+        }
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            set_publisher(None);
+        }
+    }
+
+    /// With somewhere to hand them, surfaces are not global: another process cannot find the
+    /// guest's screen by guessing ids, and the one it is meant for gets a right to it instead.
+    #[test]
+    fn a_published_surface_is_handed_over_not_exposed() {
+        let _mint = MINT.lock().expect("the mint lock is never poisoned");
+        let recorder = std::sync::Arc::new(Recorder::default());
+        let _installed = Installed::new(&recorder);
+
+        let surface = Surface::scanout(64, 32, PixelFormat::Bgra, 64 * 4).expect("minted");
+        let id = surface.id();
+        assert!(!a_stranger_finds(id), "no stranger can reach it by id");
+        assert_eq!(recorder.about(id), [("publish", true)], "the publisher got a right to it");
+
+        assert!(republish(id.0), "and can ask for it again while it lives");
+        assert_eq!(recorder.about(id).len(), 2);
+
+        drop(surface);
+        let events = recorder.about(id);
+        assert_eq!(events.len(), 3, "released exactly once");
+        assert_eq!(events[2].0, "release");
+        assert!(!republish(id.0), "and never handed over again");
+    }
+
+    /// The planar path mints its own surfaces and has to follow the same rule.
+    #[test]
+    fn a_published_planar_surface_is_handed_over_not_exposed() {
+        let _mint = MINT.lock().expect("the mint lock is never poisoned");
+        let recorder = std::sync::Arc::new(Recorder::default());
+        let _installed = Installed::new(&recorder);
+
+        let surface = Surface::planar(64, 32, PlanarFormat::BiPlanar420).expect("minted");
+        let id = surface.id();
+        assert!(!a_stranger_finds(id), "no stranger can reach it by id");
+        assert_eq!(recorder.about(id), [("publish", true)]);
+    }
+
+    /// The debug oracle reads surfaces by id from another process, so it can ask for them to be
+    /// global as well -- in addition to being handed over, not instead.
+    #[test]
+    fn a_publisher_can_ask_for_global_surfaces_as_well() {
+        let _mint = MINT.lock().expect("the mint lock is never poisoned");
+        let recorder = std::sync::Arc::new(Recorder { also_global: true, ..Default::default() });
+        let _installed = Installed::new(&recorder);
+
+        let surface = Surface::scanout(64, 32, PixelFormat::Bgra, 64 * 4).expect("minted");
+        let id = surface.id();
+        assert!(a_stranger_finds(id), "global for the oracle");
+        assert_eq!(recorder.about(id), [("publish", true)], "and handed over all the same");
+
+        // A global surface is the one kind whose aliveness a lookup can witness, so this is
+        // where the ordering is checked: the release goes out while the id still names it.
+        drop(surface);
+        assert_eq!(recorder.about(id)[1..], [("release", true)], "released before it died");
     }
 
     /// The pitch is the caller's, because the importer's layout is the caller's. A surface that

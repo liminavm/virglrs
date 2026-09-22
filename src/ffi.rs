@@ -1472,8 +1472,17 @@ pub extern "C" fn virgl_renderer_resource_sync_iosurface(res_handle: u32) -> c_i
     with(EINVAL, |r| if r.resource_sync_surface(handle) { 0 } else { EINVAL })
 }
 
+/// Hand a published surface to its publisher again, after the receiver let go of it. `-EINVAL`
+/// when no live published surface has the id -- including every surface minted with no publisher
+/// installed, which is global and needs no handing over.
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_republish_iosurface(_iosurface_id: u32) -> c_int {
+pub extern "C" fn virgl_renderer_republish_iosurface(iosurface_id: u32) -> c_int {
+    #[cfg(target_os = "macos")]
+    if crate::metal::republish(iosurface_id) {
+        return 0;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = iosurface_id;
     EINVAL
 }
 
