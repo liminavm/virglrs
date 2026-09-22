@@ -10,6 +10,7 @@
 //! ends the loop.
 
 use bumpalo::Bump;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,10 +29,11 @@ use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{COMMAND_TYPES, Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkDeviceSize,
-    VkFence, VkFlags, VkMemoryHeapFlagBits, VkMemoryResourceAllocationSizePropertiesMESA,
-    VkObjectType, VkPhysicalDevice, VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkResult,
-    VkRingCreateInfoMESA, VkRingMonitorInfoMESA, VkSemaphore, vn_command_vkAllocateCommandBuffers,
+    VkClearRect, VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDevice, VkDeviceMemory,
+    VkDeviceSize, VkFence, VkFlags, VkMemoryHeapFlagBits,
+    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType, VkPhysicalDevice,
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkResult, VkRingCreateInfoMESA,
+    VkRingMonitorInfoMESA, VkSemaphore, vn_command_vkAllocateCommandBuffers,
     vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
     vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
     vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginQuery,
@@ -2329,6 +2331,22 @@ fn cap_api_version(version: u32) -> u32 {
 /// whether the name agrees with the first rather than refused for being a repeat.
 fn handed_back(ty: VkObjectType) -> bool {
     ty == VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE || ty == VkObjectType::VK_OBJECT_TYPE_QUEUE
+}
+
+/// Whether a clear rect covers something inside a render area, by the rules the C renderer
+/// applied (`vkr_dispatch_vkCmdClearAttachments`): a width, a height and a layer, a non-negative
+/// offset, and an end no further than `i32::MAX`. The end is summed in `i64`, where a guest's
+/// `u32` extent cannot wrap it back into range.
+fn clear_rect_is_sound(r: &VkClearRect) -> bool {
+    let (offset, extent) = (r.rect.offset, r.rect.extent);
+    let ends_in_range = |start: i32, len: u32| {
+        start >= 0 && i64::from(start) + i64::from(len) <= i64::from(i32::MAX)
+    };
+    extent.width != 0
+        && extent.height != 0
+        && r.layerCount != 0
+        && ends_in_range(offset.x, extent.width)
+        && ends_in_range(offset.y, extent.height)
 }
 
 impl Commands for Handlers<'_> {
@@ -5003,11 +5021,21 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkCmdClearAttachments(&mut self, args: &mut vn_command_vkCmdClearAttachments<'_>) {
-        // Two counts over two arrays, cleared as a product. Either being empty clears nothing,
-        // which is legal and is the guest's business rather than a violation.
+        // Two counts over two arrays, cleared as a product. A rect that is empty, starts at a
+        // negative offset or ends past `i32::MAX` is invalid usage that clears nothing:
+        //   VUID-vkCmdClearAttachments-rect-02682, VUID-vkCmdClearAttachments-rect-02683,
+        // and a rect must lie inside the render area. The host driver's clear path takes it on
+        // trust, though: the offset wraps in its unsigned rect maths and trips an assert that
+        // aborts the worker. Such rects are dropped here rather than rejected, as the C renderer
+        // drops them; what survives is all the driver sees.
         let attachments = args.pAttachments();
-        let rects = args.pRects();
-        let done = self.driver.cmd_clear_attachments(args.commandBuffer, attachments, rects);
+        let all = args.pRects();
+        let rects: Cow<'_, [VkClearRect]> = if all.iter().all(clear_rect_is_sound) {
+            Cow::Borrowed(all)
+        } else {
+            Cow::Owned(all.iter().copied().filter(clear_rect_is_sound).collect())
+        };
+        let done = self.driver.cmd_clear_attachments(args.commandBuffer, attachments, &rects);
         self.recorded(done);
     }
 
@@ -15713,8 +15741,12 @@ mod tests {
 
         // Two arrays under two counts. Unequal on purpose: both counts are `u32` and the
         // pointers differ only in type, so passing one where the other belongs compiles.
+        // The rects cover something: an empty one is dropped before the driver sees it.
         let attachments = [VkClearAttachment::default(); 2];
-        let rects = [VkClearRect::default(); 3];
+        let mut rect = VkClearRect { layerCount: 1, ..Default::default() };
+        rect.rect.extent.width = 1;
+        rect.rect.extent.height = 1;
+        let rects = [rect; 3];
         let mut args = vn_command_vkCmdClearAttachments::default();
         args.commandBuffer = cb;
         args.plant_pAttachments(&attachments);
@@ -15747,6 +15779,140 @@ mod tests {
         h.vkCmdPushConstants(&mut args);
         assert!(h.reject.is_some(), "a count with no blob behind it stops the ring");
         SAW.with_borrow(|s| assert_eq!(s.pushed.len(), 1, "and pushes nothing"));
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// A clear rect the guest could not legally send never reaches the host driver, and a clear
+    /// left with no rects is not recorded at all.
+    ///
+    /// An empty rect clears nothing, and one with a negative offset or an end past `i32::MAX`
+    /// lies outside any render area, but the host driver's clear path does not expect either:
+    /// the signed offset wraps in its unsigned rect maths and the result trips its asserts,
+    /// which abort the worker.
+    #[test]
+    fn a_clear_hands_the_driver_only_the_rects_it_can_clear() {
+        use super::super::proto::types::{
+            VkClearAttachment, VkClearRect, VkCommandBuffer, VkCommandPool, VkDevice,
+            vn_command_vkCmdClearAttachments,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // (x, y, width, height, layerCount) of every rect of every call, in order.
+        type Rect = (i32, i32, u32, u32, u32);
+        thread_local! {
+            static CALLS: RefCell<Vec<Vec<Rect>>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn clear_attachments(
+            _cb: VkCommandBuffer,
+            _attachments: u32,
+            _pa: *const VkClearAttachment,
+            count: u32,
+            p: *const VkClearRect,
+        ) {
+            // SAFETY: the wrapper passes a slice's own pointer and length for the rects.
+            let rects = unsafe { core::slice::from_raw_parts(p, count as usize) };
+            let seen = rects
+                .iter()
+                .map(|r| {
+                    let (o, e) = (r.rect.offset, r.rect.extent);
+                    (o.x, o.y, e.width, e.height, r.layerCount)
+                })
+                .collect();
+            CALLS.with_borrow_mut(|c| c.push(seen));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdClearAttachments(clear_attachments);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkCommandPool(POOL),
+            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            in_flight: BTreeMap::new(),
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let rect = |(x, y, width, height, layers): Rect| {
+            let mut r = VkClearRect { layerCount: layers, ..Default::default() };
+            r.rect.offset.x = x;
+            r.rect.offset.y = y;
+            r.rect.extent.width = width;
+            r.rect.extent.height = height;
+            r
+        };
+        let attachments = [VkClearAttachment::default()];
+        let clear = |h: &mut Handlers<'_>, rects: &[Rect]| {
+            let rects: Vec<VkClearRect> = rects.iter().copied().map(rect).collect();
+            let mut args = vn_command_vkCmdClearAttachments::default();
+            args.commandBuffer = VkCommandBuffer(CB.0);
+            args.plant_pAttachments(&attachments);
+            args.plant_pRects(&rects);
+            h.vkCmdClearAttachments(&mut args);
+        };
+
+        // Two sound rects around every way of being unsound, the last reaching the far edge
+        // exactly: `i32::MAX` is still inside, one past it is not.
+        let first = (0, 0, 16, 16, 1);
+        let last = (i32::MAX - 4, 8, 4, 2, 2);
+        clear(
+            &mut h,
+            &[
+                first,
+                (0, 0, 0, 16, 1),
+                (0, 0, 16, 0, 1),
+                (0, 0, 16, 16, 0),
+                (-1, 0, 16, 16, 1),
+                (0, i32::MIN, 16, 16, 1),
+                (i32::MAX - 3, 0, 4, 1, 1),
+                (0, 1, 1, u32::MAX, 1),
+                last,
+            ],
+        );
+        assert!(h.reject.is_none(), "an unsound rect is dropped, not a violation");
+        CALLS.with_borrow(|c| {
+            assert_eq!(c.as_slice(), [vec![first, last]], "only the sound rects, in order");
+        });
+
+        // Nothing left to clear: a zero-rect call is itself invalid, so none is made.
+        clear(&mut h, &[(0, 0, 0, 0, 0), (-8, -8, 4, 4, 1)]);
+        assert!(h.reject.is_none(), "nothing to clear is not a violation either");
+        CALLS.with_borrow(|c| assert_eq!(c.len(), 1, "and the driver is not called"));
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();

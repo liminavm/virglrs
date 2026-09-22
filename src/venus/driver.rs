@@ -4335,7 +4335,9 @@ impl Driver {
     /// `vkCmdClearAttachments`, whose two arrays are counted separately and mean different things.
     ///
     /// Every attachment is cleared over every rect, so the two are a product, not a pair: neither
-    /// count governs the other and neither may be derived from the other.
+    /// count governs the other and neither may be derived from the other. Either being empty
+    /// clears nothing, and a zero count is itself invalid usage, so no call is made -- but the
+    /// command buffer is still resolved, and one this context does not have still answers `None`.
     pub fn cmd_clear_attachments(
         &self,
         cb: VkCommandBuffer,
@@ -4343,6 +4345,9 @@ impl Driver {
         rects: &[VkClearRect],
     ) -> Option<()> {
         let d = self.recorder(cb)?;
+        if attachments.is_empty() || rects.is_empty() {
+            return Some(());
+        }
         // SAFETY: as above; each count is its own slice's length.
         unsafe {
             (d.vkCmdClearAttachments())(
