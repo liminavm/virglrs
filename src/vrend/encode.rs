@@ -4,9 +4,11 @@
 //! The classic wire, written. The inverse of [`decode`](super::decode): a [`Command`] back to the
 //! dwords the guest's encoder (`virgl_encode.c` in mesa) produces for it, bit for bit.
 //!
-//! Nothing in the renderer sends classic commands; this exists for the differential gate -- a
+//! Nothing in the renderer sends classic commands. This exists for the differential gate -- a
 //! recorded stream decoded and re-encoded must reproduce itself, which proves every field was
-//! read from where it lives -- and for tests, which build their wire with it rather than by hand.
+//! read from where it lives -- for tests, which build their wire with it rather than by hand, and
+//! for the journal, which writes the sampler units' bindings as the commands that rebuild them
+//! (`Units::rebuild`) instead of keeping the last ones the guest sent.
 
 use super::proto::*;
 use crate::ids::ResourceHandle;

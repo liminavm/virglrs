@@ -22,6 +22,8 @@
 //! a sub-context's latest-wins state goes with the sub-context, and a blob-defining resource
 //! create goes with the resource.
 
+use std::borrow::Cow;
+
 use super::pipe::ShaderStage;
 use super::proto::{Cmd, Command};
 
@@ -133,12 +135,6 @@ pub fn state_key(cmd: &Command<'_>) -> Option<StateKey> {
         // Per stage.
         Command::BindShader { stage, .. } => (Cmd::BindShader, (stage.index() as u32, 0)),
         // Per stage and the first slot the set writes.
-        Command::BindSamplerStates { stage, start_slot, .. } => {
-            (Cmd::BindSamplerStates, stage_slot(stage, start_slot))
-        }
-        Command::SetSamplerViews { stage, start_slot, .. } => {
-            (Cmd::SetSamplerViews, stage_slot(stage, start_slot))
-        }
         Command::SetConstantBuffer { stage, index, .. } => {
             (Cmd::SetConstantBuffer, stage_slot(stage, index))
         }
@@ -177,6 +173,13 @@ pub fn state_key(cmd: &Command<'_>) -> Option<StateKey> {
         // added to the protocol fell into it and was never retained, and nothing said so until a
         // restored context died on the state it had lost. Now the build refuses the new variant
         // until someone answers the question for it.
+
+        // State, but not kept as the command that set it: the sampler units are rebuilt from what
+        // they hold when the journal is written (`Context::journal`). A view or a sampler state
+        // destroyed while bound leaves its slot live, and its handle free for the guest's next
+        // create, so the last command sent names objects the units no longer hold -- replayed, it
+        // binds nothing past the dead view and binds a reused handle into a slot that was empty.
+        Command::SetSamplerViews { .. } | Command::BindSamplerStates { .. } => return None,
 
         // Work, not state: the client re-issues these every frame, so a rebuild that starts with
         // none of them is a rebuild that is simply between frames.
@@ -293,8 +296,9 @@ impl std::fmt::Display for Census {
 pub enum Step<'a> {
     /// Make this sub-context. Sub-context 0 is never emitted -- a fresh context has it.
     CreateSub(u32),
-    /// Feed these dwords with that sub-context current.
-    Feed { sub: u32, chunks: &'a [Vec<u32>] },
+    /// Feed these dwords with that sub-context current. Borrowed from what the context retained,
+    /// or owned when the export writes the command itself.
+    Feed { sub: u32, chunks: Cow<'a, [Vec<u32>]> },
 }
 
 /// One entry of a context's export, before it is written out.
@@ -418,7 +422,7 @@ mod tests {
     use super::*;
 
     fn feed(seq: u64, sub: u32, chunks: &[Vec<u32>]) -> Entry<'_> {
-        Entry { seq: Seq(seq), step: Step::Feed { sub, chunks } }
+        Entry { seq: Seq(seq), step: Step::Feed { sub, chunks: Cow::Borrowed(chunks) } }
     }
 
     /// `reuse` is an allocation optimization and nothing else: whatever it leaves behind must be

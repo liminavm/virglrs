@@ -7,7 +7,7 @@
 //! `proto` is the protocol as types, `decode` the boundary that parses the guest's dwords into
 //! them and refuses the rest, `encode` the way back -- which exists so that a recorded stream
 //! decoded and re-encoded is a differential test against the guest's own encoder, with no C dump
-//! to diff against. `pipe` is gallium's vocabulary, the enums those types are made of.
+//! to diff against, and so the journal can write the sampler units' bindings as commands. `pipe` is gallium's vocabulary, the enums those types are made of.
 //!
 //! `formats` is what each format *is* (gallium's description, which every transfer size comes
 //! from) and what GL calls it. `tgsi` is the shader language the guest sends, as typed tokens.

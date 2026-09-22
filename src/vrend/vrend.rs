@@ -1702,4 +1702,139 @@ mod tests {
         );
         v.context_destroy(ctx, &NoGuest);
     }
+
+    /// A sampler view or sampler state destroyed while bound leaves its slot live, and its handle
+    /// is free for the guest's next create. A rebuild must bind what the slots hold, not what the
+    /// last command named: replaying the command binds nothing past the dead view, and binds a
+    /// reused handle into a slot that was empty.
+    #[test]
+    fn a_rebuild_binds_what_the_units_hold_not_what_was_last_sent() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::pipe::{
+            CompareFunc, MipFilter, ShaderStage, Swizzle, TexFilter, TexWrap,
+        };
+        use crate::vrend::proto::{Command, Object, ObjectType, SamplerState, SamplerView};
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        /// Every resource reachable from every context, as a VMM that attached them would say.
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+        )
+        .expect("vrend comes up");
+        let bgra = super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM");
+        let res = ResourceHandle::new(1).expect("a resource handle is non-zero");
+        v.resource_create(
+            res,
+            resource::Args {
+                target: TextureTarget::Texture2d,
+                format: bgra,
+                bind: resource::Bind(1 << 3),
+                width: 16,
+                height: 16,
+                depth: 1,
+                array_size: 1,
+                last_level: 0,
+                nr_samples: 0,
+                flags: resource::ResourceFlags(0),
+            },
+        )
+        .expect("a texture");
+        let o = |n: u32| crate::vrend::proto::ObjectHandle::new(n).expect("non-zero");
+        let view = |swizzle| {
+            Object::SamplerView(SamplerView {
+                resource: res,
+                format: bgra,
+                target: TextureTarget::Texture2d,
+                first_element_or_layers: 0,
+                last_element_or_levels: 0,
+                swizzle,
+            })
+        };
+        let state = |wrap| {
+            Object::SamplerState(SamplerState {
+                wrap_s: wrap,
+                wrap_t: wrap,
+                wrap_r: wrap,
+                min_img_filter: TexFilter::Linear,
+                min_mip_filter: MipFilter::None,
+                mag_img_filter: TexFilter::Linear,
+                compare_mode: false,
+                compare_func: CompareFunc::LessEqual,
+                seamless_cube_map: false,
+                max_anisotropy: 0,
+                lod_bias: 0.0,
+                min_lod: 0.0,
+                max_lod: 0.0,
+                border_color: [0; 4],
+            })
+        };
+        let rgba = [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W];
+        let stage = ShaderStage::Fragment;
+        let mut wire = Vec::new();
+        for c in [
+            Command::CreateObject { handle: o(5), object: view(rgba) },
+            Command::CreateObject { handle: o(6), object: view(rgba) },
+            Command::SetSamplerViews { stage, start_slot: 0, views: vec![Some(o(5)), Some(o(6))] },
+            Command::CreateObject { handle: o(7), object: state(TexWrap::Repeat) },
+            Command::CreateObject { handle: o(8), object: state(TexWrap::ClampToEdge) },
+            Command::BindSamplerStates {
+                stage,
+                start_slot: 0,
+                states: vec![Some(o(7)), Some(o(8))],
+            },
+            // Destroyed while bound, then the handles reused for objects nothing binds.
+            Command::DestroyObject { kind: ObjectType::SamplerView, handle: o(5) },
+            Command::DestroyObject { kind: ObjectType::SamplerState, handle: o(7) },
+            Command::CreateObject {
+                handle: o(5),
+                object: view([Swizzle::Z, Swizzle::Y, Swizzle::X, Swizzle::W]),
+            },
+            Command::CreateObject { handle: o(7), object: state(TexWrap::MirrorRepeat) },
+        ] {
+            encode(&c, &mut wire);
+        }
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &AllAttached).expect("a context");
+        v.submit(ctx, &wire, &AllAttached).expect("the context is here").expect("accepted");
+        let live = v.contexts[&ctx.id()].bound_units(stage);
+        assert_eq!(
+            live,
+            (vec![(1, o(6))], vec![(0, o(8))]),
+            "the dead view left its slot; the dead state's slot closed up"
+        );
+
+        let journal = v.journal_export(ctx).expect("a live context exports its journal");
+        v.context_destroy(ctx, &AllAttached);
+        v.context_create(ctx, &AllAttached).expect("a fresh context to rebuild");
+        assert!(v.replay_begin(ctx));
+        v.journal_restore(ctx, &journal).expect("the journal is taken");
+        v.replay_upto(ctx, &AllAttached, Seq(u64::MAX)).expect("and fed");
+        let dropped = v.contexts.get_mut(&ctx.id()).expect("the context").replay_end();
+        assert_eq!(dropped, 0, "a rebuild of what the context holds drops nothing");
+        assert_eq!(v.contexts[&ctx.id()].bound_units(stage), live, "and binds what it held");
+        v.context_destroy(ctx, &AllAttached);
+    }
 }

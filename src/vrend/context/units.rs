@@ -25,6 +25,9 @@ pub struct Units {
     views: BTreeMap<u32, ObjectHandle>,
     samplers: BTreeMap<u32, ObjectHandle>,
     dirty: Dirty<MAX_SAMPLERS>,
+    /// When a set or a bind last changed this stage's units: where a rebuild of them sits in
+    /// the journal. Every object they hold was created before it, because a set is how it got in.
+    touched: Seq,
 }
 
 impl Units {
@@ -36,6 +39,42 @@ impl Units {
     /// Every view set, in slot order, the ones above the units included.
     pub fn views(&self) -> impl Iterator<Item = (u32, ObjectHandle)> + '_ {
         self.views.iter().map(|(s, h)| (*s, *h))
+    }
+
+    /// Record that a set or a bind changed these units at `seq`.
+    pub fn stamp(&mut self, seq: Seq) {
+        self.touched = seq;
+    }
+
+    /// When a set or a bind last changed these units.
+    pub fn touched(&self) -> Seq {
+        self.touched
+    }
+
+    /// The commands that rebuild these units as they stand: every view slot from 0 up to the
+    /// highest one held, and every sampler slot likewise, empty slots as `None`. `None` for units
+    /// that hold nothing, which a fresh context already has.
+    pub fn rebuild(&self, stage: ShaderStage) -> Option<Vec<u32>> {
+        let table = |m: &BTreeMap<u32, ObjectHandle>| -> Vec<Option<ObjectHandle>> {
+            let n = m.keys().next_back().map_or(0, |s| s + 1);
+            (0..n).map(|s| m.get(&s).copied()).collect()
+        };
+        let mut wire = Vec::new();
+        if !self.views.is_empty() {
+            let views = table(&self.views);
+            encode::encode(&Command::SetSamplerViews { stage, start_slot: 0, views }, &mut wire);
+        }
+        if !self.samplers.is_empty() {
+            let states = table(&self.samplers);
+            encode::encode(&Command::BindSamplerStates { stage, start_slot: 0, states }, &mut wire);
+        }
+        (!wire.is_empty()).then_some(wire)
+    }
+
+    /// Every sampler state bound, in slot order.
+    #[cfg(test)]
+    pub fn samplers(&self) -> impl Iterator<Item = (u32, ObjectHandle)> + '_ {
+        self.samplers.iter().map(|(s, h)| (*s, *h))
     }
 
     /// The sampler state in `slot`, if one is bound.

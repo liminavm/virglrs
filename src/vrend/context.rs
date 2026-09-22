@@ -39,11 +39,12 @@ use super::proto::{self, *};
 use super::resource::{self, Limits, Resource, Storage, Texture, ViewKey};
 use super::tally::TransferDoor;
 use super::transfer::{self, Info};
-use super::{debug, shader, tgsi, video};
+use super::{debug, encode, shader, tgsi, video};
 use crate::decode;
 use crate::guest_mem::{HostSpan, Iov, PixelSource};
 use crate::ids::BlobId;
 use crate::ids::{ContextId, ResourceHandle};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -582,6 +583,10 @@ struct Replay {
     /// What could not be used, by command name. See [`Context::replay_end`].
     dropped: BTreeMap<&'static str, u64>,
 }
+
+/// Slot and handle, in slot order: what a stage's units hold.
+#[cfg(test)]
+pub type Bindings = Vec<(u32, ObjectHandle)>;
 
 /// A journal was handed to, or fed through, a context that is not being rebuilt. The VMM's
 /// mistake, never a guest's: only the replay ABI reaches either.
@@ -1378,6 +1383,13 @@ impl Context {
             // Read before the command is consumed, recorded only if it ran: the journal holds
             // what this context accepted, never what it refused.
             let slot = state_key(&framed.cmd);
+            // The sampler units are rebuilt from what they hold rather than retained as a command
+            // (see `state_key`), so what is recorded for them is only when they changed.
+            let units = match &framed.cmd {
+                Command::SetSamplerViews { stage, .. }
+                | Command::BindSamplerStates { stage, .. } => Some(*stage),
+                _ => None,
+            };
             let wire = framed.wire;
             if let Err(f) = self.run(host, framed.cmd, wire) {
                 if !self.dropped_in_replay(host.ctx, kind, &f) {
@@ -1394,6 +1406,10 @@ impl Context {
                     .entry(slot)
                     .and_modify(|at| at.reuse(seq, wire))
                     .or_insert_with(|| Retained::new(seq, wire));
+            }
+            if let Some(stage) = units {
+                let seq = self.seq.advance();
+                self.sub_mut().units[stage.index()].stamp(seq);
             }
             self.fill_composites(host);
             // `vrend_check_no_error`: any GL error a command left is the context's error.
@@ -1483,16 +1499,18 @@ impl Context {
     /// The report is a worklist, not a footnote. Every dropped command is either something that
     /// genuinely cannot be rebuilt, or a gap in what the recorder kept -- and the two look
     /// identical from here, so the only way to tell them apart is to name them and go and look.
-    pub fn replay_end(&mut self) {
-        let Some(r) = self.replay.take() else { return };
+    ///
+    /// Returns how many commands were dropped.
+    pub fn replay_end(&mut self) -> u64 {
+        let Some(r) = self.replay.take() else { return 0 };
         let left = r.entries.len().saturating_sub(r.fed);
         if left > 0 {
             eprintln!("[virglrs] vrend: replay ended with {left} entries never fed");
         }
-        if r.dropped.is_empty() {
-            return;
-        }
         let total: u64 = r.dropped.values().sum();
+        if total == 0 {
+            return 0;
+        }
         eprintln!(
             "[virglrs] vrend: replay could not use {total} of {} retained commands:",
             r.entries.len()
@@ -1500,6 +1518,14 @@ impl Context {
         for (cmd, n) in &r.dropped {
             eprintln!("[virglrs]   {n:>6}  {cmd}");
         }
+        total
+    }
+
+    /// The current sub-context's view and sampler-state bindings for `stage`, in slot order.
+    #[cfg(test)]
+    pub fn bound_units(&self, stage: ShaderStage) -> (Bindings, Bindings) {
+        let u = &self.sub().units[stage.index()];
+        (u.views().collect(), u.samplers().collect())
     }
 
     /// Count a drop that has already been reported by name.
@@ -1546,6 +1572,11 @@ impl Context {
             for at in sub.state.values() {
                 c.add(at, false);
             }
+            for (i, u) in sub.units.iter().enumerate() {
+                if let Some(wire) = ShaderStage::from_wire(i as u32).and_then(|s| u.rebuild(s)) {
+                    c.add_wire(wire.len(), false);
+                }
+            }
         }
         for at in self.video.retained() {
             c.add(at, true);
@@ -1566,13 +1597,20 @@ impl Context {
                 .then_some(Entry { seq: sub.created_at, step: Step::CreateSub(id.0) });
             let objects = sub.objects.retained().map(move |at| Entry {
                 seq: at.seq,
-                step: Step::Feed { sub: id.0, chunks: &at.chunks },
+                step: Step::Feed { sub: id.0, chunks: Cow::Borrowed(&at.chunks) },
             });
             let state = sub.state.values().map(move |at| Entry {
                 seq: at.seq,
-                step: Step::Feed { sub: id.0, chunks: &at.chunks },
+                step: Step::Feed { sub: id.0, chunks: Cow::Borrowed(&at.chunks) },
             });
-            create.into_iter().chain(objects).chain(state)
+            let units = sub.units.iter().enumerate().filter_map(move |(i, u)| {
+                let wire = u.rebuild(ShaderStage::from_wire(i as u32)?)?;
+                Some(Entry {
+                    seq: u.touched(),
+                    step: Step::Feed { sub: id.0, chunks: Cow::Owned(vec![wire]) },
+                })
+            });
+            create.into_iter().chain(objects).chain(state).chain(units)
         });
         // Codecs and decode targets belong to the context, not to a sub-context, so they are fed
         // on whichever one is current -- any of them will do. Without them a restored context is
@@ -1580,7 +1618,7 @@ impl Context {
         // command the guest was never told to stop sending.
         let video = self.video.retained().map(|at| Entry {
             seq: at.seq,
-            step: Step::Feed { sub: self.subs.id().0, chunks: &at.chunks },
+            step: Step::Feed { sub: self.subs.id().0, chunks: Cow::Borrowed(&at.chunks) },
         });
         // A resource's type is not a sub-context's business -- it is filed under the one the
         // command arrived on, which is the current one at that point in the order anyway.
@@ -1589,7 +1627,10 @@ impl Context {
         // recorded command, which start at one.
         let types = typed.map(|wire| Entry {
             seq: Seq::default(),
-            step: Step::Feed { sub: self.subs.id().0, chunks: std::slice::from_ref(wire) },
+            step: Step::Feed {
+                sub: self.subs.id().0,
+                chunks: Cow::Borrowed(std::slice::from_ref(wire)),
+            },
         });
         order(subs.chain(video).chain(types))
     }
