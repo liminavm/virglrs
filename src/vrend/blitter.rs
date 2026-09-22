@@ -221,28 +221,54 @@ pub struct Job {
 }
 
 /// `vrend_set_tex_param`, which sets on the source *texture object* what a sampler object cannot
-/// carry: the format's stored swizzle, and the level range the fetch is confined to.
-fn set_tex_param(gl: &Gl, job: &Job) {
+/// carry: the format's stored swizzle, and the level range the fetch is confined to. Returns what
+/// each parameter held before, for [`restore_tex_param`].
+///
+/// The object is often not the blitter's to change. A blit whose source format is the resource's
+/// samples the resource's own texture, and so does every sampler view with the identity swizzle
+/// and the full level range -- whose bind wrote its range there, and is skipped when the same view
+/// is set into the same slot again. Left behind, the blit's `BASE_LEVEL`/`MAX_LEVEL` confine the
+/// next draw through such a view to the level the blit read. So every parameter is read before it
+/// is written, from the one list that writes it, and nothing written here can be missed on the way
+/// back.
+fn set_tex_param(gl: &Gl, job: &Job) -> Vec<(GLenum, GLint)> {
     let t = job.src_gl_target;
+    let mut params = Vec::with_capacity(12);
     if let Some(sw) = job.src_table_swizzle {
         for (i, s) in sw.iter().enumerate() {
-            gl.tex_parameter_i(t, GL_TEXTURE_SWIZZLE_R + i as GLenum, gl_swizzle(*s));
+            params.push((GL_TEXTURE_SWIZZLE_R + i as GLenum, gl_swizzle(*s)));
         }
     }
     if job.set_srgb_decode && job.src_samples < 1 {
-        gl.tex_parameter_i(t, GL_TEXTURE_SRGB_DECODE_EXT, GL_DECODE_EXT as GLint);
+        params.push((GL_TEXTURE_SRGB_DECODE_EXT, GL_DECODE_EXT as GLint));
     }
     if job.src_samples < 1 {
         for wrap in [GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R] {
-            gl.tex_parameter_i(t, wrap, GL_CLAMP_TO_EDGE as GLint);
+            params.push((wrap, GL_CLAMP_TO_EDGE as GLint));
         }
     }
-    gl.tex_parameter_i(t, GL_TEXTURE_BASE_LEVEL, job.src_level as GLint);
-    gl.tex_parameter_i(t, GL_TEXTURE_MAX_LEVEL, job.src_level as GLint);
+    params.push((GL_TEXTURE_BASE_LEVEL, job.src_level as GLint));
+    params.push((GL_TEXTURE_MAX_LEVEL, job.src_level as GLint));
     if job.src_samples < 1 {
         let f = if job.filter == TexFilter::Nearest { GL_NEAREST } else { GL_LINEAR } as GLint;
-        gl.tex_parameter_i(t, GL_TEXTURE_MAG_FILTER, f);
-        gl.tex_parameter_i(t, GL_TEXTURE_MIN_FILTER, f);
+        params.push((GL_TEXTURE_MAG_FILTER, f));
+        params.push((GL_TEXTURE_MIN_FILTER, f));
+    }
+    params
+        .into_iter()
+        .map(|(name, value)| {
+            let prior = gl.get_tex_parameter_i(t, name);
+            gl.tex_parameter_i(t, name, value);
+            (name, prior)
+        })
+        .collect()
+}
+
+/// Put back what [`set_tex_param`] found on the source texture, in the reverse of the order it was
+/// written, with the source still bound.
+fn restore_tex_param(gl: &Gl, target: GLenum, prior: &[(GLenum, GLint)]) {
+    for (name, value) in prior.iter().rev() {
+        gl.tex_parameter_i(target, *name, *value);
     }
 }
 
@@ -339,7 +365,7 @@ impl Blitter {
         gl.bind_framebuffer(GL_FRAMEBUFFER, Some(self.fbo));
         gl.draw_buffers(&[GL_COLOR_ATTACHMENT0]);
         gl.bind_texture(job.src_gl_target, Some(job.src));
-        set_tex_param(gl, job);
+        let prior = set_tex_param(gl, job);
         set_vertex_param(gl, prog);
         // `set_dsa_write_depth_keep_stencil`: the quad must not be depth-tested away by whatever
         // the destination happens to carry.
@@ -366,6 +392,8 @@ impl Blitter {
         gl.viewport(0, 0, job.dst_w as GLsizei, job.dst_h as GLsizei);
         let normalized = job.src_gl_target != GL_TEXTURE_RECTANGLE && job.src_samples < 1;
         let mut vertices = [0f32; FLOATS_PER_VERTEX * VERTICES];
+        // Not `?`: a refused attachment still owes the source its parameters back.
+        let mut outcome = Ok(());
         for dst_z in 0..job.dst_depth {
             // The layer sampled for this destination slice, at the middle of the source's share
             // of it -- what the C's dst2src_scale and dst_offset compute.
@@ -380,7 +408,7 @@ impl Blitter {
                 }
                 _ => dst_z,
             };
-            transfer::attach_texture(
+            if let Err(feature) = transfer::attach_texture(
                 gl,
                 features,
                 job.dst_gl_target,
@@ -388,8 +416,10 @@ impl Blitter {
                 job.dst_attachment,
                 job.dst_level as GLint,
                 Some(layer),
-            )
-            .map_err(Unserved::NoFeature)?;
+            ) {
+                outcome = Err(Unserved::NoFeature(feature));
+                break;
+            }
             let coord = texcoords(normalized, job.src_w, job.src_h, src0, src1);
             let pos = quad_positions(job.dst_w, job.dst_h, dst0, dst1);
             let tex = quad_texcoords(coord);
@@ -420,8 +450,10 @@ impl Blitter {
         gl.use_program(bound, None);
         gl.framebuffer_texture_2d(GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, None, 0);
         gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, None, 0);
+        gl.bind_texture(job.src_gl_target, Some(job.src));
+        restore_tex_param(gl, job.src_gl_target, &prior);
         gl.bind_texture(job.src_gl_target, None);
-        Ok(())
+        outcome
     }
 
     /// `vrend_renderer_convert_planes_gl`: a composite target's two planes into its base texture.

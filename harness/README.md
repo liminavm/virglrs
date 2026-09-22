@@ -654,17 +654,21 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   hashes exactly like a correct pair, whereas a draw naming its layer in a texture coordinate
   shares nothing with the blitter's attachment path. Every layer the corpus does not blit into
   carries its own fill, so a stray blit is visible from the untouched end too.
-  **`sampled.score` is the one fixture pinned from virglrs and not from the C.** Its last three
-  lines draw twice through one sampler view with a blit between, and the two implementations
-  disagree: virglrs returns the same pixels both times, the C's second read comes back
-  byte-identical to the blit's destination — the blitter's own texture parameters, reaching a draw
-  that never asked for them. Two identical draws with nothing between them have one correct
-  answer, so the C is the wrong golden here; reproducing its bug to keep a fixture green is not a
-  trade worth making, and a permanently red line is a gate nobody reads. The deviation is in
-  `docs/design.md`; every other line of this fixture, and every other fixture in the tree,
-  is still pinned from the C. **A bulk re-record overwrites that line with the C's answer**, and
-  it is one line in a fixture nobody rereads, so restore it deliberately afterwards -- the value
-  to restore is the one `res=52` carries, because the whole point is that the two reads agree.
+  **`sampled.score` is the one fixture with lines pinned from virglrs and not from the C.** Two
+  of its cases draw twice through one sampler view with a blit out of that view's texture
+  between, and the two implementations disagree on both. virglrs returns the same pixels both
+  times. The C's second read comes back as the blitter's own texture parameters, reaching a draw
+  that never asked for them: through a swizzled view (`res=52`/`res=53`) it is byte-identical to
+  the blit's destination; through a full-range identity view of a two-level texture after a blit
+  out of level 1 (`res=72`/`res=73`) it is level 1, hashing equal to the control `res=74` that
+  samples level 1 alone. Two identical draws with nothing between them have one correct answer,
+  so the C is the wrong golden here; reproducing its bug to keep a fixture green is not a trade
+  worth making, and a permanently red line is a gate nobody reads. The deviation is in
+  `docs/design.md`; every other line of this fixture, and every other fixture in the tree, is
+  still pinned from the C. **A bulk re-record overwrites both lines with the C's answer**, and
+  they are two lines in a fixture nobody rereads, so restore them deliberately afterwards -- the
+  values to restore are the ones `res=52` and `res=72` carry, because the whole point is that the
+  two reads agree.
   The last two lines are the depth-writing blit, which takes the blitter's other fragment
   shader — `gl_FragDepth` instead of a colour, and the depth attachment instead of colour
   attachment 0. Two disagreeing depth formats force it off `glBlitFramebuffer`, and the Z mask

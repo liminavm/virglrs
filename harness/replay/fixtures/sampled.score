@@ -1,4 +1,4 @@
-loop 0 created 21 failed 0 unrefs 10 submits 1 cmds 104 xfers 0 copy-fed 0 copy-unmatched 0 submit-errors 0 iosurface-backed 0
+loop 0 created 29 failed 0 unrefs 14 submits 1 cmds 141 xfers 0 copy-fed 0 copy-unmatched 0 submit-errors 0 iosurface-backed 0
 probe transfer-of-unknown-resource answered=22
 res=30 64x64 hash=72df905637076c83 ink=4096/4096
 res=32 64x64 hash=9805c840cc497003 ink=4096/4096
@@ -8,5 +8,9 @@ res=42 64x64 hash=cca7ee3ae0939803 ink=4096/4096
 res=51 64x64 hash=b737e95d5f6c0083 ink=4096/4096
 res=52 64x64 hash=cbb616ac51ba6d03 ink=4096/4096
 res=53 64x64 hash=cbb616ac51ba6d03 ink=4096/4096
+res=71 64x64 hash=5f493df2d6526583 ink=4096/4096
+res=72 64x64 hash=e1e0347d2a090b03 ink=4096/4096
+res=73 64x64 hash=e1e0347d2a090b03 ink=4096/4096
+res=74 64x64 hash=007f1569ddb88883 ink=4096/4096
 res=62 64x64 hash=d39e19f744fdb33b ink=4096/4096
 res=63 64x64 hash=d39e19f744fdb33b ink=4096/4096

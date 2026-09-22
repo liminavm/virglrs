@@ -865,16 +865,20 @@ to have it, each because reproducing the C would mean reproducing a defect.
 - **A blit leaves nothing on its source that a later draw can read.** `vrend_set_tex_param` writes
   the base and max level, the filters, the wrap modes and the format swizzle onto the *source
   texture object*, and the sampler-view bind skips its work when the same view handle is set into
-  the same slot again — so on the reading, a draw after a blit samples through the blitter's
-  settings. Measured, it does not: `sampled.score` draws twice through one view with a blit
-  between, and virglrs returns the same pixels both times while the C's second read comes back
-  byte-identical to the blit's destination, carrying the identity swizzle and the forced alpha
-  `vrend_set_tex_param` wrote. Two identical draws with no state change between them have only one
-  correct answer, so the C is wrong here and this is the one fixture in the tree pinned from
-  virglrs rather than from the C — reproducing the bug to keep a golden green is not a trade worth
-  making, and a permanently red line is a gate nobody reads. What shields virglrs is not
-  established; the fixture pins the invariant, so a driver or a cache change that lets the write
-  through moves the score.
+  the same slot again — so in the C, a draw after a blit samples through the blitter's settings.
+  `sampled.score` draws twice through one view with a blit between, twice over, and the C's second
+  read comes back as the blitter's settings both times: through a swizzled view it is
+  byte-identical to the blit's destination, carrying the identity swizzle and the forced alpha,
+  and through a full-range identity view of a mipmapped texture it is the level the blit read.
+  virglrs returns the same pixels both times in both cases. Two things shield it. A view whose
+  swizzle is not the identity samples a GL object of its own (`create_sampler_view`), so the
+  blitter's writes never reach it. A full-range identity view has no such object and samples the
+  resource's texture, so the blitter reads every parameter it writes before writing it and puts
+  each back after the blit (`set_tex_param`/`restore_tex_param` in `vrend/blitter.rs`), from the
+  one list that writes them. Two identical draws with no state change between them have only one
+  correct answer, so the C is wrong here and these lines of that fixture are pinned from virglrs
+  rather than from the C — reproducing the bug to keep a golden green is not a trade worth making,
+  and a permanently red line is a gate nobody reads.
 
 ## Open, and owed a decision
 

@@ -23,7 +23,8 @@ import sys, zlib
 
 from corpus import (Corpus, cmd0, f32, BIND_DEPTH_STENCIL, BIND_RENDER_TARGET, BIND_SAMPLER_VIEW,
                     BIND_VERTEX_BUFFER, PIPE_MASK_Z,
-                    B8G8R8A8_UNORM, B8G8R8X8_UNORM, R32G32B32A32_FLOAT,
+                    B8G8R8A8_UNORM, B8G8R8X8_UNORM, R8G8B8A8_UNORM, R8G8B8X8_UNORM,
+                    R32G32B32A32_FLOAT,
                     Z32_FLOAT, Z24X8_UNORM,
                     OBJ_BLEND, OBJ_DSA, OBJ_RASTERIZER, OBJ_SAMPLER_VIEW, OBJ_SURFACE,
                     OBJ_VERTEX_ELEMENTS,
@@ -193,34 +194,47 @@ def build():
     # The blitter samples its source through the source's OWN texture object, and writes that
     # object's swizzle, base and max level, filters and wrap modes to suit itself. The sampler
     # view bind is cached on the view handle, so re-binding the identical view after a blit
-    # re-applies none of them. On the reading, the next draw samples through the blitter's
-    # settings. Two draws through one view, identical in every respect, with a blit between:
-    # what the second reads settles it.
+    # re-applies none of them. Two draws through one view, identical in every respect, with a
+    # blit between: what the second reads settles it.
     #
-    # The two implementations disagree, and the C is the one that is wrong. virglrs reads the
-    # same pixels twice, which is the only answer two identical draws with nothing between them
-    # can have. The C's second read comes back byte-identical to the blit's DESTINATION --
-    # identity swizzle, alpha forced to one, exactly what `vrend_set_tex_param` wrote -- so the
-    # blitter's settings reached a draw that never asked for them.
+    # The C's second read comes back byte-identical to the blit's DESTINATION -- identity
+    # swizzle, alpha forced to one, exactly what `vrend_set_tex_param` wrote -- so the blitter's
+    # settings reach a draw that never asked for them. virglrs reads the same pixels twice, which
+    # is the only answer two identical draws with nothing between them can have. So this is one
+    # of the lines in the tree whose golden is not the C; the deviation is in `docs/design.md`.
     #
-    # So this is the one fixture in the tree whose golden is not the C: pinning the C here would
-    # mean reproducing a bug in code already written correctly, and a permanently red line is a
-    # gate nobody reads. The deviation is in `docs/design.md`.
-    #
-    # The observable has to be the SWIZZLE, which is a finding and not a preference. A view that
-    # restricts levels is backed by a GL texture view carrying its own parameters, so the
-    # blitter's writes land on the parent and no draw through that view could see them whatever
-    # happened. Filters and wrap are no better: those come from the bound sampler object, which
-    # overrides the texture's. Only the swizzle is a parameter both ends write on the same
-    # object, and only a full-range view has no view object in between.
-    #
-    # What shields virglrs is not established, and these lines do not depend on it. They pin the
-    # invariant, so if a driver or a change to the view cache ever lets the write through, the
-    # score moves and says so.
+    # Two things shield the draw, and each case here isolates one. This one is swizzled, and a
+    # view whose swizzle is not the identity gets a GL object of its own, so the blitter's
+    # writes land on an object the draw never samples. The level-range case below has no such
+    # object, and what shields it is the blitter putting back every parameter it wrote. Filters
+    # and wrap are not observable either way: those come from the bound sampler object, which
+    # overrides the texture's.
     SAMP_SRC = 50
     SAMP_BLIT_DST = 51
     SAMP_READ_BEFORE, SAMP_READ_AFTER = 52, 53
     SAMP_VIEW_SWIZZLE = (SWIZZLE_Z, SWIZZLE_Y, SWIZZLE_X, SWIZZLE_W)   # red and blue swapped
+
+    # --- what a blit out of a lower level leaves on its source ---
+    # The blitter confines its fetch to the level it reads by setting the source texture
+    # object's base and max level. A full-range view with the identity swizzle has no object of
+    # its own -- it samples the resource's texture, and its bind is what writes the level range
+    # there -- so the blit's range reaches the next draw through a view that is still bound.
+    # With a sampler that does not mip, the draw reads the base level, which the blit left at
+    # the level it read.
+    #
+    # The source is an A-format, whose table swizzle is the identity, so the view needs no private
+    # object; an X-format's alpha-to-one would give it one and shield it. The blitter is forced
+    # from the destination's end instead, by its X-twin, and the blit is scaled to keep it off
+    # the copy path, which takes an A -> X pair of equal extents.
+    #
+    # The two reads through the one view must agree, and virglrs, which puts back every
+    # parameter the blitter wrote, is the golden. The C's second read is level 1. The third line
+    # reads level 1 on purpose, through a view of that level alone, so an AFTER that has picked up
+    # the blit's level range hashes equal to it rather than merely differing from BEFORE.
+    LVL_SRC = 70
+    LVL_BLIT_DST = 71
+    LVL_READ_BEFORE, LVL_READ_AFTER, LVL_READ_LEVEL1 = 72, 73, 74
+    LVL_SIDE1 = SIDE // 2
 
     # --- the depth-writing blit ---
     # A blit whose destination is depth takes the blitter's OTHER fragment shader, which writes
@@ -247,6 +261,11 @@ def build():
     c.create(SAMP_BLIT_DST, B8G8R8A8_UNORM, tex, SIDE)
     c.create(SAMP_READ_BEFORE, B8G8R8A8_UNORM, tex, SIDE)
     c.create(SAMP_READ_AFTER, B8G8R8A8_UNORM, tex, SIDE)
+    c.create(LVL_SRC, R8G8B8A8_UNORM, tex, SIDE, levels=1)
+    c.create(LVL_BLIT_DST, R8G8B8X8_UNORM, tex, SIDE)
+    c.create(LVL_READ_BEFORE, B8G8R8A8_UNORM, tex, SIDE)
+    c.create(LVL_READ_AFTER, B8G8R8A8_UNORM, tex, SIDE)
+    c.create(LVL_READ_LEVEL1, B8G8R8A8_UNORM, tex, SIDE)
     c.create(DEPTH_SRC, Z24X8_UNORM, BIND_DEPTH_STENCIL | BIND_SAMPLER_VIEW, SIDE)
     c.create(DEPTH_DST, Z32_FLOAT, BIND_DEPTH_STENCIL | BIND_SAMPLER_VIEW, SIDE)
     c.create(DEPTH_READ_SRC, B8G8R8A8_UNORM, tex, SIDE)
@@ -262,6 +281,9 @@ def build():
     for slice_ in range(SLICES):
         c.inline_write(VOL_SRC, pattern(20 + slice_, SIDE, SIDE), SIDE, SIDE, SIDE * 4, z=slice_)
     c.inline_write(SAMP_SRC, pattern(30, SIDE, SIDE), SIDE, SIDE, SIDE * 4)
+    c.inline_write(LVL_SRC, pattern(40, SIDE, SIDE), SIDE, SIDE, SIDE * 4)
+    c.inline_write(LVL_SRC, pattern(41, LVL_SIDE1, LVL_SIDE1), LVL_SIDE1, LVL_SIDE1,
+                   LVL_SIDE1 * 4, level=1)
     c.inline_write(DEPTH_SRC, depth_pattern(SIDE, SIDE), SIDE, SIDE, SIDE * 4)
 
     c.blit(ARR_SRC, B8G8R8X8_UNORM, (0, 0, 0, SIDE, SIDE, 1),
@@ -288,6 +310,14 @@ def build():
            SAMP_BLIT_DST, B8G8R8A8_UNORM, (0, 0, 0, SIDE, SIDE, 1))
     rig.sample(samp_view, TARGET_2D, 0, SAMP_READ_AFTER, B8G8R8A8_UNORM, SIDE)
 
+    lvl_view = rig.view(LVL_SRC, R8G8B8A8_UNORM, TARGET_2D, last_level=1)
+    rig.sample(lvl_view, TARGET_2D, 0, LVL_READ_BEFORE, B8G8R8A8_UNORM, SIDE)
+    c.blit(LVL_SRC, R8G8B8A8_UNORM, (0, 0, 0, LVL_SIDE1, LVL_SIDE1, 1),
+           LVL_BLIT_DST, R8G8B8X8_UNORM, (0, 0, 0, SIDE, SIDE, 1), src_level=1)
+    rig.sample(lvl_view, TARGET_2D, 0, LVL_READ_AFTER, B8G8R8A8_UNORM, SIDE)
+    rig.sample(rig.view(LVL_SRC, R8G8B8A8_UNORM, TARGET_2D, first_level=1, last_level=1),
+               TARGET_2D, 0, LVL_READ_LEVEL1, B8G8R8A8_UNORM, SIDE)
+
     c.blit(DEPTH_SRC, Z24X8_UNORM, (0, 0, 0, SIDE, SIDE, 1),
            DEPTH_DST, Z32_FLOAT, (0, 0, 0, SIDE, SIDE, 1), mask=PIPE_MASK_Z)
     rig.sample(rig.view(DEPTH_SRC, Z24X8_UNORM, TARGET_2D), TARGET_2D, 0,
@@ -300,6 +330,7 @@ def build():
     # The sweep reads each scored offscreen AT its unref, so everything it scores is unref'd.
     for h in (ARR_SRC, ARR_READ_2, ARR_READ_0, VOL_READ_5, VOL_READ_1,
               SAMP_BLIT_DST, SAMP_READ_BEFORE, SAMP_READ_AFTER,
+              LVL_BLIT_DST, LVL_READ_BEFORE, LVL_READ_AFTER, LVL_READ_LEVEL1,
               DEPTH_READ_SRC, DEPTH_READ_DST):
         c.unref(h)
     c.submit()
