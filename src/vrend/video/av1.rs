@@ -759,6 +759,31 @@ pub fn test_descriptor(width: u16, height: u16) -> Vec<u8> {
     blob
 }
 
+/// A test descriptor for one frame of a stream: key or inter, shown or hidden, super-resolution
+/// or not, against the guest reference map `ref_map`.
+#[cfg(test)]
+pub fn test_frame(
+    key: bool,
+    show: bool,
+    superres: bool,
+    ref_map: [u32; NUM_REF_FRAMES],
+) -> Vec<u8> {
+    let mut blob = test_descriptor(640, 360);
+    let mut set = |f: Bits, v: u32| {
+        let mut word = u32::from_le_bytes(blob[f.at..][..4].try_into().expect("four bytes"));
+        word |= v << f.shift;
+        blob[f.at..][..4].copy_from_slice(&word.to_le_bytes());
+    };
+    set(at::PIC_FRAME_TYPE, if key { u32::from(FRAME_KEY) } else { u32::from(FRAME_INTER) });
+    set(at::PIC_SHOW_FRAME, u32::from(show));
+    set(at::PIC_USE_SUPERRES, u32::from(superres));
+    blob[at::SUPERRES_SCALE_DENOMINATOR] = if superres { 16 } else { 0 };
+    for (i, surface) in ref_map.iter().enumerate() {
+        blob[at::REF + 4 * i..][..4].copy_from_slice(&surface.to_le_bytes());
+    }
+    blob
+}
+
 impl FrameDesc {
     /// Whether this frame re-seeds every reference slot.
     ///

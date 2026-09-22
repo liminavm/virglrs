@@ -598,6 +598,17 @@ impl Shape {
         }
     }
 
+    /// Whether this host is known to hand back this frame's picture wrong.
+    ///
+    /// An AV1 super-resolution frame: VideoToolbox reconstructs it correctly -- frames that
+    /// predict from it come back bit-exact -- but the picture it returns is a coded-width buffer
+    /// holding roughly the rightmost coded-width columns of the upscaled image. Keyed on the
+    /// stream's own flag rather than on the width that comes back, so a host whose bug changes
+    /// shape is still caught.
+    fn misreturned(&self) -> bool {
+        matches!(self, Shape::Av1 { desc, .. } if desc.use_superres)
+    }
+
     /// The extent the decoded picture is expected to come back at.
     fn extent(&self) -> (u32, u32) {
         match self {
@@ -774,22 +785,93 @@ pub struct Codec {
     session: Option<Session>,
 }
 
-impl Codec {
+/// What becomes of the picture a submitted unit decodes to.
+///
+/// Decided once, from the frame's shape and its target, by [`Delivery::of`], and handed to the
+/// decoder whole. The decode itself never varies with it -- only what happens to the picture after.
+#[derive(Clone, Copy)]
+enum Delivery<'a> {
+    /// Copied into the guest's target.
+    To(&'a Arc<Buffer>),
+    /// Decoded, and the picture withheld from the target it was meant for, because this host is
+    /// known to return it wrong (see [`Shape::misreturned`]).
+    ///
+    /// The decode still happens: the host's reconstruction is right and later frames predict
+    /// from it. The target is still named because the session is keyed on its layout -- keying a
+    /// withheld frame on anything else would rebuild the session at the next delivered frame and
+    /// take every reference picture with it.
+    Withheld(&'a Arc<Buffer>),
+    /// Decoded for its reference value alone: an AV1 frame re-emitted to claim its reference
+    /// slot, whose picture went out a submission earlier into a target the guest may since have
+    /// recycled.
+    Nowhere,
+}
+
+impl<'a> Delivery<'a> {
+    fn of(shape: &Shape, target: Option<&'a Arc<Buffer>>) -> Delivery<'a> {
+        match target {
+            None => Delivery::Nowhere,
+            Some(buffer) if shape.misreturned() => Delivery::Withheld(buffer),
+            Some(buffer) => Delivery::To(buffer),
+        }
+    }
+
+    /// The target whose layout the session is keyed on, delivered into or not.
+    fn target(self) -> Option<&'a Arc<Buffer>> {
+        match self {
+            Delivery::To(buffer) | Delivery::Withheld(buffer) => Some(buffer),
+            Delivery::Nowhere => None,
+        }
+    }
+}
+
+/// The step that reaches the host decoder: decode one unit, and do with its picture what the
+/// delivery says.
+///
+/// A trait so that what drives it -- which units go out, in what order, and where each picture
+/// goes -- can be exercised without a decoder. AV1 needs silicon most hosts do not have, and the
+/// serializer's hold is exactly the kind of ordering a test has to pin rather than trust.
+trait Submit {
+    fn decode(
+        &mut self,
+        handle: VideoCodecHandle,
+        shape: &Shape,
+        unit: &[u8],
+        delivery: Delivery<'_>,
+    ) -> Result<(), Refusal>;
+
     /// Decode one unit and put the picture it produced where it belongs.
     ///
-    /// `target` is `None` for a unit decoded for its reference value alone: an AV1 frame
-    /// re-emitted to claim its reference slot, whose picture went out a submission earlier into
-    /// a target the guest may since have recycled.
+    /// `target` is `None` for a unit decoded for its reference value alone.
     fn submit(
         &mut self,
-        gl: &Gl,
         handle: VideoCodecHandle,
         shape: &Shape,
         unit: &[u8],
         target: Option<&Arc<Buffer>>,
     ) -> Result<(), Refusal> {
+        self.decode(handle, shape, unit, Delivery::of(shape, target))
+    }
+}
+
+/// The host's decoder: a codec's live session, and the GL a delivery uploads through.
+struct HostDecoder<'a> {
+    gl: &'a Gl,
+    session: &'a mut Option<Session>,
+    /// Which codec the host was asked for, for a message about the host.
+    codec: &'static str,
+}
+
+impl Submit for HostDecoder<'_> {
+    fn decode(
+        &mut self,
+        handle: VideoCodecHandle,
+        shape: &Shape,
+        unit: &[u8],
+        delivery: Delivery<'_>,
+    ) -> Result<(), Refusal> {
         let unserved = || Refusal::Unsupported("no CoreVideo layout for that decode target");
-        let destination = match target {
+        let destination = match delivery.target() {
             Some(buffer) => {
                 let Layout::Served(layout) = buffer.format else {
                     return Err(unserved());
@@ -812,8 +894,8 @@ impl Codec {
         // pictures with it, and every frame after one that did not need it then predicts from
         // an empty buffer -- which decodes "successfully" and looks like slightly wrong colour.
         if !self.session.as_ref().is_some_and(|s| s.serves(&key)) && !self.adopt(&key, handle) {
-            let codec = self.kind.name();
-            self.session = Some(Session::create(key).map_err(|status| {
+            let codec = self.codec;
+            *self.session = Some(Session::create(key).map_err(|status| {
                 // The probe advertised this codec, so a host that now says it has no such
                 // decoder is contradicting itself and every later frame will fail the same way.
                 assert!(
@@ -833,6 +915,21 @@ impl Codec {
                 return Err(Refusal::HostRefusedFrame);
             }
         };
+        // Decoded, which is all a frame the host returns wrong was submitted for. Ahead of the
+        // width check: such a frame comes back at some other width, and whatever it comes back
+        // at, it is not refused -- the decoder has it, and later frames predict from it.
+        if shape.misreturned() {
+            // Only a withheld delivery is news. A re-emission claiming its slot never had a
+            // picture to deliver, and its first emission already said this.
+            if let Delivery::Withheld(_) = delivery {
+                eprintln!(
+                    "[virglrs] video codec {handle}: this host does not return AV1 \
+                     super-resolution frames correctly; the frame is decoded for later frames to \
+                     predict from, but its picture is withheld and the target keeps what it held"
+                );
+            }
+            return Ok(());
+        }
         // The picture comes back at its coded width. A host returning some other width has
         // returned something that is not this frame, and delivering it puts visibly wrong
         // content on screen with nothing anywhere reporting a problem.
@@ -852,104 +949,12 @@ impl Codec {
             eprintln!("[virglrs] video codec {handle}: the decoded picture could not be mapped");
             return Err(Refusal::HostRefusedFrame);
         };
-        buffer.deliver(gl, layout, &locked);
+        buffer.deliver(self.gl, layout, &locked);
         Ok(())
     }
+}
 
-    /// DECODE_BITSTREAM for AV1.
-    ///
-    /// Nothing the guest sends is a bitstream: VA-API hands over a parsed frame header and the
-    /// tile data, and the whole temporal unit around it is written from the descriptor. The
-    /// descriptor is also what settles the *previous* frame's reference slot -- which slot the
-    /// guest chose is visible only in the next frame's `ref[]` -- so a held frame goes out here.
-    fn decode_av1(
-        &mut self,
-        gl: &Gl,
-        handle: VideoCodecHandle,
-        target: VideoBufferHandle,
-        descriptor: &[u8],
-        bitstream: &[u8],
-    ) -> Result<(), Refusal> {
-        let desc = match av1::FrameDesc::read(descriptor) {
-            Ok(desc) => desc,
-            Err(why) => {
-                eprintln!("[virglrs] video codec {handle}: AV1 frame refused ({why})");
-                return Err(Refusal::HostRefusedFrame);
-            }
-        };
-        // VideoToolbox returns super-resolution frames wrongly and there is no software decoder
-        // here to fall back to, so the frame is refused rather than delivered wrong.
-        if desc.use_superres {
-            eprintln!(
-                "[virglrs] video codec {handle}: this host does not return super-resolution \
-                 frames correctly"
-            );
-            return Err(Refusal::HostRefusedFrame);
-        }
-        let config = match av1::SeqParams::read(descriptor).and_then(|seq| seq.av1c()) {
-            Ok(config) => config,
-            Err(why) => {
-                eprintln!("[virglrs] video codec {handle}: no AV1 configuration record ({why})");
-                return Err(Refusal::HostRefusedFrame);
-            }
-        };
-
-        // The held frame first, under its own shape: decode order is preserved, and it is this
-        // descriptor's reference map that makes its refresh exact.
-        let Kind::Av1(av1) = &mut self.kind else {
-            unreachable!("only an AV1 codec decodes an AV1 frame");
-        };
-        if let Some((unit, owed)) = av1.obu.flush_held(&desc) {
-            self.submit(gl, handle, &owed.shape, &unit.bytes, owed.target.as_ref())?;
-        }
-
-        let (accumulated, shape) = self.frame.open_on(target)?;
-        accumulated.extend_from_slice(bitstream);
-        let width = if desc.frame_width == 0 { self.width } else { u32::from(desc.frame_width) };
-        let height =
-            if desc.frame_height == 0 { self.height } else { u32::from(desc.frame_height) };
-        *shape = Some(Shape::Av1 {
-            key: desc.starts_dpb(),
-            desc: Box::new(desc),
-            config,
-            width,
-            height,
-        });
-        Ok(())
-    }
-
-    /// END_FRAME for AV1: build the frame's temporal unit, or hold it.
-    fn end_av1_frame(
-        &mut self,
-        gl: &Gl,
-        handle: VideoCodecHandle,
-        shape: &Shape,
-        tiles: &[u8],
-        buffer: Arc<Buffer>,
-    ) -> Result<(), Refusal> {
-        let Shape::Av1 { desc, .. } = shape else {
-            unreachable!("an AV1 codec's frames carry an AV1 shape");
-        };
-        let Kind::Av1(av1) = &mut self.kind else {
-            unreachable!("only an AV1 codec ends an AV1 frame");
-        };
-        let owed = Owed { shape: shape.clone(), target: Some(Arc::clone(&buffer)) };
-        match av1.obu.build_temporal_unit(desc, tiles, owed) {
-            // Nothing emitted: the serializer is holding this frame until the next descriptor
-            // says which slot the guest stored it in. Its target is held with it.
-            Ok(None) => Ok(()),
-            Ok(Some(bytes)) => self.submit(gl, handle, shape, &bytes, Some(&buffer)),
-            // A frame was built while one was still held: two temporal units would reach the
-            // decoder as one sample and lose a picture, which is what the hold exists to
-            // prevent. It cannot happen -- every descriptor flushes first -- but a broken model
-            // must not become a lost picture.
-            Err(av1::StillHolding) => {
-                eprintln!("[virglrs] video codec {handle}: an AV1 frame is still held");
-                Err(Refusal::HostRefusedFrame)
-            }
-        }
-    }
-
+impl HostDecoder<'_> {
     /// Try to carry the live session across a change in the frame's shape.
     ///
     /// **H.264's parameter sets are not constant across a stream, and tearing the session down
@@ -977,6 +982,126 @@ impl Codec {
             );
         }
         false
+    }
+}
+
+impl Av1 {
+    /// Advance onto a frame's descriptor: submit the frame the serializer was holding, and
+    /// return the shape of the frame the descriptor describes.
+    ///
+    /// Nothing the guest sends is a bitstream: VA-API hands over a parsed frame header and the
+    /// tile data, and the whole temporal unit around it is written from the descriptor. The
+    /// descriptor is also what settles the *previous* frame's reference slot -- which slot the
+    /// guest chose is visible only in the next frame's `ref[]` -- so a held frame goes out here,
+    /// whatever the frame after it turns out to be.
+    fn advance(
+        &mut self,
+        host: &mut impl Submit,
+        handle: VideoCodecHandle,
+        descriptor: &[u8],
+        fallback: (u32, u32),
+    ) -> Result<Shape, Refusal> {
+        let desc = match av1::FrameDesc::read(descriptor) {
+            Ok(desc) => desc,
+            Err(why) => {
+                eprintln!("[virglrs] video codec {handle}: AV1 frame refused ({why})");
+                return Err(Refusal::HostRefusedFrame);
+            }
+        };
+        // A super-resolution frame is not refused here, and neither is anything else about its
+        // descriptor: it still settles the held frame's slot, and it still has to be decoded
+        // for the frames that predict from it. Only its picture is withheld -- see
+        // `Shape::misreturned`, which travels with the frame into a hold as well.
+        let config = match av1::SeqParams::read(descriptor).and_then(|seq| seq.av1c()) {
+            Ok(config) => config,
+            Err(why) => {
+                eprintln!("[virglrs] video codec {handle}: no AV1 configuration record ({why})");
+                return Err(Refusal::HostRefusedFrame);
+            }
+        };
+
+        // The held frame first, under its own shape: decode order is preserved, and it is this
+        // descriptor's reference map that makes its refresh exact.
+        if let Some((unit, owed)) = self.obu.flush_held(&desc) {
+            host.submit(handle, &owed.shape, &unit.bytes, owed.target.as_ref())?;
+        }
+
+        let (fallback_width, fallback_height) = fallback;
+        let width = if desc.frame_width == 0 { fallback_width } else { desc.frame_width.into() };
+        let height =
+            if desc.frame_height == 0 { fallback_height } else { desc.frame_height.into() };
+        Ok(Shape::Av1 { key: desc.starts_dpb(), desc: Box::new(desc), config, width, height })
+    }
+
+    /// END_FRAME for AV1: build the frame's temporal unit, or hold it.
+    fn end(
+        &mut self,
+        host: &mut impl Submit,
+        handle: VideoCodecHandle,
+        shape: &Shape,
+        tiles: &[u8],
+        buffer: Arc<Buffer>,
+    ) -> Result<(), Refusal> {
+        let Shape::Av1 { desc, .. } = shape else {
+            unreachable!("an AV1 codec's frames carry an AV1 shape");
+        };
+        let owed = Owed { shape: shape.clone(), target: Some(Arc::clone(&buffer)) };
+        match self.obu.build_temporal_unit(desc, tiles, owed) {
+            // Nothing emitted: the serializer is holding this frame until the next descriptor
+            // says which slot the guest stored it in. Its target is held with it.
+            Ok(None) => Ok(()),
+            Ok(Some(bytes)) => host.submit(handle, shape, &bytes, Some(&buffer)),
+            // A frame was built while one was still held: two temporal units would reach the
+            // decoder as one sample and lose a picture, which is what the hold exists to
+            // prevent. It cannot happen -- every descriptor flushes first -- but a broken model
+            // must not become a lost picture.
+            Err(av1::StillHolding) => {
+                eprintln!("[virglrs] video codec {handle}: an AV1 frame is still held");
+                Err(Refusal::HostRefusedFrame)
+            }
+        }
+    }
+}
+
+impl Codec {
+    /// The host's decoder for this codec's frames.
+    fn host<'a>(&'a mut self, gl: &'a Gl) -> HostDecoder<'a> {
+        HostDecoder { gl, session: &mut self.session, codec: self.kind.name() }
+    }
+
+    /// DECODE_BITSTREAM for AV1. See [`Av1::advance`].
+    fn decode_av1(
+        &mut self,
+        gl: &Gl,
+        handle: VideoCodecHandle,
+        target: VideoBufferHandle,
+        descriptor: &[u8],
+        bitstream: &[u8],
+    ) -> Result<(), Refusal> {
+        let Codec { kind: Kind::Av1(av1), session, frame, width, height, .. } = self else {
+            unreachable!("only an AV1 codec decodes an AV1 frame");
+        };
+        let mut host = HostDecoder { gl, session, codec: "AV1" };
+        let next = av1.advance(&mut host, handle, descriptor, (*width, *height))?;
+        let (accumulated, shape) = frame.open_on(target)?;
+        accumulated.extend_from_slice(bitstream);
+        *shape = Some(next);
+        Ok(())
+    }
+
+    /// END_FRAME for AV1. See [`Av1::end`].
+    fn end_av1_frame(
+        &mut self,
+        gl: &Gl,
+        handle: VideoCodecHandle,
+        shape: &Shape,
+        tiles: &[u8],
+        buffer: Arc<Buffer>,
+    ) -> Result<(), Refusal> {
+        let Codec { kind: Kind::Av1(av1), session, .. } = self else {
+            unreachable!("only an AV1 codec ends an AV1 frame");
+        };
+        av1.end(&mut HostDecoder { gl, session, codec: "AV1" }, handle, shape, tiles, buffer)
     }
 }
 
@@ -1464,7 +1589,7 @@ impl Video {
             eprintln!("[virglrs] video codec {handle}: the access unit is not Annex-B framed");
             return Err(Refusal::HostRefusedFrame);
         };
-        codec.submit(gl, handle, &shape, &unit, Some(&buffer))
+        codec.host(gl).submit(handle, &shape, &unit, Some(&buffer))
     }
 }
 
@@ -1796,6 +1921,141 @@ mod tests {
         // Everything above is the reshaping, which is every host's.
         #[cfg(target_os = "macos")]
         assert!(matches!(av1.configuration(), Configuration::Av1c(_)));
+    }
+
+    /// Where a fake decoder was told a unit's picture goes.
+    #[derive(Debug, PartialEq)]
+    enum Went {
+        To(*const Buffer),
+        Withheld(*const Buffer),
+        Nowhere,
+    }
+
+    /// A decoder that decodes nothing and records what it was handed, in order.
+    #[derive(Default)]
+    struct Recorder {
+        units: Vec<(Vec<u8>, Went)>,
+    }
+
+    impl Submit for Recorder {
+        fn decode(
+            &mut self,
+            _handle: VideoCodecHandle,
+            _shape: &Shape,
+            unit: &[u8],
+            delivery: Delivery<'_>,
+        ) -> Result<(), Refusal> {
+            let went = match delivery {
+                Delivery::To(buffer) => Went::To(Arc::as_ptr(buffer)),
+                Delivery::Withheld(buffer) => Went::Withheld(Arc::as_ptr(buffer)),
+                Delivery::Nowhere => Went::Nowhere,
+            };
+            self.units.push((unit.to_vec(), went));
+            Ok(())
+        }
+    }
+
+    const AV1_CODEC: VideoCodecHandle = VideoCodecHandle(3);
+
+    /// A decode target nothing is ever delivered into: the recorder only compares identities.
+    fn av1_target() -> Arc<Buffer> {
+        Arc::new(Buffer {
+            retained: Retained::new(crate::vrend::journal::Seq::default(), &[]),
+            format: Layout::Unserved(0),
+            width: 640,
+            height: 360,
+            destination: Destination::PerPlane(Vec::new()),
+        })
+    }
+
+    /// One AV1 frame, descriptor to END_FRAME.
+    fn av1_frame(
+        av1: &mut Av1,
+        host: &mut Recorder,
+        descriptor: &[u8],
+        into: &Arc<Buffer>,
+    ) -> Result<(), Refusal> {
+        let shape = av1.advance(host, AV1_CODEC, descriptor, (640, 360))?;
+        av1.end(host, AV1_CODEC, &shape, &[0xa5; 16], Arc::clone(into))
+    }
+
+    /// Fill all eight reference slots with live, distinct pictures -- a shown key frame and seven
+    /// shown inter frames, each stored by the guest in a slot of its own -- so that the next frame
+    /// meets the wall and is held. Returns the guest's reference map as that frame sees it.
+    fn av1_to_the_wall(av1: &mut Av1, host: &mut Recorder) -> [u32; 8] {
+        let into = av1_target();
+        av1_frame(av1, host, &av1::test_frame(true, true, false, [0; 8]), &into)
+            .expect("a key frame");
+        for k in 1..8u32 {
+            let map = std::array::from_fn(|i| (i as u32 + 1).min(k));
+            av1_frame(av1, host, &av1::test_frame(false, true, false, map), &into)
+                .expect("an inter frame");
+        }
+        assert_eq!(host.units.len(), 8, "every frame so far went out at once");
+        std::array::from_fn(|i| i as u32 + 1)
+    }
+
+    /// A super-resolution frame is submitted like any other, and only its picture is withheld.
+    ///
+    /// The host reconstructs such a frame correctly and returns its picture wrong, so skipping
+    /// the submit corrupts every later frame predicting from it. And the frame the serializer is
+    /// holding is flushed by the *next* descriptor whatever that frame is: refusing there drops a
+    /// frame that was never super-resolution at all.
+    #[test]
+    fn a_superres_frame_is_decoded_and_only_its_delivery_withheld() {
+        let mut av1 = Av1 { obu: av1::ObuState::new() };
+        let mut host = Recorder::default();
+        let map = av1_to_the_wall(&mut av1, &mut host);
+
+        // A hidden frame at the wall is held for the next descriptor to settle its slot.
+        let held = av1_target();
+        av1_frame(&mut av1, &mut host, &av1::test_frame(false, false, false, map), &held)
+            .expect("a hidden inter frame");
+        assert_eq!(host.units.len(), 8, "the hidden frame is held, not submitted");
+
+        // The guest stored it over its oldest picture; the next frame is super-resolution.
+        let mut map = map;
+        map[0] = 9;
+        let sr = av1_target();
+        let shape = av1
+            .advance(&mut host, AV1_CODEC, &av1::test_frame(false, true, true, map), (640, 360))
+            .expect("a super-resolution descriptor is accepted");
+        assert_eq!(host.units.len(), 9, "the held frame went out ahead of it");
+        assert_eq!(host.units[8].1, Went::To(Arc::as_ptr(&held)), "and was delivered");
+
+        av1.end(&mut host, AV1_CODEC, &shape, &[0xa5; 16], Arc::clone(&sr))
+            .expect("the super-resolution frame ends");
+        assert_eq!(host.units.len(), 10, "the super-resolution frame is submitted");
+        assert_eq!(host.units[9].1, Went::Withheld(Arc::as_ptr(&sr)), "and its picture withheld");
+
+        // It went out at the wall, shown, so a copy claiming its slot follows once the guest
+        // stores it. That copy is decoded for its reference alone, super-resolution or not.
+        map[1] = 10;
+        av1_frame(&mut av1, &mut host, &av1::test_frame(false, true, false, map), &av1_target())
+            .expect("the frame after it");
+        assert_eq!(host.units[10].1, Went::Nowhere, "the slot claim delivers nothing");
+    }
+
+    /// A super-resolution frame the serializer held is still withheld when it finally goes out,
+    /// a descriptor later and under a frame that is not super-resolution.
+    #[test]
+    fn a_held_superres_frame_is_withheld_when_it_goes_out() {
+        let mut av1 = Av1 { obu: av1::ObuState::new() };
+        let mut host = Recorder::default();
+        let mut map = av1_to_the_wall(&mut av1, &mut host);
+
+        let held = av1_target();
+        av1_frame(&mut av1, &mut host, &av1::test_frame(false, false, true, map), &held)
+            .expect("a hidden super-resolution frame");
+        assert_eq!(host.units.len(), 8, "the hidden frame is held, not submitted");
+
+        map[0] = 9;
+        let next = av1_target();
+        av1_frame(&mut av1, &mut host, &av1::test_frame(false, true, false, map), &next)
+            .expect("the frame after it");
+        assert_eq!(host.units.len(), 10);
+        assert_eq!(host.units[8].1, Went::Withheld(Arc::as_ptr(&held)), "held, then withheld");
+        assert_eq!(host.units[9].1, Went::To(Arc::as_ptr(&next)), "the next frame delivers");
     }
 
     /// A codec the guest created has to survive into the journal, and stop existing when it is

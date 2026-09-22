@@ -1466,6 +1466,23 @@ SABOTAGES = [
         '        if at < cursor.base {\n',
         'a_cursor_from_another_list_restarts_on_this_one',
     ),
+    (
+        'an AV1 super-resolution picture is delivered like any other, and puts wrong pixels on screen',
+        'src/vrend/video/mod.rs',
+        '            Some(buffer) if shape.misreturned() => Delivery::Withheld(buffer),\n',
+        '',
+        'superres',
+    ),
+    (
+        'an AV1 super-resolution descriptor is refused, dropping the held frame and its own decode',
+        'src/vrend/video/mod.rs',
+        '        let config = match av1::SeqParams::read(descriptor)',
+        '        if desc.use_superres {\n'
+        '            return Err(Refusal::HostRefusedFrame);\n'
+        '        }\n'
+        '        let config = match av1::SeqParams::read(descriptor)',
+        'superres',
+    ),
 ]
 
 # Not here, and deliberately: "a ring-seqno wake is never sent". Deleting any single
