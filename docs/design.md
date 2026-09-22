@@ -723,10 +723,11 @@ buildable throughout as the A-side reference.
 
   **There is one decoder, and it is VideoToolbox.** The C carries a dav1d fallback entered
   mid-stream for AV1 frames the hardware returns wrongly (super-resolution) and for a host with
-  no AV1 silicon at all. Neither is ported. A superres frame is refused, because a refused frame
-  is a lost frame while a delivered one is a wrong picture nothing reports; and a host without
-  the silicon advertises no AV1, which leaves the stream on the guest's own dav1d -- better
-  tested than ours, and the same place the C's stock tier leaves it. That also removes the one
+  no AV1 silicon at all. Neither is ported. A superres frame is decoded and its picture withheld:
+  the host's reconstruction is right and later frames predict from it, so only the delivery is
+  suppressed, and the target keeps what it held -- a stale picture is a lost frame, while a
+  delivered one is a wrong picture nothing reports. A host without the silicon advertises no
+  AV1, which leaves the stream on the guest's own dav1d -- better tested than ours, and the same place the C's stock tier leaves it. That also removes the one
   thing that could break the two legs' equivalence for a reason that is not a bug: a switch to
   a different decoder at a different unit.
 

@@ -588,9 +588,9 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 
   The clips are limina's own AV1 spike set (`spikes/av1-obu-serializer/clips`), which is what the
   serializer was developed against: baseline, global motion, tiles, low delay, aom pyramid, pan.
-  Two of the eight are deliberately left out. `superres` because **this build refuses
-  super-resolution frames** -- the hardware returns them wrongly and there is no software decoder
-  here -- so it would diverge by design. `filmgrain` because its hardware decode **is not
+  Two of the eight are deliberately left out. `superres` because **this build withholds
+  super-resolution pictures** -- it decodes the frames, but the hardware returns their pictures
+  wrongly and there is no software decoder here -- so it would diverge by design. `filmgrain` because its hardware decode **is not
   reproducible run to run**: three consecutive decodes of the same file give three different
   md5s, which is a golden that grades the weather.
 
