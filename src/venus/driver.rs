@@ -10125,9 +10125,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    /// A scanout is charged at the surface's own extent, not at the number in the request.
-    ///
     /// A venus ring fence waits for the GPU, rather than retiring the moment it is asked for.
     ///
     /// The gate for the whole ring-fence path, written as the bug it closes. A ring fence is the
@@ -10436,11 +10433,14 @@ mod tests {
         d.abandon_planted();
     }
 
+    /// A scanout is charged at the surface's own extent, not at the number in the request.
+    ///
     /// The surface is the commitment: IOSurface rounds an allocation up to whole pages, and those
     /// pages are the host memory that is actually gone. The `VkDeviceMemory` on top of it is a
     /// host-pointer import of those same pages and commits nothing further -- so the guest's
     /// figure is the wrong number to bill, and it is the smaller one, which is the direction that
     /// lets a leak run past the cap.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_scanout_is_charged_for_the_pages_the_surface_took() {
         use super::super::proto::types::{
