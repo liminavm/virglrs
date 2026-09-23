@@ -533,4 +533,43 @@ mod tests {
 
         gl.delete_framebuffer(fb);
     }
+
+    /// A fence taken while a picture is decoding retires only once that picture has landed.
+    ///
+    /// Before decodes ran on their own threads, an END_FRAME was finished before any later fence
+    /// could be taken, and the guest trusts every fence at or below one it is told of. The fence
+    /// here has no GL work of its own, so nothing but the picture holds it back.
+    #[test]
+    fn a_fence_waits_for_the_pictures_decoding_ahead_of_it() {
+        use std::time::Duration;
+
+        use crate::vrend::video::pending::{Landing, Outcome};
+
+        let _display = crate::vrend::one_display_at_a_time();
+        let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
+        let ctx = winsys
+            .create_context(Version { major: 3, minor: 1 }, None)
+            .expect("a GLES 3.1 context");
+        winsys.make_current(&ctx).expect("ctx is current on this thread");
+
+        let (tx, retired) = std::sync::mpsc::channel();
+        let retirement = crate::fence::Retirement::start(Box::new(Recorder(tx)));
+        let display = winsys.thread_display().expect("a winsys of our own lends its display");
+        let wait_ctx = winsys
+            .create_context(Version { major: 3, minor: 1 }, Some(&ctx))
+            .expect("a shared context");
+        let waiter = Waiter::start(display, wait_ctx, Gl::new(winsys.gles()), retirement.handle());
+
+        let landing = Landing::new();
+        waiter.retire_global(vec![Arc::clone(&landing)], Answer::Ordered, ClientFenceId(1));
+        assert!(
+            retired.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the fence retired while the picture it was taken over was still decoding"
+        );
+        landing.land(Outcome::Nothing);
+        assert_eq!(
+            retired.recv_timeout(Duration::from_secs(5)).expect("the fence retires once it lands"),
+            ClientFenceId(1)
+        );
+    }
 }

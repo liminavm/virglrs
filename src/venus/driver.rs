@@ -11313,4 +11313,19 @@ mod tests {
         });
         d.abandon_planted();
     }
+
+    /// A surface handed to a venus context comes out marked lent, because the classic side reads
+    /// that mark to decide whether a picture may land into the surface after END_FRAME returns.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_share_a_venus_context_reads_through_marks_its_surface_lent() {
+        let surface = Surface::scanout(64, 8, crate::surface::PixelFormat::Bgra, 256)
+            .expect("the system minted a surface");
+        let account = Account::for_test(None);
+        let storage = Storage::minted_for_test(surface, &account);
+        let Storage::Texture(lent) = &storage else {
+            panic!("a minted share is a texture share");
+        };
+        assert!(lent.surface().is_lent(), "the share was built without marking its surface");
+    }
 }

@@ -500,8 +500,10 @@ mod tests {
             None,
             Pending::new(Arc::clone(&second), Recipe::Composite, &unsettled),
         );
+        // Read before the join, which would land it whether or not the attach waited.
+        let landed_by_the_attach = first.is_landed();
         lander.join().expect("the lander finishes");
-        assert!(first.is_landed(), "the attach waited for the first picture");
+        assert!(landed_by_the_attach, "the attach did not wait for the first picture");
         assert!(slot.in_flight(), "the second is what is pending now");
         assert_eq!(unsettled.take_waits().0, 0, "replacing is not a read");
     }

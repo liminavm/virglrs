@@ -1926,4 +1926,69 @@ mod tests {
         assert_eq!(v.contexts[&ctx.id()].bound_units(stage), live, "and binds what it held");
         v.context_destroy(ctx, &AllAttached);
     }
+
+    /// A read from the control queue -- here the texture a scanout is flushed from -- waits for
+    /// the picture decoding into it, and leaves nothing pending behind.
+    #[test]
+    fn a_control_queue_read_waits_for_the_picture_in_flight() {
+        use super::super::video::pending::{Landing, Outcome, Pending, Recipe};
+
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+        )
+        .expect("vrend comes up");
+
+        let handle = ResourceHandle::new(1).expect("a resource handle is non-zero");
+        let args = resource::Args {
+            target: TextureTarget::Texture2d,
+            format: super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM"),
+            bind: resource::Bind(1 << 1),
+            width: 64,
+            height: 64,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags(0),
+        };
+        v.resource_create(handle, args).expect("an ordinary texture");
+        let texture = v
+            .resources
+            .sync()
+            .get(&handle)
+            .and_then(resource::Slot::resource)
+            .and_then(Resource::texture)
+            .cloned()
+            .expect("a texture resource");
+
+        let landing = Landing::new();
+        texture.expect_decode(
+            &v.gl,
+            Pending::new(Arc::clone(&landing), Recipe::Composite, &v.unsettled),
+        );
+        let lander = {
+            let landing = Arc::clone(&landing);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                landing.land(Outcome::Nothing);
+            })
+        };
+        assert!(v.resource_texture(handle).is_some());
+        assert!(landing.is_landed(), "the read returned before the picture landed");
+        assert!(!v.unsettled.any(), "the read left the picture pending");
+        lander.join().expect("the lander finishes");
+    }
 }

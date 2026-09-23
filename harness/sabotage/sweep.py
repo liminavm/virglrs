@@ -1746,6 +1746,41 @@ SABOTAGES = [
         'if size == 0 || size > RING_BUFFER_MAX_SIZE {',
         'kani:parse_accepts_exactly_the_layouts_the_rules_allow',
     ),
+    # Asynchronous decode: a picture lands after END_FRAME returns, and every reader of its target
+    # has to wait for it -- a fence, a control-queue read, a second decode into the same target.
+    (
+        'a share a venus context reads through leaves its surface unmarked',
+        'src/venus/driver.rs',
+        """            held.surface().mark_lent();
+            Lent(held)""",
+        """            Lent(held)""",
+        'a_share_a_venus_context_reads_through_marks_its_surface_lent',
+    ),
+    (
+        'a control-queue read takes a target without waiting for the picture decoding into it',
+        'src/vrend/vrend.rs',
+        """        let settled = texture.settle(&self.gl, super::video::pending::Wait::Block);""",
+        """        let settled = texture.settle(&self.gl, super::video::pending::Wait::IfLanded);""",
+        'a_control_queue_read_waits_for_the_picture_in_flight',
+    ),
+    (
+        'a fence retires without waiting for the pictures decoding ahead of it',
+        'src/vrend/waiter.rs',
+        """        for picture in &job.pictures {
+            picture.wait();
+        }""",
+        """        let _ = &job.pictures;""",
+        'a_fence_waits_for_the_pictures_decoding_ahead_of_it',
+    ),
+    (
+        'a second decode into a target drops the first picture instead of delivering it',
+        'src/vrend/video/pending.rs',
+        """        if let Some(replaced) = replaced {
+            deliver(replaced, gl, name, planes);
+        }""",
+        """        drop(replaced);""",
+        'a_target_decoded_into_twice_takes_the_first_picture_before_the_second',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
