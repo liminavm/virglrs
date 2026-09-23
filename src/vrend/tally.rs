@@ -55,6 +55,10 @@ const HOPS: usize = 8;
 
 struct Armed {
     every: Duration,
+    /// Where the reads that waited for a decoded picture are counted. They are counted by the
+    /// reads themselves, which have no tally to hand, so this holds a share of the counter and
+    /// takes each window's worth at report time. See [`crate::vrend::video::pending::Unsettled`].
+    settles: crate::vrend::video::pending::Unsettled,
     window_began: Instant,
     submits: u64,
     commands: u64,
@@ -148,6 +152,7 @@ impl Armed {
     fn new(every: Duration) -> Self {
         Self {
             every,
+            settles: Default::default(),
             window_began: Instant::now(),
             submits: 0,
             commands: 0,
@@ -191,6 +196,13 @@ impl Tally {
     /// [`crate::stats`], shared with the venus tally.
     pub fn from_env() -> Self {
         Self { on: crate::stats::report_interval("vrend").map(Armed::new) }
+    }
+
+    /// Report the reads that waited for a decoded picture, from the renderer's counter.
+    pub fn watch_settles(&mut self, settles: &crate::vrend::video::pending::Unsettled) {
+        if let Some(a) = &mut self.on {
+            a.settles = settles.clone();
+        }
     }
 
     /// One guest command ran. The whole per-command cost of this instrument.
@@ -456,6 +468,18 @@ impl Armed {
                 a.stream_transfers,
                 us(a.stream_transfer_busy, a.stream_transfers),
                 mb_s(a.stream_transfer_bytes, a.stream_transfer_busy),
+            );
+        }
+        // Reads that outran the decoder: each blocked this thread until its picture landed, which
+        // is the stall asynchronous decode removes, back in miniature. Taken whether or not this
+        // window decoded, since a read can wait on a decode queued in the window before.
+        let (waits, waited, longest) = a.settles.take_waits();
+        if waits > 0 {
+            eprintln!(
+                "[virglrs] vrend video: {waits} reads waited for a picture  {:.2} ms in all  \
+                 max {:.2} ms  (over {secs:.1}s{note})",
+                waited.as_secs_f64() * 1e3,
+                longest.as_secs_f64() * 1e3,
             );
         }
         // What video costs the submitting thread, printed only for a window that decoded. The

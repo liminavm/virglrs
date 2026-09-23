@@ -149,6 +149,8 @@ pub struct Host<'a> {
     /// Classic's handle to the host-memory ledger, for the one path that mints host memory this
     /// process can count: an IOSurface. See [`crate::budget`].
     pub budget: &'a crate::budget::Classic,
+    /// Whether any decode target has a picture in flight; see [`video::pending::Unsettled`].
+    pub unsettled: &'a video::pending::Unsettled,
 }
 
 impl Host<'_> {
@@ -161,7 +163,27 @@ impl Host<'_> {
     /// A resource the context may reach, with vrend's side of it.
     fn resource(&self, cmd: Cmd, handle: ResourceHandle) -> Result<&Resource, Fault> {
         let slot = self.slot(cmd, handle)?;
-        slot.resource().ok_or(Fault::UntypedResource { cmd, handle })
+        let res = slot.resource().ok_or(Fault::UntypedResource { cmd, handle })?;
+        self.settle(res);
+        Ok(res)
+    }
+
+    /// Deliver the decoded picture in flight into a resource, before anything reads or writes it.
+    ///
+    /// Every lookup a command makes goes through here, which is what puts a barrier in front of
+    /// every read of a decode target without each command having to know which of its resources
+    /// might be one -- the decode used to finish before the next command ran, and nothing that
+    /// reads a target was ever written to expect otherwise. A write needs it as much as a read:
+    /// a clear or a copy into a target must land on top of the picture, not under it.
+    ///
+    /// One load when nothing is in flight anywhere, which is nearly always.
+    fn settle(&self, res: &Resource) {
+        if !self.unsettled.any() {
+            return;
+        }
+        if let Some(texture) = res.texture() {
+            texture.settle(self.gl, video::pending::Wait::Block);
+        }
     }
 
     /// Re-read the pages behind a blob before something samples it, if it is a texture that
@@ -192,6 +214,12 @@ impl Host<'_> {
         let Some(src) = guest.blob_pixels(ctx, handle) else {
             return;
         };
+        // Settled first, like every other write: nothing stops a guest naming a blob that copies
+        // its pages as a decode target, and the re-read has to land on top of the picture, as it
+        // did when the decode finished before the next command ran.
+        if let Some(res) = self.resources.get(&handle).and_then(|s| s.resource()) {
+            self.settle(res);
+        }
         if let Some(res) = self.resources.get_mut(&handle).and_then(|s| s.resource_mut()) {
             res.take_guest_pixels(gl, formats, batch, &src);
         }
@@ -205,13 +233,16 @@ impl Host<'_> {
     /// directly skips the attach check, and a resource this context never attached is another
     /// context's to read.
     fn bound_resource(&self, handle: ResourceHandle) -> Option<&Resource> {
-        bindable(self.guest.attached(self.ctx, handle), self.resources.get(&handle))
+        let res = bindable(self.guest.attached(self.ctx, handle), self.resources.get(&handle))?;
+        self.settle(res);
+        Some(res)
     }
 
     fn bound_resource_mut(&mut self, handle: ResourceHandle) -> Option<&mut Resource> {
         if !self.guest.attached(self.ctx, handle) {
             return None;
         }
+        self.settle(self.resources.get(&handle)?.resource()?);
         self.resources.get_mut(&handle)?.resource_mut()
     }
 
@@ -227,6 +258,9 @@ impl Host<'_> {
     fn resource_mut(&mut self, cmd: Cmd, handle: ResourceHandle) -> Result<&mut Resource, Fault> {
         if !self.guest.attached(self.ctx, handle) {
             return Err(Fault::IllegalResource { cmd, handle });
+        }
+        if let Some(res) = self.resources.get(&handle).and_then(resource::Slot::resource) {
+            self.settle(res);
         }
         self.resources
             .get_mut(&handle)
@@ -247,6 +281,9 @@ impl Host<'_> {
     ) -> Result<(&mut Resource, &mut BoundProgram, &mut transfer::Staging), Fault> {
         if !self.guest.attached(self.ctx, handle) {
             return Err(Fault::IllegalResource { cmd, handle });
+        }
+        if let Some(res) = self.resources.get(&handle).and_then(resource::Slot::resource) {
+            self.settle(res);
         }
         let res = self
             .resources
@@ -1311,6 +1348,12 @@ impl Context {
         host.make_current(self.subs.id(), &self.sub().gl_ctx);
     }
 
+    /// The hardware decodes this context has in flight, one per codec. See
+    /// [`video::Video::in_flight`].
+    pub fn decodes_in_flight(&self) -> impl Iterator<Item = Arc<video::pending::Landing>> + '_ {
+        self.video.in_flight()
+    }
+
     /// Every sub-context's GL context, for the renderer to wait on. Each has its own command
     /// queue, so work one of them rendered is not covered by a finish on any other.
     pub fn gl_contexts(&self) -> impl Iterator<Item = (SubContextId, &egl::Context)> {
@@ -1391,6 +1434,14 @@ impl Context {
                 _ => None,
             };
             let wire = framed.wire;
+            if host.unsettled.any()
+                && matches!(
+                    framed.cmd,
+                    Command::DrawVbo(_) | Command::LaunchGrid { .. } | Command::Clear { .. }
+                )
+            {
+                self.settle_bound(host);
+            }
             if let Err(f) = self.run(host, framed.cmd, wire) {
                 if !self.dropped_in_replay(host.ctx, kind, &f) {
                     return self.poison(host.ctx, f);
@@ -1422,6 +1473,53 @@ impl Context {
             }
         }
         Ok(())
+    }
+
+    /// Deliver the decoded pictures a draw, a dispatch or a clear reaches through state bound
+    /// before it, ahead of the command.
+    ///
+    /// Two things a lookup cannot catch. The framebuffer's attachments hold their textures
+    /// directly, so drawing or clearing into one looks nothing up. And a composite target sampled
+    /// whole has to be converted into its base texture *before* the draw samples it: the lookup
+    /// in the sampler bind would deliver the picture in time, but the conversion runs in the
+    /// blitter's context and never inside a bind, so from there it would land one draw late.
+    fn settle_bound(&mut self, host: &mut Host<'_>) {
+        let gl = host.gl;
+        let sub = self.sub();
+        for surface in sub.cbufs.iter().flatten().chain(&sub.zsurf) {
+            surface.textures.settle(gl, video::pending::Wait::Block);
+        }
+        let mut owed = Vec::new();
+        for units in &sub.units {
+            for (_, handle) in units.views() {
+                let Some(Object::SamplerView(view)) = sub.objects.get(&handle) else {
+                    continue;
+                };
+                let texture = host
+                    .resources
+                    .get(&view.resource)
+                    .and_then(resource::Slot::resource)
+                    .and_then(Resource::texture);
+                let Some(texture) = texture else {
+                    continue;
+                };
+                texture.settle(gl, video::pending::Wait::Block);
+                // Asked of the target rather than of this settle: a picture a lookup delivered
+                // earlier owes its conversion just the same, and the target is where that is kept.
+                if texture.planes.as_ref().is_some_and(resource::Planes::needs_fill) {
+                    owed.push(Arc::clone(texture));
+                }
+            }
+        }
+        if owed.is_empty() {
+            return;
+        }
+        for texture in owed {
+            if !self.owed.iter().any(|t| t.name == texture.name) {
+                self.owed.push(texture);
+            }
+        }
+        self.fill_composites(host);
     }
 
     /// Begin rebuilding this context from a journal.
@@ -1979,7 +2077,8 @@ impl Context {
             Command::EndFrame { codec, target } => {
                 self.make_current(host);
                 let began = host.tally.mark();
-                let ended = self.video.end_frame(host.gl, host.features, codec, target);
+                let ended =
+                    self.video.end_frame(host.gl, host.features, host.unsettled, codec, target);
                 host.tally.video(began, true);
                 video_result(kind, ended)
             }
@@ -4564,7 +4663,14 @@ impl Context {
             false,
         )?;
         let bitstream = self.read_guest_bytes(host, cmd, buffer, buffer_size, true)?;
-        let out = self.video.decode_bitstream(host.gl, codec, target, &descriptor, &bitstream);
+        let out = self.video.decode_bitstream(
+            host.gl,
+            host.unsettled,
+            codec,
+            target,
+            &descriptor,
+            &bitstream,
+        );
         video_result(cmd, out)
     }
 

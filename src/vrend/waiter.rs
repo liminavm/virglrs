@@ -37,6 +37,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use super::egl::{self, ThreadDisplay};
 use super::gl::{Fence, FenceWait, Gl};
+use super::video::pending::Landing;
 use crate::fence;
 use crate::ids::{ClientFenceId, ContextId, FenceId, RingIdx};
 
@@ -94,6 +95,11 @@ impl Answer {
 }
 
 struct Job {
+    /// Decoded pictures the fence covers that may not have landed yet: a hardware decode runs on
+    /// its codec's own thread, so a fence created after an END_FRAME has to wait for the picture
+    /// as well as for the GL work. Waited out before the syncs, and empty for every fence on a
+    /// context with no decode in flight. See [`super::video::pending`].
+    pictures: Vec<Arc<Landing>>,
     /// How this fence is answered; see [`Answer`]. An `Ordered` job still travels the queue,
     /// because leaving it out would let it overtake a fence ahead of it that is still in flight.
     fence: Answer,
@@ -127,19 +133,26 @@ impl Waiter {
         Waiter { q, thread: Some(thread) }
     }
 
-    /// Queue a fence to retire once its work has run.
-    pub fn retire_context(&self, fence: Answer, ctx: ContextId, ring: RingIdx, id: FenceId) {
-        self.push(Job { fence, retire: Retire::Context(ctx, ring, id) });
+    /// Queue a fence to retire once its work has run, and the `pictures` it covers have landed.
+    pub fn retire_context(
+        &self,
+        pictures: Vec<Arc<Landing>>,
+        fence: Answer,
+        ctx: ContextId,
+        ring: RingIdx,
+        id: FenceId,
+    ) {
+        self.push(Job { pictures, fence, retire: Retire::Context(ctx, ring, id) });
     }
 
-    /// Queue a global-ring fence to retire once its work has run.
-    pub fn retire_global(&self, fence: Answer, id: ClientFenceId) {
-        self.push(Job { fence, retire: Retire::Global(id) });
+    /// Queue a global-ring fence to retire once its work has run and its `pictures` have landed.
+    pub fn retire_global(&self, pictures: Vec<Arc<Landing>>, fence: Answer, id: ClientFenceId) {
+        self.push(Job { pictures, fence, retire: Retire::Global(id) });
     }
 
     /// Queue a present fence to retire once the work behind a flushed surface has run.
-    pub fn retire_present(&self, fence: Answer, id: FenceId) {
-        self.push(Job { fence, retire: Retire::Present(id) });
+    pub fn retire_present(&self, pictures: Vec<Arc<Landing>>, fence: Answer, id: FenceId) {
+        self.push(Job { pictures, fence, retire: Retire::Present(id) });
     }
 
     fn push(&self, job: Job) {
@@ -195,6 +208,11 @@ fn run(
         };
         if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
             eprintln!("[virglrs] fence: waiter woke, answer={}", job.fence.name());
+        }
+        // The pictures first. A decode thread needs nothing from this one, so waiting here cannot
+        // stall anything but the fences behind this one -- which is the order they owe anyway.
+        for picture in &job.pictures {
+            picture.wait();
         }
         if let Answer::Syncs(fences) = job.fence {
             // Every one, and each spent as it is waited out: they are independent queues, so the
@@ -356,7 +374,7 @@ mod tests {
             black(&gl);
             queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
             gl.flush();
-            waiter.retire_global(Answer::Ordered, ClientFenceId(1));
+            waiter.retire_global(Vec::new(), Answer::Ordered, ClientFenceId(1));
             assert_eq!(retired.recv().expect("the sink answers"), ClientFenceId(1));
             alone = first_pixel_blue(&surface);
             if alone != 0xff {
@@ -377,12 +395,13 @@ mod tests {
         queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
         let sync = gl.fence().expect("the driver gives a sync object");
         waiter.retire_context(
+            Vec::new(),
             Answer::Syncs(vec![sync]),
             ContextId::new(1).expect("a context id"),
             RingIdx(0),
             FenceId(2),
         );
-        waiter.retire_global(Answer::Ordered, ClientFenceId(3));
+        waiter.retire_global(Vec::new(), Answer::Ordered, ClientFenceId(3));
         assert_eq!(retired.recv().expect("the sink answers"), ClientFenceId(3));
         let behind = first_pixel_blue(&surface);
 

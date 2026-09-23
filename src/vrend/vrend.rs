@@ -117,6 +117,9 @@ pub struct Vrend {
     doomed: Vec<Arc<resource::Texture>>,
     /// Which resources copy guest pages, as of the batch it was last asked in.
     pixels: resource::Refresh,
+    /// How many decode targets, across every context, have a picture in flight that nothing has
+    /// settled yet. See [`crate::vrend::video::pending::Unsettled`].
+    unsettled: super::video::pending::Unsettled,
     /// Batches run, ever. The unit a copy of a guest's pages is kept fresh in: within one batch
     /// the guest has had no opportunity to run, so one read serves every draw in it.
     batch: u64,
@@ -309,6 +312,9 @@ impl Vrend {
             },
         };
         let fences = fences_for_inline;
+        let unsettled = super::video::pending::Unsettled::default();
+        let mut tally = tally::Tally::from_env();
+        tally.watch_settles(&unsettled);
         Ok(Vrend {
             winsys,
             gl,
@@ -324,12 +330,13 @@ impl Vrend {
             resources: resource::Slots::new(condemned),
             contexts: crate::Map::default(),
             todo: Todo::default(),
-            tally: tally::Tally::from_env(),
+            tally,
             staging: transfer::Staging::default(),
             blitter: None,
             waiter,
             fences,
             doomed: Vec::new(),
+            unsettled,
             batch: 0,
             pixels: resource::Refresh::default(),
             budget: crate::budget::Classic::open(budget),
@@ -392,6 +399,7 @@ impl Vrend {
             batch,
             pixels,
             budget,
+            unsettled,
             // Neither belongs to a context's commands: the waiter is a thread, and the handle is
             // where a fence goes once answered.
             staging,
@@ -419,6 +427,7 @@ impl Vrend {
             todo,
             blitter,
             video: video.as_ref(),
+            unsettled,
         };
         (host, contexts)
     }
@@ -680,9 +689,39 @@ impl Vrend {
             .or_insert_with(|| resource::Slot::Untyped(resource::Untyped::new(storage)));
     }
 
+    /// Deliver the decoded picture in flight into a resource, before the VMM or a transfer
+    /// reaches its pixels.
+    ///
+    /// The control-queue half of the barrier a context's lookups put in front of every command
+    /// (see `Host::settle`): these paths read and write a resource with no context command in
+    /// between -- a scanout flush publishes a surface, a transfer copies to or from the guest, a
+    /// cursor is read back -- so each settles first. A per-plane upload runs in whatever context
+    /// is current, and puts back what it borrows. It is flushed, because the reader is not that
+    /// context: GL makes one context's commands visible to another only once they are submitted.
+    fn settle(&mut self, handle: ResourceHandle) {
+        if !self.unsettled.any() {
+            return;
+        }
+        let texture = self
+            .resources
+            .sync()
+            .get(&handle)
+            .and_then(resource::Slot::resource)
+            .and_then(Resource::texture);
+        let Some(texture) = texture else { return };
+        let settled = texture.settle(&self.gl, super::video::pending::Wait::Block);
+        if matches!(settled, super::video::pending::Settled::Delivered { .. }) {
+            self.gl.flush();
+        }
+    }
+
     /// The IOSurface a resource is presented from, if its storage is one. Asked of the resource
     /// every time: the surface goes with the resource, and there is no other place to hold one.
+    ///
+    /// Settled first: the scanout paths all come through here, and what they publish or read is
+    /// the surface's pixels.
     pub fn resource_surface(&mut self, handle: ResourceHandle) -> Option<&surface::Surface> {
+        self.settle(handle);
         self.resources.sync().get(&handle)?.resource()?.surface()
     }
 
@@ -691,6 +730,7 @@ impl Vrend {
     /// Asked of the resource every time rather than mirrored anywhere: the name is the texture's
     /// and dies with it, and a copy kept elsewhere would outlive the object it names.
     pub fn resource_texture(&mut self, handle: ResourceHandle) -> Option<gl::TextureName> {
+        self.settle(handle);
         Some(self.resources.sync().get(&handle)?.resource()?.texture()?.name)
     }
 
@@ -710,6 +750,7 @@ impl Vrend {
         // whichever context ran last would change a binding the guest still expects to be its
         // own. It also has to happen before the resource is borrowed, since it needs `&mut self`.
         self.switch_ctx0();
+        self.settle(handle);
         let res = self.resources.sync().get(&handle)?.resource()?;
         // Multisampled is refused here rather than left to fail downstream. It would: attaching
         // one and reading it back is an error GL reports, so the answer is already `None`. But
@@ -760,6 +801,7 @@ impl Vrend {
         // ctx0 first, as the readback below binds a framebuffer and a texture: doing that in
         // whichever context ran last would change bindings the guest still expects to be its own.
         self.switch_ctx0();
+        self.settle(handle);
         let (held, width, full_height) = {
             let res = self.resources.sync().get(&handle)?.resource()?;
             (res.surface_share()?, res.args.width, res.args.height)
@@ -864,7 +906,9 @@ impl Vrend {
         // With no waiter there is no queue to retire behind, so the fence is answered inline --
         // the way this renderer did before there was one. Taking a sync and dropping it unwaited
         // would retire the fence early, which is the whole hazard this path exists to prevent.
+        let pictures = self.decodes_in_flight(Some(ctx));
         if self.waiter.is_none() {
+            pictures.iter().for_each(|p| p.wait());
             self.finish_contexts(&[ctx]);
             self.fences.retire_context(ctx, ring, id);
             return;
@@ -878,7 +922,7 @@ impl Vrend {
             );
         }
         let w = self.waiter.as_ref().expect("checked just above");
-        w.retire_context(answer, ctx, ring, id);
+        w.retire_context(pictures, answer, ctx, ring, id);
     }
 
     /// Answer a present fence for work a classic context queued: make it true that the GL work has
@@ -891,7 +935,9 @@ impl Vrend {
         let ctx = ctx.id();
         // Same reasoning as `fence_context`: with no waiter there is no queue to retire behind, so
         // the work is finished inline rather than the fence being retired unwaited.
+        let pictures = self.decodes_in_flight(Some(ctx));
         if self.waiter.is_none() {
+            pictures.iter().for_each(|p| p.wait());
             self.finish_contexts(&[ctx]);
             self.fences.retire_present(id);
             return;
@@ -901,7 +947,7 @@ impl Vrend {
             eprintln!("[virglrs] fence: present ctx={ctx:?} id={} answer={}", id.0, answer.name());
         }
         let w = self.waiter.as_ref().expect("checked just above");
-        w.retire_present(answer, id);
+        w.retire_present(pictures, answer, id);
     }
 
     /// Answer a fence on the legacy global ring, which names its context from outside.
@@ -911,7 +957,9 @@ impl Vrend {
     /// the waiter's queue instead; see [`Self::take_fence`].
     pub fn fence_global(&mut self, on: Option<ClassicCtx>, id: ClientFenceId) {
         let on = on.map(ClassicCtx::id);
+        let pictures = self.decodes_in_flight(on);
         if self.waiter.is_none() {
+            pictures.iter().for_each(|p| p.wait());
             self.finish_all();
             self.fences.retire_global(id);
             return;
@@ -921,7 +969,46 @@ impl Vrend {
             eprintln!("[virglrs] fence: global id={} on={on:?} answer={}", id.0, answer.name());
         }
         let w = self.waiter.as_ref().expect("checked just above");
-        w.retire_global(answer, id);
+        w.retire_global(pictures, answer, id);
+    }
+
+    /// [`crate::renderer::Renderer::settle_video`]: every decode thread idle, every picture
+    /// delivered.
+    pub fn settle_video(&mut self) {
+        // The threads first, context by context: each codec's newest decode landing means its
+        // thread has nothing left, and only then is every picture there to deliver.
+        for ctx in self.contexts.values() {
+            ctx.decodes_in_flight().for_each(|landing| landing.wait());
+        }
+        if !self.unsettled.any() {
+            return;
+        }
+        // A per-plane picture is uploaded in whatever context is current, and this is a call
+        // from the VMM with no context of its own: ctx0 is the renderer's.
+        self.switch_ctx0();
+        for slot in self.resources.sync().values() {
+            if let Some(texture) = slot.resource().and_then(Resource::texture) {
+                texture.settle(&self.gl, super::video::pending::Wait::Block);
+            }
+        }
+        self.gl.flush();
+    }
+
+    /// The hardware decodes `on` has in flight, which a fence created now must not retire ahead
+    /// of: before decodes ran on their own threads, an END_FRAME was finished before any fence
+    /// after it could be taken, and the guest kernel signals everything at or below a delivered
+    /// id. One per codec, since a codec's decodes land in order.
+    ///
+    /// A fence that names no context -- or one this renderer does not have -- waits for every
+    /// context's, the way its inline answer finishes every context's GL work
+    /// ([`Self::finish_all`]). Nothing says whose work it covers, so it is taken to cover all of
+    /// it; a decode thread is idle between frames, so that is rarely more than one picture a
+    /// codec.
+    fn decodes_in_flight(&self, on: Option<ContextId>) -> Vec<Arc<super::video::pending::Landing>> {
+        match on.and_then(|ctx| self.contexts.get(&ctx)) {
+            Some(ctx) => ctx.decodes_in_flight().collect(),
+            None => self.contexts.values().flat_map(Context::decodes_in_flight).collect(),
+        }
     }
 
     /// How to answer the fence for the work `on` has queued: a sync on each GL queue that work
@@ -1175,6 +1262,7 @@ impl Vrend {
     }
 
     pub fn resource(&mut self, handle: ResourceHandle) -> Option<&Resource> {
+        self.settle(handle);
         self.resources.sync().get(&handle)?.resource()
     }
 
@@ -1243,6 +1331,7 @@ impl Vrend {
         if pages.is_empty() {
             return Err(transfer::Error::NoPages);
         }
+        self.settle(handle);
         let began = self.tally.mark();
         let res = self
             .resources

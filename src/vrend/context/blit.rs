@@ -601,7 +601,9 @@ impl Context {
         }
         for texture in visit {
             let planes = texture.planes.as_ref().expect("a target that owes a fill has planes");
-            if !planes.needs_fill() {
+            // A picture still being written into the planes is left alone: converting now would
+            // convert half of it. The read that needs it settles it and converts then.
+            if !planes.needs_fill() || texture.decode.in_flight() {
                 continue;
             }
             // The extent is the luma plane's, which is the surface's, which is what the base

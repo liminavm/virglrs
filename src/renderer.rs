@@ -1419,6 +1419,18 @@ impl Renderer {
 
     // ---- journals ----
 
+    /// Bring every hardware decode to rest: wait for each codec's thread to finish what it was
+    /// given, and deliver every picture still in flight into its target.
+    ///
+    /// For a VMM about to snapshot. With decodes running on their own threads, a quiesced guest
+    /// no longer means a quiet renderer -- a decode thread may still be writing a surface while the
+    /// snapshot reads the state around it. Nothing is lost by calling it when nothing decodes.
+    pub fn settle_video(&mut self) {
+        if let Some(vrend) = self.vrend.as_mut() {
+            vrend.settle_video();
+        }
+    }
+
     /// One context's journal, for the VMM to store beside its own -- from whichever renderer
     /// keeps it. `None` for a context that is not here or has nothing retained, which is
     /// deliberately not an empty blob: a VMM that stored zero bytes and restored them later would

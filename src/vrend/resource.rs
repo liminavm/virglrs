@@ -1221,6 +1221,9 @@ pub struct Texture {
     /// too. The lock is uncontended -- a renderer's classic side is one thread -- and buys the
     /// share the `Send` a `RefCell` would cost it.
     views: Mutex<BTreeMap<ViewKey, TextureName>>,
+    /// A decoded picture on its way into this texture, when it is a decode target. Settled by
+    /// whatever reads or writes the texture first; see [`video::pending`].
+    pub decode: video::pending::Slot,
 }
 
 /// What a render target's texture view is a function of: the format it reinterprets the resource
@@ -1669,6 +1672,7 @@ impl Texture {
             pixels: Pixels::Own,
             planes: None,
             views: Mutex::default(),
+            decode: video::pending::Slot::default(),
         }
     }
 }
@@ -1680,12 +1684,29 @@ impl fmt::Debug for Texture {
 }
 
 impl Texture {
+    /// Deliver the decoded picture in flight into this texture, if there is one. See
+    /// [`video::pending::Slot::settle`].
+    pub fn settle(&self, gl: &Gl, wait: video::pending::Wait) -> video::pending::Settled {
+        self.decode.settle(gl, self.name, self.planes.as_ref(), wait)
+    }
+
+    /// Mark this texture with a decoded picture on its way in. See
+    /// [`video::pending::Slot::attach`].
+    pub fn expect_decode(&self, gl: &Gl, pending: video::pending::Pending) {
+        self.decode.attach(gl, self.name, self.planes.as_ref(), pending);
+    }
+
     /// The image this renderer minted and the texture adopted, when that is what its storage is.
     pub fn minted(&self) -> Option<&Image> {
         match &self.pixels {
             Pixels::Minted(image) => Some(image),
             Pixels::Own | Pixels::Exported(_) => None,
         }
+    }
+
+    /// Whether this texture's storage is a surface it was handed rather than one it minted.
+    pub fn exported(&self) -> bool {
+        matches!(self.pixels, Pixels::Exported(_))
     }
 
     /// The render-target view for `key`, minted the first time it is asked for.
@@ -2455,6 +2476,7 @@ fn alloc_texture(
             pixels: Pixels::Minted(image),
             planes,
             views: Mutex::default(),
+            decode: video::pending::Slot::default(),
         })));
     }
     match target {
@@ -2559,6 +2581,7 @@ fn alloc_texture(
         pixels,
         planes,
         views: Mutex::default(),
+        decode: video::pending::Slot::default(),
     })))
 }
 

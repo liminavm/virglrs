@@ -19,6 +19,7 @@ pub mod av1;
 pub mod bitstream;
 pub mod h264;
 pub mod h265;
+pub mod pending;
 
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,6 +33,7 @@ use super::journal::Retained;
 use super::proto::{Format, VideoBuffer, VideoBufferHandle, VideoCodec, VideoCodecHandle};
 use super::resource::{self, Texture};
 use crate::decode::{self, Configuration, PixelFormat, Session, SessionKey};
+use crate::surface::Held;
 
 /// `enum pipe_video_profile`, as virglrenderer numbers it.
 ///
@@ -354,78 +356,6 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    /// Copy a decoded picture into this target's planes.
-    ///
-    /// Returns how many planes were written, which is the smaller of what the picture has and
-    /// what the target has -- a target with fewer planes than the picture is the guest's own
-    /// choice of layout, not an error.
-    fn deliver(&self, gl: &Gl, layout: TargetFormat, picture: &decode::Locked<'_>) -> usize {
-        match &self.destination {
-            Destination::PerPlane(planes) => Self::deliver_per_plane(gl, planes, layout, picture),
-            Destination::Composite(texture) => Self::deliver_composite(texture, layout, picture),
-        }
-    }
-
-    /// Copy a decoded picture into the planes of a composite target's surface.
-    ///
-    /// Nothing is uploaded and no GL context is touched: the guest samples these planes through
-    /// views of its own, so the surface is where the pixels belong and the only place they go.
-    ///
-    /// Each plane's row length is the surface plane's own tight extent -- read back from the
-    /// surface, which is what was actually allocated, and not from the target's separately
-    /// stated width and height. Widening it to either pitch in sight, the decoder's or the
-    /// kernel's, writes padding into the picture and shears it.
-    fn deliver_composite(
-        texture: &Texture,
-        layout: TargetFormat,
-        picture: &decode::Locked<'_>,
-    ) -> usize {
-        // A composite target without planes cannot be built -- `create_buffer` refuses it -- so
-        // reaching this with none is a host bug and not a guest one.
-        let planes = texture.planes.as_ref().expect("a composite decode target has planes");
-        let count = picture.plane_count().min(planes.count() as usize);
-        let mut written = 0;
-        for index in 0..count {
-            let Some(source) = picture.plane(layout.source_plane(index, count)) else {
-                continue;
-            };
-            let Some(geometry) = planes.geometry(index as u32) else {
-                continue;
-            };
-            // Clamp to what the SOURCE holds, as the per-plane path does and for the same
-            // reason: the plane is the aligned allocation while the decoded picture holds
-            // exactly its own rows, so copying the plane's extent reads past the mapping.
-            let rows = geometry.height.min(source.height);
-            let row_bytes = geometry.row_bytes().min(source.pitch);
-            if planes.surface().write_plane(
-                index as u32,
-                source.bytes,
-                source.pitch,
-                rows,
-                row_bytes,
-            ) {
-                written += 1;
-            } else {
-                // Not an assert, unlike the upload below: the arithmetic here is clamped to
-                // both sides and cannot be the cause, so a refusal is the surface declining to
-                // lock -- a runtime failure, and one that shows as a target holding the
-                // previous frame.
-                eprintln!(
-                    "[virglrs] video: plane {index} of a composite target would not take a \
-                     picture; the frame keeps whatever was there"
-                );
-            }
-        }
-        // The base texture a composite view samples is now behind these planes. Whether that
-        // matters -- whether anything samples it at all -- is the resource's own to answer, and
-        // it is recorded there. Whether the conversion runs now is the caller's, because the
-        // pass needs a blitter this layer has no business holding.
-        if written > 0 {
-            planes.delivered();
-        }
-        written
-    }
-
     /// The one texture this target is, when it is a composite one.
     fn composite(&self) -> Option<&Arc<Texture>> {
         match &self.destination {
@@ -434,55 +364,20 @@ impl Buffer {
         }
     }
 
-    /// Copy a decoded picture into one GL texture per plane.
-    fn deliver_per_plane(
-        gl: &Gl,
-        planes: &[Plane],
-        layout: TargetFormat,
-        picture: &decode::Locked<'_>,
-    ) -> usize {
-        let count = picture.plane_count();
-        let mut written = 0;
-        for (index, target) in planes.iter().enumerate().take(count) {
-            let Some(source) = picture.plane(layout.source_plane(index, count)) else {
-                continue;
-            };
+    /// Every texture a decode lands in, per-plane or composite.
+    fn textures(&self) -> impl Iterator<Item = &Arc<Texture>> {
+        let (per_plane, composite) = match &self.destination {
+            Destination::PerPlane(planes) => (planes.as_slice(), None),
+            Destination::Composite(texture) => (&[][..], Some(texture)),
+        };
+        per_plane.iter().map(|plane| &plane.texture).chain(composite)
+    }
 
-            // Clamp to what the SOURCE holds. The target is the aligned allocation while the
-            // plane holds exactly the rows the picture has, so uploading the target's extent
-            // reads past the mapping -- which is a fault here rather than wrong pixels, because
-            // the source is a slice. The width bound is the padded row, not the picture's
-            // width: the decoder's pitch is what the upload strides by.
-            let row_pixels = source.pitch as u32 / target.block_bytes;
-            let w = target.width.min(row_pixels);
-            let h = target.height.min(source.height);
-            if w == 0 || h == 0 {
-                continue;
-            }
-
-            gl.bind_texture(GL_TEXTURE_2D, Some(target.texture.name));
-            let ok = gl.tex_sub_image_2d_padded(
-                GL_TEXTURE_2D,
-                0,
-                0,
-                0,
-                w as i32,
-                h as i32,
-                target.gl.glformat,
-                target.gl.gltype,
-                source.bytes,
-                row_pixels as i32,
-            );
-            // The source is a slice sized by CoreVideo, the rectangle is clamped to it just
-            // above, and the plane's bytes per pixel is the same number the upload reads by --
-            // `Plane::new` refused the formats where the two disagree. So a refusal here is this
-            // function's own arithmetic being wrong: a host bug, and one that would otherwise
-            // show as a target holding the previous frame.
-            assert!(ok, "a decoded plane clamped to its own extent does not fit it");
-            written += 1;
+    /// Deliver whatever picture is in flight into this target, waiting for it.
+    fn settle(&self, gl: &Gl) {
+        for texture in self.textures() {
+            texture.settle(gl, pending::Wait::Block);
         }
-        gl.bind_texture(GL_TEXTURE_2D, None);
-        written
     }
 }
 
@@ -777,12 +672,12 @@ pub struct Codec {
     /// snapshot's half-frame and many is a stream decoding nothing at all.
     nothing_to_decode: u32,
     frame: Frame,
-    /// The live decompression session, rebuilt when the frame's shape changes.
+    /// The thread the frames are decoded on, which owns the decompression session.
     ///
-    /// `None` before the first frame: the session is keyed on the shape of the frame it will
-    /// decode, and that arrives with the descriptor rather than with the creation arguments --
-    /// a VP9 stream may change resolution or bit depth at a key frame.
-    session: Option<Session>,
+    /// The session is built on the first frame, not at creation: it is keyed on the shape of
+    /// the frame it will decode, and that arrives with the descriptor rather than with the
+    /// creation arguments -- a VP9 stream may change resolution or bit depth at a key frame.
+    decoder: Decoder,
 }
 
 /// What becomes of the picture a submitted unit decodes to.
@@ -854,12 +749,279 @@ trait Submit {
     }
 }
 
-/// The host's decoder: a codec's live session, and the GL a delivery uploads through.
+/// How many decodes a codec may have queued ahead of the render thread.
+///
+/// Enough that a burst -- AV1's held frame going out beside the next one, a player that submits a
+/// few frames ahead -- never makes END_FRAME wait, and few enough that the decoder's pool is not
+/// drained by pictures nothing has read yet. A full queue blocks the render thread, which is
+/// exactly what every decode did before there was a queue: the worst case is the old one.
+const QUEUE_DEPTH: usize = 4;
+
+/// A codec's decode thread and the queue into it.
+///
+/// The thread owns the codec's VideoToolbox session. `Session` is `Send` and not `Sync`, and the
+/// thread is its only user, so the reference pictures inside it are never contended and every
+/// frame reaches it in the order the guest submitted them -- which is what the reference
+/// pictures need. What stays on the render thread is everything that evolves in submit order and
+/// that the guest's own commands read: parsing, the frame-drop gate, the AV1 serializer.
+#[derive(Default)]
+struct Decoder {
+    /// Started on the first decode. A codec the guest creates and never decodes with -- gst-va
+    /// makes one per profile at registration -- costs no thread.
+    worker: Option<Worker>,
+    /// The newest job sent. The queue is first in, first out, so this having landed means every
+    /// job before it has too: it is the only one a fence needs to wait on.
+    newest: Option<Arc<pending::Landing>>,
+}
+
+struct Worker {
+    jobs: std::sync::mpsc::SyncSender<Job>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Decoder {
+    fn send(&mut self, job: Job) {
+        self.newest = Some(Arc::clone(&job.landing));
+        let worker = self.worker.get_or_insert_with(|| {
+            let (jobs, queue) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
+            let thread = std::thread::Builder::new()
+                .name("virglrs-decode".into())
+                .spawn(move || decode_thread(queue))
+                .expect("spawning a codec's decode thread");
+            Worker { jobs, thread }
+        });
+        worker.jobs.send(job).expect("a codec's decode thread outlives its queue");
+    }
+
+    /// The newest decode, if it has not landed yet.
+    fn in_flight(&self) -> Option<Arc<pending::Landing>> {
+        self.newest.as_ref().filter(|landing| !landing.is_landed()).cloned()
+    }
+}
+
+impl Drop for Decoder {
+    /// Every queued decode runs to the end before the codec goes, so no thread outlives what it
+    /// writes into, and a picture the guest already asked for still lands. This blocks the render
+    /// thread for as long as the queue takes, which is at most what those decodes would have cost
+    /// it synchronously.
+    fn drop(&mut self) {
+        if let Some(Worker { jobs, thread }) = self.worker.take() {
+            drop(jobs);
+            thread.join().expect("a decode thread never panics: panics abort");
+        }
+    }
+}
+
+/// One unit for the decode thread.
+struct Job {
+    codec: VideoCodecHandle,
+    /// Which codec the host was asked for, for a message about the host.
+    name: &'static str,
+    /// The extent the picture must come back at, and the configuration record the session is
+    /// keyed on.
+    width: u32,
+    height: u32,
+    config: Configuration,
+    /// The layout the target wants, or `None` for a unit with no target: that expresses no
+    /// opinion about the layout, so the session keeps the one it has. Rebuilding it around a
+    /// default would tear a live session down mid-stream on any layout but NV12.
+    pixels: Option<PixelFormat>,
+    unit: Vec<u8>,
+    /// The frame's picture is known to come back wrong on this host; see [`Shape::misreturned`].
+    misreturned: bool,
+    /// Whether that picture was meant for a target, which is the only case worth saying so.
+    withheld: bool,
+    write: Write,
+    landing: Arc<pending::Landing>,
+}
+
+/// What the decode thread does with the picture.
+enum Write {
+    /// Nothing: no target, or one whose picture is withheld.
+    Nothing,
+    /// Hand it back, for per-plane targets to upload as each plane's texture settles. Uploads
+    /// need a GL context, which this thread does not have.
+    Keep,
+    /// Write it into a composite target's surface planes, which needs no GL at all.
+    Planes {
+        surface: Arc<dyn Held>,
+        /// Each plane's tight extent, read on the render thread where the target's planes are.
+        geometry: Vec<Option<resource::PlaneGeometry>>,
+        layout: TargetFormat,
+    },
+}
+
+fn decode_thread(queue: std::sync::mpsc::Receiver<Job>) {
+    let mut session = None;
+    for job in queue {
+        let outcome = decode_one(&mut session, &job);
+        job.landing.land(outcome);
+    }
+}
+
+/// Decode one unit on the decode thread. Every failure is the frame's and not the stream's: it
+/// is logged, the target keeps what it held, and the next frame decodes as usual.
+fn decode_one(session: &mut Option<Session>, job: &Job) -> pending::Outcome {
+    let handle = job.codec;
+    let pixels = job
+        .pixels
+        .unwrap_or_else(|| session.as_ref().map_or(PixelFormat::BiPlanar420, Session::pixels));
+    let key =
+        SessionKey { width: job.width, height: job.height, pixels, config: job.config.clone() };
+    // Rebuilt only when the frame's shape actually changes: a rebuild takes the reference
+    // pictures with it, and every frame after one that did not need it then predicts from an
+    // empty buffer -- which decodes "successfully" and looks like slightly wrong colour.
+    if !session.as_ref().is_some_and(|s| s.serves(&key)) && !adopt(session, &key, handle) {
+        match Session::create(key) {
+            Ok(created) => *session = Some(created),
+            Err(status) => {
+                // The probe advertised this codec, so a host that now says it has no such
+                // decoder is contradicting itself and every later frame will fail the same way.
+                assert!(
+                    !status.is_no_such_decoder(),
+                    "VideoToolbox advertised {} and then had no decoder for it",
+                    job.name,
+                );
+                eprintln!("[virglrs] video codec {handle}: no decode session ({status:?})");
+                return pending::Outcome::Nothing;
+            }
+        }
+    }
+    let live = session.as_mut().expect("a session was just built or kept");
+
+    let picture = match live.decode(&job.unit) {
+        Ok(picture) => picture,
+        Err(why) => {
+            eprintln!("[virglrs] video codec {handle}: the host decoded no picture ({why:?})");
+            return pending::Outcome::Nothing;
+        }
+    };
+    // Decoded, which is all a frame the host returns wrong was submitted for. Ahead of the width
+    // check: such a frame comes back at some other width, and whatever it comes back at, it is not
+    // refused -- the decoder has it, and later frames predict from it.
+    if job.misreturned {
+        // Only a withheld delivery is news. A re-emission claiming its slot never had a picture
+        // to deliver, and its first emission already said this.
+        if job.withheld {
+            eprintln!(
+                "[virglrs] video codec {handle}: this host does not return AV1 super-resolution \
+                 frames correctly; the frame is decoded for later frames to predict from, but its \
+                 picture is withheld and the target keeps what it held"
+            );
+        }
+        return pending::Outcome::Nothing;
+    }
+    // The picture comes back at its coded width. A host returning some other width has returned
+    // something that is not this frame, and delivering it puts visibly wrong content on screen
+    // with nothing anywhere reporting a problem.
+    if picture.width() != job.width {
+        eprintln!(
+            "[virglrs] video codec {handle}: the host returned a {}-wide picture for a frame that \
+             declares {}; refusing it",
+            picture.width(),
+            job.width,
+        );
+        return pending::Outcome::Nothing;
+    }
+    match &job.write {
+        Write::Nothing => pending::Outcome::Nothing,
+        Write::Keep => pending::Outcome::Picture(picture),
+        Write::Planes { surface, geometry, layout } => {
+            let Some(locked) = picture.lock() else {
+                eprintln!(
+                    "[virglrs] video codec {handle}: the decoded picture could not be mapped"
+                );
+                return pending::Outcome::Nothing;
+            };
+            if write_planes(surface.surface(), geometry, *layout, &locked) > 0 {
+                pending::Outcome::Written
+            } else {
+                pending::Outcome::Nothing
+            }
+        }
+    }
+}
+
+/// Copy a decoded picture into the planes of a composite target's surface, returning how many
+/// planes were written.
+///
+/// Nothing is uploaded and no GL context is touched: the guest samples these planes through views
+/// of its own, so the surface is where the pixels belong and the only place they go.
+///
+/// Each plane's row length is the surface plane's own tight extent -- read back from the surface,
+/// which is what was actually allocated, and not from the target's separately stated width and
+/// height. Widening it to either pitch in sight, the decoder's or the kernel's, writes padding
+/// into the picture and shears it.
+fn write_planes(
+    surface: &crate::surface::Surface,
+    geometry: &[Option<resource::PlaneGeometry>],
+    layout: TargetFormat,
+    picture: &decode::Locked<'_>,
+) -> usize {
+    let count = picture.plane_count().min(geometry.len());
+    let mut written = 0;
+    for (index, geometry) in geometry.iter().enumerate().take(count) {
+        let Some(source) = picture.plane(layout.source_plane(index, count)) else {
+            continue;
+        };
+        let Some(geometry) = geometry else {
+            continue;
+        };
+        // Clamp to what the SOURCE holds, as the per-plane path does and for the same reason: the
+        // plane is the aligned allocation while the decoded picture holds exactly its own rows,
+        // so copying the plane's extent reads past the mapping.
+        let rows = geometry.height.min(source.height);
+        let row_bytes = geometry.row_bytes().min(source.pitch);
+        if surface.write_plane(index as u32, source.bytes, source.pitch, rows, row_bytes) {
+            written += 1;
+        } else {
+            // A refusal is the surface declining to lock -- the arithmetic here is clamped to both
+            // sides and cannot be the cause -- and it shows as a target holding the previous frame.
+            eprintln!(
+                "[virglrs] video: plane {index} of a composite target would not take a picture; \
+                 the frame keeps whatever was there"
+            );
+        }
+    }
+    written
+}
+
+/// Try to carry the live session across a change in the frame's shape.
+///
+/// **H.264's parameter sets are not constant across a stream, and tearing the session down when
+/// they change is not survivable.** `num_ref_idx_lX_active_minus1` reaches us as the effective
+/// *per-slice* count, so a slice that overrides the PPS default changes the PPS written for it by
+/// a byte or two mid-GOP. Keying the session on those bytes rebuilds the decompression session
+/// there and takes the reference pictures with it: every frame after the first override predicts
+/// from an empty buffer, which decodes "successfully" and puts quietly wrong pixels on screen.
+///
+/// So the parameter sets drive the format description, and the session is asked whether it will
+/// take the new one. Falling through to a rebuild stays correct, just lossy -- and says so,
+/// because a stream that does it every frame is worth knowing about.
+fn adopt(session: &mut Option<Session>, key: &SessionKey, handle: VideoCodecHandle) -> bool {
+    let Some(live) = session.as_mut() else {
+        return false;
+    };
+    if live.adopt(key) {
+        return true;
+    }
+    if key.config.is_parameter_sets() {
+        eprintln!(
+            "[virglrs] video codec {handle}: the parameter sets changed in a way the live session \
+             would not take; its reference pictures are lost across the rebuild"
+        );
+    }
+    false
+}
+
+/// The host's decoder, as the render thread sees it: a codec's decode thread, and what a job
+/// needs from this side before it can go.
 struct HostDecoder<'a> {
     gl: &'a Gl,
-    session: &'a mut Option<Session>,
+    decoder: &'a mut Decoder,
     /// Which codec the host was asked for, for a message about the host.
     codec: &'static str,
+    unsettled: &'a pending::Unsettled,
 }
 
 impl Submit for HostDecoder<'_> {
@@ -876,112 +1038,96 @@ impl Submit for HostDecoder<'_> {
                 let Layout::Served(layout) = buffer.format else {
                     return Err(unserved());
                 };
-                Some((buffer, layout, layout.pixels().ok_or_else(unserved)?))
+                Some((layout, layout.pixels().ok_or_else(unserved)?))
             }
             None => None,
         };
-        // A unit with no target expresses no opinion about the pixel layout, so the session
-        // keeps the one it has: rebuilding it around a default would tear a live session down
-        // mid-stream on any layout but NV12.
-        let pixels = match destination {
-            Some((_, _, pixels)) => pixels,
-            None => self.session.as_ref().map_or(PixelFormat::BiPlanar420, Session::pixels),
+        let landing = pending::Landing::new();
+        // Only a delivered picture is waited for. A withheld one leaves its target as it was,
+        // and a unit decoded for its reference value has no target at all.
+        let (write, synchronous) = match (delivery, destination) {
+            (Delivery::To(buffer), Some((layout, _))) => {
+                let (write, synchronous) = self.expect(buffer, layout, &landing);
+                (write, synchronous.then_some(buffer))
+            }
+            _ => (Write::Nothing, None),
         };
-
         let (width, height) = shape.extent();
-        let key = SessionKey { width, height, pixels, config: shape.configuration() };
-        // Rebuilt only when the frame's shape actually changes: a rebuild takes the reference
-        // pictures with it, and every frame after one that did not need it then predicts from
-        // an empty buffer -- which decodes "successfully" and looks like slightly wrong colour.
-        if !self.session.as_ref().is_some_and(|s| s.serves(&key)) && !self.adopt(&key, handle) {
-            let codec = self.codec;
-            *self.session = Some(Session::create(key).map_err(|status| {
-                // The probe advertised this codec, so a host that now says it has no such
-                // decoder is contradicting itself and every later frame will fail the same way.
-                assert!(
-                    !status.is_no_such_decoder(),
-                    "VideoToolbox advertised {codec} and then had no decoder for it",
-                );
-                eprintln!("[virglrs] video codec {handle}: no decode session ({status:?})");
-                Refusal::HostRefusedFrame
-            })?);
+        self.decoder.send(Job {
+            codec: handle,
+            name: self.codec,
+            width,
+            height,
+            config: shape.configuration(),
+            pixels: destination.map(|(_, pixels)| pixels),
+            unit: unit.to_vec(),
+            misreturned: shape.misreturned(),
+            withheld: matches!(delivery, Delivery::Withheld(_)),
+            write,
+            landing,
+        });
+        if let Some(buffer) = synchronous {
+            buffer.settle(self.gl);
         }
-        let session = self.session.as_mut().expect("a session was just built or kept");
-
-        let picture = match session.decode(unit) {
-            Ok(picture) => picture,
-            Err(why) => {
-                eprintln!("[virglrs] video codec {handle}: the host decoded no picture ({why:?})");
-                return Err(Refusal::HostRefusedFrame);
-            }
-        };
-        // Decoded, which is all a frame the host returns wrong was submitted for. Ahead of the
-        // width check: such a frame comes back at some other width, and whatever it comes back
-        // at, it is not refused -- the decoder has it, and later frames predict from it.
-        if shape.misreturned() {
-            // Only a withheld delivery is news. A re-emission claiming its slot never had a
-            // picture to deliver, and its first emission already said this.
-            if let Delivery::Withheld(_) = delivery {
-                eprintln!(
-                    "[virglrs] video codec {handle}: this host does not return AV1 \
-                     super-resolution frames correctly; the frame is decoded for later frames to \
-                     predict from, but its picture is withheld and the target keeps what it held"
-                );
-            }
-            return Ok(());
-        }
-        // The picture comes back at its coded width. A host returning some other width has
-        // returned something that is not this frame, and delivering it puts visibly wrong
-        // content on screen with nothing anywhere reporting a problem.
-        if picture.width() != width {
-            eprintln!(
-                "[virglrs] video codec {handle}: the host returned a {}-wide picture for a frame \
-                 that declares {}; refusing it",
-                picture.width(),
-                width,
-            );
-            return Err(Refusal::HostRefusedFrame);
-        }
-        let Some((buffer, layout, _)) = destination else {
-            return Ok(());
-        };
-        let Some(locked) = picture.lock() else {
-            eprintln!("[virglrs] video codec {handle}: the decoded picture could not be mapped");
-            return Err(Refusal::HostRefusedFrame);
-        };
-        buffer.deliver(self.gl, layout, &locked);
         Ok(())
     }
 }
 
 impl HostDecoder<'_> {
-    /// Try to carry the live session across a change in the frame's shape.
+    /// Mark the target's textures with the picture about to be decoded into them, and say what
+    /// the decode thread is to do with it.
     ///
-    /// **H.264's parameter sets are not constant across a stream, and tearing the session down
-    /// when they change is not survivable.** `num_ref_idx_lX_active_minus1` reaches us as the
-    /// effective *per-slice* count, so a slice that overrides the PPS default changes the PPS
-    /// written for it by a byte or two mid-GOP. Keying the session on those bytes rebuilds the
-    /// decompression session there and takes the reference pictures with it: every frame after
-    /// the first override predicts from an empty buffer, which decodes "successfully" and puts
-    /// quietly wrong pixels on screen.
+    /// The second half says the target is to be settled before END_FRAME returns, because its
+    /// picture must not land asynchronously. Two kinds of target are read somewhere no barrier of
+    /// ours stands:
     ///
-    /// So the parameter sets drive the format description, and the session is asked whether it
-    /// will take the new one. Falling through to a rebuild stays correct, just lossy -- and says
-    /// so, because a stream that does it every frame is worth knowing about.
-    fn adopt(&mut self, key: &SessionKey, handle: VideoCodecHandle) -> bool {
-        let Some(live) = self.session.as_mut() else {
-            return false;
-        };
-        if live.adopt(key) {
-            return true;
+    /// - a composite surface lent to a venus context, which reads it on a Vulkan queue (see
+    ///   [`crate::surface::Surface::mark_lent`]);
+    /// - a per-plane target any of whose plane textures has a surface of its own, which can be
+    ///   presented or lent, and whose picture reaches it by an upload on this thread -- a fence
+    ///   waits for the decode to land, not for that upload. None does today: a surface is minted
+    ///   only for a 32-bit colour texture, and a plane is R8 or RG8. The rule is here so that
+    ///   minting one for a plane does not quietly make the fence a lie.
+    ///
+    /// The composite case is decided at END_FRAME, so a lend that happens later leaves the
+    /// decode already queued to land on its own. Asynchronous decode widens that window from the
+    /// END_FRAME itself to the decode's length; the lend is not ordered against END_FRAME on the
+    /// control queue either way, and closing it is the venus side's (the design's phase 3).
+    fn expect(
+        &self,
+        buffer: &Buffer,
+        layout: TargetFormat,
+        landing: &Arc<pending::Landing>,
+    ) -> (Write, bool) {
+        let pending = |recipe| pending::Pending::new(Arc::clone(landing), recipe, self.unsettled);
+        match &buffer.destination {
+            Destination::PerPlane(planes) => {
+                for (index, plane) in planes.iter().enumerate() {
+                    let upload = pending::PlaneUpload {
+                        index,
+                        layout,
+                        gl: plane.gl,
+                        block_bytes: plane.block_bytes,
+                        width: plane.width,
+                        height: plane.height,
+                    };
+                    plane.texture.expect_decode(self.gl, pending(pending::Recipe::Plane(upload)));
+                }
+                let surfaced = planes
+                    .iter()
+                    .any(|plane| plane.texture.minted().is_some() || plane.texture.exported());
+                (Write::Keep, surfaced)
+            }
+            Destination::Composite(texture) => {
+                // A composite target without planes cannot be built -- `create_buffer` refuses it
+                // -- so reaching this with none is a host bug and not a guest one.
+                let planes = texture.planes.as_ref().expect("a composite decode target has planes");
+                let geometry = (0..planes.count()).map(|index| planes.geometry(index)).collect();
+                texture.expect_decode(self.gl, pending(pending::Recipe::Composite));
+                let write = Write::Planes { surface: planes.held(), geometry, layout };
+                (write, planes.surface().is_lent())
+            }
         }
-        if key.config.is_parameter_sets() {
-            eprintln!(
-                "[virglrs] video codec {handle}: the parameter sets changed in a way the live \
-                 session would not take; its reference pictures are lost across the rebuild"
-            );
-        }
-        false
     }
 }
 
@@ -1065,23 +1211,24 @@ impl Av1 {
 
 impl Codec {
     /// The host's decoder for this codec's frames.
-    fn host<'a>(&'a mut self, gl: &'a Gl) -> HostDecoder<'a> {
-        HostDecoder { gl, session: &mut self.session, codec: self.kind.name() }
+    fn host<'a>(&'a mut self, gl: &'a Gl, unsettled: &'a pending::Unsettled) -> HostDecoder<'a> {
+        HostDecoder { gl, decoder: &mut self.decoder, codec: self.kind.name(), unsettled }
     }
 
     /// DECODE_BITSTREAM for AV1. See [`Av1::advance`].
     fn decode_av1(
         &mut self,
         gl: &Gl,
+        unsettled: &pending::Unsettled,
         handle: VideoCodecHandle,
         target: VideoBufferHandle,
         descriptor: &[u8],
         bitstream: &[u8],
     ) -> Result<(), Refusal> {
-        let Codec { kind: Kind::Av1(av1), session, frame, width, height, .. } = self else {
+        let Codec { kind: Kind::Av1(av1), decoder, frame, width, height, .. } = self else {
             unreachable!("only an AV1 codec decodes an AV1 frame");
         };
-        let mut host = HostDecoder { gl, session, codec: "AV1" };
+        let mut host = HostDecoder { gl, decoder, codec: "AV1", unsettled };
         let next = av1.advance(&mut host, handle, descriptor, (*width, *height))?;
         let (accumulated, shape) = frame.open_on(target)?;
         accumulated.extend_from_slice(bitstream);
@@ -1093,15 +1240,17 @@ impl Codec {
     fn end_av1_frame(
         &mut self,
         gl: &Gl,
+        unsettled: &pending::Unsettled,
         handle: VideoCodecHandle,
         shape: &Shape,
         tiles: &[u8],
         buffer: Arc<Buffer>,
     ) -> Result<(), Refusal> {
-        let Codec { kind: Kind::Av1(av1), session, .. } = self else {
+        let Codec { kind: Kind::Av1(av1), decoder, .. } = self else {
             unreachable!("only an AV1 codec ends an AV1 frame");
         };
-        av1.end(&mut HostDecoder { gl, session, codec: "AV1" }, handle, shape, tiles, buffer)
+        let mut host = HostDecoder { gl, decoder, codec: "AV1", unsettled };
+        av1.end(&mut host, handle, shape, tiles, buffer)
     }
 }
 
@@ -1313,7 +1462,7 @@ impl Video {
             gate: Gate::AwaitingKey { dropped: 0, freeze: None },
             nothing_to_decode: 0,
             frame: Frame::Idle,
-            session: None,
+            decoder: Decoder::default(),
         });
         Ok(())
     }
@@ -1445,6 +1594,7 @@ impl Video {
     pub fn decode_bitstream(
         &mut self,
         gl: &Gl,
+        unsettled: &pending::Unsettled,
         codec: VideoCodecHandle,
         target: VideoBufferHandle,
         descriptor: &[u8],
@@ -1458,7 +1608,7 @@ impl Video {
         // at END_FRAME -- and a stream may display a hidden frame just one decode later, which
         // leaves no margin.
         if matches!(codec.kind, Kind::Av1(_)) {
-            return codec.decode_av1(gl, handle, target, descriptor, bitstream);
+            return codec.decode_av1(gl, unsettled, handle, target, descriptor, bitstream);
         }
 
         let (accumulated, shape) = codec.frame.open_on(target)?;
@@ -1528,6 +1678,25 @@ impl Video {
         Ok(())
     }
 
+    /// The decodes this context has in flight, one per codec: a codec's decodes land in order,
+    /// so its newest having landed means all of them have. A fence created now waits for these.
+    pub fn in_flight(&self) -> impl Iterator<Item = Arc<pending::Landing>> + '_ {
+        self.codecs.values().filter_map(|codec| codec.decoder.in_flight())
+    }
+
+    /// Deliver every picture that has already landed in one of this video's targets.
+    ///
+    /// A landed picture still holds the decoder's buffer it came in, and those come from a pool
+    /// VideoToolbox sizes for the stream: a target the guest decodes into and never reads would
+    /// keep one pinned until the pool ran dry and the decoder stalled on it. Called at every
+    /// END_FRAME, which is the rate the pool drains at, and never waits -- a picture still in
+    /// flight is the next END_FRAME's.
+    fn deliver_landed(&self, gl: &Gl) {
+        for texture in self.buffers.values().flat_map(|buffer| buffer.textures()) {
+            texture.settle(gl, pending::Wait::IfLanded);
+        }
+    }
+
     fn codec_mut(&mut self, handle: VideoCodecHandle) -> Result<&mut Codec, Refusal> {
         self.codecs.get_mut(&handle).ok_or(Refusal::NoSuchObject("no such video codec"))
     }
@@ -1541,9 +1710,11 @@ impl Video {
         &mut self,
         gl: &Gl,
         features: &Features,
+        unsettled: &pending::Unsettled,
         handle: VideoCodecHandle,
         target: VideoBufferHandle,
     ) -> Result<(), Refusal> {
+        self.deliver_landed(gl);
         let codec = self.codec_mut(handle)?;
         let Frame::Open { handle: began_on, target: buffer, bitstream, shape } =
             std::mem::replace(&mut codec.frame, Frame::Idle)
@@ -1583,13 +1754,13 @@ impl Video {
         // AV1's unit is synthesized from the descriptor rather than re-framed from what the
         // guest sent, and may be held rather than submitted at all.
         if let Shape::Av1 { .. } = shape {
-            return codec.end_av1_frame(gl, handle, &shape, &bitstream, buffer);
+            return codec.end_av1_frame(gl, unsettled, handle, &shape, &bitstream, buffer);
         }
         let Some(unit) = shape.access_unit(bitstream) else {
             eprintln!("[virglrs] video codec {handle}: the access unit is not Annex-B framed");
             return Err(Refusal::HostRefusedFrame);
         };
-        codec.host(gl).submit(handle, &shape, &unit, Some(&buffer))
+        codec.host(gl, unsettled).submit(handle, &shape, &unit, Some(&buffer))
     }
 }
 
@@ -1637,6 +1808,10 @@ impl Buffer {
     /// the decode itself does not feed either -- see [`Video::end_frame`] -- so writing it here
     /// would make a dropped frame more thorough than a decoded one.
     fn replicate_into(&self, to: &Buffer, gl: &Gl, features: &Features) -> bool {
+        // Both sides settled first: the copy reads this target's picture, and a decode still in
+        // flight into the other would land on top of the copy after it.
+        self.settle(gl);
+        to.settle(gl);
         match (&self.destination, &to.destination) {
             (Destination::Composite(from), Destination::Composite(into)) => {
                 let (Some(from), Some(into)) = (from.planes.as_ref(), into.planes.as_ref()) else {
