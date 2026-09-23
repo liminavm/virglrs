@@ -139,6 +139,120 @@ impl<T: Handle> Guest<T> {
     }
 }
 
+/// A struct, or an array of them, exactly as the decoder built it in the batch arena.
+///
+/// A `Vk*` struct carries raw pointers -- its `pNext` chain and every array it names -- and the
+/// driver hands it to Vulkan, which follows them. Its fields are all `pub` and it is `Copy`,
+/// because it has C's layout and the driver assembles its own; so a bare `&VkBufferCreateInfo`
+/// says nothing about where its pointers go, and a driver entry point taking one would be trusting
+/// whoever made it. This says where they go: only the decoder mints one, and every driver entry
+/// point that passes a guest's struct on to Vulkan takes this rather than a reference. A handler
+/// can hand over what the guest sent, and nothing it made or changed -- copying the struct out
+/// gives back a bare value no entry point will take.
+///
+/// `'a` is the arena's, so it cannot outlive the memory its pointers name either.
+///
+/// `repr(transparent)` over the reference, so a command member of type `Option<Decoded<..>>` keeps
+/// the one pointer word C's struct has there.
+#[repr(transparent)]
+pub struct Decoded<'a, T: ?Sized>(&'a T);
+
+impl<T: ?Sized> Clone for Decoded<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: ?Sized> Copy for Decoded<'_, T> {}
+
+impl<T: ?Sized> core::ops::Deref for Decoded<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.0
+    }
+}
+
+impl<'a, T: ?Sized> Decoded<'a, T> {
+    /// Vouch for `r` as something the decoder built.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer reachable from `r` -- through `pNext`, through every array member and into
+    /// the structs those name -- is null, or names memory that lives for `'a` and holds as many
+    /// elements as the count beside it says. The decoder meets that by construction: it allocated
+    /// every one of them from the arena `'a` borrows, sized by the count it decoded beside it.
+    pub(crate) unsafe fn vouch(r: &'a T) -> Self {
+        Decoded(r)
+    }
+
+    /// Plant a struct a test built, as though the decoder had.
+    #[cfg(test)]
+    pub fn planted(r: &'a T) -> Self {
+        Decoded(r)
+    }
+
+    /// The reference, for reading. Reading is not what needs vouching for; handing a struct on is.
+    pub fn get(self) -> &'a T {
+        self.0
+    }
+}
+
+impl<'a, T> Decoded<'a, [T]> {
+    /// Each element, vouched for as the array was: an element of a decoded array is decoded.
+    pub fn iter(self) -> impl ExactSizeIterator<Item = Decoded<'a, T>> + Clone {
+        self.0.iter().map(Decoded)
+    }
+
+    /// The element at `i`, if there is one.
+    pub fn at(self, i: usize) -> Option<Decoded<'a, T>> {
+        self.0.get(i).map(Decoded)
+    }
+}
+
+/// A struct with no pointer anywhere in it -- an extent, a region, a subresource. Generated.
+///
+/// There is nothing in one for Vulkan to follow, so there is nothing to vouch for, and any
+/// reference to one is as good as a decoded one: see the `From` below.
+///
+/// # Safety
+///
+/// Implementing this asserts the type holds no pointer, directly or in any member it embeds. The
+/// generator implements it from the same predicate that decides what [`Decoded`] guards.
+pub unsafe trait Plain {}
+
+impl<'a, T: Plain> From<&'a T> for Decoded<'a, T> {
+    fn from(r: &'a T) -> Self {
+        Decoded(r)
+    }
+}
+
+impl<'a, T: Plain> From<&'a [T]> for Decoded<'a, [T]> {
+    fn from(r: &'a [T]) -> Self {
+        Decoded(r)
+    }
+}
+
+impl<T> Default for Decoded<'_, [T]> {
+    /// No elements, so no pointers to vouch for.
+    fn default() -> Self {
+        Decoded(&[])
+    }
+}
+
+impl<T: ?Sized + core::fmt::Debug> core::fmt::Debug for Decoded<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A struct that heads a `pNext` chain, which is every Vulkan struct with an `sType`. Generated.
+///
+/// Reading the pointer is safe; following it is what needs the struct to be [`Decoded`].
+pub trait Links {
+    fn next(&self) -> *const core::ffi::c_void;
+}
+
 pub trait Handle: Copy {
     /// The `VkObjectType` discriminant of this handle's Vulkan type.
     ///
@@ -1141,6 +1255,42 @@ mod tests {
         assert!(!e.copies() && !e.clones(), "an enumeration can be duplicated");
         let q = &Probe::<vn_command_vkGetQueryPoolResults<'static>>(PhantomData);
         assert!(!q.copies() && !q.clones(), "a blob query can be duplicated");
+    }
+
+    /// `Plain` is the one safe way to a [`Decoded`], so it must never be on a struct Vulkan follows
+    /// a pointer out of -- whether the pointer is its own member, a function pointer, or inside a
+    /// struct it embeds.
+    #[test]
+    fn a_struct_with_a_pointer_anywhere_in_it_is_never_plain() {
+        use crate::venus::proto::types::{
+            VkAllocationCallbacks, VkAttachmentSampleLocationsEXT, VkBufferCreateInfo, VkExtent3D,
+            VkImageSubresource,
+        };
+        use core::marker::PhantomData;
+        struct Probe<T>(PhantomData<T>);
+        trait IsPlain {
+            fn plain(&self) -> bool {
+                true
+            }
+        }
+        impl<T: Plain> IsPlain for Probe<T> {}
+        trait NotPlain {
+            fn plain(&self) -> bool {
+                false
+            }
+        }
+        impl<T> NotPlain for &Probe<T> {}
+
+        // The positive control: plain values are plain.
+        let (extent, sub) =
+            (&Probe::<VkExtent3D>(PhantomData), &Probe::<VkImageSubresource>(PhantomData));
+        assert!(extent.plain() && sub.plain());
+        let buffer = &Probe::<VkBufferCreateInfo>(PhantomData);
+        assert!(!buffer.plain(), "a pNext and an array");
+        let callbacks = &Probe::<VkAllocationCallbacks>(PhantomData);
+        assert!(!callbacks.plain(), "function pointers");
+        let embeds = &Probe::<VkAttachmentSampleLocationsEXT>(PhantomData);
+        assert!(!embeds.plain(), "a pointer inside an embedded struct");
     }
 
     #[test]

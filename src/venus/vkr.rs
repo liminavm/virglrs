@@ -684,7 +684,11 @@ mod tests {
         };
         use crate::venus::proto::types::vn_command_vkCreateRingMESA as Args;
 
-        let args = Args { ring, pCreateInfo: Some(info), ..Default::default() };
+        let args = Args {
+            ring,
+            pCreateInfo: Some(crate::venus::cs::Decoded::planted(info)),
+            ..Default::default()
+        };
         let proto = crate::venus::cs::AllOfIt;
         let mut buf = vec![0u8; vn_sizeof_vkCreateRingMESA_args(&proto, &args)];
         let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);

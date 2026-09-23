@@ -12,7 +12,7 @@
 use core::ffi::c_void;
 use core::marker::PhantomData;
 
-use crate::venus::cs::{ObjectId, Scalar};
+use crate::venus::cs::{self, ObjectId, Scalar};
 
 /// Vulkan's handles are pointer-sized on every target this renderer supports.
 const _: () = assert!(size_of::<*const c_void>() == 8);
@@ -101,6 +101,20 @@ pub struct ${ty.name} {
     pub ${name}: ${rs},
 %   endfor
 }
+
+%   if not RUST.carries_pointers(ty.name):
+// SAFETY: no member of this struct is a pointer, nor embeds one -- `carries_pointers` says so.
+unsafe impl cs::Plain for ${ty.name} {}
+
+%   endif
+%   if any(v.name == 'pNext' for v in ty.variables):
+impl cs::Links for ${ty.name} {
+    fn next(&self) -> *const c_void {
+        self.pNext${'' if next(v for v in ty.variables if v.name == 'pNext').ty.is_const_pointer() else '.cast_const()'}.cast()
+    }
+}
+
+%   endif
 
 impl Default for ${ty.name} {
     fn default() -> Self {

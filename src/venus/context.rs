@@ -19,7 +19,7 @@ use crate::ids::{ContextId, ResourceHandle, RingId};
 
 use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
-use super::cs::{Guest, HostHandle, ObjectId};
+use super::cs::{Decoded, Guest, HostHandle, ObjectId};
 use super::driver::{
     self, Answered, Driver, DriverWait, ExportError, Exported, MemoryError, NoSubmit2, NoSyncFd,
     NotATimeline,
@@ -1151,8 +1151,8 @@ impl Drop for Context {
 /// a guest error), and a real period (`Some(Some(us))`). Collapsing the first two would turn a
 /// malformed request into a silently unmonitored ring, and the guest would abort itself seconds
 /// later with nothing said about why.
-fn monitor_period(info: &VkRingCreateInfoMESA) -> Option<Option<u32>> {
-    let m: &VkRingMonitorInfoMESA = driver::chained(&info.pNext)?;
+fn monitor_period(info: Decoded<'_, VkRingCreateInfoMESA>) -> Option<Option<u32>> {
+    let m = driver::chained::<VkRingMonitorInfoMESA>(info)?;
     Some(Some(m.maxReportingPeriodMicroseconds).filter(|&us| us != 0))
 }
 
@@ -2053,7 +2053,7 @@ impl Handlers<'_> {
     /// The `Option` it takes is a fact about the wire, not about Vulkan: the decoder types every
     /// by-ref member this way because a guest can always send a null. Deciding what that null
     /// means is the handler's, and this is where the whole family decides it once.
-    fn names<'w, I>(&mut self, info: Option<&'w I>) -> Option<&'w I> {
+    fn names<I>(&mut self, info: Option<I>) -> Option<I> {
         if info.is_none() {
             self.reject = Some("asked a query without saying what it is about");
         }
@@ -2683,14 +2683,7 @@ impl Commands for Handlers<'_> {
     /// scanout surface has to be minted at exactly them.
     fn vkCreateImage(&mut self, args: &mut vn_command_vkCreateImage<'_>) {
         let Some(info) = self.names(args.pCreateInfo) else { return };
-        // An image the guest means to share is created with rows the host can address -- see
-        // `external_images_are_linear`. The facts noted below are of the image the driver made.
-        let info = driver::external_images_are_linear(info);
-        let host =
-            self.driver.create_object(args.device, |d| d.vkCreateImage(), &info, args.pAllocator);
-        if let Ok(image) = host {
-            self.driver.note_image(image, &info);
-        }
+        let host = self.driver.create_image(args.device, info, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkCreateImage", args.pImage(), args.handle_pImage_mut(), host);
     }
@@ -3193,7 +3186,7 @@ impl Commands for Handlers<'_> {
             return;
         }
 
-        let ring = match Ring::create(self.resources, info, self.replaying) {
+        let ring = match Ring::create(self.resources, info.get(), self.replaying) {
             Ok(r) => r,
             Err(RingError::NoResource(h)) => {
                 eprintln!("[virglrs] vkCreateRingMESA: resource {h} is not a mapped shm resource");
@@ -3752,9 +3745,9 @@ impl Commands for Handlers<'_> {
         let (device, image) = (args.device, args.image);
         let Some(sub) = self.names(args.pSubresource) else { return };
         let Some(out) = self.fills(args.pLayout_mut()) else { return };
-        let r = self
-            .driver
-            .dev_query_arg_info(device, image, sub, out, |d| d.try_vkGetImageSubresourceLayout());
+        let r = self.driver.dev_query_arg_info(device, image, sub.into(), out, |d| {
+            d.try_vkGetImageSubresourceLayout()
+        });
         self.asked(r);
     }
 
@@ -6346,7 +6339,7 @@ mod tests {
                     ser::vn_sizeof_vkWaitSemaphores_args,
                     ser::vn_encode_vkWaitSemaphores_args,
                     ty::vn_command_vkWaitSemaphores {
-                        pWaitInfo: Some(&wait_info),
+                        pWaitInfo: Some(Decoded::planted(&wait_info)),
                         timeout: u64::MAX,
                         ..Default::default()
                     },
@@ -6359,7 +6352,7 @@ mod tests {
                     ser::vn_sizeof_vkSignalSemaphore_args,
                     ser::vn_encode_vkSignalSemaphore_args,
                     ty::vn_command_vkSignalSemaphore {
-                        pSignalInfo: Some(&signal_info),
+                        pSignalInfo: Some(Decoded::planted(&signal_info)),
                         ..Default::default()
                     },
                     GENERATE_REPLY
@@ -6863,7 +6856,7 @@ mod tests {
             ser::vn_encode_vkWaitSemaphores_args,
             ty::vn_command_vkWaitSemaphores {
                 device: VkDevice(GUEST_DEV),
-                pWaitInfo: Some(&info),
+                pWaitInfo: Some(Decoded::planted(&info)),
                 timeout: u64::MAX,
                 ..Default::default()
             },
@@ -6874,7 +6867,7 @@ mod tests {
             ser::vn_encode_vkSignalSemaphore_args,
             ty::vn_command_vkSignalSemaphore {
                 device: VkDevice(GUEST_DEV),
-                pSignalInfo: Some(&signal_info),
+                pSignalInfo: Some(Decoded::planted(&signal_info)),
                 ..Default::default()
             },
             GENERATE_REPLY
@@ -7171,7 +7164,11 @@ mod tests {
             pSignalSemaphores: sems.as_ptr(),
             ..Default::default()
         };
-        captured_from.driver_mut().queue_submit(VkQueue(QUEUE), &[work], VkFence(FENCE_UP));
+        captured_from.driver_mut().queue_submit(
+            VkQueue(QUEUE),
+            Decoded::planted(&[work] as &[_]),
+            VkFence(FENCE_UP),
+        );
 
         let blob = captured_from.sync_export();
         let entries = sync::decode(&blob).expect("what the export wrote is a blob");
@@ -7349,7 +7346,7 @@ mod tests {
                     ser::vn_encode_vkWaitSemaphores_args,
                     ty::vn_command_vkWaitSemaphores {
                         device: VkDevice(GUEST_DEV),
-                        pWaitInfo: Some(&wait),
+                        pWaitInfo: Some(Decoded::planted(&wait)),
                         timeout: u64::MAX,
                         ..Default::default()
                     },
@@ -7363,7 +7360,7 @@ mod tests {
                     ser::vn_encode_vkSignalSemaphore_args,
                     ty::vn_command_vkSignalSemaphore {
                         device: VkDevice(GUEST_DEV),
-                        pSignalInfo: Some(&signal),
+                        pSignalInfo: Some(Decoded::planted(&signal)),
                         ..Default::default()
                     },
                     GENERATE_REPLY
@@ -7423,7 +7420,7 @@ mod tests {
                 let mut id = VkSemaphore(GUEST_SEM);
                 let mut made = ty::vn_command_vkCreateSemaphore::default();
                 made.device = VkDevice(GUEST_DEV);
-                made.pCreateInfo = Some(&info);
+                made.pCreateInfo = Some(Decoded::planted(&info));
                 made.plant_pSemaphore(&mut id);
 
                 let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
@@ -7591,7 +7588,7 @@ mod tests {
         let mut q = ty::vn_command_vkGetImageSubresourceLayout2::default();
         q.device = VkDevice(GUEST_DEV);
         q.image = VkImage(GUEST_IMG);
-        q.pSubresource = Some(&sub);
+        q.pSubresource = Some(Decoded::planted(&sub));
         q.plant_pLayout(&mut layout_out);
 
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
@@ -8588,7 +8585,7 @@ mod tests {
         let info = VkBufferDeviceAddressInfo::default();
         let mut args = vn_command_vkGetBufferDeviceAddress {
             device,
-            pInfo: Some(&info),
+            pInfo: Some(Decoded::planted(&info)),
             ..Default::default()
         };
         h.vkGetBufferDeviceAddress(&mut args);
@@ -8622,7 +8619,7 @@ mod tests {
         let info = super::super::proto::types::VkDeviceMemoryOpaqueCaptureAddressInfo::default();
         let mut args = vn_command_vkGetDeviceMemoryOpaqueCaptureAddress {
             device,
-            pInfo: Some(&info),
+            pInfo: Some(Decoded::planted(&info)),
             ..Default::default()
         };
         h.vkGetDeviceMemoryOpaqueCaptureAddress(&mut args);
@@ -8859,7 +8856,7 @@ mod tests {
         };
         use super::super::proto::types::vn_command_vkCreateRingMESA as Args;
 
-        let args = Args { ring, pCreateInfo: Some(info), ..Default::default() };
+        let args = Args { ring, pCreateInfo: Some(Decoded::planted(info)), ..Default::default() };
         let proto = crate::venus::cs::AllOfIt;
         let mut buf = vec![0u8; vn_sizeof_vkCreateRingMESA_args(&proto, &args)];
         let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
@@ -9511,11 +9508,19 @@ mod tests {
             note: None,
             journal: &mut jrnl,
         };
-        h.vkCreateRingMESA(&mut Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() });
+        h.vkCreateRingMESA(&mut Create {
+            ring: 7,
+            pCreateInfo: Some(Decoded::planted(&info)),
+            ..Default::default()
+        });
         assert_eq!(h.reject, None, "on the context's stream, creating is fine");
 
         h.current_ring = Some(RingId::new(7).unwrap());
-        h.vkCreateRingMESA(&mut Create { ring: 8, pCreateInfo: Some(&info), ..Default::default() });
+        h.vkCreateRingMESA(&mut Create {
+            ring: 8,
+            pCreateInfo: Some(Decoded::planted(&info)),
+            ..Default::default()
+        });
         assert_eq!(h.reject.take(), Some("created a ring from inside a ring's own stream"));
         h.vkDestroyRingMESA(&mut Destroy { ring: 7, ..Default::default() });
         assert_eq!(h.reject.take(), Some("destroyed a ring from inside a ring's own stream"));
@@ -9590,7 +9595,8 @@ mod tests {
             journal: &mut jrnl,
         };
         for ring in [low, high] {
-            let mut args = Create { ring, pCreateInfo: Some(&info), ..Default::default() };
+            let mut args =
+                Create { ring, pCreateInfo: Some(Decoded::planted(&info)), ..Default::default() };
             h.vkCreateRingMESA(&mut args);
             assert_eq!(h.reject, None, "ring {ring:#x} is a layout we accept");
         }
@@ -9642,12 +9648,14 @@ mod tests {
             journal: &mut jrnl,
         };
 
-        let mut first = Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() };
+        let mut first =
+            Create { ring: 7, pCreateInfo: Some(Decoded::planted(&info)), ..Default::default() };
         h.vkCreateRingMESA(&mut first);
         assert_eq!(h.reject, None);
         h.rings[&RingId::new(7).unwrap()].idle().set_head(0x1234);
 
-        let mut again = Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() };
+        let mut again =
+            Create { ring: 7, pCreateInfo: Some(Decoded::planted(&info)), ..Default::default() };
         h.vkCreateRingMESA(&mut again);
         assert!(h.reject.is_some(), "the second create under the same id is refused");
         assert_eq!(h.rings.len(), 1, "and did not add a second entry");
@@ -9761,7 +9769,7 @@ mod tests {
         let mut first_out = VkDeviceMemory(0x6001);
         let mut first = Alloc::default();
         first.device = VkDevice(DEVICE);
-        first.pAllocateInfo = Some(&info);
+        first.pAllocateInfo = Some(Decoded::planted(&info));
         first.plant_pMemory(&mut first_out);
         h.vkAllocateMemory(&mut first);
         assert_eq!(h.reject, None, "the first fits under the cap");
@@ -9771,7 +9779,7 @@ mod tests {
         let mut second_out = VkDeviceMemory(0x6002);
         let mut second = Alloc::default();
         second.device = VkDevice(DEVICE);
-        second.pAllocateInfo = Some(&info);
+        second.pAllocateInfo = Some(Decoded::planted(&info));
         second.plant_pMemory(&mut second_out);
         h.vkAllocateMemory(&mut second);
         assert!(
@@ -9826,7 +9834,8 @@ mod tests {
             note: None,
             journal: &mut jrnl,
         };
-        let mut args = Create { ring: 1, pCreateInfo: Some(&info), ..Default::default() };
+        let mut args =
+            Create { ring: 1, pCreateInfo: Some(Decoded::planted(&info)), ..Default::default() };
         h.vkCreateRingMESA(&mut args);
         assert!(h.reject.is_some());
         assert!(rings.is_empty(), "and nothing was registered");
@@ -11979,7 +11988,7 @@ mod tests {
         let info = VkShaderModuleCreateInfo { codeSize: 7, ..Default::default() };
         let mut args = vn_command_vkCreateShaderModule::default();
         args.device = VkDevice(DEVICE);
-        args.pCreateInfo = Some(&info);
+        args.pCreateInfo = Some(Decoded::planted(&info));
         h.vkCreateShaderModule(&mut args);
         assert!(h.reject.is_some(), "seven bytes is not a whole number of words");
         h.reject = None;
@@ -12011,7 +12020,7 @@ mod tests {
         let info = VkShaderModuleCreateInfo { codeSize: 8, ..Default::default() };
         let mut args = vn_command_vkCreateShaderModule::default();
         args.device = VkDevice(DEVICE);
-        args.pCreateInfo = Some(&info);
+        args.pCreateInfo = Some(Decoded::planted(&info));
         h.vkCreateShaderModule(&mut args);
         assert!(h.reject.is_none());
 
@@ -12190,7 +12199,7 @@ mod tests {
         let mut shadow = VkSamplerYcbcrConversion(0);
         let mut args = vn_command_vkCreateSamplerYcbcrConversion::default();
         args.device = VkDevice(DEVICE);
-        args.pCreateInfo = Some(&info);
+        args.pCreateInfo = Some(Decoded::planted(&info));
         args.plant_pYcbcrConversion(&mut wire);
         args.plant_handle_pYcbcrConversion(&mut shadow);
         h.vkCreateSamplerYcbcrConversion(&mut args);
@@ -12798,7 +12807,7 @@ mod tests {
 
         let odd = VkShaderModuleCreateInfo { codeSize: 7, ..Default::default() };
         let mut args = vn_command_vkCreateShaderModule::default();
-        args.pCreateInfo = Some(&odd);
+        args.pCreateInfo = Some(Decoded::planted(&odd));
         h.vkCreateShaderModule(&mut args);
         assert!(h.reject.is_some(), "a code size of 7 must not reach the driver");
 
@@ -12806,7 +12815,7 @@ mod tests {
         // refuses it -- which is a different answer from a protocol violation.
         let whole = VkShaderModuleCreateInfo { codeSize: 4, ..Default::default() };
         let mut args = vn_command_vkCreateShaderModule::default();
-        args.pCreateInfo = Some(&whole);
+        args.pCreateInfo = Some(Decoded::planted(&whole));
         h.reject = None;
         h.vkCreateShaderModule(&mut args);
         assert!(h.reject.is_none(), "a whole number of words is not a protocol violation");
@@ -13407,7 +13416,7 @@ mod tests {
         let mut shadow = VkQueryPool(0);
         let mut args = vn_command_vkCreateQueryPool::default();
         args.device = device;
-        args.pCreateInfo = Some(&info);
+        args.pCreateInfo = Some(Decoded::planted(&info));
         args.plant_pQueryPool(&mut id);
         args.plant_handle_pQueryPool(&mut shadow);
         h.vkCreateQueryPool(&mut args);
@@ -13624,7 +13633,7 @@ mod tests {
         // The count is `pAllocateInfo`'s, so the planters set only the pointers -- which is the
         // shape the decoder leaves too.
         let mut args = vn_command_vkAllocateCommandBuffers::default();
-        args.plant_pAllocateInfo(Some(&info));
+        args.plant_pAllocateInfo(Some(Decoded::planted(&info)));
         args.plant_pCommandBuffers(&mut asked);
         args.plant_handle_pCommandBuffers(&mut shadow);
         h.vkAllocateCommandBuffers(&mut args);
@@ -14707,7 +14716,7 @@ mod tests {
         // replaced by a success the renderer invented.
         let begin = VkCommandBufferBeginInfo::default();
         let mut args = vn_command_vkBeginCommandBuffer { commandBuffer: cb, ..Default::default() };
-        args.pBeginInfo = Some(&begin);
+        args.pBeginInfo = Some(Decoded::planted(&begin));
         h.vkBeginCommandBuffer(&mut args);
         assert!(h.reject.is_none());
         assert_eq!(args.ret, VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -15373,7 +15382,7 @@ mod tests {
         let mut shadow = [VkCommandBuffer(0); 3];
         let mut args = vn_command_vkAllocateCommandBuffers::default();
         args.device = VkDevice(DEVICE);
-        args.plant_pAllocateInfo(Some(&info));
+        args.plant_pAllocateInfo(Some(Decoded::planted(&info)));
         args.plant_pCommandBuffers(&mut wire);
         args.plant_handle_pCommandBuffers(&mut shadow);
 
@@ -15404,7 +15413,7 @@ mod tests {
         let mut shadow = [VkCommandBuffer(0); 3];
         let mut args = vn_command_vkAllocateCommandBuffers::default();
         args.device = VkDevice(DEVICE);
-        args.plant_pAllocateInfo(Some(&info));
+        args.plant_pAllocateInfo(Some(Decoded::planted(&info)));
         args.plant_pCommandBuffers(&mut wire);
         args.plant_handle_pCommandBuffers(&mut shadow);
         h.vkAllocateCommandBuffers(&mut args);
@@ -16387,7 +16396,7 @@ mod tests {
             VkImportSemaphoreResourceInfoMESA { semaphore: VkSemaphore(5), ..Default::default() };
         let mut args = vn_command_vkImportSemaphoreResourceMESA {
             device: VkDevice(DEVICE),
-            pImportSemaphoreResourceInfo: Some(&info),
+            pImportSemaphoreResourceInfo: Some(Decoded::planted(&info)),
             ..Default::default()
         };
         h.vkImportSemaphoreResourceMESA(&mut args);
@@ -16442,7 +16451,7 @@ mod tests {
         };
         let mut args = vn_command_vkImportSemaphoreResourceMESA {
             device: VkDevice(DEVICE),
-            pImportSemaphoreResourceInfo: Some(&info),
+            pImportSemaphoreResourceInfo: Some(Decoded::planted(&info)),
             ..Default::default()
         };
         h.vkImportSemaphoreResourceMESA(&mut args);
@@ -16459,7 +16468,7 @@ mod tests {
             VkImportSemaphoreResourceInfoMESA { semaphore: VkSemaphore(5), ..Default::default() };
         let mut args = vn_command_vkImportSemaphoreResourceMESA {
             device: VkDevice(BARE),
-            pImportSemaphoreResourceInfo: Some(&info),
+            pImportSemaphoreResourceInfo: Some(Decoded::planted(&info)),
             ..Default::default()
         };
         h.reject = None;

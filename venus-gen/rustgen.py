@@ -588,6 +588,38 @@ class RustGen:
     def member_expr(self, var):
         return 'val.%s' % self.field_name(var.name)
 
+    def carries_pointers(self, name):
+        """Whether the struct or union `name` holds a pointer, itself or in a member it embeds.
+
+        Those are the types a handler must not be able to assemble and hand the driver: Vulkan
+        follows every pointer in them. A struct of plain values can be built by anyone, and is --
+        a region, an extent, a clear colour -- and the driver trusts nothing in it. See
+        `cs::Decoded`.
+        """
+        if not hasattr(self, '_pointerful'):
+            kinds = (VkType.STRUCT, VkType.UNION)
+            types = {t.name: t for k in kinds for t in self.gen.supported_types[k]}
+            found = set()
+            changed = True
+            while changed:
+                changed = False
+                for n, t in types.items():
+                    if n in found:
+                        continue
+                    for v in t.variables:
+                        b = v.ty.base
+                        if (v.ty.is_pointer() or b.category == VkType.FUNCPOINTER
+                                or (b.category in kinds and b.name in found)):
+                            found.add(n)
+                            changed = True
+                            break
+            self._pointerful = found
+        return name in self._pointerful
+
+    def witnessed(self, ty, var):
+        """Whether a by-reference member is handed out as a `cs::Decoded` rather than a reference."""
+        return self.is_ref_member(ty, var) and self.carries_pointers(var.ty.base.name)
+
     def is_ref_member(self, ty, var):
         """Whether this member is a reference rather than a pointer.
 
@@ -618,6 +650,8 @@ class RustGen:
         `life` is the struct\'s lifetime everywhere but the layout table, which names types in a
         static and so has no borrow to name.
         """
+        if self.witnessed(ty, var):
+            return "Option<cs::Decoded<%s, %s>>" % (life, self.base_name(var.ty))
         if self.is_ref_member(ty, var):
             return "Option<&%s %s>" % (life, self.base_name(var.ty))
         return self.field_type(var)
@@ -853,7 +887,13 @@ class RustGen:
                            else '*p = dec.decode_scalar::<%s>();' % elem)
             # The arena hands back `&'a mut T` and the member wants `&'a T`, which is where the
             # decoder's lifetime enters the struct: a reborrow, not a cast.
-            hit.append('%s = Some(&*p);' % m if ref else '%s = p as %s _;' % (m, ptr))
+            if self.witnessed(ty, var):
+                hit += ['// SAFETY: the decode just above allocated every pointer in `p` from this',
+                        "// arena, each sized by the count it decoded beside it, and `'a` borrows",
+                        '// the arena.',
+                        '%s = Some(unsafe { cs::Decoded::vouch(&*p) });' % m]
+            else:
+                hit.append('%s = Some(&*p);' % m if ref else '%s = p as %s _;' % (m, ptr))
             return (['if dec.decode_simple_pointer() {'] + ['    ' + l for l in hit]
                     + ['} else {'] + ['    ' + l for l in miss] + ['}'])
 
@@ -1090,8 +1130,10 @@ class RustGen:
                     body = 'enc.encode_scalar::<%s>(*p);' % elem if kind == 'encode' \
                         else 'size += cs::sizeof_scalar::<%s>();' % elem
                 else:
-                    body = '%s(enc, p%s);' % (elem, tag) if kind == 'encode' \
-                        else 'size += %s(proto, p%s);' % (elem, tag)
+                    # A `cs::Decoded` member is lent as `&p`, and deref coercion does the rest.
+                    lent = '&p' if self.witnessed(ty, var) else 'p'
+                    body = '%s(enc, %s%s);' % (elem, lent, tag) if kind == 'encode' \
+                        else 'size += %s(proto, %s%s);' % (elem, lent, tag)
                 head = 'enc.encode_simple_pointer(%s.is_some());' % m if kind == 'encode' \
                     else 'size += cs::sizeof_scalar::<u64>();'
                 # A body that never names the pointee needs no binding for it.
@@ -1644,10 +1686,13 @@ class RustGen:
                  "    vn_decode_%s_args_temp(&mut dec, &mut got);" % n,
                  "    assert!(!dec.fatal(), \"the decoder poisoned its own encoder's wire\");",
                  ""]
-        for f, _, sure, _, ask in rows:
+        for f, elem, sure, wr, ask in rows:
             if not ask:
                 continue
-            got = "Some(got.%s())" % f if sure else "got.%s()" % f
+            # A vouched array is read through its reference, which is what `carried` compares.
+            read = '.get()' if not wr and self.carries_pointers(elem) else ''
+            got = ("Some(got.%s()%s)" % (f, read) if sure
+                   else "got.%s()%s" % (f, '.map(|a| a.get())' if read else ''))
             body.append('    carried(%s, N, got.%s as *const (), "%s");' % (got, f, f))
         return (["#[test]",
                  "fn %s_accessors_carry_the_wire() {" % n] + body + ["}", ""])
@@ -1671,7 +1716,10 @@ class RustGen:
             if shape[0] != 'pointer' or var.is_optional() or not var.can_validate():
                 continue
             f, base = self.field_name(var.name), self.base_name(var.ty)
-            if self.is_ref_member(ty, var):
+            if self.witnessed(ty, var):
+                out += ["    let %s_v = %s::default();" % (f, base),
+                        "    val.%s = Some(cs::Decoded::planted(&%s_v));" % (f, f)]
+            elif self.is_ref_member(ty, var):
                 out += ["    let %s_v = %s::default();" % (f, base),
                         "    val.%s = Some(&%s_v);" % (f, f)]
             else:
@@ -2078,10 +2126,17 @@ class RustGen:
             # As in `_scalar_accessor`: a create's out-array carries the guest's ids.
             read = 'cs::Guest<%s>' % elem if f in out_handles else elem
             sure = f in infallible
+            # An array of structs Vulkan will follow pointers out of is handed out vouched for,
+            # so it can be passed on; see `cs::Decoded`.
+            vouched = not mutable and self.carries_pointers(elem)
             if mutable and sure:
                 sig = 'pub fn %s_mut(&mut self) -> &mut [%s]' % (f, elem)
             elif mutable:
                 sig = 'pub fn %s_mut(&mut self) -> Option<&mut [%s]>' % (f, elem)
+            elif vouched and sure:
+                sig = "pub fn %s(&self) -> cs::Decoded<'a, [%s]>" % (f, read)
+            elif vouched:
+                sig = "pub fn %s(&self) -> Option<cs::Decoded<'a, [%s]>>" % (f, read)
             elif sure:
                 sig = "pub fn %s(&self) -> &'a [%s]" % (f, read)
             else:
@@ -2109,6 +2164,10 @@ class RustGen:
                     "        // sized to that count, and the arena outlives the struct's `'a`.",
                     '        unsafe { cs::%s((%s) as usize, val.%s as *%s _) }'
                     % (call, n, f, 'mut' if mutable else 'const')
+                    + ('' if not vouched else
+                       '\n            // SAFETY: and every pointer in its elements the decoder allocated'
+                       '\n            // from the same arena, sized as it decoded them.'
+                       '\n            .map(|a| unsafe { cs::Decoded::vouch(a) })')
                     + ('' if not sure else self.EXPECT),
                     '    }',
                     '']

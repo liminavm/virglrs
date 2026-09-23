@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use super::ring_thread::BarrierWaiter;
 use crate::ids::{ContextId, FenceId, RingIdx};
 
-use super::cs::{Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
+use super::cs::{self, Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
 use super::objects::Doomed;
 use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBool32, VkBuffer, VkBufferCopy,
@@ -1252,8 +1252,8 @@ fn sync_fd_fence_info(fence: VkFence) -> VkFenceGetFdInfoKHR {
 /// This is the whole of the conversion, and it lives here because here is where the C ABI starts.
 /// Above it a missing argument is `None`; below it, null -- and nothing in between has to know
 /// that Vulkan spells absence with a pointer value.
-fn ptr<T>(r: Option<&T>) -> *const T {
-    r.map_or(core::ptr::null(), |r| r as *const T)
+fn ptr<T>(r: Option<cs::Decoded<'_, T>>) -> *const T {
+    r.map_or(core::ptr::null(), |r| r.get() as *const T)
 }
 
 /// One extension name and version as Vulkan's own struct, or `None` for a name this build's
@@ -1429,8 +1429,8 @@ impl Driver {
     pub fn create_instance(
         &mut self,
         global: &Global,
-        info: &VkInstanceCreateInfo,
-        alloc: Option<&VkAllocationCallbacks>,
+        info: cs::Decoded<'_, VkInstanceCreateInfo>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkInstance, VkResult> {
         // One instance per context, as `objects` describes: a second would orphan the first's
         // devices and leak it, and no guest has a reason to ask.
@@ -1440,7 +1440,7 @@ impl Driver {
         let mut out = VkInstance(0);
         // SAFETY: `info` and `alloc` are the decoder's arena allocations, live for this call, and
         // `out` is a local. The guest cannot make them dangle: the arena outlives the batch.
-        let r = unsafe { (global.vkCreateInstance())(info, ptr(alloc), &mut out) };
+        let r = unsafe { (global.vkCreateInstance())(info.get(), ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -1590,8 +1590,8 @@ impl Driver {
     pub fn create_device(
         &mut self,
         pd: VkPhysicalDevice,
-        info: &VkDeviceCreateInfo,
-        alloc: Option<&VkAllocationCallbacks>,
+        info: cs::Decoded<'_, VkDeviceCreateInfo>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkDevice, VkResult> {
         if self.instance.is_none() {
             // A device on an instance this context never created. The guest named an instance the
@@ -1732,7 +1732,7 @@ impl Driver {
     pub fn pd_query_info<I, T, R>(
         &self,
         pd: VkPhysicalDevice,
-        info: &I,
+        info: cs::Decoded<'_, I>,
         out: &mut T,
         pick: impl FnOnce(
             &InstanceFns,
@@ -1741,7 +1741,7 @@ impl Driver {
     ) -> Result<R, VkResult> {
         let f = self.instance().and_then(pick).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `pd_query`; `info` borrows an arena struct live for the call.
-        Ok(unsafe { f(pd, info, out) })
+        Ok(unsafe { f(pd, info.get(), out) })
     }
 
     /// `vkGetPhysicalDeviceImageFormatProperties2`, with the external-memory half answered here
@@ -1765,7 +1765,7 @@ impl Driver {
     pub fn image_format_properties2(
         &self,
         pd: VkPhysicalDevice,
-        info: &VkPhysicalDeviceImageFormatInfo2,
+        info: cs::Decoded<'_, VkPhysicalDeviceImageFormatInfo2>,
         out: &mut VkImageFormatProperties2,
     ) -> Result<VkResult, VkResult> {
         let f = self
@@ -1773,12 +1773,12 @@ impl Driver {
             .and_then(|i| i.try_vkGetPhysicalDeviceImageFormatProperties2())
             .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
 
-        let Some(handle) = self.emulated_external_image(pd, info) else {
+        let Some(handle) = self.emulated_external_image(pd, info.get()) else {
             // SAFETY: as `pd_query_info`; both structs borrow arena entries live for the call.
-            return Ok(unsafe { f(pd, info, out) });
+            return Ok(unsafe { f(pd, info.get(), out) });
         };
 
-        let ret = without_external_image_info(info, |asked| {
+        let ret = without_external_image_info(info.get(), |asked| {
             // SAFETY: as above, and `asked` is the guest's own request with one link unchained.
             unsafe { f(pd, asked, out) }
         });
@@ -1816,7 +1816,7 @@ impl Driver {
         if !self.emulates_fd_external_memory(pd) {
             return None;
         }
-        let handle = chained::<VkPhysicalDeviceExternalImageFormatInfo>(&info.pNext)?.handleType;
+        let handle = chained_at::<VkPhysicalDeviceExternalImageFormatInfo>(&info.pNext)?.handleType;
         (handle.0 & FD_FLAVOURED != 0).then_some(handle)
     }
 
@@ -1894,13 +1894,13 @@ impl Driver {
     pub fn dev_ask_info<I, R>(
         &self,
         device: VkDevice,
-        info: &I,
+        info: cs::Decoded<'_, I>,
         pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I) -> R>,
     ) -> Result<R, VkResult> {
         let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `dev_query_info`; `info` borrows an arena struct live for the call.
-        Ok(unsafe { f(device, info) })
+        Ok(unsafe { f(device, info.get()) })
     }
 
     /// A device query that names what it is asking about with a struct. `info` is a borrow for
@@ -1908,7 +1908,7 @@ impl Driver {
     pub fn dev_query_info<I, T, R>(
         &self,
         device: VkDevice,
-        info: &I,
+        info: cs::Decoded<'_, I>,
         out: &mut T,
         pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I, *mut T) -> R>,
     ) -> Result<R, VkResult> {
@@ -1916,7 +1916,7 @@ impl Driver {
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: `device` is a handle this table was loaded from, `info` borrows an arena struct
         // live for the call, and `out` is a live exclusive borrow.
-        Ok(unsafe { f(device, info, out) })
+        Ok(unsafe { f(device, info.get(), out) })
     }
 
     /// A device query about one of the device's own objects.
@@ -1939,7 +1939,7 @@ impl Driver {
         &self,
         device: VkDevice,
         a: A,
-        info: &I,
+        info: cs::Decoded<'_, I>,
         out: &mut T,
         pick: impl FnOnce(
             &DeviceFns,
@@ -1948,7 +1948,7 @@ impl Driver {
         let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `dev_query_info`.
-        Ok(unsafe { f(device, a, info, out) })
+        Ok(unsafe { f(device, a, info.get(), out) })
     }
 
     /// An enumeration, in whichever of Vulkan's two calls the guest asked for.
@@ -2003,10 +2003,10 @@ impl Driver {
     pub fn create_semaphore(
         &mut self,
         device: VkDevice,
-        info: &VkSemaphoreCreateInfo,
-        alloc: Option<&VkAllocationCallbacks>,
+        info: cs::Decoded<'_, VkSemaphoreCreateInfo>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkSemaphore, VkResult> {
-        let kind = match chained::<VkSemaphoreTypeCreateInfo>(&info.pNext) {
+        let kind = match chained_at::<VkSemaphoreTypeCreateInfo>(&info.pNext) {
             Some(t) if t.semaphoreType == VkSemaphoreType::VK_SEMAPHORE_TYPE_TIMELINE => {
                 SemaphoreKind::Timeline
             }
@@ -2014,7 +2014,7 @@ impl Driver {
         };
         // The initial value is a `requested` like any other: a timeline created at 7 has been
         // asked to reach 7, and a restore that put it back at 0 would be moving it backwards.
-        let requested = match chained::<VkSemaphoreTypeCreateInfo>(&info.pNext) {
+        let requested = match chained_at::<VkSemaphoreTypeCreateInfo>(&info.pNext) {
             Some(t) => t.initialValue,
             None => 0,
         };
@@ -2141,7 +2141,9 @@ impl Driver {
             value,
             ..Default::default()
         };
-        self.dev_op_info(device, &info, |d| d.try_vkSignalSemaphore()) == VkResult::VK_SUCCESS
+        // SAFETY: built here, and its one pointer, `pNext`, is null.
+        let info = unsafe { cs::Decoded::vouch(&info) };
+        self.dev_op_info(device, info, |d| d.try_vkSignalSemaphore()) == VkResult::VK_SUCCESS
     }
 
     /// Let the fast-forward submits retire before the guest is allowed to see anything.
@@ -2170,7 +2172,7 @@ impl Driver {
             self.pending_fences.insert(fence);
         }
         for s in submits {
-            let Some(t) = chained::<VkTimelineSemaphoreSubmitInfo>(&s.pNext) else { continue };
+            let Some(t) = chained_at::<VkTimelineSemaphoreSubmitInfo>(&s.pNext) else { continue };
             // SAFETY: both arrays were allocated by the decoder from the batch arena, each sized
             // to the count beside it, and both outlive this call. `wire_array` is the same
             // reconciliation the generated accessors use.
@@ -2262,7 +2264,7 @@ impl Driver {
     pub fn signal_semaphore(
         &mut self,
         device: VkDevice,
-        info: &VkSemaphoreSignalInfo,
+        info: cs::Decoded<'_, VkSemaphoreSignalInfo>,
     ) -> Result<VkResult, NotATimeline> {
         self.as_timeline(device, info.semaphore)?;
         let ret = self.dev_op_info(device, info, |d| d.try_vkSignalSemaphore());
@@ -2281,7 +2283,7 @@ impl Driver {
     pub fn wait_semaphores(
         &self,
         device: VkDevice,
-        info: &VkSemaphoreWaitInfo,
+        info: cs::Decoded<'_, VkSemaphoreWaitInfo>,
         timeout: u64,
     ) -> Result<VkResult, NotATimeline> {
         // SAFETY: the decoder allocated `pSemaphores` from the batch arena sized to
@@ -2309,11 +2311,11 @@ impl Driver {
     pub fn create_query_pool(
         &mut self,
         device: VkDevice,
-        info: &VkQueryPoolCreateInfo,
-        alloc: Option<&VkAllocationCallbacks>,
+        info: cs::Decoded<'_, VkQueryPoolCreateInfo>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkQueryPool, VkResult> {
         let pool = self.create_object(device, |d| d.vkCreateQueryPool(), info, alloc)?;
-        self.query_pools.insert(pool, QueryFacts::of(info));
+        self.query_pools.insert(pool, QueryFacts::of(info.get()));
         Ok(pool)
     }
 
@@ -2402,7 +2404,7 @@ impl Driver {
     pub fn transition_image_layout(
         &self,
         device: VkDevice,
-        transitions: &[VkHostImageLayoutTransitionInfo],
+        transitions: cs::Decoded<'_, [VkHostImageLayoutTransitionInfo]>,
     ) -> Option<VkResult> {
         let d = &self.devices.get(&device)?.fns;
         // SAFETY: a device in this table; the slice was decoded into the batch arena and is live
@@ -2415,13 +2417,13 @@ impl Driver {
     pub fn copy_image_to_image(
         &self,
         device: VkDevice,
-        info: &VkCopyImageToImageInfo,
+        info: cs::Decoded<'_, VkCopyImageToImageInfo>,
     ) -> Option<VkResult> {
         let d = &self.devices.get(&device)?.fns;
         // SAFETY: a device in this table, and `info` is an arena allocation live for the call --
         // its own `pRegions` included, which the decoder sized and allocated beside it.
         let f = d.try_vkCopyImageToImage()?;
-        Some(unsafe { f(device, info) })
+        Some(unsafe { f(device, info.get()) })
     }
 
     /// `vkCopyImageToMemoryMESA`: read one region of an image out into `out`.
@@ -2433,7 +2435,7 @@ impl Driver {
     pub fn copy_image_to_memory(
         &self,
         device: VkDevice,
-        info: &VkCopyImageToMemoryInfoMESA,
+        info: cs::Decoded<'_, VkCopyImageToMemoryInfoMESA>,
         out: &mut [u8],
     ) -> Option<VkResult> {
         let d = &self.devices.get(&device)?.fns;
@@ -2479,7 +2481,7 @@ impl Driver {
     pub fn copy_memory_to_image(
         &self,
         device: VkDevice,
-        info: &VkCopyMemoryToImageInfoMESA,
+        info: cs::Decoded<'_, VkCopyMemoryToImageInfoMESA>,
     ) -> Option<VkResult> {
         let d = &self.devices.get(&device)?.fns;
         // SAFETY: the decoder allocated `regionCount` regions from the batch arena and wrote
@@ -2575,7 +2577,7 @@ impl Driver {
     pub fn enumerate_info_into<H, I, T, R>(
         &self,
         h: H,
-        info: &I,
+        info: cs::Decoded<'_, I>,
         out: Option<&mut [T]>,
         pick: impl FnOnce(
             &InstanceFns,
@@ -2584,7 +2586,7 @@ impl Driver {
         let f = self.instance().and_then(pick).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         let (mut n, room, array) = split(out);
         // SAFETY: as `enumerate_into`; `info` borrows an arena struct live for the call.
-        let r = unsafe { f(h, info, &mut n, array) };
+        let r = unsafe { f(h, info.get(), &mut n, array) };
         fits(n, room);
         Ok((n, r))
     }
@@ -2650,7 +2652,7 @@ impl Driver {
     pub fn dev_enumerate_info<I, T, R>(
         &self,
         device: VkDevice,
-        info: &I,
+        info: cs::Decoded<'_, I>,
         out: Option<&mut [T]>,
         pick: impl FnOnce(
             &DeviceFns,
@@ -2661,7 +2663,7 @@ impl Driver {
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         let (mut n, room, array) = split(out);
         // SAFETY: as `enumerate_into`; `info` borrows an arena struct live for the call.
-        let r = unsafe { f(device, info, &mut n, array) };
+        let r = unsafe { f(device, info.get(), &mut n, array) };
         fits(n, room);
         Ok((n, r))
     }
@@ -2725,12 +2727,16 @@ impl Driver {
     }
 
     /// A device's queue, which is owned by the device and never created or destroyed.
-    pub fn device_queue(&mut self, device: VkDevice, info: &VkDeviceQueueInfo2) -> Option<VkQueue> {
+    pub fn device_queue(
+        &mut self,
+        device: VkDevice,
+        info: cs::Decoded<'_, VkDeviceQueueInfo2>,
+    ) -> Option<VkQueue> {
         let d = self.devices.get(&device)?;
         let mut out = VkQueue(0);
         // SAFETY: `device` is a handle this table was loaded from and `info` is an arena
         // allocation live for the call.
-        unsafe { (d.fns.vkGetDeviceQueue2())(device, info, &mut out) };
+        unsafe { (d.fns.vkGetDeviceQueue2())(device, info.get(), &mut out) };
         if out.0 == 0 {
             return None;
         }
@@ -2972,8 +2978,8 @@ impl Driver {
             *const VkAllocationCallbacks,
             *mut T,
         ) -> VkResult,
-        info: &I,
-        alloc: Option<&VkAllocationCallbacks>,
+        info: cs::Decoded<'_, I>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<T, VkResult> {
         let Some(d) = self.devices.get(&device) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
@@ -2981,7 +2987,7 @@ impl Driver {
         let mut out = T::null();
         // SAFETY: `device` is a handle in this table, `info` and `alloc` are the decoder's arena
         // allocations live for this call, and `out` is a local.
-        let r = unsafe { proc(&d.fns)(device, info, ptr(alloc), &mut out) };
+        let r = unsafe { proc(&d.fns)(device, info.get(), ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -2998,7 +3004,7 @@ impl Driver {
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks),
         object: T,
-        alloc: Option<&VkAllocationCallbacks>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) {
         let Some(d) = self.devices.get(&device) else {
             return;
@@ -3029,7 +3035,7 @@ impl Driver {
             &DeviceFns,
         )
             -> unsafe extern "C" fn(VkDevice, *const I, *mut P::Child) -> VkResult,
-        info: &I,
+        info: cs::Decoded<'_, I>,
         out: &mut [P::Child],
         ids: &[ObjectId],
     ) -> Result<(), VkResult> {
@@ -3046,7 +3052,7 @@ impl Driver {
         }
         // SAFETY: `device` is a handle in this table; `info` is an arena allocation live for the
         // call, and `out` is the arena array the decoder sized from the count inside `info`.
-        let r = unsafe { proc(&d.fns)(device, info, out.as_mut_ptr()) };
+        let r = unsafe { proc(&d.fns)(device, info.get(), out.as_mut_ptr()) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -3084,8 +3090,8 @@ impl Driver {
             *mut VkPipeline,
         ) -> VkResult,
         cache: VkPipelineCache,
-        infos: &[I],
-        alloc: Option<&VkAllocationCallbacks>,
+        infos: cs::Decoded<'_, [I]>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
         out: &mut [VkPipeline],
     ) -> Result<(), VkResult> {
         let Some(d) = self.devices.get(&device) else {
@@ -3431,8 +3437,8 @@ impl Driver {
             *const VkAllocationCallbacks,
             *mut T,
         ) -> VkResult,
-        info: &I,
-        alloc: Option<&VkAllocationCallbacks>,
+        info: cs::Decoded<'_, I>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<T, VkResult> {
         let handle = self.create_object(device, proc, info, alloc)?;
         self.pools.open(device, handle);
@@ -3450,7 +3456,7 @@ impl Driver {
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks),
         pool: T,
-        alloc: Option<&VkAllocationCallbacks>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Vec<ObjectId> {
         let orphans = self.pools.close(pool);
         self.destroy_object(device, proc, pool, alloc);
@@ -3505,12 +3511,12 @@ impl Driver {
     pub fn begin_command_buffer(
         &self,
         cb: VkCommandBuffer,
-        info: &VkCommandBufferBeginInfo,
+        info: cs::Decoded<'_, VkCommandBufferBeginInfo>,
     ) -> Option<VkResult> {
         let d = self.recorder(cb)?;
         // SAFETY: a command buffer this context allocated, and `info` is an arena allocation
         // live for the call. The same holds for every call in this section.
-        Some(unsafe { (d.vkBeginCommandBuffer())(cb, info) })
+        Some(unsafe { (d.vkBeginCommandBuffer())(cb, info.get()) })
     }
 
     pub fn end_command_buffer(&self, cb: VkCommandBuffer) -> Option<VkResult> {
@@ -3540,9 +3546,9 @@ impl Driver {
         src: VkPipelineStageFlags,
         dst: VkPipelineStageFlags,
         dependency: VkDependencyFlags,
-        memory: &[VkMemoryBarrier],
-        buffers: &[VkBufferMemoryBarrier],
-        images: &[VkImageMemoryBarrier],
+        memory: cs::Decoded<'_, [VkMemoryBarrier]>,
+        buffers: cs::Decoded<'_, [VkBufferMemoryBarrier]>,
+        images: cs::Decoded<'_, [VkImageMemoryBarrier]>,
     ) -> Option<()> {
         let d = self.recorder(cb)?;
         // SAFETY: as above; every count is its own slice's length.
@@ -3606,9 +3612,9 @@ impl Driver {
         events: &[VkEvent],
         src: VkPipelineStageFlags,
         dst: VkPipelineStageFlags,
-        memory: &[VkMemoryBarrier],
-        buffers: &[VkBufferMemoryBarrier],
-        images: &[VkImageMemoryBarrier],
+        memory: cs::Decoded<'_, [VkMemoryBarrier]>,
+        buffers: cs::Decoded<'_, [VkBufferMemoryBarrier]>,
+        images: cs::Decoded<'_, [VkImageMemoryBarrier]>,
     ) -> Option<()> {
         let d = self.recorder(cb)?;
         // SAFETY: as above; every count is its own slice's length.
@@ -3634,11 +3640,11 @@ impl Driver {
         &self,
         cb: VkCommandBuffer,
         event: VkEvent,
-        dependency: &VkDependencyInfo,
+        dependency: cs::Decoded<'_, VkDependencyInfo>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdSetEvent2()?;
         // SAFETY: as above.
-        unsafe { f(cb, event, dependency) };
+        unsafe { f(cb, event, dependency.get()) };
         Some(())
     }
 
@@ -3663,7 +3669,7 @@ impl Driver {
         &self,
         cb: VkCommandBuffer,
         events: &[VkEvent],
-        dependencies: &[VkDependencyInfo],
+        dependencies: cs::Decoded<'_, [VkDependencyInfo]>,
     ) -> Option<()> {
         if events.len() != dependencies.len() {
             return None;
@@ -3677,12 +3683,12 @@ impl Driver {
     pub fn cmd_begin_render_pass(
         &self,
         cb: VkCommandBuffer,
-        begin: &VkRenderPassBeginInfo,
+        begin: cs::Decoded<'_, VkRenderPassBeginInfo>,
         contents: VkSubpassContents,
     ) -> Option<()> {
         let d = self.recorder(cb)?;
         // SAFETY: as above.
-        unsafe { (d.vkCmdBeginRenderPass())(cb, begin, contents) };
+        unsafe { (d.vkCmdBeginRenderPass())(cb, begin.get(), contents) };
         Some(())
     }
 
@@ -3875,7 +3881,7 @@ impl Driver {
         bind_point: VkPipelineBindPoint,
         layout: VkPipelineLayout,
         set: u32,
-        writes: &[VkWriteDescriptorSet],
+        writes: cs::Decoded<'_, [VkWriteDescriptorSet]>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdPushDescriptorSet()?;
         // SAFETY: as above; the count is the slice's own length, and every pointer inside a
@@ -4068,21 +4074,25 @@ impl Driver {
         Some(())
     }
 
-    pub fn cmd_begin_rendering(&self, cb: VkCommandBuffer, info: &VkRenderingInfo) -> Option<()> {
+    pub fn cmd_begin_rendering(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkRenderingInfo>,
+    ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdBeginRendering()?;
         // SAFETY: as above.
-        unsafe { f(cb, info) };
+        unsafe { f(cb, info.get()) };
         Some(())
     }
 
     pub fn cmd_pipeline_barrier2(
         &self,
         cb: VkCommandBuffer,
-        dependency: &VkDependencyInfo,
+        dependency: cs::Decoded<'_, VkDependencyInfo>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdPipelineBarrier2()?;
         // SAFETY: as above.
-        unsafe { f(cb, dependency) };
+        unsafe { f(cb, dependency.get()) };
         Some(())
     }
 
@@ -4484,7 +4494,7 @@ impl Driver {
     pub fn calibrated_timestamps(
         &self,
         device: VkDevice,
-        infos: &[VkCalibratedTimestampInfoKHR],
+        infos: cs::Decoded<'_, [VkCalibratedTimestampInfoKHR]>,
         stamps: &mut [u64],
         deviation: &mut u64,
     ) -> Result<VkResult, VkResult> {
@@ -4553,11 +4563,11 @@ impl Driver {
     pub fn queue_submit(
         &mut self,
         queue: VkQueue,
-        submits: &[VkSubmitInfo],
+        submits: cs::Decoded<'_, [VkSubmitInfo]>,
         fence: VkFence,
     ) -> Option<VkResult> {
         self.submitter(queue)?;
-        self.note_submit(submits, fence);
+        self.note_submit(submits.get(), fence);
         let q = self.submitter(queue)?;
         let _vk = q.held();
         // Submitting no work to signal a fence is a normal thing for a guest to do, and Vulkan
@@ -4576,12 +4586,12 @@ impl Driver {
     pub fn queue_submit2(
         &mut self,
         queue: VkQueue,
-        submits: &[VkSubmitInfo2],
+        submits: cs::Decoded<'_, [VkSubmitInfo2]>,
         fence: VkFence,
     ) -> Result<VkResult, NoSubmit2> {
         let q = Arc::clone(self.submitter(queue).ok_or(NoSubmit2::Queue)?);
         let f = q.fns.try_vkQueueSubmit2().ok_or(NoSubmit2::EntryPoint)?;
-        self.note_submit2(submits, fence);
+        self.note_submit2(submits.get(), fence);
         let _vk = q.held();
         // Submitting no work to signal a fence is as normal here as it is for v1, and Vulkan takes
         // a null array for it -- so the slice's own pointer is passed either way.
@@ -4667,7 +4677,7 @@ impl Driver {
     pub fn semaphore_wait(
         &self,
         device: VkDevice,
-        info: &VkSemaphoreWaitInfo,
+        info: cs::Decoded<'_, VkSemaphoreWaitInfo>,
         timeout: u64,
     ) -> Result<Option<DriverWait>, NotATimeline> {
         // SAFETY: as `wait_semaphores`.
@@ -4962,7 +4972,7 @@ impl Driver {
         &self,
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, u32, *const I) -> VkResult,
-        infos: &[I],
+        infos: cs::Decoded<'_, [I]>,
     ) -> VkResult {
         let Some(d) = self.devices.get(&device) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
@@ -4992,7 +5002,7 @@ impl Driver {
     pub fn dev_op_info<I>(
         &self,
         device: VkDevice,
-        info: &I,
+        info: cs::Decoded<'_, I>,
         pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I) -> VkResult>,
     ) -> VkResult {
         let Some(d) = self.devices.get(&device) else {
@@ -5005,7 +5015,7 @@ impl Driver {
         // decoder filled and outlives the call. Any counted array inside it was reconciled against
         // the array actually sent before the struct was handed on, so the pair Vulkan reads out of
         // it agrees with itself.
-        unsafe { f(device, info) }
+        unsafe { f(device, info.get()) }
     }
 
     /// The same, with the guest's own timeout beside it: `vkWaitSemaphores`.
@@ -5020,7 +5030,7 @@ impl Driver {
     pub fn dev_op_info_timeout<I>(
         &self,
         device: VkDevice,
-        info: &I,
+        info: cs::Decoded<'_, I>,
         timeout: u64,
         pick: impl FnOnce(
             &DeviceFns,
@@ -5033,7 +5043,7 @@ impl Driver {
             return VkResult::VK_ERROR_EXTENSION_NOT_PRESENT;
         };
         // SAFETY: as `dev_op_info`; `timeout` is a plain scalar off the wire.
-        unsafe { f(device, info, timeout) }
+        unsafe { f(device, info.get(), timeout) }
     }
 
     /// Write and copy descriptors: `vkUpdateDescriptorSets`.
@@ -5044,8 +5054,8 @@ impl Driver {
     pub fn update_descriptor_sets(
         &self,
         device: VkDevice,
-        writes: &[VkWriteDescriptorSet],
-        copies: &[VkCopyDescriptorSet],
+        writes: cs::Decoded<'_, [VkWriteDescriptorSet]>,
+        copies: cs::Decoded<'_, [VkCopyDescriptorSet]>,
     ) {
         let Some(d) = self.devices.get(&device) else {
             return;
@@ -5075,8 +5085,8 @@ impl Driver {
         &mut self,
         device: VkDevice,
         id: ObjectId,
-        info: &VkMemoryAllocateInfo,
-        alloc: Option<&VkAllocationCallbacks>,
+        info: cs::Decoded<'_, VkMemoryAllocateInfo>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
         resource_bytes: &dyn Fn(ResourceHandle) -> Option<ResourceBytes>,
     ) -> Result<VkDeviceMemory, NoMemory> {
         let Some(d) = self.devices.get(&device) else {
@@ -5601,11 +5611,36 @@ impl Driver {
         Ok(Scanout::Minted(surface))
     }
 
+    /// `vkCreateImage`: the image, made with rows the host can address where the guest means to
+    /// share it (see [`external_images_are_linear`]), and noted for a scanout allocation that
+    /// has to match it.
+    ///
+    /// The rewrite happens here rather than in the handler because the struct that then reaches
+    /// the driver is no longer the one the guest sent, and only this module may vouch for one of
+    /// those.
+    pub fn create_image(
+        &mut self,
+        device: VkDevice,
+        info: cs::Decoded<'_, VkImageCreateInfo>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+    ) -> Result<VkImage, VkResult> {
+        let linear = external_images_are_linear(info.get());
+        // SAFETY: a copy of a decoded struct with only plain members changed -- `tiling` and
+        // `usage` -- so every pointer in it is one the decoder vouched for in `info`, and this
+        // borrow ends before `info`'s does.
+        let vouched = unsafe { cs::Decoded::vouch(&linear) };
+        let host = self.create_object(device, |d| d.vkCreateImage(), vouched, alloc);
+        if let Ok(image) = host {
+            self.note_image(image, &linear);
+        }
+        host
+    }
+
     /// Record what an image was created as, for a scanout allocation that has to match it.
     ///
     /// Kept because Vulkan will not answer for an image's extent or format after the fact, and
     /// forgotten in [`Self::forget_image`].
-    pub fn note_image(&mut self, image: VkImage, info: &VkImageCreateInfo) {
+    fn note_image(&mut self, image: VkImage, info: &VkImageCreateInfo) {
         self.images.insert(
             image,
             ImageFacts {
@@ -6834,10 +6869,21 @@ pub unsafe trait InStruct {
 /// The struct the guest chained onto a request, or `None` if it chained none.
 ///
 /// The read-only mirror of [`chained_mut`], and it exists for the same reason: a handler that
-/// wants what the guest hung off a `pNext` gets a borrow, so `context.rs` stays free of unsafe.
-/// It takes the `pNext` field itself rather than the struct holding it, so the returned reference
-/// lives exactly as long as the borrow of the chain it was found in.
-pub fn chained<T: InStruct>(head: &*const core::ffi::c_void) -> Option<&T> {
+/// wants what the guest hung off a `pNext` gets it without unsafe. It takes the struct decoded, so
+/// the chain it walks is the decoder's and not a pointer the caller chose, and hands the link back
+/// decoded, so it can be passed on in turn.
+pub fn chained<'a, T: InStruct>(
+    head: cs::Decoded<'a, impl cs::Links>,
+) -> Option<cs::Decoded<'a, T>> {
+    // SAFETY: `head` is the decoder's, so every link of its chain is an arena struct that lives
+    // for `'a`, and `chained_at` hands back a reference into exactly that; the link's own pointers
+    // are the decoder's too, which is what vouching for it claims.
+    let first = head.next();
+    chained_at::<T>(&first).map(|t| unsafe { cs::Decoded::vouch(&*(t as *const T)) })
+}
+
+/// [`chained`] over a raw chain, for this module's own walks of structs it already trusts.
+fn chained_at<T: InStruct>(head: &*const core::ffi::c_void) -> Option<&T> {
     let mut node = (*head).cast::<VkBaseInStructure>();
     while !node.is_null() {
         // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one
@@ -7056,12 +7102,12 @@ unsafe impl OutStruct for VkExternalImageFormatProperties {
 /// export direction exists to preserve. So this dissolves rather than porting, and the guest's
 /// request goes through untouched.
 #[cfg(not(target_os = "macos"))]
-pub fn external_images_are_linear(info: &VkImageCreateInfo) -> VkImageCreateInfo {
+fn external_images_are_linear(info: &VkImageCreateInfo) -> VkImageCreateInfo {
     *info
 }
 
 #[cfg(target_os = "macos")]
-pub fn external_images_are_linear(info: &VkImageCreateInfo) -> VkImageCreateInfo {
+fn external_images_are_linear(info: &VkImageCreateInfo) -> VkImageCreateInfo {
     let mut info = *info;
     if info.tiling != VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
         && has_external_handle_types(info.pNext)
@@ -7526,7 +7572,10 @@ mod tests {
             imageExtent: VkExtent3D { width: 5, height: 6, depth: 1 },
             ..Default::default()
         };
-        assert_eq!(d.copy_image_to_memory(DEVICE, &read, &mut out), Some(VkResult::VK_SUCCESS));
+        assert_eq!(
+            d.copy_image_to_memory(DEVICE, cs::Decoded::planted(&read), &mut out),
+            Some(VkResult::VK_SUCCESS)
+        );
         assert_eq!(
             SAW.with_borrow(|v| v.clone()),
             vec![(37, 11, want, 5)],
@@ -7563,7 +7612,10 @@ mod tests {
             pRegions: regions.as_ptr(),
             ..Default::default()
         };
-        assert_eq!(d.copy_memory_to_image(DEVICE, &write), Some(VkResult::VK_SUCCESS));
+        assert_eq!(
+            d.copy_memory_to_image(DEVICE, cs::Decoded::planted(&write)),
+            Some(VkResult::VK_SUCCESS)
+        );
         assert_eq!(
             SAW.with_borrow(|v| v.clone()),
             vec![(3, 4, a.as_ptr() as usize, 9), (5, 6, b.as_ptr() as usize, 8)],
@@ -7583,13 +7635,20 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert_eq!(d.transition_image_layout(DEVICE, &t), Some(VkResult::VK_SUCCESS));
+        assert_eq!(
+            d.transition_image_layout(DEVICE, cs::Decoded::planted(&t as &[_])),
+            Some(VkResult::VK_SUCCESS)
+        );
         assert_eq!(LAYOUTS.with_borrow(|v| v.clone()), vec![7, 2]);
 
         // A device this renderer does not have is a refusal, not a copy reported as done.
-        assert!(d.copy_image_to_memory(VkDevice(0x99), &read, &mut out).is_none());
-        assert!(d.copy_memory_to_image(VkDevice(0x99), &write).is_none());
-        assert!(d.transition_image_layout(VkDevice(0x99), &t).is_none());
+        assert!(
+            d.copy_image_to_memory(VkDevice(0x99), cs::Decoded::planted(&read), &mut out).is_none()
+        );
+        assert!(d.copy_memory_to_image(VkDevice(0x99), cs::Decoded::planted(&write)).is_none());
+        assert!(
+            d.transition_image_layout(VkDevice(0x99), cs::Decoded::planted(&t as &[_])).is_none()
+        );
 
         d.destroy_device(DEVICE, &[]);
     }
@@ -7668,7 +7727,7 @@ mod tests {
         ) -> VkResult {
             // SAFETY: the caller passed pointers to live structs it borrows for the call.
             let (info, out) = unsafe { (&*info, &mut *out) };
-            if chained::<VkPhysicalDeviceExternalImageFormatInfo>(&info.pNext).is_some() {
+            if chained_at::<VkPhysicalDeviceExternalImageFormatInfo>(&info.pNext).is_some() {
                 return VkResult::VK_ERROR_FORMAT_NOT_SUPPORTED;
             }
             out.imageFormatProperties.maxMipLevels = MIP_LEVELS;
@@ -7720,7 +7779,7 @@ mod tests {
         let mut props = VkExternalImageFormatProperties::default();
         let mut out = answer(&mut props);
         assert_eq!(
-            driver.image_format_properties2(METAL, &info, &mut out),
+            driver.image_format_properties2(METAL, cs::Decoded::planted(&info), &mut out),
             Ok(VkResult::VK_SUCCESS),
             "a dma-buf image is what this renderer mints, so the query is not the driver's to refuse",
         );
@@ -7760,7 +7819,7 @@ mod tests {
         let mut props = VkExternalImageFormatProperties::default();
         let mut out = answer(&mut props);
         assert_eq!(
-            driver.image_format_properties2(METAL, &info, &mut out),
+            driver.image_format_properties2(METAL, cs::Decoded::planted(&info), &mut out),
             Ok(VkResult::VK_SUCCESS),
             "the link is found wherever the guest hung it, not only at the head",
         );
@@ -7790,7 +7849,7 @@ mod tests {
         let mut props = VkExternalImageFormatProperties::default();
         let mut out = answer(&mut props);
         assert_eq!(
-            driver.image_format_properties2(METAL, &metal_asked, &mut out),
+            driver.image_format_properties2(METAL, cs::Decoded::planted(&metal_asked), &mut out),
             Ok(VkResult::VK_ERROR_FORMAT_NOT_SUPPORTED),
             "Metal's own handle type is not one of the two this renderer stands in for",
         );
@@ -7799,7 +7858,7 @@ mod tests {
         let mut props = VkExternalImageFormatProperties::default();
         let mut out = answer(&mut props);
         assert_eq!(
-            driver.image_format_properties2(NATIVE, &info, &mut out),
+            driver.image_format_properties2(NATIVE, cs::Decoded::planted(&info), &mut out),
             Ok(VkResult::VK_ERROR_FORMAT_NOT_SUPPORTED),
             "a driver that really has dma-buf is asked the question the guest sent",
         );
@@ -8075,7 +8134,8 @@ mod tests {
             allocationSize: VkDeviceSize(4096),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(72), &plain, None, &|_| None).expect("no cap");
+        d.allocate_memory(DEVICE, ObjectId(72), cs::Decoded::planted(&plain), None, &|_| None)
+            .expect("no cap");
 
         // The route is worth nothing if the census never names it: an undeclared allocation the
         // driver owns is exactly the memory a desktop's images live in, and leaving it out would
@@ -8420,7 +8480,10 @@ mod tests {
             memoryTypeIndex: 0,
         };
         let resolve = |_| Some(ResourceBytes::Shared(storage.clone()));
-        assert!(d.allocate_memory(DEVICE, ObjectId(80), &info, None, &resolve).is_ok());
+        assert!(
+            d.allocate_memory(DEVICE, ObjectId(80), cs::Decoded::planted(&info), None, &resolve)
+                .is_ok()
+        );
 
         // The exporter's record and the resource both let go: the client is gone.
         drop(storage);
@@ -8492,7 +8555,10 @@ mod tests {
                 allocationSize: VkDeviceSize(16384),
                 memoryTypeIndex: 0,
             };
-            let refused = d.allocate_memory(DEVICE, ObjectId(80), &info, None, &|_| None);
+            let refused =
+                d.allocate_memory(DEVICE, ObjectId(80), cs::Decoded::planted(&info), None, &|_| {
+                    None
+                });
             assert!(
                 matches!(
                     refused,
@@ -8600,7 +8666,7 @@ mod tests {
                 allocationSize: VkDeviceSize(SIZE),
                 memoryTypeIndex: 0,
             };
-            d.allocate_memory(DEVICE, ObjectId(id), &info, None, &|_| None)
+            d.allocate_memory(DEVICE, ObjectId(id), cs::Decoded::planted(&info), None, &|_| None)
         };
 
         assert!(ask(&mut d, 1).is_ok(), "the first fits under the cap");
@@ -8654,7 +8720,7 @@ mod tests {
             allocationSize: VkDeviceSize(900),
             memoryTypeIndex: 0,
         };
-        match d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None) {
+        match d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None) {
             Err(NoMemory::Driver(r)) => {
                 assert_eq!(r, VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY, "the driver's own answer")
             }
@@ -9534,7 +9600,8 @@ mod tests {
             allocationSize: VkDeviceSize(ASKED),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None).expect("no cap");
+        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None)
+            .expect("no cap");
 
         let (ptr, told) = GIVEN.with(Cell::get);
         let page = crate::guest_mem::page_size();
@@ -9598,7 +9665,8 @@ mod tests {
         let plain = VkMemoryAllocateInfo { pNext: core::ptr::null(), ..info };
         GIVEN.with(|g| g.set((0, 0)));
         HEAP.with(|b| *b.borrow_mut() = vec![0u8; padded as usize]);
-        d.allocate_memory(DEVICE, ObjectId(2), &plain, None, &|_| None).expect("no cap");
+        d.allocate_memory(DEVICE, ObjectId(2), cs::Decoded::planted(&plain), None, &|_| None)
+            .expect("no cap");
         assert_eq!(GIVEN.with(Cell::get).0, 0, "the driver was handed no pages: the memory is its");
         assert_eq!(MAPPED.with(Cell::get), 1, "and this renderer took the one mapping over it");
 
@@ -9769,7 +9837,8 @@ mod tests {
             // 1. A scanout: exported and dedicated to a LINEAR image, which is the one shape a
             //    window buffer has.
             let scanout = VkMemoryAllocateInfo { pNext: (&raw const export).cast(), ..base };
-            d.allocate_memory(DEVICE, ObjectId(1), &scanout, None, &|_| None).expect("no cap");
+            d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&scanout), None, &|_| None)
+                .expect("no cap");
 
             // 2. Declared for export but dedicated to nothing, so there is no surface to mint and
             //    the bytes are pages this renderer mints instead.
@@ -9779,14 +9848,17 @@ mod tests {
                 memoryTypeIndex: 0,
                 ..base
             };
-            d.allocate_memory(DEVICE, ObjectId(2), &linear, None, &|_| None).expect("no cap");
+            d.allocate_memory(DEVICE, ObjectId(2), cs::Decoded::planted(&linear), None, &|_| None)
+                .expect("no cap");
 
             // 3. Host-visible and undeclared: the driver's own memory, mapped once and owned.
             let heap = VkMemoryAllocateInfo { memoryTypeIndex: 0, ..base };
-            d.allocate_memory(DEVICE, ObjectId(3), &heap, None, &|_| None).expect("no cap");
+            d.allocate_memory(DEVICE, ObjectId(3), cs::Decoded::planted(&heap), None, &|_| None)
+                .expect("no cap");
 
             // 4. Memory the host cannot address at all.
-            d.allocate_memory(DEVICE, ObjectId(4), &base, None, &|_| None).expect("no cap");
+            d.allocate_memory(DEVICE, ObjectId(4), cs::Decoded::planted(&base), None, &|_| None)
+                .expect("no cap");
 
             // 5. An import: the bytes are another allocation's, the handle is this one's.
             let lent = Storage::pages_for_test(4096, &Account::for_test(None));
@@ -9801,7 +9873,8 @@ mod tests {
                 ..base
             };
             let resolve = |_| Some(ResourceBytes::Shared(lent.clone()));
-            d.allocate_memory(DEVICE, ObjectId(5), &imported, None, &resolve).expect("no cap");
+            d.allocate_memory(DEVICE, ObjectId(5), cs::Decoded::planted(&imported), None, &resolve)
+                .expect("no cap");
 
             // The premise, asserted: five allocations, five different backings. A shape that
             // stopped reaching the backing it is named for would otherwise quietly test nothing.
@@ -10064,7 +10137,10 @@ mod tests {
             pNext: (&raw const timeline).cast(),
             ..Default::default()
         };
-        assert_eq!(d.device_queue(VkDevice(DEVICE), &info), Some(VkQueue(QUEUE)));
+        assert_eq!(
+            d.device_queue(VkDevice(DEVICE), cs::Decoded::planted(&info)),
+            Some(VkQueue(QUEUE))
+        );
 
         assert!(d.ring_queues().fence(RingIdx(RING), FenceId(11)), "the ring has a queue");
         assert_eq!(SUBMITS.load(Ordering::Acquire), 1, "ordered by an empty submit on the queue");
@@ -10217,7 +10293,10 @@ mod tests {
             pNext: (&raw const timeline).cast(),
             ..Default::default()
         };
-        assert_eq!(d.device_queue(VkDevice(DEVICE), &info), Some(VkQueue(QUEUE)));
+        assert_eq!(
+            d.device_queue(VkDevice(DEVICE), cs::Decoded::planted(&info)),
+            Some(VkQueue(QUEUE))
+        );
 
         // An empty decode barrier: this test is about phase two. Phase one is a wait on ring
         // threads, which a driver standing on its own has none of.
@@ -10356,7 +10435,8 @@ mod tests {
             allocationSize: VkDeviceSize(ASKED),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None).expect("no cap");
+        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None)
+            .expect("no cap");
         assert!(d.memory_surface_id(ObjectId(1)).is_some(), "the premise: this minted a surface");
         assert_eq!(d.account.live(), extent, "charged for the pages, not for the rows");
 
@@ -10364,7 +10444,8 @@ mod tests {
         let opaque_export =
             VkExportMemoryAllocateInfo { pNext: (&raw const opaque_dedicated).cast(), ..export };
         let opaque = VkMemoryAllocateInfo { pNext: (&raw const opaque_export).cast(), ..info };
-        d.allocate_memory(DEVICE, ObjectId(2), &opaque, None, &|_| None).expect("no cap");
+        d.allocate_memory(DEVICE, ObjectId(2), cs::Decoded::planted(&opaque), None, &|_| None)
+            .expect("no cap");
         assert!(
             d.memory_surface_id(ObjectId(2)).is_none(),
             "an opaque image has no rows to alias, whatever pitch the driver quotes for it"
@@ -10437,13 +10518,15 @@ mod tests {
         let pages = Storage::pages_for_test(4096, &Account::for_test(None));
         let resolve = |_| Some(ResourceBytes::Shared(pages.clone()));
         assert!(
-            d.allocate_memory(DEVICE, ObjectId(2), &info, None, &resolve).is_ok(),
+            d.allocate_memory(DEVICE, ObjectId(2), cs::Decoded::planted(&info), None, &resolve)
+                .is_ok(),
             "an import is admitted with no room left, because it takes none"
         );
         assert_eq!(d.account.live(), 900, "and the ledger did not move");
 
         assert!(
-            d.allocate_memory(DEVICE, ObjectId(3), &info, None, &|_| None).is_err(),
+            d.allocate_memory(DEVICE, ObjectId(3), cs::Decoded::planted(&info), None, &|_| None)
+                .is_err(),
             "an import that resolved to nothing is an ordinary allocation, and there is no room"
         );
         assert_eq!(d.account.live(), 900, "a refusal costs nothing");
@@ -10897,7 +10980,7 @@ mod tests {
             queryCount: 4,
             ..Default::default()
         };
-        assert_eq!(d.create_query_pool(DEVICE, &info, None), Ok(POOL));
+        assert_eq!(d.create_query_pool(DEVICE, cs::Decoded::planted(&info), None), Ok(POOL));
 
         const NONE: VkQueryResultFlags = VkQueryResultFlags(0);
         const WIDE: VkQueryResultFlags =
@@ -11035,7 +11118,7 @@ mod tests {
             pipelineStatistics: VkQueryPipelineStatisticFlags(0b1011),
             ..Default::default()
         };
-        assert_eq!(d.create_query_pool(DEVICE, &info, None), Ok(STATS));
+        assert_eq!(d.create_query_pool(DEVICE, cs::Decoded::planted(&info), None), Ok(STATS));
         let r = d.query_pool_results(DEVICE, STATS, 0, 1, &mut buf[..12], VkDeviceSize(12), NONE);
         assert_eq!(r, Ok(VkResult::VK_NOT_READY), "three statistics, three words");
         let r = d.query_pool_results(DEVICE, STATS, 0, 1, &mut buf[..8], VkDeviceSize(8), NONE);
@@ -11049,7 +11132,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            d.create_query_pool(DEVICE, &info, None),
+            d.create_query_pool(DEVICE, cs::Decoded::planted(&info), None),
             Ok(PERF),
             "the driver's call, not ours"
         );

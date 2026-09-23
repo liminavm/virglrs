@@ -62,6 +62,23 @@ SABOTAGES = [
         'an_out_count_cannot_be_raised_past_the_arrays_it_sized',
     ),
     (
+        'a struct embedding a pointerful one counts as plain',
+        'venus-gen/rustgen.py',
+        """                        if (v.ty.is_pointer() or b.category == VkType.FUNCPOINTER
+                                or (b.category in kinds and b.name in found)):""",
+        """                        if (v.ty.is_pointer() or b.category == VkType.FUNCPOINTER):""",
+        'a_struct_with_a_pointer_anywhere_in_it_is_never_plain',
+    ),
+    (
+        'a struct of function pointers counts as plain',
+        'venus-gen/rustgen.py',
+        """                        if (v.ty.is_pointer() or b.category == VkType.FUNCPOINTER
+                                or (b.category in kinds and b.name in found)):""",
+        """                        if (v.ty.is_pointer()
+                                or (b.category in kinds and b.name in found)):""",
+        'a_struct_with_a_pointer_anywhere_in_it_is_never_plain',
+    ),
+    (
         'a command can be copied, lending its arrays twice',
         'venus-gen/templates/types.rs',
         """% for ty in GEN.supported_types[VkType.COMMAND]:
