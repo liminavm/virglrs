@@ -1970,11 +1970,18 @@ impl Context {
                 video_result(kind, self.video.begin_frame(codec, target))
             }
             Command::DecodeBitstream { codec, target, descriptor, buffer, buffer_size } => {
-                self.decode_bitstream(host, codec, target, descriptor, buffer, buffer_size)
+                let began = host.tally.mark();
+                let ran =
+                    self.decode_bitstream(host, codec, target, descriptor, buffer, buffer_size);
+                host.tally.video(began, false);
+                ran
             }
             Command::EndFrame { codec, target } => {
                 self.make_current(host);
-                video_result(kind, self.video.end_frame(host.gl, host.features, codec, target))
+                let began = host.tally.mark();
+                let ended = self.video.end_frame(host.gl, host.features, codec, target);
+                host.tally.video(began, true);
+                video_result(kind, ended)
             }
             // The C decodes none of its payload and does nothing with it, and reports success.
             // A guest sending one is asking for an entrypoint no capset advertises.

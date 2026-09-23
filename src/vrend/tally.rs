@@ -129,6 +129,15 @@ struct Armed {
     attaches: u64,
     attach_entries: u64,
     attach_entries_max: u64,
+    /// Video commands that may decode -- END_FRAME, and DECODE_BITSTREAM, which sends a held
+    /// AV1 frame out -- and the time the submitting thread spent inside them. Inside `busy`
+    /// too; kept apart because a decode that runs on the submitting thread holds up every
+    /// context's commands behind it, and the worst single command is that stall's length. The
+    /// pictures are counted as END_FRAMEs, the unit a guest's frame rate is in.
+    video_frames: u64,
+    video_commands: u64,
+    video_busy: Duration,
+    video_max: Duration,
     /// Wall time inside `Vrend::submit`. Against the window's own length this also says what
     /// share of the worker's second the command path took, which is the other half of the
     /// question: a cheap command path that is still 90% of the thread has not finished the job.
@@ -168,6 +177,10 @@ impl Armed {
             attaches: 0,
             attach_entries: 0,
             attach_entries_max: 0,
+            video_frames: 0,
+            video_commands: 0,
+            video_busy: Duration::ZERO,
+            video_max: Duration::ZERO,
             busy: Duration::ZERO,
         }
     }
@@ -277,6 +290,18 @@ impl Tally {
             a.attach_entries += entries as u64;
             a.attach_entries_max = a.attach_entries_max.max(entries as u64);
         }
+    }
+
+    /// One video command that may decode ran; `frame` for an END_FRAME. `began` is the
+    /// [`Tally::mark`] taken before it.
+    #[inline]
+    pub fn video(&mut self, began: Option<Instant>, frame: bool) {
+        let (Some(a), Some(began)) = (&mut self.on, began) else { return };
+        let took = Instant::now() - began;
+        a.video_commands += 1;
+        a.video_frames += u64::from(frame);
+        a.video_busy += took;
+        a.video_max = a.video_max.max(took);
     }
 
     /// One surface-backed resource was made whole for a present.
@@ -431,6 +456,23 @@ impl Armed {
                 a.stream_transfers,
                 us(a.stream_transfer_busy, a.stream_transfers),
                 mb_s(a.stream_transfer_bytes, a.stream_transfer_busy),
+            );
+        }
+        // What video costs the submitting thread, printed only for a window that decoded. The
+        // maximum is the number that matters: it is how long one command held up every context.
+        if a.video_commands > 0 {
+            eprintln!(
+                "[virglrs] vrend video: {} frames  {:.2} ms/frame  max {:.2} ms/command  \
+                 {:.1}% of wall  (n={} command over {secs:.1}s{note})",
+                a.video_frames,
+                if a.video_frames == 0 {
+                    0.0
+                } else {
+                    a.video_busy.as_secs_f64() * 1e3 / a.video_frames as f64
+                },
+                a.video_max.as_secs_f64() * 1e3,
+                100.0 * a.video_busy.as_secs_f64() / secs,
+                a.video_commands,
             );
         }
         if a.attaches > 0 {

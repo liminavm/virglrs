@@ -23,6 +23,7 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 // ------------------------------------------------------------------ foreign
 
@@ -722,6 +723,23 @@ pub struct Session {
     /// the callback runs on one of VideoToolbox's threads while `decode` blocks on this one --
     /// synchronous in ordering, not in threading.
     parked: Box<Mutex<Option<Picture>>>,
+    /// How long each decode is made to take on top of the hardware's own time: the test knob
+    /// [`DECODE_DELAY_KNOB`] describes. `None` unless the knob is set.
+    delay: Option<Duration>,
+}
+
+/// A test-only knob: `VIRGLRS_DECODE_DELAY_MS=<n>` makes every decode return `n` ms late.
+///
+/// A fast media engine hides whatever depends on a decode's timing. Whatever waits for a
+/// picture, and whatever reads a target before its picture lands, only shows up when the decode
+/// is slow. The delay is spent inside [`Session::decode`], on whichever thread runs the decode,
+/// so it stretches exactly the window a real slow decode would. Read once per session, at
+/// creation; unset, empty, `0` or junk leave it off.
+pub const DECODE_DELAY_KNOB: &str = "VIRGLRS_DECODE_DELAY_MS";
+
+fn decode_delay() -> Option<Duration> {
+    let ms = std::env::var(DECODE_DELAY_KNOB).ok()?.trim().parse::<u64>().ok()?;
+    (ms > 0).then(|| Duration::from_millis(ms))
 }
 
 /// Where VideoToolbox leaves a decoded picture.
@@ -837,7 +855,11 @@ impl Session {
         }
         // SAFETY: VTDecompressionSessionCreate returns a reference the caller owns.
         let session = unsafe { Owned::from_created(session) }.ok_or(Status(-1))?;
-        Ok(Session { session, format, key, parked })
+        let delay = decode_delay();
+        if let Some(delay) = delay {
+            eprintln!("[virglrs] video: {DECODE_DELAY_KNOB} makes every decode {delay:?} late");
+        }
+        Ok(Session { session, format, key, parked, delay })
     }
 
     /// The pixel layout this session was built to produce.
@@ -944,6 +966,9 @@ impl Session {
             )
         };
         let parked = self.parked.lock().expect("the decode thread never panics").take();
+        if let Some(delay) = self.delay {
+            std::thread::sleep(delay);
+        }
         status.ok().map_err(DecodeError::Rejected)?;
         parked.ok_or(DecodeError::NoPicture)
     }
