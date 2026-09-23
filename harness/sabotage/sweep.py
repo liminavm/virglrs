@@ -31,6 +31,9 @@ ROOT = Path(__file__).resolve().parents[2]
 RS = ROOT
 
 # (name, path relative to the repo root, what to replace, what with, cargo test filter)
+#
+# A filter of the form `kani:<harness>` runs that one Kani proof instead of `cargo test`: the
+# property is stated for every input up to a bound, so the witness is the proof, not a test.
 SABOTAGES = [
     (
         'an array accessor hands its handler one element fewer',
@@ -1490,6 +1493,24 @@ SABOTAGES = [
         '        let config = match av1::SeqParams::read(descriptor)',
         'superres',
     ),
+    # A ring layout is checked against the rules for every value of every field, both ways: a
+    # parser that refuses too much fails the proof as surely as one that accepts too much.
+    (
+        'two ring regions that only touch are refused as overlapping',
+        'src/venus/ring.rs',
+        """    pub fn is_disjoint(&self, other: &Region) -> bool {
+        self.begin >= other.end || self.end <= other.begin""",
+        """    pub fn is_disjoint(&self, other: &Region) -> bool {
+        self.begin >= other.end || self.end < other.begin""",
+        'kani:parse_accepts_exactly_the_layouts_the_rules_allow',
+    ),
+    (
+        'a ring buffer that is not a power of two is accepted, and its size is used as a mask',
+        'src/venus/ring.rs',
+        'if size == 0 || !size.is_power_of_two() || size > RING_BUFFER_MAX_SIZE {',
+        'if size == 0 || size > RING_BUFFER_MAX_SIZE {',
+        'kani:parse_accepts_exactly_the_layouts_the_rules_allow',
+    ),
 ]
 
 # Not here, and deliberately: "a ring-seqno wake is never sent". Deleting any single
@@ -1531,6 +1552,13 @@ def run(cmd, cwd=RS, timeout=None):
     return SimpleNamespace(returncode=proc.returncode, stdout=out, stderr=err, timed_out=False)
 
 
+def command(filt):
+    """What runs an entry's witness: one Kani proof, or `cargo test` under a filter."""
+    if filt and filt.startswith('kani:'):
+        return ['cargo', 'kani', '--harness', filt[len('kani:'):]]
+    return ['cargo', 'test'] + ([filt] if filt else [])
+
+
 def main():
     patterns = sys.argv[1:]
     chosen = [s for s in SABOTAGES if not patterns or any(p in s[0] for p in patterns)]
@@ -1555,6 +1583,11 @@ def main():
     baseline = run(['cargo', 'test'])
     if baseline.returncode != 0:
         sys.exit('the tests do not pass before any sabotage; fix that first')
+    # A proof is its own baseline: `cargo test` never runs it, so a proof already failing on the
+    # clean tree would read every sabotage aimed at it as caught.
+    for filt in sorted({f for *_, f in chosen if f and f.startswith('kani:')}):
+        if run(command(filt)).returncode != 0:
+            sys.exit('%s does not verify before any sabotage; fix that first' % filt)
     # Derived from the clean run rather than fixed, so a slow machine is not called a hang and a
     # fast one still catches a wedge quickly. The floor covers a rebuild after each edit.
     budget = max(180.0, (time.monotonic() - started) * 8)
@@ -1566,7 +1599,7 @@ def main():
         assert old in original, 'sabotage %r no longer matches %s' % (name, rel)
         path.write_text(original.replace(old, new, 1))
         try:
-            r = run(['cargo', 'test'] + ([filt] if filt else []), timeout=budget)
+            r = run(command(filt), timeout=budget)
         finally:
             path.write_text(original)
         if r.timed_out:
@@ -1586,6 +1619,9 @@ def main():
         # panic line instead. Reporting a count from whichever of those happened to be there is
         # how a sweep comes to claim coverage it cannot point at.
         named = re.findall(r"^    (\S+::\S+)$", r.stdout, re.M)
+        if not named and filt and filt.startswith('kani:'):
+            named = ['%s: %s' % (filt, d) for d in
+                     re.findall(r'Status: FAILURE\n\t - Description: "(.*)"', r.stdout)[:1]]
         if not named:
             named = re.findall(r"^thread '(\S+::\S+)'", r.stdout + r.stderr, re.M)[:1]
         witness = ', '.join(sorted(set(named))[:2]) if named else 'the test binary failed'
