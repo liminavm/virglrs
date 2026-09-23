@@ -17186,10 +17186,7 @@ mod tests {
             }
 
             #[test]
-            #[cfg_attr(
-                miri,
-                ignore = "hundreds of thousands of contexts, each calling into planted C"
-            )]
+            #[cfg_attr(miri, ignore = "tens of thousands of contexts, one per sequence")]
             fn a_destroy_is_refused_exactly_while_a_live_streams_wait_reads_it() {
                 let (mut seen, mut runs) = (Seen::default(), 0);
                 walk(&Tally::new(), &mut Vec::new(), &mut seen, &mut runs);
