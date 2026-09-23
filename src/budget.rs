@@ -17,9 +17,9 @@
 //! a per-arm ledger would be blind to the half of that total the host actually kills for.
 //!
 //! **What it does not see, and should never be claimed to.** Only the allocations this process
-//! makes with its own hands: venus's device memory and exported pages, and classic's IOSurfaces
-//! and CUSTOM buffers -- the last because the guest sizes them and nothing on the wire bounds
-//! them. Ordinary `glTexStorage`/`glBufferData` storage is the
+//! makes with its own hands: venus's device memory and exported pages, and classic's IOSurfaces,
+//! CUSTOM buffers and accumulated video bitstreams -- the last two because the guest sizes them
+//! and nothing on the wire bounds either. Ordinary `glTexStorage`/`glBufferData` storage is the
 //! driver's and this process cannot size it; nor are `GuestPixels.staging` or the VideoToolbox
 //! output pool counted. So "the ledger sees what classic holds" is never going to be true -- it
 //! sees what classic holds in memory it allocated itself.
@@ -727,7 +727,7 @@ impl Budget {
         self.ledger.lock().expect("the budget ledger").shared.bytes()
     }
 
-    /// What classic holds: its IOSurfaces and CUSTOM buffers.
+    /// What classic holds: its IOSurfaces, CUSTOM buffers and accumulated bitstreams.
     pub fn classic(&self) -> u64 {
         self.ledger.lock().expect("the budget ledger").classic.bytes()
     }

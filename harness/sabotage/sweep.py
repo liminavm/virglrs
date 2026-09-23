@@ -1816,6 +1816,13 @@ SABOTAGES = [
         """        let charge = budget.charge("CUSTOM buffer", 0);""",
         'a_custom_buffer_is_charged_for_the_bytes_it_holds',
     ),
+    (
+        "a frame's bitstream grows without its charge following",
+        'src/vrend/video/mod.rs',
+        """            self.charge = Some(budget.charge("video bitstream", held));""",
+        """            let _ = (budget, held);""",
+        'a_frames_bitstream_is_charged_for_as_long_as_it_is_held',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

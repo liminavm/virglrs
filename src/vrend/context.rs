@@ -4678,14 +4678,8 @@ impl Context {
             false,
         )?;
         let bitstream = self.read_guest_bytes(host, cmd, buffer, buffer_size, true)?;
-        let out = self.video.decode_bitstream(
-            host.gl,
-            host.unsettled,
-            codec,
-            target,
-            &descriptor,
-            &bitstream,
-        );
+        let env = video::Env { gl: host.gl, unsettled: host.unsettled, budget: host.budget };
+        let out = self.video.decode_bitstream(&env, codec, target, &descriptor, &bitstream);
         video_result(cmd, out)
     }
 

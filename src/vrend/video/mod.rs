@@ -32,6 +32,7 @@ use super::gl::{Gl, pixel_bytes};
 use super::journal::Retained;
 use super::proto::{Format, VideoBuffer, VideoBufferHandle, VideoCodec, VideoCodecHandle};
 use super::resource::{self, Texture};
+use crate::budget::{Charge, Classic};
 use crate::decode::{self, Configuration, PixelFormat, Session, SessionKey};
 use crate::surface::Held;
 
@@ -560,7 +561,7 @@ enum Frame {
         /// The bitstream so far. The guest may split one picture across several calls, so a
         /// DECODE_BITSTREAM only accumulates; the decode itself is END_FRAME, mirroring
         /// `vaEndPicture`.
-        bitstream: Vec<u8>,
+        bitstream: Bitstream,
         /// What the descriptors so far said about the frame. `None` until a DECODE_BITSTREAM
         /// produces one: an END_FRAME that arrives without one is the frame a snapshot cut in
         /// half, whose slices reached the codec that was saved -- or, for H.264, a frame whose
@@ -578,7 +579,7 @@ impl Frame {
     fn open_on(
         &mut self,
         target: VideoBufferHandle,
-    ) -> Result<(&mut Vec<u8>, &mut Option<Shape>), Refusal> {
+    ) -> Result<(&mut Bitstream, &mut Option<Shape>), Refusal> {
         let Frame::Open { handle, bitstream, shape, .. } = self else {
             return Err(Refusal::OutOfSequence("decode with no frame open"));
         };
@@ -586,6 +587,54 @@ impl Frame {
             return Err(Refusal::OutOfSequence("decode into a target the frame was not begun on"));
         }
         Ok((bitstream, shape))
+    }
+}
+
+/// What DECODE_BITSTREAM needs of the renderer around it.
+pub struct Env<'a> {
+    pub gl: &'a Gl,
+    /// Where a picture that goes out now -- a held AV1 frame -- is counted until it is settled.
+    pub unsettled: &'a pending::Unsettled,
+    /// Where the accumulated bitstream is charged.
+    pub budget: &'a Classic,
+}
+
+/// A frame's bitstream so far, and what holding it costs the ledger.
+///
+/// Nothing on the wire bounds it: a guest may send any number of DECODE_BITSTREAMs before the
+/// END_FRAME that consumes them, each as long as the buffer it names. So the bytes are counted
+/// for as long as they are held, and a length the host cannot allocate refuses the call instead
+/// of aborting the worker -- the C has no accumulator to compare with, since VA-API takes each
+/// buffer as it comes.
+#[derive(Default)]
+struct Bitstream {
+    bytes: Vec<u8>,
+    /// Sized to the buffer's capacity, and replaced when that grows. `None` until the first byte.
+    charge: Option<Charge>,
+}
+
+impl Bitstream {
+    fn append(&mut self, more: &[u8], budget: &Classic) -> Result<(), Refusal> {
+        self.bytes.try_reserve(more.len()).map_err(|_| Refusal::OutOfHostMemory)?;
+        self.bytes.extend_from_slice(more);
+        let held = self.bytes.capacity() as u64;
+        if self.charge.as_ref().is_none_or(|c| c.size() != held) {
+            self.charge = Some(budget.charge("video bitstream", held));
+        }
+        Ok(())
+    }
+
+    /// The bytes, for the decode. The charge goes with the rest of the frame.
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl std::ops::Deref for Bitstream {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -1222,8 +1271,7 @@ impl Codec {
     /// DECODE_BITSTREAM for AV1. See [`Av1::advance`].
     fn decode_av1(
         &mut self,
-        gl: &Gl,
-        unsettled: &pending::Unsettled,
+        env: &Env<'_>,
         handle: VideoCodecHandle,
         target: VideoBufferHandle,
         descriptor: &[u8],
@@ -1232,10 +1280,10 @@ impl Codec {
         let Codec { kind: Kind::Av1(av1), decoder, frame, width, height, .. } = self else {
             unreachable!("only an AV1 codec decodes an AV1 frame");
         };
-        let mut host = HostDecoder { gl, decoder, codec: "AV1", unsettled };
+        let mut host = HostDecoder { gl: env.gl, decoder, codec: "AV1", unsettled: env.unsettled };
         let next = av1.advance(&mut host, handle, descriptor, (*width, *height))?;
         let (accumulated, shape) = frame.open_on(target)?;
-        accumulated.extend_from_slice(bitstream);
+        accumulated.append(bitstream, env.budget)?;
         *shape = Some(next);
         Ok(())
     }
@@ -1282,6 +1330,8 @@ pub enum Refusal {
     /// The host would not decode a frame it accepted the bytes of. Not the guest's fault, and
     /// not fatal to the context: the frame is lost and the stream continues.
     HostRefusedFrame,
+    /// The host could not allocate what the guest sent for one frame.
+    OutOfHostMemory,
 }
 
 impl core::fmt::Display for Refusal {
@@ -1292,6 +1342,9 @@ impl core::fmt::Display for Refusal {
             | Refusal::NoSuchObject(what)
             | Refusal::OutOfSequence(what) => f.write_str(what),
             Refusal::HostRefusedFrame => f.write_str("the host would not decode the frame"),
+            Refusal::OutOfHostMemory => {
+                f.write_str("the host could not allocate the frame's bitstream")
+            }
         }
     }
 }
@@ -1585,8 +1638,12 @@ impl Video {
             self.buffers.get(&target).ok_or(Refusal::NoSuchObject("no such decode target"))?,
         );
         let codec = self.codec_mut(codec)?;
-        codec.frame =
-            Frame::Open { handle: target, target: buffer, bitstream: Vec::new(), shape: None };
+        codec.frame = Frame::Open {
+            handle: target,
+            target: buffer,
+            bitstream: Bitstream::default(),
+            shape: None,
+        };
         Ok(())
     }
 
@@ -1597,8 +1654,7 @@ impl Video {
     /// the guest actually attached.
     pub fn decode_bitstream(
         &mut self,
-        gl: &Gl,
-        unsettled: &pending::Unsettled,
+        env: &Env<'_>,
         codec: VideoCodecHandle,
         target: VideoBufferHandle,
         descriptor: &[u8],
@@ -1612,13 +1668,13 @@ impl Video {
         // at END_FRAME -- and a stream may display a hidden frame just one decode later, which
         // leaves no margin.
         if matches!(codec.kind, Kind::Av1(_)) {
-            return codec.decode_av1(gl, unsettled, handle, target, descriptor, bitstream);
+            return codec.decode_av1(env, handle, target, descriptor, bitstream);
         }
 
         let (accumulated, shape) = codec.frame.open_on(target)?;
         // Accumulated first: H.264 reads the shape back out of the slice headers, so the answer
         // depends on the bytes this very call carried.
-        accumulated.extend_from_slice(bitstream);
+        accumulated.append(bitstream, env.budget)?;
 
         match &mut codec.kind {
             Kind::Vp9 => *shape = Some(Shape::Vp9(Vp9Frame::read(descriptor, width, height))),
@@ -1760,7 +1816,7 @@ impl Video {
         if let Shape::Av1 { .. } = shape {
             return codec.end_av1_frame(gl, unsettled, handle, &shape, &bitstream, buffer);
         }
-        let Some(unit) = shape.access_unit(bitstream) else {
+        let Some(unit) = shape.access_unit(bitstream.into_bytes()) else {
             eprintln!("[virglrs] video codec {handle}: the access unit is not Annex-B framed");
             return Err(Refusal::HostRefusedFrame);
         };
@@ -1879,6 +1935,27 @@ impl Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame's bitstream is in the ledger for as long as it is held, at what it holds, and
+    /// leaves it with the frame. Nothing on the wire bounds how much a guest sends before the
+    /// END_FRAME, so the ledger is the one place that growth shows.
+    #[test]
+    fn a_frames_bitstream_is_charged_for_as_long_as_it_is_held() {
+        let budget = crate::budget::Budget::with_cap(None, false);
+        let classic = Classic::open(&budget);
+        let mut bitstream = Bitstream::default();
+        bitstream.append(&[1; 1000], &classic).expect("a small part is allocated");
+        bitstream.append(&[2; 3000], &classic).expect("and a second");
+        assert_eq!(bitstream.len(), 4000, "both parts are held, in order");
+        assert_eq!((bitstream[999], bitstream[1000]), (1, 2));
+        assert_eq!(
+            budget.classic(),
+            bitstream.bytes.capacity() as u64,
+            "the ledger holds what the accumulator holds"
+        );
+        drop(bitstream);
+        assert_eq!(budget.classic(), 0, "and lets it go with the frame");
+    }
 
     /// Every format a guest could hand over as a decode plane, against whether the delivery
     /// arithmetic can be written for it.
