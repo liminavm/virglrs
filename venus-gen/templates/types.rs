@@ -134,8 +134,12 @@ pub struct ${ty.name} {
 /// what carries the lifetime for the commands whose members are all scalars. It is a zero-sized
 /// type at the end of a `#[repr(C)]` struct, so it costs no byte and moves no member -- which the
 /// layout oracle is what actually checks.
+///
+/// Neither `Clone` nor `Copy`: the arrays a command writes back into are handed out as `&mut`
+/// borrowed from the struct, and a second copy of the struct would be a second borrow of the
+/// same arena memory.
 % for ty in GEN.supported_types[VkType.COMMAND]:
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 #[repr(C)]
 pub struct vn_command_${ty.name}<'a> {
 %   for vis, name, rs in RUST.command_params(ty):

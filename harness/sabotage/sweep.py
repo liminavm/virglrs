@@ -52,6 +52,25 @@ SABOTAGES = [
         'witness',
     ),
     (
+        'an out-count may be raised past the arrays it sized',
+        'src/venus/cs.rs',
+        """            assert!(
+                n <= most,
+                "an out-count raised to {n} past the {most} its arrays were sized to"
+            );""",
+        """            let _ = most;""",
+        'an_out_count_cannot_be_raised_past_the_arrays_it_sized',
+    ),
+    (
+        'a command can be copied, lending its arrays twice',
+        'venus-gen/templates/types.rs',
+        """% for ty in GEN.supported_types[VkType.COMMAND]:
+#[derive(Default)]""",
+        """% for ty in GEN.supported_types[VkType.COMMAND]:
+#[derive(Clone, Copy, Default)]""",
+        'a_command_cannot_be_duplicated',
+    ),
+    (
         'an unserved command is counted and then continues, as though the host had done it',
         'src/venus/context.rs',
         """        self.todo.note(cmd);

@@ -2479,9 +2479,9 @@ impl Commands for Handlers<'_> {
         // there is nothing to register and nothing to plant.
         if !args.has_pPhysicalDevices() {
             if let Ok(n) = self.driver.physical_device_count(args.instance)
-                && let Some(count) = args.pPhysicalDeviceCount_mut()
+                && let Some(mut count) = args.pPhysicalDeviceCount_mut()
             {
-                *count = n;
+                count.set(n);
             }
             return;
         }
@@ -2520,8 +2520,8 @@ impl Commands for Handlers<'_> {
         // The count goes back last, and has to: it lives in the same struct the shadow array was
         // borrowed from, so the two cannot be held at once. That is not the borrow checker being
         // awkward -- how many there are is not known until the array has been filled.
-        if let Some(count) = args.pPhysicalDeviceCount_mut() {
-            *count = got;
+        if let Some(mut count) = args.pPhysicalDeviceCount_mut() {
+            count.set(got);
         }
         self.ghost_ids(&ids[got as usize..]);
     }
@@ -2931,7 +2931,7 @@ impl Commands for Handlers<'_> {
         let ids = args.pCommandBuffers();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let device = args.device;
-        let Some(info) = self.names(args.pAllocateInfo) else { return };
+        let Some(info) = self.names(args.pAllocateInfo()) else { return };
         let pool = info.commandPool;
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
@@ -2988,7 +2988,7 @@ impl Commands for Handlers<'_> {
         let ids = args.pDescriptorSets();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let device = args.device;
-        let Some(info) = self.names(args.pAllocateInfo) else { return };
+        let Some(info) = self.names(args.pAllocateInfo()) else { return };
         let pool = info.descriptorPool;
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
@@ -3044,9 +3044,9 @@ impl Commands for Handlers<'_> {
                 Ok((n, ret)) => {
                     args.ret = ret;
                     if ret == VkResult::VK_SUCCESS
-                        && let Some(count) = args.pPhysicalDeviceGroupCount_mut()
+                        && let Some(mut count) = args.pPhysicalDeviceGroupCount_mut()
                     {
-                        *count = n;
+                        count.set(n);
                     }
                 }
                 Err(e) => args.ret = e,
@@ -3093,8 +3093,8 @@ impl Commands for Handlers<'_> {
         }
 
         args.ret = ret;
-        if let Some(count) = args.pPhysicalDeviceGroupCount_mut() {
-            *count = n;
+        if let Some(mut count) = args.pPhysicalDeviceGroupCount_mut() {
+            count.set(n);
         }
     }
 
@@ -3115,8 +3115,8 @@ impl Commands for Handlers<'_> {
         }
         let advertised = self.driver.advertised_extensions(args.physicalDevice);
         if !args.has_pProperties() {
-            if let Some(count) = args.pPropertyCount_mut() {
-                *count = advertised.len() as u32;
+            if let Some(mut count) = args.pPropertyCount_mut() {
+                count.set(advertised.len() as u32);
             }
             args.ret = VkResult::VK_SUCCESS;
             return;
@@ -3128,8 +3128,8 @@ impl Commands for Handlers<'_> {
         out[..n].copy_from_slice(&advertised[..n]);
         args.ret =
             if n < advertised.len() { VkResult::VK_INCOMPLETE } else { VkResult::VK_SUCCESS };
-        if let Some(count) = args.pPropertyCount_mut() {
-            *count = n as u32;
+        if let Some(mut count) = args.pPropertyCount_mut() {
+            count.set(n as u32);
         }
     }
 
@@ -3147,9 +3147,9 @@ impl Commands for Handlers<'_> {
                 .driver
                 .enumerate_into(pd, None, |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties2());
             if let Some((n, ())) = self.asked(asked)
-                && let Some(count) = args.pQueueFamilyPropertyCount_mut()
+                && let Some(mut count) = args.pQueueFamilyPropertyCount_mut()
             {
-                *count = n;
+                count.set(n);
             }
             return;
         }
@@ -3161,9 +3161,9 @@ impl Commands for Handlers<'_> {
         // from, so the two cannot be held at once -- and how many there are is not known until
         // the array has been filled. See `vkEnumeratePhysicalDevices`.
         if let Some((n, ())) = self.asked(asked)
-            && let Some(count) = args.pQueueFamilyPropertyCount_mut()
+            && let Some(mut count) = args.pQueueFamilyPropertyCount_mut()
         {
-            *count = n;
+            count.set(n);
         }
     }
 
@@ -3542,8 +3542,8 @@ impl Commands for Handlers<'_> {
         }
         let speaks = crate::venus::driver::renderer_extensions();
         if !args.has_pProperties() {
-            if let Some(count) = args.pPropertyCount_mut() {
-                *count = speaks.len() as u32;
+            if let Some(mut count) = args.pPropertyCount_mut() {
+                count.set(speaks.len() as u32);
             }
             args.ret = VkResult::VK_SUCCESS;
             return;
@@ -3552,8 +3552,8 @@ impl Commands for Handlers<'_> {
         let n = out.len().min(speaks.len());
         out[..n].copy_from_slice(&speaks[..n]);
         args.ret = if n < speaks.len() { VkResult::VK_INCOMPLETE } else { VkResult::VK_SUCCESS };
-        if let Some(count) = args.pPropertyCount_mut() {
-            *count = n as u32;
+        if let Some(mut count) = args.pPropertyCount_mut() {
+            count.set(n as u32);
         }
     }
 
@@ -4101,9 +4101,9 @@ impl Commands for Handlers<'_> {
                 .driver
                 .enumerate_into(pd, None, |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties());
             if let Some((n, ())) = self.asked(asked)
-                && let Some(count) = args.pQueueFamilyPropertyCount_mut()
+                && let Some(mut count) = args.pQueueFamilyPropertyCount_mut()
             {
-                *count = n;
+                count.set(n);
             }
             return;
         }
@@ -4112,9 +4112,9 @@ impl Commands for Handlers<'_> {
             .driver
             .enumerate_into(pd, Some(out), |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties());
         if let Some((n, ())) = self.asked(asked)
-            && let Some(count) = args.pQueueFamilyPropertyCount_mut()
+            && let Some(mut count) = args.pQueueFamilyPropertyCount_mut()
         {
-            *count = n;
+            count.set(n);
         }
     }
 
@@ -4132,8 +4132,8 @@ impl Commands for Handlers<'_> {
             match asked {
                 Ok((n, ret)) => {
                     args.ret = ret;
-                    if let Some(count) = args.pToolCount_mut() {
-                        *count = n;
+                    if let Some(mut count) = args.pToolCount_mut() {
+                        count.set(n);
                     }
                 }
                 Err(e) => args.ret = e,
@@ -4147,8 +4147,8 @@ impl Commands for Handlers<'_> {
         match asked {
             Ok((n, ret)) => {
                 args.ret = ret;
-                if let Some(count) = args.pToolCount_mut() {
-                    *count = n;
+                if let Some(mut count) = args.pToolCount_mut() {
+                    count.set(n);
                 }
             }
             Err(e) => args.ret = e,
@@ -4170,8 +4170,8 @@ impl Commands for Handlers<'_> {
             match asked {
                 Ok((n, ret)) => {
                     args.ret = ret;
-                    if let Some(count) = args.pTimeDomainCount_mut() {
-                        *count = n;
+                    if let Some(mut count) = args.pTimeDomainCount_mut() {
+                        count.set(n);
                     }
                 }
                 Err(e) => args.ret = e,
@@ -4185,8 +4185,8 @@ impl Commands for Handlers<'_> {
         match asked {
             Ok((n, ret)) => {
                 args.ret = ret;
-                if let Some(count) = args.pTimeDomainCount_mut() {
-                    *count = n;
+                if let Some(mut count) = args.pTimeDomainCount_mut() {
+                    count.set(n);
                 }
             }
             Err(e) => args.ret = e,
@@ -4222,9 +4222,9 @@ impl Commands for Handlers<'_> {
             |i| i.try_vkGetPhysicalDeviceSparseImageFormatProperties(),
         );
         if let Some(n) = self.asked(asked)
-            && let Some(count) = args.pPropertyCount_mut()
+            && let Some(mut count) = args.pPropertyCount_mut()
         {
-            *count = n;
+            count.set(n);
         }
     }
 
@@ -4252,9 +4252,9 @@ impl Commands for Handlers<'_> {
             i.try_vkGetPhysicalDeviceSparseImageFormatProperties2()
         });
         if let Some((n, ())) = self.asked(asked)
-            && let Some(count) = args.pPropertyCount_mut()
+            && let Some(mut count) = args.pPropertyCount_mut()
         {
-            *count = n;
+            count.set(n);
         }
     }
 
@@ -4278,9 +4278,9 @@ impl Commands for Handlers<'_> {
             .driver
             .dev_enumerate_arg(device, image, out, |d| d.try_vkGetImageSparseMemoryRequirements());
         if let Some((n, ())) = self.asked(asked)
-            && let Some(count) = args.pSparseMemoryRequirementCount_mut()
+            && let Some(mut count) = args.pSparseMemoryRequirementCount_mut()
         {
-            *count = n;
+            count.set(n);
         }
     }
 
@@ -4308,9 +4308,9 @@ impl Commands for Handlers<'_> {
             .driver
             .dev_enumerate_info(device, info, out, |d| d.try_vkGetImageSparseMemoryRequirements2());
         if let Some((n, ())) = self.asked(asked)
-            && let Some(count) = args.pSparseMemoryRequirementCount_mut()
+            && let Some(mut count) = args.pSparseMemoryRequirementCount_mut()
         {
-            *count = n;
+            count.set(n);
         }
     }
 
@@ -4339,9 +4339,9 @@ impl Commands for Handlers<'_> {
             d.try_vkGetDeviceImageSparseMemoryRequirements()
         });
         if let Some((n, ())) = self.asked(asked)
-            && let Some(count) = args.pSparseMemoryRequirementCount_mut()
+            && let Some(mut count) = args.pSparseMemoryRequirementCount_mut()
         {
-            *count = n;
+            count.set(n);
         }
     }
 
@@ -11389,11 +11389,11 @@ mod tests {
         let bytes = [0xde_u8, 0xad, 0xbe, 0xef, 0x11, 0x22];
         let mut args = vn_command_vkCmdPushConstants::default();
         assert!(!args.has_pValues(), "a blob the guest never sent");
-        args.size = 4;
+        args.plant_size(4);
         assert!(args.pValues().is_none(), "a count with no blob behind it is refused, not emptied");
         args.plant_pValues(&bytes);
         assert_eq!(args.pValues(), Some(&bytes[..]), "the plant sets the count and the pointer");
-        args.size = 4;
+        args.plant_size(4);
         assert_eq!(args.pValues(), Some(&bytes[..4]), "the count measures it, not the pointer");
     }
 
@@ -11968,7 +11968,7 @@ mod tests {
         // the next draw constants the guest never sent -- so the answer is not an empty push.
         let mut args = vn_command_vkCmdPushConstants::default();
         args.commandBuffer = VkCommandBuffer(CB.0);
-        args.size = 16;
+        args.plant_size(16);
         h.vkCmdPushConstants(&mut args);
         assert!(h.reject.is_some(), "sixteen bytes of nothing is not a push");
         h.reject = None;
@@ -13624,7 +13624,7 @@ mod tests {
         // The count is `pAllocateInfo`'s, so the planters set only the pointers -- which is the
         // shape the decoder leaves too.
         let mut args = vn_command_vkAllocateCommandBuffers::default();
-        args.pAllocateInfo = Some(&info);
+        args.plant_pAllocateInfo(Some(&info));
         args.plant_pCommandBuffers(&mut asked);
         args.plant_handle_pCommandBuffers(&mut shadow);
         h.vkAllocateCommandBuffers(&mut args);
@@ -15373,7 +15373,7 @@ mod tests {
         let mut shadow = [VkCommandBuffer(0); 3];
         let mut args = vn_command_vkAllocateCommandBuffers::default();
         args.device = VkDevice(DEVICE);
-        args.pAllocateInfo = Some(&info);
+        args.plant_pAllocateInfo(Some(&info));
         args.plant_pCommandBuffers(&mut wire);
         args.plant_handle_pCommandBuffers(&mut shadow);
 
@@ -15404,7 +15404,7 @@ mod tests {
         let mut shadow = [VkCommandBuffer(0); 3];
         let mut args = vn_command_vkAllocateCommandBuffers::default();
         args.device = VkDevice(DEVICE);
-        args.pAllocateInfo = Some(&info);
+        args.plant_pAllocateInfo(Some(&info));
         args.plant_pCommandBuffers(&mut wire);
         args.plant_handle_pCommandBuffers(&mut shadow);
         h.vkAllocateCommandBuffers(&mut args);
@@ -15775,7 +15775,7 @@ mod tests {
         // the last push left, and the next draw would read constants the guest never sent.
         let mut args = vn_command_vkCmdPushConstants::default();
         args.commandBuffer = cb;
-        args.size = 4;
+        args.plant_size(4);
         h.vkCmdPushConstants(&mut args);
         assert!(h.reject.is_some(), "a count with no blob behind it stops the ring");
         SAW.with_borrow(|s| assert_eq!(s.pushed.len(), 1, "and pushes nothing"));

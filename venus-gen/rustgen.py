@@ -316,7 +316,7 @@ class RustGen:
             return None
 
     def restricted(self, ty):
-        """The members of `ty` no handler may reach, as field names.
+        """The members of `ty` no handler may write, as field names.
 
         An array is a count and a pointer, and the pointer alone means nothing: read with the
         wrong count it is an out-of-bounds slice, and the counts are not even all members --
@@ -324,16 +324,39 @@ class RustGen:
         arithmetic. So the pointer is shut in here with the code that knows its count, and
         `_command_accessors` emits the one door out.
 
-        Only the pointers, not the counts. A count on its own is an integer a handler is free to
-        read and cannot make unsound; shutting them in as well would also shut in the several
-        that are not array lengths at all.
+        The members a count is read from are shut in beside it, for the same reason: an accessor
+        is only as sound as its length, and a length a handler could raise would slice past the
+        allocation the decoder made from the old one -- as would the reply encoder, which reads
+        the same count. See `length_members`. Each keeps a read-only door, and an out-count its
+        own writable one; see `_command_accessors`.
 
         The single-value members are shut in beside them, for the same reason and behind the same
         kind of door -- see `scalar_rows`.
         """
         return ({f for f, _, _, _ in self._array_rows(ty)}
                 | {f for f, _, _, _ in self.scalar_rows(ty)}
-                | set(self.string_rows(ty)))
+                | set(self.string_rows(ty))
+                | set(self.length_members(ty)))
+
+    def length_members(self, ty):
+        """The members of `ty` an array's length is read from, in the order they are named.
+
+        Every name `val.X` in any array's count expression: a plain count, an out-parameter the
+        count is written back through, the room an out-blob was allocated with, or a struct the
+        count sits inside. What they have in common is that the decoder sized an allocation from
+        them, and so the decoder is the only thing that may set them.
+        """
+        out = []
+        for _, _, count, _ in self._array_rows(ty):
+            for name in re.findall(r'\bval\.(\w+)', count):
+                if name not in out:
+                    out.append(name)
+        return out
+
+    def sized_by(self, ty, member):
+        """The arrays of `ty` whose length is read from `member`, by field name."""
+        return [f for f, _, count, _ in self._array_rows(ty)
+                if re.search(r'\bval\.%s\b' % re.escape(member), count)]
 
     def destroy_target(self, ty):
         """The object a `vkDestroy*`/`vkFree*` names, as `(var, shape)`, or None.
@@ -2094,7 +2117,41 @@ class RustGen:
             out += self._scalar_accessor(ty, f, elem, mutable, field_mut)
         for f in strings:
             out += self._string_accessor(f)
+        out += self._length_getters(ty)
         return out[:-1] + ['}', '']
+
+    def _length_getters(self, ty):
+        """Read-only doors onto the plain members an array's length is read from.
+
+        Pointer members already have theirs -- see `_scalar_accessor`, where an out-count gets a
+        door that can only lower it. What is left is values: a count, an out-blob's room, the
+        struct a count sits inside. Handlers read them; only the decoder writes them.
+        """
+        types = dict(self._members(ty))
+        doored = ({f for f, _, _, _ in self._array_rows(ty)}
+                  | {f for f, _, _, _ in self.scalar_rows(ty)}
+                  | set(self.string_rows(ty)))
+        out = []
+        for f in self.length_members(ty):
+            if f in doored:
+                continue
+            rs = types[f]
+            out += ['    /// `%s`, which sizes %s. The decoder allocated from it, so the'
+                    % (f, ', '.join('`%s`' % a for a in self.sized_by(ty, f))),
+                    '    /// decoder is the only thing that sets it.',
+                    '    pub fn %s(&self) -> %s {' % (f, rs),
+                    '        self.%s' % f,
+                    '    }',
+                    '']
+            # Apart from the array it sizes, which a real decode never does -- but the refusals
+            # a split pair meets behind the decoder are only testable by building one.
+            out += ['    /// Plant `%s` on its own, which only a test may do.' % f,
+                    '    #[cfg(test)]',
+                    '    pub fn plant_%s(&mut self, v: %s) {' % (f, rs),
+                    '        self.%s = v;' % f,
+                    '    }',
+                    '']
+        return out
 
     @staticmethod
     def _string_accessor(f):
@@ -2143,6 +2200,9 @@ class RustGen:
         # A create's out-member is the guest's id, not a handle the driver may be called with,
         # and `Guest` is transparent so the reference is the same reference.
         read = 'cs::Guest<%s>' % elem if f in self.out_handle_fields(ty) else elem
+        sized = self.sized_by(ty, f)
+        if mutable and sized:
+            return self._out_count_accessor(ty, f, elem, sized)
         if mutable:
             sig = 'pub fn %s_mut(&mut self) -> Option<&mut %s>' % (f, elem)
             call, star = 'wire_out', 'mut'
@@ -2174,6 +2234,44 @@ class RustGen:
             '    #[cfg(test)]',
             '    pub fn plant_%s(&mut self, v: &%s %s) {' % (f, plant_life, elem),
             '        self.%s = v as *%s _;' % (f, plant_star),
+            '    }',
+            '',
+        ]
+
+    @staticmethod
+    def _out_count_accessor(ty, f, elem, sized):
+        """The door onto an out-count that sizes arrays the same command carries.
+
+        The handler has to write it -- how many there are is the answer -- but the arrays were
+        allocated from the value the guest sent, and their accessors and the reply encoder read
+        their length from it afterwards. So it may be lowered and never raised while one of those
+        arrays is there; with none of them sent, the guest asked how many there are, and any
+        answer fits. See `cs::OutCount`.
+        """
+        present = ' || '.join('!self.%s.is_null()' % a for a in sized)
+        return [
+            '    /// Whether the guest sent `%s` at all.' % f,
+            '    ///',
+            '    /// Not a question a handler may skip: Vulkan gives a null out-parameter its own',
+            '    /// meaning, and the accessor answers `None` rather than deciding what it meant.',
+            '    pub fn has_%s(&self) -> bool {' % f,
+            '        !self.%s.is_null()' % f,
+            '    }',
+            '',
+            '    /// `%s`, as a count that sizes %s and so may only be lowered while'
+            % (f, ', '.join('`%s`' % a for a in sized)),
+            '    /// any of them was sent.',
+            "    pub fn %s_mut(&mut self) -> Option<cs::OutCount<'_, %s>> {" % (f, elem),
+            '        let sized = %s;' % present,
+            '        // SAFETY: the decoder allocated this member from the batch arena as a',
+            "        // single element, and the arena outlives the struct's `'a`.",
+            '        unsafe { cs::wire_out(self.%s) }.map(|v| cs::OutCount::new(v, sized))' % f,
+            '    }',
+            '',
+            '    /// Plant `%s` as the decoder would have.' % f,
+            '    #[cfg(test)]',
+            "    pub fn plant_%s(&mut self, v: &'a mut %s) {" % (f, elem),
+            '        self.%s = v as *mut _;' % f,
             '    }',
             '',
         ]

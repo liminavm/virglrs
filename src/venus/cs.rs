@@ -491,7 +491,8 @@ pub unsafe fn wire_array<'a, T>(count: usize, ptr: *const T) -> Option<&'a [T]> 
 /// # Safety
 ///
 /// As [`wire_array`], and nothing else may hold the array while the returned slice lives. The
-/// generated accessor borrows the command struct mutably, which is what enforces it.
+/// generated accessor borrows the command struct mutably, which is what enforces it -- and only
+/// because a command struct is neither `Clone` nor `Copy`, so there is no second struct to borrow.
 pub unsafe fn wire_array_mut<'a, T>(count: usize, ptr: *mut T) -> Option<&'a mut [T]> {
     if ptr.is_null() {
         return (count == 0).then_some(&mut []);
@@ -555,10 +556,52 @@ pub unsafe fn wire_c_string<'a>(ptr: *const core::ffi::c_char) -> Option<&'a cor
 /// # Safety
 ///
 /// As [`wire_ref`], and nothing else may hold the value while the returned reference lives. The
-/// generated accessor borrows the command struct mutably, which is what enforces it.
+/// generated accessor borrows the command struct mutably, which is what enforces it -- and only
+/// because a command struct is neither `Clone` nor `Copy`, so there is no second struct to borrow.
 pub unsafe fn wire_out<'a, T>(ptr: *mut T) -> Option<&'a mut T> {
     // SAFETY: the caller's, above.
     unsafe { ptr.as_mut() }
+}
+
+/// An out-count that sizes arrays the same command carries: `pPropertyCount` beside
+/// `pProperties`, and every enumeration like it.
+///
+/// A handler has to write it, because how many there are is the answer. But the decoder allocated
+/// the arrays from the value the guest sent, and their accessors and the reply encoder read their
+/// length from this same value afterwards -- so a count raised past the allocation is a slice
+/// past it. While any of those arrays was sent, the count may be lowered and never raised, which
+/// is also all Vulkan lets an enumeration do. With none of them sent, the guest is asking how many
+/// there are, nothing was allocated from the value, and any answer fits.
+///
+/// A raise is this renderer's bug, not the guest's -- the guest never writes through here -- so it
+/// asserts.
+pub struct OutCount<'c, T> {
+    value: &'c mut T,
+    /// The most the count may say: what it said when the door was opened, if it sizes an array.
+    most: Option<T>,
+}
+
+impl<'c, T: Copy + PartialOrd + core::fmt::Display> OutCount<'c, T> {
+    pub(crate) fn new(value: &'c mut T, sized: bool) -> Self {
+        let most = sized.then_some(*value);
+        OutCount { value, most }
+    }
+
+    /// What the count says now: the guest's capacity until a handler answers.
+    pub fn get(&self) -> T {
+        *self.value
+    }
+
+    /// Answer with `n`.
+    pub fn set(&mut self, n: T) {
+        if let Some(most) = self.most {
+            assert!(
+                n <= most,
+                "an out-count raised to {n} past the {most} its arrays were sized to"
+            );
+        }
+        *self.value = n;
+    }
 }
 
 /// What a venus protocol supports, asked whenever a `pNext` chain must skip a struct the far side
@@ -891,6 +934,13 @@ impl<'a> Encoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::venus::proto::serialize::{
+        vn_decode_vkEnumeratePhysicalDevices_args_temp, vn_encode_vkEnumeratePhysicalDevices_reply,
+        vn_sizeof_vkEnumeratePhysicalDevices_reply,
+    };
+    use crate::venus::proto::types::{
+        VkPhysicalDevice, vn_command_vkEnumeratePhysicalDevices, vn_command_vkGetQueryPoolResults,
+    };
 
     #[test]
     fn scalars_are_word_padded_on_the_wire() {
@@ -966,6 +1016,130 @@ mod tests {
         let dec = Decoder::new(&[], &temp, &IdentityObjects, &hard);
         assert!(dec.alloc_temp::<u64>().is_none());
         assert!(dec.hard_fatal());
+    }
+
+    /// `vkEnumeratePhysicalDevices` asking for `capacity` devices, decoded as the ring would:
+    /// the count, the guest's ids, and the shadow the host handles go in, all in `temp`.
+    fn enumeration<'a>(
+        buf: &'a mut Vec<u8>,
+        temp: &'a Bump,
+        hard: &'a AtomicBool,
+        capacity: u32,
+    ) -> vn_command_vkEnumeratePhysicalDevices<'a> {
+        buf.extend(7u64.to_le_bytes()); // the instance
+        buf.extend(1u64.to_le_bytes()); // the count is there
+        buf.extend(capacity.to_le_bytes());
+        buf.extend(u64::from(capacity).to_le_bytes()); // the array is there, this long
+        for id in 0..u64::from(capacity) {
+            buf.extend((100 + id).to_le_bytes());
+        }
+        let mut dec = Decoder::new(buf, temp, &IdentityObjects, hard);
+        let mut args = vn_command_vkEnumeratePhysicalDevices::default();
+        vn_decode_vkEnumeratePhysicalDevices_args_temp(&mut dec, &mut args);
+        assert!(!dec.fatal(), "a well-formed enumeration decodes");
+        args
+    }
+
+    /// The whole life of an out-array, which is where a handler holds arena memory as `&mut`: the
+    /// decode, the handler filling the shadow and answering fewer than the guest had room for, and
+    /// the reply read back out. Run under Miri, this is what checks that the references the
+    /// accessors make from arena pointers obey the aliasing rules.
+    #[test]
+    fn an_enumeration_answers_fewer_than_it_had_room_for() {
+        let (mut buf, temp, hard) = (Vec::new(), Bump::new(), AtomicBool::new(false));
+        let mut args = enumeration(&mut buf, &temp, &hard, 3);
+        let ids = args.pPhysicalDevices().expect("the guest sent its ids");
+        assert_eq!(ids.len(), 3);
+        let shadow = args.handle_pPhysicalDevices_mut().expect("a shadow beside the ids");
+        shadow[0] = VkPhysicalDevice(0xaa);
+        shadow[1] = VkPhysicalDevice(0xbb);
+        let mut count = args.pPhysicalDeviceCount_mut().expect("the guest sent a count");
+        assert_eq!(count.get(), 3, "until answered, the count is the guest's capacity");
+        count.set(2);
+        assert_eq!(
+            args.pPhysicalDevices().map(<[_]>::len),
+            Some(2),
+            "the array follows the answer"
+        );
+
+        let proto = AllOfIt;
+        let mut out = vec![0u8; vn_sizeof_vkEnumeratePhysicalDevices_reply(&proto, &args)];
+        let mut enc = Encoder::new(&mut out, &proto);
+        vn_encode_vkEnumeratePhysicalDevices_reply(&mut enc, &args);
+        // The type, the result, the count's presence and value, then an array of two.
+        assert_eq!(&out[16..20], &2u32.to_le_bytes(), "the reply carries the answer");
+        assert_eq!(&out[20..28], &2u64.to_le_bytes(), "and an array that long");
+    }
+
+    /// The arrays were allocated from the count the guest sent, so a handler that answered with
+    /// more would have their accessors, and the reply, slice past the allocation.
+    #[test]
+    #[should_panic(expected = "an out-count raised to 4 past the 3 its arrays were sized to")]
+    fn an_out_count_cannot_be_raised_past_the_arrays_it_sized() {
+        let (mut buf, temp, hard) = (Vec::new(), Bump::new(), AtomicBool::new(false));
+        let mut args = enumeration(&mut buf, &temp, &hard, 3);
+        args.pPhysicalDeviceCount_mut().expect("the guest sent a count").set(4);
+    }
+
+    /// With no array sent, the guest is asking how many there are: nothing was allocated from the
+    /// count, and any answer fits.
+    #[test]
+    fn a_count_query_takes_any_answer() {
+        let mut buf = Vec::new();
+        buf.extend(7u64.to_le_bytes());
+        buf.extend(1u64.to_le_bytes());
+        buf.extend(0u32.to_le_bytes());
+        buf.extend(0u64.to_le_bytes()); // no array
+        let (temp, hard) = (Bump::new(), AtomicBool::new(false));
+        let mut dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
+        let mut args = vn_command_vkEnumeratePhysicalDevices::default();
+        vn_decode_vkEnumeratePhysicalDevices_args_temp(&mut dec, &mut args);
+        assert!(!dec.fatal());
+        args.pPhysicalDeviceCount_mut().expect("the guest sent a count").set(4);
+        assert!(!args.has_pPhysicalDevices());
+    }
+
+    /// A command's `_mut` accessors hand out arena memory as `&mut` borrowed from the struct,
+    /// which is one borrow only while there is one struct. A `Copy` or `Clone` command would be
+    /// two, each lending the same memory.
+    #[test]
+    fn a_command_cannot_be_duplicated() {
+        use core::marker::PhantomData;
+        struct Probe<T>(PhantomData<T>);
+        // Autoref specialisation: the by-value candidates are tried first, and only apply where
+        // the bound holds; otherwise resolution falls through to the impls on `&Probe`.
+        trait Copies {
+            fn copies(&self) -> bool {
+                true
+            }
+        }
+        impl<T: Copy> Copies for Probe<T> {}
+        trait CopiesNot {
+            fn copies(&self) -> bool {
+                false
+            }
+        }
+        impl<T> CopiesNot for &Probe<T> {}
+        trait Clones {
+            fn clones(&self) -> bool {
+                true
+            }
+        }
+        impl<T: Clone> Clones for Probe<T> {}
+        trait ClonesNot {
+            fn clones(&self) -> bool {
+                false
+            }
+        }
+        impl<T> ClonesNot for &Probe<T> {}
+
+        // The positive control: the probe does see a copy where there is one.
+        let control = &Probe::<VkPhysicalDevice>(PhantomData);
+        assert!(control.copies() && control.clones());
+        let e = &Probe::<vn_command_vkEnumeratePhysicalDevices<'static>>(PhantomData);
+        assert!(!e.copies() && !e.clones(), "an enumeration can be duplicated");
+        let q = &Probe::<vn_command_vkGetQueryPoolResults<'static>>(PhantomData);
+        assert!(!q.copies() && !q.clones(), "a blob query can be duplicated");
     }
 
     #[test]
