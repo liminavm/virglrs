@@ -971,11 +971,13 @@ it survives the session it was found in.
     table is walked this way (`every_sequence` in `src/venus/objects.rs`). Owed: the `budget.rs`
     ledger (per-context amounts sum to the total, a charge is credited once and by its last
     holder, a late credit never lands on a reused context id).
-  - **loom** tries every interleaving of the threads involved, which neither of the above can. First
-    `fence.rs`: a ring retires in creation order, everything queued is delivered before the
-    thread stops, and the queued-after-stop assert cannot fire whichever thread drops the last
-    `Handle`. Then the ring thread's wait and wake, with the guest modelled as a thread writing
-    the control words.
+  - **loom** tries every interleaving of the threads involved, which neither of the above can.
+    A module opts in by taking its `Arc`, `Mutex`, `Condvar` and thread from loom under
+    `cfg(all(test, loom))`; its models run under
+    `RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom cargo test --lib <module>::loom_models`,
+    and a sabotage entry names one as `loom:<test>`. Fence retirement is modelled
+    (`src/fence.rs`). Owed: the ring thread's wait and wake, with the guest modelled as a thread
+    writing the control words.
   - **Miri** runs the existing unit tests of the modules that make no FFI calls, and checks the
     aliasing rules Kani does not. The case that matters is the `&mut` that `wire_array_mut` and
     `wire_out` make from arena pointers.
