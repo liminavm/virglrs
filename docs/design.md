@@ -955,17 +955,20 @@ it survives the session it was found in.
   - **Kani** checks every input up to a stated bound: no panic, no overflow, no out-of-bounds
     access, plus any assertion the harness adds. It checks overflow whatever the Cargo profile
     says, which matters because a release build here wraps silently. It runs everything as
-    single-threaded code and cannot see into C. It pays where control flow is fixed and data is
-    wide: `RingLayout::parse` is proved equal to its rules for every value of every `usize`
-    field in 13 s (`src/venus/ring.rs`). Where control flow branches on state -- a table walked
-    through a sequence of operations -- its model grows without bound: 22 GB and no verdict for a
-    three-operation table. Its `cbmc` process also outlives a `timeout` on `cargo kani`, so a
-    run is stopped by killing `cbmc` itself. Proofs live in `#[cfg(kani)]` modules beside the
-    code and run under `cargo kani`, on its own pinned nightly toolchain; a sabotage entry names
-    one as `kani:<harness>`. Owed, in order: `sync::decode` (no panic on any blob, and it
-    round-trips `encode`), `Decoder::read_bytes`/`peek_bytes`/`charge` (`pos` never passes the
-    buffer, and no length panics), and `Iov::walk_from` (every piece stays inside its entry, and
-    a walk resumed from the cursor matches a fresh one).
+    single-threaded code and cannot see into C. It pays where control flow is fixed, data is
+    wide, and nothing allocates: `RingLayout::parse` is proved equal to its rules for every value
+    of every `usize` field (`src/venus/ring.rs`), and the decoder's `read_bytes`, `peek_bytes`
+    and arena charge for every length a guest can send (`src/venus/cs.rs`), each in seconds and
+    under 150 MB. Code that grows a `Vec` or branches on accumulated state does not fit: the
+    object table reached 22 GB with no verdict, and `sync::decode`, which builds its result
+    vector, ran past 10 minutes at 6 GB. The harness counts as much as the code: comparing two
+    slices of symbolic length unrolls `memcmp` without bound, so a harness compares one index
+    Kani picks, which stands for all of them. `cbmc` outlives a `timeout` on `cargo kani` and has
+    no memory cap of its own, so an exploratory run is watched and `cbmc` killed by process
+    group. Proofs live in `#[cfg(kani)]` modules beside the code and run under `cargo kani`, on
+    its own pinned nightly toolchain; a sabotage entry names one as `kani:<harness>`. Owed:
+    `Iov::walk_from` (every piece stays inside its entry, and a walk resumed from the cursor
+    matches a fresh one).
   - **Exhaustive enumeration** in a plain `cargo test` takes state machines whose domains are
     small by design: every operation sequence to a fixed depth, each step checked. The object
     table is walked this way (`every_sequence` in `src/venus/objects.rs`). Owed: the `budget.rs`
@@ -985,8 +988,9 @@ it survives the session it was found in.
     aliasing rules Kani does not. The case that matters is the `&mut` that `wire_array_mut` and
     `wire_out` make from arena pointers.
   - **cargo-fuzz** takes whatever is too large to prove: the generated venus decoder behind
-    `IdentityObjects`, the TGSI translator (where two guest-reachable aborts were found), and the
-    h264, h265 and AV1 bitstream parsers. It is Layer 3's fuzz item, made concrete.
+    `IdentityObjects`, the TGSI translator (where two guest-reachable aborts were found), the
+    h264, h265 and AV1 bitstream parsers, and `sync::decode` (no panic on any blob, and it
+    round-trips `encode`). It is Layer 3's fuzz item, made concrete.
 
   Out of reach as the code stands: `vrend/waiter.rs` waits on GL, and the storage shares in
   `vrend/resource.rs` are tied up with GL and Metal. The venus `in_flight` wait record could be
