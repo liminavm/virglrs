@@ -823,7 +823,9 @@ mod tests {
 /// of them, over three ids and three types -- few enough that ids collide: a create under a live
 /// id, a refusal over one, a slot handed out again, which is where a lifetime bug lives. The
 /// domains are that small on purpose, so enumerating them is exhaustive within the bound rather
-/// than a sample of it.
+/// than a sample of it. Three ids is also the fewest a tree two levels deep takes -- an instance,
+/// a device under it, an object under that -- so none is spent on id zero, whose refusal has a
+/// test of its own.
 ///
 /// The operations are the ones the context makes, under the constraints it makes them with. An
 /// object's owner is the first handle its create names, so it is an instance for a device and a
@@ -836,7 +838,7 @@ mod every_sequence {
     use super::*;
 
     const DEPTH: usize = 4;
-    const IDS: [ObjectId; 3] = [ObjectId(0), ObjectId(1), ObjectId(2)];
+    const IDS: [ObjectId; 3] = [ObjectId(1), ObjectId(2), ObjectId(3)];
     const MINTED: u64 = 100;
     const INSTANCE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_INSTANCE;
     const DEVICE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_DEVICE;
@@ -933,6 +935,8 @@ mod every_sequence {
     struct Reached {
         nodes: u64,
         cascades: u64,
+        /// Cascades that reached a grandchild: a device's objects under a destroyed instance.
+        deep_cascades: u64,
         reused_under_stale_key: u64,
         duplicates: u64,
         fictions_resolved: u64,
@@ -991,19 +995,13 @@ mod every_sequence {
                         return Some(t.key_of(id).expect("an added object has a key"));
                     }
                     Err(e) => {
-                        if e == AddError::Duplicate {
-                            seen.duplicates += 1;
-                        }
-                        let expected =
-                            if id.0 == 0 { AddError::ZeroId } else { AddError::Duplicate };
+                        seen.duplicates += 1;
                         assert_eq!(
-                            e, expected,
+                            e,
+                            AddError::Duplicate,
                             "a create was refused for the wrong reason, after {ops:?}"
                         );
-                        assert!(
-                            id.0 == 0 || prior.is_some(),
-                            "a free id was refused, after {ops:?}"
-                        );
+                        assert!(prior.is_some(), "a free id was refused, after {ops:?}");
                         assert_eq!(
                             t.get(id).copied(),
                             prior,
@@ -1048,6 +1046,9 @@ mod every_sequence {
                 let doomed = t.take_tree(id);
                 if doomed.len() >= 2 {
                     seen.cascades += 1;
+                }
+                if doomed.len() >= 3 {
+                    seen.deep_cascades += 1;
                 }
                 destroyed(&before, &taken, &doomed, root, ops);
                 let after: Vec<_> = live(t).iter().map(|(h, ..)| *h).collect();
@@ -1157,6 +1158,7 @@ mod every_sequence {
         // Each of these is a case the assertions above are about; a walk that never reached one
         // would pass them vacuously.
         assert!(seen.cascades > 0, "no destroy took a child: {seen:?}");
+        assert!(seen.deep_cascades > 0, "no destroy took a grandchild: {seen:?}");
         assert!(seen.reused_under_stale_key > 0, "no slot was reused under a stale key: {seen:?}");
         assert!(seen.duplicates > 0, "no create reused a live id: {seen:?}");
         assert!(seen.fictions_resolved > 0, "no fiction resolved: {seen:?}");
