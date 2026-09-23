@@ -288,8 +288,9 @@ a Rust dylib, and they do not build on this platform anyway. Rewriting them
 public-ABI-only would duplicate Layer 2 at the same speed. They stay as C-side
 regression tests with no role in the rewrite.
 
-What is carried: `tests/fuzzer/` corpora move to `cargo-fuzz` once the Rust decode
-paths exist — corpora are data and survive the language change. And the perf bench
+`tests/fuzzer/` carries harnesses and no corpora, and each harness submits a whole
+command stream to a live GL context. The Rust fuzz targets are in `fuzz/` instead,
+seeded from the harness's own recordings (see *In-crate checkers*). The perf bench
 stays a **trend ledger, never a gate** — a rewrite regresses performance invisibly,
 and gating on it stops work for the wrong reason.
 
@@ -996,10 +997,24 @@ it survives the session it was found in.
     why the driver takes `cs::Decoded` and `cs::Out` rather than references to `Vk*` structs,
     and why a write into an answer goes through `Out::edit`, which asserts its pointers and the
     counts that size them are unchanged. Owed: the other modules without FFI.
-  - **cargo-fuzz** takes whatever is too large to prove: the generated venus decoder behind
-    `IdentityObjects`, the TGSI translator (where two guest-reachable aborts were found), the
-    h264, h265 and AV1 bitstream parsers, and `sync::decode` (no panic on any blob, and it
-    round-trips `encode`). It is Layer 3's fuzz item, made concrete.
+  - **cargo-fuzz** takes pure parsers too large to prove. The targets live in `fuzz/`, which is
+    its own workspace so the renderer's build never sees libFuzzer, and run as
+    `cargo +nightly fuzz run <target> -- -max_total_time=<seconds>`. Every target checks for no
+    panic on any input, and a target named with a second property checks that as well:
+    - `venus_command` runs one venus command through the generated decoder, behind
+      `IdentityObjects`. A command that decodes must encode back to exactly the bytes `sizeof`
+      promised, and decoding that encoding must give the same encoding again.
+    - `tgsi_translate` parses TGSI text, scans it, and translates it to GLSL.
+    - `h264_annexb`, `h265_picture` and `av1_frame` take the parsers and the header writers
+      that turn a guest's picture descriptor back into bitstream.
+    - `sync_blob` checks that `sync::decode` of any blob round-trips through `encode`.
+
+    Random bytes almost never form a real command. So
+    `cargo run --release --manifest-path fuzz/Cargo.toml --bin seed-corpora`, run from the
+    repository root, seeds `venus_command` with every distinct command in
+    `harness/vm/captures/*.vkrc`, and `tgsi_translate` with every shader in the classic corpus's
+    TGSI log. Nothing here reaches GL or Vulkan, so the vrend command stream as a whole is not
+    fuzzed.
 
   Out of reach as the code stands: `vrend/waiter.rs` waits on GL, and the storage shares in
   `vrend/resource.rs` are tied up with GL and Metal. The venus `in_flight` wait record could be

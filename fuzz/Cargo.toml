@@ -1,0 +1,68 @@
+[package]
+name = "virglrs-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bumpalo = "3.20"
+libfuzzer-sys = "0.4.13"
+virglrs = { path = ".." }
+
+# Its own workspace, so `cargo fuzz` builds it with its own flags and the renderer's build never
+# sees it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "seed-corpora"
+path = "src/bin/seed-corpora.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "venus_command"
+path = "fuzz_targets/venus_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tgsi_translate"
+path = "fuzz_targets/tgsi_translate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h264_annexb"
+path = "fuzz_targets/h264_annexb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h265_picture"
+path = "fuzz_targets/h265_picture.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "av1_frame"
+path = "fuzz_targets/av1_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_blob"
+path = "fuzz_targets/sync_blob.rs"
+test = false
+doc = false
+bench = false
