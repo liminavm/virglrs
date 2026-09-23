@@ -8430,7 +8430,8 @@ mod tests {
         };
         let resolve = |_| Some(ResourceBytes::Shared(lent.clone()));
         assert!(
-            d.allocate_memory(DEVICE, ObjectId(80), &info, None, &resolve).is_err(),
+            d.allocate_memory(DEVICE, ObjectId(80), cs::Decoded::planted(&info), None, &resolve)
+                .is_err(),
             "the guest is told the handle is not importable"
         );
         assert!(!d.memory.contains_key(&ObjectId(80)), "and nothing is left behind for it");
@@ -8521,7 +8522,8 @@ mod tests {
         };
         let resolve = |_| Some(ResourceBytes::Shared(lent.clone()));
         assert!(
-            d.allocate_memory(DEVICE, ObjectId(81), &info, None, &resolve).is_err(),
+            d.allocate_memory(DEVICE, ObjectId(81), cs::Decoded::planted(&info), None, &resolve)
+                .is_err(),
             "the guest is told the handle is not importable, rather than given an alias"
         );
         assert!(!d.memory.contains_key(&ObjectId(81)), "and nothing is left behind for it");
@@ -9068,7 +9070,8 @@ mod tests {
             allocationSize: VkDeviceSize(ASKED),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None).expect("no cap");
+        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None)
+            .expect("no cap");
 
         assert_eq!(
             GIVEN.with(Cell::get),
@@ -9227,7 +9230,7 @@ mod tests {
             allocationSize: VkDeviceSize(SIZE),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None)
+        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None)
             .expect("a declared export is an export whether or not anything can describe it");
 
         let allocated = d.memory.get(&ObjectId(1)).expect("allocated");
@@ -9402,7 +9405,7 @@ mod tests {
             allocationSize: VkDeviceSize(SIZE),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None)
+        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None)
             .expect("a tiling this side cannot describe is not a refusal to export");
 
         assert_eq!(
@@ -9569,7 +9572,9 @@ mod tests {
         };
         assert!(
             matches!(
-                d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None),
+                d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| {
+                    None
+                }),
                 Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE))
             ),
             "no descriptor and no address is no route to the bytes at all"
@@ -9581,7 +9586,7 @@ mod tests {
         // failed. Without this the assertion above would pass just as well if the refusal were
         // about the export failing rather than about there being nowhere left to go.
         let addressable = VkMemoryAllocateInfo { memoryTypeIndex: 1, ..info };
-        d.allocate_memory(DEVICE, ObjectId(2), &addressable, None, &|_| None)
+        d.allocate_memory(DEVICE, ObjectId(2), cs::Decoded::planted(&addressable), None, &|_| None)
             .expect("host-visible memory still has a mapping to be composited from");
         let allocated = d.memory.get(&ObjectId(2)).expect("allocated");
         assert!(allocated.surface().is_none(), "there is no surface, and none is invented");
