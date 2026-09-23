@@ -1287,8 +1287,10 @@ mod tests {
         assert!(extent.plain() && sub.plain());
         let buffer = &Probe::<VkBufferCreateInfo>(PhantomData);
         assert!(!buffer.plain(), "a pNext and an array");
+        // The one struct with function pointers also has `pUserData`, so this does not isolate
+        // the function-pointer rule -- no struct in this vk.xml would.
         let callbacks = &Probe::<VkAllocationCallbacks>(PhantomData);
-        assert!(!callbacks.plain(), "function pointers");
+        assert!(!callbacks.plain(), "function pointers and a user pointer");
         let embeds = &Probe::<VkAttachmentSampleLocationsEXT>(PhantomData);
         assert!(!embeds.plain(), "a pointer inside an embedded struct");
     }
