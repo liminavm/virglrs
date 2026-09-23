@@ -1583,14 +1583,19 @@ def main():
     baseline = run(['cargo', 'test'])
     if baseline.returncode != 0:
         sys.exit('the tests do not pass before any sabotage; fix that first')
-    # A proof is its own baseline: `cargo test` never runs it, so a proof already failing on the
-    # clean tree would read every sabotage aimed at it as caught.
-    for filt in sorted({f for *_, f in chosen if f and f.startswith('kani:')}):
-        if run(command(filt)).returncode != 0:
-            sys.exit('%s does not verify before any sabotage; fix that first' % filt)
     # Derived from the clean run rather than fixed, so a slow machine is not called a hang and a
     # fast one still catches a wedge quickly. The floor covers a rebuild after each edit.
     budget = max(180.0, (time.monotonic() - started) * 8)
+    # A proof is its own baseline: `cargo test` never runs it, so a proof already failing on the
+    # clean tree would read every sabotage aimed at it as caught. It is its own clock too: a proof
+    # can take far longer than the suite, and held to the suite's budget it would be reported as
+    # a hang -- caught -- without ever having decided.
+    proof_budget = {}
+    for filt in sorted({f for *_, f in chosen if f and f.startswith('kani:')}):
+        began = time.monotonic()
+        if run(command(filt)).returncode != 0:
+            sys.exit('%s does not verify before any sabotage; fix that first' % filt)
+        proof_budget[filt] = max(180.0, (time.monotonic() - began) * 3)
 
     holes = []
     for name, rel, old, new, filt in chosen:
@@ -1599,7 +1604,7 @@ def main():
         assert old in original, 'sabotage %r no longer matches %s' % (name, rel)
         path.write_text(original.replace(old, new, 1))
         try:
-            r = run(command(filt), timeout=budget)
+            r = run(command(filt), timeout=proof_budget.get(filt, budget))
         finally:
             path.write_text(original)
         if r.timed_out:
