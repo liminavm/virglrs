@@ -1093,22 +1093,60 @@ impl Answered {
     }
 }
 
-impl DriverWait {
-    /// The device the call is on, for the record of what must not be destroyed under it.
-    pub fn device(&self) -> VkDevice {
-        self.device.handle
+/// What one suspended [`DriverWait`] reads, kept by the stream that suspended on it.
+///
+/// This record is what makes releasing the context lock during the call legal. Vulkan forbids
+/// destroying a fence, a semaphore or a device that another thread is waiting on, and with the
+/// lock held that could not happen; without it the context's stream can reach the destroy while
+/// the wait is inside the driver. So a destroy that names what a record here reads is refused and
+/// poisons: the guest broke Vulkan's own rule, and the alternative is undefined behaviour in the
+/// driver.
+///
+/// Handles only, typed as the call reads them. It holds no share of the device, so keeping it
+/// keeps nothing alive; what it says is only true while the wait it was taken from is out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlight {
+    device: VkDevice,
+    reads: Reads,
+}
+
+/// The handles a wait reads besides its device. A queue wait reads none a guest can destroy: a
+/// queue goes only with its device, which the device half of the record already covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reads {
+    Fences(Vec<VkFence>),
+    Semaphores(Vec<VkSemaphore>),
+    Device,
+}
+
+impl InFlight {
+    /// Whether the wait reads `fence`.
+    pub fn reads_fence(&self, fence: VkFence) -> bool {
+        matches!(&self.reads, Reads::Fences(f) if f.contains(&fence))
     }
 
-    /// The handles the call reads, as raw values, for the same record.
-    pub fn handles(&self) -> Vec<u64> {
-        match &self.kind {
-            WaitKind::Fences { fences, .. } => fences.iter().map(|f| f.0).collect(),
-            WaitKind::Semaphores { semaphores, .. } => semaphores.iter().map(|s| s.0).collect(),
-            WaitKind::DeviceIdle => Vec::new(),
-            WaitKind::QueueIdle(q) => vec![q.handle.0],
-            WaitKind::ExportSemaphoreSyncFd(s) => vec![s.0],
-            WaitKind::ExportFenceSyncFd(f) => vec![f.0],
-        }
+    /// Whether the wait reads `semaphore`.
+    pub fn reads_semaphore(&self, semaphore: VkSemaphore) -> bool {
+        matches!(&self.reads, Reads::Semaphores(s) if s.contains(&semaphore))
+    }
+
+    /// Whether the wait is on `device`, which every wait is on one of.
+    pub fn on_device(&self, device: VkDevice) -> bool {
+        self.device == device
+    }
+}
+
+impl DriverWait {
+    /// What the call reads, for the stream that suspends on it to keep until it is answered.
+    pub fn in_flight(&self) -> InFlight {
+        let reads = match &self.kind {
+            WaitKind::Fences { fences, .. } => Reads::Fences(fences.clone()),
+            WaitKind::Semaphores { semaphores, .. } => Reads::Semaphores(semaphores.clone()),
+            WaitKind::ExportFenceSyncFd(f) => Reads::Fences(vec![*f]),
+            WaitKind::ExportSemaphoreSyncFd(s) => Reads::Semaphores(vec![*s]),
+            WaitKind::DeviceIdle | WaitKind::QueueIdle(_) => Reads::Device,
+        };
+        InFlight { device: self.device.handle, reads }
     }
 
     /// Make the call, with nothing of the renderer held.
@@ -4655,8 +4693,8 @@ impl Driver {
     // lock, every other context's ring behind the writer. The handler probes with a zero timeout,
     // and when the answer is not ready it builds a `DriverWait` out of what the call needs and
     // suspends the batch. Whoever owns the stream runs the wait with nothing held and offers the
-    // batch again with the answer. See `Context::in_flight` for what keeps the handles valid
-    // while the context lock is not held.
+    // batch again with the answer. See `InFlight` for what keeps the handles valid while the
+    // context lock is not held.
 
     /// `vkWaitForFences`, to be run outside the batch. `None` is a device this context never
     /// created, which the probe before it already answered for.

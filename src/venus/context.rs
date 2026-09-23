@@ -21,8 +21,8 @@ use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Decoded, Guest, HostHandle, ObjectId};
 use super::driver::{
-    self, Answered, Driver, DriverWait, ExportError, Exported, MemoryError, NoSubmit2, NoSyncFd,
-    NotATimeline,
+    self, Answered, Driver, DriverWait, ExportError, Exported, InFlight, MemoryError, NoSubmit2,
+    NoSyncFd, NotATimeline,
 };
 use super::journal::{self, Journal, Owner, Seq};
 use super::monitor::Monitor;
@@ -299,19 +299,6 @@ pub enum Wait {
 enum Waiter {
     Context,
     Ring(RingId),
-}
-
-/// The handles one suspended driver wait is reading, while nothing of the renderer is held.
-///
-/// This record is what makes releasing the context lock during the call legal. Vulkan forbids
-/// destroying a fence, a semaphore or a device that another thread is waiting on, and with the
-/// lock held that could not happen; without it the context's stream can reach the destroy while
-/// the wait is inside the driver. So a destroy that names a handle here is refused and poisons:
-/// the guest broke Vulkan's own rule, and the alternative is undefined behaviour in the driver.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct InFlight {
-    device: VkDevice,
-    handles: Vec<u64>,
 }
 
 /// How a submission ended.
@@ -2195,20 +2182,24 @@ impl Handlers<'_> {
     /// Suspend the batch on a driver wait, recording what it reads so that nothing destroys it
     /// while the context lock is not held.
     fn suspend_on(&mut self, wait: DriverWait) {
-        let record = InFlight { device: wait.device(), handles: wait.handles() };
-        let stale = self.in_flight.insert(self.waiter(), record);
+        let stale = self.in_flight.insert(self.waiter(), wait.in_flight());
         assert!(stale.is_none(), "a stream suspended on a driver wait while one was in flight");
         self.wait = Some(Wait::Driver(wait));
     }
 
-    /// Whether a driver wait in flight on any of this context's streams is reading `handle`.
-    fn waited_on(&self, handle: u64) -> bool {
-        self.in_flight.values().any(|w| w.handles.contains(&handle))
+    /// Whether a driver wait in flight on any of this context's streams is reading `fence`.
+    fn waited_fence(&self, fence: VkFence) -> bool {
+        self.in_flight.values().any(|w| w.reads_fence(fence))
+    }
+
+    /// Whether a driver wait in flight on any of this context's streams is reading `semaphore`.
+    fn waited_semaphore(&self, semaphore: VkSemaphore) -> bool {
+        self.in_flight.values().any(|w| w.reads_semaphore(semaphore))
     }
 
     /// Whether a driver wait in flight on any of this context's streams is on `device`.
     fn waited_device(&self, device: VkDevice) -> bool {
-        self.in_flight.values().any(|w| w.device == device)
+        self.in_flight.values().any(|w| w.on_device(device))
     }
 
     /// The three refusals a timeline command has, said once.
@@ -2599,7 +2590,7 @@ impl Commands for Handlers<'_> {
     /// a record of whether a submit is outstanding on it, and a record that outlived its fence
     /// would answer for whatever handle Vulkan hands out next.
     fn vkDestroyFence(&mut self, args: &mut vn_command_vkDestroyFence<'_>) {
-        if self.waited_on(args.fence.0) {
+        if self.waited_fence(args.fence) {
             self.reject = Some("destroyed a fence one of its streams is waiting on");
             return;
         }
@@ -2625,7 +2616,7 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkDestroySemaphore(&mut self, args: &mut vn_command_vkDestroySemaphore<'_>) {
-        if self.waited_on(args.semaphore.0) {
+        if self.waited_semaphore(args.semaphore) {
             self.reject = Some("destroyed a semaphore one of its streams is waiting on");
             return;
         }

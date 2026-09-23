@@ -1481,7 +1481,7 @@ SABOTAGES = [
     (
         'a fence a ring is waiting on inside the driver can be destroyed from the context stream',
         'src/venus/context.rs',
-        """        if self.waited_on(args.fence.0) {
+        """        if self.waited_fence(args.fence) {
             self.reject = Some("destroyed a fence one of its streams is waiting on");
             return;
         }""",
