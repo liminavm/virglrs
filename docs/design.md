@@ -947,6 +947,46 @@ it survives the session it was found in.
   `third_party/libkrun`'s `limina` branch with a `third_party/manifest.toml` bump. Nothing blocks
   it now.
 
+- **In-crate checkers for what the harness cannot see.** The harness drives only the public ABI,
+  so it cannot state a property of an internal type. Four tools can, each covering a different
+  part. Each gate is armed by breaking the property it holds and watching it fail, exactly as for
+  a sabotage entry.
+
+  - **Kani** checks every input up to a stated bound: no panic, no overflow, no out-of-bounds
+    access, plus any assertion the harness adds. It checks overflow whatever the Cargo profile
+    says, which matters because a release build here wraps silently. Kani runs everything as
+    single-threaded code and cannot see into C, so its targets are the pure bookkeeping at the
+    trust boundary. Proofs live in `#[cfg(kani)]` modules beside the code and run under
+    `cargo kani`, on its own pinned nightly toolchain. In order:
+    `RingLayout::parse` (`Ok` means five regions inside the resource, aligned, pairwise
+    disjoint, and a power-of-two buffer within the maximum). Then `objects::Table` over
+    arbitrary sequences of `add`, `add_ghost`, `add_fiction`, `remove`, `take_tree` and
+    `take_all`, on a small id domain so ids collide. It must show that every added handle comes
+    out exactly once, that no `Doomed` carries a fiction, that a key taken before a `remove`
+    never resolves after it even once its slot is reused, and that `take_tree`'s device is the
+    nearest ancestor that is a device. Then the `budget.rs` ledger (per-context amounts sum to
+    the total, a charge is credited once and by its last holder, a late credit never lands on a
+    reused context id) and `sync::decode` (no panic on any blob, and it round-trips `encode`).
+    Then `Iov::walk_from` (every piece stays inside its entry, and a walk resumed from the cursor
+    matches a fresh one) and `Decoder::read_bytes`/`peek_bytes`/`charge` (`pos` never passes the
+    buffer, and no length panics).
+  - **loom** tries every interleaving of the threads involved, which Kani cannot. First
+    `fence.rs`: a ring retires in creation order, everything queued is delivered before the
+    thread stops, and the queued-after-stop assert cannot fire whichever thread drops the last
+    `Handle`. Then the ring thread's wait and wake, with the guest modelled as a thread writing
+    the control words.
+  - **Miri** runs the existing unit tests of the modules that make no FFI calls, and checks the
+    aliasing rules Kani does not. The case that matters is the `&mut` that `wire_array_mut` and
+    `wire_out` make from arena pointers.
+  - **cargo-fuzz** takes whatever is too large to prove: the generated venus decoder behind
+    `IdentityObjects`, the TGSI translator (where two guest-reachable aborts were found), and the
+    h264, h265 and AV1 bitstream parsers. It is Layer 3's fuzz item, made concrete.
+
+  Out of reach as the code stands: `vrend/waiter.rs` waits on GL, and the storage shares in
+  `vrend/resource.rs` are tied up with GL and Metal. The venus `in_flight` wait record could be
+  proved only once it is pulled out of `context.rs` and `driver.rs` into a type that holds no
+  device.
+
 ## Consequences to accept
 
 - **A classic object can outlive the resource it names, and a snapshot loses it.** Two guest
