@@ -1785,10 +1785,25 @@ impl Gl {
         unsafe { self.t.glEndQuery()(target) };
     }
 
+    /// `glQueryCounterEXT` with `GL_TIMESTAMP_EXT`: record the GPU's clock into `q` once every
+    /// command before it has run. A timestamp's only command -- it has no begin and no end.
+    pub fn query_timestamp(&self, q: QueryName) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glQueryCounterEXT()(q.0, GL_TIMESTAMP_EXT) };
+    }
+
     pub fn get_query_object_uiv(&self, q: QueryName, name: GLenum) -> GLuint {
         let mut v: GLuint = 0;
         // SAFETY: every name asked for writes exactly one integer.
         unsafe { self.t.glGetQueryObjectuiv()(q.0, name, &mut v) };
+        v
+    }
+
+    /// `glGetQueryObjectui64vEXT`: the 64-bit read a timer query's nanoseconds need.
+    pub fn get_query_object_ui64v(&self, q: QueryName, name: GLenum) -> u64 {
+        let mut v: GLuint64 = 0;
+        // SAFETY: every name asked for writes exactly one 64-bit integer.
+        unsafe { self.t.glGetQueryObjectui64vEXT()(q.0, name, &mut v) };
         v
     }
 

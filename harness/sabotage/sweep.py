@@ -1795,6 +1795,20 @@ SABOTAGES = [
         """    let _ = (unsettled, began);""",
         'a_send_into_a_full_queue_waits_and_is_counted',
     ),
+    (
+        'a timestamp query is never recorded',
+        'src/vrend/context.rs',
+        """            host.gl.query_timestamp(q.id);""",
+        """            let _ = q.id;""",
+        'a_timestamp_query_is_recorded_and_read_back_in_eight_bytes',
+    ),
+    (
+        "a timer query's result is reported in four bytes",
+        'src/vrend/context.rs',
+        """            (gl.get_query_object_ui64v(id, GL_QUERY_RESULT), 8u32)""",
+        """            (gl.get_query_object_ui64v(id, GL_QUERY_RESULT), 4u32)""",
+        'a_timestamp_query_is_recorded_and_read_back_in_eight_bytes',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

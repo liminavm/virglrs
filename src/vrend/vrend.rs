@@ -1675,6 +1675,98 @@ mod tests {
         v.context_destroy(ctx, &NoGuest);
     }
 
+    /// A timestamp query records the GPU's clock at its END_QUERY, and its result comes back
+    /// whole: eight bytes, as the C writes it for a timer query.
+    ///
+    /// A timestamp has no begin. A query name that nothing ever issued is not a query object,
+    /// so reading one back is a GL error, and that poisons the context the guest asked from.
+    #[test]
+    fn a_timestamp_query_is_recorded_and_read_back_in_eight_bytes() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::pipe::QueryType;
+        use crate::vrend::proto::{Command, Object, QueryCreate};
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+        )
+        .expect("vrend comes up");
+        assert!(v.features.has(Feature::timer_query), "the premise: this driver has timer queries");
+
+        // The query's answer goes into host memory: a CUSTOM buffer, as mesa makes one.
+        let res = ResourceHandle::new(1).expect("a resource handle is non-zero");
+        v.resource_create(
+            res,
+            resource::Args {
+                target: TextureTarget::Buffer,
+                format: super::super::proto::Format::from_wire(64).expect("R8_UNORM"),
+                bind: resource::Bind::CUSTOM,
+                width: 16,
+                height: 1,
+                depth: 1,
+                array_size: 1,
+                last_level: 0,
+                nr_samples: 0,
+                flags: resource::ResourceFlags(0),
+            },
+        )
+        .expect("a host-memory buffer");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &AllAttached).expect("a context");
+
+        let query = crate::vrend::proto::ObjectHandle::new(1).expect("non-zero");
+        let create = QueryCreate { kind: QueryType::Timestamp, index: 0, offset: 0, resource: res };
+        let mut wire = Vec::new();
+        encode(&Command::CreateObject { handle: query, object: Object::Query(create) }, &mut wire);
+        encode(&Command::EndQuery(query), &mut wire);
+        v.submit(ctx, &wire, &AllAttached).expect("the context is here").expect("recorded");
+        // Ready by construction, so one read is the whole answer.
+        v.finish_all();
+        let mut wire = Vec::new();
+        encode(&Command::GetQueryResult { query, wait: true }, &mut wire);
+        v.submit(ctx, &wire, &AllAttached)
+            .expect("the context is here")
+            .expect("a recorded timestamp reads back");
+
+        let answer = match &v.resources.sync().get(&res).and_then(resource::Slot::resource) {
+            Some(r) => match &r.storage {
+                resource::Storage::Host(shadow) => shadow.bytes()[..16].to_vec(),
+                _ => panic!("a CUSTOM buffer is host memory"),
+            },
+            None => panic!("the buffer is here"),
+        };
+        let word = |at: usize| u32::from_le_bytes(answer[at..at + 4].try_into().expect("4 bytes"));
+        assert_eq!(word(0), 1, "VIRGL_QUERY_STATE_DONE");
+        assert_eq!(word(4), 8, "a timer query's result is 64 bits wide");
+        let result = u64::from_le_bytes(answer[8..16].try_into().expect("8 bytes"));
+        assert_ne!(result, 0, "the GPU's clock was recorded");
+
+        v.context_destroy(ctx, &AllAttached);
+    }
+
     #[test]
     fn the_version_string_parses_the_way_epoxy_reads_it() {
         assert_eq!(parse_gles_version("OpenGL ES 3.1 Mesa 26.0.0"), 31);

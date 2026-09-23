@@ -589,6 +589,13 @@ pub struct Query {
     pub fake_samples_passed: bool,
 }
 
+impl Query {
+    /// Whether the result is nanoseconds, which need all 64 bits: the C's `vrend_is_timer_query`.
+    fn is_timer(&self) -> bool {
+        matches!(self.kind, QueryType::Timestamp | QueryType::TimeElapsed)
+    }
+}
+
 pub struct Streamout {
     pub id: TransformFeedbackName,
     pub targets: Vec<Option<ObjectHandle>>,
@@ -4346,8 +4353,10 @@ impl Context {
 
     fn end_query(&mut self, host: &mut Host<'_>, h: ObjectHandle) -> Result<(), Fault> {
         let q = self.query(Cmd::EndQuery, h)?;
+        // A timestamp has nothing to end: the END_QUERY is the moment it records. `create_query`
+        // admits one only on a driver with timer queries, so the entry point is there.
         if q.gl_type == GL_TIMESTAMP_EXT {
-            host.todo.note("timestamp queries");
+            host.gl.query_timestamp(q.id);
             return Ok(());
         }
         if q.gl_type != 0 {
@@ -4366,21 +4375,27 @@ impl Context {
         _wait: bool,
     ) -> Result<(), Fault> {
         let cmd = Cmd::GetQueryResult;
-        let (id, resource, fake) = {
+        let (id, resource, fake, timer) = {
             let q = self.query(cmd, h)?;
-            (q.id, q.resource, q.fake_samples_passed)
+            (q.id, q.resource, q.fake_samples_passed, q.is_timer())
         };
         let gl = host.gl;
         if gl.get_query_object_uiv(id, GL_QUERY_RESULT_AVAILABLE) == 0 {
             return Ok(());
         }
-        let mut result = gl.get_query_object_uiv(id, GL_QUERY_RESULT) as u64;
+        // A timer's nanoseconds pass 2^32 in about four seconds, so it is read and reported in
+        // all 64 bits; every other result is a count the 32-bit read holds.
+        let (mut result, size) = if timer {
+            (gl.get_query_object_ui64v(id, GL_QUERY_RESULT), 8u32)
+        } else {
+            (u64::from(gl.get_query_object_uiv(id, GL_QUERY_RESULT)), 4)
+        };
         if fake {
             result *= 1024;
         }
         let mut state = [0u8; 16];
         state[0..4].copy_from_slice(&1u32.to_le_bytes()); // VIRGL_QUERY_STATE_DONE
-        state[4..8].copy_from_slice(&4u32.to_le_bytes());
+        state[4..8].copy_from_slice(&size.to_le_bytes());
         state[8..16].copy_from_slice(&result.to_le_bytes());
         let ctx = host.ctx;
         let guest = host.guest;
