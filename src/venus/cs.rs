@@ -1116,3 +1116,74 @@ mod tests {
         assert_eq!(&buf[12..], &[1, 2, 3, 0]);
     }
 }
+
+/// Proofs over every length a guest can put on the wire, run by `cargo kani`.
+///
+/// A string or blob length is a `usize` the guest chooses, so these are exactly the wide-data,
+/// fixed-control-flow shape Kani settles quickly. Three reads in a row, each of any length, over
+/// a stream whose bytes are left to the guest too.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    const STREAM: usize = 16;
+
+    /// Whether `got` is the `n` bytes of `buf` at `at`. One index, chosen by Kani, stands for
+    /// all of them: a comparison of the whole slice unrolls over a symbolic length.
+    fn is_window(got: &[u8], buf: &[u8], at: usize, n: usize) -> bool {
+        let i: usize = kani::any();
+        got.len() == n && (i >= n || got[i] == buf[at + i])
+    }
+
+    /// A read hands back exactly the `n` bytes at the position, advances by `n` padded to four,
+    /// and never past the stream; a refused one poisons the stream and moves nothing. No length
+    /// panics, however near the top of `usize` it is.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn a_read_of_any_length_stays_inside_the_stream() {
+        let buf: [u8; STREAM] = kani::any();
+        let (temp, hard) = (Bump::new(), AtomicBool::new(false));
+        let mut dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
+
+        for _ in 0..3 {
+            let (n, before, poisoned) = (kani::any::<usize>(), dec.pos(), dec.hard_fatal());
+            let peeked = dec.peek_bytes(n);
+            assert!(dec.pos() == before, "a peek moved the stream");
+            assert!(peeked.is_none_or(|b| is_window(b, &buf, before, n)), "a peek read elsewhere");
+            match dec.read_bytes(n) {
+                Some(b) => {
+                    assert!(is_window(b, &buf, before, n), "a read handed back other bytes");
+                    assert!(dec.pos() == before + n.next_multiple_of(4), "a read moved wrongly");
+                    kani::cover!(n % 4 != 0, "a padded read");
+                }
+                None => {
+                    assert!(dec.pos() == before, "a refused read moved the stream");
+                    assert!(dec.hard_fatal(), "a refused read left the stream usable");
+                    kani::cover!(!poisoned && n > usize::MAX - 3, "a length that cannot be padded");
+                }
+            }
+            assert!(dec.pos() <= STREAM, "the position passed the end of the stream");
+        }
+    }
+
+    /// The arena charge never lets the total pass its cap, whatever sizes the guest asks for or
+    /// in what order, and a refused charge poisons the stream and charges nothing.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn the_arena_charge_never_passes_its_cap() {
+        let (temp, hard) = (Bump::new(), AtomicBool::new(false));
+        let dec = Decoder::new(&[], &temp, &IdentityObjects, &hard);
+        for _ in 0..3 {
+            let (bytes, before) = (kani::any::<usize>(), dec.temp_used.get());
+            match dec.charge(bytes) {
+                Some(()) => assert!(dec.temp_used.get() == before + bytes, "a charge miscounted"),
+                None => {
+                    assert!(dec.temp_used.get() == before, "a refused charge was counted");
+                    assert!(dec.hard_fatal(), "a refused charge left the stream usable");
+                }
+            }
+            assert!(dec.temp_used.get() <= TEMP_POOL_MAX, "the arena passed its cap");
+        }
+        kani::cover!(dec.temp_used.get() == TEMP_POOL_MAX, "the cap reached exactly");
+    }
+}

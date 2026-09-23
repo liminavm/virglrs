@@ -1609,6 +1609,28 @@ SABOTAGES = [
         """        started.store(false, Ordering::Release);""",
         'loom:venus::ring_thread::loom_models',
     ),
+    # The decoder's reads and its arena charge, for every length a guest can put on the wire.
+    (
+        'a string length near the top of usize wraps when padded, and the read slices past it',
+        'src/venus/cs.rs',
+        '        let Some(advance) = n.checked_next_multiple_of(4) else {',
+        '        let Some(advance) = Some(n.wrapping_add(3) & !3) else {',
+        'kani:a_read_of_any_length_stays_inside_the_stream',
+    ),
+    (
+        'a read advances by its payload and not its padding, and the next field starts misaligned',
+        'src/venus/cs.rs',
+        '        let b = self.peek_bytes(advance)?;\n        self.pos += advance;',
+        '        let b = self.peek_bytes(advance)?;\n        self.pos += n;',
+        'kani:a_read_of_any_length_stays_inside_the_stream',
+    ),
+    (
+        'the arena charge wraps, and a huge request slips under the cap',
+        'src/venus/cs.rs',
+        '        let used = self.temp_used.get().saturating_add(bytes);',
+        '        let used = self.temp_used.get().wrapping_add(bytes);',
+        'kani:the_arena_charge_never_passes_its_cap',
+    ),
     # A ring layout is checked against the rules for every value of every field, both ways: a
     # parser that refuses too much fails the proof as surely as one that accepts too much.
     (
