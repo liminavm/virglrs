@@ -34,6 +34,8 @@ RS = ROOT
 #
 # A filter of the form `kani:<harness>` runs that one Kani proof instead of `cargo test`: the
 # property is stated for every input up to a bound, so the witness is the proof, not a test.
+# `loom:<test>` runs one loom model, built with `--cfg loom` in its own target directory so the
+# two builds do not evict each other.
 SABOTAGES = [
     (
         'an array accessor hands its handler one element fewer',
@@ -1543,6 +1545,29 @@ SABOTAGES = [
         '            Some(None) => None,',
         'every_sequence_keeps_every_promise',
     ),
+    # Fence retirement, under every interleaving loom can produce of a fence retired from another
+    # thread against the owner letting go.
+    (
+        'the retirement thread is let go without waiting for it to drain',
+        'src/fence.rs',
+        '            let _ = t.join();',
+        '            drop(t);',
+        'loom:fence::loom_models',
+    ),
+    (
+        'a queued fence does not wake the retirement thread',
+        'src/fence.rs',
+        '    g.jobs.push_back(job);\n    cv.notify_one();\n',
+        '    g.jobs.push_back(job);\n',
+        'loom:fence::loom_models',
+    ),
+    (
+        'a fence is queued ahead of the ones before it, and its ring retires out of order',
+        'src/fence.rs',
+        '    g.jobs.push_back(job);',
+        '    g.jobs.push_front(job);',
+        'loom:fence::loom_models',
+    ),
     # A ring layout is checked against the rules for every value of every field, both ways: a
     # parser that refuses too much fails the proof as surely as one that accepts too much.
     (
@@ -1580,7 +1605,7 @@ SABOTAGES = [
 # that cannot be written because the bug cannot be written is the design working.
 
 
-def run(cmd, cwd=RS, timeout=None):
+def run(cmd, cwd=RS, timeout=None, env=None):
     """Run a command, killing the whole process group if it outstays `timeout`.
 
     The group, not the child: `cargo test` spawns the test binary, and a sabotage that deadlocks
@@ -1591,7 +1616,7 @@ def run(cmd, cwd=RS, timeout=None):
     """
     proc = subprocess.Popen(
         cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        start_new_session=True,
+        start_new_session=True, env=env,
     )
     try:
         out, err = proc.communicate(timeout=timeout)
@@ -1603,10 +1628,20 @@ def run(cmd, cwd=RS, timeout=None):
 
 
 def command(filt):
-    """What runs an entry's witness: one Kani proof, or `cargo test` under a filter."""
+    """What runs an entry's witness, as `(argv, env)`: one Kani proof, one loom model, or
+    `cargo test` under a filter. `env` is None where the sweep's own environment is used."""
     if filt and filt.startswith('kani:'):
-        return ['cargo', 'kani', '--harness', filt[len('kani:'):]]
-    return ['cargo', 'test'] + ([filt] if filt else [])
+        return ['cargo', 'kani', '--harness', filt[len('kani:'):]], None
+    if filt and filt.startswith('loom:'):
+        env = dict(os.environ, RUSTFLAGS='--cfg loom', CARGO_TARGET_DIR=str(RS / 'target/loom'))
+        return ['cargo', 'test', '--lib', filt[len('loom:'):]], env
+    return ['cargo', 'test'] + ([filt] if filt else []), None
+
+
+def separate(filt):
+    """Whether an entry's witness is one `cargo test` does not run, and so needs its own
+    baseline and its own clock."""
+    return bool(filt) and filt.startswith(('kani:', 'loom:'))
 
 
 def main():
@@ -1636,15 +1671,16 @@ def main():
     # Derived from the clean run rather than fixed, so a slow machine is not called a hang and a
     # fast one still catches a wedge quickly. The floor covers a rebuild after each edit.
     budget = max(180.0, (time.monotonic() - started) * 8)
-    # A proof is its own baseline: `cargo test` never runs it, so a proof already failing on the
-    # clean tree would read every sabotage aimed at it as caught. It is its own clock too: a proof
-    # can take far longer than the suite, and held to the suite's budget it would be reported as
-    # a hang -- caught -- without ever having decided.
+    # A proof or a model is its own baseline: `cargo test` never runs it, so one already failing
+    # on the clean tree would read every sabotage aimed at it as caught. It is its own clock too:
+    # it can take far longer than the suite, and held to the suite's budget it would be reported
+    # as a hang -- caught -- without ever having decided.
     proof_budget = {}
-    for filt in sorted({f for *_, f in chosen if f and f.startswith('kani:')}):
+    for filt in sorted({f for *_, f in chosen if separate(f)}):
         began = time.monotonic()
-        if run(command(filt)).returncode != 0:
-            sys.exit('%s does not verify before any sabotage; fix that first' % filt)
+        argv, env = command(filt)
+        if run(argv, env=env).returncode != 0:
+            sys.exit('%s does not pass before any sabotage; fix that first' % filt)
         proof_budget[filt] = max(180.0, (time.monotonic() - began) * 3)
 
     holes = []
@@ -1654,7 +1690,8 @@ def main():
         assert old in original, 'sabotage %r no longer matches %s' % (name, rel)
         path.write_text(original.replace(old, new, 1))
         try:
-            r = run(command(filt), timeout=proof_budget.get(filt, budget))
+            argv, env = command(filt)
+            r = run(argv, timeout=proof_budget.get(filt, budget), env=env)
         finally:
             path.write_text(original)
         if r.timed_out:
