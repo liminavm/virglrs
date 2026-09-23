@@ -324,6 +324,8 @@ pub struct Surface {
     surface: NonNull<CfType>,
     /// Who it was handed to, if anyone: the one it must be released to.
     publisher: Option<Arc<dyn Publisher>>,
+    /// Whether a venus context has been lent this surface. See [`Self::mark_lent`].
+    lent: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: an `IOSurfaceRef` is a CoreFoundation object whose accessors are read-only queries of
@@ -418,7 +420,10 @@ impl Surface {
         // SAFETY: `IOSurfaceCreate` returns a +1 reference or null, and `Surface` takes that one
         // reference -- there is no second owner and no second release.
         NonNull::new(surface.cast_mut())
-            .map(|surface| Surface { surface, publisher: None }.handed_over(publisher))
+            .map(|surface| {
+                Surface { surface, publisher: None, lent: Default::default() }
+                    .handed_over(publisher)
+            })
             .ok_or(SurfaceError::Refused)
     }
 
@@ -564,7 +569,7 @@ impl Surface {
         // SAFETY: `IOSurfaceCreate` returns a +1 reference or null, and `Surface` takes that one
         // reference -- there is no second owner and no second release.
         let surface = NonNull::new(surface.cast_mut())
-            .map(|surface| Surface { surface, publisher: None })
+            .map(|surface| Surface { surface, publisher: None, lent: Default::default() })
             .ok_or(SurfaceError::Refused)?;
 
         // What came back has to be what was asked for, plane by plane. A surface the kernel laid
@@ -812,6 +817,21 @@ impl Surface {
     /// caller is choosing between two transports and this says which one is available.
     pub fn export(&self) -> Option<(std::os::fd::OwnedFd, crate::surface::Layout)> {
         None
+    }
+
+    /// Note that this surface was lent to a venus context, which reads it on a Vulkan queue with
+    /// nothing on this side in between. Latched: a lent share can be imported again at any time.
+    ///
+    /// Called by [`crate::venus::driver::Storage::lent`] and nowhere else, so a surface cannot be
+    /// lent without it. What asks is the hardware decode, which delivers a picture into a surface
+    /// only once every read of it is known to wait -- and a Vulkan read does not.
+    pub fn mark_lent(&self) {
+        self.lent.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`Self::mark_lent`] has run.
+    pub fn is_lent(&self) -> bool {
+        self.lent.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The global id another process looks this surface up by.

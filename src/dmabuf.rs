@@ -189,6 +189,8 @@ pub struct Surface {
     /// Whether the refusal above has been reported. Latched, for the same reason
     /// [`crate::venus::driver::Pages`] latches its own: a compositor asks every frame.
     said: AtomicBool,
+    /// Whether a venus context has been lent this surface. See [`Self::mark_lent`].
+    lent: AtomicBool,
 }
 
 impl Surface {
@@ -198,7 +200,14 @@ impl Surface {
     /// made the allocation and asked the driver for both halves, and this is where the two stop
     /// being separable.
     pub fn exported(fd: OwnedFd, layout: Layout) -> Surface {
-        Surface { fd, id: next_id(), layout, map: OnceLock::new(), said: AtomicBool::new(false) }
+        Surface {
+            fd,
+            id: next_id(),
+            layout,
+            map: OnceLock::new(),
+            said: AtomicBool::new(false),
+            lent: AtomicBool::new(false),
+        }
     }
 
     /// The descriptor, borrowed. An importer dups it; nothing takes it, because this owns it for
@@ -229,6 +238,21 @@ impl Surface {
 
     pub fn id(&self) -> SurfaceId {
         self.id
+    }
+
+    /// Note that this surface was lent to a venus context, which reads it on a Vulkan queue with
+    /// nothing on this side in between. Latched: a lent share can be imported again at any time.
+    ///
+    /// Called by [`crate::venus::driver::Storage::lent`] and nowhere else, so a surface cannot be
+    /// lent without it. What asks is the hardware decode, which delivers a picture into a surface
+    /// only once every read of it is known to wait -- and a Vulkan read does not.
+    pub fn mark_lent(&self) {
+        self.lent.store(true, Ordering::Release);
+    }
+
+    /// Whether [`Self::mark_lent`] has run.
+    pub fn is_lent(&self) -> bool {
+        self.lent.load(Ordering::Acquire)
     }
 
     /// Never this host: `dmabuf.rs` has no constructor that makes storage, so every surface

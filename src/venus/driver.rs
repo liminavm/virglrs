@@ -6548,7 +6548,11 @@ impl Storage {
     /// No charge is taken here: the share already carries the one vrend took when it minted the
     /// surface, so an import counts nothing new and the bytes stay counted for exactly as long as
     /// somebody holds them.
+    ///
+    /// The surface is marked lent on the way out, because from here it is read by Vulkan with
+    /// nothing on the classic side in between; see [`Surface::mark_lent`].
     pub fn lent(held: Arc<dyn Held>) -> Storage {
+        held.surface().mark_lent();
         Storage::Texture(held)
     }
 
