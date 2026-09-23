@@ -598,7 +598,7 @@ impl Vrend {
             &self.budget,
             args,
         )?;
-        self.resources.sync().insert(handle, resource::Slot::Resource(res));
+        self.resources.sync().insert(handle, resource::Slot::Resource(Box::new(res)));
         Ok(())
     }
 
@@ -650,7 +650,7 @@ impl Vrend {
             );
             return Err(why);
         }
-        self.resources.sync().insert(handle, resource::Slot::Resource(res));
+        self.resources.sync().insert(handle, resource::Slot::Resource(Box::new(res)));
         Ok(args)
     }
 
@@ -1765,6 +1765,52 @@ mod tests {
         assert_ne!(result, 0, "the GPU's clock was recorded");
 
         v.context_destroy(ctx, &AllAttached);
+    }
+
+    /// A CUSTOM buffer is host memory the guest sized, so it is in the ledger at that size.
+    ///
+    /// Its width is whatever the create said -- mesa's video bitstream buffers are CUSTOM and
+    /// grow with the stream -- and without the charge the one thing that can say which host
+    /// allocation is growing would be blind to it.
+    #[test]
+    fn a_custom_buffer_is_charged_for_the_bytes_it_holds() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let budget = crate::budget::Budget::with_cap(None, false);
+        let mut v = Vrend::new(
+            Config::default(),
+            &budget,
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+        )
+        .expect("vrend comes up");
+        let before = budget.classic();
+        let res = ResourceHandle::new(1).expect("a resource handle is non-zero");
+        v.resource_create(
+            res,
+            resource::Args {
+                target: TextureTarget::Buffer,
+                format: super::super::proto::Format::from_wire(64).expect("R8_UNORM"),
+                bind: resource::Bind::CUSTOM,
+                width: 65536,
+                height: 1,
+                depth: 1,
+                array_size: 1,
+                last_level: 0,
+                nr_samples: 0,
+                flags: resource::ResourceFlags(0),
+            },
+        )
+        .expect("a host-memory buffer");
+        assert_eq!(budget.classic() - before, 65536, "the ledger holds the buffer's width");
     }
 
     #[test]

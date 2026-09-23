@@ -22,7 +22,7 @@ use super::proto::{Format, Plane};
 use super::video;
 #[cfg(target_os = "macos")]
 use crate::budget::Charged;
-use crate::budget::Classic;
+use crate::budget::{Charge, Classic};
 use crate::guest_mem::{Iov, PixelSource};
 use crate::ids::ResourceHandle;
 #[cfg(target_os = "macos")]
@@ -186,6 +186,8 @@ pub enum Refusal {
     NoBufferStorage,
     /// The driver refused the allocation.
     GlError(GLenum),
+    /// The host could not allocate the memory the resource is kept in: the C's `ENOMEM`.
+    OutOfHostMemory,
     /// An IOSurface was minted for the resource and the driver has no entry point to make it
     /// a texture's storage.
     NoEglImage,
@@ -296,6 +298,9 @@ impl Refusal {
             // field for "IOSurfaces can become textures" -- but nor does a guest ever ask for
             // one: it arrives on a blob the guest exported, and the refusal is reported at init.
             Refusal::NoEglImage => J::HostRefused,
+            // The host's own allocator, at the moment of asking: no capset field can promise
+            // memory the host has not got.
+            Refusal::OutOfHostMemory => J::HostRefused,
 
             Refusal::MultisampleArrayUnsupported => J::Unjustified(
                 "the capset has no per-target multisample bit, so a format advertised as \
@@ -341,6 +346,7 @@ impl fmt::Display for Refusal {
             Refusal::NotTextureStorage => "a blob typed as something other than a texture",
             Refusal::MultisampleArrayUnsupported => "multisample array textures are not supported",
             Refusal::BufferNotFlat => "buffer target with height or depth other than 1",
+            Refusal::OutOfHostMemory => "the host could not allocate the resource's memory",
             Refusal::QueryBuffersUnsupported => "query buffers are not supported",
             Refusal::IndirectUnsupported => "indirect draw buffers are not supported",
             Refusal::NoTextureBind => "invalid texture bind flags",
@@ -411,8 +417,9 @@ impl Limits {
 pub enum Slot {
     /// Storage, and nothing yet that says what it is.
     Untyped(Untyped),
-    /// Shape, format and host storage all decided.
-    Resource(Resource),
+    /// Shape, format and host storage all decided. Boxed: a resource is ten times the size of
+    /// an untyped slot, and the table holds one of these per handle the guest has named.
+    Resource(Box<Resource>),
 }
 
 /// The handles whose vrend half has lost its owner, written by a [`Claim`]'s drop and drained by
@@ -799,11 +806,22 @@ fn describe(
 /// process the attach. Pushing a fresh buffer's zeros then lands on top of what it wrote -- the
 /// whole buffer, or everything up to wherever its copy had reached.
 ///
-/// So the push is reachable only from [`Shadow::Unmirrored`], and nothing constructs that except
+/// So the push is reachable only from [`Side::Unmirrored`], and nothing constructs that except
 /// a detach or a transfer the pages did not receive. A newly created resource is
-/// [`Shadow::Mirrored`] and there is no path from there to a push, which is the bug made
+/// [`Side::Mirrored`] and there is no path from there to a push, which is the bug made
 /// unrepresentable rather than guarded against.
-pub enum Shadow {
+///
+/// The bytes are the guest's to size -- a CUSTOM buffer's width is whatever the create said -- so
+/// they are counted in the ledger for as long as they live, and a size the host cannot allocate
+/// refuses the create, as the C's `calloc` failing does, instead of aborting the worker.
+pub struct Shadow {
+    side: Side,
+    /// What the bytes cost the ledger, credited when the buffer goes.
+    _charge: Charge,
+}
+
+/// Which of [`Shadow`]'s two containers holds the truth.
+enum Side {
     /// The guest's pages already hold everything this buffer does, so an attach owes them
     /// nothing. Where a resource starts, and where every paid attach returns it.
     Mirrored(Vec<u8>),
@@ -814,35 +832,40 @@ pub enum Shadow {
 }
 
 impl Shadow {
-    /// A newly created resource's buffer: zeroed, and owing the guest nothing.
-    pub fn fresh(size: usize) -> Shadow {
-        Shadow::Mirrored(vec![0; size])
+    /// A newly created resource's buffer: zeroed, charged, and owing the guest nothing. `None`
+    /// when the host cannot allocate `size` bytes.
+    pub fn fresh(size: usize, budget: &Classic) -> Option<Shadow> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size).ok()?;
+        bytes.resize(size, 0);
+        let charge = budget.charge("CUSTOM buffer", size as u64);
+        Some(Shadow { side: Side::Mirrored(bytes), _charge: charge })
     }
 
     pub fn bytes(&self) -> &[u8] {
-        match self {
-            Shadow::Mirrored(b) | Shadow::Unmirrored(b) => b,
+        match &self.side {
+            Side::Mirrored(b) | Side::Unmirrored(b) => b,
         }
     }
 
     pub fn bytes_mut(&mut self) -> &mut [u8] {
-        match self {
-            Shadow::Mirrored(b) | Shadow::Unmirrored(b) => b,
+        match &mut self.side {
+            Side::Mirrored(b) | Side::Unmirrored(b) => b,
         }
     }
 
     /// The guest's pages now hold what this buffer does -- they were just written from it, or
     /// they are where its bytes came from.
     pub fn mirrored(&mut self) {
-        if let Shadow::Unmirrored(b) = self {
-            *self = Shadow::Mirrored(std::mem::take(b));
+        if let Side::Unmirrored(b) = &mut self.side {
+            self.side = Side::Mirrored(std::mem::take(b));
         }
     }
 
     /// This buffer now holds bytes the guest's pages do not, and owes them to the next attach.
     pub fn unmirrored(&mut self) {
-        if let Shadow::Mirrored(b) = self {
-            *self = Shadow::Unmirrored(std::mem::take(b));
+        if let Side::Mirrored(b) = &mut self.side {
+            self.side = Side::Unmirrored(std::mem::take(b));
         }
     }
 
@@ -852,7 +875,7 @@ impl Shadow {
     /// guest's first write through its own mapping has nothing to clobber it with.
     #[must_use]
     pub fn mirror_into(&mut self, pages: &Iov<'_>) -> bool {
-        let Shadow::Unmirrored(b) = self else {
+        let Side::Unmirrored(b) = &self.side else {
             return true;
         };
         let ok = pages.copy_in(0, b);
@@ -1539,7 +1562,9 @@ impl Resource {
         args: Args,
     ) -> Result<Resource, Refusal> {
         let storage = match plan(features, formats, limits, &args)? {
-            Plan::HostShadow => Storage::Host(Shadow::fresh(args.width as usize)),
+            Plan::HostShadow => Storage::Host(
+                Shadow::fresh(args.width as usize, budget).ok_or(Refusal::OutOfHostMemory)?,
+            ),
             Plan::GuestPages => Storage::Guest,
             Plan::Buffer { gl_target, storage_flags } => {
                 alloc_buffer(gl, &args, gl_target, storage_flags)?
@@ -2859,12 +2884,17 @@ mod tests {
         [crate::abi::GuestIov { base: crate::abi::VmmPtr(buf.as_mut_ptr().cast()), len: buf.len() }]
     }
 
+    /// A fresh buffer of `size` bytes, charged to a ledger of its own.
+    fn shadow(size: usize) -> Shadow {
+        Shadow::fresh(size, &Classic::for_test()).expect("a small buffer is allocated")
+    }
+
     /// The race this type exists for: the guest queues `RESOURCE_CREATE` and `ATTACH_BACKING`
     /// and starts writing without waiting for either, so a fresh resource's zeroed buffer must
     /// not be pushed on top of what it wrote.
     #[test]
     fn attaching_backing_to_a_fresh_resource_leaves_the_guest_bytes_alone() {
-        let mut shadow = Shadow::fresh(4096);
+        let mut shadow = shadow(4096);
         let mut guest = vec![0xa5u8; 4096];
         let entries = pages(&mut guest);
 
@@ -2876,7 +2906,7 @@ mod tests {
     /// to receive them.
     #[test]
     fn attaching_backing_restores_what_the_guest_cannot_have() {
-        let mut shadow = Shadow::fresh(4096);
+        let mut shadow = shadow(4096);
         shadow.bytes_mut().fill(0x5a);
         shadow.unmirrored();
 
@@ -2890,7 +2920,7 @@ mod tests {
     /// case again, reached from a resource that has been round the loop.
     #[test]
     fn a_paid_attach_owes_the_next_one_nothing() {
-        let mut shadow = Shadow::fresh(16);
+        let mut shadow = shadow(16);
         shadow.bytes_mut().fill(0x5a);
         shadow.unmirrored();
 
@@ -2908,7 +2938,7 @@ mod tests {
     /// A detach is what makes the buffer authoritative: the pages it captured are going away.
     #[test]
     fn what_a_detach_captured_reaches_the_next_backing() {
-        let mut shadow = Shadow::fresh(16);
+        let mut shadow = shadow(16);
 
         let mut old = vec![0x3cu8; 16];
         let entries = pages(&mut old);

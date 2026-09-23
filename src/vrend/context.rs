@@ -4285,7 +4285,7 @@ impl Context {
         ) {
             Ok(mut res) => {
                 res.typed_by = Some(wire.to_vec());
-                host.resources.insert(resource, resource::Slot::Resource(res));
+                host.resources.insert(resource, resource::Slot::Resource(Box::new(res)));
                 Ok(())
             }
             Err((untyped, why)) => {

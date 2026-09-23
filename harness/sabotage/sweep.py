@@ -1809,6 +1809,13 @@ SABOTAGES = [
         """            (gl.get_query_object_ui64v(id, GL_QUERY_RESULT), 4u32)""",
         'a_timestamp_query_is_recorded_and_read_back_in_eight_bytes',
     ),
+    (
+        'a CUSTOM buffer is held without a charge',
+        'src/vrend/resource.rs',
+        """        let charge = budget.charge("CUSTOM buffer", size as u64);""",
+        """        let charge = budget.charge("CUSTOM buffer", 0);""",
+        'a_custom_buffer_is_charged_for_the_bytes_it_holds',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
