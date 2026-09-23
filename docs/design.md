@@ -975,9 +975,12 @@ it survives the session it was found in.
     A module opts in by taking its `Arc`, `Mutex`, `Condvar` and thread from loom under
     `cfg(all(test, loom))`; its models run under
     `RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom cargo test --lib <module>::loom_models`,
-    and a sabotage entry names one as `loom:<test>`. Fence retirement is modelled
-    (`src/fence.rs`). Owed: the ring thread's wait and wake, with the guest modelled as a thread
-    writing the control words.
+    and a sabotage entry names one as `loom:<test>`. Fence retirement (`src/fence.rs`) and the
+    ring thread's two condvar sleeps (`src/venus/ring_thread.rs`) are modelled. The ring's
+    idle/doorbell handshake with the guest is not, and cannot be: it rests on sequentially
+    consistent loads, which loom weakens to acquire/release and reports as races the hardware
+    cannot produce. Guest memory is also behind std atomics loom cannot see. The std tests
+    cover the handshake.
   - **Miri** runs the existing unit tests of the modules that make no FFI calls, and checks the
     aliasing rules Kani does not. The case that matters is the `&mut` that `wire_array_mut` and
     `wire_out` make from arena pointers.
