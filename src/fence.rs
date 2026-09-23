@@ -14,7 +14,19 @@
 //! there is no order to preserve and none is imposed.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+
+// loom's primitives in a test build under `--cfg loom`, so a model can drive every interleaving
+// of the threads here; std's otherwise. Nothing else in this module names a synchronisation type.
+#[cfg(all(test, loom))]
+use loom::{
+    sync::{Arc, Condvar, Mutex},
+    thread,
+};
+#[cfg(not(all(test, loom)))]
+use std::{
+    sync::{Arc, Condvar, Mutex},
+    thread,
+};
 
 use crate::ids::{ClientFenceId, ContextId, FenceId, RingIdx};
 
@@ -70,7 +82,7 @@ struct Queue {
 /// declared or dropped in.
 struct Inner {
     q: Arc<(Mutex<Queue>, Condvar)>,
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Drop for Inner {
@@ -93,7 +105,7 @@ impl Retirement {
         let q =
             Arc::new((Mutex::new(Queue { jobs: VecDeque::new(), stopped: false }), Condvar::new()));
         let qt = Arc::clone(&q);
-        let thread = std::thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("virglrs-fence".into())
             .spawn(move || run(sink, qt))
             .expect("spawning the fence retirement thread");
@@ -199,7 +211,7 @@ fn run(mut sink: Box<dyn FenceSink>, q: Arc<(Mutex<Queue>, Condvar)>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::sync::mpsc::{Sender, channel};
@@ -269,5 +281,68 @@ mod tests {
             assert_eq!((*c, *ring, *fence), (7, 1, i as u64 + 1), "a ring retired out of order");
         }
         assert_eq!(got[N as usize], (0, 0, 99));
+    }
+}
+
+/// Every interleaving of a fence retired from another thread against the owner letting go, run
+/// under `RUSTFLAGS="--cfg loom" cargo test --lib fence::loom_models`.
+///
+/// The tests above run the one schedule the machine happens to pick. Here loom runs them all:
+/// either thread may drop the last share of the queue, the retirement thread may be waiting or
+/// running at each push, and the stop may land anywhere after the last push can.
+#[cfg(all(test, loom))]
+mod loom_models {
+    use super::*;
+
+    /// A sink that records `(ring, fence)` in arrival order, behind loom's own lock so the
+    /// model sees the handoff.
+    struct Recorder(Arc<Mutex<Vec<(u32, u64)>>>);
+
+    impl FenceSink for Recorder {
+        fn context_fence(&mut self, _ctx: ContextId, ring: RingIdx, fence: FenceId) {
+            self.0.lock().unwrap().push((ring.0, fence.0));
+        }
+
+        fn present_fence(&mut self, _: FenceId) {}
+
+        fn global_fence(&mut self, fence: ClientFenceId) {
+            self.0.lock().unwrap().push((u32::MAX, fence.0 as u64));
+        }
+    }
+
+    /// Whatever order the two threads let go in, every fence queued is delivered before the
+    /// retirement thread stops, each ring in the order its fences were queued, and the
+    /// queued-after-stop assert never fires.
+    #[test]
+    fn every_fence_is_delivered_in_ring_order_whoever_lets_go_last() {
+        // Counted outside the model, with std's atomic: loom reruns the closure once per
+        // schedule, and a model that ran once would pass having tried nothing.
+        static SCHEDULES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        loom::model(|| {
+            SCHEDULES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let got = Arc::new(Mutex::new(Vec::new()));
+            let r = Retirement::start(Box::new(Recorder(Arc::clone(&got))));
+            let h = r.handle();
+            let ctx = ContextId::new(7).unwrap();
+            let other = thread::spawn(move || {
+                h.retire_context(ctx, RingIdx(1), FenceId(1));
+                h.retire_context(ctx, RingIdx(1), FenceId(2));
+            });
+            r.retire_context(ctx, RingIdx(2), FenceId(9));
+            drop(r);
+            other.join().unwrap();
+
+            // Whichever thread dropped the last share joined the retirement thread before it
+            // returned, and both are done now, so delivery is complete -- not merely under way.
+            let got = got.lock().unwrap().clone();
+            let ring =
+                |n: u32| got.iter().filter(|(r, _)| *r == n).map(|(_, f)| *f).collect::<Vec<_>>();
+            assert_eq!(got.len(), 3, "a fence was lost: {got:?}");
+            assert_eq!(ring(1), [1, 2], "a ring retired out of order: {got:?}");
+            assert_eq!(ring(2), [9], "a fence was lost: {got:?}");
+        });
+        let ran = SCHEDULES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(ran > 100, "loom ran {ran} schedules; the model is not exploring");
+        eprintln!("[fence] loom ran {ran} schedules");
     }
 }
