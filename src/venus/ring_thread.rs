@@ -31,9 +31,18 @@
 //! reach its own stop check -- spinning, sleeping, copying, or parked on its own condvar -- and the
 //! join completes. Nothing in this loop may acquire a lock by waiting for it.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+
+// The park and the wait-ring lock and wake through loom's primitives in a test build under
+// `--cfg loom`, so a model can drive every interleaving of them; std's otherwise. Only these two
+// swap: the `Arc`s and the context's poison cross into `context.rs`, and every wait and every
+// wake here goes through a `Mutex` and a `Condvar` anyway.
+#[cfg(all(test, loom))]
+use loom::sync::{Condvar, Mutex};
+#[cfg(not(all(test, loom)))]
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::ids::{ContextId, RingId};
@@ -134,6 +143,26 @@ struct ParkState {
 }
 
 impl Park {
+    /// Publish a virtqueue seqno and wake the ring if it sleeps on one. Returns whether the value
+    /// rose. See [`RingThread::submit_virtqueue_seqno`].
+    fn submit(&self, seqno: u64) -> bool {
+        let mut state = self.state.lock().expect("the park lock is never poisoned");
+        let rose = seqno > state.vq_seqno;
+        state.vq_seqno = state.vq_seqno.max(seqno);
+        self.wake.notify_one();
+        rose
+    }
+
+    /// Tell the ring to stop, and wake it wherever it sleeps.
+    ///
+    /// Under the park mutex, for the same reason [`RingThread::notify`] is: a thread about to
+    /// sleep must not miss this between checking `started` and waiting.
+    fn stop(&self, started: &AtomicBool) {
+        let _held = self.state.lock().expect("the park lock is never poisoned");
+        started.store(false, Ordering::Release);
+        self.wake.notify_one();
+    }
+
     /// The virtqueue seqno this ring is asleep on *and cannot reach*, if it is in that state.
     ///
     /// One answer under one lock rather than two questions asked separately. Asked apart, the
@@ -203,35 +232,52 @@ enum Stop {
 }
 
 impl RingWaiter {
+    /// What the wait's predicate found, asked under the wait-ring lock and acted on after it.
+    /// `None` is "nothing yet". What each stall means is the caller's to say; see [`Stop`].
+    fn check(&self) -> Option<Stop> {
+        if self.fatal.load(Ordering::Acquire) {
+            return Some(Stop::Fatal);
+        }
+        if seqno_ge(self.control.head(), self.seqno) {
+            return Some(Stop::Reached);
+        }
+        if let Some(want) = self.park.stalled_on() {
+            return Some(Stop::Stalled(want));
+        }
+        let (head, tail) = (self.control.head(), self.control.tail());
+        if head == tail && !seqno_ge(tail, self.seqno) {
+            return Some(Stop::Drained(head));
+        }
+        None
+    }
+
     /// Sleep until the ring's head reaches the seqno, or until it provably never will.
     ///
-    /// Both refusals are checked before the first sleep and again on every wake, because the
-    /// state that makes them true can arrive either side of the sleep beginning.
+    /// Both stalls are checked before the first sleep and again on every wake, because the state
+    /// that makes them true can arrive either side of the sleep beginning -- and checked under
+    /// the wait-ring lock, as one step with the sleep, so a change that lands between the check
+    /// and the sleep still wakes it. What a caller does about a stall happens after the lock is
+    /// released, because killing the ring announces itself through that same lock.
     fn run(&self) -> Stop {
         let warn = wait_warn();
         let mut logged = false;
         loop {
-            if self.fatal.load(Ordering::Acquire) {
-                return Stop::Fatal;
+            let mut found = None;
+            let timed_out = self.wait_ring.wait_unless(warn, || {
+                found = self.check();
+                found.is_some()
+            });
+            if let Some(stop) = found {
+                return stop;
             }
-            if seqno_ge(self.control.head(), self.seqno) {
-                return Stop::Reached;
-            }
-            if let Some(want) = self.park.stalled_on() {
-                return Stop::Stalled(want);
-            }
-            let (head, tail) = (self.control.head(), self.control.tail());
-            if head == tail && !seqno_ge(tail, self.seqno) {
-                return Stop::Drained(head);
-            }
-
-            if self.wait_ring.wait(warn) && !logged {
+            if timed_out && !logged {
                 // A timeout is the diagnostic firing, never a failure: the wait goes on. Latched
                 // to one line, because this dispatch runs per exported frame sync fd -- hundreds
                 // of times a second on a busy compositor -- and an unconditional log here is a
                 // frame stutter.
                 eprintln!(
-                    "[virglrs] ctx {}: {} ring-seqno wait stuck >{}ms: want {} head {} tail {}                      status {:#x}",
+                    "[virglrs] ctx {}: {} ring-seqno wait stuck >{}ms: want {} head {} tail {} \
+                     status {:#x}",
                     self.ctx,
                     self.id,
                     warn.as_millis(),
@@ -381,11 +427,7 @@ impl RingThread {
     /// later, lower seqno supersede the higher one a restore must reproduce. Answered under the
     /// lock this already takes, so the answer cannot be raced by a concurrent submit.
     pub fn submit_virtqueue_seqno(&self, seqno: u64) -> bool {
-        let mut state = self.park.state.lock().expect("the park lock is never poisoned");
-        let rose = seqno > state.vq_seqno;
-        state.vq_seqno = state.vq_seqno.max(seqno);
-        self.park.wake.notify_one();
-        rose
+        self.park.submit(seqno)
     }
 
     /// The virtqueue seqno this ring is asleep on, if it is asleep on one.
@@ -440,13 +482,7 @@ impl RingThread {
     /// Safe to call while holding whatever lock [`Dispatch`] wants, which is the only reason a
     /// destroy handler can call it at all. See the module docs.
     pub fn stop(mut self) -> Ring {
-        // Under the park mutex, for the same reason `notify` is: a thread about to sleep must not
-        // miss this between checking `started` and waiting.
-        {
-            let _held = self.park.state.lock().expect("the park lock is never poisoned");
-            self.started.store(false, Ordering::Release);
-            self.park.wake.notify_one();
-        }
+        self.park.stop(&self.started);
         self.thread
             .take()
             .expect("a RingThread holds its handle until stop takes it, and stop consumes self")
@@ -465,9 +501,7 @@ impl Drop for RingThread {
     /// this is the backstop for every other path, and a detached ring loop terminates on its own
     /// -- it can no longer reach a context, so its next dispatch is `Verdict::Poisoned`.
     fn drop(&mut self) {
-        let _held = self.park.state.lock().expect("the park lock is never poisoned");
-        self.started.store(false, Ordering::Release);
-        self.park.wake.notify_one();
+        self.park.stop(&self.started);
     }
 }
 
@@ -530,16 +564,26 @@ impl WaitRing {
         self.wake.notify_all();
     }
 
-    /// Sleep until [`Self::changed`] fires or `timeout` elapses. Returns whether it timed out.
+    /// Unless `ready` already holds, sleep until [`Self::changed`] fires or `timeout` elapses.
+    /// Returns whether it timed out.
     ///
-    /// The caller re-checks its own predicate around this; nothing is decided here. A timeout is
-    /// not a failure -- it is the diagnostic firing, and the wait goes on. (The C has to say this
-    /// at length because its C11 shim maps `ETIMEDOUT` to `thrd_busy` rather than `thrd_timeout`,
-    /// and testing the wrong one turned every slow wait into a poisoned context. `wait_timeout`
-    /// has no such trap: the timeout is a distinct value, not an error.)
+    /// `ready` is asked under the lock [`Self::changed`] takes, so the check and the sleep are one
+    /// step: a change lands either before the check, which sees it, or after the sleep has begun,
+    /// which it wakes. Asked outside the lock, a change landing between the two wakes nobody, and
+    /// the waiter sleeps through it until the timeout. `ready` may only read -- anything that calls
+    /// [`Self::changed`] would deadlock on this lock -- and it may take the park lock, which is a
+    /// leaf that no path holds across a call to [`Self::changed`].
+    ///
+    /// A timeout is not a failure -- it is the diagnostic firing, and the wait goes on. (The C has
+    /// to say this at length because its C11 shim maps `ETIMEDOUT` to `thrd_busy` rather than
+    /// `thrd_timeout`, and testing the wrong one turned every slow wait into a poisoned context.
+    /// `wait_timeout` has no such trap: the timeout is a distinct value, not an error.)
     #[must_use]
-    pub fn wait(&self, timeout: Duration) -> bool {
+    pub fn wait_unless(&self, timeout: Duration, ready: impl FnOnce() -> bool) -> bool {
         let held = self.changed.lock().expect("the wait-ring lock is never poisoned");
+        if ready() {
+            return false;
+        }
         let (_g, r) =
             self.wake.wait_timeout(held, timeout).expect("the wait-ring lock is never poisoned");
         r.timed_out()
@@ -770,7 +814,7 @@ fn park_if_quiet(ring: &Ring, park: &Park, started: &AtomicBool, cur: &mut u32) 
     !started.load(Ordering::Acquire)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::guest_mem::GuestMap;
@@ -1040,5 +1084,127 @@ mod tests {
             "the ten bytes before the end, then the six after the start"
         );
         t.stop();
+    }
+}
+
+/// Every interleaving of the ring's two condvar sleeps against what wakes them, run under
+/// `RUSTFLAGS="--cfg loom" cargo test --lib venus::ring_thread::loom_models`.
+///
+/// What is modelled is the synchronisation, not the ring. The head a ring-seqno waiter reads lives
+/// in guest memory behind std atomics loom cannot see, so the first model stands a loom atomic in
+/// for it and asks exactly the question [`RingWaiter::wait`] asks. The idle/doorbell handshake in
+/// [`park_if_quiet`] is out of reach altogether: it rests on sequentially consistent loads, which
+/// loom weakens to acquire/release and would report as races the hardware cannot produce. The std
+/// tests above keep it.
+#[cfg(all(test, loom))]
+mod loom_models {
+    use super::*;
+    use loom::sync::atomic::AtomicU32;
+    use loom::thread;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Run `f` as a loom model and fail unless loom ran more than `floor` schedules of it: loom
+    /// reruns the closure once per schedule, and a model that ran once would pass having tried
+    /// nothing. Each floor sits just under what the model explores today.
+    fn explored(what: &str, floor: usize, f: impl Fn() + Sync + Send + 'static) {
+        let schedules = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&schedules);
+        loom::model(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            f();
+        });
+        let ran = schedules.load(Ordering::Relaxed);
+        assert!(ran > floor, "loom ran {ran} schedules of {what}; the model is not exploring");
+        eprintln!("[ring_thread] loom ran {ran} schedules of {what}");
+    }
+
+    /// A ring-seqno waiter wakes for the head it wants wherever each advance lands against its
+    /// check -- before it, between it and the sleep, or during the sleep. Loom's `wait_timeout`
+    /// never times out, so a wake lost in the gap is a hang here, not half a second of latency.
+    #[test]
+    fn a_ring_seqno_waiter_never_sleeps_through_the_head_it_wants() {
+        explored("the ring-seqno wait", 300, || {
+            let wait_ring = Arc::new(WaitRing::default());
+            let head = Arc::new(AtomicU32::new(0));
+            let ring = {
+                let (wait_ring, head) = (Arc::clone(&wait_ring), Arc::clone(&head));
+                thread::spawn(move || {
+                    for seqno in 1..=2 {
+                        head.store(seqno, Ordering::Release);
+                        wait_ring.changed();
+                    }
+                })
+            };
+            loop {
+                let mut reached = false;
+                let _ = wait_ring.wait_unless(Duration::from_millis(500), || {
+                    reached = seqno_ge(head.load(Ordering::Acquire), 2);
+                    reached
+                });
+                if reached {
+                    break;
+                }
+            }
+            ring.join().unwrap();
+        });
+    }
+
+    /// A ring asleep on a virtqueue seqno wakes when it is published, clears `blocked_on_vq` on
+    /// the way out, and says it was not stopped.
+    #[test]
+    fn a_virtqueue_seqno_sleeper_wakes_when_it_is_published() {
+        explored("the virtqueue-seqno wait", 3, || {
+            let park = Arc::new(Park::default());
+            let started = Arc::new(AtomicBool::new(true));
+            let wait_ring = Arc::new(WaitRing::default());
+            let ring = {
+                let (park, started) = (Arc::clone(&park), Arc::clone(&started));
+                thread::spawn(move || wait_virtqueue_seqno(&park, &started, &wait_ring, 5))
+            };
+            assert!(park.submit(5), "a first publish of a higher seqno rose");
+            assert!(!ring.join().unwrap(), "a published seqno reported as a stop");
+            assert_eq!(park.state.lock().unwrap().blocked_on_vq, None);
+        });
+    }
+
+    /// A stop reaches a ring asleep on a virtqueue seqno wherever it lands against the sleep, and
+    /// the ring says it was stopped.
+    #[test]
+    fn a_virtqueue_seqno_sleeper_can_always_be_stopped() {
+        explored("the virtqueue-seqno wait against a stop", 3, || {
+            let park = Arc::new(Park::default());
+            let started = Arc::new(AtomicBool::new(true));
+            let wait_ring = Arc::new(WaitRing::default());
+            let ring = {
+                let (park, started) = (Arc::clone(&park), Arc::clone(&started));
+                thread::spawn(move || wait_virtqueue_seqno(&park, &started, &wait_ring, 5))
+            };
+            park.stop(&started);
+            assert!(ring.join().unwrap(), "a stopped ring reported it was not stopped");
+            assert_eq!(park.state.lock().unwrap().blocked_on_vq, None);
+        });
+    }
+
+    /// A stop racing the publish that would wake the ring anyway still ends the wait, whichever
+    /// lands first, and the ring leaves nothing claiming it is blocked.
+    #[test]
+    fn a_stop_racing_a_publish_still_ends_the_wait() {
+        explored("the virtqueue-seqno wait against a publish and a stop", 250, || {
+            let park = Arc::new(Park::default());
+            let started = Arc::new(AtomicBool::new(true));
+            let wait_ring = Arc::new(WaitRing::default());
+            let ring = {
+                let (park, started) = (Arc::clone(&park), Arc::clone(&started));
+                thread::spawn(move || wait_virtqueue_seqno(&park, &started, &wait_ring, 5))
+            };
+            let context = {
+                let park = Arc::clone(&park);
+                thread::spawn(move || park.submit(5))
+            };
+            park.stop(&started);
+            ring.join().unwrap();
+            context.join().unwrap();
+            assert_eq!(park.state.lock().unwrap().blocked_on_vq, None);
+        });
     }
 }

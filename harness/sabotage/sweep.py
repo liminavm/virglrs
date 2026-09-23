@@ -664,8 +664,8 @@ SABOTAGES = [
     (
         'a ring wait sleeps without ever checking whether it is the only thing that could end it',
         'src/venus/ring_thread.rs',
-        '''            if let Some(want) = self.park.stalled_on() {''',
-        '''            if let Some(want) = None::<u64> {''',
+        '''        if let Some(want) = self.park.stalled_on() {''',
+        '''        if let Some(want) = None::<u64> {''',
         '',
     ),
     (
@@ -685,8 +685,8 @@ SABOTAGES = [
     (
         'a ring wait past everything the guest wrote is waited through',
         'src/venus/ring_thread.rs',
-        '''            if head == tail && !seqno_ge(tail, self.seqno) {''',
-        '''            if false {''',
+        '''        if head == tail && !seqno_ge(tail, self.seqno) {''',
+        '''        if false {''',
         '',
     ),
     (
@@ -1568,6 +1568,47 @@ SABOTAGES = [
         '    g.jobs.push_front(job);',
         'loom:fence::loom_models',
     ),
+    # The ring thread's two condvar sleeps, under every interleaving loom can produce of what wakes
+    # them. Loom's `wait_timeout` never times out, so a wake lost here is a hang in the model rather
+    # than the half-second stall the timeout turns it into on hardware.
+    (
+        'a ring-seqno waiter checks the head before taking the lock it sleeps under',
+        'src/venus/ring_thread.rs',
+        """        let held = self.changed.lock().expect("the wait-ring lock is never poisoned");
+        if ready() {
+            return false;
+        }
+""",
+        """        if ready() {
+            return false;
+        }
+        let held = self.changed.lock().expect("the wait-ring lock is never poisoned");
+""",
+        'loom:venus::ring_thread::loom_models',
+    ),
+    (
+        'a change to a ring-seqno waiter\'s predicate wakes nobody',
+        'src/venus/ring_thread.rs',
+        '        self.wake.notify_all();\n',
+        '',
+        'loom:venus::ring_thread::loom_models',
+    ),
+    (
+        'a published virtqueue seqno does not wake the ring asleep on it',
+        'src/venus/ring_thread.rs',
+        """        state.vq_seqno = state.vq_seqno.max(seqno);
+        self.wake.notify_one();""",
+        """        state.vq_seqno = state.vq_seqno.max(seqno);""",
+        'loom:venus::ring_thread::loom_models',
+    ),
+    (
+        'a stop does not wake a ring asleep on its park',
+        'src/venus/ring_thread.rs',
+        """        started.store(false, Ordering::Release);
+        self.wake.notify_one();""",
+        """        started.store(false, Ordering::Release);""",
+        'loom:venus::ring_thread::loom_models',
+    ),
     # A ring layout is checked against the rules for every value of every field, both ways: a
     # parser that refuses too much fails the proof as surely as one that accepts too much.
     (
@@ -1588,16 +1629,17 @@ SABOTAGES = [
     ),
 ]
 
-# Not here, and deliberately: "a ring-seqno wake is never sent". Deleting any single
-# `wait_ring.changed()` leaves every witness green, and that is the design rather than a hole. The
-# waiter's stuck-log timeout doubles as a poll, so no individual wake is load-bearing for
-# correctness -- what a missing one costs is latency: the wait ends at half a second instead of at
-# microseconds, and prints a line the C's own comment calls a frame stutter, on a path that runs
-# per exported frame sync fd. A test for that is a stopwatch, and the two arrangements it needs are
-# mutually exclusive: the head must advance while the waiter is already asleep, but a waiter that
-# suspends before the guest has written is refused outright by the drained-and-short guard, which
-# is correct and is itself under test. An entry that can only be caught by winning a race would
-# report a hole on a loaded machine and coverage on a quiet one.
+# Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
+# head". A wake lost inside `WaitRing` itself is an entry above, witnessed by a loom model; a call
+# site in `run` that never makes the call is not. The loop reads the head from guest memory behind
+# std atomics loom cannot see, so no model reaches it, and on hardware the waiter's stuck-log
+# timeout doubles as a poll: the missing wake costs latency, not correctness -- the wait ends at
+# half a second instead of at microseconds, and prints a line the C's own comment calls a frame
+# stutter. A test for that is a stopwatch, and the two arrangements it needs are mutually
+# exclusive: the head must advance while the waiter is already asleep, but a waiter that suspends
+# before the guest has written is refused outright by the drained-and-short guard, which is correct
+# and is itself under test. An entry that can only be caught by winning a race would report a hole
+# on a loaded machine and coverage on a quiet one.
 
 # Not here, and deliberately: "a free forgets to credit the ledger". There is no such line to
 # break. A charge is a value held by the record of what it paid for, so crediting is that record
