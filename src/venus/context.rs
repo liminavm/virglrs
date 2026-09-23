@@ -11038,7 +11038,11 @@ mod tests {
         let names: Vec<String> = advertised
             .iter()
             .map(|e| {
-                e.extensionName.iter().take_while(|c| **c != 0).map(|c| *c as u8 as char).collect()
+                e.extensionName
+                    .iter()
+                    .take_while(|c| **c != 0)
+                    .map(|c| char::from(c.to_ne_bytes()[0]))
+                    .collect()
             })
             .collect();
         assert_eq!(

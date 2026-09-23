@@ -1533,7 +1533,11 @@ impl Driver {
         let names = props
             .iter()
             .map(|p| {
-                p.extensionName.iter().take_while(|c| **c != 0).map(|c| *c as u8 as char).collect()
+                p.extensionName
+                    .iter()
+                    .take_while(|c| **c != 0)
+                    .map(|c| char::from(c.to_ne_bytes()[0]))
+                    .collect()
             })
             .collect();
         self.physical_device_exts.insert(pd, names);
@@ -7551,7 +7555,11 @@ mod tests {
         props
             .iter()
             .map(|p| {
-                p.extensionName.iter().take_while(|c| **c != 0).map(|c| *c as u8 as char).collect()
+                p.extensionName
+                    .iter()
+                    .take_while(|c| **c != 0)
+                    .map(|c| char::from(c.to_ne_bytes()[0]))
+                    .collect()
             })
             .collect()
     }
