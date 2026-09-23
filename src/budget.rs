@@ -1469,6 +1469,7 @@ mod every_sequence {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a walk of a million replays, which Miri would run for days")]
     fn every_uncapped_sequence_counts_each_charge_once_where_it_belongs() {
         let reached = walk(None, 7);
         assert!(reached.sequences > 100_000, "{reached:?}");
@@ -1481,6 +1482,7 @@ mod every_sequence {
     /// With a cap of 5 and sizes of 2 and 3, a charge is refused or admitted depending on what
     /// came before -- including what outlived its context -- and the walk reaches both.
     #[test]
+    #[cfg_attr(miri, ignore = "a walk of a million replays, which Miri would run for days")]
     fn every_capped_sequence_admits_exactly_what_fits() {
         let reached = walk(Some(5), 5);
         assert!(reached.sequences > 1_000 && reached.refusals > 0, "{reached:?}");

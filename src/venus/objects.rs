@@ -1178,6 +1178,7 @@ mod every_sequence {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a walk of every sequence, which Miri would run for days")]
     fn every_sequence_keeps_every_promise() {
         let mut seen = Reached::default();
         walk(&Table::new(), &alphabet(), &mut Vec::new(), &mut Vec::new(), &mut seen);

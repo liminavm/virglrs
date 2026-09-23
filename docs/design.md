@@ -983,9 +983,16 @@ it survives the session it was found in.
     consistent loads, which loom weakens to acquire/release and reports as races the hardware
     cannot produce. Guest memory is also behind std atomics loom cannot see. The std tests
     cover the handshake.
-  - **Miri** runs the existing unit tests of the modules that make no FFI calls, and checks the
-    aliasing rules Kani does not. The case that matters is the `&mut` that `wire_array_mut` and
-    `wire_out` make from arena pointers.
+  - **Miri** runs the unit tests of the modules that make no FFI calls, and checks the aliasing
+    rules Kani does not: `CARGO_TARGET_DIR=target/miri cargo +nightly miri test --lib <module>`.
+    A test too long for it is marked `#[cfg_attr(miri, ignore = "...")]`, so a bare run on a
+    module finishes. `venus::cs` runs clean, including a decode, handler write and reply encode
+    of an enumeration -- the `&mut` that `wire_array_mut` and `wire_out` make from arena
+    pointers. Those are sound only while a handler cannot change an array's length or hold a
+    second copy of the command that owns it: a length safe code can write makes the accessor
+    reading it unsound. So the generator lets only the decoder set what sizes an array (an
+    out-count goes through `cs::OutCount`, which can only lower it), and command structs are
+    neither `Clone` nor `Copy`; each has a sabotage entry. Owed: the other modules without FFI.
   - **cargo-fuzz** takes whatever is too large to prove: the generated venus decoder behind
     `IdentityObjects`, the TGSI translator (where two guest-reachable aborts were found), the
     h264, h265 and AV1 bitstream parsers, and `sync::decode` (no panic on any blob, and it

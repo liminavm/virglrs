@@ -973,6 +973,7 @@ mod tests {
     /// ring thread's stack goes. The chain here is a quarter of a million links of one struct a
     /// buffer create admits; unbounded, decoding it overruns any thread's stack.
     #[test]
+    #[cfg_attr(miri, ignore = "a quarter-million-link chain, which Miri would run for hours")]
     fn a_pnext_chain_deeper_than_the_structs_it_may_name_is_refused() {
         use crate::venus::proto::serialize::vn_decode_VkBufferCreateInfo_pnext_temp;
         use crate::venus::proto::types::VkStructureType;
