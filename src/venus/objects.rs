@@ -79,6 +79,7 @@ struct Key {
 }
 
 /// One place in the arena, occupied or not.
+#[cfg_attr(test, derive(Clone))]
 struct Entry {
     /// Bumped every time the slot is emptied, which is what invalidates every key to it.
     generation: u64,
@@ -91,6 +92,7 @@ struct Entry {
 /// into this and nothing else. There is exactly one copy of an object's handle, so there is no
 /// second copy to forget to update.
 #[derive(Default)]
+#[cfg_attr(test, derive(Clone))]
 struct Arena {
     entries: Vec<Entry>,
     /// Slots emptied by a removal, to be handed out again.
@@ -209,6 +211,7 @@ pub enum AddError {
 /// consulted the live side first; the damage was deferred to the destroy, after which the stale
 /// ghost went on answering for an id that named nothing, turning every later command naming it into
 /// a silent drop where the ring should have stopped.
+#[cfg_attr(test, derive(Clone))]
 enum Slot {
     Live(Key),
     /// The host refused to create this id. A guest pipelines: it sends the create and the commands
@@ -266,6 +269,7 @@ pub struct Doomed {
 }
 
 #[derive(Default)]
+#[cfg_attr(test, derive(Clone))]
 pub struct Table {
     /// What the guest calls each object. Entries here are allowed to go stale: a key whose object
     /// the arena has dropped resolves to nothing, so a parent's destroy does not have to come back
@@ -809,6 +813,353 @@ mod tests {
                 (HostHandle(40), Some(VkDevice(20))),
             ]
         );
+    }
+}
+
+/// Every sequence of table operations up to [`every_sequence::DEPTH`] long, each step checked
+/// against what the table promises.
+///
+/// The tests above each walk one sequence, most of them the one a bug was found on. This walks all
+/// of them, over three ids and three types -- few enough that ids collide: a create under a live
+/// id, a refusal over one, a slot handed out again, which is where a lifetime bug lives. The
+/// domains are that small on purpose, so enumerating them is exhaustive within the bound rather
+/// than a sample of it.
+///
+/// The operations are the ones the context makes, under the constraints it makes them with. An
+/// object's owner is the first handle its create names, so it is an instance for a device and a
+/// device for anything else, and the decoder has already refused a create whose owner resolves to
+/// the wrong type. An instance or a device is destroyed through `take_tree`, everything else
+/// through `remove`. The handle a create mints is `MINTED` plus its depth, above every id, so a
+/// fiction's id reaching a destroy list cannot pass for a driver handle.
+#[cfg(test)]
+mod every_sequence {
+    use super::*;
+
+    const DEPTH: usize = 4;
+    const IDS: [ObjectId; 3] = [ObjectId(0), ObjectId(1), ObjectId(2)];
+    const MINTED: u64 = 100;
+    const INSTANCE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_INSTANCE;
+    const DEVICE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_DEVICE;
+    const BUFFER: VkObjectType = VkObjectType::VK_OBJECT_TYPE_BUFFER;
+    const TYPES: [VkObjectType; 3] = [INSTANCE, DEVICE, BUFFER];
+
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        Add(ObjectId, VkObjectType, Option<ObjectId>),
+        Ghost(ObjectId),
+        Fiction(ObjectId, VkObjectType, Option<ObjectId>),
+        Remove(ObjectId),
+        TakeTree(ObjectId),
+    }
+
+    fn alphabet() -> Vec<Op> {
+        let owners = [None, Some(IDS[0]), Some(IDS[1]), Some(IDS[2])];
+        let mut ops = Vec::new();
+        for id in IDS {
+            for ty in TYPES {
+                for owner in owners {
+                    ops.push(Op::Add(id, ty, owner));
+                    ops.push(Op::Fiction(id, ty, owner));
+                }
+            }
+            ops.extend([Op::Ghost(id), Op::Remove(id), Op::TakeTree(id)]);
+        }
+        ops
+    }
+
+    fn ty_of(t: &Table, id: ObjectId) -> Option<VkObjectType> {
+        t.get(id).map(|o| o.ty)
+    }
+
+    /// Whether the context could make `op` against `t`.
+    fn admissible(t: &Table, op: Op) -> bool {
+        let owned = |ty: VkObjectType, owner: Option<ObjectId>| match owner {
+            None => true,
+            Some(o) => {
+                let parent = if ty == DEVICE { INSTANCE } else { DEVICE };
+                ty != INSTANCE && ty_of(t, o).is_none_or(|p| p == parent)
+            }
+        };
+        match op {
+            Op::Add(_, ty, owner) | Op::Fiction(_, ty, owner) => owned(ty, owner),
+            Op::Ghost(_) => true,
+            Op::Remove(id) => ty_of(t, id).is_none_or(|ty| ty == BUFFER),
+            Op::TakeTree(id) => ty_of(t, id).is_none_or(|ty| ty != BUFFER),
+        }
+    }
+
+    /// Every live object, by handle, with its key and the device a destroy of it must name.
+    fn live(t: &Table) -> Vec<(HostHandle, Key, Option<VkDevice>)> {
+        let mut out: Vec<_> = t
+            .arena
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, e)| {
+                let key = Key { index, generation: e.generation };
+                e.object.map(|o| (o.handle, key, device_above(t, key)))
+            })
+            .collect();
+        out.sort_unstable_by_key(|(h, ..)| *h);
+        out
+    }
+
+    /// The nearest device strictly above `key`.
+    fn device_above(t: &Table, key: Key) -> Option<VkDevice> {
+        let mut at = t.arena.get(key)?.parent;
+        while let Some(o) = at.and_then(|k| t.arena.get(k)) {
+            if o.ty == DEVICE {
+                return Some(VkDevice::from_host(o.handle));
+            }
+            at = o.parent;
+        }
+        None
+    }
+
+    /// Whether `key` is `root` or sits somewhere below it.
+    fn in_tree(t: &Table, key: Key, root: Key) -> bool {
+        let mut at = Some(key);
+        while let Some(k) = at {
+            if k == root {
+                return true;
+            }
+            at = t.arena.get(k).and_then(|o| o.parent);
+        }
+        false
+    }
+
+    /// What the walk must have reached, or its passing says nothing about these cases.
+    #[derive(Default, Debug)]
+    struct Reached {
+        nodes: u64,
+        cascades: u64,
+        reused_under_stale_key: u64,
+        duplicates: u64,
+        fictions_resolved: u64,
+    }
+
+    /// Check a destroy list against the world before it: every handle `taken` names comes back
+    /// exactly once and nothing else does, each on the device above it -- except `root`, the
+    /// object the caller named, which is destroyed on no device.
+    fn destroyed(
+        before: &[(HostHandle, Key, Option<VkDevice>)],
+        taken: &[(HostHandle, Key, Option<VkDevice>)],
+        doomed: &[Doomed],
+        root: Option<Key>,
+        ops: &[Op],
+    ) {
+        let mut got: Vec<HostHandle> = doomed.iter().map(|d| d.handle).collect();
+        got.sort_unstable();
+        let want: Vec<HostHandle> = taken.iter().map(|(h, ..)| *h).collect();
+        assert_eq!(got, want, "a destroy list is not exactly what it took, after {ops:?}");
+        for d in doomed {
+            assert!(d.handle.0 >= MINTED, "a destroy list names a fiction, after {ops:?}");
+            let (_, key, device) = before.iter().find(|(h, ..)| *h == d.handle).unwrap();
+            let want = if Some(*key) == root { None } else { *device };
+            assert_eq!(d.device, want, "destroyed on the wrong device, after {ops:?}");
+        }
+    }
+
+    /// Apply `op` and check it did exactly what it promises. Returns the key a create took.
+    fn apply(
+        t: &mut Table,
+        op: Op,
+        h: HostHandle,
+        ops: &[Op],
+        seen: &mut Reached,
+    ) -> Option<ObjectKey> {
+        let before = live(t);
+        let unchanged = |t: &Table| {
+            let after: Vec<HostHandle> = live(t).iter().map(|(h, ..)| *h).collect();
+            let was: Vec<HostHandle> = before.iter().map(|(h, ..)| *h).collect();
+            assert_eq!(after, was, "the live set changed under {op:?}, after {ops:?}");
+        };
+        match op {
+            Op::Add(id, ty, owner) => {
+                let prior = t.get(id).copied();
+                match t.add(id, ty, h, owner) {
+                    Ok(()) => {
+                        assert!(prior.is_none(), "a create replaced a live object, after {ops:?}");
+                        let after: Vec<HostHandle> = live(t).iter().map(|(h, ..)| *h).collect();
+                        let mut want: Vec<HostHandle> = before.iter().map(|(h, ..)| *h).collect();
+                        want.push(h);
+                        want.sort_unstable();
+                        assert_eq!(
+                            after, want,
+                            "a create did not add exactly its handle, after {ops:?}"
+                        );
+                        return Some(t.key_of(id).expect("an added object has a key"));
+                    }
+                    Err(e) => {
+                        if e == AddError::Duplicate {
+                            seen.duplicates += 1;
+                        }
+                        let expected =
+                            if id.0 == 0 { AddError::ZeroId } else { AddError::Duplicate };
+                        assert_eq!(
+                            e, expected,
+                            "a create was refused for the wrong reason, after {ops:?}"
+                        );
+                        assert!(
+                            id.0 == 0 || prior.is_some(),
+                            "a free id was refused, after {ops:?}"
+                        );
+                        assert_eq!(
+                            t.get(id).copied(),
+                            prior,
+                            "a refused create moved {id:?}, after {ops:?}"
+                        );
+                        unchanged(t);
+                    }
+                }
+            }
+            Op::Ghost(id) | Op::Fiction(id, ..) => {
+                let prior = t.get(id).copied();
+                match op {
+                    Op::Ghost(_) => t.add_ghost(id),
+                    Op::Fiction(_, ty, owner) => t.add_fiction(id, ty, owner),
+                    _ => unreachable!(),
+                }
+                assert_eq!(t.get(id).copied(), prior, "a refusal moved {id:?}, after {ops:?}");
+                unchanged(t);
+            }
+            Op::Remove(id) => {
+                let root = t.key_of(id).map(|k| k.0);
+                let taken: Vec<_> =
+                    before.iter().filter(|(_, k, _)| Some(*k) == root).copied().collect();
+                let gone = t.remove(id);
+                assert_eq!(
+                    gone.map(|o| o.handle),
+                    taken.first().map(|(h, ..)| *h),
+                    "remove returned the wrong object, after {ops:?}"
+                );
+                let after: Vec<_> = live(t).iter().map(|(h, ..)| *h).collect();
+                let want: Vec<_> =
+                    before.iter().filter(|(_, k, _)| Some(*k) != root).map(|(h, ..)| *h).collect();
+                assert_eq!(after, want, "a leaf destroy took more than its leaf, after {ops:?}");
+            }
+            Op::TakeTree(id) => {
+                let root = t.key_of(id).map(|k| k.0);
+                let taken: Vec<_> = before
+                    .iter()
+                    .filter(|(_, k, _)| root.is_some_and(|r| in_tree(t, *k, r)))
+                    .copied()
+                    .collect();
+                let doomed = t.take_tree(id);
+                if doomed.len() >= 2 {
+                    seen.cascades += 1;
+                }
+                destroyed(&before, &taken, &doomed, root, ops);
+                let after: Vec<_> = live(t).iter().map(|(h, ..)| *h).collect();
+                let want: Vec<_> =
+                    before.iter().filter(|b| !taken.contains(b)).map(|(h, ..)| *h).collect();
+                assert_eq!(after, want, "a destroy took something outside its tree, after {ops:?}");
+            }
+        }
+        None
+    }
+
+    /// What holds between any two operations, whatever came before.
+    fn invariants(t: &Table, keys: &[(ObjectKey, HostHandle)], ops: &[Op], seen: &mut Reached) {
+        // A live object is reachable by its own id, and an empty slot is on the free list exactly
+        // once. Its parent need not be live: a create whose owner's id still holds a key a cascade
+        // left behind takes that dead key as its parent, which resolves to nothing from then on.
+        // Nothing descends to such an object, so the teardown check below is what holds it -- the
+        // sweep in `take_all` is the only path that reaches it.
+        for (index, e) in t.arena.entries.iter().enumerate() {
+            let free = t.arena.free.iter().filter(|&&f| f == index).count();
+            match e.object {
+                Some(o) => {
+                    let key = Key { index, generation: e.generation };
+                    assert_eq!(free, 0, "a live slot is on the free list, after {ops:?}");
+                    assert!(
+                        matches!(t.slots.get(&o.id), Some(Slot::Live(k)) if *k == key),
+                        "a live object is not reachable by its own id, after {ops:?}"
+                    );
+                }
+                None => assert_eq!(free, 1, "an empty slot is not free once, after {ops:?}"),
+            }
+        }
+        // A key names the object it was taken for or nothing, whatever holds its slot now.
+        for (k, h) in keys {
+            if t.holds(*k) {
+                let o = t.arena.get(k.0).unwrap();
+                assert_eq!(o.handle, *h, "a stale key names a new object, after {ops:?}");
+            } else if t.arena.entries[k.0.index].object.is_some() {
+                seen.reused_under_stale_key += 1;
+            }
+        }
+        // A lookup finds a live object under its own type, and a fiction only where no live
+        // object stands -- as the guest's own id, never as a driver handle.
+        for id in IDS {
+            for ty in TYPES {
+                let live = t.get(id).filter(|o| o.ty == ty).map(|o| o.handle);
+                match t.lookup(id, ty.0) {
+                    Lookup::Found(h) if Some(h) == live => {}
+                    Lookup::Found(h) => {
+                        assert!(
+                            live.is_none() && t.get(id).is_none(),
+                            "a fiction shadows a live object, after {ops:?}"
+                        );
+                        assert_eq!(
+                            h,
+                            HostHandle(id.0),
+                            "a fiction resolves to a handle, after {ops:?}"
+                        );
+                        seen.fictions_resolved += 1;
+                    }
+                    _ => assert!(live.is_none(), "a live object does not resolve, after {ops:?}"),
+                }
+            }
+        }
+        // A teardown here would take everything, each handle once, on the device above it.
+        let before = live(t);
+        let mut down = t.clone();
+        destroyed(&before, &before, &down.take_all(), None, ops);
+        assert!(down.is_empty(), "a teardown left something behind, after {ops:?}");
+    }
+
+    fn walk(
+        t: &Table,
+        alphabet: &[Op],
+        keys: &mut Vec<(ObjectKey, HostHandle)>,
+        ops: &mut Vec<Op>,
+        seen: &mut Reached,
+    ) {
+        seen.nodes += 1;
+        invariants(t, keys, ops, seen);
+        if ops.len() == DEPTH {
+            return;
+        }
+        for &op in alphabet {
+            if !admissible(t, op) {
+                continue;
+            }
+            let mut next = t.clone();
+            let h = HostHandle(MINTED + ops.len() as u64);
+            ops.push(op);
+            let key = apply(&mut next, op, h, ops, seen);
+            if let Some(k) = key {
+                keys.push((k, h));
+            }
+            walk(&next, alphabet, keys, ops, seen);
+            if key.is_some() {
+                keys.pop();
+            }
+            ops.pop();
+        }
+    }
+
+    #[test]
+    fn every_sequence_keeps_every_promise() {
+        let mut seen = Reached::default();
+        walk(&Table::new(), &alphabet(), &mut Vec::new(), &mut Vec::new(), &mut seen);
+        // Each of these is a case the assertions above are about; a walk that never reached one
+        // would pass them vacuously.
+        assert!(seen.cascades > 0, "no destroy took a child: {seen:?}");
+        assert!(seen.reused_under_stale_key > 0, "no slot was reused under a stale key: {seen:?}");
+        assert!(seen.duplicates > 0, "no create reused a live id: {seen:?}");
+        assert!(seen.fictions_resolved > 0, "no fiction resolved: {seen:?}");
     }
 }
 

@@ -1493,6 +1493,42 @@ SABOTAGES = [
         '        let config = match av1::SeqParams::read(descriptor)',
         'superres',
     ),
+    # The object table, walked through every operation sequence to a fixed depth: each of these
+    # breaks one promise the walk checks at every step.
+    (
+        'a destroyed object\'s slot keeps its generation, so a stale key names the next occupant',
+        'src/venus/objects.rs',
+        '        e.generation += 1;\n',
+        '',
+        'every_sequence_keeps_every_promise',
+    ),
+    (
+        'a destroy takes its children but not theirs, and the grandchildren leak',
+        'src/venus/objects.rs',
+        '                    walk.push((child, under(&o, device)));\n',
+        '',
+        'every_sequence_keeps_every_promise',
+    ),
+    (
+        'a device is not carried down its tree, so its objects are destroyed on no device',
+        'src/venus/objects.rs',
+        'VkObjectType::VK_OBJECT_TYPE_DEVICE => Some(VkDevice::from_host(o.handle)),',
+        'VkObjectType::VK_OBJECT_TYPE_DEVICE => inherited,',
+        'every_sequence_keeps_every_promise',
+    ),
+    (
+        'a refused create ghosts an id that still names a live object',
+        'src/venus/objects.rs',
+        """        if id.0 == 0 || self.get(id).is_some() {
+            return;
+        }
+        self.slots.insert(id, Slot::Ghost);""",
+        """        if id.0 == 0 {
+            return;
+        }
+        self.slots.insert(id, Slot::Ghost);""",
+        'every_sequence_keeps_every_promise',
+    ),
     # A ring layout is checked against the rules for every value of every field, both ways: a
     # parser that refuses too much fails the proof as surely as one that accepts too much.
     (
