@@ -992,7 +992,10 @@ it survives the session it was found in.
     second copy of the command that owns it: a length safe code can write makes the accessor
     reading it unsound. So the generator lets only the decoder set what sizes an array (an
     out-count goes through `cs::OutCount`, which can only lower it), and command structs are
-    neither `Clone` nor `Copy`; each has a sabotage entry. Owed: the other modules without FFI.
+    neither `Clone` nor `Copy`; each has a sabotage entry. The same argument one level down is
+    why the driver takes `cs::Decoded` and `cs::Out` rather than references to `Vk*` structs,
+    and why a write into an answer goes through `Out::edit`, which asserts its pointers and the
+    counts that size them are unchanged. Owed: the other modules without FFI.
   - **cargo-fuzz** takes whatever is too large to prove: the generated venus decoder behind
     `IdentityObjects`, the TGSI translator (where two guest-reachable aborts were found), the
     h264, h265 and AV1 bitstream parsers, and `sync::decode` (no panic on any blob, and it

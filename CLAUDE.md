@@ -43,6 +43,10 @@ answer.
 The list is exhaustive on purpose: a module that starts needing unsafe is a module whose types are
 wrong. Handlers in `venus/context.rs` in particular must stay safe — when one needs a raw pointer,
 the fix is for the generator to hand it a reference or a slice, not for the handler to dereference.
+A `Vk*` struct is all `pub` fields and raw pointers, so a bare reference to one proves nothing: a
+driver entry point that passes one to Vulkan takes `cs::Decoded` (or `cs::Out` for an answer),
+which only the decoder mints. A handler passes on what the guest sent; it cannot build what the
+driver will follow.
 
 **Make bad state unrepresentable; fail the build, not the run.** Use the type system in our
 favour. The concrete form this takes here: virgl is a soup of bare `uint32_t` — resource
