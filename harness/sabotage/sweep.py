@@ -869,6 +869,27 @@ SABOTAGES = [
         'a_late_credit_never_lands_on_the_next_context_with_the_same_id',
     ),
     (
+        'a credit skips the context that took it and lands on the shared bucket',
+        'src/budget.rs',
+        """            Payer::Ctx(ctx) => match ledger.slot_of(ctx) {""",
+        """            Payer::Ctx(ctx) => match ledger.slot_of(ctx).filter(|_| false) {""",
+        'budget::every_sequence',
+    ),
+    (
+        'a charge that exactly fills the cap is refused',
+        'src/budget.rs',
+        """            && live.saturating_add(size) > cap""",
+        """            && live.saturating_add(size) >= cap""",
+        'budget::every_sequence',
+    ),
+    (
+        'a classic credit lands on the shared bucket',
+        'src/budget.rs',
+        """            Payer::Classic => ledger.classic.credit(self.what, self.size),""",
+        """            Payer::Classic => ledger.shared.credit(self.what, self.size),""",
+        'budget::every_sequence',
+    ),
+    (
         'an image the guest shares keeps the opaque tiling it asked for',
         'src/venus/driver.rs',
         """        info.tiling = VkImageTiling::VK_IMAGE_TILING_LINEAR;

@@ -1252,3 +1252,237 @@ mod tests {
         assert!(budget.kills_context(), "and a refusal would still stop the context");
     }
 }
+
+/// Every sequence of ledger operations up to a fixed length, the ledger checked against an
+/// independent tally after each step.
+///
+/// The tests above each walk the one sequence a bug was found on. This walks all of them over two
+/// context ids, two charge sizes and classic, so the cases that matter arise on their own: an id
+/// reused while a charge from its previous occupant is still held, a context retired with charges
+/// outstanding, a credit landing after its context is gone, a charge that exactly fills the cap.
+/// The tally is kept from what the walk holds, never read back from the ledger.
+///
+/// Two walks: an uncapped one, longer, for what is counted and where; and a capped one, shorter,
+/// for what is admitted -- a cap of 5 against sizes of 2 and 3 is decided within three charges.
+#[cfg(test)]
+mod every_sequence {
+    use super::*;
+
+    const IDS: [u32; 2] = [1, 2];
+    const SIZES: [u64; 2] = [2, 3];
+
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        Open(usize),
+        Close(usize),
+        Charge(usize, u64),
+        Classic(u64),
+        /// Drop the held charge at this position.
+        Drop(usize),
+    }
+
+    /// A held charge, and who the tally says it belongs to: the occupant it was taken under, or
+    /// classic.
+    struct Held {
+        _charge: Charge,
+        owner: Option<ContextKey>,
+        size: u64,
+    }
+
+    /// The walk's world: the ledger, and what the walk itself holds of it.
+    struct World {
+        budget: Arc<Budget>,
+        classic: Classic,
+        accounts: [Option<(Account, ContextKey)>; 2],
+        held: Vec<Held>,
+    }
+
+    impl World {
+        fn new(cap: Option<u64>) -> World {
+            let budget = Budget::with_cap(cap, false);
+            let classic = Classic::open(&budget);
+            World { budget, classic, accounts: [None, None], held: Vec::new() }
+        }
+
+        fn apply(&mut self, op: Op, ops: &[Op]) {
+            match op {
+                Op::Open(i) => {
+                    let key = ContextKey::for_test(ContextId::new(IDS[i]).unwrap());
+                    self.accounts[i] = Some((Account::open(&self.budget, key, String::new()), key));
+                }
+                Op::Close(i) => self.accounts[i] = None,
+                Op::Charge(i, size) => {
+                    let before = self.budget.live();
+                    let (account, key) = self.accounts[i].as_ref().unwrap();
+                    let refused = self.budget.cap.is_some_and(|cap| before + size > cap);
+                    match account.try_charge("memory", size) {
+                        Ok(charge) => {
+                            assert!(!refused, "a charge past the cap was admitted, after {ops:?}");
+                            self.held.push(Held { _charge: charge, owner: Some(*key), size });
+                        }
+                        Err(r) => {
+                            assert!(refused, "a charge within the cap was refused, after {ops:?}");
+                            assert_eq!((r.wanted, r.live), (size, before), "after {ops:?}");
+                        }
+                    }
+                }
+                Op::Classic(size) => {
+                    let charge = self.classic.charge("IOSurface", size);
+                    self.held.push(Held { _charge: charge, owner: None, size });
+                }
+                Op::Drop(k) => drop(self.held.remove(k)),
+            }
+        }
+
+        /// The ledger agrees with the tally: every held charge counted once, under its own
+        /// context while that occupant stands, under shared once it is gone, and under classic
+        /// if it never had one.
+        fn agrees(&self, ops: &[Op]) {
+            let sum = |f: &dyn Fn(&Held) -> bool| {
+                self.held.iter().filter(|h| f(h)).map(|h| h.size).sum::<u64>()
+            };
+            let standing = |key: ContextKey| self.accounts.iter().flatten().any(|(_, k)| *k == key);
+            assert_eq!(self.budget.live(), sum(&|_| true), "the total, after {ops:?}");
+            assert_eq!(
+                self.budget.classic(),
+                sum(&|h| h.owner.is_none()),
+                "classic, after {ops:?}"
+            );
+            assert_eq!(
+                self.budget.shared(),
+                sum(&|h| h.owner.is_some_and(|k| !standing(k))),
+                "shared, after {ops:?}"
+            );
+            for (i, id) in IDS.iter().enumerate() {
+                let want =
+                    self.accounts[i].as_ref().map_or(0, |(_, key)| sum(&|h| h.owner == Some(*key)));
+                assert_eq!(
+                    self.budget.live_for(ContextId::new(*id).unwrap()),
+                    want,
+                    "context {id}, after {ops:?}"
+                );
+            }
+        }
+    }
+
+    fn alphabet() -> Vec<Op> {
+        let mut ops = Vec::new();
+        for i in 0..IDS.len() {
+            ops.extend([Op::Open(i), Op::Close(i)]);
+            ops.extend(SIZES.map(|s| Op::Charge(i, s)));
+        }
+        ops.extend(SIZES.map(Op::Classic));
+        ops.extend((0..4).map(Op::Drop));
+        ops
+    }
+
+    /// Replay `ops` on a fresh world, checking after every step. Replayed rather than cloned
+    /// forward: a charge is a value whose drop is the credit, and a copy of one would be a
+    /// second credit.
+    fn replay(cap: Option<u64>, ops: &[Op]) {
+        let mut world = World::new(cap);
+        for (n, &op) in ops.iter().enumerate() {
+            world.apply(op, &ops[..=n]);
+            world.agrees(&ops[..=n]);
+        }
+    }
+
+    /// The shape of a world, enough to decide which operations are admissible next without
+    /// building one: which occupant stands at each id, and the size and occupant of each held
+    /// charge. It also counts the cases the walk exists to reach, so a walk that stops reaching
+    /// them fails rather than passing on nothing.
+    #[derive(Clone, Default)]
+    struct Shape {
+        /// The generation of the occupant standing at each id.
+        open: [Option<u32>; 2],
+        generations: u32,
+        /// Each held charge's size, and the id and generation it was taken under.
+        held: Vec<(u64, Option<(usize, u32)>)>,
+    }
+
+    #[derive(Default, Debug)]
+    struct Reached {
+        sequences: u64,
+        refusals: u64,
+        /// A context closed while a charge taken under it was still held.
+        retired_with_residue: u64,
+        /// A charge from an id's previous occupant credited while a new one stands there.
+        late_credits_on_reused_id: u64,
+    }
+
+    /// Every admissible sequence `depth` long, each replayed once on a fresh world.
+    fn walk(cap: Option<u64>, depth: usize) -> Reached {
+        fn go(
+            cap: Option<u64>,
+            depth: usize,
+            alphabet: &[Op],
+            ops: &mut Vec<Op>,
+            shape: &Shape,
+            reached: &mut Reached,
+        ) {
+            if ops.len() == depth {
+                replay(cap, ops);
+                reached.sequences += 1;
+                return;
+            }
+            for &op in alphabet {
+                let mut next = shape.clone();
+                match op {
+                    // An account opens only where none stands: a second is this renderer's bug,
+                    // which `open` asserts on, not a sequence a guest can drive.
+                    Op::Open(i) if shape.open[i].is_none() => {
+                        next.generations += 1;
+                        next.open[i] = Some(next.generations);
+                    }
+                    Op::Close(i) if let Some(g) = shape.open[i] => {
+                        next.open[i] = None;
+                        if shape.held.iter().any(|h| h.1 == Some((i, g))) {
+                            reached.retired_with_residue += 1;
+                        }
+                    }
+                    Op::Charge(i, size) if let Some(g) = shape.open[i] => {
+                        let live: u64 = shape.held.iter().map(|h| h.0).sum();
+                        if cap.is_some_and(|cap| live + size > cap) {
+                            reached.refusals += 1;
+                        } else {
+                            next.held.push((size, Some((i, g))));
+                        }
+                    }
+                    Op::Classic(size) => next.held.push((size, None)),
+                    Op::Drop(k) if k < shape.held.len() => {
+                        if let Some((i, g)) = next.held.remove(k).1
+                            && shape.open[i].is_some_and(|now| now != g)
+                        {
+                            reached.late_credits_on_reused_id += 1;
+                        }
+                    }
+                    _ => continue,
+                }
+                ops.push(op);
+                go(cap, depth, alphabet, ops, &next, reached);
+                ops.pop();
+            }
+        }
+        let mut reached = Reached::default();
+        go(cap, depth, &alphabet(), &mut Vec::new(), &Shape::default(), &mut reached);
+        reached
+    }
+
+    #[test]
+    fn every_uncapped_sequence_counts_each_charge_once_where_it_belongs() {
+        let reached = walk(None, 7);
+        assert!(reached.sequences > 100_000, "{reached:?}");
+        assert!(
+            reached.retired_with_residue > 0 && reached.late_credits_on_reused_id > 0,
+            "{reached:?}"
+        );
+    }
+
+    /// With a cap of 5 and sizes of 2 and 3, a charge is refused or admitted depending on what
+    /// came before -- including what outlived its context -- and the walk reaches both.
+    #[test]
+    fn every_capped_sequence_admits_exactly_what_fits() {
+        let reached = walk(Some(5), 5);
+        assert!(reached.sequences > 1_000 && reached.refusals > 0, "{reached:?}");
+    }
+}
