@@ -628,7 +628,11 @@ class RustGen:
         lines = []
         for v in ty.variables:
             f, b = self.field_name(v.name), v.ty.base
-            if v.ty.is_pointer():
+            if v.name == 'sType':
+                # Not a pointer, but read as one: a chain walk casts each link to the struct its
+                # tag names, so a retagged link is read as a struct larger than the one allocated.
+                lines.append('out.push(self.sType.0 as u64);')
+            elif v.ty.is_pointer():
                 lines.append('out.push(self.%s as usize as u64);' % f)
                 try:
                     shape = self._shape(ty, v)

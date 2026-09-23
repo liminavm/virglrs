@@ -1418,6 +1418,123 @@ mod tests {
         Out::planted(&mut props).edit(|p| p.pNext = (&raw mut elsewhere).cast());
     }
 
+    /// Nor its tag: a chain walk casts each link to the struct its `sType` names.
+    #[test]
+    #[should_panic(expected = "an answer's pointers or their counts were rewritten")]
+    fn an_answer_keeps_its_tag() {
+        use crate::venus::proto::types::{VkPhysicalDeviceProperties2, VkStructureType};
+        let mut props = VkPhysicalDeviceProperties2::default();
+        Out::planted(&mut props).edit(|p| {
+            p.sType = VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2
+        });
+    }
+
+    /// A link the guest chained onto an answer, reached the way a handler reaches it and written
+    /// the way a handler writes it, then read back out by the reply encoder. Under Miri this is
+    /// what checks the `&mut` `chained_mut` makes from the chain's raw pointers.
+    #[test]
+    fn a_chained_answer_is_filled_in_place() {
+        use crate::venus::driver::chained_mut;
+        use crate::venus::proto::serialize::{
+            vn_decode_vkGetPhysicalDeviceMemoryProperties2_args_temp,
+            vn_encode_vkGetPhysicalDeviceMemoryProperties2_args,
+            vn_encode_vkGetPhysicalDeviceMemoryProperties2_reply,
+        };
+        use crate::venus::proto::types::{
+            VkCommandTypeEXT, VkDeviceSize, VkFlags, VkPhysicalDeviceMemoryBudgetPropertiesEXT,
+            VkPhysicalDeviceMemoryProperties2, VkStructureType,
+            vn_command_vkGetPhysicalDeviceMemoryProperties2,
+        };
+        let mut budget = VkPhysicalDeviceMemoryBudgetPropertiesEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT,
+            ..Default::default()
+        };
+        let mut props = VkPhysicalDeviceMemoryProperties2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+            pNext: (&raw mut budget).cast(),
+            ..Default::default()
+        };
+        let mut sent = vn_command_vkGetPhysicalDeviceMemoryProperties2::default();
+        sent.physicalDevice = VkPhysicalDevice(9);
+        sent.plant_pMemoryProperties(&mut props);
+        let mut wire = Vec::new();
+        vn_encode_vkGetPhysicalDeviceMemoryProperties2_args(
+            &mut Encoder::growing(&mut wire, &AllOfIt),
+            VkFlags(0),
+            &sent,
+        );
+
+        let (temp, hard) = (Bump::new(), AtomicBool::new(false));
+        let mut dec = Decoder::new(&wire, &temp, &IdentityObjects, &hard);
+        let _ = dec.decode_scalar::<VkCommandTypeEXT>();
+        let _ = dec.decode_scalar::<VkFlags>();
+        let mut got = vn_command_vkGetPhysicalDeviceMemoryProperties2::default();
+        vn_decode_vkGetPhysicalDeviceMemoryProperties2_args_temp(&mut dec, &mut got);
+        assert!(!dec.fatal());
+
+        let mut out = got.pMemoryProperties_mut().expect("the guest sent room for the answer");
+        let mut link = chained_mut::<VkPhysicalDeviceMemoryBudgetPropertiesEXT>(&mut out)
+            .expect("the budget link decoded onto the chain");
+        link.edit(|l| l.heapBudget[0] = VkDeviceSize(0x5eed));
+
+        let mut reply = Vec::new();
+        vn_encode_vkGetPhysicalDeviceMemoryProperties2_reply(
+            &mut Encoder::growing(&mut reply, &AllOfIt),
+            &got,
+        );
+        assert!(
+            reply.windows(8).any(|w| w == 0x5eed_u64.to_le_bytes()),
+            "the reply carries what the handler wrote into the link"
+        );
+    }
+
+    /// The read-only mirror: a link the guest chained onto a request, handed back decoded.
+    #[test]
+    fn a_chained_request_is_read_decoded() {
+        use crate::venus::driver::chained;
+        use crate::venus::proto::serialize::{
+            vn_decode_vkCreateSemaphore_args_temp, vn_encode_vkCreateSemaphore_args,
+        };
+        use crate::venus::proto::types::{
+            VkCommandTypeEXT, VkFlags, VkSemaphoreCreateInfo, VkSemaphoreType,
+            VkSemaphoreTypeCreateInfo, VkStructureType, vn_command_vkCreateSemaphore,
+        };
+        let kind = VkSemaphoreTypeCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            semaphoreType: VkSemaphoreType::VK_SEMAPHORE_TYPE_TIMELINE,
+            initialValue: 17,
+            ..Default::default()
+        };
+        let info = VkSemaphoreCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            pNext: (&raw const kind).cast(),
+            ..Default::default()
+        };
+        let mut sent = vn_command_vkCreateSemaphore::default();
+        sent.pCreateInfo = Some(Decoded::planted(&info));
+        let mut id = crate::venus::proto::types::VkSemaphore(5);
+        sent.plant_pSemaphore(&mut id);
+        let mut wire = Vec::new();
+        vn_encode_vkCreateSemaphore_args(
+            &mut Encoder::growing(&mut wire, &AllOfIt),
+            VkFlags(0),
+            &sent,
+        );
+
+        let (temp, hard) = (Bump::new(), AtomicBool::new(false));
+        let mut dec = Decoder::new(&wire, &temp, &IdentityObjects, &hard);
+        let _ = dec.decode_scalar::<VkCommandTypeEXT>();
+        let _ = dec.decode_scalar::<VkFlags>();
+        let mut got = vn_command_vkCreateSemaphore::default();
+        vn_decode_vkCreateSemaphore_args_temp(&mut dec, &mut got);
+        assert!(!dec.fatal());
+
+        let decoded = got.pCreateInfo.expect("the guest sent a create info");
+        let link = chained::<VkSemaphoreTypeCreateInfo>(decoded).expect("the type link decoded");
+        assert_eq!(link.initialValue, 17);
+        assert_eq!(link.semaphoreType, VkSemaphoreType::VK_SEMAPHORE_TYPE_TIMELINE);
+    }
+
     /// Nor the size of a blob: the reply encoder copies that many bytes out of it.
     #[test]
     #[should_panic(expected = "an answer's pointers or their counts were rewritten")]

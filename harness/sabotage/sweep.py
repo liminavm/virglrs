@@ -84,6 +84,13 @@ SABOTAGES = [
         'an_answer_keeps_the_size_of_its_blob',
     ),
     (
+        'the shape of an answer leaves out its tag',
+        'venus-gen/rustgen.py',
+        """                lines.append('out.push(self.sType.0 as u64);')""",
+        """                pass""",
+        'an_answer_keeps_its_tag',
+    ),
+    (
         'the shape of an answer leaves out the structs it embeds',
         'venus-gen/rustgen.py',
         """                    lines.append('cs::Shape::shape(&self.%s, out);' % f)""",
