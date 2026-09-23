@@ -973,7 +973,12 @@ it survives the session it was found in.
     small by design: every operation sequence to a fixed depth, each step checked against a
     tally kept outside the thing under test, and each walk asserting it reached the cases it
     exists for. The object table (`src/venus/objects.rs`) and the budget ledger
-    (`src/budget.rs`) are walked this way, each in a module named `every_sequence`.
+    (`src/budget.rs`) are walked this way, each in a module named `every_sequence`. So is the
+    record of what a suspended driver wait reads (`driver::InFlight`), in
+    `venus::context`'s `driver_waits::every_sequence`. It drives a real `Context` with a planted
+    device through every order of waits, answers and destroys across the context's stream and
+    two rings, because the property is about where each stream keeps its record, not about the
+    record alone.
   - **loom** tries every interleaving of the threads involved, which neither of the above can.
     A module opts in by taking its `Arc`, `Mutex`, `Condvar` and thread from loom under
     `cfg(all(test, loom))`; its models run under
@@ -1017,9 +1022,7 @@ it survives the session it was found in.
     fuzzed.
 
   Out of reach as the code stands: `vrend/waiter.rs` waits on GL, and the storage shares in
-  `vrend/resource.rs` are tied up with GL and Metal. The venus `in_flight` wait record could be
-  proved only once it is pulled out of `context.rs` and `driver.rs` into a type that holds no
-  device.
+  `vrend/resource.rs` are tied up with GL and Metal.
 
 ## Consequences to accept
 
