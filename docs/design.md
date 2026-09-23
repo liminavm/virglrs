@@ -991,19 +991,20 @@ it survives the session it was found in.
     cover the handshake.
   - **Miri** runs the unit tests that make no foreign call, and checks the aliasing rules Kani
     does not: `CARGO_TARGET_DIR=target/miri cargo +nightly miri test --lib <module>`. A foreign
-    call ends the whole run, hiding every test after it, so a module that has one is run again
-    with `-- --skip <test>` for each test Miri stops on until it finishes. A test too long for it
-    is marked `#[cfg_attr(miri, ignore = "...")]`. `venus::driver` and `venus::context` also need
-    `MIRIFLAGS=-Zmiri-ignore-leaks`: `Driver::abandon_planted` leaks the tables a test planted, on
-    purpose, because dropping them would call entry points the test never planted.
+    call ends the whole run, hiding every test after it, so `harness/miri/sweep.py [module ...]`
+    runs each module again with `--skip` for every test Miri stops on until it finishes, and
+    reports what ran. A test too long for Miri is marked `#[cfg_attr(miri, ignore = "...")]`.
+    `venus::driver` and `venus::context` run with `-Zmiri-ignore-leaks`, which the script sets:
+    `Driver::abandon_planted` leaks the tables a test planted, on purpose, because dropping them
+    would call entry points the test never planted.
 
     Measured 2026-09-23, every module: no undefined behaviour in any test Miri could run. Every
     test reaches C in `vulkan`, `vrend::waiter`, `vrend::egl`, `venus::vkr`, `venus::monitor` and
     `metal::plain_tests`, so Miri covers nothing there. It covers part of `venus::context` (19 of
     127 tests), `venus::driver` (21 of 27), `renderer` (4 of 17), `guest_mem` (5 of 14), `metal`
     (1 of 11), `venus::ring` (4 of 12), `venus::ring_thread` (1 of 8), `vrend::vrend` (2 of 9),
-    `vrend::video` (5 of 7), `vrend::blitter` (11 of 12) and `budget` (14 of 15), and all of every
-    other module.
+    `vrend::video` (5 of 7), `vrend::blitter` (11 of 12), `budget` (14 of 15) and `decode` (9 of
+    11), and all of every other module.
 
     `venus::cs` runs clean, including a decode, handler write and reply encode
     of an enumeration -- the `&mut` that `wire_array_mut` and `wire_out` make from arena
