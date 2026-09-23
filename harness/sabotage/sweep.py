@@ -1499,11 +1499,10 @@ SABOTAGES = [
         'a_device_with_a_wait_in_flight_cannot_be_destroyed',
     ),
     (
-        'a ring destroyed mid-wait pins its fence for the life of the context',
+        "a ring's driver wait is recorded on the context, and outlives the ring it was made on",
         'src/venus/context.rs',
-        """        self.in_flight.remove(&Waiter::Ring(id));
-    }""",
-        """    }""",
+        """            Some(id) => self.rings.get_mut(&id).map(|e| &mut e.wait),""",
+        """            Some(_) => Some(&mut self.own_wait),""",
         'a_destroyed_ring_releases_what_its_wait_was_reading',
     ),
     (

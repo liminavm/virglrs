@@ -211,7 +211,7 @@ pub struct Context {
     ///
     /// One map, so a ring has exactly one owner. Destroying the context drops it, which is what
     /// releases the share each ring holds of its resource's mapping.
-    rings: BTreeMap<RingId, RingSlot>,
+    rings: BTreeMap<RingId, RingEntry>,
     /// Where answers to commands that arrived on the context's own stream go. Each ring holds its
     /// own; this is the one for everything that did not come in on a ring.
     reply: Option<ReplyStream>,
@@ -229,10 +229,9 @@ pub struct Context {
     /// What this context would have to be told again to be itself. Written by the dispatch loop as
     /// commands go by; read only by an export.
     journal: Journal,
-    /// The driver waits this context's streams have suspended on and not yet resumed, by stream.
-    /// See [`InFlight`]. A stream has at most one, because a suspended stream runs nothing else
-    /// until it is offered its batch again.
-    in_flight: BTreeMap<Waiter, InFlight>,
+    /// The driver wait the context's own stream is suspended on, if it is. A ring's is kept in
+    /// its [`RingEntry`]. See [`InFlight`].
+    own_wait: Option<InFlight>,
 }
 
 /// The object table, answering the journal's one question about it.
@@ -291,16 +290,6 @@ pub enum Wait {
     Driver(DriverWait),
 }
 
-/// Who a batch that suspended on a driver wait was: the context's own stream, or one ring's.
-///
-/// The key under which the wait's handles are recorded as in flight, and the thing whose death
-/// releases them -- a ring that is destroyed mid-wait never offers its batch again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Waiter {
-    Context,
-    Ring(RingId),
-}
-
 /// How a submission ended.
 ///
 /// `Waiting` is the reason this is not a `bool`. A batch can stop partway through, and the caller
@@ -345,6 +334,24 @@ enum RingSlot {
     Running(RingThread),
 }
 
+/// A ring, and the driver wait its stream is suspended on, if it is.
+///
+/// The wait is kept beside the ring rather than in a table of its own so that it goes with the
+/// ring. A ring that is destroyed or stopped never offers its batch again, and once its thread is
+/// joined nothing is reading what the wait read; dropping the entry is the release, so there is no
+/// destroy path that has to remember one. A stream has at most one wait, because a suspended
+/// stream runs nothing else until it is offered its batch again.
+struct RingEntry {
+    slot: RingSlot,
+    wait: Option<InFlight>,
+}
+
+impl RingEntry {
+    fn new(slot: RingSlot) -> RingEntry {
+        RingEntry { slot, wait: None }
+    }
+}
+
 impl RingSlot {
     /// The ring's control words, whichever state it is in.
     ///
@@ -355,6 +362,14 @@ impl RingSlot {
             RingSlot::Idle(r) => &r.control,
             RingSlot::Running(t) => t.control(),
         }
+    }
+}
+
+#[cfg(test)]
+impl RingEntry {
+    /// The body of a ring that has not been started. See [`RingSlot::idle`].
+    fn idle(&self) -> &Ring {
+        self.slot.idle()
     }
 }
 
@@ -407,7 +422,7 @@ impl Context {
             wait_ring: Arc::new(WaitRing::default()),
             monitor: None,
             journal: Journal::new(),
-            in_flight: BTreeMap::new(),
+            own_wait: None,
         }
     }
 
@@ -435,7 +450,7 @@ impl Context {
     /// number that cannot arrive, and returning a waiter for it would hand the caller a hang
     /// instead of the refusal it is owed.
     pub fn ring_waiter(&self, ring: RingId, seqno: u32) -> Option<RingWaiter> {
-        match self.rings.get(&ring)? {
+        match &self.rings.get(&ring)?.slot {
             RingSlot::Running(t) => {
                 Some(t.waiter(self.id(), seqno, self.wait_ring(), self.fatal_flag()))
             }
@@ -462,7 +477,7 @@ impl Context {
     pub fn decode_barrier(&self) -> Vec<BarrierWaiter> {
         self.rings
             .values()
-            .filter_map(|slot| match slot {
+            .filter_map(|e| match &e.slot {
                 RingSlot::Running(t) => {
                     let tail = t.control().tail();
                     Some(t.barrier_waiter(self.id(), tail, self.wait_ring(), self.fatal_flag()))
@@ -725,7 +740,7 @@ impl Context {
             replaying: replay,
             depth: 0,
             answer,
-            in_flight: std::mem::take(&mut self.in_flight),
+            own_wait: self.own_wait.take(),
             note: None,
             journal: &mut self.journal,
         };
@@ -737,7 +752,7 @@ impl Context {
         // -- the ring thread re-offers the bytes it kept, the VMM the buffer it was handed --
         // so it is asserted, not rejected.
         let unclaimed = h.answer.take();
-        self.in_flight = std::mem::take(&mut h.in_flight);
+        self.own_wait = h.own_wait.take();
 
         self.dispatched += counts.dispatched;
         self.unhandled += counts.unhandled;
@@ -796,7 +811,7 @@ impl Context {
         global: &Global,
         resources: &dyn ShmResources,
     ) -> bool {
-        match self.rings.get(&ring) {
+        match self.rings.get(&ring).map(|e| &e.slot) {
             None => {
                 eprintln!(
                     "[virglrs] ctx {}: submission for {ring}, which is not a ring here",
@@ -814,12 +829,12 @@ impl Context {
         }
         // The ring lends its slot for the batch, exactly as the context lends its own above.
         // A running ring's thread owns the body and lends from there instead -- see `dispatch_ring`.
-        let mut reply = match self.rings.get_mut(&ring) {
+        let mut reply = match self.rings.get_mut(&ring).map(|e| &mut e.slot) {
             Some(RingSlot::Idle(r)) => r.reply.take(),
             _ => None,
         };
         let out = self.submit_on(Some(ring), &mut reply, buf, None, todo, global, resources);
-        if let Some(RingSlot::Idle(r)) = self.rings.get_mut(&ring) {
+        if let Some(RingSlot::Idle(r)) = self.rings.get_mut(&ring).map(|e| &mut e.slot) {
             r.reply = reply;
         }
         // A journal is a record of commands that already ran on a live guest, replayed into a
@@ -876,20 +891,20 @@ impl Context {
         // The common case by far: every batch a guest sends comes through here, and almost none
         // of them create a ring. Answering that without allocating keeps promotion off the
         // submission path's conscience.
-        if !self.rings.values().any(|slot| matches!(slot, RingSlot::Idle(_))) {
+        if !self.rings.values().any(|e| matches!(e.slot, RingSlot::Idle(_))) {
             return 0;
         }
         let idle: Vec<RingId> = self
             .rings
             .iter()
-            .filter(|(_, slot)| matches!(slot, RingSlot::Idle(_)))
+            .filter(|(_, e)| matches!(e.slot, RingSlot::Idle(_)))
             .map(|(id, _)| *id)
             .collect();
         for id in &idle {
-            let Some(RingSlot::Idle(ring)) = self.rings.remove(id) else {
+            let Some(RingEntry { slot: RingSlot::Idle(ring), wait }) = self.rings.remove(id) else {
                 unreachable!("just filtered for idle rings, and nothing else runs meanwhile")
             };
-            self.rings.insert(*id, RingSlot::Running(spawn(*id, ring)));
+            self.rings.insert(*id, RingEntry { slot: RingSlot::Running(spawn(*id, ring)), wait });
         }
         idle.len()
     }
@@ -902,14 +917,11 @@ impl Context {
     /// could make the thread itself the last owner -- and the drop would join the thread it was
     /// running on. Joining here, while no dispatch can be in flight afterwards, removes that.
     pub fn stop_rings(&mut self) {
-        for (_, slot) in std::mem::take(&mut self.rings) {
-            if let RingSlot::Running(t) = slot {
+        for (_, entry) in std::mem::take(&mut self.rings) {
+            if let RingSlot::Running(t) = entry.slot {
                 drop(t.stop());
             }
         }
-        // A stopped ring never offers its batch again, so whatever it was waiting on is no
-        // longer being read.
-        self.in_flight.retain(|w, _| *w == Waiter::Context);
     }
 
     /// The driver state, for the teardown that has to destroy what it holds.
@@ -1849,7 +1861,7 @@ pub struct Handlers<'a> {
     /// Where this batch's answers go, lent by whoever owns the stream it arrived on.
     reply: &'a mut Option<ReplyStream>,
     /// The rings this context has stood up. Held mutably because creating one is a command.
-    rings: &'a mut BTreeMap<RingId, RingSlot>,
+    rings: &'a mut BTreeMap<RingId, RingEntry>,
     /// The context's ring monitor, started here by the first ring that asks for one.
     monitor: &'a mut Option<Monitor>,
     /// A handler asking to be suspended: it cannot proceed until something outside this context
@@ -1880,9 +1892,9 @@ pub struct Handlers<'a> {
     /// again. Taken by the wait command the batch begins with, which is the same command that
     /// suspended it; the loop asserts that nothing else was offered one.
     answer: Option<Answered>,
-    /// The context's record of driver waits in flight, keyed by stream, lent to the batch and
-    /// taken back after it. See [`InFlight`].
-    in_flight: BTreeMap<Waiter, InFlight>,
+    /// The driver wait the context's own stream is suspended on, lent to the batch and taken back
+    /// after it. See [`InFlight`].
+    own_wait: Option<InFlight>,
     /// What the recorder could not work out for itself, left by the handler that knows.
     ///
     /// A message, like `wait` and `execute`, and for a narrower version of the same reason: the
@@ -2151,9 +2163,19 @@ impl Handlers<'_> {
         self.reject = Some("recorded into a command buffer with no device behind it");
     }
 
-    /// Which stream this batch is, as the in-flight record keys it.
-    fn waiter(&self) -> Waiter {
-        self.current_ring.map_or(Waiter::Context, Waiter::Ring)
+    /// Where this stream keeps the driver wait it is suspended on: its ring's entry, so that the
+    /// record goes with the ring, or the context for its own stream. `None` is a ring that is not
+    /// here.
+    fn wait_record(&mut self) -> Option<&mut Option<InFlight>> {
+        match self.current_ring {
+            None => Some(&mut self.own_wait),
+            Some(id) => self.rings.get_mut(&id).map(|e| &mut e.wait),
+        }
+    }
+
+    /// Every driver wait in flight on any of this context's streams.
+    fn waits(&self) -> impl Iterator<Item = &InFlight> {
+        self.own_wait.iter().chain(self.rings.values().filter_map(|e| e.wait.as_ref()))
     }
 
     /// Whether a driver wait has to block in the handler because the batch cannot suspend: a
@@ -2175,31 +2197,40 @@ impl Handlers<'_> {
     /// the handles it read are no longer in flight.
     fn answered(&mut self) -> Option<VkResult> {
         let answered = self.answer.take()?;
-        self.in_flight.remove(&self.waiter());
+        if let Some(record) = self.wait_record() {
+            *record = None;
+        }
         Some(answered.result())
     }
 
     /// Suspend the batch on a driver wait, recording what it reads so that nothing destroys it
     /// while the context lock is not held.
+    ///
+    /// A ring that is not here has nowhere to keep the record, and a wait with no record is one a
+    /// destroy could pull out from under the driver, so the batch is refused instead.
     fn suspend_on(&mut self, wait: DriverWait) {
-        let stale = self.in_flight.insert(self.waiter(), wait.in_flight());
-        assert!(stale.is_none(), "a stream suspended on a driver wait while one was in flight");
+        let Some(record) = self.wait_record() else {
+            self.reject = Some("suspended on a driver wait on a ring that is not here");
+            return;
+        };
+        assert!(record.is_none(), "a stream suspended on a driver wait while one was in flight");
+        *record = Some(wait.in_flight());
         self.wait = Some(Wait::Driver(wait));
     }
 
     /// Whether a driver wait in flight on any of this context's streams is reading `fence`.
     fn waited_fence(&self, fence: VkFence) -> bool {
-        self.in_flight.values().any(|w| w.reads_fence(fence))
+        self.waits().any(|w| w.reads_fence(fence))
     }
 
     /// Whether a driver wait in flight on any of this context's streams is reading `semaphore`.
     fn waited_semaphore(&self, semaphore: VkSemaphore) -> bool {
-        self.in_flight.values().any(|w| w.reads_semaphore(semaphore))
+        self.waits().any(|w| w.reads_semaphore(semaphore))
     }
 
     /// Whether a driver wait in flight on any of this context's streams is on `device`.
     fn waited_device(&self, device: VkDevice) -> bool {
-        self.in_flight.values().any(|w| w.on_device(device))
+        self.waits().any(|w| w.on_device(device))
     }
 
     /// The three refusals a timeline command has, said once.
@@ -3225,7 +3256,7 @@ impl Commands for Handlers<'_> {
         // Registered idle, never started here. Promotion happens at the end of the batch, which is
         // where the caller knows whether it was replaying -- and doing it there rather than in the
         // handler is why a handler never needs to reach the renderer's locks. See `Vkr::promote`.
-        self.rings.insert(id, RingSlot::Idle(ring));
+        self.rings.insert(id, RingEntry::new(RingSlot::Idle(ring)));
         self.note = Some(Note::RingCreated(id));
     }
 
@@ -3238,11 +3269,12 @@ impl Commands for Handlers<'_> {
             return;
         };
         // Dropping the entry is the teardown: it releases this ring's share of the resource's
-        // mapping, and the mapping goes when the last share does. A running ring is stopped
+        // mapping, and the mapping goes when the last share does. It also releases what a driver
+        // wait the ring suspended on was reading: the call returned before the join below could. A running ring is stopped
         // first, which joins its thread -- safe from here only because the refusal above means
         // this is never a ring's own thread asking, and because that thread never blocks on the
         // context lock this dispatch is holding.
-        match self.rings.remove(&id) {
+        match self.rings.remove(&id).map(|e| e.slot) {
             None => self.reject = Some("destroyed a ring that was never created"),
             Some(RingSlot::Idle(_)) => self.note = Some(Note::RingGone(id)),
             Some(RingSlot::Running(t)) => {
@@ -3250,10 +3282,6 @@ impl Commands for Handlers<'_> {
                 self.note = Some(Note::RingGone(id));
             }
         }
-        // A ring that is gone never offers its batch again, so a driver wait it suspended on is
-        // over as far as the handles are concerned: its thread has been joined, and the call
-        // returned before the join could.
-        self.in_flight.remove(&Waiter::Ring(id));
     }
 
     /// The guest rang a ring's doorbell.
@@ -3268,7 +3296,7 @@ impl Commands for Handlers<'_> {
         let Some(id) = self.named_ring(args.ring) else {
             return;
         };
-        match self.rings.get(&id) {
+        match self.rings.get(&id).map(|e| &e.slot) {
             None => self.reject = Some("rang the doorbell of a ring that was never created"),
             // Not yet reading, so there is nothing to wake. Harmless to miss: promotion happens
             // at the end of this batch, and a fresh thread reads the tail before it can park.
@@ -3289,7 +3317,7 @@ impl Commands for Handlers<'_> {
         let Some(id) = self.named_ring(args.ring) else {
             return;
         };
-        match self.rings.get(&id) {
+        match self.rings.get(&id).map(|e| &e.slot) {
             None => self.reject = Some("wrote the extra word of a ring that was never created"),
             Some(slot) => {
                 if !slot.control().write_extra(args.offset, args.value) {
@@ -3315,7 +3343,7 @@ impl Commands for Handlers<'_> {
         let Some(id) = self.named_ring(args.ring) else {
             return;
         };
-        match self.rings.get_mut(&id) {
+        match self.rings.get_mut(&id).map(|e| &mut e.slot) {
             None => {
                 self.reject = Some("submitted a virtqueue seqno for a ring that was never created")
             }
@@ -3348,7 +3376,7 @@ impl Commands for Handlers<'_> {
         };
         // Already satisfied is the common case and costs nothing: the guest submits the seqno and
         // waits for it in that order far more often than it gets ahead of itself.
-        let published = match self.rings.get(&id) {
+        let published = match self.rings.get(&id).map(|e| &e.slot) {
             None => {
                 self.reject = Some("waited on a virtqueue seqno for a ring that is not here");
                 return;
@@ -3387,7 +3415,7 @@ impl Commands for Handlers<'_> {
         let Some(id) = self.named_ring(args.ring) else {
             return;
         };
-        match self.rings.get(&id) {
+        match self.rings.get(&id).map(|e| &e.slot) {
             None => self.reject = Some("waited on the seqno of a ring that was never created"),
             // Nothing advances an idle ring's head -- it has no thread yet, and promotion happens
             // only once this batch is over, which this command is inside. Suspending on it would
@@ -6495,7 +6523,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -7821,7 +7849,7 @@ mod tests {
                     replaying: false,
                     depth: 0,
                     answer: None,
-                    in_flight: BTreeMap::new(),
+                    own_wait: None,
                     current_ring: None,
                     reply: &mut ctx_reply,
                     note: None,
@@ -7894,7 +7922,7 @@ mod tests {
                     replaying: false,
                     depth: 0,
                     answer: None,
-                    in_flight: BTreeMap::new(),
+                    own_wait: None,
                     current_ring: None,
                     reply: &mut ctx_reply,
                     note: None,
@@ -8004,7 +8032,7 @@ mod tests {
                     replaying: false,
                     depth: 0,
                     answer: None,
-                    in_flight: BTreeMap::new(),
+                    own_wait: None,
                     current_ring: None,
                     reply: &mut ctx_reply,
                     note: None,
@@ -8107,7 +8135,7 @@ mod tests {
                     replaying: false,
                     depth: 0,
                     answer: None,
-                    in_flight: BTreeMap::new(),
+                    own_wait: None,
                     current_ring: None,
                     reply: &mut ctx_reply,
                     note: None,
@@ -8232,7 +8260,7 @@ mod tests {
                     replaying: false,
                     depth: 0,
                     answer: None,
-                    in_flight: BTreeMap::new(),
+                    own_wait: None,
                     current_ring: None,
                     reply: &mut ctx_reply,
                     note: None,
@@ -8552,7 +8580,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -8674,7 +8702,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9353,7 +9381,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9413,7 +9441,7 @@ mod tests {
                 replaying: false,
                 depth: 0,
                 answer: None,
-                in_flight: BTreeMap::new(),
+                own_wait: None,
                 current_ring: None,
                 reply: &mut ctx_reply,
                 note: None,
@@ -9462,7 +9490,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9507,7 +9535,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9593,7 +9621,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9646,7 +9674,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9757,7 +9785,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9833,7 +9861,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9876,7 +9904,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -9920,7 +9948,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10124,7 +10152,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10218,7 +10246,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10328,7 +10356,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10466,7 +10494,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10593,7 +10621,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10674,7 +10702,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10729,7 +10757,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10791,7 +10819,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10828,7 +10856,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10921,7 +10949,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -10965,7 +10993,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11113,7 +11141,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11193,7 +11221,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11231,7 +11259,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11293,7 +11321,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11345,7 +11373,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11381,7 +11409,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11560,7 +11588,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11647,7 +11675,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11790,7 +11818,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -11970,7 +11998,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12135,7 +12163,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12288,7 +12316,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12495,7 +12523,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12643,7 +12671,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12734,7 +12762,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -12803,7 +12831,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13000,7 +13028,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13114,7 +13142,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13203,7 +13231,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13393,7 +13421,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13620,7 +13648,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13822,7 +13850,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -13923,7 +13951,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -14097,7 +14125,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -14248,7 +14276,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -14411,7 +14439,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -14502,7 +14530,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -14666,7 +14694,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -14935,7 +14963,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -15086,7 +15114,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -15189,7 +15217,7 @@ mod tests {
             driver: &'a mut Driver,
             todo: &'a Unimplemented,
             global: &'a crate::vulkan::Global,
-            rings: &'a mut BTreeMap<RingId, RingSlot>,
+            rings: &'a mut BTreeMap<RingId, RingEntry>,
             monitor: &'a mut Option<Monitor>,
             reply: &'a mut Option<ReplyStream>,
             journal: &'a mut Journal,
@@ -15209,7 +15237,7 @@ mod tests {
                 replaying: false,
                 depth: 0,
                 answer: None,
-                in_flight: BTreeMap::new(),
+                own_wait: None,
                 current_ring: None,
                 reply,
                 note: None,
@@ -15368,7 +15396,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -15513,7 +15541,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -15678,7 +15706,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -15875,7 +15903,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -15998,7 +16026,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -16129,7 +16157,7 @@ mod tests {
                     replaying: false,
                     depth: 0,
                     answer: None,
-                    in_flight: BTreeMap::new(),
+                    own_wait: None,
                     current_ring: None,
                     reply: $reply,
                     note: None,
@@ -16331,7 +16359,7 @@ mod tests {
             replaying: false,
             depth: 0,
             answer: None,
-            in_flight: BTreeMap::new(),
+            own_wait: None,
             current_ring: None,
             reply: &mut ctx_reply,
             note: None,
@@ -16760,6 +16788,7 @@ mod tests {
         fn a_fence_being_waited_on_cannot_be_destroyed_until_the_wait_is_over() {
             let (todo, g, t) = (Unimplemented::default(), crate::vulkan::global(), ring_table());
             let mut ctx = context();
+            assert!(ctx.submit(&wire_create_ring(7, &ring_info()), &todo, &g, &t).ran());
 
             // Over: waited, answered, resumed. The destroy that follows is ordinary.
             let batch = wire_wait(GUEST_FENCE_A);
@@ -16797,6 +16826,7 @@ mod tests {
         fn a_device_with_a_wait_in_flight_cannot_be_destroyed() {
             let (todo, g, t) = (Unimplemented::default(), crate::vulkan::global(), ring_table());
             let mut ctx = context();
+            assert!(ctx.submit(&wire_create_ring(7, &ring_info()), &todo, &g, &t).ran());
 
             let Submitted::Waiting { on: Wait::Driver(_), .. } =
                 on_ring(&mut ctx, &wire_wait(GUEST_FENCE_A), None, &todo, &g, &t)
@@ -16835,6 +16865,38 @@ mod tests {
             SAW.with_borrow(|s| assert_eq!(s.destroyed, [HOST_FENCE_A]));
         }
 
+        /// Stopping the rings releases what their waits were reading, as destroying one does:
+        /// the record is the ring's, so it goes wherever the ring goes.
+        #[test]
+        fn stopped_rings_release_what_their_waits_were_reading() {
+            let (todo, g, t) = (Unimplemented::default(), crate::vulkan::global(), ring_table());
+            let mut ctx = context();
+            assert!(ctx.submit(&wire_create_ring(7, &ring_info()), &todo, &g, &t).ran());
+
+            let Submitted::Waiting { on: Wait::Driver(_), .. } =
+                on_ring(&mut ctx, &wire_wait(GUEST_FENCE_A), None, &todo, &g, &t)
+            else {
+                panic!("the ring's wait suspends");
+            };
+            ctx.stop_rings();
+            assert!(ctx.submit(&wire_destroy_fence(GUEST_FENCE_A), &todo, &g, &t).ran());
+            SAW.with_borrow(|s| assert_eq!(s.destroyed, [HOST_FENCE_A]));
+        }
+
+        /// A wait has to be recorded where its stream lives, and a ring that is not here has no
+        /// such place. The batch is refused rather than suspended with nothing standing between
+        /// the wait and a destroy.
+        #[test]
+        fn a_driver_wait_on_a_ring_that_is_not_here_is_refused() {
+            let (todo, g, t) = (Unimplemented::default(), crate::vulkan::global(), ring_table());
+            let mut ctx = context();
+
+            assert_eq!(
+                on_ring(&mut ctx, &wire_wait(GUEST_FENCE_A), None, &todo, &g, &t),
+                Submitted::Poisoned
+            );
+        }
+
         /// An answer is for the wait command a resumed batch begins with. Offering one to a
         /// batch that begins with anything else is a caller resuming from the wrong place, which
         /// is host code and a host invariant.
@@ -16843,6 +16905,7 @@ mod tests {
         fn an_answer_offered_to_a_batch_that_did_not_suspend_is_a_host_bug() {
             let (todo, g, t) = (Unimplemented::default(), crate::vulkan::global(), ring_table());
             let mut ctx = context();
+            assert!(ctx.submit(&wire_create_ring(7, &ring_info()), &todo, &g, &t).ran());
 
             let Submitted::Waiting { on: Wait::Driver(wait), .. } =
                 on_ring(&mut ctx, &wire_wait(GUEST_FENCE_A), None, &todo, &g, &t)
