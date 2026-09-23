@@ -1529,6 +1529,20 @@ SABOTAGES = [
         self.slots.insert(id, Slot::Ghost);""",
         'every_sequence_keeps_every_promise',
     ),
+    (
+        'a create takes a dead key as its parent, and only a teardown sweep can reach it',
+        'src/venus/objects.rs',
+        '        let parent = owner.and_then(|o| self.key_of(o)).map(|k| k.0);',
+        '        let parent = owner.and_then(|o| self.slots.get(&o)).and_then(Slot::key);',
+        'every_sequence_keeps_every_promise',
+    ),
+    (
+        'a fiction named under a dead owner is recorded parentless, and stands forever',
+        'src/venus/objects.rs',
+        '            Some(None) => return,',
+        '            Some(None) => None,',
+        'every_sequence_keeps_every_promise',
+    ),
     # A ring layout is checked against the rules for every value of every field, both ways: a
     # parser that refuses too much fails the proof as surely as one that accepts too much.
     (

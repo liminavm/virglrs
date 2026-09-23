@@ -301,6 +301,11 @@ impl Table {
     /// device for a device, `None` for the instance. An owner that no longer resolves leaves the
     /// object parentless rather than refusing it: the id came off the wire, so it is the guest's
     /// to get wrong, and the create it belongs to has already happened.
+    ///
+    /// Parentless means `None`, and never a key to something dead. An owner's id can still hold
+    /// the key a cascade left behind, so the owner is resolved through [`Table::key_of`], which
+    /// answers only for a live object -- that is what keeps every live object's parent live, and
+    /// so every object reachable from a root.
     pub fn add(
         &mut self,
         id: ObjectId,
@@ -314,7 +319,7 @@ impl Table {
         if self.get(id).is_some() {
             return Err(AddError::Duplicate);
         }
-        let parent = owner.and_then(|o| self.slots.get(&o)).and_then(Slot::key);
+        let parent = owner.and_then(|o| self.key_of(o)).map(|k| k.0);
         let key = self.arena.insert(Object { id, ty, handle, parent });
         self.added.push(ObjectKey(key));
         // An id the host once refused can be created for real later, and so can one whose object
@@ -345,11 +350,21 @@ impl Table {
     ///
     /// An id that already names something keeps it, for [`Table::add_ghost`]'s reason -- a
     /// decision already made is not overwritten by the absence of one.
+    ///
+    /// An owner that is named and not live records nothing. A fiction stands only while its
+    /// world does, and this one's is already gone: recorded parentless, it would stand forever
+    /// instead. That differs from [`Table::add`] on purpose -- a real object exists whatever the
+    /// guest said about its owner and must stay reachable for its destroy, while a fiction has
+    /// nothing behind it and its commands can go unresolved.
     pub fn add_fiction(&mut self, id: ObjectId, ty: VkObjectType, owner: Option<ObjectId>) {
         if id.0 == 0 || self.get(id).is_some() || self.is_ghost(id) {
             return;
         }
-        let under = owner.and_then(|o| self.slots.get(&o)).and_then(Slot::key);
+        let under = match owner.map(|o| self.key_of(o)) {
+            None => None,
+            Some(Some(k)) => Some(k.0),
+            Some(None) => return,
+        };
         self.slots.insert(id, Slot::Fiction { ty, under });
     }
 
@@ -520,15 +535,11 @@ impl Table {
             })
             .map(|(id, _)| *id)
             .collect();
-        let mut doomed: Vec<Doomed> = roots.into_iter().flat_map(|id| self.take_tree(id)).collect();
-        // An object whose owner was already gone when it was created has no root above it, so no
-        // descent reaches it. Swept here instead, with no device to destroy it on -- which is the
-        // truth about it, not an omission.
-        for (_, slot) in core::mem::take(&mut self.slots) {
-            if let Some(o) = slot.key().and_then(|k| self.arena.remove(k)) {
-                doomed.push(Doomed { id: o.id, ty: o.ty, handle: o.handle, device: None });
-            }
-        }
+        let doomed: Vec<Doomed> = roots.into_iter().flat_map(|id| self.take_tree(id)).collect();
+        // Every live object's parent is live -- `add` takes only a live owner, and a destroy takes
+        // the whole tree beneath what it names -- so the descents above reached everything.
+        assert!(self.arena.len() == 0, "an object no root reaches survived a teardown");
+        self.slots.clear();
         doomed
     }
 }
@@ -940,6 +951,8 @@ mod every_sequence {
         reused_under_stale_key: u64,
         duplicates: u64,
         fictions_resolved: u64,
+        /// Fictions named under an owner that was not live.
+        orphaned_fictions: u64,
     }
 
     /// Check a destroy list against the world before it: every handle `taken` names comes back
@@ -1013,12 +1026,23 @@ mod every_sequence {
             }
             Op::Ghost(id) | Op::Fiction(id, ..) => {
                 let prior = t.get(id).copied();
+                let lookups = |t: &Table| TYPES.map(|ty| t.lookup(id, ty.0));
+                let resolved = lookups(t);
+                let orphaned = matches!(op, Op::Fiction(_, _, Some(o)) if t.key_of(o).is_none());
                 match op {
                     Op::Ghost(_) => t.add_ghost(id),
                     Op::Fiction(_, ty, owner) => t.add_fiction(id, ty, owner),
                     _ => unreachable!(),
                 }
                 assert_eq!(t.get(id).copied(), prior, "a refusal moved {id:?}, after {ops:?}");
+                if orphaned {
+                    seen.orphaned_fictions += 1;
+                    assert_eq!(
+                        lookups(t),
+                        resolved,
+                        "a fiction under a dead owner was recorded, after {ops:?}"
+                    );
+                }
                 unchanged(t);
             }
             Op::Remove(id) => {
@@ -1062,11 +1086,9 @@ mod every_sequence {
 
     /// What holds between any two operations, whatever came before.
     fn invariants(t: &Table, keys: &[(ObjectKey, HostHandle)], ops: &[Op], seen: &mut Reached) {
-        // A live object is reachable by its own id, and an empty slot is on the free list exactly
-        // once. Its parent need not be live: a create whose owner's id still holds a key a cascade
-        // left behind takes that dead key as its parent, which resolves to nothing from then on.
-        // Nothing descends to such an object, so the teardown check below is what holds it -- the
-        // sweep in `take_all` is the only path that reaches it.
+        // A live object is reachable by its own id and sits under a live parent, which is what
+        // makes a cascade complete and a teardown reach everything. An empty slot is on the free
+        // list exactly once.
         for (index, e) in t.arena.entries.iter().enumerate() {
             let free = t.arena.free.iter().filter(|&&f| f == index).count();
             match e.object {
@@ -1076,6 +1098,10 @@ mod every_sequence {
                     assert!(
                         matches!(t.slots.get(&o.id), Some(Slot::Live(k)) if *k == key),
                         "a live object is not reachable by its own id, after {ops:?}"
+                    );
+                    assert!(
+                        o.parent.is_none_or(|p| t.arena.get(p).is_some()),
+                        "a live object outlived its parent, after {ops:?}"
                     );
                 }
                 None => assert_eq!(free, 1, "an empty slot is not free once, after {ops:?}"),
@@ -1162,6 +1188,7 @@ mod every_sequence {
         assert!(seen.reused_under_stale_key > 0, "no slot was reused under a stale key: {seen:?}");
         assert!(seen.duplicates > 0, "no create reused a live id: {seen:?}");
         assert!(seen.fictions_resolved > 0, "no fiction resolved: {seen:?}");
+        assert!(seen.orphaned_fictions > 0, "no fiction was named under a dead owner: {seen:?}");
     }
 }
 
