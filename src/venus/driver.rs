@@ -3361,7 +3361,7 @@ impl Driver {
                 size: surface.alloc_size(),
                 memory: Self::planted_memory(surface.alloc_size()),
                 backing: Backing::Owned {
-                    storage: Storage::Texture(Arc::new(Charged::new(surface, charge))),
+                    storage: Storage::Texture(Lent::new(Arc::new(Charged::new(surface, charge)))),
                     published: false,
                 },
                 props: VkMemoryPropertyFlags(
@@ -5241,7 +5241,7 @@ impl Driver {
             (None, Ok(Scanout::Minted(surface)), _) => {
                 let charge = self.admit("IOSurface", surface.alloc_size())?;
                 Planned::Ready(Backing::Owned {
-                    storage: Storage::Texture(Arc::new(Charged::new(surface, charge))),
+                    storage: Storage::Texture(Lent::new(Arc::new(Charged::new(surface, charge)))),
                     published: false,
                 })
             }
@@ -5410,7 +5410,9 @@ impl Driver {
                 });
                 match described {
                     Some(Ok(surface)) => Backing::Owned {
-                        storage: Storage::Texture(Arc::new(Charged::new(surface, charge))),
+                        storage: Storage::Texture(Lent::new(Arc::new(Charged::new(
+                            surface, charge,
+                        )))),
                         published: false,
                     },
                     // Host-visible memory keeps an address a snapshot can read, and a compositor
@@ -6262,6 +6264,45 @@ fn exported_fd(fd: core::ffi::c_int) -> Option<std::os::fd::OwnedFd> {
     (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
+pub use lent::Lent;
+
+mod lent {
+    use std::sync::Arc;
+
+    use crate::surface::Held;
+
+    /// A share of a surface that a venus context reads on a Vulkan queue: the payload of
+    /// [`super::Storage::Texture`].
+    ///
+    /// Built only by [`Lent::new`], which marks the surface lent (see
+    /// [`crate::surface::Surface::mark_lent`]). A Vulkan read passes no barrier on the classic
+    /// side, so the classic side has to be told before one can happen -- and a mark taken by the
+    /// only constructor cannot be skipped by a call site written later. The type lives in a module
+    /// of its own so that nothing else in the driver can build one around the constructor.
+    /// Marking a surface venus minted for itself is harmless: nothing on the classic side decodes
+    /// into one.
+    ///
+    /// It dereferences to the share, which is what every reader wants; the share it hands out can
+    /// be cloned, but only this constructor turns one back into a `Storage`.
+    #[derive(Clone)]
+    pub struct Lent(Arc<dyn Held>);
+
+    impl Lent {
+        pub(super) fn new(held: Arc<dyn Held>) -> Lent {
+            held.surface().mark_lent();
+            Lent(held)
+        }
+    }
+
+    impl std::ops::Deref for Lent {
+        type Target = Arc<dyn Held>;
+
+        fn deref(&self) -> &Arc<dyn Held> {
+            &self.0
+        }
+    }
+}
+
 /// A share of the storage behind a published allocation, held by whoever needs those bytes.
 ///
 /// A resource keeps one of these rather than the *name* of an allocation, because a name is only
@@ -6283,7 +6324,7 @@ pub enum Storage {
     /// a classic resource lends the share its EGL image already holds. Either way what travels is
     /// the right to keep the surface alive, and the owner decides what that costs -- see
     /// [`Held`].
-    Texture(Arc<dyn Held>),
+    Texture(Lent),
     /// Pages this renderer minted for an allocation the guest meant to share, and handed the
     /// driver by host-pointer import. Plain memory with rows the CPU can address; the guest's
     /// fences are the only barrier over them, as they are for any host-visible allocation.
@@ -6550,17 +6591,16 @@ impl Storage {
     /// somebody holds them.
     ///
     /// The surface is marked lent on the way out, because from here it is read by Vulkan with
-    /// nothing on the classic side in between; see [`Surface::mark_lent`].
+    /// nothing on the classic side in between; see [`Lent`].
     pub fn lent(held: Arc<dyn Held>) -> Storage {
-        held.surface().mark_lent();
-        Storage::Texture(held)
+        Storage::Texture(Lent::new(held))
     }
 
     /// A share over a real surface, charged to `account`, for a test outside this module.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn minted_for_test(surface: Surface, account: &Account) -> Storage {
         let charge = account.try_charge("IOSurface", surface.alloc_size()).expect("no cap");
-        Storage::Texture(Arc::new(Charged::new(surface, charge)))
+        Storage::Texture(Lent::new(Arc::new(Charged::new(surface, charge))))
     }
 
     /// A share over pages this renderer minted, charged to `account`, for the same tests.

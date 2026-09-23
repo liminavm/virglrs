@@ -243,9 +243,10 @@ impl Surface {
     /// Note that this surface was lent to a venus context, which reads it on a Vulkan queue with
     /// nothing on this side in between. Latched: a lent share can be imported again at any time.
     ///
-    /// Called by [`crate::venus::driver::Storage::lent`] and nowhere else, so a surface cannot be
-    /// lent without it. What asks is the hardware decode, which delivers a picture into a surface
-    /// only once every read of it is known to wait -- and a Vulkan read does not.
+    /// Called by [`crate::venus::driver::Lent::new`], the only way to build the share a venus
+    /// context reads through, so a surface cannot be lent without it. What asks is the hardware
+    /// decode, which delivers a picture into a surface only once every read of it is known to
+    /// wait -- and a Vulkan read does not.
     pub fn mark_lent(&self) {
         self.lent.store(true, Ordering::Release);
     }
