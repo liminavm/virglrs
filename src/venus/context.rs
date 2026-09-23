@@ -16897,6 +16897,313 @@ mod tests {
             );
         }
 
+        /// Every sequence of waits, answers and destroys across three streams, to a fixed depth,
+        /// against a real context.
+        ///
+        /// The record of what a suspended wait reads is kept by whichever stream suspended: a
+        /// ring's in its entry, the context's own on the context. What the walk holds it to is the
+        /// rule the record exists for -- a destroy is refused exactly while some live stream's
+        /// wait reads what it names, and served otherwise -- across every order the streams can
+        /// suspend, be answered, be destroyed or be stopped in. The tally beside it is a plain
+        /// map from stream to fence, kept outside the thing under test.
+        mod every_sequence {
+            use super::*;
+            use std::collections::{BTreeMap, BTreeSet};
+
+            const DEPTH: usize = 6;
+            const RINGS: [u64; 2] = [7, 8];
+            const FENCES: [(u64, u64); 2] =
+                [(GUEST_FENCE_A, HOST_FENCE_A), (GUEST_FENCE_B, HOST_FENCE_B)];
+
+            #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+            enum Stream {
+                Context,
+                Ring(u64),
+            }
+
+            #[derive(Clone, Copy, Debug)]
+            enum Op {
+                /// The stream sends a `vkWaitForFences` the driver cannot answer yet.
+                Wait(Stream, u64),
+                /// The stream's wait is run and the batch offered again with its answer.
+                Answer(Stream),
+                /// The stream sends a `vkDestroyFence`.
+                DestroyFence(Stream, u64),
+                /// The stream sends a `vkDestroyDevice`.
+                DestroyDevice(Stream),
+                /// The context's stream sends a `vkDestroyRingMESA`.
+                DestroyRing(u64),
+                /// The VMM stops every ring, as teardown does.
+                StopRings,
+            }
+
+            /// What the walk expects, and the one place it is decided.
+            #[derive(Clone, Default)]
+            struct Tally {
+                rings: BTreeSet<u64>,
+                fences: BTreeSet<u64>,
+                /// Which fence each suspended stream's wait reads.
+                waits: BTreeMap<Stream, u64>,
+                /// Host fences the driver has been told to destroy, in order.
+                destroyed: Vec<u64>,
+                /// Fences a wait read when its ring went: a destroy of one is owed service.
+                released: BTreeSet<u64>,
+                /// The context is poisoned or its device gone; nothing after this is a step.
+                over: bool,
+            }
+
+            /// What one step of the walk reached, so the walk can say it reached everything.
+            #[derive(Default, Debug)]
+            struct Seen {
+                refused_under_a_ring: usize,
+                refused_under_the_context: usize,
+                served_after_a_ring_went: usize,
+                device_refused: usize,
+                device_served: usize,
+            }
+
+            impl Tally {
+                fn new() -> Tally {
+                    Tally {
+                        rings: RINGS.into_iter().collect(),
+                        fences: FENCES.iter().map(|&(guest, _)| guest).collect(),
+                        ..Tally::default()
+                    }
+                }
+
+                fn streams(&self) -> impl Iterator<Item = Stream> + '_ {
+                    std::iter::once(Stream::Context)
+                        .chain(self.rings.iter().map(|&r| Stream::Ring(r)))
+                }
+
+                /// Every step a well-behaved host could take from here. A suspended stream is
+                /// offered nothing but its answer: it runs nothing else until then.
+                fn ops(&self) -> Vec<Op> {
+                    let mut ops = Vec::new();
+                    if self.over {
+                        return ops;
+                    }
+                    for s in self.streams() {
+                        if self.waits.contains_key(&s) {
+                            ops.push(Op::Answer(s));
+                            continue;
+                        }
+                        for &f in &self.fences {
+                            ops.push(Op::Wait(s, f));
+                            ops.push(Op::DestroyFence(s, f));
+                        }
+                        ops.push(Op::DestroyDevice(s));
+                    }
+                    if !self.waits.contains_key(&Stream::Context) {
+                        ops.extend(self.rings.iter().map(|&r| Op::DestroyRing(r)));
+                    }
+                    if !self.rings.is_empty() {
+                        ops.push(Op::StopRings);
+                    }
+                    ops
+                }
+
+                /// Take the step, and say what it must come back as.
+                fn step(&mut self, op: Op, seen: &mut Seen) -> Expect {
+                    match op {
+                        Op::Wait(s, f) => {
+                            self.waits.insert(s, f);
+                            Expect::Suspended
+                        }
+                        Op::Answer(s) => {
+                            self.waits.remove(&s);
+                            Expect::Ran
+                        }
+                        Op::DestroyFence(_, f) => {
+                            let readers: Vec<Stream> = self
+                                .waits
+                                .iter()
+                                .filter(|&(_, &w)| w == f)
+                                .map(|(&s, _)| s)
+                                .collect();
+                            if readers.is_empty() {
+                                if self.freed_by_a_ring_that_went(f) {
+                                    seen.served_after_a_ring_went += 1;
+                                }
+                                self.fences.remove(&f);
+                                self.destroyed.push(host(f));
+                                Expect::Ran
+                            } else {
+                                if readers.contains(&Stream::Context) {
+                                    seen.refused_under_the_context += 1;
+                                } else {
+                                    seen.refused_under_a_ring += 1;
+                                }
+                                self.over = true;
+                                Expect::Poisoned
+                            }
+                        }
+                        Op::DestroyDevice(_) => {
+                            self.over = true;
+                            if self.waits.is_empty() {
+                                seen.device_served += 1;
+                                Expect::Ran
+                            } else {
+                                seen.device_refused += 1;
+                                Expect::Poisoned
+                            }
+                        }
+                        Op::DestroyRing(r) => {
+                            self.rings.remove(&r);
+                            self.forget(Stream::Ring(r));
+                            Expect::Ran
+                        }
+                        Op::StopRings => {
+                            for r in std::mem::take(&mut self.rings) {
+                                self.forget(Stream::Ring(r));
+                            }
+                            Expect::Nothing
+                        }
+                    }
+                }
+
+                /// A ring that goes takes its wait with it; the fence it read is remembered as
+                /// one a later destroy is owed, so the walk can say it saw that destroy served.
+                fn forget(&mut self, s: Stream) {
+                    if let Some(f) = self.waits.remove(&s) {
+                        self.released.insert(f);
+                    }
+                }
+
+                fn freed_by_a_ring_that_went(&self, f: u64) -> bool {
+                    self.released.contains(&f)
+                }
+            }
+
+            #[derive(Debug, PartialEq, Eq)]
+            enum Expect {
+                Suspended,
+                Ran,
+                Poisoned,
+                Nothing,
+            }
+
+            fn host(guest: u64) -> u64 {
+                FENCES.iter().find(|&&(g, _)| g == guest).expect("a fence of the walk's").1
+            }
+
+            /// Replay `ops` against a fresh context, checking every step against the tally.
+            fn replay(ops: &[Op], seen: &mut Seen) {
+                let (todo, g, t) =
+                    (Unimplemented::default(), crate::vulkan::global(), ring_table());
+                let mut ctx = context();
+                for r in RINGS {
+                    assert!(ctx.submit(&wire_create_ring(r, &ring_info()), &todo, &g, &t).ran());
+                }
+                let mut tally = Tally::new();
+                let mut pending: BTreeMap<Stream, (Vec<u8>, DriverWait)> = BTreeMap::new();
+
+                let offer =
+                    |ctx: &mut Context, s: Stream, buf: &[u8], answer: Option<Answered>| match (
+                        s, answer,
+                    ) {
+                        (Stream::Context, None) => ctx.submit(buf, &todo, &g, &t),
+                        (Stream::Context, Some(a)) => ctx.resume(buf, a, &todo, &g, &t),
+                        (Stream::Ring(r), answer) => {
+                            let mut reply = None;
+                            let id = RingId::new(r).expect("a ring id of the walk's");
+                            ctx.dispatch_ring(id, &mut reply, buf, answer, &todo, &g, &t)
+                        }
+                    };
+
+                for (i, &op) in ops.iter().enumerate() {
+                    let want = tally.step(op, seen);
+                    let got = match op {
+                        Op::Wait(s, f) => {
+                            let buf = wire_wait(f);
+                            let out = offer(&mut ctx, s, &buf, None);
+                            let Submitted::Waiting { consumed: 0, on: Wait::Driver(w) } = out
+                            else {
+                                panic!(
+                                    "{ops:?} step {i}: a wait the driver cannot answer suspends, got {out:?}"
+                                );
+                            };
+                            pending.insert(s, (buf, w));
+                            Expect::Suspended
+                        }
+                        Op::Answer(s) => {
+                            let (buf, w) = pending
+                                .remove(&s)
+                                .expect("the tally only answers a suspended stream");
+                            let answered = w.run(|| true).expect("nothing stops this wait");
+                            outcome(offer(&mut ctx, s, &buf, Some(answered)))
+                        }
+                        Op::DestroyFence(s, f) => {
+                            outcome(offer(&mut ctx, s, &wire_destroy_fence(f), None))
+                        }
+                        Op::DestroyDevice(s) => {
+                            outcome(offer(&mut ctx, s, &wire_destroy_device(), None))
+                        }
+                        Op::DestroyRing(r) => {
+                            pending.remove(&Stream::Ring(r));
+                            outcome(ctx.submit(&wire_destroy_ring(r), &todo, &g, &t))
+                        }
+                        Op::StopRings => {
+                            ctx.stop_rings();
+                            pending.retain(|s, _| *s == Stream::Context);
+                            Expect::Nothing
+                        }
+                    };
+                    assert_eq!(got, want, "{ops:?} step {i}");
+                    if !matches!(op, Op::DestroyDevice(_)) {
+                        SAW.with_borrow(|s| {
+                            assert_eq!(s.destroyed, tally.destroyed, "{ops:?} step {i}")
+                        });
+                    }
+                }
+            }
+
+            fn outcome(s: Submitted) -> Expect {
+                match s {
+                    Submitted::Done => Expect::Ran,
+                    Submitted::Poisoned => Expect::Poisoned,
+                    Submitted::Waiting { .. } => Expect::Suspended,
+                }
+            }
+
+            /// Walk the tally's tree, and replay each sequence that ends -- at the depth, or where
+            /// the context is over -- against a fresh context. Every prefix is a prefix of one of
+            /// those, so every step of every sequence is checked.
+            fn walk(tally: &Tally, ops: &mut Vec<Op>, seen: &mut Seen, runs: &mut usize) {
+                let next = tally.ops();
+                if ops.len() == DEPTH || next.is_empty() {
+                    replay(ops, seen);
+                    *runs += 1;
+                    return;
+                }
+                for op in next {
+                    let mut t = tally.clone();
+                    t.step(op, &mut Seen::default());
+                    ops.push(op);
+                    walk(&t, ops, seen, runs);
+                    ops.pop();
+                }
+            }
+
+            #[test]
+            #[cfg_attr(
+                miri,
+                ignore = "hundreds of thousands of contexts, each calling into planted C"
+            )]
+            fn a_destroy_is_refused_exactly_while_a_live_streams_wait_reads_it() {
+                let (mut seen, mut runs) = (Seen::default(), 0);
+                walk(&Tally::new(), &mut Vec::new(), &mut seen, &mut runs);
+
+                // The rule is only held where the walk reached; say that it reached each case the
+                // record exists for.
+                assert!(seen.refused_under_a_ring > 0, "{seen:?} over {runs} runs");
+                assert!(seen.refused_under_the_context > 0, "{seen:?} over {runs} runs");
+                assert!(seen.served_after_a_ring_went > 0, "{seen:?} over {runs} runs");
+                assert!(seen.device_refused > 0, "{seen:?} over {runs} runs");
+                assert!(seen.device_served > 0, "{seen:?} over {runs} runs");
+            }
+        }
+
         /// An answer is for the wait command a resumed batch begins with. Offering one to a
         /// batch that begins with anything else is a caller resuming from the wrong place, which
         /// is host code and a host invariant.

@@ -1499,6 +1499,13 @@ SABOTAGES = [
         'a_device_with_a_wait_in_flight_cannot_be_destroyed',
     ),
     (
+        "a destroy from a ring ignores the driver wait the context's own stream is suspended on",
+        'src/venus/context.rs',
+        """        self.own_wait.iter().chain(self.rings.values().filter_map(|e| e.wait.as_ref()))""",
+        """        None.into_iter().chain(self.rings.values().filter_map(|e| e.wait.as_ref()))""",
+        'a_destroy_is_refused_exactly_while_a_live_streams_wait_reads_it',
+    ),
+    (
         "a ring's driver wait is recorded on the context, and outlives the ring it was made on",
         'src/venus/context.rs',
         """            Some(id) => self.rings.get_mut(&id).map(|e| &mut e.wait),""",
