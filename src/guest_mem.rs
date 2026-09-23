@@ -985,3 +985,113 @@ mod tests {
         assert_eq!(got, [31, 32, 33, 34], "the short list's bytes, walked from its head");
     }
 }
+
+/// Proofs over every scatter list and every range a transfer can ask for, run by `cargo kani`.
+///
+/// `walk_from` hands its callback raw pointers into guest pages, and the copy that follows is
+/// sound only if every piece lies inside the entry it came from -- the SAFETY comments on
+/// [`Iov::copy_out_from`] and [`Iov::copy_in_from`] rest on it. These prove it for lists of up to
+/// three entries of any 32-bit length, and any start and length. Entry bases are distinct
+/// addresses nothing dereferences: the walk only does arithmetic on them.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+    use crate::abi::{GuestIov, VmmPtr};
+
+    const ENTRIES: usize = 3;
+    /// Where entry `i` of a list starts. Far enough apart that no entry reaches the next.
+    const fn base(i: usize) -> usize {
+        (i + 1) << 40
+    }
+
+    fn any_list() -> [GuestIov; ENTRIES] {
+        core::array::from_fn(|i| GuestIov {
+            base: VmmPtr(base(i) as *mut core::ffi::c_void),
+            len: kani::any::<u32>() as usize,
+        })
+    }
+
+    /// The pieces one walk handed its callback, as `(address, into, len)`.
+    #[derive(Clone, Copy, PartialEq)]
+    struct Pieces {
+        got: [(usize, usize, usize); ENTRIES + 1],
+        n: usize,
+    }
+
+    fn walk(iov: &Iov<'_>, cursor: &mut Cursor, at: u64, len: usize) -> (bool, Pieces) {
+        let mut p = Pieces { got: [(0, 0, 0); ENTRIES + 1], n: 0 };
+        let ok = iov.walk_from(cursor, at, len, |ptr, into, n| {
+            assert!(p.n <= ENTRIES, "a walk handed back more pieces than there are entries");
+            p.got[p.n] = (ptr as usize, into, n);
+            p.n += 1;
+        });
+        (ok, p)
+    }
+
+    /// Where logical offset `pos` of the list lives: its entry's base plus the offset into it.
+    fn address_of(list: &[GuestIov], pos: u64) -> Option<(usize, usize)> {
+        let mut start = 0u64;
+        for (i, e) in list.iter().enumerate() {
+            if pos < start + e.len as u64 {
+                return Some((i, base(i) + (pos - start) as usize));
+            }
+            start += e.len as u64;
+        }
+        None
+    }
+
+    /// A walk succeeds exactly when the range fits, hands back contiguous pieces that add up to
+    /// it, and puts each piece where its logical offset lives, inside its own entry. A refused
+    /// walk visits nothing.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn every_piece_lies_inside_its_entry() {
+        let all = any_list();
+        let n: usize = kani::any();
+        kani::assume(n <= ENTRIES);
+        let list = &all[..n];
+        let iov = Iov::new(list);
+        let (at, len): (u64, usize) = (kani::any(), kani::any());
+
+        let (ok, p) = walk(&iov, &mut Cursor::default(), at, len);
+        let fits = at.checked_add(len as u64).is_some_and(|end| end <= iov.len());
+        assert!(ok == fits, "a walk's verdict disagrees with the range");
+        if !ok {
+            assert!(p.n == 0, "a refused walk visited a piece");
+            return;
+        }
+        let mut done = 0usize;
+        for &(addr, into, take) in &p.got[..p.n] {
+            assert!(into == done, "the pieces are not contiguous");
+            if take > 0 {
+                let (i, want) = address_of(list, at + into as u64).expect("inside the list");
+                assert!(addr == want, "a piece starts somewhere its offset does not live");
+                let skip = addr - base(i);
+                assert!(skip + take <= list[i].len, "a piece runs past its entry");
+            }
+            done += take;
+        }
+        assert!(done == len, "the pieces do not add up to the range");
+        kani::cover!(
+            p.got[..p.n].iter().filter(|g| g.2 > 0).count() >= 2,
+            "a range across entries"
+        );
+    }
+
+    /// A walk resumed from where an earlier one left the cursor does exactly what a fresh walk
+    /// does, whichever order the two ranges come in.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn a_resumed_walk_matches_a_fresh_one() {
+        let all = any_list();
+        let iov = Iov::new(&all);
+        let mut cursor = Cursor::default();
+        let _ = walk(&iov, &mut cursor, kani::any(), kani::any());
+
+        let (at, len): (u64, usize) = (kani::any(), kani::any());
+        let resumed = walk(&iov, &mut cursor, at, len);
+        let fresh = walk(&iov, &mut Cursor::default(), at, len);
+        assert!(resumed == fresh, "a resumed walk went somewhere a fresh one does not");
+        kani::cover!(cursor.entry > 0, "a cursor carried past the first entry");
+    }
+}

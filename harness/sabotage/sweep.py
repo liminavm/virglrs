@@ -1631,6 +1631,21 @@ SABOTAGES = [
         '        let used = self.temp_used.get().wrapping_add(bytes);',
         'kani:the_arena_charge_never_passes_its_cap',
     ),
+    # The scatter-list walk, for every list of up to three entries and every range over it.
+    (
+        'a piece of a transfer ignores where in its entry it starts, and runs past the entry',
+        'src/guest_mem.rs',
+        '            let take = (e.len - skip).min(len - done);',
+        '            let take = e.len.min(len - done);',
+        'kani:every_piece_lies_inside_its_entry',
+    ),
+    (
+        'a walk leaves its cursor one entry ahead of where it stopped',
+        'src/guest_mem.rs',
+        '        *cursor = Cursor { list: self.entries.as_ptr(), entry: i, base };',
+        '        *cursor = Cursor { list: self.entries.as_ptr(), entry: i + 1, base };',
+        'kani:a_resumed_walk_matches_a_fresh_one',
+    ),
     # A ring layout is checked against the rules for every value of every field, both ways: a
     # parser that refuses too much fails the proof as surely as one that accepts too much.
     (
