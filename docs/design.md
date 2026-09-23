@@ -957,18 +957,17 @@ it survives the session it was found in.
     says, which matters because a release build here wraps silently. It runs everything as
     single-threaded code and cannot see into C. It pays where control flow is fixed, data is
     wide, and nothing allocates: `RingLayout::parse` is proved equal to its rules for every value
-    of every `usize` field (`src/venus/ring.rs`), and the decoder's `read_bytes`, `peek_bytes`
-    and arena charge for every length a guest can send (`src/venus/cs.rs`), each in seconds and
-    under 150 MB. Code that grows a `Vec` or branches on accumulated state does not fit: the
+    of every `usize` field (`src/venus/ring.rs`), the decoder's `read_bytes`, `peek_bytes` and
+    arena charge for every length a guest can send (`src/venus/cs.rs`), and `Iov::walk_from` for
+    every list of up to three entries of any 32-bit length (`src/guest_mem.rs`), each in under a
+    minute and a gigabyte. Code that grows a `Vec` or branches on accumulated state does not fit: the
     object table reached 22 GB with no verdict, and `sync::decode`, which builds its result
     vector, ran past 10 minutes at 6 GB. The harness counts as much as the code: comparing two
     slices of symbolic length unrolls `memcmp` without bound, so a harness compares one index
     Kani picks, which stands for all of them. `cbmc` outlives a `timeout` on `cargo kani` and has
     no memory cap of its own, so an exploratory run is watched and `cbmc` killed by process
     group. Proofs live in `#[cfg(kani)]` modules beside the code and run under `cargo kani`, on
-    its own pinned nightly toolchain; a sabotage entry names one as `kani:<harness>`. Owed:
-    `Iov::walk_from` (every piece stays inside its entry, and a walk resumed from the cursor
-    matches a fresh one).
+    its own pinned nightly toolchain; a sabotage entry names one as `kani:<harness>`.
   - **Exhaustive enumeration** in a plain `cargo test` takes state machines whose domains are
     small by design: every operation sequence to a fixed depth, each step checked. The object
     table is walked this way (`every_sequence` in `src/venus/objects.rs`). Owed: the `budget.rs`
