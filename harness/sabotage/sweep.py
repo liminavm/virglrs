@@ -249,8 +249,8 @@ SABOTAGES = [
     (
         'a short enumeration reports the length the guest asked for',
         'src/venus/context.rs',
-        '        if let Some(count) = args.pPhysicalDeviceCount_mut() {\n            *count = got;\n        }',
-        '        let asked = ids.len() as u32;\n        if let Some(count) = args.pPhysicalDeviceCount_mut() {\n            *count = asked;\n        }',
+        '        if let Some(mut count) = args.pPhysicalDeviceCount_mut() {\n            count.set(got);\n        }',
+        '        let asked = ids.len() as u32;\n        if let Some(mut count) = args.pPhysicalDeviceCount_mut() {\n            count.set(asked);\n        }',
         '',
     ),
     (
