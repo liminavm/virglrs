@@ -969,10 +969,10 @@ it survives the session it was found in.
     group. Proofs live in `#[cfg(kani)]` modules beside the code and run under `cargo kani`, on
     its own pinned nightly toolchain; a sabotage entry names one as `kani:<harness>`.
   - **Exhaustive enumeration** in a plain `cargo test` takes state machines whose domains are
-    small by design: every operation sequence to a fixed depth, each step checked. The object
-    table is walked this way (`every_sequence` in `src/venus/objects.rs`). Owed: the `budget.rs`
-    ledger (per-context amounts sum to the total, a charge is credited once and by its last
-    holder, a late credit never lands on a reused context id).
+    small by design: every operation sequence to a fixed depth, each step checked against a
+    tally kept outside the thing under test, and each walk asserting it reached the cases it
+    exists for. The object table (`src/venus/objects.rs`) and the budget ledger
+    (`src/budget.rs`) are walked this way, each in a module named `every_sequence`.
   - **loom** tries every interleaving of the threads involved, which neither of the above can.
     A module opts in by taking its `Arc`, `Mutex`, `Condvar` and thread from loom under
     `cfg(all(test, loom))`; its models run under
