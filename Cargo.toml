@@ -52,3 +52,7 @@ rustc-hash = "2.1"
 
 [build-dependencies]
 cc = { version = "1.4", optional = true }
+
+# `cfg(kani)` gates the proofs `cargo kani` runs; see docs/design.md.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

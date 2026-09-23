@@ -1031,3 +1031,99 @@ mod tests {
         );
     }
 }
+
+/// Proofs over every layout a guest can send, run by `cargo kani`.
+///
+/// `parse` is compared against a statement of the rules written in `u128`, where no sum of two
+/// `usize` can overflow, so the specification needs none of the care the implementation takes.
+/// The comparison runs both ways: a layout the rules accept must parse, and a parsed layout must
+/// be one the rules accept. The first half is what a refusal-only test cannot see -- a parser that
+/// refused everything would pass every negative case.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// A region as the rules see it: `begin..end` in a width no guest value can overflow.
+    #[derive(Clone, Copy)]
+    struct Span {
+        begin: u128,
+        end: u128,
+    }
+
+    impl Span {
+        fn at(window: usize, offset: usize, size: usize) -> Span {
+            let begin = window as u128 + offset as u128;
+            Span { begin, end: begin + size as u128 }
+        }
+
+        fn fits(&self) -> bool {
+            self.end <= usize::MAX as u128
+        }
+
+        fn within(&self, other: &Span) -> bool {
+            self.begin >= other.begin && self.end <= other.end
+        }
+
+        fn aligned(&self) -> bool {
+            self.begin % 4 == 0 && self.end % 4 == 0
+        }
+
+        fn disjoint(&self, other: &Span) -> bool {
+            self.begin >= other.end || self.end <= other.begin
+        }
+
+        fn is(&self, r: &Region) -> bool {
+            self.begin == r.begin() as u128 && self.end == (r.begin() + r.size()) as u128
+        }
+    }
+
+    #[kani::proof]
+    fn parse_accepts_exactly_the_layouts_the_rules_allow() {
+        let resource_size: usize = kani::any();
+        let info = VkRingCreateInfoMESA {
+            offset: kani::any(),
+            size: kani::any(),
+            headOffset: kani::any(),
+            tailOffset: kani::any(),
+            statusOffset: kani::any(),
+            bufferOffset: kani::any(),
+            bufferSize: kani::any(),
+            extraOffset: kani::any(),
+            extraSize: kani::any(),
+            ..Default::default()
+        };
+
+        let whole = Span::at(info.offset, 0, info.size);
+        let parts = [
+            Span::at(info.offset, info.headOffset, 4),
+            Span::at(info.offset, info.tailOffset, 4),
+            Span::at(info.offset, info.statusOffset, 4),
+            Span::at(info.offset, info.bufferOffset, info.bufferSize),
+            Span::at(info.offset, info.extraOffset, info.extraSize),
+        ];
+        let buffer = info.bufferSize;
+        let allowed = whole.fits()
+            && whole.end <= resource_size as u128
+            && parts.iter().all(|p| p.fits() && p.within(&whole) && p.aligned())
+            && (0..5).all(|i| (i + 1..5).all(|j| parts[i].disjoint(&parts[j])))
+            && buffer != 0
+            && buffer.is_power_of_two()
+            && buffer <= RING_BUFFER_MAX_SIZE;
+
+        match RingLayout::parse(resource_size, &info) {
+            Ok(l) => {
+                assert!(allowed, "parse accepted a layout the rules refuse");
+                assert!(whole.is(&l.whole));
+                let got = [l.head, l.tail, l.status, l.buffer, l.extra];
+                for (want, got) in parts.iter().zip(&got) {
+                    assert!(want.is(got), "a parsed region is not where the guest put it");
+                }
+            }
+            Err(_) => assert!(!allowed, "parse refused a layout the rules allow"),
+        }
+
+        // Both verdicts must be reachable, or the assertions above hold vacuously.
+        kani::cover!(allowed, "an accepted layout");
+        kani::cover!(!allowed, "a refused layout");
+    }
+}
