@@ -606,7 +606,7 @@ impl Shape {
     /// stream's own flag rather than on the width that comes back, so a host whose bug changes
     /// shape is still caught.
     fn misreturned(&self) -> bool {
-        matches!(self, Shape::Av1 { desc, .. } if desc.use_superres)
+        matches!(self, Shape::Av1 { desc, .. } if desc.superres.is_some())
     }
 
     /// The extent the decoded picture is expected to come back at.

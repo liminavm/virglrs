@@ -1565,7 +1565,7 @@ SABOTAGES = [
         'an AV1 super-resolution descriptor is refused, dropping the held frame and its own decode',
         'src/vrend/video/mod.rs',
         '        let config = match av1::SeqParams::read(descriptor)',
-        '        if desc.use_superres {\n'
+        '        if desc.superres.is_some() {\n'
         '            return Err(Refusal::HostRefusedFrame);\n'
         '        }\n'
         '        let config = match av1::SeqParams::read(descriptor)',

@@ -305,6 +305,10 @@ pub enum Unsupported {
     /// whole byte, and the value is a *bit width*: every order hint in the frame header, and the
     /// eight saved hints of a reference-frame update, are written that many bits wide.
     OrderHintBits(u8),
+    /// A super-resolution denominator the syntax cannot say. It is written as `coded_denom`, three
+    /// bits over nine, so the only denominators are nine to sixteen; the descriptor carries a whole
+    /// byte, and anything larger shrinks the coded width until a frame has no superblock column.
+    SuperresDenominator(u8),
 }
 
 impl fmt::Display for Unsupported {
@@ -321,6 +325,9 @@ impl fmt::Display for Unsupported {
             }
             Unsupported::OrderHintBits(n) => {
                 write!(f, "order_hint_bits_minus_1 {n} is out of range")
+            }
+            Unsupported::SuperresDenominator(n) => {
+                write!(f, "superres_scale_denominator {n} is out of range")
             }
         }
     }
@@ -605,6 +612,9 @@ const MAX_SLICES: usize = 256;
 /// `cdef_bits` is two bits wide, so at most eight strengths, which is the array's length.
 const MAX_CDEF_BITS: u8 = 3;
 
+/// 5.9.8 -- `coded_denom` is `f(3)` over `SUPERRES_DENOM_MIN`.
+const SUPERRES_DENOMINATORS: core::ops::RangeInclusive<u8> = 9..=16;
+
 /// 5.5.1 -- `order_hint_bits_minus_1` is `f(3)`, so eight is the widest an order hint gets.
 const MAX_ORDER_HINT_BITS_MINUS_1: u8 = 7;
 
@@ -670,7 +680,6 @@ pub struct FrameDesc {
     pub allow_screen_content_tools: bool,
     pub force_integer_mv: bool,
     pub allow_intrabc: bool,
-    pub use_superres: bool,
     pub allow_high_precision_mv: bool,
     pub is_motion_mode_switchable: bool,
     pub use_ref_frame_mvs: bool,
@@ -680,7 +689,9 @@ pub struct FrameDesc {
 
     pub frame_width: u16,
     pub frame_height: u16,
-    pub superres_scale_denominator: u8,
+    /// The super-resolution denominator, when the frame uses super-resolution; always one of
+    /// `SUPERRES_DENOMINATORS`.
+    pub superres: Option<u8>,
     pub interp_filter: u8,
 
     pub seg_enabled: bool,
@@ -826,6 +837,12 @@ impl FrameDesc {
             return Err(Unsupported::SliceCount(slice_count));
         }
 
+        let superres = match byte(at::SUPERRES_SCALE_DENOMINATOR) {
+            _ if !d.flag(at::PIC_USE_SUPERRES) => None,
+            n if SUPERRES_DENOMINATORS.contains(&n) => Some(n),
+            n => return Err(Unsupported::SuperresDenominator(n)),
+        };
+
         let grain = |n: usize, max: usize| -> Result<usize, Unsupported> {
             if n > max { Err(Unsupported::FilmGrainPoints(n)) } else { Ok(n) }
         };
@@ -848,7 +865,6 @@ impl FrameDesc {
             allow_screen_content_tools: d.flag(at::PIC_ALLOW_SCREEN_CONTENT_TOOLS),
             force_integer_mv: d.flag(at::PIC_FORCE_INTEGER_MV),
             allow_intrabc: d.flag(at::PIC_ALLOW_INTRABC),
-            use_superres: d.flag(at::PIC_USE_SUPERRES),
             allow_high_precision_mv: d.flag(at::PIC_ALLOW_HIGH_PRECISION_MV),
             is_motion_mode_switchable: d.flag(at::PIC_IS_MOTION_MODE_SWITCHABLE),
             use_ref_frame_mvs: d.flag(at::PIC_USE_REF_FRAME_MVS),
@@ -858,7 +874,7 @@ impl FrameDesc {
 
             frame_width: short(at::FRAME_WIDTH),
             frame_height: short(at::FRAME_HEIGHT),
-            superres_scale_denominator: byte(at::SUPERRES_SCALE_DENOMINATOR),
+            superres,
             interp_filter: byte(at::INTERP_FILTER),
 
             seg_enabled: d.flag(at::SEG_ENABLED),
@@ -1136,9 +1152,9 @@ impl FrameDesc {
     /// 5.9.8 `superres_params`, which also settles the downscaled width.
     fn write_superres_params(&self, w: &mut Writer, c: &mut FrameCtx) {
         let mut denom = 8u32; // SUPERRES_NUM
-        w.flag(self.use_superres);
-        if self.use_superres {
-            denom = u32::from(self.superres_scale_denominator).max(9);
+        w.flag(self.superres.is_some());
+        if let Some(n) = self.superres {
+            denom = u32::from(n);
             w.u(3, denom - 9); // coded_denom, from SUPERRES_DENOM_MIN
         }
         c.frame_width = (c.upscaled_width * 8 + denom / 2) / denom;
@@ -1437,8 +1453,12 @@ impl FrameDesc {
         // nothing subtracted; subtracting `sub` from it too sends every diagonal term of a
         // rotzoom or affine model to the range floor -- a scale of about 0.875 where the encoder
         // meant 1.0 -- and the warped prediction smears.
+        //
+        // The parameter is the guest's whole `int`, so taking `round` from it is done wide: near
+        // the bottom of the range it would overflow, which the C wraps and a checked build aborts.
         let r = ((prev[idx] >> prec_diff) - sub).clamp(-mx, mx);
-        let v = ((self.wm[ref_idx].wmmat[idx] - round) >> prec_diff).clamp(-mx, mx);
+        let wide = (i64::from(self.wm[ref_idx].wmmat[idx]) - round) >> prec_diff;
+        let v = wide.clamp((-mx).into(), mx.into()) as i32;
 
         write_signed_subexp_with_ref(w, v, -mx, mx + 1, r);
     }
@@ -2270,6 +2290,54 @@ mod tests {
             let seq = SeqParams::read(&blob).expect("a width the syntax allows");
             assert_eq!(seq.order_hint_bits.get(), minus_1 + 1);
             assert!(seq.sequence_header().is_ok());
+        }
+    }
+
+    #[test]
+    fn a_superres_denominator_the_syntax_cannot_say_is_refused() {
+        // The descriptor carries the denominator as a byte; the frame header has three bits of it
+        // over nine. A large one scales the coded width below a superblock, and the tile info then
+        // divides by a column count of zero -- which cargo-fuzz found. Only the frame header
+        // writer reads it, so a frame without super-resolution keeps whatever byte it carries.
+        let mut blob = test_descriptor(640, 360);
+        let on = at::PIC_USE_SUPERRES;
+        for n in [0u8, 8, 17, 255] {
+            blob[at::SUPERRES_SCALE_DENOMINATOR] = n;
+            assert_eq!(FrameDesc::read(&blob).map(|d| d.superres), Ok(None));
+        }
+
+        blob[on.at + on.shift as usize / 8] |= 1 << (on.shift % 8);
+        for n in [0u8, 8, 17, 255] {
+            blob[at::SUPERRES_SCALE_DENOMINATOR] = n;
+            assert_eq!(FrameDesc::read(&blob), Err(Unsupported::SuperresDenominator(n)));
+        }
+
+        for n in SUPERRES_DENOMINATORS {
+            blob[at::SUPERRES_SCALE_DENOMINATOR] = n;
+            let frame = FrameDesc::read(&blob).expect("a denominator the syntax allows");
+            assert_eq!(frame.superres, Some(n));
+            assert!(ObuState::<()>::new().build_temporal_unit(&frame, &[0; 16], ()).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_warp_parameter_at_either_end_of_its_int_is_written() {
+        // The warp matrix is the guest's `int`s as they are; taking the rounding term from one at
+        // the bottom of the range overflowed, which cargo-fuzz found.
+        let mut blob = test_descriptor(640, 360);
+        blob[at::PIC_SHOW_FRAME.at] |= 1 << at::PIC_SHOW_FRAME.shift;
+        let key = FrameDesc::read(&blob).expect("a Main frame");
+        let mut state = ObuState::<()>::new();
+        assert!(state.build_temporal_unit(&key, &[0; 16], ()).is_ok_and(|u| u.is_some()));
+
+        for param in [i32::MIN, i32::MAX] {
+            let mut inter = FrameDesc::read(&blob).expect("a Main frame");
+            inter.frame_type = FRAME_INTER;
+            for warp in &mut inter.wm {
+                warp.wmtype = 3; // AFFINE, which writes all six
+                warp.wmmat = [param; WARP_PARAMS];
+            }
+            assert!(state.build_temporal_unit(&inter, &[0; 16], ()).is_ok_and(|u| u.is_some()));
         }
     }
 
