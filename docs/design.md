@@ -989,10 +989,23 @@ it survives the session it was found in.
     consistent loads, which loom weakens to acquire/release and reports as races the hardware
     cannot produce. Guest memory is also behind std atomics loom cannot see. The std tests
     cover the handshake.
-  - **Miri** runs the unit tests of the modules that make no FFI calls, and checks the aliasing
-    rules Kani does not: `CARGO_TARGET_DIR=target/miri cargo +nightly miri test --lib <module>`.
-    A test too long for it is marked `#[cfg_attr(miri, ignore = "...")]`, so a bare run on a
-    module finishes. `venus::cs` runs clean, including a decode, handler write and reply encode
+  - **Miri** runs the unit tests that make no foreign call, and checks the aliasing rules Kani
+    does not: `CARGO_TARGET_DIR=target/miri cargo +nightly miri test --lib <module>`. A foreign
+    call ends the whole run, hiding every test after it, so a module that has one is run again
+    with `-- --skip <test>` for each test Miri stops on until it finishes. A test too long for it
+    is marked `#[cfg_attr(miri, ignore = "...")]`. `venus::driver` and `venus::context` also need
+    `MIRIFLAGS=-Zmiri-ignore-leaks`: `Driver::abandon_planted` leaks the tables a test planted, on
+    purpose, because dropping them would call entry points the test never planted.
+
+    Measured 2026-09-23, every module: no undefined behaviour in any test Miri could run. Every
+    test reaches C in `vulkan`, `vrend::waiter`, `vrend::egl`, `venus::vkr`, `venus::monitor` and
+    `metal::plain_tests`, so Miri covers nothing there. It covers part of `venus::context` (19 of
+    127 tests), `venus::driver` (21 of 27), `renderer` (4 of 17), `guest_mem` (5 of 14), `metal`
+    (1 of 11), `venus::ring` (4 of 12), `venus::ring_thread` (1 of 8), `vrend::vrend` (2 of 9),
+    `vrend::video` (5 of 7), `vrend::blitter` (11 of 12) and `budget` (14 of 15), and all of every
+    other module.
+
+    `venus::cs` runs clean, including a decode, handler write and reply encode
     of an enumeration -- the `&mut` that `wire_array_mut` and `wire_out` make from arena
     pointers. Those are sound only while a handler cannot change an array's length or hold a
     second copy of the command that owns it: a length safe code can write makes the accessor
@@ -1001,7 +1014,7 @@ it survives the session it was found in.
     neither `Clone` nor `Copy`; each has a sabotage entry. The same argument one level down is
     why the driver takes `cs::Decoded` and `cs::Out` rather than references to `Vk*` structs,
     and why a write into an answer goes through `Out::edit`, which asserts its pointers and the
-    counts that size them are unchanged. Owed: the other modules without FFI.
+    counts that size them are unchanged.
   - **cargo-fuzz** takes pure parsers too large to prove. The targets live in `fuzz/`, which is
     its own workspace so the renderer's build never sees libFuzzer, and run as
     `cargo +nightly fuzz run <target> -- -max_total_time=<seconds>`. Every target checks for no
