@@ -3047,10 +3047,10 @@ impl Commands for Handlers<'_> {
             return;
         }
 
-        let Some(out) = self.array(args.pPhysicalDeviceGroupProperties_mut()) else { return };
-        let asked = self
-            .driver
-            .enumerate_into(instance, Some(out), |i| i.try_vkEnumeratePhysicalDeviceGroups());
+        let Some(mut out) = self.array(args.pPhysicalDeviceGroupProperties_mut()) else { return };
+        let asked = self.driver.enumerate_into(instance, Some(out.reborrow()), |i| {
+            i.try_vkEnumeratePhysicalDeviceGroups()
+        });
         let (n, ret) = match asked {
             Ok(pair) => pair,
             Err(e) => {
@@ -3068,14 +3068,17 @@ impl Commands for Handlers<'_> {
         // it has no name for, and inventing one would name something it never asked to exist.
         let table = self.objects.borrow();
         let mut unknown = false;
-        for group in out.iter_mut().take(n as usize) {
-            let live = (group.physicalDeviceCount as usize).min(group.physicalDevices.len());
-            for pd in &mut group.physicalDevices[..live] {
-                match table.id_of_handle(VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE, pd.host()) {
-                    Some(id) => *pd = VkPhysicalDevice(id.0),
-                    None => unknown = true,
+        for mut group in out.iter_mut().take(n as usize) {
+            group.edit(|group| {
+                let live = (group.physicalDeviceCount as usize).min(group.physicalDevices.len());
+                for pd in &mut group.physicalDevices[..live] {
+                    let kind = VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE;
+                    match table.id_of_handle(kind, pd.host()) {
+                        Some(id) => *pd = VkPhysicalDevice(id.0),
+                        None => unknown = true,
+                    }
                 }
-            }
+            });
         }
         drop(table);
         if unknown {
@@ -3592,7 +3595,8 @@ impl Commands for Handlers<'_> {
     ) {
         let pd = args.physicalDevice;
         let Some(out) = self.fills(args.pProperties_mut()) else { return };
-        let r = self.driver.pd_query(pd, &mut *out, |i| i.try_vkGetPhysicalDeviceProperties());
+        let r =
+            self.driver.pd_query(pd, (&mut *out).into(), |i| i.try_vkGetPhysicalDeviceProperties());
         if r.is_ok() {
             out.apiVersion = cap_api_version(out.apiVersion);
         }
@@ -3604,10 +3608,11 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkGetPhysicalDeviceProperties2<'_>,
     ) {
         let pd = args.physicalDevice;
-        let Some(out) = self.fills(args.pProperties_mut()) else { return };
-        let r = self.driver.pd_query(pd, &mut *out, |i| i.try_vkGetPhysicalDeviceProperties2());
+        let Some(mut out) = self.fills(args.pProperties_mut()) else { return };
+        let r =
+            self.driver.pd_query(pd, out.reborrow(), |i| i.try_vkGetPhysicalDeviceProperties2());
         if r.is_ok() {
-            out.properties.apiVersion = cap_api_version(out.properties.apiVersion);
+            out.edit(|o| o.properties.apiVersion = cap_api_version(o.properties.apiVersion));
         }
         self.asked(r);
     }
@@ -3646,8 +3651,10 @@ impl Commands for Handlers<'_> {
         const DEVICE_LOCAL: u32 = VkMemoryHeapFlagBits::VK_MEMORY_HEAP_DEVICE_LOCAL_BIT.0 as u32;
 
         let pd = args.physicalDevice;
-        let Some(out) = self.fills(args.pMemoryProperties_mut()) else { return };
-        let r = self.driver.pd_query(pd, out, |i| i.try_vkGetPhysicalDeviceMemoryProperties2());
+        let Some(mut out) = self.fills(args.pMemoryProperties_mut()) else { return };
+        let r = self
+            .driver
+            .pd_query(pd, out.reborrow(), |i| i.try_vkGetPhysicalDeviceMemoryProperties2());
         {
             let account = self.driver.account();
             // The heaps the driver just described: what says which heap is ours to answer for and
@@ -3655,20 +3662,22 @@ impl Commands for Handlers<'_> {
             let heaps = out.memoryProperties;
             // No cap is no answer to give, and the driver's reply is then the only true one.
             if let Some(st) = account.standing()
-                && let Some(chained) =
-                    driver::chained_mut::<VkPhysicalDeviceMemoryBudgetPropertiesEXT>(&mut out.pNext)
+                && let Some(mut chained) =
+                    driver::chained_mut::<VkPhysicalDeviceMemoryBudgetPropertiesEXT>(&mut out)
             {
                 let count = heaps.memoryHeapCount.min(heaps.memoryHeaps.len() as u32);
-                for i in 0..count as usize {
-                    let heap = heaps.memoryHeaps[i];
-                    if heap.flags.0 & DEVICE_LOCAL == 0 {
-                        continue;
+                chained.edit(|chained| {
+                    for i in 0..count as usize {
+                        let heap = heaps.memoryHeaps[i];
+                        if heap.flags.0 & DEVICE_LOCAL == 0 {
+                            continue;
+                        }
+                        let (budget, usage) =
+                            account.heap_answer(st, i as u32, heap.size.0, chained.heapBudget[i].0);
+                        chained.heapBudget[i] = VkDeviceSize(budget);
+                        chained.heapUsage[i] = VkDeviceSize(usage);
                     }
-                    let (budget, usage) =
-                        account.heap_answer(st, i as u32, heap.size.0, chained.heapBudget[i].0);
-                    chained.heapBudget[i] = VkDeviceSize(budget);
-                    chained.heapUsage[i] = VkDeviceSize(usage);
-                }
+                });
             }
         }
         self.asked(r);
@@ -3745,7 +3754,7 @@ impl Commands for Handlers<'_> {
         let (device, image) = (args.device, args.image);
         let Some(sub) = self.names(args.pSubresource) else { return };
         let Some(out) = self.fills(args.pLayout_mut()) else { return };
-        let r = self.driver.dev_query_arg_info(device, image, sub.into(), out, |d| {
+        let r = self.driver.dev_query_arg_info(device, image, sub.into(), out.into(), |d| {
             d.try_vkGetImageSubresourceLayout()
         });
         self.asked(r);
@@ -3757,7 +3766,7 @@ impl Commands for Handlers<'_> {
     ) {
         let pd = args.physicalDevice;
         let Some(out) = self.fills(args.pFeatures_mut()) else { return };
-        let r = self.driver.pd_query(pd, out, |i| i.try_vkGetPhysicalDeviceFeatures());
+        let r = self.driver.pd_query(pd, out.into(), |i| i.try_vkGetPhysicalDeviceFeatures());
         self.asked(r);
     }
 
@@ -3767,7 +3776,8 @@ impl Commands for Handlers<'_> {
     ) {
         let pd = args.physicalDevice;
         let Some(out) = self.fills(args.pMemoryProperties_mut()) else { return };
-        let r = self.driver.pd_query(pd, out, |i| i.try_vkGetPhysicalDeviceMemoryProperties());
+        let r =
+            self.driver.pd_query(pd, out.into(), |i| i.try_vkGetPhysicalDeviceMemoryProperties());
         self.asked(r);
     }
 
@@ -3779,7 +3789,7 @@ impl Commands for Handlers<'_> {
         let Some(out) = self.fills(args.pFormatProperties_mut()) else { return };
         let r = self
             .driver
-            .pd_query_arg(pd, format, out, |i| i.try_vkGetPhysicalDeviceFormatProperties());
+            .pd_query_arg(pd, format, out.into(), |i| i.try_vkGetPhysicalDeviceFormatProperties());
         self.asked(r);
     }
 
@@ -3816,7 +3826,7 @@ impl Commands for Handlers<'_> {
         let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
         let r = self
             .driver
-            .dev_query_arg(device, buffer, out, |d| d.try_vkGetBufferMemoryRequirements());
+            .dev_query_arg(device, buffer, out.into(), |d| d.try_vkGetBufferMemoryRequirements());
         self.asked(r);
     }
 
@@ -3826,8 +3836,9 @@ impl Commands for Handlers<'_> {
     ) {
         let (device, image) = (args.device, args.image);
         let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
-        let r =
-            self.driver.dev_query_arg(device, image, out, |d| d.try_vkGetImageMemoryRequirements());
+        let r = self
+            .driver
+            .dev_query_arg(device, image, out.into(), |d| d.try_vkGetImageMemoryRequirements());
         self.asked(r);
     }
 
@@ -3837,16 +3848,18 @@ impl Commands for Handlers<'_> {
     ) {
         let (device, memory) = (args.device, args.memory);
         let Some(out) = self.fills(args.pCommittedMemoryInBytes_mut()) else { return };
-        let r =
-            self.driver.dev_query_arg(device, memory, out, |d| d.try_vkGetDeviceMemoryCommitment());
+        let r = self
+            .driver
+            .dev_query_arg(device, memory, out.into(), |d| d.try_vkGetDeviceMemoryCommitment());
         self.asked(r);
     }
 
     fn vkGetRenderAreaGranularity(&mut self, args: &mut vn_command_vkGetRenderAreaGranularity<'_>) {
         let (device, pass) = (args.device, args.renderPass);
         let Some(out) = self.fills(args.pGranularity_mut()) else { return };
-        let r =
-            self.driver.dev_query_arg(device, pass, out, |d| d.try_vkGetRenderAreaGranularity());
+        let r = self
+            .driver
+            .dev_query_arg(device, pass, out.into(), |d| d.try_vkGetRenderAreaGranularity());
         self.asked(r);
     }
 
@@ -3859,7 +3872,7 @@ impl Commands for Handlers<'_> {
         let Some(out) = self.fills(args.pGranularity_mut()) else { return };
         let r = self
             .driver
-            .dev_query_info(device, info, out, |d| d.try_vkGetRenderingAreaGranularity());
+            .dev_query_info(device, info, out.into(), |d| d.try_vkGetRenderingAreaGranularity());
         self.asked(r);
     }
 
@@ -3959,7 +3972,7 @@ impl Commands for Handlers<'_> {
         let device = args.device;
         let (heap, local, remote) = (args.heapIndex, args.localDeviceIndex, args.remoteDeviceIndex);
         let Some(out) = self.fills(args.pPeerMemoryFeatures_mut()) else { return };
-        let r = self.driver.peer_memory_features(device, heap, local, remote, out, |d| {
+        let r = self.driver.peer_memory_features(device, heap, local, remote, out.into(), |d| {
             d.try_vkGetDeviceGroupPeerMemoryFeatures()
         });
         self.asked(r);
@@ -4017,7 +4030,7 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkGetMemoryResourcePropertiesMESA<'_>,
     ) {
         let (device, named) = (args.device, args.resourceId);
-        let Some(out) = self.fills(args.pMemoryResourceProperties_mut()) else { return };
+        let Some(mut out) = self.fills(args.pMemoryResourceProperties_mut()) else { return };
 
         // A resource id that names nothing is answered, never refused, and this is the one place
         // in the query family where that is true. The C says why (vkr_device_memory.c:945): a
@@ -4051,17 +4064,18 @@ impl Commands for Handlers<'_> {
         // The answer has to agree with what the allocation path will do with the same resource --
         // see `Driver::host_visible_memory_types`. A guest reads this, intersects it with the
         // image's own requirements, and hands the result straight back as a `memoryTypeIndex`.
-        out.memoryTypeBits = bits;
-        if let Some(size) =
-            driver::chained_mut::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut out.pNext)
+        out.edit(|o| o.memoryTypeBits = bits);
+        if let Some(mut size) =
+            driver::chained_mut::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut out)
         {
-            size.allocationSize = match &bytes {
+            let allocation = match &bytes {
                 ResourceBytes::Host(map) => map.len() as u64,
                 // The span the import will alias, reported as the size the guest may allocate
                 // over it -- literally the same number, so the query cannot promise an extent
                 // the allocation then clamps away.
                 ResourceBytes::Shared(_) => span.1,
             };
+            size.edit(|s| s.allocationSize = allocation);
         }
         args.ret = VkResult::VK_SUCCESS;
     }
@@ -4101,9 +4115,9 @@ impl Commands for Handlers<'_> {
             return;
         }
         let Some(out) = self.array(args.pQueueFamilyProperties_mut()) else { return };
-        let asked = self
-            .driver
-            .enumerate_into(pd, Some(out), |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties());
+        let asked = self.driver.enumerate_into(pd, Some(out.into()), |i| {
+            i.try_vkGetPhysicalDeviceQueueFamilyProperties()
+        });
         if let Some((n, ())) = self.asked(asked)
             && let Some(mut count) = args.pQueueFamilyPropertyCount_mut()
         {
@@ -4172,7 +4186,7 @@ impl Commands for Handlers<'_> {
             return;
         }
         let Some(out) = self.array(args.pTimeDomains_mut()) else { return };
-        let asked = self.driver.enumerate_into(pd, Some(out), |i| {
+        let asked = self.driver.enumerate_into(pd, Some(out.into()), |i| {
             i.try_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR()
         });
         match asked {
@@ -4211,7 +4225,7 @@ impl Commands for Handlers<'_> {
             samples,
             usage,
             tiling,
-            out,
+            out.map(Into::into),
             |i| i.try_vkGetPhysicalDeviceSparseImageFormatProperties(),
         );
         if let Some(n) = self.asked(asked)
@@ -4267,9 +4281,9 @@ impl Commands for Handlers<'_> {
         } else {
             None
         };
-        let asked = self
-            .driver
-            .dev_enumerate_arg(device, image, out, |d| d.try_vkGetImageSparseMemoryRequirements());
+        let asked = self.driver.dev_enumerate_arg(device, image, out.map(Into::into), |d| {
+            d.try_vkGetImageSparseMemoryRequirements()
+        });
         if let Some((n, ())) = self.asked(asked)
             && let Some(mut count) = args.pSparseMemoryRequirementCount_mut()
         {

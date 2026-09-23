@@ -616,6 +616,48 @@ class RustGen:
             self._pointerful = found
         return name in self._pointerful
 
+    def shape_lines(self, ty):
+        """The body of `ty`'s `cs::Shape`: a push per pointer and per count one is sized by.
+
+        `None` where that cannot be stated without following a pointer -- a count held behind
+        one, or an embedded union whose live member only a tag elsewhere names. Such a struct gets
+        no `Shape`, so a handler cannot `edit` one at all: a compile error, not a check that
+        quietly covers less than it says.
+        """
+        kinds = (VkType.STRUCT, VkType.UNION)
+        lines = []
+        for v in ty.variables:
+            f, b = self.field_name(v.name), v.ty.base
+            if v.ty.is_pointer():
+                lines.append('out.push(self.%s as usize as u64);' % f)
+                try:
+                    shape = self._shape(ty, v)
+                except self.Unsupported:
+                    continue
+                if shape[0] in ('dynamic', 'blob', 'string_array'):
+                    if 'unsafe' in shape[1] or 'val.' not in shape[1]:
+                        return None
+                    lines.append('out.push(%s);' % shape[1].replace('val.', 'self.'))
+            elif b.category == VkType.FUNCPOINTER:
+                lines.append('out.push(self.%s.map_or(0, |f| f as usize as u64));' % f)
+            elif b.category in kinds and self.carries_pointers(b.name):
+                if b.category == VkType.UNION:
+                    return None
+                if v.ty.is_static_array():
+                    if '][' in v.ty.static_array_size():
+                        return None
+                    lines.append('self.%s.iter().for_each(|e| cs::Shape::shape(e, out));' % f)
+                else:
+                    lines.append('cs::Shape::shape(&self.%s, out);' % f)
+        return lines
+
+    def shaped(self, name):
+        """Whether the struct `name` gets a `cs::Shape`: it carries pointers, and they can be stated."""
+        if not self.carries_pointers(name):
+            return False
+        ty = self.gen.reg.type_table.get(name)
+        return ty is not None and ty.category == VkType.STRUCT and self.shape_lines(ty) is not None
+
     def witnessed(self, ty, var):
         """Whether a by-reference member is handed out as a `cs::Decoded` rather than a reference."""
         return self.is_ref_member(ty, var) and self.carries_pointers(var.ty.base.name)
@@ -2129,7 +2171,12 @@ class RustGen:
             # An array of structs Vulkan will follow pointers out of is handed out vouched for,
             # so it can be passed on; see `cs::Decoded`.
             vouched = not mutable and self.carries_pointers(elem)
-            if mutable and sure:
+            answer = mutable and self.carries_pointers(elem)
+            if answer and sure:
+                sig = "pub fn %s_mut(&mut self) -> cs::Out<'_, [%s]>" % (f, elem)
+            elif answer:
+                sig = "pub fn %s_mut(&mut self) -> Option<cs::Out<'_, [%s]>>" % (f, elem)
+            elif mutable and sure:
                 sig = 'pub fn %s_mut(&mut self) -> &mut [%s]' % (f, elem)
             elif mutable:
                 sig = 'pub fn %s_mut(&mut self) -> Option<&mut [%s]>' % (f, elem)
@@ -2164,6 +2211,10 @@ class RustGen:
                     "        // sized to that count, and the arena outlives the struct's `'a`.",
                     '        unsafe { cs::%s((%s) as usize, val.%s as *%s _) }'
                     % (call, n, f, 'mut' if mutable else 'const')
+                    + ('' if not answer else
+                       '\n            // SAFETY: and every pointer in its elements the decoder allocated'
+                       '\n            // from the same arena, sized as it decoded them.'
+                       '\n            .map(|a| unsafe { cs::Out::vouch(a) })')
                     + ('' if not vouched else
                        '\n            // SAFETY: and every pointer in its elements the decoder allocated'
                        '\n            // from the same arena, sized as it decoded them.'
@@ -2262,7 +2313,11 @@ class RustGen:
         sized = self.sized_by(ty, f)
         if mutable and sized:
             return self._out_count_accessor(ty, f, elem, sized)
-        if mutable:
+        answer = mutable and self.carries_pointers(elem)
+        if answer:
+            sig = "pub fn %s_mut(&mut self) -> Option<cs::Out<'_, %s>>" % (f, elem)
+            call, star = 'wire_out', 'mut'
+        elif mutable:
             sig = 'pub fn %s_mut(&mut self) -> Option<&mut %s>' % (f, elem)
             call, star = 'wire_out', 'mut'
         else:
@@ -2286,7 +2341,11 @@ class RustGen:
             '    ' + sig + ' {',
             '        // SAFETY: the decoder allocated this member from the batch arena as a',
             "        // single element, and the arena outlives the struct's `'a`.",
-            '        unsafe { cs::%s(self.%s as *%s _) }' % (call, f, star),
+            '        unsafe { cs::%s(self.%s as *%s _) }' % (call, f, star)
+            + ('' if not answer else
+               '\n            // SAFETY: and every pointer in it the decoder allocated from the same'
+               '\n            // arena, sized as it decoded them.'
+               '\n            .map(|r| unsafe { cs::Out::vouch(r) })'),
             '    }',
             '',
             '    /// Plant `%s` as the decoder would have.' % f,

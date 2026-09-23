@@ -1297,9 +1297,9 @@ pub fn renderer_extensions() -> Vec<VkExtensionProperties> {
 /// array is one slice, and its length is both what the driver is told it has room for and what the
 /// count it writes back is measured against. `None` is the guest's count query -- no array and no
 /// room, and no bound either: answering it *is* writing a count larger than the zero it was given.
-fn split<T>(out: Option<&mut [T]>) -> (u32, Option<usize>, *mut T) {
+fn split<T>(out: Option<cs::Out<'_, [T]>>) -> (u32, Option<usize>, *mut T) {
     match out {
-        Some(s) => (s.len() as u32, Some(s.len()), s.as_mut_ptr()),
+        Some(mut s) => (s.len() as u32, Some(s.len()), s.as_mut_ptr().cast()),
         None => (0, None, core::ptr::null_mut()),
     }
 }
@@ -1699,13 +1699,13 @@ impl Driver {
     pub fn pd_query<T, R>(
         &self,
         pd: VkPhysicalDevice,
-        out: &mut T,
+        mut out: cs::Out<'_, T>,
         pick: impl FnOnce(&InstanceFns) -> Option<unsafe extern "C" fn(VkPhysicalDevice, *mut T) -> R>,
     ) -> Result<R, VkResult> {
         let f = self.instance().and_then(pick).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: `pd` is a handle this instance returned, and `out` is a live exclusive
         // borrow for the length of the call.
-        Ok(unsafe { f(pd, out) })
+        Ok(unsafe { f(pd, out.as_mut_ptr()) })
     }
 
     /// A physical-device query that names what it is asking about by value.
@@ -1713,14 +1713,14 @@ impl Driver {
         &self,
         pd: VkPhysicalDevice,
         a: A,
-        out: &mut T,
+        mut out: cs::Out<'_, T>,
         pick: impl FnOnce(
             &InstanceFns,
         ) -> Option<unsafe extern "C" fn(VkPhysicalDevice, A, *mut T) -> R>,
     ) -> Result<R, VkResult> {
         let f = self.instance().and_then(pick).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `pd_query`; `a` is a plain value the guest sent.
-        Ok(unsafe { f(pd, a, out) })
+        Ok(unsafe { f(pd, a, out.as_mut_ptr()) })
     }
 
     /// A physical-device query that names what it is asking about with a struct.
@@ -1733,7 +1733,7 @@ impl Driver {
         &self,
         pd: VkPhysicalDevice,
         info: cs::Decoded<'_, I>,
-        out: &mut T,
+        mut out: cs::Out<'_, T>,
         pick: impl FnOnce(
             &InstanceFns,
         )
@@ -1741,7 +1741,7 @@ impl Driver {
     ) -> Result<R, VkResult> {
         let f = self.instance().and_then(pick).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `pd_query`; `info` borrows an arena struct live for the call.
-        Ok(unsafe { f(pd, info.get(), out) })
+        Ok(unsafe { f(pd, info.get(), out.as_mut_ptr()) })
     }
 
     /// `vkGetPhysicalDeviceImageFormatProperties2`, with the external-memory half answered here
@@ -1766,7 +1766,7 @@ impl Driver {
         &self,
         pd: VkPhysicalDevice,
         info: cs::Decoded<'_, VkPhysicalDeviceImageFormatInfo2>,
-        out: &mut VkImageFormatProperties2,
+        mut out: cs::Out<'_, VkImageFormatProperties2>,
     ) -> Result<VkResult, VkResult> {
         let f = self
             .instance()
@@ -1775,24 +1775,26 @@ impl Driver {
 
         let Some(handle) = self.emulated_external_image(pd, info.get()) else {
             // SAFETY: as `pd_query_info`; both structs borrow arena entries live for the call.
-            return Ok(unsafe { f(pd, info.get(), out) });
+            return Ok(unsafe { f(pd, info.get(), out.as_mut_ptr()) });
         };
 
         let ret = without_external_image_info(info.get(), |asked| {
             // SAFETY: as above, and `asked` is the guest's own request with one link unchained.
-            unsafe { f(pd, asked, out) }
+            unsafe { f(pd, asked, out.as_mut_ptr()) }
         });
         if ret == VkResult::VK_SUCCESS
-            && let Some(props) = chained_mut::<VkExternalImageFormatProperties>(&mut out.pNext)
+            && let Some(mut props) = chained_mut::<VkExternalImageFormatProperties>(&mut out)
         {
             let features =
                 VkExternalMemoryFeatureFlagBits::VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT.0
                     | VkExternalMemoryFeatureFlagBits::VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT.0;
-            props.externalMemoryProperties = VkExternalMemoryProperties {
-                externalMemoryFeatures: VkExternalMemoryFeatureFlags(features as u32),
-                exportFromImportedHandleTypes: VkExternalMemoryHandleTypeFlags(handle.0 as u32),
-                compatibleHandleTypes: VkExternalMemoryHandleTypeFlags(handle.0 as u32),
-            };
+            props.edit(|p| {
+                p.externalMemoryProperties = VkExternalMemoryProperties {
+                    externalMemoryFeatures: VkExternalMemoryFeatureFlags(features as u32),
+                    exportFromImportedHandleTypes: VkExternalMemoryHandleTypeFlags(handle.0 as u32),
+                    compatibleHandleTypes: VkExternalMemoryHandleTypeFlags(handle.0 as u32),
+                }
+            });
         }
         Ok(ret)
     }
@@ -1870,7 +1872,7 @@ impl Driver {
         heap_index: u32,
         local_device: u32,
         remote_device: u32,
-        out: &mut T,
+        mut out: cs::Out<'_, T>,
         pick: impl FnOnce(
             &DeviceFns,
         ) -> Option<unsafe extern "C" fn(VkDevice, u32, u32, u32, *mut T) -> R>,
@@ -1878,7 +1880,7 @@ impl Driver {
         let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `dev_query_info`; the three indices are plain scalars off the wire.
-        Ok(unsafe { f(device, heap_index, local_device, remote_device, out) })
+        Ok(unsafe { f(device, heap_index, local_device, remote_device, out.as_mut_ptr()) })
     }
 
     /// A device query whose answer is the entry point's own return value, with no out-parameter
@@ -1909,14 +1911,14 @@ impl Driver {
         &self,
         device: VkDevice,
         info: cs::Decoded<'_, I>,
-        out: &mut T,
+        mut out: cs::Out<'_, T>,
         pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I, *mut T) -> R>,
     ) -> Result<R, VkResult> {
         let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: `device` is a handle this table was loaded from, `info` borrows an arena struct
         // live for the call, and `out` is a live exclusive borrow.
-        Ok(unsafe { f(device, info.get(), out) })
+        Ok(unsafe { f(device, info.get(), out.as_mut_ptr()) })
     }
 
     /// A device query about one of the device's own objects.
@@ -1924,13 +1926,13 @@ impl Driver {
         &self,
         device: VkDevice,
         a: A,
-        out: &mut T,
+        mut out: cs::Out<'_, T>,
         pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, A, *mut T) -> R>,
     ) -> Result<R, VkResult> {
         let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `dev_query_info`; `a` is a handle the guest named, already resolved.
-        Ok(unsafe { f(device, a, out) })
+        Ok(unsafe { f(device, a, out.as_mut_ptr()) })
     }
 
     /// A device query about one of its objects, narrowed by a struct. `info` is a borrow for the
@@ -1940,7 +1942,7 @@ impl Driver {
         device: VkDevice,
         a: A,
         info: cs::Decoded<'_, I>,
-        out: &mut T,
+        mut out: cs::Out<'_, T>,
         pick: impl FnOnce(
             &DeviceFns,
         ) -> Option<unsafe extern "C" fn(VkDevice, A, *const I, *mut T) -> R>,
@@ -1948,7 +1950,7 @@ impl Driver {
         let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `dev_query_info`.
-        Ok(unsafe { f(device, a, info.get(), out) })
+        Ok(unsafe { f(device, a, info.get(), out.as_mut_ptr()) })
     }
 
     /// An enumeration, in whichever of Vulkan's two calls the guest asked for.
@@ -2257,7 +2259,7 @@ impl Driver {
         out: &mut u64,
     ) -> Result<Result<VkResult, VkResult>, NotATimeline> {
         self.as_timeline(device, sem)?;
-        Ok(self.dev_query_arg(device, sem, out, |d| d.try_vkGetSemaphoreCounterValue()))
+        Ok(self.dev_query_arg(device, sem, out.into(), |d| d.try_vkGetSemaphoreCounterValue()))
     }
 
     /// `vkSignalSemaphore`, on a semaphore that has a counter to raise.
@@ -2557,7 +2559,7 @@ impl Driver {
     pub fn enumerate_into<H, T, R>(
         &self,
         h: H,
-        out: Option<&mut [T]>,
+        out: Option<cs::Out<'_, [T]>>,
         pick: impl FnOnce(&InstanceFns) -> Option<unsafe extern "C" fn(H, *mut u32, *mut T) -> R>,
     ) -> Result<(u32, R), VkResult> {
         let f = self.instance().and_then(pick).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
@@ -2578,7 +2580,7 @@ impl Driver {
         &self,
         h: H,
         info: cs::Decoded<'_, I>,
-        out: Option<&mut [T]>,
+        out: Option<cs::Out<'_, [T]>>,
         pick: impl FnOnce(
             &InstanceFns,
         ) -> Option<unsafe extern "C" fn(H, *const I, *mut u32, *mut T) -> R>,
@@ -2605,7 +2607,7 @@ impl Driver {
         samples: VkSampleCountFlagBits,
         usage: VkImageUsageFlags,
         tiling: VkImageTiling,
-        out: Option<&mut [T]>,
+        out: Option<cs::Out<'_, [T]>>,
         pick: impl FnOnce(
             &InstanceFns,
         ) -> Option<
@@ -2634,7 +2636,7 @@ impl Driver {
         &self,
         device: VkDevice,
         a: A,
-        out: Option<&mut [T]>,
+        out: Option<cs::Out<'_, [T]>>,
         pick: impl FnOnce(
             &DeviceFns,
         ) -> Option<unsafe extern "C" fn(VkDevice, A, *mut u32, *mut T) -> R>,
@@ -2653,7 +2655,7 @@ impl Driver {
         &self,
         device: VkDevice,
         info: cs::Decoded<'_, I>,
-        out: Option<&mut [T]>,
+        out: Option<cs::Out<'_, [T]>>,
         pick: impl FnOnce(
             &DeviceFns,
         )
@@ -6844,16 +6846,6 @@ pub unsafe trait OutStruct {
     const TYPE: VkStructureType;
 }
 
-/// The struct the guest chained onto an out-parameter, or `None` if it chained none.
-///
-/// A guest asking a query for more than the base struct says so by hanging a second struct off the
-/// answer's `pNext`, and this is how a handler reaches it: as a borrow, so `context.rs` stays free
-/// of unsafe. Safe to call for the reason stated at the top of this section -- every pointer these
-/// take is one the decoder allocated in the batch arena, which outlives the whole submission.
-///
-/// It takes the `pNext` field itself rather than the struct that holds it, which is what makes the
-/// borrow honest: the returned reference lives exactly as long as the exclusive borrow of the
-/// chain it was found in.
 /// The same claim for a struct the guest chained onto an *in*-parameter.
 ///
 /// Separate from [`OutStruct`] because the two are read through different pointers and a type is
@@ -7038,7 +7030,25 @@ unsafe impl InStruct for VkPhysicalDeviceExternalImageFormatInfo {
         VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
 }
 
-pub fn chained_mut<T: OutStruct>(head: &mut *mut core::ffi::c_void) -> Option<&mut T> {
+/// The struct the guest chained onto an answer, or `None` if it chained none.
+///
+/// A guest asking a query for more than the base struct says so by hanging a second struct off the
+/// answer's `pNext`, and this is how a handler reaches it without unsafe. It takes the answer as an
+/// [`cs::Out`], so the chain it walks is the decoder's and not a pointer the caller chose, and
+/// borrows it exclusively for as long as the link it hands back lives -- which is an `Out` too, so
+/// writing into it goes through [`cs::Out::edit`] like any answer.
+pub fn chained_mut<'c, T: OutStruct>(
+    head: &'c mut cs::Out<'_, impl cs::Links>,
+) -> Option<cs::Out<'c, T>> {
+    let mut first = head.next().cast_mut();
+    // SAFETY: `head` is the decoder's, so every link of its chain is an arena struct that outlives
+    // the exclusive borrow of `head` this one is tied to, and the link's own pointers are the
+    // decoder's too, which is what vouching for it claims.
+    chained_mut_at::<T>(&mut first).map(|t| unsafe { cs::Out::vouch(&mut *(t as *mut T)) })
+}
+
+/// [`chained_mut`] over a raw chain, for this module's own walks of answers it already trusts.
+fn chained_mut_at<T: OutStruct>(head: &mut *mut core::ffi::c_void) -> Option<&mut T> {
     let mut node = (*head).cast::<VkBaseOutStructure>();
     while !node.is_null() {
         // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one
@@ -7779,7 +7789,11 @@ mod tests {
         let mut props = VkExternalImageFormatProperties::default();
         let mut out = answer(&mut props);
         assert_eq!(
-            driver.image_format_properties2(METAL, cs::Decoded::planted(&info), &mut out),
+            driver.image_format_properties2(
+                METAL,
+                cs::Decoded::planted(&info),
+                cs::Out::planted(&mut out)
+            ),
             Ok(VkResult::VK_SUCCESS),
             "a dma-buf image is what this renderer mints, so the query is not the driver's to refuse",
         );
@@ -7819,7 +7833,11 @@ mod tests {
         let mut props = VkExternalImageFormatProperties::default();
         let mut out = answer(&mut props);
         assert_eq!(
-            driver.image_format_properties2(METAL, cs::Decoded::planted(&info), &mut out),
+            driver.image_format_properties2(
+                METAL,
+                cs::Decoded::planted(&info),
+                cs::Out::planted(&mut out)
+            ),
             Ok(VkResult::VK_SUCCESS),
             "the link is found wherever the guest hung it, not only at the head",
         );
@@ -7849,7 +7867,11 @@ mod tests {
         let mut props = VkExternalImageFormatProperties::default();
         let mut out = answer(&mut props);
         assert_eq!(
-            driver.image_format_properties2(METAL, cs::Decoded::planted(&metal_asked), &mut out),
+            driver.image_format_properties2(
+                METAL,
+                cs::Decoded::planted(&metal_asked),
+                cs::Out::planted(&mut out)
+            ),
             Ok(VkResult::VK_ERROR_FORMAT_NOT_SUPPORTED),
             "Metal's own handle type is not one of the two this renderer stands in for",
         );
@@ -7858,7 +7880,11 @@ mod tests {
         let mut props = VkExternalImageFormatProperties::default();
         let mut out = answer(&mut props);
         assert_eq!(
-            driver.image_format_properties2(NATIVE, cs::Decoded::planted(&info), &mut out),
+            driver.image_format_properties2(
+                NATIVE,
+                cs::Decoded::planted(&info),
+                cs::Out::planted(&mut out)
+            ),
             Ok(VkResult::VK_ERROR_FORMAT_NOT_SUPPORTED),
             "a driver that really has dma-buf is asked the question the guest sent",
         );
@@ -7954,7 +7980,7 @@ mod tests {
         };
         let mut head = (&mut first) as *mut _ as *mut core::ffi::c_void;
 
-        let found = chained_mut::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut head)
+        let found = chained_mut_at::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut head)
             .expect("the third link is still on the chain");
         found.allocationSize = 0x1234;
         assert_eq!(want.allocationSize, 0x1234, "the borrow writes into the guest's own struct");
@@ -7962,7 +7988,9 @@ mod tests {
         // And a chain without it says so, rather than handing back the nearest thing.
         first.pNext = core::ptr::null_mut();
         let mut head = (&mut first) as *mut _ as *mut core::ffi::c_void;
-        assert!(chained_mut::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut head).is_none());
+        assert!(
+            chained_mut_at::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut head).is_none()
+        );
     }
 
     const HOST_VISIBLE: VkMemoryPropertyFlags = VkMemoryPropertyFlags(

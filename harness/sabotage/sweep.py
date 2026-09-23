@@ -70,6 +70,27 @@ SABOTAGES = [
         'a_struct_with_a_pointer_anywhere_in_it_is_never_plain',
     ),
     (
+        'an answer takes any write, pointers included',
+        'src/venus/cs.rs',
+        """        assert!(before == after, "an answer's pointers or their counts were rewritten");""",
+        """        let _ = (before, after);""",
+        'an_answer_keeps',
+    ),
+    (
+        'the shape of an answer leaves out the counts its pointers are sized by',
+        'venus-gen/rustgen.py',
+        """                    lines.append('out.push(%s);' % shape[1].replace('val.', 'self.'))""",
+        """                    pass""",
+        'an_answer_keeps_the_size_of_its_blob',
+    ),
+    (
+        'the shape of an answer leaves out the structs it embeds',
+        'venus-gen/rustgen.py',
+        """                    lines.append('cs::Shape::shape(&self.%s, out);' % f)""",
+        """                    pass""",
+        'an_answer_keeps_the_pointers_of_what_it_embeds',
+    ),
+    (
         'a command can be copied, lending its arrays twice',
         'venus-gen/templates/types.rs',
         """% for ty in GEN.supported_types[VkType.COMMAND]:

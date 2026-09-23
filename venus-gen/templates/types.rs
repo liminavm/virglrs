@@ -17,10 +17,15 @@ use crate::venus::cs::{self, ObjectId, Scalar};
 /// Vulkan's handles are pointer-sized on every target this renderer supports.
 const _: () = assert!(size_of::<*const c_void>() == 8);
 
-<%def name="newtype(name, repr)">\
+<%def name="newtype(name, repr, plain=True)">\
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 #[repr(transparent)]
 pub struct ${name}(pub ${repr});
+% if plain:
+
+// SAFETY: a number, with nothing in it to follow.
+unsafe impl cs::Plain for ${name} {}
+% endif
 
 impl Scalar for ${name} {
     fn from_le_bytes(b: &[u8]) -> Self {
@@ -40,7 +45,7 @@ ${newtype(ty.name, inner)}\
 
 % for ty in GEN.supported_types[VkType.HANDLE]:
 /// ${'Dispatchable' if ty.dispatchable else 'Non-dispatchable'} handle.
-${newtype(ty.name, 'u64')}\
+${newtype(ty.name, 'u64', plain=False)}\
 % endfor
 
 % for ty in GEN.supported_types[VkType.ENUM]:
@@ -105,6 +110,17 @@ pub struct ${ty.name} {
 %   if not RUST.carries_pointers(ty.name):
 // SAFETY: no member of this struct is a pointer, nor embeds one -- `carries_pointers` says so.
 unsafe impl cs::Plain for ${ty.name} {}
+
+%   endif
+%   if RUST.shaped(ty.name):
+// SAFETY: every pointer member and every count one is sized by, from `RustGen.shape_lines`.
+unsafe impl cs::Shape for ${ty.name} {
+    fn shape(&self, out: &mut Vec<u64>) {
+%     for line in RUST.shape_lines(ty):
+        ${line}
+%     endfor
+    }
+}
 
 %   endif
 %   if any(v.name == 'pNext' for v in ty.variables):

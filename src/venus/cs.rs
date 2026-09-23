@@ -221,6 +221,15 @@ impl<'a, T> Decoded<'a, [T]> {
 /// generator implements it from the same predicate that decides what [`Decoded`] guards.
 pub unsafe trait Plain {}
 
+// SAFETY: numbers, with nothing in them to follow.
+unsafe impl Plain for u8 {}
+unsafe impl Plain for u32 {}
+unsafe impl Plain for i32 {}
+unsafe impl Plain for u64 {}
+unsafe impl Plain for i64 {}
+unsafe impl Plain for usize {}
+unsafe impl Plain for f32 {}
+
 impl<'a, T: Plain> From<&'a T> for Decoded<'a, T> {
     fn from(r: &'a T) -> Self {
         Decoded(r)
@@ -244,6 +253,100 @@ impl<T: ?Sized + core::fmt::Debug> core::fmt::Debug for Decoded<'_, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.0.fmt(f)
     }
+}
+
+/// A struct, or an array of them, that a query answers into: [`Decoded`]'s writable counterpart.
+///
+/// The driver fills it and the reply encoder reads it back, and both follow its pointers -- the
+/// `pNext` chain a guest hangs extra questions off, the blob a size member measures. So a handler
+/// holding one may write the answer's values and nothing that says where memory is: this derefs
+/// for reading, and every write goes through [`Out::edit`], which checks the struct's [`Shape`]
+/// came back as it went in. The driver writes through [`Out::as_mut_ptr`], which only it may
+/// follow.
+pub struct Out<'c, T: ?Sized>(&'c mut T);
+
+impl<T: ?Sized> core::ops::Deref for Out<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.0
+    }
+}
+
+impl<'c, T: ?Sized> Out<'c, T> {
+    /// Vouch for `r` as a struct the decoder allocated for an answer.
+    ///
+    /// # Safety
+    ///
+    /// As [`Decoded::vouch`]: every pointer reachable from `r` is null, or names memory that
+    /// lives for `'c` and is as long as the member sizing it says.
+    pub(crate) unsafe fn vouch(r: &'c mut T) -> Self {
+        Out(r)
+    }
+
+    /// Plant a struct a test built, as though the decoder had.
+    #[cfg(test)]
+    pub fn planted(r: &'c mut T) -> Self {
+        Out(r)
+    }
+
+    /// A shorter borrow of the same struct, to lend to the driver and keep using afterwards.
+    pub fn reborrow(&mut self) -> Out<'_, T> {
+        Out(self.0)
+    }
+
+    /// Where the struct is, for the driver to hand to Vulkan. Having the pointer is harmless;
+    /// writing through it is `unsafe`, and that is the driver's to justify.
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.0
+    }
+}
+
+impl<T: Shape> Out<'_, T> {
+    /// Write values into the answer.
+    ///
+    /// `f` gets the struct itself, so any member can be written -- and a pointer, or a count one
+    /// is read by, must come back as it was, which is asserted rather than trusted: changing one
+    /// is this renderer's bug, and the next thing to read the struct would follow it.
+    pub fn edit<R>(&mut self, f: impl FnOnce(&mut T) -> R) -> R {
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        self.0.shape(&mut before);
+        let r = f(self.0);
+        self.0.shape(&mut after);
+        assert!(before == after, "an answer's pointers or their counts were rewritten");
+        r
+    }
+}
+
+impl<T> Out<'_, [T]> {
+    /// Each element, as writable as the array was.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = Out<'_, T>> {
+        self.0.iter_mut().map(Out)
+    }
+}
+
+impl<'c, T: Plain> From<&'c mut T> for Out<'c, T> {
+    fn from(r: &'c mut T) -> Self {
+        Out(r)
+    }
+}
+
+impl<'c, T: Plain> From<&'c mut [T]> for Out<'c, [T]> {
+    fn from(r: &'c mut [T]) -> Self {
+        Out(r)
+    }
+}
+
+/// Every pointer in a struct, and every count one is sized by, as words. Generated.
+///
+/// What [`Out::edit`] holds a handler's writes to: these may not change, and everything else may.
+///
+/// # Safety
+///
+/// `shape` pushes every pointer the struct holds -- its own, its function pointers', and those of
+/// the structs it embeds -- and every expression the decoder sized one of them by.
+pub unsafe trait Shape {
+    fn shape(&self, out: &mut Vec<u64>);
 }
 
 /// A struct that heads a `pNext` chain, which is every Vulkan struct with an `sType`. Generated.
@@ -1293,6 +1396,46 @@ mod tests {
         assert!(!callbacks.plain(), "function pointers and a user pointer");
         let embeds = &Probe::<VkAttachmentSampleLocationsEXT>(PhantomData);
         assert!(!embeds.plain(), "a pointer inside an embedded struct");
+    }
+
+    /// The values of an answer are the handler's to write; that is what the query is for.
+    #[test]
+    fn an_answer_takes_its_values() {
+        use crate::venus::proto::types::VkPhysicalDeviceProperties2;
+        let mut props = VkPhysicalDeviceProperties2::default();
+        let mut out = Out::planted(&mut props);
+        out.edit(|p| p.properties.apiVersion = 42);
+        assert_eq!(props.properties.apiVersion, 42);
+    }
+
+    /// Its chain is not: the driver fills it and the reply encoder walks it.
+    #[test]
+    #[should_panic(expected = "an answer's pointers or their counts were rewritten")]
+    fn an_answer_keeps_its_chain() {
+        use crate::venus::proto::types::VkPhysicalDeviceProperties2;
+        let mut props = VkPhysicalDeviceProperties2::default();
+        let mut elsewhere = 0u64;
+        Out::planted(&mut props).edit(|p| p.pNext = (&raw mut elsewhere).cast());
+    }
+
+    /// Nor the size of a blob: the reply encoder copies that many bytes out of it.
+    #[test]
+    #[should_panic(expected = "an answer's pointers or their counts were rewritten")]
+    fn an_answer_keeps_the_size_of_its_blob() {
+        use crate::venus::proto::types::VkHostAddressRangeEXT;
+        let mut bytes = [0u8; 4];
+        let mut range = VkHostAddressRangeEXT { address: bytes.as_mut_ptr().cast(), size: 4 };
+        Out::planted(&mut range).edit(|r| r.size = 64);
+    }
+
+    /// Nor a pointer inside a struct it embeds.
+    #[test]
+    #[should_panic(expected = "an answer's pointers or their counts were rewritten")]
+    fn an_answer_keeps_the_pointers_of_what_it_embeds() {
+        use crate::venus::proto::types::{VkAttachmentSampleLocationsEXT, VkSampleLocationEXT};
+        let mut at = VkAttachmentSampleLocationsEXT::default();
+        let one = VkSampleLocationEXT::default();
+        Out::planted(&mut at).edit(|a| a.sampleLocationsInfo.pSampleLocations = &one);
     }
 
     #[test]
