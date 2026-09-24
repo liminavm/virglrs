@@ -4610,17 +4610,21 @@ impl Driver {
         submits: cs::Decoded<'_, [VkSubmitInfo]>,
         fence: VkFence,
     ) -> Option<VkResult> {
-        self.submitter(queue)?;
-        self.note_submit(submits.get(), fence);
         let q = self.submitter(queue)?;
-        let _vk = q.held();
-        // Submitting no work to signal a fence is a normal thing for a guest to do, and Vulkan
-        // takes a null array for it -- so the slice's own pointer is passed either way.
-        // SAFETY: a queue this context retrieved, and `submits` is an arena allocation live for
-        // the call whose count is its own length.
-        Some(unsafe {
-            (q.fns.vkQueueSubmit())(queue, submits.len() as u32, submits.as_ptr(), fence)
-        })
+        let ret = {
+            let _vk = q.held();
+            // Submitting no work to signal a fence is a normal thing for a guest to do, and Vulkan
+            // takes a null array for it -- so the slice's own pointer is passed either way.
+            // SAFETY: a queue this context retrieved, and `submits` is an arena allocation live
+            // for the call whose count is its own length.
+            unsafe { (q.fns.vkQueueSubmit())(queue, submits.len() as u32, submits.as_ptr(), fence) }
+        };
+        // Only a submit the driver took promises anything: a refused one performs none of its
+        // fence or semaphore operations, and a snapshot would restore them as done.
+        if ret == VkResult::VK_SUCCESS {
+            self.note_submit(submits.get(), fence);
+        }
+        Some(ret)
     }
 
     /// `vkQueueSubmit2`, the synchronization2 form of the submit above.
@@ -4635,13 +4639,19 @@ impl Driver {
     ) -> Result<VkResult, NoSubmit2> {
         let q = Arc::clone(self.submitter(queue).ok_or(NoSubmit2::Queue)?);
         let f = q.fns.try_vkQueueSubmit2().ok_or(NoSubmit2::EntryPoint)?;
-        self.note_submit2(submits.get(), fence);
-        let _vk = q.held();
-        // Submitting no work to signal a fence is as normal here as it is for v1, and Vulkan takes
-        // a null array for it -- so the slice's own pointer is passed either way.
-        // SAFETY: a queue this context retrieved, and `submits` is an arena allocation live for
-        // the call whose count is its own length.
-        Ok(unsafe { f(queue, submits.len() as u32, submits.as_ptr(), fence) })
+        let ret = {
+            let _vk = q.held();
+            // Submitting no work to signal a fence is as normal here as it is for v1, and Vulkan
+            // takes a null array for it -- so the slice's own pointer is passed either way.
+            // SAFETY: a queue this context retrieved, and `submits` is an arena allocation live
+            // for the call whose count is its own length.
+            unsafe { f(queue, submits.len() as u32, submits.as_ptr(), fence) }
+        };
+        // As for v1: only a submit the driver took is noted.
+        if ret == VkResult::VK_SUCCESS {
+            self.note_submit2(submits.get(), fence);
+        }
+        Ok(ret)
     }
 
     /// `vkResetFences`.
@@ -10136,6 +10146,88 @@ mod tests {
             );
             d.abandon_planted();
         }
+    }
+
+    /// A submit the driver refused promises nothing: its fence is not pending and its timeline
+    /// signals are not requested.
+    ///
+    /// Those two records are what a snapshot restores as signalled, on the grounds that the work
+    /// was submitted and will not survive the snapshot. A refused submit put no work on the
+    /// queue -- Vulkan performs none of its fence or semaphore operations -- so recording it
+    /// would bring the fence back signalled for work that never ran, and move the timeline past
+    /// a value nothing reached.
+    #[test]
+    fn a_refused_submit_leaves_no_fence_pending_and_no_signal_requested() {
+        const DEVICE: u64 = 0xd2;
+        const QUEUE: u64 = 0x92;
+        const TIMELINE: u64 = 0x44;
+        const FENCE: u64 = 0x99;
+
+        unsafe extern "C" fn submit(
+            _q: VkQueue,
+            _n: u32,
+            _s: *const VkSubmitInfo,
+            _f: VkFence,
+        ) -> VkResult {
+            VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY
+        }
+        unsafe extern "C" fn submit2(
+            _q: VkQueue,
+            _n: u32,
+            _s: *const VkSubmitInfo2,
+            _f: VkFence,
+        ) -> VkResult {
+            VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY
+        }
+
+        let mut d = Driver::new(Account::for_test(None));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkQueueSubmit(submit);
+        fns.plant_vkQueueSubmit2(submit2);
+        d.plant_device(VkDevice(DEVICE), fns);
+        d.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
+        d.plant_semaphore(VkSemaphore(TIMELINE), SemaphoreKind::Timeline);
+
+        let sems = [VkSemaphore(TIMELINE)];
+        let values = [7u64];
+        let timeline = VkTimelineSemaphoreSubmitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+            signalSemaphoreValueCount: 1,
+            pSignalSemaphoreValues: values.as_ptr(),
+            ..Default::default()
+        };
+        let v1 = [VkSubmitInfo {
+            pNext: (&raw const timeline).cast(),
+            signalSemaphoreCount: 1,
+            pSignalSemaphores: sems.as_ptr(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            d.queue_submit(VkQueue(QUEUE), cs::Decoded::planted(&v1 as &[_]), VkFence(FENCE)),
+            Some(VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY),
+            "the driver's refusal is the guest's answer"
+        );
+        assert!(!d.fence_pending(VkFence(FENCE)), "a refused submit leaves its fence alone");
+        assert_eq!(d.semaphore_requested(VkSemaphore(TIMELINE)), 0, "and asks no timeline");
+
+        let signal = [VkSemaphoreSubmitInfo {
+            semaphore: VkSemaphore(TIMELINE),
+            value: 9,
+            ..Default::default()
+        }];
+        let v2 = [VkSubmitInfo2 {
+            signalSemaphoreInfoCount: 1,
+            pSignalSemaphoreInfos: signal.as_ptr(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            d.queue_submit2(VkQueue(QUEUE), cs::Decoded::planted(&v2 as &[_]), VkFence(FENCE)),
+            Ok(VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY),
+        );
+        assert!(!d.fence_pending(VkFence(FENCE)), "the synchronization2 form the same");
+        assert_eq!(d.semaphore_requested(VkSemaphore(TIMELINE)), 0);
+
+        d.abandon_planted();
     }
 
     /// A venus ring fence waits for the GPU, rather than retiring the moment it is asked for.

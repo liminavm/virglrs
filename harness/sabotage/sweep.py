@@ -1823,6 +1823,24 @@ SABOTAGES = [
         """            let _ = (budget, held);""",
         'a_frames_bitstream_is_charged_for_as_long_as_it_is_held',
     ),
+    (
+        'a refused vkQueueSubmit still records what it promised',
+        'src/venus/driver.rs',
+        """        if ret == VkResult::VK_SUCCESS {
+            self.note_submit(submits.get(), fence);""",
+        """        if ret == ret {
+            self.note_submit(submits.get(), fence);""",
+        'a_refused_submit_leaves_no_fence_pending_and_no_signal_requested',
+    ),
+    (
+        'a refused vkQueueSubmit2 still records what it promised',
+        'src/venus/driver.rs',
+        """        if ret == VkResult::VK_SUCCESS {
+            self.note_submit2(submits.get(), fence);""",
+        """        if ret == ret {
+            self.note_submit2(submits.get(), fence);""",
+        'a_refused_submit_leaves_no_fence_pending_and_no_signal_requested',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
