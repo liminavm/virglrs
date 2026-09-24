@@ -685,17 +685,20 @@ pub enum Unfed {
 /// A plain map plus a second map of retained dwords would be two records of one fact, and the
 /// destroy that updates only one of them is the bug this shape cannot have: there is one entry,
 /// [`insert`](Objects::insert) is the only way to make one and takes both halves at once, and
-/// `remove` takes both away. Lookups hand out only the object, so no caller can reach the wire to
-/// let it drift -- the journal reads it through [`retained`](Objects::retained) alone.
+/// [`remove`](Objects::remove) takes both away together -- to a bound shader's slot, which
+/// rebuilds from them, or to be dropped. Lookups hand out only the object, so no caller can reach
+/// the wire to let it drift -- the journal reads it through [`retained`](Objects::retained) and
+/// the slots alone.
 #[derive(Default)]
 pub struct Objects {
     live: crate::Map<ObjectHandle, (Retained, Object)>,
 }
 
 impl Objects {
-    /// Create an object and retain the command that asked for it.
-    fn insert(&mut self, handle: ObjectHandle, at: Retained, obj: Object) -> Option<Object> {
-        self.live.insert(handle, (at, obj)).map(|(_, old)| old)
+    /// Create an object and retain the command that asked for it, under a handle that is free.
+    fn insert(&mut self, handle: ObjectHandle, at: Retained, obj: Object) {
+        let old = self.live.insert(handle, (at, obj));
+        assert!(old.is_none(), "an object is inserted only under a handle already vacated");
     }
 
     fn get(&self, handle: &ObjectHandle) -> Option<&Object> {
@@ -706,8 +709,8 @@ impl Objects {
         self.live.get_mut(handle).map(|(_, o)| o)
     }
 
-    fn remove(&mut self, handle: &ObjectHandle) -> Option<Object> {
-        self.live.remove(handle).map(|(_, o)| o)
+    fn remove(&mut self, handle: &ObjectHandle) -> Option<(Retained, Object)> {
+        self.live.remove(handle)
     }
 
     /// Retain another chunk of the create already under way for `handle` -- a shader's text
@@ -1050,8 +1053,8 @@ impl SubContext {
             }
         }
         for b in std::mem::take(&mut self.shaders) {
-            if let Some(Bound::Owned(s)) = b {
-                draw::release_shader(&mut self, gl, bound, s);
+            if let Some(Bound::Owned(o)) = b {
+                draw::release_shader(&mut self, gl, bound, o.shader);
             }
         }
         self.gl_ctx
@@ -1680,6 +1683,25 @@ impl Context {
         total
     }
 
+    /// What the current sub-context has bound at `stage`: the handle of a shader bound from the
+    /// table, `None` inside for one the guest destroyed while bound.
+    #[cfg(test)]
+    pub fn bound_shader(&self, stage: ShaderStage) -> Option<Option<ObjectHandle>> {
+        self.sub().shaders[stage.index()].as_ref().map(|b| match b {
+            Bound::Object { handle, .. } => Some(*handle),
+            Bound::Owned(_) => None,
+        })
+    }
+
+    /// The stage of the shader the current sub-context's table holds under `handle`.
+    #[cfg(test)]
+    pub fn shader_in_table(&self, handle: ObjectHandle) -> Option<ShaderStage> {
+        match self.sub().objects.get(&handle) {
+            Some(Object::Shader(s)) => Some(s.stage),
+            _ => None,
+        }
+    }
+
     /// The current sub-context's view and sampler-state bindings for `stage`, in slot order.
     #[cfg(test)]
     pub fn bound_units(&self, stage: ShaderStage) -> (Bindings, Bindings) {
@@ -1736,6 +1758,17 @@ impl Context {
                     c.add_wire(wire.len(), false);
                 }
             }
+            for (i, b) in sub.shaders.iter().enumerate() {
+                let Some((b, stage)) = b.as_ref().zip(ShaderStage::from_wire(i as u32)) else {
+                    continue;
+                };
+                // An orphan's create is a create, as it was in the table; its bind and its
+                // destroy are the slot's.
+                for (n, (_, chunks)) in b.rebuild(stage).iter().enumerate() {
+                    let dwords = chunks.iter().map(Vec::len).sum();
+                    c.add_wire(dwords, matches!(b, Bound::Owned(_)) && n == 0);
+                }
+            }
         }
         for at in self.video.retained() {
             c.add(at, true);
@@ -1769,7 +1802,14 @@ impl Context {
                     step: Step::Feed { sub: id.0, chunks: Cow::Owned(vec![wire]) },
                 })
             });
-            create.into_iter().chain(objects).chain(state).chain(units)
+            let shaders = sub.shaders.iter().enumerate().flat_map(move |(i, b)| {
+                let rebuilt = b.as_ref().zip(ShaderStage::from_wire(i as u32));
+                rebuilt
+                    .into_iter()
+                    .flat_map(|(b, stage)| b.rebuild(stage))
+                    .map(move |(seq, chunks)| Entry { seq, step: Step::Feed { sub: id.0, chunks } })
+            });
+            create.into_iter().chain(objects).chain(state).chain(units).chain(shaders)
         });
         // Codecs and decode targets belong to the context, not to a sub-context, so they are fed
         // on whichever one is current -- any of them will do. Without them a restored context is
@@ -2240,21 +2280,28 @@ impl Context {
         obj: Object,
         wire: &[u32],
     ) {
+        // The old object goes first, so that anything its going is retained at sorts before this
+        // create: replayed the other way round, it would free the object this command made.
+        self.destroy_object(host, handle);
         let at = Retained::new(self.seq.advance(), wire);
-        if let Some(old) = self.sub_mut().objects.insert(handle, at, obj) {
-            self.on_object_gone(host, handle, old);
-        }
+        self.sub_mut().objects.insert(handle, at, obj);
     }
 
     /// `vrend_renderer_object_destroy`: the type byte is ignored, a missing handle is nothing.
     fn destroy_object(&mut self, host: &mut Host<'_>, handle: ObjectHandle) {
-        if let Some(old) = self.sub_mut().objects.remove(&handle) {
-            self.on_object_gone(host, handle, old);
+        if let Some((created, old)) = self.sub_mut().objects.remove(&handle) {
+            self.on_object_gone(host, handle, created, old);
         }
     }
 
     /// The per-type destroy callbacks: unbind what was bound, then release the GL side.
-    fn on_object_gone(&mut self, host: &mut Host<'_>, handle: ObjectHandle, old: Object) {
+    fn on_object_gone(
+        &mut self,
+        host: &mut Host<'_>,
+        handle: ObjectHandle,
+        created: Retained,
+        old: Object,
+    ) {
         let gl = host.gl;
         match &old {
             Object::Dsa(_) => {
@@ -2321,22 +2368,23 @@ impl Context {
                 }
             }
             Object::Shader(shader) => {
+                let stage = shader.stage.index();
+                let bound = self.sub().shaders[stage].as_ref().is_some_and(|b| b.is(handle));
+                // A position of its own, which a rebuild destroys the shader at.
+                let destroyed_at = bound.then(|| self.seq.advance());
                 let sub = self.sub_mut();
                 for s in sub.long_shader.iter_mut() {
                     if *s == Some(handle) {
                         *s = None;
                     }
                 }
+                let Object::Shader(shader) = old else { unreachable!() };
                 // The C holds a reference from the bound slot, so the shader outlives its
                 // handle there: the slot takes it over.
-                let slot = &mut sub.shaders[shader.stage.index()];
-                if slot.as_ref().is_some_and(|b| b.is(handle)) {
-                    let Object::Shader(shader) = old else { unreachable!() };
-                    *slot = Some(Bound::Owned(shader));
-                    return;
+                match (&mut sub.shaders[stage], destroyed_at) {
+                    (Some(slot), Some(at)) => slot.orphan(shader, created, at),
+                    _ => draw::release_shader(sub, gl, host.current.program(), shader),
                 }
-                let Object::Shader(shader) = old else { unreachable!() };
-                draw::release_shader(sub, gl, host.current.program(), shader);
                 return;
             }
             _ => {}
@@ -2540,24 +2588,27 @@ impl Context {
         handle: Option<ObjectHandle>,
         stage: ShaderStage,
     ) {
-        let sub = self.sub_mut();
-        let bound = match handle {
+        let handle = match handle {
             None => None,
-            Some(h) => match sub.objects.get(&h) {
-                Some(Object::Shader(s)) if s.stage == stage => Some(Bound::Object(h)),
+            Some(h) => match self.sub().objects.get(&h) {
+                Some(Object::Shader(s)) if s.stage == stage => Some(h),
                 _ => return,
             },
         };
-        let same = match (&bound, &sub.shaders[stage.index()]) {
+        // Only a bind that binds takes a position: the slot is what a rebuild binds from.
+        let at = self.seq.advance();
+        let sub = self.sub_mut();
+        let same = match (handle, &sub.shaders[stage.index()]) {
             (None, None) => true,
-            (Some(Bound::Object(a)), Some(b)) => b.is(*a),
+            (Some(a), Some(b)) => b.is(a),
             _ => false,
         };
         if !same {
             sub.shader_dirty = true;
         }
-        if let Some(Bound::Owned(s)) = std::mem::replace(&mut sub.shaders[stage.index()], bound) {
-            draw::release_shader(sub, host.gl, host.current.program(), s);
+        let bound = handle.map(|handle| Bound::Object { handle, at });
+        if let Some(Bound::Owned(o)) = std::mem::replace(&mut sub.shaders[stage.index()], bound) {
+            draw::release_shader(sub, host.gl, host.current.program(), o.shader);
         }
     }
 

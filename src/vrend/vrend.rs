@@ -1399,6 +1399,8 @@ fn parse_gles_version(s: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vrend::pipe::ShaderStage;
+    use crate::vrend::proto::ObjectHandle;
 
     #[test]
     fn a_blob_is_never_published_past_the_resource_backing_it() {
@@ -2193,6 +2195,130 @@ mod tests {
         assert_eq!(dropped, 0, "a rebuild of what the context holds drops nothing");
         assert_eq!(v.contexts[&ctx.id()].bound_units(stage), live, "and binds what it held");
         v.context_destroy(ctx, &AllAttached);
+    }
+
+    /// What the vertex stage holds, and the stage of the shader the table holds under handle 3.
+    type ShaderSlot = (Option<Option<ObjectHandle>>, Option<ShaderStage>);
+
+    /// Run `commands` on a fresh context, then rebuild it from its journal, and answer what the
+    /// vertex stage holds and what the table holds under handle 3, live and rebuilt, with the
+    /// number of commands the rebuild dropped.
+    fn shader_slot_across_a_rebuild(
+        commands: &[crate::vrend::proto::Command<'_>],
+    ) -> (ShaderSlot, ShaderSlot, u64) {
+        use crate::vrend::encode::encode;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+        )
+        .expect("vrend comes up");
+        let mut wire = Vec::new();
+        for c in commands {
+            encode(c, &mut wire);
+        }
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &NoGuest).expect("a context");
+        v.submit(ctx, &wire, &NoGuest).expect("the context is here").expect("accepted");
+        let h = ObjectHandle::new(3).expect("non-zero");
+        let seen = |v: &Vrend| {
+            let c = &v.contexts[&ctx.id()];
+            (c.bound_shader(ShaderStage::Vertex), c.shader_in_table(h))
+        };
+        let live = seen(&v);
+
+        let journal = v.journal_export(ctx).expect("a live context exports its journal");
+        v.context_destroy(ctx, &NoGuest);
+        v.context_create(ctx, &NoGuest).expect("a fresh context to rebuild");
+        assert!(v.replay_begin(ctx));
+        v.journal_restore(ctx, &journal).expect("the journal is taken");
+        v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)).expect("and fed");
+        let dropped = v.contexts.get_mut(&ctx.id()).expect("the context").replay_end();
+        let rebuilt = seen(&v);
+        v.context_destroy(ctx, &NoGuest);
+        (live, rebuilt, dropped)
+    }
+
+    /// A whole shader of `stage` under handle 3, and the text it is made from.
+    fn shader_under_3(stage: ShaderStage, text: &[u32]) -> crate::vrend::proto::Command<'_> {
+        use crate::vrend::proto::{
+            Command, Object, ShaderChunk, ShaderCreate, ShaderKind, StreamOutput,
+        };
+        Command::CreateObject {
+            handle: ObjectHandle::new(3).expect("non-zero"),
+            object: Object::Shader(ShaderCreate {
+                stage,
+                chunk: ShaderChunk::New { total_bytes: text.len() as u32 * 4 },
+                num_tokens: 100,
+                kind: ShaderKind::Graphics { stream_output: StreamOutput::default() },
+                text,
+            }),
+        }
+    }
+
+    /// TGSI text as the guest sends it: dword-packed, NUL-terminated.
+    fn tgsi_words(text: &str) -> Vec<u32> {
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(0);
+        bytes.resize(bytes.len().div_ceil(4) * 4, 0);
+        bytes.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    const PASS_VS: &str =
+        "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n";
+    const RED_FS: &str = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 { 1.0, 0.0, 0.0, 1.0 }\n  \
+                          0: MOV OUT[0], IMM[0]\n  1: END\n";
+
+    /// A shader the guest destroys while it is bound stays bound, as the C's reference keeps it,
+    /// and a rebuild must reach the same place: bound, and gone from the table. The bind alone
+    /// names a handle the journal no longer creates.
+    #[test]
+    fn a_shader_destroyed_while_bound_is_rebuilt_bound_and_destroyed() {
+        use crate::vrend::proto::{Command, ObjectType};
+        let h = ObjectHandle::new(3).expect("non-zero");
+        let vs = tgsi_words(PASS_VS);
+        let (live, rebuilt, dropped) = shader_slot_across_a_rebuild(&[
+            shader_under_3(ShaderStage::Vertex, &vs),
+            Command::BindShader { stage: ShaderStage::Vertex, handle: Some(h) },
+            Command::DestroyObject { kind: ObjectType::Shader, handle: h },
+            // Ignored, as the C ignores it: the handle names no shader now.
+            Command::BindShader { stage: ShaderStage::Vertex, handle: Some(h) },
+        ]);
+        assert_eq!(live, (Some(None), None), "the slot holds the destroyed shader");
+        assert_eq!(dropped, 0, "a rebuild of what the context holds drops nothing");
+        assert_eq!(rebuilt, live, "and holds what it held");
+    }
+
+    /// A create under the handle of a bound shader replaces it in the table and leaves it bound.
+    /// The rebuild must free the handle before that create, not after, or it frees the new object.
+    #[test]
+    fn a_create_over_a_bound_shaders_handle_keeps_both_across_a_rebuild() {
+        use crate::vrend::proto::Command;
+        let h = ObjectHandle::new(3).expect("non-zero");
+        let (vs, fs) = (tgsi_words(PASS_VS), tgsi_words(RED_FS));
+        let (live, rebuilt, dropped) = shader_slot_across_a_rebuild(&[
+            shader_under_3(ShaderStage::Vertex, &vs),
+            Command::BindShader { stage: ShaderStage::Vertex, handle: Some(h) },
+            shader_under_3(ShaderStage::Fragment, &fs),
+        ]);
+        assert_eq!(
+            live,
+            (Some(None), Some(ShaderStage::Fragment)),
+            "the vertex shader stays bound; the handle names the fragment shader"
+        );
+        assert_eq!(dropped, 0, "a rebuild of what the context holds drops nothing");
+        assert_eq!(rebuilt, live, "and holds what it held");
     }
 
     /// A view names its resource by handle, and the guest may free that handle and reuse it for a

@@ -55,20 +55,70 @@ pub struct Variant {
     pub gl: Option<ShaderName>,
 }
 
-/// What a sub-context has bound at a stage. The C holds a reference, so a shader the guest
-/// destroys while it is bound stays bound until the next bind; it moves here from the object
-/// table, and the slot is the one owner either way. Six slots, so the size of the owned case
-/// is nothing.
-#[allow(clippy::large_enum_variant)]
+/// What a sub-context has bound at a stage, and when. The C holds a reference, so a shader the
+/// guest destroys while it is bound stays bound until the next bind; it moves here from the
+/// object table, and the slot is the one owner either way.
+///
+/// The slot is also what a rebuild binds from, as the sampler units are, and not the last
+/// `BIND_SHADER` sent: the C ignores a bind naming no shader of the stage, so the last command
+/// can name something the slot never held.
 pub enum Bound {
-    Object(ObjectHandle),
-    Owned(Shader),
+    /// Bound from the table, by the command retained at `at`.
+    Object {
+        handle: ObjectHandle,
+        at: Seq,
+    },
+    Owned(Box<Orphan>),
+}
+
+/// A shader destroyed while bound, with what a rebuild needs to reach the same state: its
+/// create under the handle it had, the bind, and the destroy, each at the position it was
+/// accepted. The handle may name another object by now; the destroy comes before that object's
+/// create, so a rebuild frees it for the create exactly as the guest did.
+pub struct Orphan {
+    pub shader: Shader,
+    handle: ObjectHandle,
+    created: Retained,
+    bound_at: Seq,
+    destroyed_at: Seq,
 }
 
 impl Bound {
     /// Whether this is `handle`, bound from the table.
     pub fn is(&self, handle: ObjectHandle) -> bool {
-        matches!(self, Bound::Object(h) if *h == handle)
+        matches!(self, Bound::Object { handle: h, .. } if *h == handle)
+    }
+
+    /// The shader bound here leaves the table, destroyed at `destroyed_at`: the slot takes it,
+    /// and the create the table retained for it.
+    pub fn orphan(&mut self, shader: Shader, created: Retained, destroyed_at: Seq) {
+        let Bound::Object { handle, at } = *self else {
+            panic!("only a shader bound from the table can leave it");
+        };
+        *self =
+            Bound::Owned(Box::new(Orphan { shader, handle, created, bound_at: at, destroyed_at }));
+    }
+
+    /// The commands that put this binding back in a fresh sub-context, each at its position.
+    pub fn rebuild(&self, stage: ShaderStage) -> Vec<(Seq, Cow<'_, [Vec<u32>]>)> {
+        let bind = |handle| {
+            let mut wire = Vec::new();
+            encode::encode(&Command::BindShader { stage, handle: Some(handle) }, &mut wire);
+            Cow::Owned(vec![wire])
+        };
+        match self {
+            Bound::Object { handle, at } => vec![(*at, bind(*handle))],
+            Bound::Owned(o) => {
+                let mut destroy = Vec::new();
+                let kind = ObjectType::Shader;
+                encode::encode(&Command::DestroyObject { kind, handle: o.handle }, &mut destroy);
+                vec![
+                    (o.created.seq, Cow::Borrowed(o.created.chunks.as_slice())),
+                    (o.bound_at, bind(o.handle)),
+                    (o.destroyed_at, Cow::Owned(vec![destroy])),
+                ]
+            }
+        }
     }
 }
 
@@ -176,11 +226,11 @@ impl SubContext {
     /// The program bound at `stage`, when a shader is bound there and its text is whole.
     pub(super) fn bound_program(&self, stage: ShaderStage) -> Option<&Program> {
         let shader = match self.shaders[stage.index()].as_ref()? {
-            Bound::Object(h) => match self.objects.get(h) {
+            Bound::Object { handle, .. } => match self.objects.get(handle) {
                 Some(Object::Shader(s)) => s,
                 _ => return None,
             },
-            Bound::Owned(s) => s,
+            Bound::Owned(o) => &o.shader,
         };
         match &shader.text {
             ShaderText::Whole(p) => Some(p),
@@ -190,11 +240,11 @@ impl SubContext {
 
     fn bound_shader_mut(&mut self, stage: ShaderStage) -> Option<&mut Shader> {
         match self.shaders[stage.index()].as_mut()? {
-            Bound::Object(h) => match self.objects.get_mut(h) {
+            Bound::Object { handle, .. } => match self.objects.get_mut(handle) {
                 Some(Object::Shader(s)) => Some(s),
                 _ => None,
             },
-            Bound::Owned(s) => Some(s),
+            Bound::Owned(o) => Some(&mut o.shader),
         }
     }
 
@@ -478,7 +528,7 @@ impl Context {
     ) -> Result<bool, Fault> {
         let sub = self.sub();
         let handle = match sub.shaders[stage.index()].as_ref() {
-            Some(Bound::Object(h)) => Some(*h),
+            Some(Bound::Object { handle, .. }) => Some(*handle),
             Some(Bound::Owned(_)) => None,
             None => return Ok(false),
         };

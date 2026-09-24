@@ -132,8 +132,6 @@ pub fn state_key(cmd: &Command<'_>) -> Option<StateKey> {
     let (cmd, slot) = match cmd {
         // Per object type: one bind of each kind is current at a time.
         Command::BindObject { kind, .. } => (Cmd::BindObject, (kind.wire(), 0)),
-        // Per stage.
-        Command::BindShader { stage, .. } => (Cmd::BindShader, (stage.index() as u32, 0)),
         // Per stage and the first slot the set writes.
         Command::SetConstantBuffer { stage, index, .. } => {
             (Cmd::SetConstantBuffer, stage_slot(stage, index))
@@ -180,6 +178,10 @@ pub fn state_key(cmd: &Command<'_>) -> Option<StateKey> {
         // create, so the last command sent names objects the units no longer hold -- replayed, it
         // binds nothing past the dead view and binds a reused handle into a slot that was empty.
         Command::SetSamplerViews { .. } | Command::BindSamplerStates { .. } => return None,
+        // Likewise the shader slots (`Bound::rebuild`): a shader destroyed while bound stays
+        // bound, and the C ignores a bind naming no shader of the stage, so the last bind sent can
+        // name what the slot does not hold.
+        Command::BindShader { .. } => return None,
 
         // Work, not state: the client re-issues these every frame, so a rebuild that starts with
         // none of them is a rebuild that is simply between frames.

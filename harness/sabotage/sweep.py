@@ -1847,6 +1847,29 @@ SABOTAGES = [
         'a_texture_view_is_refused_once_its_handle_names_a_buffer',
     ),
     (
+        "a rebuild binds an orphaned shader without creating it",
+        'src/vrend/context/select.rs',
+        """                    (o.created.seq, Cow::Borrowed(o.created.chunks.as_slice())),""",
+        """                    (o.created.seq, Cow::Owned(vec![Vec::new()])),""",
+        'a_shader_destroyed_while_bound_is_rebuilt_bound_and_destroyed',
+    ),
+    (
+        "a rebuild leaves an orphaned shader's handle live",
+        'src/vrend/context/select.rs',
+        """                    (o.destroyed_at, Cow::Owned(vec![destroy])),""",
+        """                    (o.destroyed_at, Cow::Owned(vec![Vec::new()])),""",
+        'a_shader_destroyed_while_bound_is_rebuilt_bound_and_destroyed',
+    ),
+    (
+        'a replacing create is retained before the object it replaces goes',
+        'src/vrend/context.rs',
+        """        self.destroy_object(host, handle);
+        let at = Retained::new(self.seq.advance(), wire);""",
+        """        let at = Retained::new(self.seq.advance(), wire);
+        self.destroy_object(host, handle);""",
+        'a_create_over_a_bound_shaders_handle_keeps_both_across_a_rebuild',
+    ),
+    (
         'an shm mapping may run past the end of its descriptor',
         'src/guest_mem.rs',
         """        if len as u64 > held {""",
