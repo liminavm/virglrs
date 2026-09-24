@@ -6,6 +6,7 @@
 use core::mem::offset_of;
 
 use super::types::*;
+use crate::venus::cs;
 
 /// A whole type, as the compiler laid it out.
 pub struct TypeLayout {
