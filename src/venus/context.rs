@@ -729,12 +729,10 @@ impl Context {
             driver: &mut self.driver,
             global,
             ctx: id,
-            reject: None,
+            ask: None,
             resources,
             rings: &mut self.rings,
             monitor: &mut self.monitor,
-            wait: None,
-            execute: None,
             current_ring: on,
             reply,
             replaying: replay,
@@ -1270,6 +1268,8 @@ fn run_batch(
             (t.take_added(), t.take_removed())
         };
         let note = h.note.take();
+        // Drained with them, so that nothing a handler asked for outlives its command.
+        let ask = h.ask.take();
 
         match verdict {
             Dispatched::Served => {}
@@ -1320,10 +1320,13 @@ fn run_batch(
         // have, a length that would send the driver off the end of what was decoded -- or no
         // handler exists for it. The handler has no decoder to say so with; this is where it
         // lands.
-        if let Some(why) = h.reject.take() {
-            poison(id, &dec, cmd, why);
-            break;
-        }
+        let ask = match ask {
+            Some(Ask::Reject(why)) => {
+                poison(id, &dec, cmd, why);
+                break;
+            }
+            ask => ask,
+        };
 
         // Poisoned from outside while the command ran -- a ring thread stopping this context.
         // The command itself was served, and its answer must not go over: a reply from a
@@ -1338,7 +1341,7 @@ fn run_batch(
         // not the answer, which would otherwise report a wait as finished before it was. The
         // command is counted twice in `dispatched` for the same reason -- a cosmetic cost of
         // the resume being a real re-dispatch rather than a resumption of one.
-        if let Some(on) = h.wait.take() {
+        if let Some(Ask::Suspend(on)) = ask {
             // Not from inside an execute. A suspension unwinds to `ffi.rs`, which resumes the
             // *outer* batch from the position it was handed -- and that position names a byte
             // in the outer stream, not in the copied one this command came from. The C can
@@ -1358,9 +1361,9 @@ fn run_batch(
             break;
         }
 
-        // A handler asking for streams to be executed. Same message shape as `wait`, for the
-        // same reason: the nested dispatch needs a decoder, and a handler has none.
-        if let Some(exec) = h.execute.take() {
+        // A handler asking for streams to be executed: the nested dispatch needs a decoder, and a
+        // handler has none.
+        if let Some(Ask::Execute(exec)) = ask {
             if h.depth > 0 {
                 poison(
                     id,
@@ -1847,9 +1850,10 @@ pub struct Handlers<'a> {
     /// The entry points that exist before an instance does. Owned by the renderer root, because
     /// they are the same for every context.
     global: &'a Global,
-    /// Why the handler refused the command, if it did. It cannot be reported from here -- the
-    /// handler has no decoder -- so the loop reads it back and poisons with this as the reason.
-    reject: Option<&'static str>,
+    /// What the handler asks of the loop beyond its reply, if anything. Set through
+    /// [`Handlers::reject`], [`Handlers::suspend`] and [`Handlers::execute`], and read back and
+    /// cleared by the loop after every command.
+    ask: Option<Ask>,
     /// The renderer's resource table, for the commands that name guest memory.
     resources: &'a dyn ShmResources,
     /// Which context this is, for the resource questions whose answer is only meaningful within
@@ -1864,17 +1868,6 @@ pub struct Handlers<'a> {
     rings: &'a mut BTreeMap<RingId, RingEntry>,
     /// The context's ring monitor, started here by the first ring that asks for one.
     monitor: &'a mut Option<Monitor>,
-    /// A handler asking to be suspended: it cannot proceed until something outside this context
-    /// happens, and it must not sleep here.
-    ///
-    /// Read back and cleared by the loop, like `reject`. The reason it is a message rather than a
-    /// blocking call is the lock: this loop runs with the context locked and, on the ABI path,
-    /// with the renderer root locked behind that. A handler that slept would hold both, and the
-    /// thread it is waiting for needs the first of them to make any progress at all.
-    wait: Option<Wait>,
-    /// A handler asking for command streams to be executed, for the same reason `wait` is a
-    /// message: the nested dispatch needs a decoder, and a handler is handed none.
-    execute: Option<Execute>,
     /// Whether this batch is a snapshot journal being replayed rather than a guest talking.
     ///
     /// A created ring reads it: replay restores head and status words the host would otherwise
@@ -1897,12 +1890,12 @@ pub struct Handlers<'a> {
     own_wait: Option<InFlight>,
     /// What the recorder could not work out for itself, left by the handler that knows.
     ///
-    /// A message, like `wait` and `execute`, and for a narrower version of the same reason: the
-    /// loop can see what a command created (the object table counted it) and what it named (the
-    /// decoder collected it), but a ring is not an object in that table and a pool reset names its
-    /// pool among several handles the loop cannot tell apart. Rather than have the loop re-read
+    /// A message, like `ask`, and for a narrower version of the same reason: the loop can see
+    /// what a command created (the object table counted it) and what it named (the decoder
+    /// collected it), but a ring is not an object in that table and a pool reset names its pool
+    /// among several handles the loop cannot tell apart. Rather than have the loop re-read
     /// arguments the handler already decoded -- a second opinion about a reconciled value -- the
-    /// handler says.
+    /// handler says. Kept apart from `ask` because it goes with a command that was served.
     note: Option<Note>,
     /// Where a command that still describes live state is kept, so the context can be rebuilt.
     journal: &'a mut Journal,
@@ -1939,6 +1932,37 @@ enum Note {
     PoolReset(Vec<ObjectKey>),
 }
 
+/// What a handler asks of the batch loop about the command it just ran.
+///
+/// A message rather than an action, because each needs something a handler is not handed: a
+/// refusal is reported through the decoder, a nested dispatch needs one of its own, and a wait
+/// must not sleep here -- this loop runs with the context locked and, on the ABI path, with the
+/// renderer root locked behind that, and the thread being waited for needs the first of them to
+/// make any progress at all.
+///
+/// One slot, because a command ends one way. A refusal outranks the others: once a handler has
+/// found the command unusable nothing it goes on to ask for can stand.
+enum Ask {
+    /// The command was unusable -- an id the guest cannot have, a length that would send the
+    /// driver off the end of what was decoded -- and the context is poisoned with this reason.
+    Reject(&'static str),
+    /// The command cannot proceed until something outside this context happens, and is offered
+    /// again once it has.
+    Suspend(Wait),
+    /// These command streams are to be run before the next command.
+    Execute(Execute),
+}
+
+impl Ask {
+    fn name(&self) -> &'static str {
+        match self {
+            Ask::Reject(_) => "a refusal",
+            Ask::Suspend(_) => "a suspension",
+            Ask::Execute(_) => "command streams to be run",
+        }
+    }
+}
+
 impl Handlers<'_> {
     /// The ring a command named, or a rejection. Zero is no ring: it is `VK_NULL_HANDLE` in the
     /// space the guest names objects from, and it is what the journal writes for the context's
@@ -1947,9 +1971,65 @@ impl Handlers<'_> {
     fn named_ring(&mut self, raw: u64) -> Option<RingId> {
         let id = RingId::new(raw);
         if id.is_none() {
-            self.reject = Some("named ring 0, which is no ring");
+            self.reject("named ring 0, which is no ring");
         }
         id
+    }
+
+    /// Refuse the command: the loop poisons the context with `why`. Replaces anything else this
+    /// command asked for, which a refused command does not get.
+    fn reject(&mut self, why: &'static str) {
+        self.ask = Some(Ask::Reject(why));
+    }
+
+    /// Ask for the batch to be suspended on `wait` and this command offered again.
+    fn suspend(&mut self, wait: Wait) {
+        self.ask_once(Ask::Suspend(wait));
+    }
+
+    /// Ask for command streams to be run before the next command.
+    fn execute(&mut self, exec: Execute) {
+        self.ask_once(Ask::Execute(exec));
+    }
+
+    /// A refusal already made stands. Anything else already asked is a handler asking twice,
+    /// which is ours: no handler ends a command two ways.
+    fn ask_once(&mut self, ask: Ask) {
+        match &self.ask {
+            None => self.ask = Some(ask),
+            Some(Ask::Reject(_)) => {}
+            Some(had) => {
+                panic!("a handler asked for {} after already asking for {}", ask.name(), had.name())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn rejected(&self) -> Option<&'static str> {
+        match self.ask {
+            Some(Ask::Reject(why)) => Some(why),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn take_rejected(&mut self) -> Option<&'static str> {
+        let why = self.rejected();
+        if why.is_some() {
+            self.ask = None;
+        }
+        why
+    }
+
+    #[cfg(test)]
+    fn take_suspended(&mut self) -> Option<Wait> {
+        match self.ask.take() {
+            Some(Ask::Suspend(wait)) => Some(wait),
+            other => {
+                self.ask = other;
+                None
+            }
+        }
     }
 
     /// The guest id a single out-handle carries, or None when the guest asked for no object.
@@ -2002,7 +2082,7 @@ impl Handlers<'_> {
     /// guest drawing through binds and writes that never happened.
     fn array<T>(&mut self, a: Option<T>) -> Option<T> {
         if a.is_none() {
-            self.reject = Some("counted an array it did not send");
+            self.reject("counted an array it did not send");
         }
         a
     }
@@ -2015,7 +2095,7 @@ impl Handlers<'_> {
     /// though the host had written it.
     fn fills<T>(&mut self, out: Option<T>) -> Option<T> {
         if out.is_none() {
-            self.reject = Some("asked a query with no struct to answer into");
+            self.reject("asked a query with no struct to answer into");
         }
         out
     }
@@ -2036,7 +2116,7 @@ impl Handlers<'_> {
     #[must_use]
     fn counted(&mut self, asked: bool) -> bool {
         if !asked {
-            self.reject = Some("enumerated without asking for a count");
+            self.reject("enumerated without asking for a count");
         }
         asked
     }
@@ -2054,7 +2134,7 @@ impl Handlers<'_> {
     /// means is the handler's, and this is where the whole family decides it once.
     fn names<I>(&mut self, info: Option<I>) -> Option<I> {
         if info.is_none() {
-            self.reject = Some("asked a query without saying what it is about");
+            self.reject("asked a query without saying what it is about");
         }
         info
     }
@@ -2067,7 +2147,7 @@ impl Handlers<'_> {
     /// other than a refusal would be reporting success for a call that never happened.
     fn asked<R>(&mut self, r: Result<R, VkResult>) -> Option<R> {
         if r.is_err() {
-            self.reject = Some("asked a query this driver cannot answer");
+            self.reject("asked a query this driver cannot answer");
         }
         r.ok()
     }
@@ -2094,7 +2174,7 @@ impl Handlers<'_> {
         match r {
             Ok(r) => Some(r),
             Err(why) => {
-                self.reject = Some(match why {
+                self.reject(match why {
                     Q::NoDevice => "named a query pool on a device with no table here",
                     Q::NoHostReset => {
                         "reset a query pool from the host on a device that exports no reset"
@@ -2116,11 +2196,11 @@ impl Handlers<'_> {
         match r {
             Ok(r) => Some(r),
             Err(driver::FreeRefused::NotFromThisPool) => {
-                self.reject = Some("frees objects the pool it names did not allocate");
+                self.reject("frees objects the pool it names did not allocate");
                 None
             }
             Err(driver::FreeRefused::NoDevice) => {
-                self.reject = Some("frees from a pool on a device with no table here");
+                self.reject("frees from a pool on a device with no table here");
                 None
             }
         }
@@ -2160,7 +2240,7 @@ impl Handlers<'_> {
     }
 
     fn no_recorder(&mut self) {
-        self.reject = Some("recorded into a command buffer with no device behind it");
+        self.reject("recorded into a command buffer with no device behind it");
     }
 
     /// Where this stream keeps the driver wait it is suspended on: its ring's entry, so that the
@@ -2210,12 +2290,12 @@ impl Handlers<'_> {
     /// destroy could pull out from under the driver, so the batch is refused instead.
     fn suspend_on(&mut self, wait: DriverWait) {
         let Some(record) = self.wait_record() else {
-            self.reject = Some("suspended on a driver wait on a ring that is not here");
+            self.reject("suspended on a driver wait on a ring that is not here");
             return;
         };
         assert!(record.is_none(), "a stream suspended on a driver wait while one was in flight");
         *record = Some(wait.in_flight());
-        self.wait = Some(Wait::Driver(wait));
+        self.suspend(Wait::Driver(wait));
     }
 
     /// Whether a driver wait in flight on any of this context's streams is reading `fence`.
@@ -2235,7 +2315,7 @@ impl Handlers<'_> {
 
     /// The three refusals a timeline command has, said once.
     fn refuse_timeline(&mut self, e: NotATimeline) {
-        self.reject = Some(match e {
+        self.reject(match e {
             NotATimeline::Binary => "waited on a binary semaphore",
             NotATimeline::Unrecorded => "named an unrecorded semaphore",
             NotATimeline::Malformed => "waited on semaphores it did not send",
@@ -2249,14 +2329,14 @@ impl Handlers<'_> {
             Ok(VkResult::VK_SUCCESS) => {}
             Ok(r) => {
                 eprintln!("[virglrs] {cmd} refused by the driver: {r:?}");
-                self.reject = Some("asked for a sync payload the driver would not move");
+                self.reject("asked for a sync payload the driver would not move");
             }
             Err(NoSyncFd::NoDevice) => {
-                self.reject = Some("moved a sync payload on a device it does not have");
+                self.reject("moved a sync payload on a device it does not have");
             }
             Err(NoSyncFd::Unsupported) => {
                 eprintln!("[virglrs] {cmd}: this driver exports no external sync fd");
-                self.reject = Some("asked for venus sync on a driver that cannot do it");
+                self.reject("asked for venus sync on a driver that cannot do it");
             }
         }
     }
@@ -2384,7 +2464,7 @@ impl Commands for Handlers<'_> {
     /// says.
     fn unsupported(&mut self, cmd: VkCommandTypeEXT) {
         self.todo.note(cmd);
-        self.reject = Some("is not a command this build serves");
+        self.reject("is not a command this build serves");
     }
 
     /// A create naming an id that already names an object is refused before the handler runs.
@@ -2404,7 +2484,7 @@ impl Commands for Handlers<'_> {
             return true;
         }
         if self.objects.borrow().get(id).is_some() {
-            self.reject = Some("created an object under an id that is already an object");
+            self.reject("created an object under an id that is already an object");
             return false;
         }
         true
@@ -2434,7 +2514,7 @@ impl Commands for Handlers<'_> {
                 // objects is what the table exists to make impossible, and the C renderer
                 // refuses it the same way.
                 if host.0 != 0 && (have.ty != ty || have.handle != host) {
-                    self.reject = Some("named by a live id an object that id does not name");
+                    self.reject("named by a live id an object that id does not name");
                 }
                 return;
             }
@@ -2449,7 +2529,7 @@ impl Commands for Handlers<'_> {
                 && host.0 != 0
                 && objects.id_of_handle(ty, host).is_some_and(|first| first != id)
             {
-                self.reject = Some("named under a second id an object it had already named");
+                self.reject("named under a second id an object it had already named");
                 return;
             }
         }
@@ -2461,7 +2541,7 @@ impl Commands for Handlers<'_> {
             return;
         }
         if self.objects.borrow_mut().add(id, ty, host, owner).is_err() {
-            self.reject = Some("named an object it cannot have");
+            self.reject("named an object it cannot have");
         }
     }
 
@@ -2559,7 +2639,7 @@ impl Commands for Handlers<'_> {
         // Any wait on the device, not only one reading a handle: the cascade below destroys every
         // child the guest left, which is where a fence still being waited on would go.
         if self.waited_device(args.device) {
-            self.reject = Some("destroyed a device one of its streams is waiting on");
+            self.reject("destroyed a device one of its streams is waiting on");
             return;
         }
         // Taken out before the driver call, because destroying them afterwards would be destroying
@@ -2594,7 +2674,7 @@ impl Commands for Handlers<'_> {
         // hardware.
         let host = host.map_err(|e| {
             if let driver::NoMemory::OverBudget { stop: true } = e {
-                self.reject = Some("the host memory budget refused this allocation");
+                self.reject("the host memory budget refused this allocation");
             }
             e.ret()
         });
@@ -2622,7 +2702,7 @@ impl Commands for Handlers<'_> {
     /// would answer for whatever handle Vulkan hands out next.
     fn vkDestroyFence(&mut self, args: &mut vn_command_vkDestroyFence<'_>) {
         if self.waited_fence(args.fence) {
-            self.reject = Some("destroyed a fence one of its streams is waiting on");
+            self.reject("destroyed a fence one of its streams is waiting on");
             return;
         }
         self.driver.destroy_object(
@@ -2648,7 +2728,7 @@ impl Commands for Handlers<'_> {
 
     fn vkDestroySemaphore(&mut self, args: &mut vn_command_vkDestroySemaphore<'_>) {
         if self.waited_semaphore(args.semaphore) {
-            self.reject = Some("destroyed a semaphore one of its streams is waiting on");
+            self.reject("destroyed a semaphore one of its streams is waiting on");
             return;
         }
         self.driver.destroy_object(
@@ -2914,7 +2994,7 @@ impl Commands for Handlers<'_> {
     fn vkCreateShaderModule(&mut self, args: &mut vn_command_vkCreateShaderModule<'_>) {
         let Some(info) = self.names(args.pCreateInfo) else { return };
         if info.codeSize % 4 != 0 {
-            self.reject = Some("gave a shader a code size that is not a whole number of words");
+            self.reject("gave a shader a code size that is not a whole number of words");
             return;
         }
         let host = self.driver.create_object(
@@ -3125,7 +3205,7 @@ impl Commands for Handlers<'_> {
         if args.has_pLayerName() {
             // A layer is host-side software the guest cannot see and this renderer does not load,
             // so naming one is not a request that can be honoured or a mistake to smooth over.
-            self.reject = Some("named a layer, which no venus renderer has");
+            self.reject("named a layer, which no venus renderer has");
             return;
         }
         if !self.counted(args.has_pPropertyCount()) {
@@ -3192,14 +3272,14 @@ impl Commands for Handlers<'_> {
 
     fn vkCreateRingMESA(&mut self, args: &mut vn_command_vkCreateRingMESA<'_>) {
         if self.current_ring.is_some() {
-            self.reject = Some("created a ring from inside a ring's own stream");
+            self.reject("created a ring from inside a ring's own stream");
             return;
         }
         let Some(id) = self.named_ring(args.ring) else {
             return;
         };
         let Some(info) = args.pCreateInfo else {
-            self.reject = Some("asked to create a ring with no description of it");
+            self.reject("asked to create a ring with no description of it");
             return;
         };
 
@@ -3207,7 +3287,7 @@ impl Commands for Handlers<'_> {
         // replacing matters: the entry that is already there owns a share of a mapping, and
         // dropping it silently would strand whatever is still reading from it.
         if self.rings.contains_key(&id) {
-            self.reject = Some("created a ring under an id that is already a ring");
+            self.reject("created a ring under an id that is already a ring");
             return;
         }
 
@@ -3215,12 +3295,12 @@ impl Commands for Handlers<'_> {
             Ok(r) => r,
             Err(RingError::NoResource(h)) => {
                 eprintln!("[virglrs] vkCreateRingMESA: resource {h} is not a mapped shm resource");
-                self.reject = Some("created a ring in a resource that has no host mapping");
+                self.reject("created a ring in a resource that has no host mapping");
                 return;
             }
             Err(RingError::Layout(e)) => {
                 eprintln!("[virglrs] vkCreateRingMESA: ring {id}: {e:?}");
-                self.reject = Some("created a ring with a layout we will not touch");
+                self.reject("created a ring with a layout we will not touch");
                 return;
             }
 
@@ -3229,7 +3309,7 @@ impl Commands for Handlers<'_> {
                     "[virglrs] vkCreateRingMESA: ring {id}: head={head} status={status:#x} before \
                      the host has written either"
                 );
-                self.reject = Some("created a ring another renderer is already driving");
+                self.reject("created a ring another renderer is already driving");
                 return;
             }
         };
@@ -3240,7 +3320,7 @@ impl Commands for Handlers<'_> {
         // nothing has to be unwound.
         if let Some(want) = monitor_period(info) {
             let Some(period_us) = want else {
-                self.reject = Some("asked to be monitored with a reporting period of zero");
+                self.reject("asked to be monitored with a reporting period of zero");
                 return;
             };
             match self.monitor {
@@ -3262,7 +3342,7 @@ impl Commands for Handlers<'_> {
 
     fn vkDestroyRingMESA(&mut self, args: &mut vn_command_vkDestroyRingMESA<'_>) {
         if self.current_ring.is_some() {
-            self.reject = Some("destroyed a ring from inside a ring's own stream");
+            self.reject("destroyed a ring from inside a ring's own stream");
             return;
         }
         let Some(id) = self.named_ring(args.ring) else {
@@ -3275,7 +3355,7 @@ impl Commands for Handlers<'_> {
         // this is never a ring's own thread asking, and because that thread never blocks on the
         // context lock this dispatch is holding.
         match self.rings.remove(&id).map(|e| e.slot) {
-            None => self.reject = Some("destroyed a ring that was never created"),
+            None => self.reject("destroyed a ring that was never created"),
             Some(RingSlot::Idle(_)) => self.note = Some(Note::RingGone(id)),
             Some(RingSlot::Running(t)) => {
                 drop(t.stop());
@@ -3290,14 +3370,14 @@ impl Commands for Handlers<'_> {
     /// caller may simply have raced, a notify names a ring the guest believes it owns.
     fn vkNotifyRingMESA(&mut self, args: &mut vn_command_vkNotifyRingMESA<'_>) {
         if self.current_ring.is_some() {
-            self.reject = Some("rang a ring's doorbell from inside a ring's own stream");
+            self.reject("rang a ring's doorbell from inside a ring's own stream");
             return;
         }
         let Some(id) = self.named_ring(args.ring) else {
             return;
         };
         match self.rings.get(&id).map(|e| &e.slot) {
-            None => self.reject = Some("rang the doorbell of a ring that was never created"),
+            None => self.reject("rang the doorbell of a ring that was never created"),
             // Not yet reading, so there is nothing to wake. Harmless to miss: promotion happens
             // at the end of this batch, and a fresh thread reads the tail before it can park.
             Some(RingSlot::Idle(_)) => {}
@@ -3311,17 +3391,17 @@ impl Commands for Handlers<'_> {
     /// mapping, because the rest of the resource is not the guest's to reach through this door.
     fn vkWriteRingExtraMESA(&mut self, args: &mut vn_command_vkWriteRingExtraMESA<'_>) {
         if self.current_ring.is_some() {
-            self.reject = Some("wrote a ring's extra word from inside a ring's own stream");
+            self.reject("wrote a ring's extra word from inside a ring's own stream");
             return;
         }
         let Some(id) = self.named_ring(args.ring) else {
             return;
         };
         match self.rings.get(&id).map(|e| &e.slot) {
-            None => self.reject = Some("wrote the extra word of a ring that was never created"),
+            None => self.reject("wrote the extra word of a ring that was never created"),
             Some(slot) => {
                 if !slot.control().write_extra(args.offset, args.value) {
-                    self.reject = Some("wrote outside the ring's extra region");
+                    self.reject("wrote outside the ring's extra region");
                 }
             }
         }
@@ -3337,16 +3417,14 @@ impl Commands for Handlers<'_> {
     /// and carried into its thread's park state at promotion, because it is state and not an edge.
     fn vkSubmitVirtqueueSeqnoMESA(&mut self, args: &mut vn_command_vkSubmitVirtqueueSeqnoMESA<'_>) {
         if self.current_ring.is_some() {
-            self.reject = Some("submitted a virtqueue seqno from inside a ring's own stream");
+            self.reject("submitted a virtqueue seqno from inside a ring's own stream");
             return;
         }
         let Some(id) = self.named_ring(args.ring) else {
             return;
         };
         match self.rings.get_mut(&id).map(|e| &mut e.slot) {
-            None => {
-                self.reject = Some("submitted a virtqueue seqno for a ring that was never created")
-            }
+            None => self.reject("submitted a virtqueue seqno for a ring that was never created"),
             Some(RingSlot::Idle(r)) => {
                 if args.seqno > r.virtqueue_seqno {
                     r.virtqueue_seqno = args.seqno;
@@ -3371,21 +3449,21 @@ impl Commands for Handlers<'_> {
     /// still reach it. See [`Submitted::Waiting`].
     fn vkWaitVirtqueueSeqnoMESA(&mut self, args: &mut vn_command_vkWaitVirtqueueSeqnoMESA<'_>) {
         let Some(id) = self.current_ring else {
-            self.reject = Some("waited on a virtqueue seqno from the context's own stream");
+            self.reject("waited on a virtqueue seqno from the context's own stream");
             return;
         };
         // Already satisfied is the common case and costs nothing: the guest submits the seqno and
         // waits for it in that order far more often than it gets ahead of itself.
         let published = match self.rings.get(&id).map(|e| &e.slot) {
             None => {
-                self.reject = Some("waited on a virtqueue seqno for a ring that is not here");
+                self.reject("waited on a virtqueue seqno for a ring that is not here");
                 return;
             }
             Some(RingSlot::Idle(r)) => r.virtqueue_seqno,
             Some(RingSlot::Running(t)) => t.virtqueue_seqno(),
         };
         if published < args.seqno {
-            self.wait = Some(Wait::Virtqueue(args.seqno));
+            self.suspend(Wait::Virtqueue(args.seqno));
         }
     }
 
@@ -3402,31 +3480,31 @@ impl Commands for Handlers<'_> {
     /// been yet.
     fn vkWaitRingSeqnoMESA(&mut self, args: &mut vn_command_vkWaitRingSeqnoMESA<'_>) {
         if self.current_ring.is_some() {
-            self.reject = Some("waited on a ring seqno from inside a ring's own stream");
+            self.reject("waited on a ring seqno from inside a ring's own stream");
             return;
         }
         // A ring seqno is a byte position in a 32-bit free-running counter, widened to fit the
         // wire's field. A guest naming a value that does not fit is describing a position its own
         // ring cannot hold; truncating it would build a wait on a number nobody asked for.
         let Ok(seqno) = u32::try_from(args.seqno) else {
-            self.reject = Some("waited on a ring seqno too large to be a position in a ring");
+            self.reject("waited on a ring seqno too large to be a position in a ring");
             return;
         };
         let Some(id) = self.named_ring(args.ring) else {
             return;
         };
         match self.rings.get(&id).map(|e| &e.slot) {
-            None => self.reject = Some("waited on the seqno of a ring that was never created"),
+            None => self.reject("waited on the seqno of a ring that was never created"),
             // Nothing advances an idle ring's head -- it has no thread yet, and promotion happens
             // only once this batch is over, which this command is inside. Suspending on it would
             // be suspending forever.
             Some(RingSlot::Idle(_)) => {
-                self.reject = Some("waited on the seqno of a ring that is not reading yet")
+                self.reject("waited on the seqno of a ring that is not reading yet")
             }
             Some(RingSlot::Running(t)) => {
                 t.notify();
                 if !seqno_ge(t.control().head(), seqno) {
-                    self.wait = Some(Wait::Ring { ring: id, seqno });
+                    self.suspend(Wait::Ring { ring: id, seqno });
                 }
             }
         }
@@ -3445,7 +3523,7 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkSetReplyCommandStreamMESA<'_>,
     ) {
         let Some(stream) = args.pStream else {
-            self.reject = Some("set a reply stream without saying where it is");
+            self.reject("set a reply stream without saying where it is");
             return;
         };
 
@@ -3455,12 +3533,12 @@ impl Commands for Handlers<'_> {
                 eprintln!(
                     "[virglrs] vkSetReplyCommandStreamMESA: resource {h} is not a mapped shm resource"
                 );
-                self.reject = Some("set a reply stream in a resource that has no host mapping");
+                self.reject("set a reply stream in a resource that has no host mapping");
                 return;
             }
             Err(e @ ReplyStreamError::OutOfRange { .. }) => {
                 eprintln!("[virglrs] vkSetReplyCommandStreamMESA: {e:?}");
-                self.reject = Some("set a reply stream that does not fit the resource holding it");
+                self.reject("set a reply stream that does not fit the resource holding it");
                 return;
             }
         };
@@ -3483,7 +3561,7 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkSeekReplyCommandStreamMESA<'_>,
     ) {
         let Some(reply) = self.reply.as_mut() else {
-            self.reject = Some("seeked a reply stream that was never set");
+            self.reject("seeked a reply stream that was never set");
             return;
         };
         if !reply.seek(args.position) {
@@ -3492,7 +3570,7 @@ impl Commands for Handlers<'_> {
                 args.position,
                 reply.window().size()
             );
-            self.reject = Some("seeked a reply stream past the end of its own window");
+            self.reject("seeked a reply stream past the end of its own window");
         }
     }
 
@@ -3510,12 +3588,12 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkExecuteCommandStreamsMESA<'_>,
     ) {
         if !args.has_pStreams() {
-            self.reject = Some("executed command streams without saying which");
+            self.reject("executed command streams without saying which");
             return;
         }
         let streams = args.pStreams();
         if streams.is_empty() {
-            self.reject = Some("executed no command streams at all");
+            self.reject("executed no command streams at all");
             return;
         }
 
@@ -3524,15 +3602,14 @@ impl Commands for Handlers<'_> {
         // streams anyway would run them and drop every answer.
         let reply_positions = match args.pReplyPositions() {
             Some(_) if self.reply.is_none() => {
-                self.reject =
-                    Some("executed command streams with reply positions and no reply stream");
+                self.reject("executed command streams with reply positions and no reply stream");
                 return;
             }
             Some(p) => Some(p.to_vec()),
             None => None,
         };
 
-        self.execute = Some(Execute { streams: streams.to_vec(), reply_positions });
+        self.execute(Execute { streams: streams.to_vec(), reply_positions });
     }
 
     // The queries that carry a `ret`. Where a command has a field designed to say "no", that is
@@ -4260,7 +4337,7 @@ impl Commands for Handlers<'_> {
     ) {
         let pd = args.physicalDevice;
         let Some(info) = args.pFormatInfo else {
-            self.reject = Some("asked which formats are sparse without naming one");
+            self.reject("asked which formats are sparse without naming one");
             return;
         };
         if !self.counted(args.has_pPropertyCount()) {
@@ -4316,7 +4393,7 @@ impl Commands for Handlers<'_> {
     ) {
         let device = args.device;
         let Some(info) = args.pInfo else {
-            self.reject = Some("asked an image's sparse requirements without naming the image");
+            self.reject("asked an image's sparse requirements without naming the image");
             return;
         };
         if !self.counted(args.has_pSparseMemoryRequirementCount()) {
@@ -4346,8 +4423,7 @@ impl Commands for Handlers<'_> {
     ) {
         let device = args.device;
         let Some(info) = args.pInfo else {
-            self.reject =
-                Some("asked an unbuilt image's sparse requirements without describing it");
+            self.reject("asked an unbuilt image's sparse requirements without describing it");
             return;
         };
         if !self.counted(args.has_pSparseMemoryRequirementCount()) {
@@ -4976,7 +5052,7 @@ impl Commands for Handlers<'_> {
     fn vkTransitionImageLayout(&mut self, args: &mut vn_command_vkTransitionImageLayout<'_>) {
         let transitions = args.pTransitions();
         let Some(ret) = self.driver.transition_image_layout(args.device, transitions) else {
-            self.reject = Some("transitioned an image layout on a device it does not have");
+            self.reject("transitioned an image layout on a device it does not have");
             return;
         };
         args.ret = ret;
@@ -4985,7 +5061,7 @@ impl Commands for Handlers<'_> {
     fn vkCopyImageToImage(&mut self, args: &mut vn_command_vkCopyImageToImage<'_>) {
         let Some(info) = self.names(args.pCopyImageToImageInfo) else { return };
         let Some(ret) = self.driver.copy_image_to_image(args.device, info) else {
-            self.reject = Some("copied between images on a device it does not have");
+            self.reject("copied between images on a device it does not have");
             return;
         };
         args.ret = ret;
@@ -4998,11 +5074,11 @@ impl Commands for Handlers<'_> {
         // No blob to read into is not an empty read: the guest asked for the image's bytes and
         // gave nowhere to put them, and answering success would report a copy that never ran.
         let Some(out) = args.pData_mut() else {
-            self.reject = Some("read an image out without room for the bytes");
+            self.reject("read an image out without room for the bytes");
             return;
         };
         let Some(ret) = self.driver.copy_image_to_memory(device, info, out) else {
-            self.reject = Some("read an image out on a device it does not have");
+            self.reject("read an image out on a device it does not have");
             return;
         };
         args.ret = ret;
@@ -5011,7 +5087,7 @@ impl Commands for Handlers<'_> {
     fn vkCopyMemoryToImageMESA(&mut self, args: &mut vn_command_vkCopyMemoryToImageMESA<'_>) {
         let Some(info) = self.names(args.pCopyMemoryToImageInfo) else { return };
         let Some(ret) = self.driver.copy_memory_to_image(args.device, info) else {
-            self.reject = Some("wrote into an image on a device it does not have");
+            self.reject("wrote into an image on a device it does not have");
             return;
         };
         args.ret = ret;
@@ -5070,7 +5146,7 @@ impl Commands for Handlers<'_> {
         // decoder cannot resolve into a slice, and pushing whatever the layout last held would
         // hand the next draw constants the guest never sent.
         let Some(values) = args.pValues() else {
-            self.reject = Some("pushed constants without saying what they are");
+            self.reject("pushed constants without saying what they are");
             return;
         };
         let done = self.driver.cmd_push_constants(
@@ -5135,7 +5211,7 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkGetCalibratedTimestampsKHR<'_>,
     ) {
         if !args.has_pMaxDeviation() {
-            self.reject = Some("asked for calibrated timestamps with no room for the deviation");
+            self.reject("asked for calibrated timestamps with no room for the deviation");
             return;
         }
         let device = args.device;
@@ -5183,7 +5259,7 @@ impl Commands for Handlers<'_> {
         // empty slice goes through rather than being turned away.
         let submits = args.pSubmits();
         let Some(ret) = self.driver.queue_submit(args.queue, submits, args.fence) else {
-            self.reject = Some("submitted to a queue with no device behind it");
+            self.reject("submitted to a queue with no device behind it");
             return;
         };
         args.ret = ret;
@@ -5196,11 +5272,9 @@ impl Commands for Handlers<'_> {
         let submits = args.pSubmits();
         match self.driver.queue_submit2(args.queue, submits, args.fence) {
             Ok(ret) => args.ret = ret,
-            Err(NoSubmit2::Queue) => {
-                self.reject = Some("submitted to a queue with no device behind it")
-            }
+            Err(NoSubmit2::Queue) => self.reject("submitted to a queue with no device behind it"),
             Err(NoSubmit2::EntryPoint) => {
-                self.reject = Some("submitted with vkQueueSubmit2 to a device that has none")
+                self.reject("submitted with vkQueueSubmit2 to a device that has none")
             }
         }
     }
@@ -5275,7 +5349,7 @@ impl Commands for Handlers<'_> {
         }
         if self.blocks_inline() {
             let Some(ret) = self.driver.queue_op(args.queue, |d| d.vkQueueWaitIdle()) else {
-                self.reject = Some("waited on a queue with no device behind it");
+                self.reject("waited on a queue with no device behind it");
                 return;
             };
             args.ret = ret;
@@ -5283,7 +5357,7 @@ impl Commands for Handlers<'_> {
         }
         match self.driver.queue_idle_wait(args.queue) {
             Some(wait) => self.suspend_on(wait),
-            None => self.reject = Some("waited on a queue with no device behind it"),
+            None => self.reject("waited on a queue with no device behind it"),
         }
     }
 
@@ -5334,8 +5408,8 @@ impl Commands for Handlers<'_> {
         let Some(out) = self.fills(args.pValue_mut()) else { return };
         let r = self.driver.semaphore_counter(device, semaphore, out);
         match r {
-            Err(NotATimeline::Binary) => self.reject = Some("read a binary semaphore's counter"),
-            Err(_) => self.reject = Some("named an unrecorded semaphore"),
+            Err(NotATimeline::Binary) => self.reject("read a binary semaphore's counter"),
+            Err(_) => self.reject("named an unrecorded semaphore"),
             Ok(r) => {
                 if let Some(ret) = self.asked(r) {
                     args.ret = ret;
@@ -5347,12 +5421,12 @@ impl Commands for Handlers<'_> {
     /// Raise a timeline semaphore's counter from the host side.
     fn vkSignalSemaphore(&mut self, args: &mut vn_command_vkSignalSemaphore<'_>) {
         let Some(info) = args.pSignalInfo else {
-            self.reject = Some("signalled a semaphore it did not name");
+            self.reject("signalled a semaphore it did not name");
             return;
         };
         match self.driver.signal_semaphore(args.device, info) {
-            Err(NotATimeline::Binary) => self.reject = Some("signalled a binary semaphore"),
-            Err(_) => self.reject = Some("named an unrecorded semaphore"),
+            Err(NotATimeline::Binary) => self.reject("signalled a binary semaphore"),
+            Err(_) => self.reject("named an unrecorded semaphore"),
             Ok(ret) => args.ret = ret,
         }
     }
@@ -5368,7 +5442,7 @@ impl Commands for Handlers<'_> {
             return;
         }
         let Some(info) = args.pWaitInfo else {
-            self.reject = Some("waited on semaphores it did not name");
+            self.reject("waited on semaphores it did not name");
             return;
         };
         let probe = match self.driver.wait_semaphores(args.device, info, 0) {
@@ -5511,14 +5585,14 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkImportSemaphoreResourceMESA<'_>,
     ) {
         let Some(info) = args.pImportSemaphoreResourceInfo else {
-            self.reject = Some("imported a semaphore payload from no descriptor at all");
+            self.reject("imported a semaphore payload from no descriptor at all");
             return;
         };
         // The C asserts on this. Here it is the guest's own number, arriving over the wire, so an
         // assert would let a guest abort the process: only id 0 -- an already-signaled payload
         // with no resource behind it -- is a thing this serves, and anything else is rejected.
         if info.resourceId != 0 {
-            self.reject = Some("imported a semaphore payload from a resource id");
+            self.reject("imported a semaphore payload from a resource id");
             return;
         }
         let done = self.driver.import_signaled_semaphore(args.device, info.semaphore);
@@ -6514,12 +6588,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -6536,7 +6608,7 @@ mod tests {
         let mut args = vn_command_vkDeviceWaitIdle { device, ..Default::default() };
         h.vkDeviceWaitIdle(&mut args);
         SAW.with_borrow(|s| assert!(s.waited.is_empty(), "nothing was asked under the lock"));
-        let Some(Wait::Driver(wait)) = h.wait.take() else {
+        let Some(Wait::Driver(wait)) = h.take_suspended() else {
             panic!("an idle wait suspends the batch");
         };
         assert_eq!(
@@ -7840,12 +7912,10 @@ mod tests {
                     driver: &mut driver,
                     global: &global,
                     ctx: ContextId::new(1).expect("1 is not zero"),
-                    reject: None,
+                    ask: None,
                     resources: &t,
                     rings: &mut rings,
                     monitor: &mut monitor,
-                    wait: None,
-                    execute: None,
                     replaying: false,
                     depth: 0,
                     answer: None,
@@ -7856,7 +7926,7 @@ mod tests {
                     journal: &mut jrnl,
                 };
                 h.vkGetMemoryResourcePropertiesMESA($args);
-                h.reject
+                h.rejected()
             }};
         }
 
@@ -7913,12 +7983,10 @@ mod tests {
                     driver: &mut driver,
                     global: &global,
                     ctx: ContextId::new(1).expect("1 is not zero"),
-                    reject: None,
+                    ask: None,
                     resources: &t,
                     rings: &mut rings,
                     monitor: &mut monitor,
-                    wait: None,
-                    execute: None,
                     replaying: false,
                     depth: 0,
                     answer: None,
@@ -7930,7 +7998,7 @@ mod tests {
                 };
                 #[allow(clippy::redundant_closure_call)]
                 (|h: &mut Handlers| $call(h))(&mut h);
-                h.reject
+                h.rejected()
             }};
         }
 
@@ -8023,12 +8091,10 @@ mod tests {
                     driver: &mut driver,
                     global: &global,
                     ctx: ContextId::new(1).expect("1 is not zero"),
-                    reject: None,
+                    ask: None,
                     resources: &t,
                     rings: &mut rings,
                     monitor: &mut monitor,
-                    wait: None,
-                    execute: None,
                     replaying: false,
                     depth: 0,
                     answer: None,
@@ -8040,7 +8106,7 @@ mod tests {
                 };
                 #[allow(clippy::redundant_closure_call)]
                 (|h: &mut Handlers| $call(h))(&mut h);
-                h.reject
+                h.rejected()
             }};
         }
 
@@ -8126,12 +8192,10 @@ mod tests {
                     driver: &mut driver,
                     global: &global,
                     ctx: ContextId::new(1).expect("1 is not zero"),
-                    reject: None,
+                    ask: None,
                     resources: &NO_RESOURCES,
                     rings: &mut rings,
                     monitor: &mut monitor,
-                    wait: None,
-                    execute: None,
                     replaying: false,
                     depth: 0,
                     answer: None,
@@ -8142,7 +8206,7 @@ mod tests {
                     journal: &mut jrnl,
                 };
                 h.vkGetPhysicalDeviceQueueFamilyProperties($args);
-                assert!(h.reject.is_none(), "a served enumeration is not a refusal");
+                assert!(h.rejected().is_none(), "a served enumeration is not a refusal");
             }};
         }
 
@@ -8251,12 +8315,10 @@ mod tests {
                     driver: &mut driver,
                     global: &global,
                     ctx: ContextId::new(1).expect("1 is not zero"),
-                    reject: None,
+                    ask: None,
                     resources: &NO_RESOURCES,
                     rings: &mut rings,
                     monitor: &mut monitor,
-                    wait: None,
-                    execute: None,
                     replaying: false,
                     depth: 0,
                     answer: None,
@@ -8267,7 +8329,7 @@ mod tests {
                     journal: &mut jrnl,
                 };
                 h.vkGetPhysicalDeviceToolProperties($args);
-                assert!(h.reject.is_none(), "a short answer is an answer, not a refusal");
+                assert!(h.rejected().is_none(), "a short answer is an answer, not a refusal");
             }};
         }
 
@@ -8571,12 +8633,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -8624,7 +8684,7 @@ mod tests {
         h.vkGetBufferDeviceAddress(&mut args);
         assert_eq!(args.ret.0, ADDRESS, "the driver's address, not a zero of ours");
 
-        assert!(h.reject.is_none(), "every one of those was answerable");
+        assert!(h.rejected().is_none(), "every one of those was answerable");
         SAW.with_borrow(|s| {
             assert_eq!(s.buffers, [0x111], "the buffer went to the buffer query");
             assert_eq!(s.images, [0x222], "and the image to the image one");
@@ -8636,7 +8696,7 @@ mod tests {
         let mut args = vn_command_vkGetBufferMemoryRequirements::default();
         args.device = device;
         h.vkGetBufferMemoryRequirements(&mut args);
-        assert!(h.reject.take().is_some(), "a query with nowhere to answer");
+        assert!(h.take_rejected().is_some(), "a query with nowhere to answer");
 
         // A query this driver has no entry point for. `vkGetRenderAreaGranularity` was never
         // planted above, so the table has no opinion about it.
@@ -8645,7 +8705,7 @@ mod tests {
         args.device = device;
         args.plant_pGranularity(&mut extent);
         h.vkGetRenderAreaGranularity(&mut args);
-        assert!(h.reject.take().is_some(), "a query this driver cannot answer");
+        assert!(h.take_rejected().is_some(), "a query this driver cannot answer");
 
         // The address queries have no field in which to say no, so a failed ask must reject too:
         // `ret` stays zero, and zero is a null address.
@@ -8656,7 +8716,7 @@ mod tests {
             ..Default::default()
         };
         h.vkGetDeviceMemoryOpaqueCaptureAddress(&mut args);
-        assert!(h.reject.take().is_some(), "an address this driver cannot be asked for");
+        assert!(h.take_rejected().is_some(), "an address this driver cannot be asked for");
         assert_eq!(args.ret, 0, "and nothing was invented to fill it");
 
         // And an address query with no struct naming what to look up. The struct is required, so
@@ -8664,7 +8724,7 @@ mod tests {
         // between a null and the driver, and it has to hold on its own.
         let mut args = vn_command_vkGetBufferDeviceAddress { device, ..Default::default() };
         h.vkGetBufferDeviceAddress(&mut args);
-        assert!(h.reject.take().is_some(), "an address query naming nothing");
+        assert!(h.take_rejected().is_some(), "an address query naming nothing");
         assert_eq!(args.ret.0, 0, "and no address was invented for it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
@@ -8693,12 +8753,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -8711,12 +8769,12 @@ mod tests {
 
         let mut args = vn_command_vkWaitSemaphores { timeout: u64::MAX, ..Default::default() };
         h.vkWaitSemaphores(&mut args);
-        assert!(h.reject.is_some(), "a wait with no wait info");
-        h.reject = None;
+        assert!(h.rejected().is_some(), "a wait with no wait info");
+        h.take_rejected();
 
         let mut args = vn_command_vkSignalSemaphore::default();
         h.vkSignalSemaphore(&mut args);
-        assert!(h.reject.is_some(), "a signal with no signal info");
+        assert!(h.rejected().is_some(), "a signal with no signal info");
     }
 
     /// Waiting on a queue this context never retrieved is refused, not answered.
@@ -9372,12 +9430,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -9393,7 +9449,7 @@ mod tests {
                 pStream: Some(&d),
                 ..Default::default()
             });
-            assert_eq!(h.reject, None, "setting a stream at {offset:#x} is not a duplicate");
+            assert_eq!(h.rejected(), None, "setting a stream at {offset:#x} is not a duplicate");
             assert_eq!(h.reply.as_ref().unwrap().window().begin(), offset);
             assert_eq!(h.reply.as_ref().unwrap().pos(), 0, "and it starts from the top");
         }
@@ -9432,12 +9488,10 @@ mod tests {
                 driver: &mut driver,
                 global: &global,
                 ctx: ContextId::new(1).expect("1 is not zero"),
-                reject: None,
+                ask: None,
                 resources: &t,
                 rings: &mut rings,
                 monitor: &mut monitor,
-                wait: None,
-                execute: None,
                 replaying: false,
                 depth: 0,
                 answer: None,
@@ -9453,10 +9507,10 @@ mod tests {
                 ..Default::default()
             });
             assert_eq!(
-                h.reject.is_none(),
+                h.rejected().is_none(),
                 taken,
                 "{asked:x?} against a {len:#x}-byte resource: reject was {:?}",
-                h.reject
+                h.rejected()
             );
             assert_eq!(h.reply.is_some(), taken, "a refused stream leaves nothing behind");
         }
@@ -9481,12 +9535,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -9498,7 +9550,7 @@ mod tests {
         };
         let d = reply_at(0, 0x100);
         h.vkSetReplyCommandStreamMESA(&mut SetReply { pStream: Some(&d), ..Default::default() });
-        assert_eq!(h.reject, Some("set a reply stream in a resource that has no host mapping"));
+        assert_eq!(h.rejected(), Some("set a reply stream in a resource that has no host mapping"));
         assert!(h.reply.is_none());
     }
 
@@ -9526,12 +9578,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -9546,7 +9596,7 @@ mod tests {
             pCreateInfo: Some(Decoded::planted(&info)),
             ..Default::default()
         });
-        assert_eq!(h.reject, None, "on the context's stream, creating is fine");
+        assert_eq!(h.rejected(), None, "on the context's stream, creating is fine");
 
         h.current_ring = Some(RingId::new(7).unwrap());
         h.vkCreateRingMESA(&mut Create {
@@ -9554,9 +9604,9 @@ mod tests {
             pCreateInfo: Some(Decoded::planted(&info)),
             ..Default::default()
         });
-        assert_eq!(h.reject.take(), Some("created a ring from inside a ring's own stream"));
+        assert_eq!(h.take_rejected(), Some("created a ring from inside a ring's own stream"));
         h.vkDestroyRingMESA(&mut Destroy { ring: 7, ..Default::default() });
-        assert_eq!(h.reject.take(), Some("destroyed a ring from inside a ring's own stream"));
+        assert_eq!(h.take_rejected(), Some("destroyed a ring from inside a ring's own stream"));
 
         assert!(h.rings.contains_key(&RingId::new(7).unwrap()), "the refusals changed nothing");
         assert_eq!(h.rings.len(), 1);
@@ -9612,12 +9662,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -9631,7 +9679,7 @@ mod tests {
             let mut args =
                 Create { ring, pCreateInfo: Some(Decoded::planted(&info)), ..Default::default() };
             h.vkCreateRingMESA(&mut args);
-            assert_eq!(h.reject, None, "ring {ring:#x} is a layout we accept");
+            assert_eq!(h.rejected(), None, "ring {ring:#x} is a layout we accept");
         }
         assert_eq!(rings.len(), 2, "two ids, two rings");
         assert!(
@@ -9665,12 +9713,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -9684,13 +9730,13 @@ mod tests {
         let mut first =
             Create { ring: 7, pCreateInfo: Some(Decoded::planted(&info)), ..Default::default() };
         h.vkCreateRingMESA(&mut first);
-        assert_eq!(h.reject, None);
+        assert_eq!(h.rejected(), None);
         h.rings[&RingId::new(7).unwrap()].idle().set_head(0x1234);
 
         let mut again =
             Create { ring: 7, pCreateInfo: Some(Decoded::planted(&info)), ..Default::default() };
         h.vkCreateRingMESA(&mut again);
-        assert!(h.reject.is_some(), "the second create under the same id is refused");
+        assert!(h.rejected().is_some(), "the second create under the same id is refused");
         assert_eq!(h.rings.len(), 1, "and did not add a second entry");
         assert_eq!(
             h.rings[&RingId::new(7).unwrap()].idle().map.load_u32(0),
@@ -9699,15 +9745,15 @@ mod tests {
         );
 
         // And destroying it is the only thing that removes it.
-        h.reject = None;
+        h.take_rejected();
         let mut gone = Destroy { ring: 7, ..Default::default() };
         h.vkDestroyRingMESA(&mut gone);
-        assert_eq!(h.reject, None);
+        assert_eq!(h.rejected(), None);
         assert!(h.rings.is_empty());
 
         let mut twice = Destroy { ring: 7, ..Default::default() };
         h.vkDestroyRingMESA(&mut twice);
-        assert!(h.reject.is_some(), "destroying a ring that is not there is refused");
+        assert!(h.rejected().is_some(), "destroying a ring that is not there is refused");
     }
 
     /// A budget refusal has to stop the context, and this handler is the only place that can say
@@ -9776,12 +9822,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -9805,7 +9849,7 @@ mod tests {
         first.pAllocateInfo = Some(Decoded::planted(&info));
         first.plant_pMemory(&mut first_out);
         h.vkAllocateMemory(&mut first);
-        assert_eq!(h.reject, None, "the first fits under the cap");
+        assert_eq!(h.rejected(), None, "the first fits under the cap");
         assert_eq!(first.ret, VkResult::VK_SUCCESS);
         assert_eq!(ASKED.with(Cell::get), 1);
 
@@ -9816,7 +9860,7 @@ mod tests {
         second.plant_pMemory(&mut second_out);
         h.vkAllocateMemory(&mut second);
         assert!(
-            h.reject.is_some(),
+            h.rejected().is_some(),
             "the second is over the cap, and the guest will never read the error it was given"
         );
         assert_eq!(
@@ -9852,12 +9896,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -9870,7 +9912,7 @@ mod tests {
         let mut args =
             Create { ring: 1, pCreateInfo: Some(Decoded::planted(&info)), ..Default::default() };
         h.vkCreateRingMESA(&mut args);
-        assert!(h.reject.is_some());
+        assert!(h.rejected().is_some());
         assert!(rings.is_empty(), "and nothing was registered");
     }
 
@@ -9895,12 +9937,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -9912,7 +9952,7 @@ mod tests {
         };
         let mut args = Create { ring: 1, pCreateInfo: None, ..Default::default() };
         h.vkCreateRingMESA(&mut args);
-        assert!(h.reject.is_some());
+        assert!(h.rejected().is_some());
         assert!(rings.is_empty());
     }
 
@@ -9939,12 +9979,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -9956,7 +9994,7 @@ mod tests {
         };
         let mut args = Create { ring: 0, pCreateInfo: None, ..Default::default() };
         h.vkCreateRingMESA(&mut args);
-        assert_eq!(h.reject, Some("named ring 0, which is no ring"));
+        assert_eq!(h.rejected(), Some("named ring 0, which is no ring"));
         assert!(rings.is_empty());
     }
 
@@ -10144,12 +10182,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -10162,7 +10198,7 @@ mod tests {
 
         for why in ["the first enumeration", "asking again under the same names"] {
             enumerate_as(&mut h, &objects, INSTANCE, &IDS);
-            assert!(h.reject.is_none(), "{why} is served");
+            assert!(h.rejected().is_none(), "{why} is served");
         }
         for (id, host) in IDS.iter().zip(HANDED) {
             assert_eq!(
@@ -10180,7 +10216,7 @@ mod tests {
         // The same two devices, each under the other's id: a live id handed a different object.
         enumerate_as(&mut h, &objects, INSTANCE, &[IDS[1], IDS[0]]);
         assert!(
-            h.reject.take().is_some(),
+            h.take_rejected().is_some(),
             "a live id handed an object it does not name is refused"
         );
         for (id, host) in IDS.iter().zip(HANDED) {
@@ -10238,12 +10274,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -10255,9 +10289,12 @@ mod tests {
         };
 
         enumerate_as(&mut h, &objects, INSTANCE, &IDS);
-        assert!(h.reject.is_none(), "the first enumeration is served");
+        assert!(h.rejected().is_none(), "the first enumeration is served");
         enumerate_as(&mut h, &objects, INSTANCE, &AGAIN);
-        assert!(h.reject.take().is_some(), "a second name for an object already named is refused");
+        assert!(
+            h.take_rejected().is_some(),
+            "a second name for an object already named is refused"
+        );
         for id in AGAIN {
             assert_eq!(
                 objects.lookup(ObjectId(id), PD.0),
@@ -10348,12 +10385,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -10365,14 +10400,14 @@ mod tests {
         };
 
         ask(&mut h, &objects, ID);
-        assert!(h.reject.is_none(), "the first ask is served");
+        assert!(h.rejected().is_none(), "the first ask is served");
         ask(&mut h, &objects, ID);
-        assert!(h.reject.is_none(), "asking again is how a guest works, not a repeat create");
+        assert!(h.rejected().is_none(), "asking again is how a guest works, not a repeat create");
         assert_eq!(objects.lookup(ObjectId(ID), Q.0), Lookup::Found(HostHandle(QUEUE)));
         assert_eq!(objects.borrow().of_type(Q).count(), 1, "one queue, asked for twice");
 
         ask(&mut h, &objects, AGAIN);
-        assert!(h.reject.take().is_some(), "a second name for the same queue is refused");
+        assert!(h.take_rejected().is_some(), "a second name for the same queue is refused");
         assert_eq!(objects.lookup(ObjectId(AGAIN), Q.0), Lookup::Missing, "and names nothing");
         assert_eq!(objects.lookup(ObjectId(ID), Q.0), Lookup::Found(HostHandle(QUEUE)));
 
@@ -10486,12 +10521,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -10502,7 +10535,7 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
-        assert!(h.reject.is_none(), "a query this driver can answer is not refused");
+        assert!(h.rejected().is_none(), "a query this driver can answer is not refused");
 
         assert_eq!(
             asked.features.geometryShader,
@@ -10613,12 +10646,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -10629,7 +10660,7 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceMemoryProperties2(&mut args);
-        assert!(h.reject.is_none(), "answering a fair question is not a poisoned ring");
+        assert!(h.rejected().is_none(), "answering a fair question is not a poisoned ring");
         driver.abandon_planted();
 
         assert_eq!(
@@ -10694,12 +10725,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -10710,7 +10739,7 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceProperties(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
 
         assert_eq!(
             asked.apiVersion,
@@ -10749,12 +10778,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -10765,7 +10792,7 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceProperties2(&mut args2);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
 
         assert_eq!(
             asked2.properties.apiVersion,
@@ -10811,12 +10838,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -10827,7 +10852,10 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkEnumerateInstanceVersion(&mut args);
-        assert!(h.reject.is_none(), "a real loader answering is never a reason to poison a ring");
+        assert!(
+            h.rejected().is_none(),
+            "a real loader answering is never a reason to poison a ring"
+        );
         let ret = args.ret;
         if ret == VkResult::VK_SUCCESS {
             assert!(
@@ -10848,12 +10876,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -10864,7 +10890,7 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkEnumerateInstanceVersion(&mut empty);
-        assert!(h.reject.is_some(), "a query with nowhere to answer is refused, not answered");
+        assert!(h.rejected().is_some(), "a query with nowhere to answer is refused, not answered");
     }
 
     /// A host handle must never reach a guest, and this is the one query that hands them back
@@ -10941,12 +10967,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -10957,7 +10981,7 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkEnumeratePhysicalDeviceGroups(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         assert_eq!(
             [props[0].physicalDevices[0].0, props[0].physicalDevices[1].0],
@@ -10985,12 +11009,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -11137,12 +11159,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -11153,7 +11173,7 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkEnumerateDeviceExtensionProperties(&mut args);
-        assert!(h.reject.is_some(), "a layer this renderer has no way to load");
+        assert!(h.rejected().is_some(), "a layer this renderer has no way to load");
         assert_eq!(n, 0, "and nothing was answered");
 
         driver.abandon_planted();
@@ -11217,12 +11237,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -11233,7 +11251,7 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceQueueFamilyProperties2(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert_eq!(n, FAMILIES, "a null array is the guest asking how many there are");
 
         // The fill call, with room to spare on purpose. The count the guest reads back has to be
@@ -11255,12 +11273,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -11271,7 +11287,7 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceQueueFamilyProperties2(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert_eq!(n, FAMILIES, "the driver's count reaches the guest, not the size it asked with");
         assert_eq!(
             props.map(|p| p.queueFamilyProperties.queueCount),
@@ -11317,12 +11333,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -11334,7 +11348,7 @@ mod tests {
         };
         h.vkGetImageDrmFormatModifierPropertiesEXT(&mut args);
 
-        assert!(h.reject.is_none(), "a fair question is not a poisoned ring");
+        assert!(h.rejected().is_none(), "a fair question is not a poisoned ring");
         assert_eq!(
             args.ret,
             VkResult::VK_ERROR_EXTENSION_NOT_PRESENT,
@@ -11369,12 +11383,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -11385,7 +11397,7 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
-        assert!(h.reject.is_some(), "a query with nowhere to put the answer");
+        assert!(h.rejected().is_some(), "a query with nowhere to put the answer");
 
         // A struct, but a driver with no such entry point. The guest can steer this one, so it is
         // a refusal and not the panic the advertised-command accessor would raise.
@@ -11405,12 +11417,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -11421,7 +11431,7 @@ mod tests {
             journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
-        assert!(h.reject.is_some(), "a query this driver does not export");
+        assert!(h.rejected().is_some(), "a query this driver does not export");
 
         driver.abandon_planted();
     }
@@ -11584,12 +11594,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -11671,12 +11679,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -11814,12 +11820,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -11994,12 +11998,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -12017,8 +12019,8 @@ mod tests {
         args.commandBuffer = VkCommandBuffer(CB.0);
         args.plant_size(16);
         h.vkCmdPushConstants(&mut args);
-        assert!(h.reject.is_some(), "sixteen bytes of nothing is not a push");
-        h.reject = None;
+        assert!(h.rejected().is_some(), "sixteen bytes of nothing is not a push");
+        h.take_rejected();
 
         // A shader whose code is not a whole number of words. `pCode` is `uint32_t*` and the size
         // is in bytes, so a size Vulkan cannot divide is a driver reading a partial word past the
@@ -12028,8 +12030,8 @@ mod tests {
         args.device = VkDevice(DEVICE);
         args.pCreateInfo = Some(Decoded::planted(&info));
         h.vkCreateShaderModule(&mut args);
-        assert!(h.reject.is_some(), "seven bytes is not a whole number of words");
-        h.reject = None;
+        assert!(h.rejected().is_some(), "seven bytes is not a whole number of words");
+        h.take_rejected();
 
         // A submit to a queue this context never retrieved. There is no device behind it, so
         // there is no entry point to call -- and inventing a success would tell the guest work it
@@ -12039,8 +12041,8 @@ mod tests {
         let submits: [VkSubmitInfo; 0] = [];
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit(&mut args);
-        assert!(h.reject.is_some(), "a queue with no device behind it cannot be submitted to");
-        h.reject = None;
+        assert!(h.rejected().is_some(), "a queue with no device behind it cannot be submitted to");
+        h.take_rejected();
 
         REACHED.with_borrow(|r| {
             assert!(r.is_empty(), "the driver was reached by {r:?}, after the guest was refused");
@@ -12053,14 +12055,14 @@ mod tests {
         args.commandBuffer = VkCommandBuffer(CB.0);
         args.plant_pValues(&values);
         h.vkCmdPushConstants(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
 
         let info = VkShaderModuleCreateInfo { codeSize: 8, ..Default::default() };
         let mut args = vn_command_vkCreateShaderModule::default();
         args.device = VkDevice(DEVICE);
         args.pCreateInfo = Some(Decoded::planted(&info));
         h.vkCreateShaderModule(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
 
         REACHED.with_borrow(|r| {
             assert_eq!(r.as_slice(), &["vkCmdPushConstants", "vkCreateShaderModule"]);
@@ -12159,12 +12161,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -12183,8 +12183,8 @@ mod tests {
             args.pipelineCache = VkPipelineCache(CACHE);
             args.plant_pDataSize(&mut size);
             h.vkGetPipelineCacheData(&mut args);
-            assert!(h.reject.is_none(), "served now; a build that still refuses it fails here");
-            assert!(h.reject.is_none());
+            assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+            assert!(h.rejected().is_none());
             assert_eq!(args.ret, VkResult::VK_SUCCESS);
         }
         assert_eq!(size, BLOB.len(), "the count call says how many bytes there are");
@@ -12227,7 +12227,7 @@ mod tests {
         args.dstCache = VkPipelineCache(CACHE);
         args.plant_pSrcCaches(&srcs);
         h.vkMergePipelineCaches(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         SAW.with_borrow(|w| assert_eq!(w.merged, [(CACHE, vec![0x501, 0x502])]));
 
@@ -12241,7 +12241,7 @@ mod tests {
         args.plant_pYcbcrConversion(&mut wire);
         args.plant_handle_pYcbcrConversion(&mut shadow);
         h.vkCreateSamplerYcbcrConversion(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         assert_eq!(shadow, VkSamplerYcbcrConversion(0x9c));
         assert_eq!(wire, VkSamplerYcbcrConversion(77), "the guest's id on the wire is left alone");
@@ -12312,12 +12312,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -12336,10 +12334,10 @@ mod tests {
         args.plant_pDescriptorSets(&one);
         h.vkFreeDescriptorSets(&mut args);
         assert!(
-            h.reject.is_none(),
+            h.rejected().is_none(),
             "the command is served now; a build that still refuses it fails here"
         );
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         SAW.with_borrow(|w| assert_eq!(w, &[(POOL, vec![SETS[0].0])], "that set, under its pool"));
         assert_eq!(
@@ -12374,7 +12372,7 @@ mod tests {
         args.descriptorPool = VkDescriptorPool(OTHER);
         args.plant_pDescriptorSets(&two);
         h.vkFreeDescriptorSets(&mut args);
-        assert!(h.reject.take().is_some(), "a run that is not the pool's is refused");
+        assert!(h.take_rejected().is_some(), "a run that is not the pool's is refused");
         SAW.with_borrow(|w| assert_eq!(w.len(), 1, "and never reached the driver"));
         assert_eq!(
             h.driver.pool_child_id(VkDescriptorPool(POOL), VkDescriptorSet(SETS[1].0)),
@@ -12388,7 +12386,7 @@ mod tests {
         args.descriptorPool = VkDescriptorPool(POOL);
         args.plant_pDescriptorSets(&one);
         h.vkFreeDescriptorSets(&mut args);
-        assert!(h.reject.take().is_some(), "a set already freed is not the pool's to free again");
+        assert!(h.take_rejected().is_some(), "a set already freed is not the pool's to free again");
         SAW.with_borrow(|w| assert_eq!(w.len(), 1));
 
         h.driver.abandon_planted();
@@ -12519,12 +12517,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -12546,7 +12542,7 @@ mod tests {
         args.plant_pDescriptorSets(&sets);
         args.plant_pDynamicOffsets(&offsets);
         h.vkCmdBindDescriptorSets(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|w| {
             assert_eq!(w.bound, [(5, vec![0x300, 0x400], vec![16, 32, 48])]);
         });
@@ -12568,7 +12564,7 @@ mod tests {
         args.offset = 12;
         args.plant_pValues(&values);
         h.vkCmdPushConstants(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|w| {
             assert_eq!(w.pushed, [(12, values.to_vec())], "all five bytes, at the offset given");
         });
@@ -12580,7 +12576,7 @@ mod tests {
         args.fence = VkFence(0x77);
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit(&mut args);
-        assert!(h.reject.is_none(), "an empty submit is a fence signal, not a botched command");
+        assert!(h.rejected().is_none(), "an empty submit is a fence signal, not a botched command");
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         SAW.with_borrow(|w| {
             assert_eq!(w.submitted, [(0, 0x77)], "no work, and the fence that is waiting on it");
@@ -12667,12 +12663,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -12693,7 +12687,10 @@ mod tests {
         args.plant_handle_pPipelines(&mut shadow);
 
         h.vkCreateGraphicsPipelines(&mut args);
-        assert!(h.reject.is_none(), "a driver refusing to compile is an answer, not a bad command");
+        assert!(
+            h.rejected().is_none(),
+            "a driver refusing to compile is an answer, not a bad command"
+        );
         assert_eq!(args.ret, VkResult::VK_ERROR_INVALID_SHADER_NV);
 
         ASKED.with_borrow(|a| {
@@ -12758,12 +12755,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -12793,7 +12788,7 @@ mod tests {
         let _flags = dec.decode_scalar::<VkFlags>();
         assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Dispatched::Served);
         assert!(!dec.fatal(), "a refusal is the driver's answer, not a protocol error");
-        assert!(h.reject.is_none(), "a refused create is not a protocol violation");
+        assert!(h.rejected().is_none(), "a refused create is not a protocol violation");
 
         assert_eq!(
             objects.lookup(ObjectId(FENCE), VkObjectType::VK_OBJECT_TYPE_FENCE.0),
@@ -12827,12 +12822,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -12847,16 +12840,16 @@ mod tests {
         let mut args = vn_command_vkCreateShaderModule::default();
         args.pCreateInfo = Some(Decoded::planted(&odd));
         h.vkCreateShaderModule(&mut args);
-        assert!(h.reject.is_some(), "a code size of 7 must not reach the driver");
+        assert!(h.rejected().is_some(), "a code size of 7 must not reach the driver");
 
         // Four is a whole word, so the guard lets it through; there is no device, so the driver
         // refuses it -- which is a different answer from a protocol violation.
         let whole = VkShaderModuleCreateInfo { codeSize: 4, ..Default::default() };
         let mut args = vn_command_vkCreateShaderModule::default();
         args.pCreateInfo = Some(Decoded::planted(&whole));
-        h.reject = None;
+        h.take_rejected();
         h.vkCreateShaderModule(&mut args);
-        assert!(h.reject.is_none(), "a whole number of words is not a protocol violation");
+        assert!(h.rejected().is_none(), "a whole number of words is not a protocol violation");
     }
 
     /// A command that claims an array and sends none is refused, not quietly done as nothing.
@@ -13024,12 +13017,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -13138,12 +13129,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -13165,7 +13154,7 @@ mod tests {
         args.plant_handle_pPipelines(&mut shadow);
         h.vkCreateComputePipelines(&mut args);
 
-        assert!(h.reject.is_none(), "a served command refuses nothing");
+        assert!(h.rejected().is_none(), "a served command refuses nothing");
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         SAW.with_borrow(|s| {
             assert_eq!(s.runs, vec![(IDS.len() as u32, CACHE)], "one run, the guest's own cache");
@@ -13183,7 +13172,7 @@ mod tests {
             ..Default::default()
         };
         h.vkCmdDispatch(&mut args);
-        assert!(h.reject.is_none(), "a recorded command on a live command buffer");
+        assert!(h.rejected().is_none(), "a recorded command on a live command buffer");
         SAW.with_borrow(|s| assert_eq!(s.dispatches, vec![(CB.0, 5, 6, 7)]));
 
         h.driver.abandon_planted();
@@ -13227,12 +13216,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -13417,12 +13404,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -13460,7 +13445,7 @@ mod tests {
         h.vkCreateQueryPool(&mut args);
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         assert_eq!(shadow, HOST_POOL, "the driver's handle, in the shadow the reply reads");
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
 
         // Both, 32-bit, four apart, into eight bytes: exactly enough.
         let mut room = [0xffu8; 8];
@@ -13468,7 +13453,7 @@ mod tests {
         args.plant_pData(&mut room);
         h.vkGetQueryPoolResults(&mut args);
         assert_eq!(args.ret, VkResult::VK_SUCCESS, "the driver's answer");
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert_eq!(room, [0, 1, 2, 3, 4, 5, 6, 7], "and the driver's bytes, in the guest's room");
 
         // The same read into seven bytes: refused, and the driver never sees it.
@@ -13476,7 +13461,7 @@ mod tests {
         let mut args = read(device, 2);
         args.plant_pData(&mut short);
         h.vkGetQueryPoolResults(&mut args);
-        assert!(h.reject.take().is_some(), "a read past the room is a refusal");
+        assert!(h.take_rejected().is_some(), "a read past the room is a refusal");
         assert_eq!(short, [0xff; 7], "and nothing was written");
         READS.with_borrow(|n| assert_eq!(*n, 1, "only the read that fit reached the driver"));
 
@@ -13533,7 +13518,7 @@ mod tests {
             ..Default::default()
         };
         h.vkCmdCopyQueryPoolResults(&mut args);
-        assert!(h.reject.is_none(), "every one of them was within the pool");
+        assert!(h.rejected().is_none(), "every one of them was within the pool");
         SAW.with_borrow(|s| {
             assert_eq!(
                 s.as_slice(),
@@ -13560,7 +13545,7 @@ mod tests {
             ..Default::default()
         };
         h.vkResetQueryPool(&mut args);
-        assert!(h.reject.take().is_some(), "a host-side reset past the pool is a heap scribble");
+        assert!(h.take_rejected().is_some(), "a host-side reset past the pool is a heap scribble");
         let mut args = vn_command_vkCmdBeginQuery {
             commandBuffer: CB,
             queryPool: HOST_POOL,
@@ -13568,7 +13553,7 @@ mod tests {
             ..Default::default()
         };
         h.vkCmdBeginQuery(&mut args);
-        assert!(h.reject.take().is_some());
+        assert!(h.take_rejected().is_some());
         let mut args = vn_command_vkCmdEndQuery {
             commandBuffer: CB,
             queryPool: HOST_POOL,
@@ -13576,7 +13561,7 @@ mod tests {
             ..Default::default()
         };
         h.vkCmdEndQuery(&mut args);
-        assert!(h.reject.take().is_some());
+        assert!(h.take_rejected().is_some());
         let mut args = vn_command_vkCmdResetQueryPool {
             commandBuffer: CB,
             queryPool: HOST_POOL,
@@ -13585,7 +13570,7 @@ mod tests {
             ..Default::default()
         };
         h.vkCmdResetQueryPool(&mut args);
-        assert!(h.reject.take().is_some());
+        assert!(h.take_rejected().is_some());
         let mut args = vn_command_vkCmdWriteTimestamp {
             commandBuffer: CB,
             queryPool: HOST_POOL,
@@ -13593,7 +13578,7 @@ mod tests {
             ..Default::default()
         };
         h.vkCmdWriteTimestamp(&mut args);
-        assert!(h.reject.take().is_some());
+        assert!(h.take_rejected().is_some());
         let mut args = vn_command_vkCmdCopyQueryPoolResults {
             commandBuffer: CB,
             queryPool: HOST_POOL,
@@ -13602,7 +13587,7 @@ mod tests {
             ..Default::default()
         };
         h.vkCmdCopyQueryPoolResults(&mut args);
-        assert!(h.reject.take().is_some());
+        assert!(h.take_rejected().is_some());
         SAW.with_borrow(|s| assert!(s.is_empty(), "no refusal reached the driver"));
 
         // Destroyed, the pool's record goes with it, and a read of it is a refusal too.
@@ -13612,7 +13597,7 @@ mod tests {
         let mut args = read(device, 1);
         args.plant_pData(&mut room[..4]);
         h.vkGetQueryPoolResults(&mut args);
-        assert!(h.reject.take().is_some(), "a pool with no record is not read");
+        assert!(h.take_rejected().is_some(), "a pool with no record is not read");
         READS.with_borrow(|n| assert_eq!(*n, 1));
 
         h.driver.abandon_planted();
@@ -13644,12 +13629,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -13846,12 +13829,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -13947,12 +13928,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -14121,12 +14100,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -14272,12 +14249,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -14435,12 +14410,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -14526,12 +14499,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -14690,12 +14661,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -14716,7 +14685,7 @@ mod tests {
         args.firstViewport = 2;
         args.plant_pViewports(&vps);
         h.vkCmdSetViewport(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| {
             assert_eq!(s.viewports, [(2, vec![10.0, 11.0, 12.0])], "all three, in order, at 2");
         });
@@ -14730,7 +14699,7 @@ mod tests {
         args.plant_pBuffers(&buffers);
         args.plant_pOffsets(&offsets);
         h.vkCmdBindVertexBuffers(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| {
             assert_eq!(s.vertex_buffers, [(1, vec![0x100, 0x200], vec![64, 128])]);
         });
@@ -14747,7 +14716,7 @@ mod tests {
         args.plant_pBufferMemoryBarriers(&buffers);
         args.plant_pImageMemoryBarriers(&images);
         h.vkCmdPipelineBarrier(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| assert_eq!(s.barriers, [(1, 2, 3)], "each count with its own array"));
 
         // A result the guest is owed: the driver's answer has to reach the reply, not be
@@ -14756,7 +14725,7 @@ mod tests {
         let mut args = vn_command_vkBeginCommandBuffer { commandBuffer: cb, ..Default::default() };
         args.pBeginInfo = Some(Decoded::planted(&begin));
         h.vkBeginCommandBuffer(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert_eq!(args.ret, VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY);
         SAW.with_borrow(|s| assert_eq!(s.began, 1));
 
@@ -14766,7 +14735,7 @@ mod tests {
         args.commandBuffer = VkCommandBuffer(0xdead);
         args.plant_pViewports(&vps);
         h.vkCmdSetViewport(&mut args);
-        assert!(h.reject.is_some(), "there is no device to record into");
+        assert!(h.rejected().is_some(), "there is no device to record into");
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
         h.driver.abandon_planted();
@@ -14959,12 +14928,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -14989,7 +14956,7 @@ mod tests {
         args.pVertexOffset = Some(&vertex_offset);
         args.plant_pIndexInfo(&draws);
         h.vkCmdDrawMultiIndexedEXT(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with(|s| {
             assert_eq!(
                 s.get(),
@@ -15110,12 +15077,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -15135,7 +15100,7 @@ mod tests {
             ..Default::default()
         };
         h.vkCmdSetBlendConstants(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| assert_eq!(s.blend, [[0.25, 0.5, 0.75, 1.0]]));
 
         // Two viewports and no first index. The 1.0 form takes one; passing the count where it
@@ -15146,7 +15111,7 @@ mod tests {
         args.commandBuffer = cb;
         args.plant_pViewports(&vps);
         h.vkCmdSetViewportWithCount(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| assert_eq!(s.viewports, [vec![20.0, 21.0]]));
 
         // All four arrays, then only the two mandatory ones. An absent array is null and not an
@@ -15164,7 +15129,7 @@ mod tests {
         args.plant_pSizes(&sizes);
         args.plant_pStrides(&strides);
         h.vkCmdBindVertexBuffers2(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
 
         let mut args = vn_command_vkCmdBindVertexBuffers2::default();
         args.commandBuffer = cb;
@@ -15172,7 +15137,7 @@ mod tests {
         args.plant_pBuffers(&buffers);
         args.plant_pOffsets(&offsets);
         h.vkCmdBindVertexBuffers2(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| {
             assert_eq!(
                 s.bind2,
@@ -15233,12 +15198,10 @@ mod tests {
                 driver,
                 global,
                 ctx: ContextId::new(1).expect("1 is not zero"),
-                reject: None,
+                ask: None,
                 resources: &NO_RESOURCES,
                 rings,
                 monitor,
-                wait: None,
-                execute: None,
                 replaying: false,
                 depth: 0,
                 answer: None,
@@ -15292,7 +15255,7 @@ mod tests {
             &mut jrnl,
         );
         call(&mut h);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert_eq!(SAW.with(|s| s.get()), ASPECTS, "the guest's aspect mask, and nothing else");
         h.driver.abandon_planted();
 
@@ -15311,7 +15274,7 @@ mod tests {
             &mut jrnl,
         );
         call(&mut h);
-        assert!(h.reject.is_some(), "an entry point the device has not got is a rejection");
+        assert!(h.rejected().is_some(), "an entry point the device has not got is a rejection");
         h.driver.abandon_planted();
     }
 
@@ -15392,12 +15355,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -15425,7 +15386,7 @@ mod tests {
         args.plant_handle_pCommandBuffers(&mut shadow);
 
         h.vkAllocateCommandBuffers(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         SAW.with_borrow(|s| {
             assert_eq!(s, &[(3, 3)], "the count it was told and the room it was given are one");
@@ -15537,12 +15498,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -15562,9 +15521,9 @@ mod tests {
         args.plant_pRegions(&regions);
         h.vkCmdCopyImageToBuffer(&mut args);
 
-        assert!(h.reject.is_none(), "a served command does not reject");
+        assert!(h.rejected().is_none(), "a served command does not reject");
         assert!(
-            h.reject.is_none(),
+            h.rejected().is_none(),
             "the command is served now; a build that still refuses it fails here"
         );
         SAW.with_borrow(|s| {
@@ -15702,12 +15661,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -15729,7 +15686,7 @@ mod tests {
         args.filter = VkFilter::VK_FILTER_LINEAR;
         args.plant_pRegions(&regions);
         h.vkCmdBlitImage(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| {
             assert_eq!(
                 s.blits,
@@ -15752,9 +15709,9 @@ mod tests {
         args.dstImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         args.plant_pRegions(&regions);
         h.vkCmdCopyImage(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert!(
-            h.reject.is_none(),
+            h.rejected().is_none(),
             "the command is served now; a build that still refuses it fails here"
         );
         SAW.with_borrow(|s| {
@@ -15781,7 +15738,7 @@ mod tests {
         args.pColor = Some(&color);
         args.plant_pRanges(&ranges);
         h.vkCmdClearColorImage(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| {
             assert_eq!(s.cleared_image, [(0x33, 0xabcd_ef01, 4)], "the guest's colour and range");
         });
@@ -15799,7 +15756,7 @@ mod tests {
         args.plant_pAttachments(&attachments);
         args.plant_pRects(&rects);
         h.vkCmdClearAttachments(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| {
             assert_eq!(s.cleared_attachments, [(2, 3)], "each count with its own array");
         });
@@ -15813,7 +15770,7 @@ mod tests {
         args.offset = 8;
         args.plant_pValues(&bytes);
         h.vkCmdPushConstants(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| {
             assert_eq!(s.pushed, [(0x44, 8, bytes.to_vec())], "the offset and every byte");
         });
@@ -15824,7 +15781,7 @@ mod tests {
         args.commandBuffer = cb;
         args.plant_size(4);
         h.vkCmdPushConstants(&mut args);
-        assert!(h.reject.is_some(), "a count with no blob behind it stops the ring");
+        assert!(h.rejected().is_some(), "a count with no blob behind it stops the ring");
         SAW.with_borrow(|s| assert_eq!(s.pushed.len(), 1, "and pushes nothing"));
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
@@ -15899,12 +15856,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -15951,14 +15906,14 @@ mod tests {
                 last,
             ],
         );
-        assert!(h.reject.is_none(), "an unsound rect is dropped, not a violation");
+        assert!(h.rejected().is_none(), "an unsound rect is dropped, not a violation");
         CALLS.with_borrow(|c| {
             assert_eq!(c.as_slice(), [vec![first, last]], "only the sound rects, in order");
         });
 
         // Nothing left to clear: a zero-rect call is itself invalid, so none is made.
         clear(&mut h, &[(0, 0, 0, 0, 0), (-8, -8, 4, 4, 1)]);
-        assert!(h.reject.is_none(), "nothing to clear is not a violation either");
+        assert!(h.rejected().is_none(), "nothing to clear is not a violation either");
         CALLS.with_borrow(|c| assert_eq!(c.len(), 1, "and the driver is not called"));
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
@@ -16022,12 +15977,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -16044,12 +15997,12 @@ mod tests {
             ..Default::default()
         };
         h.vkResetFenceResourceMESA(&mut args);
-        assert!(h.reject.is_none(), "a served command does not stop the ring");
+        assert!(h.rejected().is_none(), "a served command does not stop the ring");
         EXPORTED.with_borrow(|e| {
             assert!(e.is_empty(), "the export blocks on the GPU, so it is taken out of the batch")
         });
 
-        let Some(Wait::Driver(wait)) = h.wait.take() else {
+        let Some(Wait::Driver(wait)) = h.take_suspended() else {
             panic!("an export that blocks on the GPU suspends the batch");
         };
         let answered = wait.run(|| true).expect("nothing stops this wait");
@@ -16071,7 +16024,7 @@ mod tests {
         // has signalled again since.
         h.answer = Some(answered);
         h.vkResetFenceResourceMESA(&mut args);
-        assert!(h.reject.is_none(), "the resumed pass is served too");
+        assert!(h.rejected().is_none(), "the resumed pass is served too");
         EXPORTED.with_borrow(|e| assert_eq!(e.len(), 1, "and asks the driver nothing"));
 
         // A device the guest never made. The handle is the guest's, so this is a rejection and
@@ -16082,7 +16035,7 @@ mod tests {
             ..Default::default()
         };
         h.vkResetFenceResourceMESA(&mut args);
-        assert!(h.reject.is_some(), "a fence on a device that does not exist stops the ring");
+        assert!(h.rejected().is_some(), "a fence on a device that does not exist stops the ring");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
@@ -16153,12 +16106,10 @@ mod tests {
                     driver: $driver,
                     global: &global,
                     ctx: ContextId::new(1).expect("1 is not zero"),
-                    reject: None,
+                    ask: None,
                     resources: &NO_RESOURCES,
                     rings: $rings,
                     monitor: $monitor,
-                    wait: None,
-                    execute: None,
                     replaying: false,
                     depth: 0,
                     answer: None,
@@ -16194,7 +16145,7 @@ mod tests {
         args.fence = VkFence(FENCE);
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit2(&mut args);
-        assert!(h.reject.is_none(), "a well-formed submit is not a refusal");
+        assert!(h.rejected().is_none(), "a well-formed submit is not a refusal");
         assert_eq!(args.ret, VkResult::VK_SUCCESS, "the driver's answer is the guest's");
         SAW.with_borrow(|s| assert_eq!(*s, [(QUEUE, 1, FENCE)]));
         assert_eq!(
@@ -16211,7 +16162,7 @@ mod tests {
         args.fence = VkFence(FENCE);
         args.plant_pSubmits(&[]);
         h.vkQueueSubmit2(&mut args);
-        assert!(h.reject.is_none(), "submitting nothing is legal");
+        assert!(h.rejected().is_none(), "submitting nothing is legal");
         SAW.with_borrow(|s| assert_eq!(*s, [(QUEUE, 0, FENCE)]));
         h.driver.abandon_planted();
 
@@ -16226,7 +16177,7 @@ mod tests {
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit2(&mut args);
         assert_eq!(
-            h.reject,
+            h.rejected(),
             Some("submitted with vkQueueSubmit2 to a device that has none"),
             "a device narrower than the capset is guest input, and must not abort the worker"
         );
@@ -16235,9 +16186,9 @@ mod tests {
         let mut args = vn_command_vkQueueSubmit2::default();
         args.queue = VkQueue(QUEUE + 1);
         args.plant_pSubmits(&submits);
-        h.reject = None;
+        h.take_rejected();
         h.vkQueueSubmit2(&mut args);
-        assert_eq!(h.reject, Some("submitted to a queue with no device behind it"));
+        assert_eq!(h.rejected(), Some("submitted to a queue with no device behind it"));
         h.driver.abandon_planted();
     }
 
@@ -16355,12 +16306,10 @@ mod tests {
             driver: &mut driver,
             global: &global,
             ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
+            ask: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
-            wait: None,
-            execute: None,
             replaying: false,
             depth: 0,
             answer: None,
@@ -16380,7 +16329,7 @@ mod tests {
         args.fence = VkFence(99);
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         assert_eq!(args.ret, VkResult::VK_SUCCESS, "the driver's answer is the guest's");
         SAW.with_borrow(|s| assert_eq!(s.submits, [(QUEUE, 2, 99)]));
 
@@ -16404,7 +16353,7 @@ mod tests {
         // Probed with no timeout first; the driver said not yet, so the batch suspends on a wait
         // that carries the guest's own timeout, and only running that wait spends it.
         SAW.with_borrow(|s| assert_eq!(s.waited, [(2, 1, 0)], "the probe, and nothing more"));
-        let Some(Wait::Driver(wait)) = h.wait.take() else {
+        let Some(Wait::Driver(wait)) = h.take_suspended() else {
             panic!("a wait the driver could not answer at once suspends the batch");
         };
         let answered = wait.run(|| true).expect("nothing stops this wait");
@@ -16438,7 +16387,7 @@ mod tests {
             ..Default::default()
         };
         h.vkImportSemaphoreResourceMESA(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| assert_eq!(s.imported, 1));
 
         // The export half. Its whole effect is outside Vulkan, so what there is to check is that
@@ -16450,14 +16399,14 @@ mod tests {
             ..Default::default()
         };
         h.vkWaitSemaphoreResourceMESA(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| {
             assert!(
                 s.exported.is_empty(),
                 "the export blocks on the GPU, so it is taken out of the batch"
             )
         });
-        let Some(Wait::Driver(wait)) = h.wait.take() else {
+        let Some(Wait::Driver(wait)) = h.take_suspended() else {
             panic!("an export that blocks on the GPU suspends the batch");
         };
         let answered = wait.run(|| true).expect("nothing stops this wait");
@@ -16477,7 +16426,7 @@ mod tests {
         // payload, so a second one would move a payload the guest has since put back.
         h.answer = Some(answered);
         h.vkWaitSemaphoreResourceMESA(&mut args);
-        assert!(h.reject.is_none());
+        assert!(h.rejected().is_none());
         SAW.with_borrow(|s| assert_eq!(s.exported.len(), 1, "and asks the driver nothing"));
 
         // A resource id the C asserts on. The number is the guest's, so it is a rejection here --
@@ -16493,7 +16442,7 @@ mod tests {
             ..Default::default()
         };
         h.vkImportSemaphoreResourceMESA(&mut args);
-        assert!(h.reject.is_some(), "a resource-backed import is not something this serves");
+        assert!(h.rejected().is_some(), "a resource-backed import is not something this serves");
         SAW.with_borrow(|s| assert_eq!(s.imported, 1, "and it must not have reached the driver"));
 
         // A driver with no `vkImportSemaphoreFdKHR` at all. The proc table's own answer to a
@@ -16509,19 +16458,22 @@ mod tests {
             pImportSemaphoreResourceInfo: Some(Decoded::planted(&info)),
             ..Default::default()
         };
-        h.reject = None;
+        h.take_rejected();
         h.vkImportSemaphoreResourceMESA(&mut args);
-        assert!(h.reject.is_some(), "a driver without the extension is a rejection, not an abort");
+        assert!(
+            h.rejected().is_some(),
+            "a driver without the extension is a rejection, not an abort"
+        );
         SAW.with_borrow(|s| assert_eq!(s.imported, 1));
 
         // A queue the context never retrieved stops the ring rather than reaching Vulkan with a
         // handle nothing vouches for.
-        h.reject = None;
+        h.take_rejected();
         let mut args = vn_command_vkQueueSubmit::default();
         args.queue = VkQueue(4242);
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit(&mut args);
-        assert!(h.reject.is_some(), "a queue with no device behind it must poison the ring");
+        assert!(h.rejected().is_some(), "a queue with no device behind it must poison the ring");
         SAW.with_borrow(|s| assert_eq!(s.submits.len(), 1, "and must not reach the driver"));
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.

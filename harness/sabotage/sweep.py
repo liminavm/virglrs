@@ -110,7 +110,7 @@ SABOTAGES = [
         'an unserved command is counted and then continues, as though the host had done it',
         'src/venus/context.rs',
         """        self.todo.note(cmd);
-        self.reject = Some("is not a command this build serves");""",
+        self.reject("is not a command this build serves");""",
         """        self.todo.note(cmd);""",
         'unserved_command',
     ),
@@ -306,7 +306,7 @@ SABOTAGES = [
     (
         'constants are pushed without the bytes that are the command',
         'src/venus/context.rs',
-        '        let Some(values) = args.pValues() else {\n            self.reject = Some("pushed constants without saying what they are");\n            return;\n        };',
+        '        let Some(values) = args.pValues() else {\n            self.reject("pushed constants without saying what they are");\n            return;\n        };',
         '        let values = args.pValues().unwrap_or(&[]);',
         '',
     ),
@@ -640,7 +640,7 @@ SABOTAGES = [
         'a budget refusal is reported to the guest and to nobody else',
         'src/venus/context.rs',
         '''            if let driver::NoMemory::OverBudget { stop: true } = e {
-                self.reject = Some("the host memory budget refused this allocation");
+                self.reject("the host memory budget refused this allocation");
             }
 ''',
         '',
@@ -755,17 +755,17 @@ SABOTAGES = [
         'a virtqueue wait suspends even when the seqno is already published',
         'src/venus/context.rs',
         '''        if published < args.seqno {
-            self.wait = Some(Wait::Virtqueue(args.seqno));
+            self.suspend(Wait::Virtqueue(args.seqno));
         }''',
         '''        let _ = published;
-        self.wait = Some(Wait::Virtqueue(args.seqno));''',
+        self.suspend(Wait::Virtqueue(args.seqno));''',
         '',
     ),
     (
         'a ring seqno wider than a ring position is truncated instead of refused',
         'src/venus/context.rs',
         '''        let Ok(seqno) = u32::try_from(args.seqno) else {
-            self.reject = Some("waited on a ring seqno too large to be a position in a ring");
+            self.reject("waited on a ring seqno too large to be a position in a ring");
             return;
         };''',
         '''        let seqno = args.seqno as u32;''',
@@ -791,7 +791,7 @@ SABOTAGES = [
         'a transport command is served on whichever stream it arrives on',
         'src/venus/context.rs',
         '''        let Some(id) = self.current_ring else {
-            self.reject = Some("waited on a virtqueue seqno from the context's own stream");
+            self.reject("waited on a virtqueue seqno from the context's own stream");
             return;
         };''',
         '''        let id = self.current_ring.unwrap_or(RingId(7));''',
@@ -850,8 +850,7 @@ SABOTAGES = [
         'reply positions are accepted with no window for them to be positions in',
         'src/venus/context.rs',
         """            Some(_) if self.reply.is_none() => {
-                self.reject =
-                    Some("executed command streams with reply positions and no reply stream");
+                self.reject("executed command streams with reply positions and no reply stream");
                 return;
             }""",
         """""",
@@ -1363,9 +1362,9 @@ SABOTAGES = [
         'a create under a live id reaches the driver, and the object it makes is nobody\'s',
         'src/venus/context.rs',
         """        if self.objects.borrow().get(id).is_some() {
-            self.reject = Some("created an object under an id that is already an object");""",
+            self.reject("created an object under an id that is already an object");""",
         """        if false && self.objects.borrow().get(id).is_some() {
-            self.reject = Some("created an object under an id that is already an object");""",
+            self.reject("created an object under an id that is already an object");""",
         'a_create_under_a_live_id_never_reaches_the_driver',
     ),
     (
@@ -1482,7 +1481,7 @@ SABOTAGES = [
         'a fence a ring is waiting on inside the driver can be destroyed from the context stream',
         'src/venus/context.rs',
         """        if self.waited_fence(args.fence) {
-            self.reject = Some("destroyed a fence one of its streams is waiting on");
+            self.reject("destroyed a fence one of its streams is waiting on");
             return;
         }""",
         '',
@@ -1492,7 +1491,7 @@ SABOTAGES = [
         'a device with a wait in flight can be destroyed, cascading through the fence being waited on',
         'src/venus/context.rs',
         """        if self.waited_device(args.device) {
-            self.reject = Some("destroyed a device one of its streams is waiting on");
+            self.reject("destroyed a device one of its streams is waiting on");
             return;
         }""",
         '',
