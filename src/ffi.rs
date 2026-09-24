@@ -121,12 +121,18 @@ struct Sink {
     write_present_fence: Mutex<Option<PresentFenceCb>>,
     /// Retired fences the VMM has not been told of yet, or `None` when it asked to be told at once.
     deferred: Option<Mutex<VecDeque<Retired>>>,
+    /// `VIRGLRS_DEBUG`'s switches, as the renderer read them. Set once, by init, from the
+    /// renderer this sink was built for -- which is built after the sink, since it takes it.
+    /// Nothing is handed over before init returns, so every hand-over sees it set. Not read
+    /// through the renderer: a drain from `poll` never takes the renderer's lock.
+    debug: OnceLock<crate::vrend::debug::Switches>,
 }
 
 impl Sink {
     /// Call the VMM. Only ever from a thread the VMM has agreed to be called on.
     fn hand_over(&self, retired: Retired) {
-        if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
+        let debug = *self.debug.get().expect("init gives the sink its switches before it returns");
+        if debug.enabled(crate::vrend::debug::Switch::Fence) {
             let what = match &retired {
                 Retired::Context(ctx, ring, fence) => {
                     format!("context ctx={ctx:?} ring={ring:?} id={}", fence.0)
@@ -403,6 +409,7 @@ pub extern "C" fn virgl_renderer_init(
             write_present_fence: Mutex::new(None),
             // The VMM that did not ask to be called out of band is told through `poll` instead.
             deferred: (flags & abi::ASYNC_FENCE_CB == 0).then(|| Mutex::new(VecDeque::new())),
+            debug: OnceLock::new(),
         })
     };
     *sink().lock().expect("the sink slot is never held across a panic") = Some(Arc::clone(&shared));
@@ -438,8 +445,9 @@ pub extern "C" fn virgl_renderer_init(
         crate::renderer::unsupported_renderers(config_of(flags)),
         if contexts.is_some() { "minted by the VMM" } else { "of our own" },
     );
-    match Renderer::new(Box::new(VmmFences(shared)), config_of(flags), contexts) {
+    match Renderer::new(Box::new(VmmFences(Arc::clone(&shared))), config_of(flags), contexts) {
         Ok(renderer) => {
+            shared.debug.set(renderer.debug()).expect("a sink is initialised once");
             *g = Some(Client { renderer, init: InitArgs::new(cookie, flags, cb) });
             0
         }
@@ -958,26 +966,29 @@ pub extern "C" fn virgl_renderer_resource_create(
         }
     };
     let iov = read_iov(iov, num_iovs);
-    if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Resource) {
-        eprintln!(
-            "[virglrs] resource {} create: target {} format {} {}x{}x{} bind {:#x}",
-            a.handle, a.target, a.format, a.width, a.height, a.depth, a.bind
-        );
-    }
-    with(EINVAL, |r| match r.resource_create(handle, desc, iov) {
-        Ok(()) => {
-            if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Resource) {
-                eprintln!(
-                    "[virglrs] resource {} created: tex_id={:?}",
-                    handle.get(),
-                    r.classic_texture(handle).map(|n| n.raw())
-                );
-            }
-            0
+    with(EINVAL, |r| {
+        let log = r.debug().enabled(crate::vrend::debug::Switch::Resource);
+        if log {
+            eprintln!(
+                "[virglrs] resource {} create: target {} format {} {}x{}x{} bind {:#x}",
+                a.handle, a.target, a.format, a.width, a.height, a.depth, a.bind
+            );
         }
-        Err(e) => {
-            eprintln!("[virglrs] resource {}: {e}", handle.get());
-            errno(e)
+        match r.resource_create(handle, desc, iov) {
+            Ok(()) => {
+                if log {
+                    eprintln!(
+                        "[virglrs] resource {} created: tex_id={:?}",
+                        handle.get(),
+                        r.classic_texture(handle).map(|n| n.raw())
+                    );
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("[virglrs] resource {}: {e}", handle.get());
+                errno(e)
+            }
         }
     })
 }
@@ -1177,8 +1188,9 @@ pub extern "C" fn virgl_renderer_resource_get_info(
             }
             _ => None,
         });
+        let log = r.debug().enabled(crate::vrend::debug::Switch::Resource);
         let Some(described) = described else {
-            if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Resource) {
+            if log {
                 eprintln!("[virglrs] resource {res_handle} get_info: nothing holds this handle");
             }
             return EINVAL;
@@ -1194,7 +1206,7 @@ pub extern "C" fn virgl_renderer_resource_get_info(
         // The scanout's whole description, as the VMM will read it. `tex_id` in particular: a
         // VMM with a GL display hands that name to its own compositor, so two live resources
         // reporting one name is a corrupted display rather than a wrong number.
-        if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Resource) {
+        if log {
             eprintln!(
                 "[virglrs] resource {res_handle} get_info: format={virgl_format} \
                  {width}x{height}x{depth} flags={flags:#x} stride={stride} tex_id={tex_id}"
@@ -1872,10 +1884,10 @@ pub extern "C" fn virgl_renderer_create_fence(client_fence_id: c_int, ctx_id: u3
         AbiCtx::Context(id) => Some(id),
         _ => None,
     };
-    if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
-        eprintln!("[virglrs] fence: create_fence id={client_fence_id} ctx={ctx_id} on={on:?}");
-    }
     with(EINVAL, |r| {
+        if r.debug().enabled(crate::vrend::debug::Switch::Fence) {
+            eprintln!("[virglrs] fence: create_fence id={client_fence_id} ctx={ctx_id} on={on:?}");
+        }
         r.create_fence(ClientFenceId(client_fence_id as u32), on);
         0
     })
@@ -1889,17 +1901,19 @@ pub extern "C" fn virgl_renderer_context_create_fence(
     fence_id: u64,
 ) -> c_int {
     // The global has no per-context ring to fence; `virgl_renderer_create_fence` is its path.
-    if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
-        eprintln!(
-            "[virglrs] fence: context_create_fence ctx={ctx_id} ring={ring_idx} id={fence_id}"
-        );
-    }
     let AbiCtx::Context(id) = AbiCtx::new(ctx_id) else {
         return EINVAL;
     };
-    with(EINVAL, |r| match r.context_create_fence(id, RingIdx(ring_idx), FenceId(fence_id)) {
-        Ok(()) => 0,
-        Err(e) => errno(e),
+    with(EINVAL, |r| {
+        if r.debug().enabled(crate::vrend::debug::Switch::Fence) {
+            eprintln!(
+                "[virglrs] fence: context_create_fence ctx={ctx_id} ring={ring_idx} id={fence_id}"
+            );
+        }
+        match r.context_create_fence(id, RingIdx(ring_idx), FenceId(fence_id)) {
+            Ok(()) => 0,
+            Err(e) => errno(e),
+        }
     })
 }
 
@@ -2641,6 +2655,7 @@ mod tests {
             write_context_fence: None,
             write_present_fence: Mutex::new(None),
             deferred: Some(Mutex::new(VecDeque::new())),
+            debug: OnceLock::from(crate::vrend::debug::Switches::default()),
         };
 
         CALLS.store(0, Ordering::SeqCst);
@@ -2664,6 +2679,7 @@ mod tests {
             write_context_fence: None,
             write_present_fence: Mutex::new(None),
             deferred: None,
+            debug: OnceLock::from(crate::vrend::debug::Switches::default()),
         };
         CALLS.store(0, Ordering::SeqCst);
         at_once.retire(Retired::Global(ClientFenceId(9)));
@@ -2696,6 +2712,7 @@ mod tests {
             write_context_fence: None,
             write_present_fence: Mutex::new(Some(present)),
             deferred: Some(Mutex::new(VecDeque::new())),
+            debug: OnceLock::from(crate::vrend::debug::Switches::default()),
         };
 
         CALLS.store(0, Ordering::SeqCst);
@@ -2722,6 +2739,7 @@ mod tests {
             write_context_fence: None,
             write_present_fence: Mutex::new(None),
             deferred: None,
+            debug: OnceLock::from(crate::vrend::debug::Switches::default()),
         };
         CALLS.store(0, Ordering::SeqCst);
         silent.retire(Retired::Present(FenceId(3)));

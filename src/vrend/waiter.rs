@@ -35,6 +35,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
+use super::debug;
 use super::egl::{self, ThreadDisplay};
 use super::gl::{Fence, FenceWait, Gl};
 use super::video::pending::Landing;
@@ -122,13 +123,19 @@ impl Waiter {
     ///
     /// The context is created here, on the caller's thread, and made current on the waiter's --
     /// currency is per thread, so the two never contend for it.
-    pub fn start(display: ThreadDisplay, ctx: egl::Context, gl: Gl, sink: fence::Handle) -> Waiter {
+    pub fn start(
+        display: ThreadDisplay,
+        ctx: egl::Context,
+        gl: Gl,
+        sink: fence::Handle,
+        debug: debug::Switches,
+    ) -> Waiter {
         let q =
             Arc::new((Mutex::new(Queue { jobs: VecDeque::new(), stopped: false }), Condvar::new()));
         let qt = Arc::clone(&q);
         let thread = std::thread::Builder::new()
             .name("virglrs-glwait".into())
-            .spawn(move || run(display, ctx, gl, sink, qt))
+            .spawn(move || run(display, ctx, gl, sink, qt, debug))
             .expect("spawning the classic fence waiter");
         Waiter { q, thread: Some(thread) }
     }
@@ -187,6 +194,7 @@ fn run(
     gl: Gl,
     sink: fence::Handle,
     q: Arc<(Mutex<Queue>, Condvar)>,
+    debug: debug::Switches,
 ) {
     display.make_current(&ctx).expect("the fence waiter's own context is made current");
     let (m, cv) = &*q;
@@ -206,7 +214,7 @@ fn run(
                 g = cv.wait(g).expect("the waiter queue lock is never held across a panic");
             }
         };
-        if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
+        if debug.enabled(debug::Switch::Fence) {
             eprintln!("[virglrs] fence: waiter woke, answer={}", job.fence.name());
         }
         // The pictures first. A decode thread needs nothing from this one, so waiting here cannot
@@ -223,7 +231,7 @@ fn run(
                 gl.fence_delete(fence);
             }
         }
-        if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
+        if debug.enabled(debug::Switch::Fence) {
             eprintln!("[virglrs] fence: waiter done waiting, retiring");
         }
         match job.retire {
@@ -353,12 +361,21 @@ mod tests {
         let surface = render_target(&winsys, &gl);
 
         let (tx, retired) = std::sync::mpsc::channel();
-        let retirement = crate::fence::Retirement::start(Box::new(Recorder(tx)));
+        let retirement = crate::fence::Retirement::start(
+            Box::new(Recorder(tx)),
+            crate::vrend::debug::Switches::default(),
+        );
         let display = winsys.thread_display().expect("a winsys of our own lends its display");
         let wait_ctx = winsys
             .create_context(Version { major: 3, minor: 1 }, Some(&ctx))
             .expect("a shared context");
-        let waiter = Waiter::start(display, wait_ctx, Gl::new(winsys.gles()), retirement.handle());
+        let waiter = Waiter::start(
+            display,
+            wait_ctx,
+            Gl::new(winsys.gles()),
+            retirement.handle(),
+            debug::Switches::default(),
+        );
 
         let black = |gl: &Gl| {
             gl.clear_color([0.0, 0.0, 0.0, 1.0]);
@@ -553,12 +570,21 @@ mod tests {
         winsys.make_current(&ctx).expect("ctx is current on this thread");
 
         let (tx, retired) = std::sync::mpsc::channel();
-        let retirement = crate::fence::Retirement::start(Box::new(Recorder(tx)));
+        let retirement = crate::fence::Retirement::start(
+            Box::new(Recorder(tx)),
+            crate::vrend::debug::Switches::default(),
+        );
         let display = winsys.thread_display().expect("a winsys of our own lends its display");
         let wait_ctx = winsys
             .create_context(Version { major: 3, minor: 1 }, Some(&ctx))
             .expect("a shared context");
-        let waiter = Waiter::start(display, wait_ctx, Gl::new(winsys.gles()), retirement.handle());
+        let waiter = Waiter::start(
+            display,
+            wait_ctx,
+            Gl::new(winsys.gles()),
+            retirement.handle(),
+            debug::Switches::default(),
+        );
 
         let landing = Landing::new();
         waiter.retire_global(vec![Arc::clone(&landing)], Answer::Ordered, ClientFenceId(1));

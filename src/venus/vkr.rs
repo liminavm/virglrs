@@ -646,7 +646,11 @@ mod tests {
         let table: SharedResources = Arc::new(RwLock::new(OneShm(Arc::clone(&map))));
         // A retirement to hang ring fences off. The handle keeps the thread alive on its own,
         // so the `Retirement` itself need not be held here.
-        let retire = crate::fence::Retirement::start(Box::new(Nowhere)).handle();
+        let retire = crate::fence::Retirement::start(
+            Box::new(Nowhere),
+            crate::vrend::debug::Switches::default(),
+        )
+        .handle();
         let mut v = Vkr::new(Config::default(), table, &Budget::with_cap(None, false), retire);
         v.context_create(ctx_id(), String::new());
         (v, map)

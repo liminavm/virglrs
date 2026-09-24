@@ -456,7 +456,7 @@ fn translate(
         ShaderKind::Compute { req_local_mem } => (*req_local_mem, &none),
         ShaderKind::Graphics { stream_output } => (0, stream_output),
     };
-    let log = debug::enabled(debug::Switch::Shader);
+    let log = host.debug.enabled(debug::Switch::Shader);
     if log {
         eprint!("TGSI received:\n{}\n", tgsi::dump::dump(&program.tgsi.shader));
     }

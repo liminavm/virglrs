@@ -101,13 +101,13 @@ pub struct Retirement {
 }
 
 impl Retirement {
-    pub fn start(sink: Box<dyn FenceSink>) -> Retirement {
+    pub fn start(sink: Box<dyn FenceSink>, debug: crate::vrend::debug::Switches) -> Retirement {
         let q =
             Arc::new((Mutex::new(Queue { jobs: VecDeque::new(), stopped: false }), Condvar::new()));
         let qt = Arc::clone(&q);
         let thread = thread::Builder::new()
             .name("virglrs-fence".into())
-            .spawn(move || run(sink, qt))
+            .spawn(move || run(sink, qt, debug))
             .expect("spawning the fence retirement thread");
         Retirement { inner: Arc::new(Inner { q, thread: Mutex::new(Some(thread)) }) }
     }
@@ -174,7 +174,11 @@ fn push(q: &Arc<(Mutex<Queue>, Condvar)>, job: Job) {
     cv.notify_one();
 }
 
-fn run(mut sink: Box<dyn FenceSink>, q: Arc<(Mutex<Queue>, Condvar)>) {
+fn run(
+    mut sink: Box<dyn FenceSink>,
+    q: Arc<(Mutex<Queue>, Condvar)>,
+    debug: crate::vrend::debug::Switches,
+) {
     let (m, cv) = &*q;
     loop {
         let job = {
@@ -188,7 +192,7 @@ fn run(mut sink: Box<dyn FenceSink>, q: Arc<(Mutex<Queue>, Condvar)>) {
                 }
             }
         };
-        if crate::vrend::debug::enabled(crate::vrend::debug::Switch::Fence) {
+        if debug.enabled(crate::vrend::debug::Switch::Fence) {
             let what = match &job {
                 Job::Context(ctx, ring, fence) => {
                     format!("context ctx={ctx:?} ring={ring:?} id={}", fence.0)
@@ -240,7 +244,7 @@ mod tests {
     #[test]
     fn a_handle_outliving_its_retirement_still_delivers() {
         let (tx, rx) = channel();
-        let r = Retirement::start(Box::new(Recorder(tx)));
+        let r = Retirement::start(Box::new(Recorder(tx)), crate::vrend::debug::Switches::default());
         let h = r.handle();
         drop(r);
         h.retire_global(ClientFenceId(7));
@@ -263,7 +267,7 @@ mod tests {
     fn every_queued_fence_is_delivered_in_ring_order_before_the_queue_stops() {
         const N: u64 = 500;
         let (tx, rx) = channel();
-        let r = Retirement::start(Box::new(Recorder(tx)));
+        let r = Retirement::start(Box::new(Recorder(tx)), crate::vrend::debug::Switches::default());
 
         let ctx = ContextId::new(7).unwrap();
         for i in 1..=N {
@@ -321,7 +325,10 @@ mod loom_models {
         loom::model(|| {
             SCHEDULES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let got = Arc::new(Mutex::new(Vec::new()));
-            let r = Retirement::start(Box::new(Recorder(Arc::clone(&got))));
+            let r = Retirement::start(
+                Box::new(Recorder(Arc::clone(&got))),
+                crate::vrend::debug::Switches::default(),
+            );
             let h = r.handle();
             let ctx = ContextId::new(7).unwrap();
             let other = thread::spawn(move || {

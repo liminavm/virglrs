@@ -121,6 +121,8 @@ pub struct Host<'a> {
     pub gl: &'a Gl,
     /// limina's trace knobs, as the renderer read them when it was built.
     pub traces: super::debug::Traces,
+    /// `VIRGLRS_DEBUG`'s switches, as the renderer read them when it was built.
+    pub debug: super::debug::Switches,
     /// Which batch is running, for the one thing that has to know: whether a copy of a guest's
     /// pages was already taken since the guest last had a chance to write them.
     pub batch: u64,

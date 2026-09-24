@@ -702,6 +702,8 @@ pub struct Renderer {
     vrend: Option<vrend::vrend::Vrend>,
     /// limina's trace knobs, read once here and handed to the classic renderer with the rest.
     traces: vrend::debug::Traces,
+    /// `VIRGLRS_DEBUG`'s switches, read once here and handed to every thread that logs by them.
+    debug: vrend::debug::Switches,
     /// Retirement outlives whoever can still retire through it, including the classic fence waiter
     /// `vrend` owns -- a `fence::Handle` keeps the thread alive, so the order these fields are
     /// declared or dropped in does not decide whether a fence in flight is delivered.
@@ -730,7 +732,8 @@ impl Renderer {
         // ledgers would be two answers to the one question the cap is asked.
         let budget = crate::budget::Budget::from_env();
         let traces = vrend::debug::Traces::from_env();
-        let fences = Retirement::start(fences);
+        let debug = vrend::debug::Switches::from_env();
+        let fences = Retirement::start(fences, debug);
         let vrend = if config.vrend {
             Some(vrend::vrend::Vrend::new(
                 config,
@@ -739,6 +742,7 @@ impl Renderer {
                 contexts,
                 condemned.clone(),
                 traces,
+                debug,
             )?)
         } else {
             None
@@ -754,8 +758,14 @@ impl Renderer {
             budget,
             vrend,
             traces,
+            debug,
             fences,
         })
+    }
+
+    /// `VIRGLRS_DEBUG`'s switches, as read when this renderer was built.
+    pub fn debug(&self) -> vrend::debug::Switches {
+        self.debug
     }
 
     /// What this process holds on the guest's behalf, and the cap on it.

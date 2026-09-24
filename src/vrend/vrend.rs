@@ -129,6 +129,8 @@ pub struct Vrend {
     budget: crate::budget::Classic,
     /// limina's trace knobs, as the renderer read them when it was built.
     traces: super::debug::Traces,
+    /// `VIRGLRS_DEBUG`'s switches, as the renderer read them when it was built.
+    debug: super::debug::Switches,
     /// `VIRGLRS_FENCE_FINISH=1`: every fence finishes every context inline, on this thread -- the
     /// behaviour the fence path replaced, kept so the two can be compared on one build the way the
     /// cost of the finish was measured in the first place. Retirement still goes through the
@@ -228,6 +230,7 @@ impl Vrend {
         contexts: Option<Box<dyn GlContexts>>,
         condemned: resource::Condemned,
         traces: super::debug::Traces,
+        debug: super::debug::Switches,
     ) -> Result<Vrend, InitError> {
         let fences_for_inline = fences.clone();
         // An embedder's winsys arrives with ctx0 already made and current, because its display is
@@ -311,9 +314,13 @@ impl Vrend {
         let waiter = match winsys.thread_display() {
             None => None,
             Some(display) => match winsys.create_context(version, Some(&ctx0)) {
-                Ok(wait_ctx) => {
-                    Some(waiter::Waiter::start(display, wait_ctx, Gl::new(winsys.gles()), fences))
-                }
+                Ok(wait_ctx) => Some(waiter::Waiter::start(
+                    display,
+                    wait_ctx,
+                    Gl::new(winsys.gles()),
+                    fences,
+                    debug,
+                )),
                 Err(e) => {
                     eprintln!(
                         "[virglrs] vrend: no context for the fence waiter ({e}); \
@@ -352,6 +359,7 @@ impl Vrend {
             pixels: resource::Refresh::default(),
             budget: crate::budget::Classic::open(budget),
             traces,
+            debug,
             fence_finish: std::env::var("VIRGLRS_FENCE_FINISH").as_deref() == Ok("1"),
         })
     }
@@ -419,11 +427,13 @@ impl Vrend {
             waiter: _,
             fences: _,
             traces,
+            debug,
             fence_finish: _,
         } = self;
         let host = Host {
             batch: *batch,
             traces: *traces,
+            debug: *debug,
             tally,
             staging,
             budget,
@@ -925,7 +935,7 @@ impl Vrend {
             return;
         }
         let answer = self.take_fence(Some(ctx));
-        if super::debug::enabled(super::debug::Switch::Fence) {
+        if self.debug.enabled(super::debug::Switch::Fence) {
             eprintln!(
                 "[virglrs] fence: context ctx={ctx:?} ring={ring:?} id={} answer={}",
                 id.0,
@@ -954,7 +964,7 @@ impl Vrend {
             return;
         }
         let answer = self.take_fence(Some(ctx));
-        if super::debug::enabled(super::debug::Switch::Fence) {
+        if self.debug.enabled(super::debug::Switch::Fence) {
             eprintln!("[virglrs] fence: present ctx={ctx:?} id={} answer={}", id.0, answer.name());
         }
         let w = self.waiter.as_ref().expect("checked just above");
@@ -976,7 +986,7 @@ impl Vrend {
             return;
         }
         let answer = self.take_fence(on);
-        if super::debug::enabled(super::debug::Switch::Fence) {
+        if self.debug.enabled(super::debug::Switch::Fence) {
             eprintln!("[virglrs] fence: global id={} on={on:?} answer={}", id.0, answer.name());
         }
         let w = self.waiter.as_ref().expect("checked just above");
@@ -1435,7 +1445,10 @@ mod tests {
         }
         // Declared first so it outlives the renderer: the fence waiter retires through this as it
         // drains, which happens while `v` is dropping.
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -1443,6 +1456,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         let present: Vec<&str> = v.features.present().map(|f| f.name()).collect();
@@ -1469,7 +1483,10 @@ mod tests {
 
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -1477,6 +1494,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
 
@@ -1533,7 +1551,10 @@ mod tests {
             }
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        let retire = crate::fence::Retirement::start(Box::new(Recorder(tx)));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Recorder(tx)),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -1541,6 +1562,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         assert!(
@@ -1588,7 +1610,10 @@ mod tests {
 
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
-        let retire = crate::fence::Retirement::start(Box::new(Ignore));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Ignore),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -1596,6 +1621,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
 
@@ -1643,7 +1669,10 @@ mod tests {
 
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
-        let retire = crate::fence::Retirement::start(Box::new(Ignore));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Ignore),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -1651,6 +1680,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
@@ -1715,7 +1745,10 @@ mod tests {
                 None
             }
         }
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -1723,6 +1756,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         assert!(v.features.has(Feature::timer_query), "the premise: this driver has timer queries");
@@ -1815,7 +1849,10 @@ mod tests {
         };
         let mut short = [0u8; 8];
         let guest = ShortPages(pages(&mut short));
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -1823,6 +1860,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         assert!(v.features.has(Feature::timer_query), "the premise: this driver has timer queries");
@@ -1882,7 +1920,10 @@ mod tests {
 
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let budget = crate::budget::Budget::with_cap(None, false);
         let mut v = Vrend::new(
             Config::default(),
@@ -1891,6 +1932,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         let before = budget.classic();
@@ -1941,7 +1983,10 @@ mod tests {
                 None
             }
         }
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -1949,6 +1994,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
@@ -2017,7 +2063,10 @@ mod tests {
 
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -2025,6 +2074,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
@@ -2083,7 +2133,10 @@ mod tests {
 
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -2091,6 +2144,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
@@ -2127,7 +2181,10 @@ mod tests {
 
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -2135,6 +2192,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
@@ -2195,7 +2253,10 @@ mod tests {
                 None
             }
         }
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -2203,6 +2264,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         let bgra = super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM");
@@ -2317,7 +2379,10 @@ mod tests {
 
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -2325,6 +2390,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         let mut wire = Vec::new();
@@ -2455,7 +2521,10 @@ mod tests {
                 None
             }
         }
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let condemned = crate::vrend::resource::Condemned::default();
         let mut v = Vrend::new(
             Config::default(),
@@ -2464,6 +2533,7 @@ mod tests {
             None,
             condemned.clone(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
         let bgra = super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM");
@@ -2535,7 +2605,10 @@ mod tests {
 
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
-        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
         let mut v = Vrend::new(
             Config::default(),
             &crate::budget::Budget::with_cap(None, false),
@@ -2543,6 +2616,7 @@ mod tests {
             None,
             crate::vrend::resource::Condemned::default(),
             crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
 

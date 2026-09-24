@@ -5,8 +5,6 @@
 //! of switches, read once; the C's is `VREND_DEBUG`, and the switches keep its names where they
 //! print the same thing.
 
-use std::sync::OnceLock;
-
 /// One switch.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Switch {
@@ -32,29 +30,31 @@ impl Switch {
         &[(Switch::Shader, "shader"), (Switch::Resource, "resource"), (Switch::Fence, "fence")];
 }
 
-fn switches() -> &'static [Switch] {
-    static SWITCHES: OnceLock<Vec<Switch>> = OnceLock::new();
-    SWITCHES.get_or_init(|| {
-        let Ok(spec) = std::env::var("VIRGLRS_DEBUG") else {
-            return Vec::new();
-        };
-        spec.split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .filter_map(|name| {
-                let found = Switch::ALL.iter().find(|(_, n)| *n == name).map(|(s, _)| *s);
-                if found.is_none() {
-                    eprintln!("[virglrs] VIRGLRS_DEBUG: no switch named {name:?}");
-                }
-                found
-            })
-            .collect()
-    })
-}
+/// The switches `VIRGLRS_DEBUG` asked for, read once when the renderer is built and carried by
+/// it from there, as every other knob is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Switches(u8);
 
-/// Whether `switch` was asked for.
-pub fn enabled(switch: Switch) -> bool {
-    switches().contains(&switch)
+impl Switches {
+    pub fn from_env() -> Switches {
+        let Ok(spec) = std::env::var("VIRGLRS_DEBUG") else {
+            return Switches::default();
+        };
+        let mut on = Switches::default();
+        for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match Switch::ALL.iter().position(|(_, n)| *n == name) {
+                Some(i) => on.0 |= 1 << i,
+                None => eprintln!("[virglrs] VIRGLRS_DEBUG: no switch named {name:?}"),
+            }
+        }
+        on
+    }
+
+    /// Whether `switch` was asked for.
+    pub fn enabled(self, switch: Switch) -> bool {
+        let i = Switch::ALL.iter().position(|(s, _)| *s == switch).expect("every switch is listed");
+        self.0 & (1 << i) != 0
+    }
 }
 
 /// limina's two trace knobs, read once when the renderer is built and carried by it from there.

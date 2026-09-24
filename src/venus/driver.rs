@@ -10347,7 +10347,9 @@ mod tests {
         RELEASE.store(false, Ordering::Release);
 
         let (tx, rx) = channel();
-        let retire = Retirement::start(Box::new(Recorder(tx))).handle();
+        let retire =
+            Retirement::start(Box::new(Recorder(tx)), crate::vrend::debug::Switches::default())
+                .handle();
         let ctx = ContextId::new(4).expect("4 is not zero");
 
         let mut d = Driver::new(Account::for_test(None));
@@ -10496,7 +10498,9 @@ mod tests {
         RELEASE.store(false, Ordering::Release);
 
         let (tx, rx) = channel();
-        let retire = Retirement::start(Box::new(Recorder(tx))).handle();
+        let retire =
+            Retirement::start(Box::new(Recorder(tx)), crate::vrend::debug::Switches::default())
+                .handle();
         let ctx = ContextId::new(7).expect("7 is not zero");
 
         let mut d = Driver::new(Account::for_test(None));
