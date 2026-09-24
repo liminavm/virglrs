@@ -794,7 +794,7 @@ SABOTAGES = [
             self.reject("waited on a virtqueue seqno from the context's own stream");
             return;
         };''',
-        '''        let id = self.current_ring.unwrap_or(RingId(7));''',
+        '''        let id = self.current_ring.unwrap_or(RingId::new(7).expect("seven is not zero"));''',
         '',
     ),
     (
