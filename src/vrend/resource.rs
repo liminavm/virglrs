@@ -2284,17 +2284,18 @@ fn fill_texture(
     }
     // A picture in more than one plane. Its table entry is the RGBA8 triple -- four bytes per
     // pixel at luma resolution -- against guest pages holding one byte of luma and a
-    // quarter-sized chroma plane the single-plane layout below has no way to name. The
-    // arithmetic refuses it as it stands, but for the wrong reason and saying the wrong thing:
-    // a byte count, when what is missing is a YUV-to-RGBA pass over the planes. Refused by
-    // name, as `transfer::write` refuses the same formats, so the gap reads as a gap.
+    // quarter-sized chroma plane the single-plane layout below has no way to name. The C runs a
+    // YUV-to-RGBA pass over the planes here; this does not, by decision, because no workload we
+    // can find types a planar blob (docs/design.md, "Where virglrs deliberately differs"). Refused
+    // by name, as `transfer::write` refuses the same formats, so a workload that does reach it
+    // says so -- and that line is what reopens the decision.
     if video::guest_planes(a.format) > 1 {
         if !say {
             return false;
         }
         eprintln!(
             "[virglrs] vrend: blob {}x{} is {}, whose picture is in {} planes; converting one \
-             from guest pages is not served",
+             from guest pages is not served (a workload reaching this is worth reporting)",
             a.width,
             a.height,
             a.format.name(),

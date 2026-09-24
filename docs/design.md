@@ -872,46 +872,28 @@ to have it, each because reproducing the C would mean reproducing a defect.
   correct answer, so the C is wrong here and these lines of that fixture are pinned from virglrs
   rather than from the C — reproducing the bug to keep a golden green is not a trade worth making,
   and a permanently red line is a gate nobody reads.
+- **A blob typed with a planar format is not converted.** The C runs a CPU YUV-to-RGBA pass when
+  `SET_TYPE` names NV12, NV21, I420 or YV12 on a blob in guest pages. virglrs refuses it by name
+  in `fill_texture`, blanks the texture (wrong, but no other context's memory shows through) and
+  says so on stderr. This is a decision, not a gap: nothing we can find reaches it.
 
-## Open, and owed a decision
+  Every fixture but `vrend-vkclient` leaves its blobs untyped, and vkclient's six typed blobs are
+  `R16G16B16X16_FLOAT`. Composite decode targets arrive through `resource_create`, and the C sets
+  `guest_pixels` only in `SET_TYPE`. No video route on either GNOME tier types a blob at all.
+  Measured 2026-09-05 on both seated guests, counting `PIPE_RESOURCE_SET_TYPE` in the dumped
+  command histogram, with the decoder shown to count it (six in `vrend-vkclient.bin`):
 
-Each of these is a question about the renderers rather than about the harness, and each is
-waiting on a call rather than on work.
+  - stock, 267 s over 819,698 records: software H.264 into `waylandsink` and into
+    `glupload ! glimagesink`, Showtime with the VA decoders deranked, `vah264dec`, and Showtime's
+    default. 3,506 `TRANSFER3D`, 165 `DECODE_BITSTREAM`, zero `SET_TYPE`.
+  - enhanced, 123 s over 772,843 records: `vah264dec ! waylandsink` (a dmabuf export for the
+    compositor, the shape a planar `SET_TYPE` would come from), then Showtime hardware and
+    deranked. 833 `DECODE_BITSTREAM`, 3,183 video buffers, zero `SET_TYPE`.
 
-- **A blob typed with a planar format gets no picture.** The C converts one: `SET_TYPE` on an
-  NV12, NV21, I420 or YV12 blob runs a CPU YUV-to-RGBA pass over the guest's planes into an RGBA
-  texture at luma resolution. virglrs refuses it by name in `fill_texture` and blanks the
-  texture, which is wrong-but-not-a-leak and says so on stderr.
-
-  Nothing we hold reaches it. Every fixture but `vrend-vkclient` leaves all its blobs untyped,
-  and vkclient's six typed blobs are `R16G16B16X16_FLOAT`. The C's other planar consumer does not
-  reach it either: composite decode targets arrive through `resource_create`, and the C sets
-  `guest_pixels` at one site only, in `SET_TYPE`.
-
-  **No video route on either GNOME tier types a blob at all**, which is stronger than the fixture
-  census and was measured rather than reasoned. Measured 2026-09-05, both guests seated, the
-  discriminator `PIPE_RESOURCE_SET_TYPE` in the dumped command histogram:
-
-  - stock, one 267 s window over 819,698 records: software H.264 into `waylandsink`, into
-    `glupload ! glimagesink`, and Showtime with the VA decoders deranked; then `vah264dec`, and
-    Showtime's default. 3,506 `TRANSFER3D`, 165 `DECODE_BITSTREAM`, zero `SET_TYPE`.
-  - enhanced, one 123 s window over 772,843 records: `vah264dec ! waylandsink` — the VA decoder
-    exporting a dmabuf for the compositor to import, which is the shape a planar `SET_TYPE` would
-    come from — then Showtime hardware and Showtime deranked. 833 `DECODE_BITSTREAM`, 3,183
-    video buffers, zero `SET_TYPE`.
-
-  Decoded frames reach the renderer as transfers into ordinary resources, or as video buffers.
-  Never as a typed blob. The instrument was checked before the negative was believed: the decoder
-  names the command and counts six of it in `vrend-vkclient.bin`.
-
-  Two gaps, so the negative is not read wider than it is. The C's comment above this code says the
-  guest-pages fill is how "every GStreamer glupload whose buffers qualify" reaches the GPU;
-  qualifying means dmabuf-backed, and the one arm pairing a dmabuf source with `glupload`
-  (`vah264dec ! glupload ! glimagesink`) died guest-side on a bus error before it drew. That arm
-  is unobserved, not disproved. And synoik was not booted — it has no GNOME and no video stack, so
-  it is the least likely of the three, but it was not tried. Until a workload is found the
-  conversion is unreachable and unscoreable, and refusing it by name is the resting state; the
-  decision is whether to keep hunting for one.
+  Two arms were never observed, so the negative is no wider than this: `vah264dec ! glupload !
+  glimagesink`, the one pairing a dmabuf source with `glupload`, died guest-side on a bus error
+  before it drew; and synoik, which has no video stack, was not booted. **A real workload that
+  prints the refusal reopens this**, and what it asks for is the C's conversion.
 
 ## Owed, and waiting on work
 
