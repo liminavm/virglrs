@@ -1891,6 +1891,15 @@ SABOTAGES = [
         'a_transfer_on_a_context_the_resource_is_not_attached_to_is_refused_as_such',
     ),
     (
+        'a host with only the EGL image storage entry point is taken to bind images',
+        'src/vrend/features.rs',
+        """    pub fn binds_egl_images(&self) -> bool {
+        self.has(Feature::egl_image)""",
+        """    pub fn binds_egl_images(&self) -> bool {
+        self.has(Feature::egl_image) || self.has(Feature::egl_image_storage)""",
+        'only_the_oes_entry_point_makes_a_host_bind_egl_images',
+    ),
+    (
         'an shm mapping may run past the end of its descriptor',
         'src/guest_mem.rs',
         """        if len as u64 > held {""",

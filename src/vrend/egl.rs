@@ -623,8 +623,7 @@ impl Winsys {
     /// and not of the window being adopted. It is silent: a host that cannot adopt composites a
     /// blank window with nothing said, which `docs/linux-port.md` books.
     pub fn adopts_shared_storage(&self, features: &super::features::Features) -> bool {
-        use super::features::Feature;
-        if !(features.has(Feature::egl_image) || features.has(Feature::egl_image_storage)) {
+        if !features.binds_egl_images() {
             return false;
         }
         // An IOSurface is imported through a Limina-specific target that needs no EGL extension

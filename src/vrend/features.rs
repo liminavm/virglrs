@@ -226,12 +226,23 @@ impl Features {
     /// a host that has neither entry point has them for no surface, and asking again at each
     /// import would find that out at the first client window instead of at startup.
     pub fn adopts_iosurfaces(&self) -> bool {
-        // The extensions are necessary and not sufficient: they are Mesa's own, present on any
-        // host with EGLImage at all, and answering from them alone reads true on a host that has
-        // no IOSurfaces to adopt. Where nothing can mint one the answer is no, and it is no
-        // before the driver is asked -- see `crate::surface`.
-        cfg!(target_os = "macos")
-            && (self.has(Feature::egl_image) || self.has(Feature::egl_image_storage))
+        // The extension is necessary and not sufficient: it is Mesa's own, present on any host
+        // with EGLImage at all, and answering from it alone reads true on a host that has no
+        // IOSurfaces to adopt. Where nothing can mint one the answer is no, and it is no before
+        // the driver is asked -- see `crate::surface`.
+        cfg!(target_os = "macos") && self.binds_egl_images()
+    }
+
+    /// Whether this host can make an EGL image a texture's storage by some entry point every
+    /// adopting path can use.
+    ///
+    /// `glEGLImageTargetTexture2DOES`, and nothing else: `glEGLImageTargetTexStorageEXT` is an
+    /// upgrade on it for a texture whose format can be immutable, not a substitute. Its extension
+    /// is written against `OES_EGL_image`, and a decode plane or a format without texture storage
+    /// binds through the OES entry point alone -- so a host answering yes on the EXT one only
+    /// would say it adopts, and then have nothing to bind those with.
+    pub fn binds_egl_images(&self) -> bool {
+        self.has(Feature::egl_image)
     }
 
     /// Decide every feature from a context's version and the extensions it advertises.
@@ -287,6 +298,16 @@ impl Features {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host that can only bind an EGL image as immutable storage adopts nothing: a decode plane,
+    /// or a format without texture storage, binds through the OES entry point and it has none.
+    #[test]
+    fn only_the_oes_entry_point_makes_a_host_bind_egl_images() {
+        let ext = |names: &[&str]| Features::probe(300, names.iter().map(|n| n.to_string()));
+        assert!(ext(&["GL_OES_EGL_image"]).binds_egl_images());
+        assert!(ext(&["GL_OES_EGL_image", "GL_EXT_EGL_image_storage"]).binds_egl_images());
+        assert!(!ext(&["GL_EXT_EGL_image_storage"]).binds_egl_images(), "an upgrade on nothing");
+    }
 
     /// Every row of the table has a bit, and each bit is its own. The array is sized from
     /// `Feature::COUNT`, so it cannot be too small; what this guards is `at` folding two rows

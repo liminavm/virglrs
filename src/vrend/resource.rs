@@ -2455,24 +2455,19 @@ fn alloc_texture(
     gl.drain_errors();
     if let Some(image) = image {
         // The surface becomes the texture's storage: through the entry point that asks for
-        // immutable storage where the driver has it, else the older one, which does not.
+        // immutable storage where the driver has it, else the older one, which does not -- and
+        // which every host that makes images has, by `Features::binds_egl_images`.
         // Whether the texture came out immutable-format is read back below rather than inferred
         // from which of the two ran.
-        let bound = if immutable && features.has(Feature::egl_image_storage) {
+        if immutable && features.has(Feature::egl_image_storage) {
             gl.egl_image_target_tex_storage(target, &image);
-            true
-        } else if features.has(Feature::egl_image) {
-            gl.egl_image_target_texture_2d(target, &image);
-            true
         } else {
-            false
-        };
+            gl.egl_image_target_texture_2d(target, &image);
+        }
         let err = gl.drain_errors();
-        // Nobody makes an EGL image without `Features::adopts_iosurfaces` first saying the host
-        // takes them, so reaching here means the driver accepted the image and then would not
-        // attach it. That is a host bug, and a resource that quietly kept GL storage instead
-        // would hide it behind a window that merely renders the wrong thing.
-        assert!(bound, "an EGL image with no entry point to bind it, past the feature probe");
+        // The driver accepted the image and then would not attach it. That is a host bug, and a
+        // resource that quietly kept GL storage instead would hide it behind a window that merely
+        // renders the wrong thing.
         assert_eq!(
             err,
             GL_NO_ERROR,
