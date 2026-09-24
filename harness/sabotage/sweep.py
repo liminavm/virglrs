@@ -2003,6 +2003,13 @@ SABOTAGES = [
             self.note_submit2(submits.get(), fence);""",
         'a_refused_submit_leaves_no_fence_pending_and_no_signal_requested',
     ),
+    (
+        'a stats window drops the decoder counters when the next one starts',
+        'src/vrend/tally.rs',
+        """        *a = Armed::new(a.every, a.settles.clone());""",
+        """        *a = Armed::new(a.every, Default::default());""",
+        'the_decoder_counters_outlive_the_window',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

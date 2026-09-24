@@ -317,8 +317,7 @@ impl Vrend {
         };
         let fences = fences_for_inline;
         let unsettled = super::video::pending::Unsettled::default();
-        let mut tally = tally::Tally::from_env();
-        tally.watch_settles(&unsettled);
+        let tally = tally::Tally::from_env(&unsettled);
         Ok(Vrend {
             winsys,
             gl,
