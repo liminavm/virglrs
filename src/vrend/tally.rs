@@ -490,6 +490,27 @@ impl Armed {
                 );
             }
         }
+        // Where the decode threads' time went. A fence taken behind a decode waits at most its
+        // queued + session + write, so this bounds how long one context's decode can hold back
+        // another context's fences in the waiter.
+        let t = a.settles.take_decode_times();
+        if t.queued.count > 0 {
+            let mean = |w: crate::vrend::video::pending::Waited| {
+                if w.count == 0 { 0.0 } else { w.total.as_secs_f64() * 1e3 / w.count as f64 }
+            };
+            eprintln!(
+                "[virglrs] vrend video: decode thread  queued {:.2} ms mean  max {:.2} ms  \
+                 session {:.2} ms mean  max {:.2} ms  write {:.2} ms mean  max {:.2} ms  \
+                 (n={} decode over {secs:.1}s{note})",
+                mean(t.queued),
+                t.queued.longest.as_secs_f64() * 1e3,
+                mean(t.session),
+                t.session.longest.as_secs_f64() * 1e3,
+                mean(t.write),
+                t.write.longest.as_secs_f64() * 1e3,
+                t.queued.count,
+            );
+        }
         // What video costs the submitting thread, printed only for a window that decoded. The
         // maximum is the number that matters: it is how long one command held up every context.
         if a.video_commands > 0 {

@@ -785,9 +785,10 @@ impl Decoder {
         self.newest = Some(Arc::clone(&job.landing));
         let worker = self.worker.get_or_insert_with(|| {
             let (jobs, queue) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
+            let times = unsettled.clone();
             let thread = std::thread::Builder::new()
                 .name("virglrs-decode".into())
-                .spawn(move || decode_thread(queue))
+                .spawn(move || decode_thread(queue, &times))
                 .expect("spawning a codec's decode thread");
             Worker { jobs, thread }
         });
@@ -834,6 +835,8 @@ struct Job {
     withheld: bool,
     write: Write,
     landing: Arc<pending::Landing>,
+    /// When the render thread sent it, for the time it spent queued.
+    sent: std::time::Instant,
 }
 
 /// What the decode thread does with the picture.
@@ -852,17 +855,32 @@ enum Write {
     },
 }
 
-fn decode_thread(queue: std::sync::mpsc::Receiver<Job>) {
+fn decode_thread(queue: std::sync::mpsc::Receiver<Job>, times: &pending::Unsettled) {
     let mut session = None;
     for job in queue {
-        let outcome = decode_one(&mut session, &job);
+        let mut phases = pending::Phases { queued: job.sent.elapsed(), ..Default::default() };
+        let outcome = decode_one(&mut session, &job, &mut phases);
         job.landing.land(outcome);
+        times.record_decode(phases);
+    }
+}
+
+/// Stores how long its scope took on drop, so every return out of a timed phase is timed.
+struct Timed<'a>(std::time::Instant, &'a mut Option<std::time::Duration>);
+
+impl Drop for Timed<'_> {
+    fn drop(&mut self) {
+        *self.1 = Some(self.0.elapsed());
     }
 }
 
 /// Decode one unit on the decode thread. Every failure is the frame's and not the stream's: it
 /// is logged, the target keeps what it held, and the next frame decodes as usual.
-fn decode_one(session: &mut Option<Session>, job: &Job) -> pending::Outcome {
+fn decode_one(
+    session: &mut Option<Session>,
+    job: &Job,
+    phases: &mut pending::Phases,
+) -> pending::Outcome {
     let handle = job.codec;
     let pixels = job
         .pixels
@@ -890,7 +908,10 @@ fn decode_one(session: &mut Option<Session>, job: &Job) -> pending::Outcome {
     }
     let live = session.as_mut().expect("a session was just built or kept");
 
-    let picture = match live.decode(&job.unit) {
+    let began = std::time::Instant::now();
+    let decoded = live.decode(&job.unit);
+    phases.session = Some(began.elapsed());
+    let picture = match decoded {
         Ok(picture) => picture,
         Err(why) => {
             eprintln!("[virglrs] video codec {handle}: the host decoded no picture ({why:?})");
@@ -928,6 +949,8 @@ fn decode_one(session: &mut Option<Session>, job: &Job) -> pending::Outcome {
         Write::Nothing => pending::Outcome::Nothing,
         Write::Keep => pending::Outcome::Picture(picture),
         Write::Planes { surface, geometry, layout } => {
+            let began = std::time::Instant::now();
+            let _timed = Timed(began, &mut phases.write);
             let Some(locked) = picture.lock() else {
                 eprintln!(
                     "[virglrs] video codec {handle}: the decoded picture could not be mapped"
@@ -1067,6 +1090,7 @@ impl Submit for HostDecoder<'_> {
                 withheld: matches!(delivery, Delivery::Withheld(_)),
                 write,
                 landing,
+                sent: std::time::Instant::now(),
             },
             self.unsettled,
         );
