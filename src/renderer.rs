@@ -1088,7 +1088,11 @@ impl Renderer {
         let own = Iov::new(&own);
         let given = Iov::new(&iov);
         let pages = if iov.is_empty() { &own } else { &given };
-        v.transfer(ctx, handle, direction, Some(&own), pages, info).map_err(Error::Transfer)
+        let pages = match direction {
+            transfer::Direction::ToHost => transfer::Through::ToHost(pages.source()),
+            transfer::Direction::ToGuest => transfer::Through::ToGuest(pages),
+        };
+        v.transfer(ctx, handle, Some(&own), pages, info).map_err(Error::Transfer)
     }
 
     // ---- contexts ----
@@ -1555,9 +1559,8 @@ impl Renderer {
                 match v.transfer(
                     Some(classic),
                     handle,
-                    transfer::Direction::ToGuest,
                     Some(&own),
-                    &span.iov(),
+                    transfer::Through::ToGuest(&span.iov()),
                     &info,
                 ) {
                     // Counted, and nothing written: a level that could not be read back has no
@@ -1651,9 +1654,8 @@ impl Renderer {
             match v.transfer(
                 Some(classic),
                 e.res,
-                transfer::Direction::ToHost,
                 Some(&own),
-                &span.iov(),
+                transfer::Through::ToHost(span.source()),
                 &info,
             ) {
                 Ok(()) => account.entries += 1,

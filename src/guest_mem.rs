@@ -308,6 +308,11 @@ impl<'a> Iov<'a> {
         Iov { entries, len: entries.iter().map(|e| e.len as u64).sum() }
     }
 
+    /// These pages, to be read from and nothing else.
+    pub fn source(&self) -> Source<'a> {
+        Source { entries: self.entries, len: self.len }
+    }
+
     /// How many entries the list has: the multiplier on every row a transfer walks.
     pub fn entries(&self) -> usize {
         self.entries.len()
@@ -322,8 +327,9 @@ impl<'a> Iov<'a> {
         self.len == 0
     }
 
-    /// Whether the entries are the same pages, in the same order, as `other`'s.
-    pub fn same_pages(&self, other: &Iov<'_>) -> bool {
+    /// Whether the entries are the same pages, in the same order, as `other`'s -- a list, or a
+    /// source read from one.
+    pub fn same_pages(&self, other: &Source<'_>) -> bool {
         self.entries.len() == other.entries.len()
             && self
                 .entries
@@ -413,6 +419,45 @@ impl<'a> Iov<'a> {
     }
 }
 
+/// An [`Iov`] that can only be read: the pages a transfer to the host copies out of.
+///
+/// Its own type rather than a promise not to write, because not every source is the guest's.
+/// [`HostSpan`] is bytes a command or a snapshot carried, borrowed shared, and a `copy_in` through
+/// one would be a write through `&`. A source has no `copy_in` to call.
+#[derive(Clone, Copy)]
+pub struct Source<'a> {
+    entries: &'a [crate::abi::GuestIov],
+    len: u64,
+}
+
+impl<'a> Source<'a> {
+    /// The pages as a list again, privately: every read below is [`Iov`]'s own.
+    fn iov(&self) -> Iov<'a> {
+        Iov { entries: self.entries, len: self.len }
+    }
+
+    /// The total bytes the source describes.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// See [`Iov::copy_out`].
+    #[must_use]
+    pub fn copy_out(&self, at: u64, dst: &mut [u8]) -> bool {
+        self.iov().copy_out(at, dst)
+    }
+
+    /// See [`Iov::copy_out_from`].
+    #[must_use]
+    pub fn copy_out_from(&self, cursor: &mut Cursor, at: u64, dst: &mut [u8]) -> bool {
+        self.iov().copy_out_from(cursor, at, dst)
+    }
+}
+
 /// Host bytes presented as one guest span, for a transfer whose bytes arrive in the command
 /// stream rather than in attached pages (`RESOURCE_INLINE_WRITE`).
 ///
@@ -434,18 +479,16 @@ impl<'a> HostSpan<'a> {
         }
     }
 
-    /// The span as pages. Only ever read from: `Iov::copy_out` reads `len` bytes at `base`,
-    /// which is the borrowed slice, live for `'a`. A `copy_in` would write through a shared
-    /// borrow; no transfer writes to the pages it was given as a source.
-    pub fn iov(&self) -> Iov<'_> {
-        Iov::new(&self.entry)
+    /// The span as pages to read from, which is all a shared borrow allows.
+    pub fn source(&self) -> Source<'_> {
+        Iov::new(&self.entry).source()
     }
 }
 
 /// Host bytes a transfer may write into, presented as one guest span.
 ///
-/// The read-only [`HostSpan`] cannot serve a readback: `Iov::copy_in` writes through the pointer,
-/// and handing it one taken from a shared borrow would be a write through `&`. This holds the
+/// The read-only [`HostSpan`] cannot serve a readback: it hands out only a [`Source`], because
+/// its pointer was taken from a shared borrow. This holds the
 /// borrow exclusively instead, so the write is the only one there is, and the entry cannot
 /// outlive the bytes it points at.
 pub struct HostSpanMut<'a> {

@@ -27,7 +27,7 @@ use super::pipe::TextureTarget;
 use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::shader;
 use super::tally;
-use super::transfer::{self, Direction, Info};
+use super::transfer::{self, Info};
 use super::waiter::{self, Answer};
 use crate::config::Config;
 use crate::decode;
@@ -1315,9 +1315,8 @@ impl Vrend {
         &mut self,
         ctx: Option<ClassicCtx>,
         handle: ResourceHandle,
-        direction: Direction,
         own: Option<&Iov<'_>>,
-        pages: &Iov<'_>,
+        pages: transfer::Through<'_, '_>,
         info: &Info,
     ) -> Result<(), transfer::Error> {
         match ctx.map(ClassicCtx::id) {
@@ -1343,18 +1342,18 @@ impl Vrend {
             .and_then(resource::Slot::resource_mut)
             .ok_or(transfer::Error::NoPages)?;
         let bytes = transfer::box_bytes(res, info);
-        let r = match direction {
-            Direction::ToHost => transfer::write(
+        let r = match pages {
+            transfer::Through::ToHost(pages) => transfer::write(
                 &self.gl,
                 self.current.program(),
                 &self.formats,
                 &mut self.staging,
                 res,
                 own,
-                pages,
+                &pages,
                 info,
             ),
-            Direction::ToGuest => transfer::read(
+            transfer::Through::ToGuest(pages) => transfer::read(
                 &self.gl,
                 self.current.program(),
                 &self.features,

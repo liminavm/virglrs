@@ -20,7 +20,7 @@ use super::gl::gles::*;
 use super::gl::{BoundProgram, GLenum, GLint, GLsizei, Gl, TextureName, pixel_bytes};
 use super::proto::Box3;
 use super::resource::{Resource, Storage};
-use crate::guest_mem::{Cursor, Iov};
+use crate::guest_mem::{Cursor, Iov, Source};
 use std::fmt;
 
 /// Where a transfer lands in the resource, and how the guest laid it out in the pages.
@@ -49,6 +49,23 @@ pub enum Direction {
     ToHost,
     /// The resource into guest pages: `virgl_renderer_transfer_read_iov`.
     ToGuest,
+}
+
+/// A transfer's direction and the pages it goes through, as one value: pages a transfer to the
+/// host only reads, and pages a transfer to the guest writes. A span that may only be read -- see
+/// [`Source`] -- therefore cannot be named as the destination of a readback.
+pub enum Through<'p, 'a> {
+    ToHost(Source<'a>),
+    ToGuest(&'p Iov<'a>),
+}
+
+impl Through<'_, '_> {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Through::ToHost(pages) => pages.is_empty(),
+            Through::ToGuest(pages) => pages.is_empty(),
+        }
+    }
 }
 
 /// Why a transfer did not happen.
@@ -174,7 +191,7 @@ pub fn contains_box(res: &Resource, b: &Box3, level: u32) -> bool {
 }
 
 /// `check_iov_bounds`, with the layout it computes on the way.
-fn layout(res: &Resource, info: &Info, pages: &Iov<'_>) -> Result<Layout, Error> {
+fn layout(res: &Resource, info: &Info, size: u64) -> Result<Layout, Error> {
     let desc = res.args.format.describe().ok_or(Error::Unsupported)?;
     let b = &info.region;
     let (w, h, d) = (b.width.max(1) as u32, b.height.max(1) as u32, b.depth.max(1) as u64);
@@ -206,7 +223,6 @@ fn layout(res: &Resource, info: &Info, pages: &Iov<'_>) -> Result<Layout, Error>
         layer_stride,
         compressed: desc.is_compressed(),
     };
-    let size = pages.len();
     let end = info.offset.checked_add(l.span()).ok_or(Error::IovOutOfRange)?;
     if end > size {
         return Err(Error::IovOutOfRange);
@@ -254,7 +270,7 @@ pub fn level_region(res: &Resource, level: u32) -> Box3 {
 
 /// Gather the box out of the pages into a tight buffer, rows in the order they are in the
 /// pages. `false` if a row fell outside the pages, which `layout` has already ruled out.
-fn gather(pages: &Iov<'_>, info: &Info, l: &Layout, out: &mut [u8]) -> bool {
+fn gather(pages: &Source<'_>, info: &Info, l: &Layout, out: &mut [u8]) -> bool {
     let row = l.row() as usize;
     // Rows ascend through the pages, so one cursor crosses the list once for the whole box.
     let mut cursor = Cursor::default();
@@ -392,14 +408,14 @@ pub fn write(
     staging: &mut Staging,
     res: &mut Resource,
     own: Option<&Iov<'_>>,
-    pages: &Iov<'_>,
+    pages: &Source<'_>,
     info: &Info,
 ) -> Result<(), Error> {
     let b = info.region;
     if !contains_box(res, &b, info.level) {
         return Err(Error::BoxOutOfRange);
     }
-    let l = layout(res, info, pages)?;
+    let l = layout(res, info, pages.len())?;
     match &mut res.storage {
         Storage::Guest => {
             // The guest's own pages are the storage: a transfer from them to themselves is
@@ -755,11 +771,11 @@ pub fn read(
     if !contains_box(res, &b, info.level) {
         return Err(Error::BoxOutOfRange);
     }
-    let l = layout(res, info, pages)?;
+    let l = layout(res, info, pages.len())?;
     match &res.storage {
         Storage::Guest => {
             if let Some(own) = own
-                && !own.same_pages(pages)
+                && !own.same_pages(&pages.source())
             {
                 let mut tmp = vec![0u8; b.width as usize];
                 if !own.copy_out(b.x as u64, &mut tmp) || !pages.copy_in(info.offset, &tmp) {
@@ -800,7 +816,7 @@ pub fn read(
             let readonly = || -> Result<(), Error> {
                 // `vrend_transfer_send_readonly`: the guest is reading its own upload back into
                 // the pages it uploaded from, and nothing host-side changed the texture.
-                if own.is_some_and(|own| own.same_pages(pages)) {
+                if own.is_some_and(|own| own.same_pages(&pages.source())) {
                     Ok(())
                 } else {
                     Err(Error::NotReadable)
@@ -1045,12 +1061,12 @@ mod tests {
         };
         let mut by_gallium = vec![0u8; gallium.total() as usize];
         assert!(
-            gather(&pages, &info, &gallium, &mut by_gallium),
+            gather(&pages.source(), &info, &gallium, &mut by_gallium),
             "gallium's layout fits, which is why the C's bounds check passes this transfer"
         );
         let mut staging = vec![0u8; driver.total() as usize];
         assert!(
-            !gather(&pages, &info, &driver, &mut staging),
+            !gather(&pages.source(), &info, &driver, &mut staging),
             "the driver's layout does not, and that is the answer the guest gets"
         );
     }

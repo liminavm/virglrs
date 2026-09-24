@@ -4491,9 +4491,16 @@ impl Context {
         let info = Self::info(&t, offset as u64, false);
         let bytes = transfer::box_bytes(res, &info);
         let r = match direction {
-            TransferDirection::ToHost => {
-                transfer::write(gl, bound, formats, staging, res, Some(&pages), &pages, &info)
-            }
+            TransferDirection::ToHost => transfer::write(
+                gl,
+                bound,
+                formats,
+                staging,
+                res,
+                Some(&pages),
+                &pages.source(),
+                &info,
+            ),
             TransferDirection::FromHost => transfer::read(
                 gl,
                 bound,
@@ -4542,7 +4549,7 @@ impl Context {
                 staging,
                 res,
                 own.as_ref(),
-                &staging_pages,
+                &staging_pages.source(),
                 &info,
             ),
             CopyDirection::FromHost => transfer::read(
@@ -4580,7 +4587,8 @@ impl Context {
         let (res, bound, staging) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, 0, false);
         let bytes = transfer::box_bytes(res, &info);
-        let r = transfer::write(gl, bound, formats, staging, res, own.as_ref(), &span.iov(), &info);
+        let r =
+            transfer::write(gl, bound, formats, staging, res, own.as_ref(), &span.source(), &info);
         host.tally.transfer(began, TransferDoor::Stream, bytes);
         r.map_err(|error| Fault::Transfer { cmd, error })
     }
