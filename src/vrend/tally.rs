@@ -55,9 +55,11 @@ const HOPS: usize = 8;
 
 struct Armed {
     every: Duration,
-    /// Where the reads that waited for a decoded picture are counted. They are counted by the
-    /// reads themselves, which have no tally to hand, so this holds a share of the counter and
-    /// takes each window's worth at report time. See [`crate::vrend::video::pending::Unsettled`].
+    /// Where the decoder's waits and phase times are counted. They are counted where they happen
+    /// -- reads, END_FRAME, the decode threads -- which have no tally to hand, so this holds a
+    /// share of the renderer's counters and takes each window's worth at report time. It is the
+    /// one field a new window inherits rather than zeroes, which is why [`Armed::new`] takes it:
+    /// see [`crate::vrend::video::pending::Unsettled`].
     settles: crate::vrend::video::pending::Unsettled,
     window_began: Instant,
     submits: u64,
@@ -149,10 +151,10 @@ struct Armed {
 }
 
 impl Armed {
-    fn new(every: Duration) -> Self {
+    fn new(every: Duration, settles: crate::vrend::video::pending::Unsettled) -> Self {
         Self {
             every,
-            settles: Default::default(),
+            settles,
             window_began: Instant::now(),
             submits: 0,
             commands: 0,
@@ -193,15 +195,12 @@ impl Armed {
 
 impl Tally {
     /// Read the environment once, at renderer construction. The knob and its parsing are
-    /// [`crate::stats`], shared with the venus tally.
-    pub fn from_env() -> Self {
-        Self { on: crate::stats::report_interval("vrend").map(Armed::new) }
-    }
-
-    /// Report the reads that waited for a decoded picture, from the renderer's counter.
-    pub fn watch_settles(&mut self, settles: &crate::vrend::video::pending::Unsettled) {
-        if let Some(a) = &mut self.on {
-            a.settles = settles.clone();
+    /// [`crate::stats`], shared with the venus tally. `settles` is the renderer's decoder
+    /// counters, which every window reports from.
+    pub fn from_env(settles: &crate::vrend::video::pending::Unsettled) -> Self {
+        Self {
+            on: crate::stats::report_interval("vrend")
+                .map(|every| Armed::new(every, settles.clone())),
         }
     }
 
@@ -342,7 +341,7 @@ impl Tally {
             return;
         }
         a.report(now, "");
-        *a = Armed::new(a.every);
+        *a = Armed::new(a.every, a.settles.clone());
         a.window_began = now;
     }
 }
@@ -579,7 +578,7 @@ mod tests {
     /// `write(2)` off the hot path.
     #[test]
     fn an_armed_tally_accumulates_without_reporting() {
-        let mut t = Tally { on: Some(Armed::new(Duration::from_secs(3600))) };
+        let mut t = Tally { on: Some(Armed::new(Duration::from_secs(3600), Default::default())) };
         for _ in 0..10 {
             let b = t.batch_began();
             assert!(b.is_some(), "an armed tally reads the clock once per batch");
@@ -616,7 +615,7 @@ mod tests {
     /// the window before it.
     #[test]
     fn a_report_resets_the_window() {
-        let mut t = Tally { on: Some(Armed::new(Duration::ZERO)) };
+        let mut t = Tally { on: Some(Armed::new(Duration::ZERO, Default::default())) };
         {
             let a = t.on.as_mut().expect("armed");
             a.submits = 7;
@@ -685,5 +684,22 @@ mod tests {
         );
         assert_eq!((a.attaches, a.attach_entries, a.attach_entries_max), (0, 0, 0), "the max too");
         assert_eq!(a.every, Duration::ZERO, "the interval is not a counter and must survive");
+    }
+
+    /// The decoder's counters survive every report: they are the renderer's, and a window that
+    /// starts afresh must still read them. A tally that dropped them after its first report said
+    /// "no read waited" for every window after the first, whatever happened.
+    #[test]
+    fn the_decoder_counters_outlive_the_window() {
+        use crate::vrend::video::pending::{Phases, Unsettled};
+        let unsettled = Unsettled::default();
+        let mut t = Tally { on: Some(Armed::new(Duration::ZERO, unsettled.clone())) };
+        for _ in 0..2 {
+            let began = t.batch_began();
+            t.batch_ended(began, 1);
+        }
+        unsettled.record_decode(Phases { queued: Duration::from_millis(1), ..Default::default() });
+        let a = t.on.as_ref().expect("armed");
+        assert_eq!(a.settles.take_decode_times().queued.count, 1, "the tally lost the counters");
     }
 }

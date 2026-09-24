@@ -1795,6 +1795,13 @@ SABOTAGES = [
         """    let _ = (unsettled, began);""",
         'a_send_into_a_full_queue_waits_and_is_counted',
     ),
+    (
+        'a stats window drops the decoder counters when the next one starts',
+        'src/vrend/tally.rs',
+        """        *a = Armed::new(a.every, a.settles.clone());""",
+        """        *a = Armed::new(a.every, Default::default());""",
+        'the_decoder_counters_outlive_the_window',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
