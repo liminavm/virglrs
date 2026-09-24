@@ -1,6 +1,6 @@
 use super::serialize::*;
 use super::types::*;
-use crate::venus::cs::{Decoder, Encoder};
+use crate::venus::cs::{self, Decoder, Encoder};
 use bumpalo::Bump;
 
 /// A source of distinct, non-zero field values.
@@ -31,6 +31,12 @@ impl Fill {
     pub fn take(&mut self) -> u64 {
         self.next = self.next.wrapping_add(0x11);
         self.next
+    }
+
+    /// The next value, as a handle. It is planted in a reply the oracle encodes and compares.
+    fn handle<T: cs::Handle>(&mut self) -> T {
+        // SAFETY: this handle is only ever encoded and compared; nothing hands it to a driver.
+        unsafe { T::from_raw(self.take()) }
     }
 }
 

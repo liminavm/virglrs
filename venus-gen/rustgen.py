@@ -168,7 +168,10 @@ class RustGen:
             return 'None'
         if base.category in (VkType.STRUCT, VkType.UNION):
             return '%s::default()' % base.name
-        # Newtypes: enums, handles, base types and bitmasks all wrap a scalar.
+        # A handle's field is private; null is the one it offers without a Vulkan call.
+        if base.category == VkType.HANDLE:
+            return '%s::NULL' % base.name
+        # Newtypes: enums, base types and bitmasks all wrap a scalar.
         return '%s(0)' % base.name
 
     # --- declarations ---
@@ -1398,6 +1401,10 @@ class RustGen:
             return '%s as _' % value
         if base.category == VkType.FUNCPOINTER:
             return 'None'
+        if base.category == VkType.HANDLE:
+            # A handle's field is private, so it is planted through the one method that vouches.
+            assert value == 'f.take()', 'a handle is never a length'
+            return 'f.handle()'
         return '%s(%s as _)' % (base.name, value)
 
     def _fill_one(self, ty, var, target, value):
@@ -2485,11 +2492,17 @@ class RustGen:
             '}',
             '',
             'pub fn vn_encode_%s(enc: &mut Encoder<\'_>, val: &%s) {' % (n, n),
-            '    enc.encode_scalar::<u64>(val.0);',
+            '    enc.encode_scalar::<u64>(val.raw());',
             '}',
             '',
+            '/// Read the guest\'s word into a slot the decoder does not resolve.',
+            '///',
+            '/// Only a member that is not an input takes this path -- a create\'s out-member, which its',
+            '/// accessor hands out as `cs::Guest`, or an answer\'s slot the driver writes before',
+            '/// anything reads it. Every handle the driver is called with went through `_lookup`.',
             'pub fn vn_decode_%s(dec: &mut Decoder<\'_>, val: &mut %s) {' % (n, n),
-            '    val.0 = dec.decode_scalar::<u64>();',
+            '    // SAFETY: the guest\'s id in a slot nothing hands to the driver as a handle; see above.',
+            '    *val = unsafe { %s::from_raw(dec.decode_scalar::<u64>()) };' % n,
             '}',
             '',
             'pub fn vn_decode_%s_temp(dec: &mut Decoder<\'_>, val: &mut %s) {' % (n, n),
@@ -2498,17 +2511,12 @@ class RustGen:
             '',
             'impl cs::Handle for %s {' % n,
             '    const OBJECT_TYPE: i32 = %s.0;' % objtype,
-            '    fn host(self) -> cs::HostHandle {',
-            '        cs::HostHandle(self.0)',
+            '    fn raw(self) -> u64 {',
+            '        %s::raw(self)' % n,
             '    }',
-            '    fn guest_id(self) -> ObjectId {',
-            '        ObjectId(self.0)',
-            '    }',
-            '    fn from_host(host: cs::HostHandle) -> Self {',
-            '        %s(host.0)' % n,
-            '    }',
-            '    fn null() -> Self {',
-            '        %s(0)' % n,
+            '    unsafe fn from_raw(raw: u64) -> Self {',
+            '        // SAFETY: the caller\'s, passed through.',
+            '        unsafe { %s::from_raw(raw) }' % n,
             '    }',
             '}',
             '',
@@ -2777,14 +2785,14 @@ class RustGen:
                 terms.append([
                     '%s.is_null()' % m,
                     '    // SAFETY: non-null, and the decoder allocated it in the arena, one element.',
-                    '    || h.object_creating(%s, ObjectId(unsafe { (*%s).0 }))' % (objtype, m),
+                    '    || h.object_creating(%s, cs::Handle::guest_id(unsafe { *%s }))' % (objtype, m),
                 ])
             elif shape[0] == 'dynamic':
                 terms.append([
                     '%s.is_null()' % m,
                     '    || (0..(%s) as usize).all(|i| {' % shape[1],
                     '        // SAFETY: the decoder allocated that many elements, from this count.',
-                    '        h.object_creating(%s, ObjectId(unsafe { (*%s.add(i)).0 }))' % (objtype, m),
+                    '        h.object_creating(%s, cs::Handle::guest_id(unsafe { *%s.add(i) }))' % (objtype, m),
                     '    })',
                 ])
         if len(terms) == 1:
@@ -2826,7 +2834,7 @@ class RustGen:
                     'if !%s.is_null() && !%s.is_null() {' % (m, s),
                     '    // SAFETY: both are non-null and the decoder allocated them in the arena,',
                     '    // one element each.',
-                    '    unsafe { h.object_created(%s, ObjectId((*%s).0), cs::HostHandle((*%s).0), %s) };'
+                    '    unsafe { h.object_created(%s, cs::Handle::guest_id(*%s), cs::Handle::host(*%s), %s) };'
                     % (objtype, m, s, owner),
                     '}']
             elif shape[0] == 'dynamic':
@@ -2835,7 +2843,7 @@ class RustGen:
                     '    for i in 0..(%s) as usize {' % shape[1],
                     '        // SAFETY: the decoder allocated both arrays with that many elements,',
                     '        // from the same count.',
-                    '        unsafe { h.object_created(%s, ObjectId((*%s.add(i)).0), cs::HostHandle((*%s.add(i)).0), %s) };'
+                    '        unsafe { h.object_created(%s, cs::Handle::guest_id(*%s.add(i)), cs::Handle::host(*%s.add(i)), %s) };'
                     % (objtype, m, s, owner),
                     '    }',
                     '}']

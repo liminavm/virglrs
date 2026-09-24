@@ -58,12 +58,12 @@ pub fn global() -> Global {
     // SAFETY: every name comes from vk.xml as the name of the command whose signature it is
     // transmuted to, and `vkGetInstanceProcAddr(VK_NULL_HANDLE, ..)` is the spec's own way to
     // reach a global command.
-    unsafe { Global::load(&mut |name| instance_proc(VkInstance(0), name)) }
+    unsafe { Global::load(&mut |name| instance_proc(VkInstance::NULL, name)) }
 }
 
 /// The instance-level commands, including every `vkGetPhysicalDevice*` query.
 pub fn instance(instance: VkInstance) -> Instance {
-    assert!(instance.0 != 0, "an instance table needs an instance");
+    assert!(instance.raw() != 0, "an instance table needs an instance");
     // SAFETY: as `global`, with a real instance -- which is what makes the physical-device
     // commands resolvable at all.
     unsafe { Instance::load(&mut |name| instance_proc(instance, name)) }
@@ -72,7 +72,7 @@ pub fn instance(instance: VkInstance) -> Instance {
 /// The device-level commands, resolved through the device so they skip the loader's dispatch
 /// trampoline -- which is the whole reason Vulkan has a second proc-addr call.
 pub fn device(inst: &Instance, device: VkDevice) -> Device {
-    assert!(device.0 != 0, "a device table needs a device");
+    assert!(device.raw() != 0, "a device table needs a device");
     let get_device_proc_addr = inst.vkGetDeviceProcAddr();
     // SAFETY: `get_device_proc_addr` came from the loader under its own name, `device` is a
     // handle the driver returned, and each name is the command whose signature it becomes.

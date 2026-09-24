@@ -666,7 +666,7 @@ mod tests {
         for i in 1..=n {
             let id = super::super::cs::ObjectId(i as u64);
             let ty = super::super::proto::types::VkObjectType::VK_OBJECT_TYPE_BUFFER;
-            t.add(id, ty, super::super::cs::HostHandle(i as u64 + 100), None).expect("add");
+            t.add(id, ty, super::super::cs::HostHandle::forged(i as u64 + 100), None).expect("add");
             out.push(t.key_of(id).expect("just added"));
         }
         out

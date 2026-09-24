@@ -455,7 +455,7 @@ impl Drop for LiveInstance {
         // A null handle is an instance no `vkCreateInstance` ever returned -- the shape
         // `plant_instance` stands up, whose table holds only the few entry points its test
         // needed. Destroying it would call through whichever of those was left null.
-        if self.handle.0 == 0 {
+        if self.handle.raw() == 0 {
             return;
         }
         // SAFETY: a handle this renderer created, destroyed once -- being the last holder of the
@@ -542,13 +542,13 @@ impl HostQueue {
             pNext: core::ptr::null(),
             flags: VkFenceCreateFlags::default(),
         };
-        let mut out = VkFence(0);
+        let mut out = VkFence::NULL;
         // SAFETY: the device is live for as long as this queue holds its share of it, and both
         // the info and the out-handle are ours for the call.
         let r = unsafe {
             (self.fns.vkCreateFence())(self.fns.handle, &info, core::ptr::null(), &mut out)
         };
-        (r == VkResult::VK_SUCCESS && out.0 != 0).then_some(out)
+        (r == VkResult::VK_SUCCESS && !out.is_null()).then_some(out)
     }
 
     /// Put a signalled fence back, unsignalled, for the next submit to take.
@@ -578,7 +578,7 @@ impl Drop for HostQueue {
 
 impl core::fmt::Debug for HostQueue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("HostQueue").field("queue", &self.handle.0).finish()
+        f.debug_struct("HostQueue").field("queue", &self.handle.raw()).finish()
     }
 }
 
@@ -744,7 +744,7 @@ impl RingQueues {
             "[virglrs] ctx {}: ring {} fences are ordered on queue {:#x}",
             ctx.get(),
             ring.0,
-            queue.handle.0
+            queue.handle.raw()
         );
         bound.insert(ring, RingSync { queue, jobs: Some(tx), thread: Some(thread), going });
     }
@@ -894,7 +894,7 @@ fn present_thread(
             let bound = inner.bound.lock().expect("the ring-queue lock is never poisoned");
             let mut seen = Vec::new();
             for s in bound.values() {
-                if !seen.iter().any(|q: &Arc<HostQueue>| q.handle.0 == s.queue.handle.0) {
+                if !seen.iter().any(|q: &Arc<HostQueue>| q.handle.raw() == s.queue.handle.raw()) {
                     seen.push(Arc::clone(&s.queue));
                 }
             }
@@ -1076,7 +1076,7 @@ impl Eq for DriverWait {}
 impl core::fmt::Debug for DriverWait {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DriverWait")
-            .field("device", &self.device.handle.0)
+            .field("device", &self.device.handle.raw())
             .field("kind", &self.kind)
             .finish()
     }
@@ -1475,14 +1475,14 @@ impl Driver {
         if self.instance.is_some() {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         }
-        let mut out = VkInstance(0);
+        let mut out = VkInstance::NULL;
         // SAFETY: `info` and `alloc` are the decoder's arena allocations, live for this call, and
         // `out` is a local. The guest cannot make them dangle: the arena outlives the batch.
         let r = unsafe { (global.vkCreateInstance())(info.get(), ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
-        assert!(out.0 != 0, "vkCreateInstance succeeded and returned a null instance");
+        assert!(!out.is_null(), "vkCreateInstance succeeded and returned a null instance");
         self.instance = Some(Arc::new(LiveInstance { handle: out, fns: vulkan::instance(out) }));
         Ok(out)
     }
@@ -1671,14 +1671,14 @@ impl Driver {
         info.ppEnabledExtensionNames = ptrs.as_ptr();
 
         let inst = self.instance().expect("checked above");
-        let mut out = VkDevice(0);
+        let mut out = VkDevice::NULL;
         // SAFETY: `pd` is a handle this instance returned; `info` and everything it points at are
         // live for the call, including the extension array built just above.
         let r = unsafe { (inst.vkCreateDevice())(pd, &info, ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
-        assert!(out.0 != 0, "vkCreateDevice succeeded and returned a null device");
+        assert!(!out.is_null(), "vkCreateDevice succeeded and returned a null device");
         let mut props = VkPhysicalDeviceMemoryProperties::default();
         // SAFETY: `pd` is a handle this instance returned, and `props` is a local.
         unsafe { (inst.vkGetPhysicalDeviceMemoryProperties())(pd, &mut props) };
@@ -2158,8 +2158,8 @@ impl Driver {
         };
         let submit = VkSubmitInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            signalSemaphoreCount: u32::from(sem != VkSemaphore(0)),
-            pSignalSemaphores: if sem != VkSemaphore(0) { &sem } else { core::ptr::null() },
+            signalSemaphoreCount: u32::from(sem != VkSemaphore::NULL),
+            pSignalSemaphores: if sem != VkSemaphore::NULL { &sem } else { core::ptr::null() },
             ..Default::default()
         };
         // SAFETY: a queue this context retrieved, one submit whose count is 1, and handles created
@@ -2212,7 +2212,7 @@ impl Driver {
     /// Read off the submit rather than polled afterwards, because the promise is what survives a
     /// snapshot and the completion is not.
     fn note_submit(&mut self, submits: &[VkSubmitInfo], fence: VkFence) {
-        if fence != VkFence(0) {
+        if fence != VkFence::NULL {
             self.pending_fences.insert(fence);
         }
         for s in submits {
@@ -2252,7 +2252,7 @@ impl Driver {
     /// pair before it can read either half. `VkSemaphoreSubmitInfo` carries the semaphore and its
     /// value as one struct, so there is no pair here to disagree and no chain to walk.
     fn note_submit2(&mut self, submits: &[VkSubmitInfo2], fence: VkFence) {
-        if fence != VkFence(0) {
+        if fence != VkFence::NULL {
             self.pending_fences.insert(fence);
         }
         for s in submits {
@@ -2777,11 +2777,11 @@ impl Driver {
         info: cs::Decoded<'_, VkDeviceQueueInfo2>,
     ) -> Option<VkQueue> {
         let d = self.devices.get(&device)?;
-        let mut out = VkQueue(0);
+        let mut out = VkQueue::NULL;
         // SAFETY: `device` is a handle this table was loaded from and `info` is an arena
         // allocation live for the call.
         unsafe { (d.fns.vkGetDeviceQueue2())(device, info.get(), &mut out) };
-        if out.0 == 0 {
+        if out.is_null() {
             return None;
         }
         // Asking twice for the same queue is how a guest works, not a mistake: Vulkan hands back
@@ -2918,7 +2918,8 @@ impl Driver {
                 other => {
                     eprintln!(
                         "[virglrs] no destroy for VkObjectType {}, leaking {:#x}",
-                        other.0, h.0
+                        other.0,
+                        h.raw()
                     )
                 }
             }
@@ -3035,7 +3036,7 @@ impl Driver {
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
-        assert!(out.host().0 != 0, "a create succeeded and returned a null handle");
+        assert!(out.host().raw() != 0, "a create succeeded and returned a null handle");
         Ok(out)
     }
 
@@ -3053,7 +3054,7 @@ impl Driver {
         let Some(d) = self.devices.get(&device) else {
             return;
         };
-        if object.host().0 == 0 {
+        if object.host().raw() == 0 {
             // Vulkan makes destroying a null handle a legal no-op, and guests rely on it.
             return;
         }
@@ -3104,7 +3105,7 @@ impl Driver {
         // Both names of each object are recorded together; see `Pools`.
         self.pools.adopt(
             pool,
-            out.iter().copied().zip(ids.iter().copied()).filter(|(h, _)| h.host().0 != 0),
+            out.iter().copied().zip(ids.iter().copied()).filter(|(h, _)| h.host().raw() != 0),
         );
         Ok(())
     }
@@ -3165,14 +3166,14 @@ impl Driver {
             return Ok(());
         }
         for survivor in out.iter_mut() {
-            if survivor.host().0 == 0 {
+            if survivor.host().raw() == 0 {
                 continue;
             }
             // SAFETY: a handle this call just produced, destroyed once -- the slice is walked once
             // and the guest never learns the handle, so nothing else can name it.
             unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };
             // The guest's reply must not carry a handle that is now gone.
-            *survivor = VkPipeline(0);
+            *survivor = VkPipeline::NULL;
         }
         Err(r)
     }
@@ -3244,7 +3245,7 @@ impl Driver {
     pub(super) fn plant_instance(&mut self, fns: InstanceFns) {
         // A null handle, for the reason `plant_device` passes no instance: it never came from
         // `vkCreateInstance`, and that is what stops the drop calling a destroy on it.
-        self.instance = Some(Arc::new(LiveInstance { handle: VkInstance(0), fns }));
+        self.instance = Some(Arc::new(LiveInstance { handle: VkInstance::forged(0), fns }));
     }
 
     /// A `VkDeviceMemory` that never came from Vulkan, for the planted allocations below.
@@ -3259,8 +3260,13 @@ impl Driver {
         // reach is planted -- the free above is skipped by the null handle, but the device's own
         // drop is not, and a drop that aborts a test is worse than the test it was hiding.
         fns.plant_vkDestroyDevice(destroy_device);
-        let device = Arc::new(LiveDevice { handle: VkDevice(0), fns, instance: None });
-        Arc::new(DriverMemory { device, memory: VkDeviceMemory(0), mapped: None, len: size })
+        let device = Arc::new(LiveDevice { handle: VkDevice::forged(0), fns, instance: None });
+        Arc::new(DriverMemory {
+            device,
+            memory: VkDeviceMemory::forged(0),
+            mapped: None,
+            len: size,
+        })
     }
 
     /// Plant a live allocation from a memory type with the given properties.
@@ -5338,14 +5344,14 @@ impl Driver {
 
         // `d` was borrowed before the surface was minted, which needed `&mut self`.
         let d = self.devices.get(&device).expect("the device was here a moment ago");
-        let mut out = VkDeviceMemory(0);
+        let mut out = VkDeviceMemory::NULL;
         // SAFETY: `info` is a local whose chain the decoder owns for the batch, extended with a
         // local that outlives this call, `alloc` is another arena allocation, and `out` is a local.
         let r = unsafe { (d.fns.vkAllocateMemory())(device, &info, ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(NoMemory::Driver(r));
         }
-        assert!(out.0 != 0, "vkAllocateMemory succeeded and returned a null handle");
+        assert!(!out.is_null(), "vkAllocateMemory succeeded and returned a null handle");
         // Owned before anything else can fail, and for every backing: what the driver handed
         // back is a Vulkan resource whatever this renderer decides to put behind it, so the value
         // that frees it is built here once rather than in the arms that happen to keep it.
@@ -5735,7 +5741,7 @@ impl Driver {
         };
         // A planted record carries a null handle and names no device; a real one always names
         // both, and they are the same memory the table resolved.
-        if record.memory.memory.0 != 0 {
+        if record.memory.memory.raw() != 0 {
             assert!(
                 record.memory.device.handle == device && record.memory.memory == memory,
                 "the object table and the record disagree about which memory {id:?} names"
@@ -6480,7 +6486,7 @@ impl Drop for DriverMemory {
         // A null handle is memory no `vkAllocateMemory` ever returned -- `vkAllocateMemory`'s own
         // assert is what makes that true of every real one -- so it is the shape a test plants
         // and there is nothing to give back. The same rule [`LiveInstance::drop`] uses.
-        if self.memory.0 == 0 {
+        if self.memory.raw() == 0 {
             return;
         }
         let device = self.device.handle;
@@ -7293,7 +7299,7 @@ fn exports_memory(node: *const core::ffi::c_void) -> bool {
 /// "a buffer, not an image", and reads as no image rather than as image zero.
 fn dedicated_image(node: *const core::ffi::c_void) -> Option<VkImage> {
     chain_find::<VkMemoryDedicatedAllocateInfo>(node)
-        .and_then(|d| (d.image.0 != 0).then_some(d.image))
+        .and_then(|d| (d.image.raw() != 0).then_some(d.image))
 }
 
 /// The surface format a Vulkan format is, for the formats a scanout can be.
@@ -7596,8 +7602,8 @@ mod tests {
 
         use crate::venus::proto::types::VkExtent3D;
 
-        const DEVICE: VkDevice = VkDevice(0x11);
-        const IMAGE: VkImage = VkImage(0x22);
+        const DEVICE: VkDevice = VkDevice::forged(0x11);
+        const IMAGE: VkImage = VkImage::forged(0x22);
 
         thread_local! {
             /// (row length, image height, host pointer, extent width) per region the driver saw.
@@ -7753,11 +7759,15 @@ mod tests {
 
         // A device this renderer does not have is a refusal, not a copy reported as done.
         assert!(
-            d.copy_image_to_memory(VkDevice(0x99), cs::Decoded::planted(&read), &mut out).is_none()
+            d.copy_image_to_memory(VkDevice::forged(0x99), cs::Decoded::planted(&read), &mut out)
+                .is_none()
         );
-        assert!(d.copy_memory_to_image(VkDevice(0x99), cs::Decoded::planted(&write)).is_none());
         assert!(
-            d.transition_image_layout(VkDevice(0x99), cs::Decoded::planted(&t as &[_])).is_none()
+            d.copy_memory_to_image(VkDevice::forged(0x99), cs::Decoded::planted(&write)).is_none()
+        );
+        assert!(
+            d.transition_image_layout(VkDevice::forged(0x99), cs::Decoded::planted(&t as &[_]))
+                .is_none()
         );
 
         d.destroy_device(DEVICE, &[]);
@@ -7765,9 +7775,9 @@ mod tests {
 
     #[test]
     fn the_extensions_the_metal_path_emulates_are_advertised_in_pairs() {
-        const METAL: VkPhysicalDevice = VkPhysicalDevice(1);
-        const NATIVE: VkPhysicalDevice = VkPhysicalDevice(2);
-        const NEITHER: VkPhysicalDevice = VkPhysicalDevice(3);
+        const METAL: VkPhysicalDevice = VkPhysicalDevice::forged(1);
+        const NATIVE: VkPhysicalDevice = VkPhysicalDevice::forged(2);
+        const NEITHER: VkPhysicalDevice = VkPhysicalDevice::forged(3);
 
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_extensions(METAL, &["VK_EXT_external_memory_metal"]);
@@ -7823,8 +7833,8 @@ mod tests {
             VkImageFormatListCreateInfo, VkImageStencilUsageCreateInfo,
         };
 
-        const METAL: VkPhysicalDevice = VkPhysicalDevice(1);
-        const NATIVE: VkPhysicalDevice = VkPhysicalDevice(2);
+        const METAL: VkPhysicalDevice = VkPhysicalDevice::forged(1);
+        const NATIVE: VkPhysicalDevice = VkPhysicalDevice::forged(2);
         const DMA_BUF: VkExternalMemoryHandleTypeFlagBits =
             VkExternalMemoryHandleTypeFlagBits::VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
         const MIP_LEVELS: u32 = 11;
@@ -8011,8 +8021,8 @@ mod tests {
     /// a test that only ever ran on the host it is off for would be watching nothing.
     #[test]
     fn a_device_is_created_with_the_external_memory_the_driver_really_has() {
-        const METAL: VkPhysicalDevice = VkPhysicalDevice(1);
-        const NATIVE: VkPhysicalDevice = VkPhysicalDevice(2);
+        const METAL: VkPhysicalDevice = VkPhysicalDevice::forged(1);
+        const NATIVE: VkPhysicalDevice = VkPhysicalDevice::forged(2);
 
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_extensions(METAL, &["VK_EXT_external_memory_metal"]);
@@ -8196,8 +8206,8 @@ mod tests {
     fn a_capture_goes_back_in_by_the_route_it_came_out_of() {
         use std::cell::RefCell;
 
-        const DEVICE: VkDevice = VkDevice(3);
-        const HANDLE: VkDeviceMemory = VkDeviceMemory(0x9000);
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        const HANDLE: VkDeviceMemory = VkDeviceMemory::forged(0x9000);
 
         thread_local! {
             /// What the driver would have allocated: the bytes `vkMapMemory` hands out.
@@ -8396,7 +8406,7 @@ mod tests {
         use super::super::proto::types::VkImportMemoryResourceInfoMESA;
         use crate::surface::{DRM_FORMAT_MOD_INVALID, Layout, PlaneLayout, PlaneLayouts, Surface};
 
-        const DEVICE: VkDevice = VkDevice(3);
+        const DEVICE: VkDevice = VkDevice::forged(3);
         const LEN: u64 = 16384;
 
         unsafe extern "C" fn allocate(
@@ -8475,7 +8485,7 @@ mod tests {
         use super::super::proto::types::VkImportMemoryResourceInfoMESA;
         use crate::surface::{DRM_FORMAT_MOD_LINEAR, Layout, PlaneLayout, PlaneLayouts, Surface};
 
-        const DEVICE: VkDevice = VkDevice(3);
+        const DEVICE: VkDevice = VkDevice::forged(3);
         const WIDTH: u32 = 64;
         const HEIGHT: u32 = 64;
         const PITCH: u32 = WIDTH * 4;
@@ -8562,7 +8572,7 @@ mod tests {
     fn an_import_holds_the_storage_it_resolved() {
         use super::super::proto::types::VkImportMemoryResourceInfoMESA;
 
-        const DEVICE: VkDevice = VkDevice(3);
+        const DEVICE: VkDevice = VkDevice::forged(3);
         // A whole page, so the mint's rounding does not turn the figure into two numbers.
         const LEN: u64 = 16384;
 
@@ -8573,7 +8583,7 @@ mod tests {
             out: *mut VkDeviceMemory,
         ) -> VkResult {
             // SAFETY: the caller's local.
-            unsafe { *out = VkDeviceMemory(0x9000) };
+            unsafe { *out = VkDeviceMemory::forged(0x9000) };
             VkResult::VK_SUCCESS
         }
         thread_local! {
@@ -8584,7 +8594,7 @@ mod tests {
             m: VkDeviceMemory,
             _a: *const VkAllocationCallbacks,
         ) {
-            FREED.with(|f| f.set(m.0));
+            FREED.with(|f| f.set(m.raw()));
         }
 
         let mut d = Driver::new(Account::for_test(None));
@@ -8647,7 +8657,7 @@ mod tests {
         use super::super::proto::types::VkImportMemoryResourceInfoMESA;
         use std::cell::Cell;
 
-        const DEVICE: VkDevice = VkDevice(3);
+        const DEVICE: VkDevice = VkDevice::forged(3);
 
         thread_local! {
             static ASKED: Cell<u32> = const { Cell::new(0) };
@@ -8661,7 +8671,7 @@ mod tests {
         ) -> VkResult {
             ASKED.with(|a| a.set(a.get() + 1));
             // SAFETY: the caller's local.
-            unsafe { *out = VkDeviceMemory(0x9000) };
+            unsafe { *out = VkDeviceMemory::forged(0x9000) };
             VkResult::VK_SUCCESS
         }
 
@@ -8755,7 +8765,7 @@ mod tests {
     fn an_allocation_over_the_budget_never_reaches_the_driver() {
         use std::cell::Cell;
 
-        const DEVICE: VkDevice = VkDevice(3);
+        const DEVICE: VkDevice = VkDevice::forged(3);
         const CAP: u64 = 1000;
         const SIZE: u64 = 600;
 
@@ -8771,7 +8781,7 @@ mod tests {
         ) -> VkResult {
             ASKED.with(|n| n.set(n.get() + 1));
             // SAFETY: the caller's local.
-            unsafe { *out = VkDeviceMemory(0x9000) };
+            unsafe { *out = VkDeviceMemory::forged(0x9000) };
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn free(
@@ -8814,7 +8824,7 @@ mod tests {
 
         // Freeing is the only thing that credits, and it does so by retiring the record -- there
         // is no release call anywhere in `free_memory` for this to be testing instead.
-        d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(1));
+        d.free_memory(DEVICE, VkDeviceMemory::forged(0x9000), ObjectId(1));
         assert_eq!(d.account.live(), 0, "the room comes back with the allocation");
         assert!(ask(&mut d, 3).is_ok(), "and the next one fits again");
         assert_eq!(ASKED.with(Cell::get), 2);
@@ -8827,7 +8837,7 @@ mod tests {
     /// out of scope, so there is no error path that can forget it.
     #[test]
     fn a_driver_that_refuses_costs_the_budget_nothing() {
-        const DEVICE: VkDevice = VkDevice(3);
+        const DEVICE: VkDevice = VkDevice::forged(3);
 
         unsafe extern "C" fn refuse(
             _d: VkDevice,
@@ -8957,12 +8967,12 @@ mod tests {
         };
         use std::cell::Cell;
 
-        const DEVICE: VkDevice = VkDevice(3);
-        const MEMORY: VkDeviceMemory = VkDeviceMemory(0x9100);
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        const MEMORY: VkDeviceMemory = VkDeviceMemory::forged(0x9100);
 
         const ASKED: u64 = 64 * 48 * 4;
         const PITCH: u32 = 320; // wider than 64 * 4; what an aligned driver buffer looks like.
-        const IMAGE: VkImage = VkImage(0x77);
+        const IMAGE: VkImage = VkImage::forged(0x77);
 
         thread_local! {
             /// The address the driver was handed, if any. `0` is the answer this test wants.
@@ -8991,7 +9001,7 @@ mod tests {
                     }
                     node = (*base).pNext.cast();
                 }
-                *out = VkDeviceMemory(0x9100);
+                *out = VkDeviceMemory::forged(0x9100);
             }
             VkResult::VK_SUCCESS
         }
@@ -9080,7 +9090,7 @@ mod tests {
             sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
             pNext: (&raw const export).cast(),
             image: IMAGE,
-            buffer: VkBuffer(0),
+            buffer: VkBuffer::forged(0),
         };
         let info = VkMemoryAllocateInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -9178,8 +9188,8 @@ mod tests {
     fn a_wsi_buffer_is_exported_even_though_nothing_can_describe_it() {
         use crate::venus::proto::types::{VkBuffer, VkExternalMemoryHandleTypeFlags};
 
-        const DEVICE: VkDevice = VkDevice(3);
-        const MEMORY: VkDeviceMemory = VkDeviceMemory(0x9300);
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        const MEMORY: VkDeviceMemory = VkDeviceMemory::forged(0x9300);
         const SIZE: u64 = 2_048_000;
 
         unsafe extern "C" fn allocate(
@@ -9239,8 +9249,8 @@ mod tests {
             pNext: (&raw const export_info).cast(),
             // No image. This is the whole of the difference from a minting host's window buffer,
             // and it is what a recognition rule built around a dedicated image refuses on.
-            image: VkImage(0),
-            buffer: VkBuffer(0x4321),
+            image: VkImage::forged(0),
+            buffer: VkBuffer::forged(0x4321),
         };
         let info = VkMemoryAllocateInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -9313,9 +9323,9 @@ mod tests {
         };
         use std::cell::Cell;
 
-        const DEVICE: VkDevice = VkDevice(3);
-        const MEMORY: VkDeviceMemory = VkDeviceMemory(0x9400);
-        const IMAGE: VkImage = VkImage(0x79);
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        const MEMORY: VkDeviceMemory = VkDeviceMemory::forged(0x9400);
+        const IMAGE: VkImage = VkImage::forged(0x79);
         const SIZE: u64 = 64 * 48 * 4;
 
         thread_local! {
@@ -9415,7 +9425,7 @@ mod tests {
             sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
             pNext: (&raw const export_info).cast(),
             image: IMAGE,
-            buffer: VkBuffer(0),
+            buffer: VkBuffer::forged(0),
         };
         let info = VkMemoryAllocateInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -9468,9 +9478,9 @@ mod tests {
             VkSampleCountFlagBits,
         };
 
-        const DEVICE: VkDevice = VkDevice(3);
-        const MEMORY: VkDeviceMemory = VkDeviceMemory(0x9200);
-        const IMAGE: VkImage = VkImage(0x78);
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        const MEMORY: VkDeviceMemory = VkDeviceMemory::forged(0x9200);
+        const IMAGE: VkImage = VkImage::forged(0x78);
 
         unsafe extern "C" fn allocate(
             _: VkDevice,
@@ -9479,7 +9489,7 @@ mod tests {
             out: *mut VkDeviceMemory,
         ) -> VkResult {
             // SAFETY: the caller's local.
-            unsafe { *out = VkDeviceMemory(0x9200) };
+            unsafe { *out = VkDeviceMemory::forged(0x9200) };
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn free(_: VkDevice, _: VkDeviceMemory, _: *const VkAllocationCallbacks) {
@@ -9580,7 +9590,7 @@ mod tests {
             sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
             pNext: (&raw const export).cast(),
             image: IMAGE,
-            buffer: VkBuffer(0),
+            buffer: VkBuffer::forged(0),
         };
         let info = VkMemoryAllocateInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -9634,7 +9644,7 @@ mod tests {
         use crate::budget::Budget;
         use std::cell::Cell;
 
-        const DEVICE: VkDevice = VkDevice(3);
+        const DEVICE: VkDevice = VkDevice::forged(3);
         const ASKED: u64 = 100_000;
 
         thread_local! {
@@ -9673,7 +9683,7 @@ mod tests {
                     node = base.pNext.cast();
                 }
                 GIVEN.with(|g| g.set((ptr, info.allocationSize.0)));
-                *out = VkDeviceMemory(0x9000);
+                *out = VkDeviceMemory::forged(0x9000);
             }
             VkResult::VK_SUCCESS
         }
@@ -9775,11 +9785,14 @@ mod tests {
 
         // The census reads the pages themselves -- coherent host memory -- not a driver mapping.
         let mut buf = vec![0u8; 16];
-        assert_eq!(d.memory_read(DEVICE, VkDeviceMemory(0x9000), ObjectId(1), &mut buf), Ok(16));
+        assert_eq!(
+            d.memory_read(DEVICE, VkDeviceMemory::forged(0x9000), ObjectId(1), &mut buf),
+            Ok(16)
+        );
         assert_eq!(MAPPED.with(Cell::get), 0, "still never mapped");
 
         // The allocation goes; the share keeps the pages, and the ledger keeps counting them.
-        d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(1));
+        d.free_memory(DEVICE, VkDeviceMemory::forged(0x9000), ObjectId(1));
         assert_eq!(budget.live(), span.1, "the share is what keeps the pages counted now");
         // The pages are kept by the share; the `VkDeviceMemory` over them is NOT. It is a
         // host-pointer import the driver made of our pages, and a share of the pages is not a
@@ -9832,7 +9845,7 @@ mod tests {
         // The lifetime the minting was there to buy, bought by owning instead. The guest's free
         // retires the record while the share keeps the memory -- and the address the VMM holds --
         // alive, so nothing is unmapped under the hypervisor's mapping.
-        d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(2));
+        d.free_memory(DEVICE, VkDeviceMemory::forged(0x9000), ObjectId(2));
         assert_eq!(
             FREED.with(Cell::get),
             1,
@@ -9875,8 +9888,8 @@ mod tests {
         };
         use std::cell::{Cell, RefCell};
 
-        const DEVICE: VkDevice = VkDevice(3);
-        const IMAGE: VkImage = VkImage(0x4100);
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        const IMAGE: VkImage = VkImage::forged(0x4100);
         const W: u32 = 64;
         const H: u32 = 8;
         const PITCH: u64 = (W * 4) as u64;
@@ -9905,7 +9918,7 @@ mod tests {
             });
             HANDED.with(|v| v.borrow_mut().push(h));
             // SAFETY: the caller's local.
-            unsafe { *out = VkDeviceMemory(h) };
+            unsafe { *out = VkDeviceMemory::forged(h) };
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn free(
@@ -9913,7 +9926,7 @@ mod tests {
             m: VkDeviceMemory,
             _a: *const VkAllocationCallbacks,
         ) {
-            FREED.with(|v| v.borrow_mut().push(m.0));
+            FREED.with(|v| v.borrow_mut().push(m.raw()));
         }
         unsafe extern "C" fn map(
             _d: VkDevice,
@@ -9953,7 +9966,7 @@ mod tests {
                 sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
                 pNext: core::ptr::null(),
                 image: IMAGE,
-                buffer: VkBuffer(0),
+                buffer: VkBuffer::forged(0),
             };
             let export = VkExportMemoryAllocateInfo {
                 sType: VkStructureType::VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
@@ -10132,8 +10145,8 @@ mod tests {
                 .map(|id| Doomed {
                     id: ObjectId(id),
                     ty: VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY,
-                    handle: HostHandle(
-                        d.memory.get(&ObjectId(id)).expect("allocated").memory.memory.0,
+                    handle: HostHandle::forged(
+                        d.memory.get(&ObjectId(id)).expect("allocated").memory.memory.raw(),
                     ),
                     device: Some(DEVICE),
                 })
@@ -10184,11 +10197,11 @@ mod tests {
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkQueueSubmit(submit);
         fns.plant_vkQueueSubmit2(submit2);
-        d.plant_device(VkDevice(DEVICE), fns);
-        d.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
-        d.plant_semaphore(VkSemaphore(TIMELINE), SemaphoreKind::Timeline);
+        d.plant_device(VkDevice::forged(DEVICE), fns);
+        d.plant_queue(VkDevice::forged(DEVICE), VkQueue::forged(QUEUE));
+        d.plant_semaphore(VkSemaphore::forged(TIMELINE), SemaphoreKind::Timeline);
 
-        let sems = [VkSemaphore(TIMELINE)];
+        let sems = [VkSemaphore::forged(TIMELINE)];
         let values = [7u64];
         let timeline = VkTimelineSemaphoreSubmitInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
@@ -10203,15 +10216,22 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(
-            d.queue_submit(VkQueue(QUEUE), cs::Decoded::planted(&v1 as &[_]), VkFence(FENCE)),
+            d.queue_submit(
+                VkQueue::forged(QUEUE),
+                cs::Decoded::planted(&v1 as &[_]),
+                VkFence::forged(FENCE)
+            ),
             Some(VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY),
             "the driver's refusal is the guest's answer"
         );
-        assert!(!d.fence_pending(VkFence(FENCE)), "a refused submit leaves its fence alone");
-        assert_eq!(d.semaphore_requested(VkSemaphore(TIMELINE)), 0, "and asks no timeline");
+        assert!(
+            !d.fence_pending(VkFence::forged(FENCE)),
+            "a refused submit leaves its fence alone"
+        );
+        assert_eq!(d.semaphore_requested(VkSemaphore::forged(TIMELINE)), 0, "and asks no timeline");
 
         let signal = [VkSemaphoreSubmitInfo {
-            semaphore: VkSemaphore(TIMELINE),
+            semaphore: VkSemaphore::forged(TIMELINE),
             value: 9,
             ..Default::default()
         }];
@@ -10221,11 +10241,15 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(
-            d.queue_submit2(VkQueue(QUEUE), cs::Decoded::planted(&v2 as &[_]), VkFence(FENCE)),
+            d.queue_submit2(
+                VkQueue::forged(QUEUE),
+                cs::Decoded::planted(&v2 as &[_]),
+                VkFence::forged(FENCE)
+            ),
             Ok(VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY),
         );
-        assert!(!d.fence_pending(VkFence(FENCE)), "the synchronization2 form the same");
-        assert_eq!(d.semaphore_requested(VkSemaphore(TIMELINE)), 0);
+        assert!(!d.fence_pending(VkFence::forged(FENCE)), "the synchronization2 form the same");
+        assert_eq!(d.semaphore_requested(VkSemaphore::forged(TIMELINE)), 0);
 
         d.abandon_planted();
     }
@@ -10273,7 +10297,7 @@ mod tests {
             out: *mut VkQueue,
         ) {
             // SAFETY: the caller passes a pointer to its own live handle.
-            unsafe { *out = VkQueue(QUEUE) };
+            unsafe { *out = VkQueue::forged(QUEUE) };
         }
         unsafe extern "C" fn create_fence(
             _d: VkDevice,
@@ -10282,7 +10306,7 @@ mod tests {
             out: *mut VkFence,
         ) -> VkResult {
             // SAFETY: as above.
-            unsafe { *out = VkFence(FENCE) };
+            unsafe { *out = VkFence::forged(FENCE) };
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn submit(
@@ -10292,7 +10316,7 @@ mod tests {
             fence: VkFence,
         ) -> VkResult {
             assert_eq!(count, 0, "a ring fence is an EMPTY submit; work would be the guest's");
-            assert_eq!(fence.0, FENCE, "and it carries the fence the wait is on");
+            assert_eq!(fence.raw(), FENCE, "and it carries the fence the wait is on");
             SUBMITS.fetch_add(1, Ordering::AcqRel);
             VkResult::VK_SUCCESS
         }
@@ -10335,7 +10359,7 @@ mod tests {
         fns.plant_vkWaitForFences(wait);
         fns.plant_vkResetFences(reset);
         fns.plant_vkDestroyFence(destroy_fence);
-        d.plant_device(VkDevice(DEVICE), fns);
+        d.plant_device(VkDevice::forged(DEVICE), fns);
 
         // The guest names the ring its fences belong to in the queue's own pNext chain. Without
         // this link there is no queue to order against, which is the `false` case below.
@@ -10350,8 +10374,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            d.device_queue(VkDevice(DEVICE), cs::Decoded::planted(&info)),
-            Some(VkQueue(QUEUE))
+            d.device_queue(VkDevice::forged(DEVICE), cs::Decoded::planted(&info)),
+            Some(VkQueue::forged(QUEUE))
         );
 
         assert!(d.ring_queues().fence(RingIdx(RING), FenceId(11)), "the ring has a queue");
@@ -10422,7 +10446,7 @@ mod tests {
             out: *mut VkQueue,
         ) {
             // SAFETY: the caller passes a pointer to its own live handle.
-            unsafe { *out = VkQueue(QUEUE) };
+            unsafe { *out = VkQueue::forged(QUEUE) };
         }
         unsafe extern "C" fn create_fence(
             _d: VkDevice,
@@ -10431,7 +10455,7 @@ mod tests {
             out: *mut VkFence,
         ) -> VkResult {
             // SAFETY: as above.
-            unsafe { *out = VkFence(FENCE) };
+            unsafe { *out = VkFence::forged(FENCE) };
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn submit(
@@ -10441,7 +10465,7 @@ mod tests {
             fence: VkFence,
         ) -> VkResult {
             assert_eq!(count, 0, "a present fence is an EMPTY submit, like a ring fence");
-            assert_eq!(fence.0, FENCE, "and it carries the fence the wait is on");
+            assert_eq!(fence.raw(), FENCE, "and it carries the fence the wait is on");
             SUBMITS.fetch_add(1, Ordering::AcqRel);
             VkResult::VK_SUCCESS
         }
@@ -10493,7 +10517,7 @@ mod tests {
         fns.plant_vkWaitForFences(wait);
         fns.plant_vkResetFences(reset);
         fns.plant_vkDestroyFence(destroy_fence);
-        d.plant_device(VkDevice(DEVICE), fns);
+        d.plant_device(VkDevice::forged(DEVICE), fns);
 
         let timeline = VkDeviceQueueTimelineInfoMESA {
             sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA,
@@ -10506,8 +10530,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            d.device_queue(VkDevice(DEVICE), cs::Decoded::planted(&info)),
-            Some(VkQueue(QUEUE))
+            d.device_queue(VkDevice::forged(DEVICE), cs::Decoded::planted(&info)),
+            Some(VkQueue::forged(QUEUE))
         );
 
         // An empty decode barrier: this test is about phase two. Phase one is a wait on ring
@@ -10553,8 +10577,8 @@ mod tests {
             VkImageCreateInfo, VkMemoryDedicatedAllocateInfo,
         };
 
-        const DEVICE: VkDevice = VkDevice(3);
-        const IMAGE: VkImage = VkImage(0x4100);
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        const IMAGE: VkImage = VkImage::forged(0x4100);
         const W: u32 = 64;
         const H: u32 = 8;
         const PITCH: u64 = (W * 4) as u64;
@@ -10583,7 +10607,7 @@ mod tests {
             out: *mut VkDeviceMemory,
         ) -> VkResult {
             // SAFETY: the caller's local.
-            unsafe { *out = VkDeviceMemory(0x9000) };
+            unsafe { *out = VkDeviceMemory::forged(0x9000) };
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn free(
@@ -10619,7 +10643,7 @@ mod tests {
         );
         // The same image, opaque. The layout stub answers with the same plausible pitch for it,
         // which is exactly why the refusal below has to come from the tiling and not the pitch.
-        const OPAQUE: VkImage = VkImage(0x4200);
+        const OPAQUE: VkImage = VkImage::forged(0x4200);
         d.note_image(
             OPAQUE,
             &VkImageCreateInfo {
@@ -10637,7 +10661,7 @@ mod tests {
             sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
             pNext: core::ptr::null(),
             image: IMAGE,
-            buffer: VkBuffer(0),
+            buffer: VkBuffer::forged(0),
         };
         let export = VkExportMemoryAllocateInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
@@ -10665,9 +10689,9 @@ mod tests {
             d.memory_surface_id(ObjectId(2)).is_none(),
             "an opaque image has no rows to alias, whatever pitch the driver quotes for it"
         );
-        d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(2));
+        d.free_memory(DEVICE, VkDeviceMemory::forged(0x9000), ObjectId(2));
 
-        d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(1));
+        d.free_memory(DEVICE, VkDeviceMemory::forged(0x9000), ObjectId(1));
         assert_eq!(d.account.live(), 0, "and the surface's pages come back with it");
 
         d.abandon_planted();
@@ -10684,7 +10708,7 @@ mod tests {
     fn an_import_is_not_charged_because_its_bytes_are_the_exporters() {
         use super::super::proto::types::VkImportMemoryResourceInfoMESA;
 
-        const DEVICE: VkDevice = VkDevice(3);
+        const DEVICE: VkDevice = VkDevice::forged(3);
 
         unsafe extern "C" fn allocate(
             _d: VkDevice,
@@ -10693,7 +10717,7 @@ mod tests {
             out: *mut VkDeviceMemory,
         ) -> VkResult {
             // SAFETY: the caller's local.
-            unsafe { *out = VkDeviceMemory(0x9000) };
+            unsafe { *out = VkDeviceMemory::forged(0x9000) };
             VkResult::VK_SUCCESS
         }
 
@@ -10755,7 +10779,7 @@ mod tests {
     /// could detect afterwards.
     #[test]
     fn memory_is_published_once_and_leaves_the_census_when_it_is() {
-        const DEVICE: VkDevice = VkDevice(3);
+        const DEVICE: VkDevice = VkDevice::forged(3);
         const MEM: ObjectId = ObjectId(12);
         const LOCAL: ObjectId = ObjectId(13);
         const SIZE: u64 = 128 * 1024;
@@ -10774,7 +10798,7 @@ mod tests {
         driver.plant_device(DEVICE, fns);
         driver.plant_allocation(MEM, SIZE);
         driver.plant_device_local_allocation(LOCAL, SIZE);
-        let handle = VkDeviceMemory(0xd0);
+        let handle = VkDeviceMemory::forged(0xd0);
 
         assert_eq!(driver.memory_census().len(), 2, "both are live and unexported");
 
@@ -10865,17 +10889,17 @@ mod tests {
 
         use super::super::proto::types::{VkAllocationCallbacks, VkBuffer};
 
-        const DEVICE: VkDevice = VkDevice(3);
+        const DEVICE: VkDevice = VkDevice::forged(3);
         const BUFFER: (u64, u64) = (11, 0xb0);
         const MEMORY: (u64, u64) = (12, 0xd0);
 
         thread_local! { static SAW: RefCell<Vec<(&'static str, u64)>> = const { RefCell::new(Vec::new()) }; }
         fn saw(what: &'static str, h: HostHandle) {
-            SAW.with_borrow_mut(|s| s.push((what, h.0)));
+            SAW.with_borrow_mut(|s| s.push((what, h.raw())));
         }
 
         unsafe extern "C" fn wait_idle(_d: VkDevice) -> VkResult {
-            saw("wait", HostHandle(0));
+            saw("wait", HostHandle::forged(0));
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn buffer(_d: VkDevice, h: VkBuffer, _a: *const VkAllocationCallbacks) {
@@ -10903,7 +10927,12 @@ mod tests {
         // Memory the driver allocated, so that freeing it is a call this test can see. The record
         // owns the handle now, and its drop is the only `vkFreeMemory` there is -- which is
         // exactly what the ordering below is asserting about.
-        driver.plant_driver_allocation(DEVICE, ObjectId(MEMORY.0), VkDeviceMemory(MEMORY.1), 4096);
+        driver.plant_driver_allocation(
+            DEVICE,
+            ObjectId(MEMORY.0),
+            VkDeviceMemory::forged(MEMORY.1),
+            4096,
+        );
         assert_eq!(driver.memory_census().len(), 1, "the allocation is live before the teardown");
 
         // The order the doomed list arrives in is the arena's, not Vulkan's: memory first here on
@@ -10912,17 +10941,17 @@ mod tests {
             Doomed {
                 id: ObjectId(MEMORY.0),
                 ty: VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY,
-                handle: HostHandle(MEMORY.1),
+                handle: HostHandle::forged(MEMORY.1),
                 device: Some(DEVICE),
             },
             Doomed {
                 id: ObjectId(BUFFER.0),
                 ty: VkObjectType::VK_OBJECT_TYPE_BUFFER,
-                handle: HostHandle(BUFFER.1),
+                handle: HostHandle::forged(BUFFER.1),
                 device: Some(DEVICE),
             },
             Doomed {
-                id: ObjectId(DEVICE.0),
+                id: ObjectId(DEVICE.raw()),
                 ty: VkObjectType::VK_OBJECT_TYPE_DEVICE,
                 handle: DEVICE.host(),
                 device: None,
@@ -10936,7 +10965,7 @@ mod tests {
         SAW.with_borrow(|s| {
             assert_eq!(
                 s.as_slice(),
-                [("wait", 0), ("buffer", BUFFER.1), ("free", MEMORY.1), ("device", DEVICE.0)],
+                [("wait", 0), ("buffer", BUFFER.1), ("free", MEMORY.1), ("device", DEVICE.raw())],
                 "idle, then what is bound to the memory, then the memory, then the device"
             );
         });
@@ -10950,27 +10979,31 @@ mod tests {
     /// freed and the next command naming it hands that handle back to the driver.
     #[test]
     fn a_destroyed_pool_hands_back_the_ids_of_everything_in_it() {
-        const DEVICE: VkDevice = VkDevice(3);
+        const DEVICE: VkDevice = VkDevice::forged(3);
 
         let mut d = Driver::new(Account::for_test(None));
-        d.pools.open(DEVICE, VkCommandPool(7));
+        d.pools.open(DEVICE, VkCommandPool::forged(7));
         d.pools.adopt(
-            VkCommandPool(7),
-            [(VkCommandBuffer(11), ObjectId(110)), (VkCommandBuffer(12), ObjectId(120))],
+            VkCommandPool::forged(7),
+            [
+                (VkCommandBuffer::forged(11), ObjectId(110)),
+                (VkCommandBuffer::forged(12), ObjectId(120)),
+            ],
         );
 
         // No device is registered, so the driver call itself is skipped -- the bookkeeping is
         // what is under test, and it has to happen either way.
         let mut orphans =
-            d.destroy_pool(DEVICE, |f| f.vkDestroyCommandPool(), VkCommandPool(7), None);
+            d.destroy_pool(DEVICE, |f| f.vkDestroyCommandPool(), VkCommandPool::forged(7), None);
         orphans.sort_unstable_by_key(|i| i.0);
         assert_eq!(orphans, [ObjectId(110), ObjectId(120)], "every id in the pool, and no other");
-        assert!(!d.pools.is_open(VkCommandPool(7)));
+        assert!(!d.pools.is_open(VkCommandPool::forged(7)));
 
         // And a second destroy of the same pool has nothing left to hand back: the ids must not
         // be removed from the object table twice, because the guest may have reused them.
         assert!(
-            d.destroy_pool(DEVICE, |f| f.vkDestroyCommandPool(), VkCommandPool(7), None).is_empty()
+            d.destroy_pool(DEVICE, |f| f.vkDestroyCommandPool(), VkCommandPool::forged(7), None)
+                .is_empty()
         );
     }
 
@@ -10988,21 +11021,28 @@ mod tests {
         const SHARED: u64 = 7;
 
         let mut d = Driver::new(Account::for_test(None));
-        d.pools.open(VkDevice(3), VkCommandPool(SHARED));
-        d.pools.adopt(VkCommandPool(SHARED), [(VkCommandBuffer(11), ObjectId(110))]);
-        d.pools.open(VkDevice(3), VkDescriptorPool(SHARED));
-        d.pools.adopt(VkDescriptorPool(SHARED), [(VkDescriptorSet(21), ObjectId(210))]);
+        d.pools.open(VkDevice::forged(3), VkCommandPool::forged(SHARED));
+        d.pools
+            .adopt(VkCommandPool::forged(SHARED), [(VkCommandBuffer::forged(11), ObjectId(110))]);
+        d.pools.open(VkDevice::forged(3), VkDescriptorPool::forged(SHARED));
+        d.pools.adopt(
+            VkDescriptorPool::forged(SHARED),
+            [(VkDescriptorSet::forged(21), ObjectId(210))],
+        );
 
         assert!(
-            d.pools.is_open(VkCommandPool(SHARED)),
+            d.pools.is_open(VkCommandPool::forged(SHARED)),
             "the command pool survived the second open"
         );
-        assert!(d.pools.is_open(VkDescriptorPool(SHARED)));
+        assert!(d.pools.is_open(VkDescriptorPool::forged(SHARED)));
 
         // Each destroy hands back its own contents and nothing of the other's.
-        assert_eq!(d.pools.close(VkCommandPool(SHARED)), [ObjectId(110)]);
-        assert!(d.pools.is_open(VkDescriptorPool(SHARED)), "the descriptor pool outlived it");
-        assert_eq!(d.pools.close(VkDescriptorPool(SHARED)), [ObjectId(210)]);
+        assert_eq!(d.pools.close(VkCommandPool::forged(SHARED)), [ObjectId(110)]);
+        assert!(
+            d.pools.is_open(VkDescriptorPool::forged(SHARED)),
+            "the descriptor pool outlived it"
+        );
+        assert_eq!(d.pools.close(VkDescriptorPool::forged(SHARED)), [ObjectId(210)]);
     }
 
     /// A destroyed device takes its pools with it.
@@ -11015,22 +11055,28 @@ mod tests {
     #[test]
     fn a_device_takes_its_pools_and_their_ids_with_it() {
         let mut d = Driver::new(Account::for_test(None));
-        d.pools.open(VkDevice(3), VkCommandPool(7));
+        d.pools.open(VkDevice::forged(3), VkCommandPool::forged(7));
         d.pools.adopt(
-            VkCommandPool(7),
-            [(VkCommandBuffer(11), ObjectId(110)), (VkCommandBuffer(12), ObjectId(120))],
+            VkCommandPool::forged(7),
+            [
+                (VkCommandBuffer::forged(11), ObjectId(110)),
+                (VkCommandBuffer::forged(12), ObjectId(120)),
+            ],
         );
-        d.pools.open(VkDevice(4), VkCommandPool(8));
-        d.pools.adopt(VkCommandPool(8), [(VkCommandBuffer(21), ObjectId(210))]);
+        d.pools.open(VkDevice::forged(4), VkCommandPool::forged(8));
+        d.pools.adopt(VkCommandPool::forged(8), [(VkCommandBuffer::forged(21), ObjectId(210))]);
 
-        let mut orphans = d.destroy_device(VkDevice(3), &[]);
+        let mut orphans = d.destroy_device(VkDevice::forged(3), &[]);
         orphans.sort_unstable_by_key(|i| i.0);
 
         assert_eq!(orphans, [ObjectId(110), ObjectId(120)], "its pools' ids, and no others");
-        assert!(!d.pools.is_open(VkCommandPool(7)), "a pool outlived its device");
-        assert!(d.pools.is_open(VkCommandPool(8)), "another device's pool must be untouched");
+        assert!(!d.pools.is_open(VkCommandPool::forged(7)), "a pool outlived its device");
         assert!(
-            d.destroy_device(VkDevice(4), &[]) == [ObjectId(210)],
+            d.pools.is_open(VkCommandPool::forged(8)),
+            "another device's pool must be untouched"
+        );
+        assert!(
+            d.destroy_device(VkDevice::forged(4), &[]) == [ObjectId(210)],
             "another device's pool must still hold its own"
         );
     }
@@ -11078,11 +11124,11 @@ mod tests {
         };
         use std::cell::RefCell;
 
-        const DEVICE: VkDevice = VkDevice(3);
-        const CB: VkCommandBuffer = VkCommandBuffer(0x30);
-        const POOL: VkQueryPool = VkQueryPool(0x50);
-        const STATS: VkQueryPool = VkQueryPool(0x51);
-        const PERF: VkQueryPool = VkQueryPool(0x52);
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        const CB: VkCommandBuffer = VkCommandBuffer::forged(0x30);
+        const POOL: VkQueryPool = VkQueryPool::forged(0x50);
+        const STATS: VkQueryPool = VkQueryPool::forged(0x51);
+        const PERF: VkQueryPool = VkQueryPool::forged(0x52);
 
         // What the driver was asked, by entry point: first (or the query) and count.
         thread_local! {
@@ -11188,7 +11234,7 @@ mod tests {
         fns.plant_vkDestroyDevice(destroy_device);
         let mut d = Driver::new(Account::for_test(None));
         d.plant_device(DEVICE, fns);
-        d.plant_pool(DEVICE, VkCommandPool(0x20), &[(CB, ObjectId(9))]);
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x20), &[(CB, ObjectId(9))]);
 
         let info = VkQueryPoolCreateInfo {
             queryType: VkQueryType::VK_QUERY_TYPE_TIMESTAMP,
@@ -11208,7 +11254,7 @@ mod tests {
         const WITH_STATUS: VkQueryResultFlags =
             VkQueryResultFlags(VkQueryResultFlagBits::VK_QUERY_RESULT_WITH_STATUS_BIT_KHR.0 as u32);
         const STAGE: VkPipelineStageFlagBits = VkPipelineStageFlagBits(1);
-        const BUF: VkBuffer = VkBuffer(0x60);
+        const BUF: VkBuffer = VkBuffer::forged(0x60);
         let mut buf = [0u8; 64];
         let out_of_pool: Result<(), QueryRefused> = Err(QueryRefused::OutOfPool);
         let read_out_of_pool: Result<VkResult, QueryRefused> = Err(QueryRefused::OutOfPool);
@@ -11375,7 +11421,7 @@ mod tests {
 
         // A pool this renderer has no record of is not sized and not indexed, so it is not
         // touched -- which is what a destroyed pool becomes: a recycled handle finds no record.
-        let r = d.cmd_end_query(CB, VkQueryPool(0x99), 0);
+        let r = d.cmd_end_query(CB, VkQueryPool::forged(0x99), 0);
         assert_eq!(r, Err(QueryRefused::UnknownPool));
         d.forget_query_pool(POOL);
         let r = d.query_pool_results(DEVICE, POOL, 0, 1, &mut buf, VkDeviceSize(4), NONE);
@@ -11383,8 +11429,14 @@ mod tests {
         assert_eq!(d.reset_query_pool(DEVICE, POOL, 0, 1), Err(QueryRefused::UnknownPool));
 
         // A command buffer with no device behind it, and a device with no table.
-        assert_eq!(d.cmd_end_query(VkCommandBuffer(0x31), STATS, 0), Err(QueryRefused::NoDevice));
-        assert_eq!(d.reset_query_pool(VkDevice(4), STATS, 0, 1), Err(QueryRefused::NoDevice));
+        assert_eq!(
+            d.cmd_end_query(VkCommandBuffer::forged(0x31), STATS, 0),
+            Err(QueryRefused::NoDevice)
+        );
+        assert_eq!(
+            d.reset_query_pool(VkDevice::forged(4), STATS, 0, 1),
+            Err(QueryRefused::NoDevice)
+        );
 
         // The other place a pool dies: the guest left it live and the device's teardown took
         // it. Its record goes too, so the handle the driver may now reuse vouches for nothing.

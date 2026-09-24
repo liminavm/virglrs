@@ -1482,13 +1482,13 @@ mod tests {
             let mut fns = crate::vulkan::Device::default();
             fns.plant_vkDeviceWaitIdle(wait_idle);
             fns.plant_vkDestroyDevice(destroy_device);
-            ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
+            ctx.driver_mut().plant_device(VkDevice::forged(DEVICE), fns);
             ctx.objects()
                 .borrow_mut()
                 .add(
                     ObjectId(GUEST_ID),
                     VkObjectType::VK_OBJECT_TYPE_DEVICE,
-                    HostHandle(DEVICE),
+                    HostHandle::forged(DEVICE),
                     None,
                 )
                 .expect("a fresh id");
@@ -1508,7 +1508,7 @@ mod tests {
         let ring = RingId::new(7).expect("7 is not zero");
 
         let idle = {
-            let args = Args { device: VkDevice(GUEST_ID), ..Default::default() };
+            let args = Args { device: VkDevice::forged(GUEST_ID), ..Default::default() };
             let proto = crate::venus::cs::AllOfIt;
             let mut buf = vec![0u8; vn_sizeof_vkDeviceWaitIdle_args(&proto, &args)];
             let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
@@ -1609,13 +1609,13 @@ mod tests {
             fns.plant_vkDeviceWaitIdle(idle);
             fns.plant_vkDestroyFence(destroy_fence);
             fns.plant_vkDestroyDevice(destroy_device);
-            ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
+            ctx.driver_mut().plant_device(VkDevice::forged(DEVICE), fns);
             let mut table = ctx.objects().borrow_mut();
             table
                 .add(
                     ObjectId(GUEST_DEV),
                     VkObjectType::VK_OBJECT_TYPE_DEVICE,
-                    HostHandle(DEVICE),
+                    HostHandle::forged(DEVICE),
                     None,
                 )
                 .expect("a fresh id");
@@ -1623,7 +1623,7 @@ mod tests {
                 .add(
                     ObjectId(GUEST_FENCE),
                     VkObjectType::VK_OBJECT_TYPE_FENCE,
-                    HostHandle(FENCE),
+                    HostHandle::forged(FENCE),
                     None,
                 )
                 .expect("a fresh id");
@@ -1634,9 +1634,9 @@ mod tests {
         );
 
         let work = {
-            let fences = [VkFence(GUEST_FENCE)];
+            let fences = [VkFence::forged(GUEST_FENCE)];
             let mut args = Args::default();
-            args.device = VkDevice(GUEST_DEV);
+            args.device = VkDevice::forged(GUEST_DEV);
             args.waitAll = VkBool32(1);
             args.timeout = u64::MAX;
             args.plant_pFences(&fences);
@@ -1735,13 +1735,13 @@ mod tests {
             fns.plant_vkDeviceWaitIdle(idle);
             fns.plant_vkDestroySemaphore(destroy_semaphore);
             fns.plant_vkDestroyDevice(destroy_device);
-            ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
+            ctx.driver_mut().plant_device(VkDevice::forged(DEVICE), fns);
             let mut table = ctx.objects().borrow_mut();
             table
                 .add(
                     ObjectId(GUEST_DEV),
                     VkObjectType::VK_OBJECT_TYPE_DEVICE,
-                    HostHandle(DEVICE),
+                    HostHandle::forged(DEVICE),
                     None,
                 )
                 .expect("a fresh id");
@@ -1749,7 +1749,7 @@ mod tests {
                 .add(
                     ObjectId(GUEST_SEM),
                     VkObjectType::VK_OBJECT_TYPE_SEMAPHORE,
-                    HostHandle(SEM),
+                    HostHandle::forged(SEM),
                     None,
                 )
                 .expect("a fresh id");
@@ -1761,8 +1761,8 @@ mod tests {
 
         let work = {
             let args = Args {
-                device: VkDevice(GUEST_DEV),
-                semaphore: VkSemaphore(GUEST_SEM),
+                device: VkDevice::forged(GUEST_DEV),
+                semaphore: VkSemaphore::forged(GUEST_SEM),
                 ..Default::default()
             };
             let proto = crate::venus::cs::AllOfIt;
@@ -1855,13 +1855,13 @@ mod tests {
             fns.plant_vkDeviceWaitIdle(idle);
             fns.plant_vkDestroyFence(destroy_fence);
             fns.plant_vkDestroyDevice(destroy_device);
-            ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
+            ctx.driver_mut().plant_device(VkDevice::forged(DEVICE), fns);
             let mut table = ctx.objects().borrow_mut();
             table
                 .add(
                     ObjectId(GUEST_DEV),
                     VkObjectType::VK_OBJECT_TYPE_DEVICE,
-                    HostHandle(DEVICE),
+                    HostHandle::forged(DEVICE),
                     None,
                 )
                 .expect("a fresh id");
@@ -1869,7 +1869,7 @@ mod tests {
                 .add(
                     ObjectId(GUEST_FENCE),
                     VkObjectType::VK_OBJECT_TYPE_FENCE,
-                    HostHandle(FENCE),
+                    HostHandle::forged(FENCE),
                     None,
                 )
                 .expect("a fresh id");
@@ -1880,9 +1880,9 @@ mod tests {
         );
 
         let work = {
-            let fences = [VkFence(GUEST_FENCE)];
+            let fences = [VkFence::forged(GUEST_FENCE)];
             let mut args = Args::default();
-            args.device = VkDevice(GUEST_DEV);
+            args.device = VkDevice::forged(GUEST_DEV);
             args.waitAll = VkBool32(1);
             args.timeout = u64::MAX;
             args.plant_pFences(&fences);

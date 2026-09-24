@@ -54,9 +54,28 @@ pub struct ObjectId(pub u64);
 /// Zero is an ordinary value here, unlike a resource handle: Vulkan spells `VK_NULL_HANDLE` as
 /// zero, a great many members are optional, and a create the driver refused leaves one behind on
 /// purpose. So it is a plain `u64` and not a `NonZeroU64`.
+///
+/// Only ever made from a handle, by [`Handle::host`], or by the decoder: holding one is what
+/// entitles [`Handle::from_host`] to put it back in a handle slot, so a number cannot become one.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 #[repr(transparent)]
-pub struct HostHandle(pub u64);
+pub struct HostHandle(u64);
+
+impl HostHandle {
+    /// `VK_NULL_HANDLE`.
+    pub const NULL: HostHandle = HostHandle(0);
+
+    /// The word, for reading.
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// A host handle a test made up, which no Vulkan call will ever see.
+    #[cfg(test)]
+    pub const fn forged(raw: u64) -> HostHandle {
+        HostHandle(raw)
+    }
+}
 
 /// A host handle carried with the Vulkan type it is a handle *of*.
 ///
@@ -356,6 +375,37 @@ pub trait Links {
     fn next(&self) -> *const core::ffi::c_void;
 }
 
+/// Only the decoder and the driver's Vulkan calls make one. Outside them a number does not become
+/// a handle. Each refusal below has a twin beside it that compiles, because a `compile_fail`
+/// passes on any error at all and rustdoc does not check which: the twin is what says the path is
+/// right and the one difference is what fails.
+///
+/// Not by the constructor, whose field is private; null is there for the asking:
+///
+/// ```compile_fail
+/// let _ = virglrenderer::venus::proto::types::VkBuffer(0xdead);
+/// ```
+/// ```
+/// let _ = virglrenderer::venus::proto::types::VkBuffer::NULL;
+/// ```
+///
+/// Not without `unsafe`, which a handler module does not write:
+///
+/// ```compile_fail
+/// let _ = virglrenderer::venus::proto::types::VkBuffer::from_raw(0xdead);
+/// ```
+/// ```
+/// let _ = unsafe { virglrenderer::venus::proto::types::VkBuffer::from_raw(0) };
+/// ```
+///
+/// And not through a [`HostHandle`], which [`Handle::from_host`] would take:
+///
+/// ```compile_fail
+/// let _ = virglrenderer::venus::cs::HostHandle(0xdead);
+/// ```
+/// ```
+/// let _ = virglrenderer::venus::cs::HostHandle::NULL;
+/// ```
 pub trait Handle: Copy {
     /// The `VkObjectType` discriminant of this handle's Vulkan type.
     ///
@@ -365,19 +415,54 @@ pub trait Handle: Copy {
     /// attribute the lookup already used, so the two cannot drift.
     const OBJECT_TYPE: i32;
 
+    /// The word in the slot.
+    fn raw(self) -> u64;
+
+    /// Put `raw` in a handle slot.
+    ///
+    /// # Safety
+    ///
+    /// As for the generated inherent `from_raw`: `raw` is a live handle of this type that Vulkan
+    /// gave this process, or the guest's id in a slot nothing hands to the driver as a handle.
+    unsafe fn from_raw(raw: u64) -> Self;
+
     /// The host handle in the slot, for a member the decoder has already resolved or the driver
     /// has just written.
-    fn host(self) -> HostHandle;
+    fn host(self) -> HostHandle {
+        HostHandle(self.raw())
+    }
 
     /// The guest id in the slot, for the out-member of a create -- the one place the guest, not
     /// the host, chooses what the word says.
-    fn guest_id(self) -> ObjectId;
+    fn guest_id(self) -> ObjectId {
+        ObjectId(self.raw())
+    }
 
     /// Put a host handle in the slot.
-    fn from_host(host: HostHandle) -> Self;
+    fn from_host(host: HostHandle) -> Self {
+        // SAFETY: a `HostHandle` is only made from a handle or by the decoder's lookup, so this
+        // word is one Vulkan gave this process. Its type is the caller's to get right, and the
+        // table's lookup keys by type.
+        unsafe { Self::from_raw(host.0) }
+    }
 
     /// `VK_NULL_HANDLE`, for an out-parameter before the driver has written it.
-    fn null() -> Self;
+    fn null() -> Self {
+        // SAFETY: null is no object, and Vulkan takes it wherever a handle is optional.
+        unsafe { Self::from_raw(0) }
+    }
+}
+
+/// The name the guest gave the object behind `host`, in a handle slot, for an answer.
+///
+/// A handle the driver returns inside a struct -- the physical devices of a device group -- goes
+/// back to the guest under the id it knows the object by, never as the host's word. The table
+/// answers only for an object it holds, so what comes back names something the guest was given,
+/// and `None` is a host handle the guest has no name for.
+pub fn guest_face<T: Handle>(objects: &dyn Objects, host: T) -> Option<T> {
+    let id = objects.id_of(T::OBJECT_TYPE, host.host())?;
+    // SAFETY: the guest's id for an object the table holds, in a slot bound for the encoder.
+    Some(unsafe { T::from_raw(id.0) })
 }
 
 /// A pool handle, and the one kind of object allocated from it.
@@ -405,6 +490,9 @@ pub enum Lookup {
     /// No such object, or one of a different Vulkan type. Either way the guest named something it
     /// was never given, which is a protocol violation and stops the ring.
     Missing,
+    /// An object an unserved create registered, whose handle is its own id. The decoder turns it
+    /// into one; the table has no business making a host handle out of a number.
+    Fiction,
 }
 
 pub trait Objects {
@@ -412,6 +500,10 @@ pub trait Objects {
     /// different type is `Missing`, not `Found`: the guest does not get to reinterpret one object
     /// as another by naming its id in the wrong command.
     fn lookup(&self, id: ObjectId, ty: i32) -> Lookup;
+
+    /// The id the guest knows the object of `VkObjectType` `ty` behind `host` by, if it is one
+    /// this table holds.
+    fn id_of(&self, ty: i32, host: HostHandle) -> Option<ObjectId>;
 }
 
 /// An object table that resolves every id to itself. Used by the wire round-trip, where the point
@@ -419,8 +511,12 @@ pub trait Objects {
 pub struct IdentityObjects;
 
 impl Objects for IdentityObjects {
-    fn lookup(&self, id: ObjectId, _ty: i32) -> Lookup {
-        Lookup::Found(HostHandle(id.0))
+    fn lookup(&self, _id: ObjectId, _ty: i32) -> Lookup {
+        Lookup::Fiction
+    }
+
+    fn id_of(&self, _ty: i32, host: HostHandle) -> Option<ObjectId> {
+        Some(ObjectId(host.0))
     }
 }
 
@@ -649,6 +745,10 @@ impl<'a> Decoder<'a> {
             Lookup::Found(handle) => {
                 self.resolved.borrow_mut().push(id);
                 handle
+            }
+            Lookup::Fiction => {
+                self.resolved.borrow_mut().push(id);
+                HostHandle(id.0)
             }
             Lookup::Ghost => {
                 self.ghost.set(Some(id));
@@ -1269,8 +1369,8 @@ mod tests {
         let ids = args.pPhysicalDevices().expect("the guest sent its ids");
         assert_eq!(ids.len(), 3);
         let shadow = args.handle_pPhysicalDevices_mut().expect("a shadow beside the ids");
-        shadow[0] = VkPhysicalDevice(0xaa);
-        shadow[1] = VkPhysicalDevice(0xbb);
+        shadow[0] = VkPhysicalDevice::forged(0xaa);
+        shadow[1] = VkPhysicalDevice::forged(0xbb);
         let mut count = args.pPhysicalDeviceCount_mut().expect("the guest sent a count");
         assert_eq!(count.get(), 3, "until answered, the count is the guest's capacity");
         count.set(2);
@@ -1455,7 +1555,7 @@ mod tests {
             ..Default::default()
         };
         let mut sent = vn_command_vkGetPhysicalDeviceMemoryProperties2::default();
-        sent.physicalDevice = VkPhysicalDevice(9);
+        sent.physicalDevice = VkPhysicalDevice::forged(9);
         sent.plant_pMemoryProperties(&mut props);
         let mut wire = Vec::new();
         vn_encode_vkGetPhysicalDeviceMemoryProperties2_args(
@@ -1512,7 +1612,7 @@ mod tests {
         };
         let mut sent = vn_command_vkCreateSemaphore::default();
         sent.pCreateInfo = Some(Decoded::planted(&info));
-        let mut id = crate::venus::proto::types::VkSemaphore(5);
+        let mut id = crate::venus::proto::types::VkSemaphore::forged(5);
         sent.plant_pSemaphore(&mut id);
         let mut wire = Vec::new();
         vn_encode_vkCreateSemaphore_args(
@@ -1641,16 +1741,40 @@ mod tests {
             fn lookup(&self, _id: ObjectId, _ty: i32) -> Lookup {
                 Lookup::Ghost
             }
+            fn id_of(&self, _ty: i32, _host: HostHandle) -> Option<ObjectId> {
+                None
+            }
         }
         let temp = Bump::new();
         let hard = AtomicBool::new(false);
         let buf = [0u8; 0];
         let dec = Decoder::new(&buf, &temp, &AllGhosts, &hard);
-        assert_eq!(dec.lookup_object(ObjectId(42), 0), HostHandle(0));
+        assert_eq!(dec.lookup_object(ObjectId(42), 0), HostHandle::forged(0));
         assert!(dec.fatal());
         assert!(!dec.hard_fatal());
         assert_eq!(dec.verdict(), Dispatched::Ghosted(ObjectId(42)), "and the verdict names it");
         assert!(!dec.fatal(), "a ghost does not outlive its command");
+    }
+
+    /// An unserved create's object resolves to the guest's own id: the table answers `Fiction`
+    /// and the decoder, which may make a handle, makes that one.
+    #[test]
+    fn a_fiction_resolves_to_its_own_id() {
+        struct AllFictions;
+        impl Objects for AllFictions {
+            fn lookup(&self, _id: ObjectId, _ty: i32) -> Lookup {
+                Lookup::Fiction
+            }
+            fn id_of(&self, _ty: i32, _host: HostHandle) -> Option<ObjectId> {
+                None
+            }
+        }
+        let temp = Bump::new();
+        let hard = AtomicBool::new(false);
+        let buf = [0u8; 0];
+        let dec = Decoder::new(&buf, &temp, &AllFictions, &hard);
+        assert_eq!(dec.lookup_object(ObjectId(42), 0), HostHandle::forged(42));
+        assert!(!dec.fatal(), "a fiction is not a failure");
     }
 
     /// `VK_NULL_HANDLE` is an ordinary value, not a missing object: Vulkan spells "no object" as
@@ -1662,12 +1786,15 @@ mod tests {
             fn lookup(&self, _id: ObjectId, _ty: i32) -> Lookup {
                 Lookup::Missing
             }
+            fn id_of(&self, _ty: i32, _host: HostHandle) -> Option<ObjectId> {
+                None
+            }
         }
         let temp = Bump::new();
         let hard = AtomicBool::new(false);
         let buf = [0u8; 0];
         let dec = Decoder::new(&buf, &temp, &Nothing, &hard);
-        assert_eq!(dec.lookup_object(ObjectId(0), 0), HostHandle(0));
+        assert_eq!(dec.lookup_object(ObjectId(0), 0), HostHandle::forged(0));
         assert!(!dec.fatal());
     }
 
@@ -1680,12 +1807,15 @@ mod tests {
             fn lookup(&self, _id: ObjectId, _ty: i32) -> Lookup {
                 Lookup::Missing
             }
+            fn id_of(&self, _ty: i32, _host: HostHandle) -> Option<ObjectId> {
+                None
+            }
         }
         let temp = Bump::new();
         let hard = AtomicBool::new(false);
         let buf = [0u8; 0];
         let dec = Decoder::new(&buf, &temp, &Nothing, &hard);
-        assert_eq!(dec.lookup_object(ObjectId(42), 0), HostHandle(0));
+        assert_eq!(dec.lookup_object(ObjectId(42), 0), HostHandle::forged(0));
         assert!(dec.hard_fatal());
         assert_eq!(dec.verdict(), Dispatched::Undecodable);
         assert!(dec.fatal(), "a hard poison does not clear with the command");

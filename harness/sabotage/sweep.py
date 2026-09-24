@@ -264,8 +264,8 @@ SABOTAGES = [
     (
         'a run of pool allocations is filed one object out of step',
         'src/venus/driver.rs',
-        '            out.iter().copied().zip(ids.iter().copied()).filter(|(h, _)| h.host().0 != 0),',
-        '            out.iter().copied().zip(ids.iter().skip(1).copied()).filter(|(h, _)| h.host().0 != 0),',
+        '            out.iter().copied().zip(ids.iter().copied()).filter(|(h, _)| h.host().raw() != 0),',
+        '            out.iter().copied().zip(ids.iter().skip(1).copied()).filter(|(h, _)| h.host().raw() != 0),',
         '',
     ),
     (
@@ -327,14 +327,14 @@ SABOTAGES = [
     (
         'a failed pipeline run leaks the pipelines it did make',
         'src/venus/driver.rs',
-        "            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };\n            // The guest's reply must not carry a handle that is now gone.\n            *survivor = VkPipeline(0);",
-        '            *survivor = VkPipeline(0);',
+        "            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };\n            // The guest's reply must not carry a handle that is now gone.\n            *survivor = VkPipeline::NULL;",
+        '            *survivor = VkPipeline::NULL;',
         '',
     ),
     (
         'a failed pipeline run leaves destroyed handles in the reply',
         'src/venus/driver.rs',
-        "            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };\n            // The guest's reply must not carry a handle that is now gone.\n            *survivor = VkPipeline(0);",
+        "            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };\n            // The guest's reply must not carry a handle that is now gone.\n            *survivor = VkPipeline::NULL;",
         '            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };',
         '',
     ),
@@ -381,9 +381,9 @@ SABOTAGES = [
     (
         'a sync restore only ever signals, never resets',
         'src/venus/context.rs',
-        """                        (true, false) => self.driver.fast_forward(device, VkSemaphore(0), fence),
+        """                        (true, false) => self.driver.fast_forward(device, VkSemaphore::NULL, fence),
                         (false, true) => self.driver.unsignal_fence(device, fence),""",
-        """                        (true, false) => self.driver.fast_forward(device, VkSemaphore(0), fence),
+        """                        (true, false) => self.driver.fast_forward(device, VkSemaphore::NULL, fence),
                         (false, true) => true,""",
         'a_captured_sync_state_puts_a_rebuilt_world_back_where_it_was',
     ),
@@ -1381,8 +1381,8 @@ SABOTAGES = [
     (
         'a live id handed a different object keeps the first one quietly',
         'src/venus/context.rs',
-        'if host.0 != 0 && (have.ty != ty || have.handle != host) {',
-        'if false && host.0 != 0 && (have.ty != ty || have.handle != host) {',
+        'if host.raw() != 0 && (have.ty != ty || have.handle != host) {',
+        'if false && host.raw() != 0 && (have.ty != ty || have.handle != host) {',
         'an_object_handed_back_again_keeps_its_first_name',
     ),
     (
@@ -1904,6 +1904,27 @@ SABOTAGES = [
         """    n.checked_add(1).unwrap_or(1)""",
         """    n.wrapping_add(1)""",
         'a_surface_label_skips_zero_when_the_count_wraps',
+    ),
+    (
+        'a Vulkan handle can be built from any number by its constructor',
+        'venus-gen/templates/types.rs',
+        """pub struct ${ty.name}(u64);""",
+        """pub struct ${ty.name}(pub u64);""",
+        'venus::cs::Handle',
+    ),
+    (
+        'a Vulkan handle can be made from a number without unsafe',
+        'venus-gen/templates/types.rs',
+        """    pub unsafe fn from_raw(raw: u64) -> Self {""",
+        """    pub fn from_raw(raw: u64) -> Self {""",
+        'venus::cs::Handle',
+    ),
+    (
+        'a host handle can be built from any number, and from_host makes it a handle',
+        'src/venus/cs.rs',
+        """pub struct HostHandle(u64);""",
+        """pub struct HostHandle(pub u64);""",
+        'venus::cs::Handle',
     ),
     (
         'temporaries may be declared past the register space',

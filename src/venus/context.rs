@@ -19,7 +19,7 @@ use crate::ids::{ContextId, ResourceHandle, RingId};
 
 use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
-use super::cs::{Decoded, Guest, HostHandle, ObjectId};
+use super::cs::{Decoded, Guest, HostHandle, ObjectId, guest_face};
 use super::driver::{
     self, Answered, Driver, DriverWait, ExportError, Exported, InFlight, MemoryError, NoSubmit2,
     NoSyncFd, NotATimeline,
@@ -31,7 +31,7 @@ use super::proto::serialize::{COMMAND_TYPES, Commands, vn_command_name, vn_dispa
 use super::proto::types::{
     VkClearRect, VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDevice, VkDeviceMemory,
     VkDeviceSize, VkFence, VkFlags, VkMemoryHeapFlagBits,
-    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType, VkPhysicalDevice,
+    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType,
     VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkResult, VkRingCreateInfoMESA,
     VkRingMonitorInfoMESA, VkSemaphore, vn_command_vkAllocateCommandBuffers,
     vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
@@ -1041,7 +1041,7 @@ impl Context {
                             account.agreed += 1;
                             continue;
                         }
-                        (true, false) => self.driver.fast_forward(device, VkSemaphore(0), fence),
+                        (true, false) => self.driver.fast_forward(device, VkSemaphore::NULL, fence),
                         (false, true) => self.driver.unsignal_fence(device, fence),
                     }
                 }
@@ -1062,7 +1062,7 @@ impl Context {
                     self.driver.raise_timeline(device, sem, e.value)
                 }
                 sync::Kind::Binary => {
-                    self.driver.fast_forward(device, VkSemaphore::from_host(handle), VkFence(0))
+                    self.driver.fast_forward(device, VkSemaphore::from_host(handle), VkFence::NULL)
                 }
             };
             if done {
@@ -2056,7 +2056,7 @@ impl Handlers<'_> {
             return;
         };
         match host {
-            Ok(h) if h.host().0 != 0 => {
+            Ok(h) if h.host().raw() != 0 => {
                 if let Some(shadow) = shadow {
                     *shadow = h;
                 }
@@ -2513,7 +2513,7 @@ impl Commands for Handlers<'_> {
                 // has to be the one the id already holds. One of the guest's names for two host
                 // objects is what the table exists to make impossible, and the C renderer
                 // refuses it the same way.
-                if host.0 != 0 && (have.ty != ty || have.handle != host) {
+                if host.raw() != 0 && (have.ty != ty || have.handle != host) {
                     self.reject("named by a live id an object that id does not name");
                 }
                 return;
@@ -2526,14 +2526,14 @@ impl Commands for Handlers<'_> {
             // is handed back: a created object's handle is the driver's to choose, and Vulkan
             // lets two live non-dispatchable objects share one value.
             if handed_back(ty)
-                && host.0 != 0
+                && host.raw() != 0
                 && objects.id_of_handle(ty, host).is_some_and(|first| first != id)
             {
                 self.reject("named under a second id an object it had already named");
                 return;
             }
         }
-        if host.0 == 0 {
+        if host.raw() == 0 {
             // The fiction, and it goes in as a fiction -- not as an object with the guest's id
             // where a host handle belongs. It is a decode convenience and there is nothing behind
             // it to destroy, so it must not reach the driver: see `objects::Slot::Fiction`.
@@ -3174,9 +3174,8 @@ impl Commands for Handlers<'_> {
             group.edit(|group| {
                 let live = (group.physicalDeviceCount as usize).min(group.physicalDevices.len());
                 for pd in &mut group.physicalDevices[..live] {
-                    let kind = VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE;
-                    match table.id_of_handle(kind, pd.host()) {
-                        Some(id) => *pd = VkPhysicalDevice(id.0),
+                    match guest_face(&*table, *pd) {
+                        Some(named) => *pd = named,
                         None => unknown = true,
                     }
                 }
@@ -5660,7 +5659,7 @@ mod tests {
 
     use super::super::proto::types::{
         VkDevice, VkImageAspectFlags, VkImageCreateFlags, VkImageUsageFlags, VkMemoryPropertyFlags,
-        VkSemaphoreWaitFlags, VkToolPurposeFlags,
+        VkPhysicalDevice, VkSemaphoreWaitFlags, VkToolPurposeFlags,
     };
     use super::*;
 
@@ -5890,7 +5889,7 @@ mod tests {
 
         let mut size = 0usize;
         let mut args = Args::default();
-        args.device = VkDevice(device);
+        args.device = VkDevice::forged(device);
         args.plant_pDataSize(&mut size);
         let proto = crate::venus::cs::AllOfIt;
         let mut buf = vec![0u8; vn_sizeof_vkGetPipelineCacheData_args(&proto, &args)];
@@ -6532,11 +6531,11 @@ mod tests {
         }
 
         unsafe extern "C" fn wait_idle(device: VkDevice) -> VkResult {
-            SAW.with_borrow_mut(|s| s.waited.push(device.0));
+            SAW.with_borrow_mut(|s| s.waited.push(device.raw()));
             SENTINEL
         }
         unsafe extern "C" fn set_event(device: VkDevice, event: VkEvent) -> VkResult {
-            SAW.with_borrow_mut(|s| s.events.push((device.0, event.0)));
+            SAW.with_borrow_mut(|s| s.events.push((device.raw(), event.raw())));
             SENTINEL
         }
         unsafe extern "C" fn reset_pool(
@@ -6544,7 +6543,7 @@ mod tests {
             pool: VkCommandPool,
             flags: VkCommandPoolResetFlags,
         ) -> VkResult {
-            SAW.with_borrow_mut(|s| s.pools.push((pool.0, flags.0)));
+            SAW.with_borrow_mut(|s| s.pools.push((pool.raw(), flags.0)));
             SENTINEL
         }
         unsafe extern "C" fn bind_buffer(
@@ -6553,7 +6552,7 @@ mod tests {
             memory: VkDeviceMemory,
             offset: VkDeviceSize,
         ) -> VkResult {
-            SAW.with_borrow_mut(|s| s.binds.push((buffer.0, memory.0, offset.0)));
+            SAW.with_borrow_mut(|s| s.binds.push((buffer.raw(), memory.raw(), offset.0)));
             SENTINEL
         }
         unsafe extern "C" fn flush(
@@ -6575,7 +6574,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -6601,7 +6600,7 @@ mod tests {
             note: None,
             journal: &mut jrnl,
         };
-        let device = VkDevice(DEVICE);
+        let device = VkDevice::forged(DEVICE);
 
         // An idle wait has no timeout to probe with, so it suspends outright; the driver is asked
         // by whoever runs the wait, and its answer is what the resumed command reports.
@@ -6624,7 +6623,7 @@ mod tests {
         SAW.with_borrow(|s| assert!(s.waited.is_empty(), "and asks the driver nothing again"));
 
         let mut args =
-            vn_command_vkSetEvent { device, event: VkEvent(0x111), ..Default::default() };
+            vn_command_vkSetEvent { device, event: VkEvent::forged(0x111), ..Default::default() };
         h.vkSetEvent(&mut args);
         assert_eq!(args.ret, SENTINEL);
         SAW.with_borrow(|s| assert_eq!(s.events, [(DEVICE, 0x111)], "the event the guest named"));
@@ -6633,7 +6632,7 @@ mod tests {
         // and a wrapper that swapped them would still build.
         let mut args = vn_command_vkResetCommandPool {
             device,
-            commandPool: VkCommandPool(0x222),
+            commandPool: VkCommandPool::forged(0x222),
             flags: VkCommandPoolResetFlags(0x4),
             ..Default::default()
         };
@@ -6644,8 +6643,8 @@ mod tests {
         // Three interchangeable-looking values in a row -- the shape most worth pinning.
         let mut args = vn_command_vkBindBufferMemory {
             device,
-            buffer: VkBuffer(0x333),
-            memory: VkDeviceMemory(0x444),
+            buffer: VkBuffer::forged(0x333),
+            memory: VkDeviceMemory::forged(0x444),
             memoryOffset: VkDeviceSize(0x555),
             ..Default::default()
         };
@@ -6693,7 +6692,7 @@ mod tests {
             static CALLS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
         }
         unsafe extern "C" fn wait_idle(device: VkDevice) -> VkResult {
-            CALLS.with_borrow_mut(|c| c.push(device.0));
+            CALLS.with_borrow_mut(|c| c.push(device.raw()));
             SENTINEL
         }
         /// Teardown destroys what the context created, and the planted table owes it an entry.
@@ -6711,17 +6710,25 @@ mod tests {
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkDeviceWaitIdle(wait_idle);
         fns.plant_vkDestroyDevice(destroy_device);
-        ctx.driver.plant_device(VkDevice(DEVICE), fns);
+        ctx.driver.plant_device(VkDevice::forged(DEVICE), fns);
         ctx.objects
             .borrow_mut()
-            .add(ObjectId(GUEST_ID), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
+            .add(
+                ObjectId(GUEST_ID),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                HostHandle::forged(DEVICE),
+                None,
+            )
             .expect("a fresh id");
 
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire!(
             ser::vn_sizeof_vkDeviceWaitIdle_args,
             ser::vn_encode_vkDeviceWaitIdle_args,
-            ty::vn_command_vkDeviceWaitIdle { device: VkDevice(GUEST_ID), ..Default::default() },
+            ty::vn_command_vkDeviceWaitIdle {
+                device: VkDevice::forged(GUEST_ID),
+                ..Default::default()
+            },
             GENERATE_REPLY
         ));
         // The wait suspends the batch rather than blocking in it; the driver is asked by whoever
@@ -6848,7 +6855,10 @@ mod tests {
                 // SAFETY: as above, now that the count and the two pointers agree.
                 unsafe {
                     (
-                        core::slice::from_raw_parts(i.pSemaphores, n).iter().map(|s| s.0).collect(),
+                        core::slice::from_raw_parts(i.pSemaphores, n)
+                            .iter()
+                            .map(|s| s.raw())
+                            .collect(),
                         core::slice::from_raw_parts(i.pValues, n).to_vec(),
                     )
                 }
@@ -6856,7 +6866,7 @@ mod tests {
             let flags = i.flags.0;
             SAW.with_borrow_mut(|s| {
                 s.waited.push(Wait {
-                    device: device.0,
+                    device: device.raw(),
                     flags,
                     semaphores: sems,
                     values: vals,
@@ -6872,7 +6882,7 @@ mod tests {
             assert!(!info.is_null());
             // SAFETY: as `wait`.
             let i = unsafe { &*info };
-            SAW.with_borrow_mut(|s| s.signalled.push((device.0, i.semaphore.0, i.value)));
+            SAW.with_borrow_mut(|s| s.signalled.push((device.raw(), i.semaphore.raw(), i.value)));
             SENTINEL
         }
         unsafe extern "C" fn counter(
@@ -6883,7 +6893,7 @@ mod tests {
             assert!(!out.is_null(), "the handler refuses a query with nowhere to answer");
             // SAFETY: `out` is the single arena slot the decoder allocated for this out-parameter.
             unsafe { *out = COUNTER };
-            SAW.with_borrow_mut(|s| s.counted.push((device.0, semaphore.0)));
+            SAW.with_borrow_mut(|s| s.counted.push((device.raw(), semaphore.raw())));
             SENTINEL
         }
         /// Teardown drains the device before destroying it, and the planted table owes it both.
@@ -6907,7 +6917,7 @@ mod tests {
         fns.plant_vkSignalSemaphore(signal);
         fns.plant_vkGetSemaphoreCounterValue(counter);
         fns.plant_vkDestroyDevice(destroy_device);
-        ctx.driver.plant_device(VkDevice(DEVICE), fns);
+        ctx.driver.plant_device(VkDevice::forged(DEVICE), fns);
         {
             let mut table = ctx.objects.borrow_mut();
             for (id, host, ty) in [
@@ -6915,24 +6925,24 @@ mod tests {
                 (GUEST_SEM_A, HOST_SEM_A, VkObjectType::VK_OBJECT_TYPE_SEMAPHORE),
                 (GUEST_SEM_B, HOST_SEM_B, VkObjectType::VK_OBJECT_TYPE_SEMAPHORE),
             ] {
-                table.add(ObjectId(id), ty, HostHandle(host), None).expect("a fresh id");
+                table.add(ObjectId(id), ty, HostHandle::forged(host), None).expect("a fresh id");
             }
         }
         // These three commands are undefined on a binary semaphore and are refused for it, so the
         // pair has to be what a create would have recorded -- see `Driver::as_timeline`.
         for sem in [HOST_SEM_A, HOST_SEM_B] {
-            ctx.driver.plant_semaphore(VkSemaphore(sem), driver::SemaphoreKind::Timeline);
+            ctx.driver.plant_semaphore(VkSemaphore::forged(sem), driver::SemaphoreKind::Timeline);
         }
 
         // The counter query goes first so its reply -- the only one carrying a value the driver
         // wrote -- sits at the front of the window, where no other reply's size can move it.
         let mut value = 0u64;
         let mut cv = ty::vn_command_vkGetSemaphoreCounterValue::default();
-        cv.device = VkDevice(GUEST_DEV);
-        cv.semaphore = VkSemaphore(GUEST_SEM_A);
+        cv.device = VkDevice::forged(GUEST_DEV);
+        cv.semaphore = VkSemaphore::forged(GUEST_SEM_A);
         cv.plant_pValue(&mut value);
 
-        let sems = [VkSemaphore(GUEST_SEM_A), VkSemaphore(GUEST_SEM_B)];
+        let sems = [VkSemaphore::forged(GUEST_SEM_A), VkSemaphore::forged(GUEST_SEM_B)];
         let vals = [0x77u64, 0x99u64];
         let info = VkSemaphoreWaitInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
@@ -6944,7 +6954,7 @@ mod tests {
         };
         let signal_info = VkSemaphoreSignalInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
-            semaphore: VkSemaphore(GUEST_SEM_B),
+            semaphore: VkSemaphore::forged(GUEST_SEM_B),
             value: 0xabcd,
             ..Default::default()
         };
@@ -6960,7 +6970,7 @@ mod tests {
             ser::vn_sizeof_vkWaitSemaphores_args,
             ser::vn_encode_vkWaitSemaphores_args,
             ty::vn_command_vkWaitSemaphores {
-                device: VkDevice(GUEST_DEV),
+                device: VkDevice::forged(GUEST_DEV),
                 pWaitInfo: Some(Decoded::planted(&info)),
                 timeout: u64::MAX,
                 ..Default::default()
@@ -6971,7 +6981,7 @@ mod tests {
             ser::vn_sizeof_vkSignalSemaphore_args,
             ser::vn_encode_vkSignalSemaphore_args,
             ty::vn_command_vkSignalSemaphore {
-                device: VkDevice(GUEST_DEV),
+                device: VkDevice::forged(GUEST_DEV),
                 pSignalInfo: Some(Decoded::planted(&signal_info)),
                 ..Default::default()
             },
@@ -7057,14 +7067,14 @@ mod tests {
                 (GUEST_DEV, 3, VkObjectType::VK_OBJECT_TYPE_DEVICE),
                 (GUEST_SEM, 0x901, VkObjectType::VK_OBJECT_TYPE_SEMAPHORE),
             ] {
-                table.add(ObjectId(id), ty, HostHandle(host), None).expect("a fresh id");
+                table.add(ObjectId(id), ty, HostHandle::forged(host), None).expect("a fresh id");
             }
         }
 
         let mut value = 0u64;
         let mut cv = ty::vn_command_vkGetSemaphoreCounterValue::default();
-        cv.device = VkDevice(GUEST_DEV);
-        cv.semaphore = VkSemaphore(GUEST_SEM);
+        cv.device = VkDevice::forged(GUEST_DEV);
+        cv.semaphore = VkSemaphore::forged(GUEST_SEM);
         cv.plant_pValue(&mut value);
 
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
@@ -7128,7 +7138,7 @@ mod tests {
         }
 
         unsafe extern "C" fn status(_d: VkDevice, f: VkFence) -> VkResult {
-            let on = WORLD.with_borrow(|w| w.signalled.contains(&f.0));
+            let on = WORLD.with_borrow(|w| w.signalled.contains(&f.raw()));
             if on { VkResult::VK_SUCCESS } else { VkResult::VK_NOT_READY }
         }
         unsafe extern "C" fn submit(
@@ -7144,7 +7154,7 @@ mod tests {
                 0
             } else {
                 // SAFETY: the count says there is one, and it lives for the call.
-                unsafe { (*info.pSignalSemaphores).0 }
+                unsafe { (*info.pSignalSemaphores).raw() }
             };
             // The guest's work does not complete, and a fast-forward does. That is the whole
             // situation being modelled: the capture happens while a submit is still in flight, so
@@ -7152,9 +7162,9 @@ mod tests {
             // a timeline chain is the guest's here; an empty one is a fast-forward.
             let guest_work = !info.pNext.is_null();
             WORLD.with_borrow_mut(|w| {
-                w.submits.push((q.0, sem, fence.0));
-                if fence.0 != 0 && !guest_work {
-                    w.signalled.push(fence.0);
+                w.submits.push((q.raw(), sem, fence.raw()));
+                if fence.raw() != 0 && !guest_work {
+                    w.signalled.push(fence.raw());
                 }
             });
             VkResult::VK_SUCCESS
@@ -7164,8 +7174,8 @@ mod tests {
             let named = unsafe { core::slice::from_raw_parts(fences, n as usize) };
             WORLD.with_borrow_mut(|w| {
                 for f in named {
-                    w.resets.push(f.0);
-                    w.signalled.retain(|s| *s != f.0);
+                    w.resets.push(f.raw());
+                    w.signalled.retain(|s| *s != f.raw());
                 }
             });
             VkResult::VK_SUCCESS
@@ -7180,7 +7190,7 @@ mod tests {
             // SAFETY: one struct, live for the call.
             let i = unsafe { &*info };
             WORLD.with_borrow_mut(|w| {
-                w.raised.push((i.semaphore.0, i.value));
+                w.raised.push((i.semaphore.raw(), i.value));
                 w.counter = i.value;
             });
             VkResult::VK_SUCCESS
@@ -7226,12 +7236,17 @@ mod tests {
             fns.plant_vkDestroyDevice(destroy_device);
             fns.plant_vkDestroyFence(destroy_fence);
             fns.plant_vkDestroySemaphore(destroy_semaphore);
-            ctx.driver.plant_device(VkDevice(DEVICE), fns);
-            ctx.driver.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
+            ctx.driver.plant_device(VkDevice::forged(DEVICE), fns);
+            ctx.driver.plant_queue(VkDevice::forged(DEVICE), VkQueue::forged(QUEUE));
             {
                 let mut table = ctx.objects.borrow_mut();
                 table
-                    .add(ObjectId(9), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
+                    .add(
+                        ObjectId(9),
+                        VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                        HostHandle::forged(DEVICE),
+                        None,
+                    )
                     .expect("a fresh id");
                 for (id, host, ty) in [
                     (ID_FENCE_UP, FENCE_UP, VkObjectType::VK_OBJECT_TYPE_FENCE),
@@ -7239,11 +7254,14 @@ mod tests {
                     (ID_TIMELINE, TIMELINE, VkObjectType::VK_OBJECT_TYPE_SEMAPHORE),
                     (ID_BINARY, BINARY, VkObjectType::VK_OBJECT_TYPE_SEMAPHORE),
                 ] {
-                    table.add(ObjectId(id), ty, HostHandle(host), Some(ObjectId(9))).unwrap();
+                    table
+                        .add(ObjectId(id), ty, HostHandle::forged(host), Some(ObjectId(9)))
+                        .unwrap();
                 }
             }
-            ctx.driver.plant_semaphore(VkSemaphore(TIMELINE), driver::SemaphoreKind::Timeline);
-            ctx.driver.plant_semaphore(VkSemaphore(BINARY), driver::SemaphoreKind::Binary);
+            ctx.driver
+                .plant_semaphore(VkSemaphore::forged(TIMELINE), driver::SemaphoreKind::Timeline);
+            ctx.driver.plant_semaphore(VkSemaphore::forged(BINARY), driver::SemaphoreKind::Binary);
             ctx
         }
 
@@ -7255,7 +7273,7 @@ mod tests {
         // -- the fence polls unsignalled and the counter is still 5 -- and that is exactly the
         // state the C's capture would record and lose.
         let values = [9u64];
-        let sems = [VkSemaphore(TIMELINE)];
+        let sems = [VkSemaphore::forged(TIMELINE)];
         let timeline_info = super::super::proto::types::VkTimelineSemaphoreSubmitInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
             signalSemaphoreValueCount: 1,
@@ -7270,9 +7288,9 @@ mod tests {
             ..Default::default()
         };
         captured_from.driver_mut().queue_submit(
-            VkQueue(QUEUE),
+            VkQueue::forged(QUEUE),
             Decoded::planted(&[work] as &[_]),
-            VkFence(FENCE_UP),
+            VkFence::forged(FENCE_UP),
         );
 
         let blob = captured_from.sync_export();
@@ -7376,7 +7394,7 @@ mod tests {
         ) -> VkResult {
             assert!(!info.is_null() && !out.is_null());
             // SAFETY: the single arena slot the decoder allocated for this out-parameter.
-            unsafe { *out = VkSemaphore(HOST_SEM) };
+            unsafe { *out = VkSemaphore::forged(HOST_SEM) };
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn destroy_semaphore(
@@ -7412,7 +7430,7 @@ mod tests {
             VkResult::VK_SUCCESS
         }
 
-        let sems = [VkSemaphore(GUEST_SEM)];
+        let sems = [VkSemaphore::forged(GUEST_SEM)];
         let vals = [0x77u64];
         let wait = VkSemaphoreWaitInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
@@ -7423,15 +7441,15 @@ mod tests {
         };
         let signal = VkSemaphoreSignalInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
-            semaphore: VkSemaphore(GUEST_SEM),
+            semaphore: VkSemaphore::forged(GUEST_SEM),
             value: 0xabcd,
             ..Default::default()
         };
 
         let mut value = 0u64;
         let mut cv = ty::vn_command_vkGetSemaphoreCounterValue::default();
-        cv.device = VkDevice(GUEST_DEV);
-        cv.semaphore = VkSemaphore(GUEST_SEM);
+        cv.device = VkDevice::forged(GUEST_DEV);
+        cv.semaphore = VkSemaphore::forged(GUEST_SEM);
         cv.plant_pValue(&mut value);
 
         let commands: Vec<(&str, Vec<u8>)> = vec![
@@ -7450,7 +7468,7 @@ mod tests {
                     ser::vn_sizeof_vkWaitSemaphores_args,
                     ser::vn_encode_vkWaitSemaphores_args,
                     ty::vn_command_vkWaitSemaphores {
-                        device: VkDevice(GUEST_DEV),
+                        device: VkDevice::forged(GUEST_DEV),
                         pWaitInfo: Some(Decoded::planted(&wait)),
                         timeout: u64::MAX,
                         ..Default::default()
@@ -7464,7 +7482,7 @@ mod tests {
                     ser::vn_sizeof_vkSignalSemaphore_args,
                     ser::vn_encode_vkSignalSemaphore_args,
                     ty::vn_command_vkSignalSemaphore {
-                        device: VkDevice(GUEST_DEV),
+                        device: VkDevice::forged(GUEST_DEV),
                         pSignalInfo: Some(Decoded::planted(&signal)),
                         ..Default::default()
                     },
@@ -7491,14 +7509,14 @@ mod tests {
                 fns.plant_vkGetSemaphoreCounterValue(counter);
                 fns.plant_vkWaitSemaphores(wait_sems);
                 fns.plant_vkSignalSemaphore(signal_sem);
-                ctx.driver.plant_device(VkDevice(DEVICE), fns);
+                ctx.driver.plant_device(VkDevice::forged(DEVICE), fns);
                 {
                     let mut table = ctx.objects.borrow_mut();
                     table
                         .add(
                             ObjectId(GUEST_DEV),
                             VkObjectType::VK_OBJECT_TYPE_DEVICE,
-                            HostHandle(DEVICE),
+                            HostHandle::forged(DEVICE),
                             None,
                         )
                         .expect("a fresh id");
@@ -7522,9 +7540,9 @@ mod tests {
                     },
                     ..Default::default()
                 };
-                let mut id = VkSemaphore(GUEST_SEM);
+                let mut id = VkSemaphore::forged(GUEST_SEM);
                 let mut made = ty::vn_command_vkCreateSemaphore::default();
-                made.device = VkDevice(GUEST_DEV);
+                made.device = VkDevice::forged(GUEST_DEV);
                 made.pCreateInfo = Some(Decoded::planted(&info));
                 made.plant_pSemaphore(&mut id);
 
@@ -7641,8 +7659,8 @@ mod tests {
                 let s = (*sub).imageSubresource;
                 SAW.with_borrow_mut(|v| {
                     v.push(Asked {
-                        device: device.0,
-                        image: image.0,
+                        device: device.raw(),
+                        image: image.raw(),
                         aspect: s.aspectMask.0,
                         mip: s.mipLevel,
                         layer: s.arrayLayer,
@@ -7669,14 +7687,14 @@ mod tests {
         fns.plant_vkGetImageSubresourceLayout2(layout);
         fns.plant_vkDeviceWaitIdle(idle);
         fns.plant_vkDestroyDevice(destroy_device);
-        ctx.driver.plant_device(VkDevice(DEVICE), fns);
+        ctx.driver.plant_device(VkDevice::forged(DEVICE), fns);
         {
             let mut table = ctx.objects.borrow_mut();
             for (id, host, ty) in [
                 (GUEST_DEV, DEVICE, VkObjectType::VK_OBJECT_TYPE_DEVICE),
                 (GUEST_IMG, HOST_IMG, VkObjectType::VK_OBJECT_TYPE_IMAGE),
             ] {
-                table.add(ObjectId(id), ty, HostHandle(host), None).expect("a fresh id");
+                table.add(ObjectId(id), ty, HostHandle::forged(host), None).expect("a fresh id");
             }
         }
 
@@ -7691,8 +7709,8 @@ mod tests {
         };
         let mut layout_out = VkSubresourceLayout2::default();
         let mut q = ty::vn_command_vkGetImageSubresourceLayout2::default();
-        q.device = VkDevice(GUEST_DEV);
-        q.image = VkImage(GUEST_IMG);
+        q.device = VkDevice::forged(GUEST_DEV);
+        q.image = VkImage::forged(GUEST_IMG);
         q.pSubresource = Some(Decoded::planted(&sub));
         q.plant_pLayout(&mut layout_out);
 
@@ -7789,11 +7807,16 @@ mod tests {
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkDeviceWaitIdle(idle);
         fns.plant_vkDestroyDevice(destroy_device);
-        ctx.driver.plant_device(VkDevice(DEVICE), fns);
-        ctx.driver.plant_memory_types(VkDevice(DEVICE), &TYPES);
+        ctx.driver.plant_device(VkDevice::forged(DEVICE), fns);
+        ctx.driver.plant_memory_types(VkDevice::forged(DEVICE), &TYPES);
         ctx.objects
             .borrow_mut()
-            .add(ObjectId(GUEST_DEV), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
+            .add(
+                ObjectId(GUEST_DEV),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                HostHandle::forged(DEVICE),
+                None,
+            )
             .expect("a fresh id");
 
         /// The out-struct as the guest chains it: the base, and the size struct behind it.
@@ -7815,7 +7838,7 @@ mod tests {
         let (mut props, mut size) = asked();
         props.pNext = (&mut size) as *mut _ as *mut core::ffi::c_void;
         let mut q = ty::vn_command_vkGetMemoryResourcePropertiesMESA::default();
-        q.device = VkDevice(GUEST_DEV);
+        q.device = VkDevice::forged(GUEST_DEV);
         q.resourceId = RING_RES.get();
         q.plant_pMemoryResourceProperties(&mut props);
 
@@ -7850,7 +7873,7 @@ mod tests {
         let (mut props, mut size) = asked();
         props.pNext = (&mut size) as *mut _ as *mut core::ffi::c_void;
         let mut q = ty::vn_command_vkGetMemoryResourcePropertiesMESA::default();
-        q.device = VkDevice(GUEST_DEV);
+        q.device = VkDevice::forged(GUEST_DEV);
         q.resourceId = RING_RES.get() + 1;
         q.plant_pMemoryResourceProperties(&mut props);
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x200));
@@ -7931,7 +7954,7 @@ mod tests {
         }
 
         let mut args = Cmd::default();
-        args.device = VkDevice(GUEST_DEV);
+        args.device = VkDevice::forged(GUEST_DEV);
         args.resourceId = RING_RES.get();
         assert!(run!(&mut args).is_some(), "a query with nowhere to answer is refused");
 
@@ -7939,7 +7962,7 @@ mod tests {
         // with VK_SUCCESS on it, which is the fiction this family exists to refuse.
         let mut props = VkMemoryResourcePropertiesMESA::default();
         let mut args = Cmd::default();
-        args.device = VkDevice(GUEST_DEV);
+        args.device = VkDevice::forged(GUEST_DEV);
         args.resourceId = RING_RES.get();
         args.plant_pMemoryResourceProperties(&mut props);
         assert!(run!(&mut args).is_some(), "a device with no table behind it is refused");
@@ -8126,7 +8149,7 @@ mod tests {
 
         // A recording command, which has no reply at all to carry a refusal.
         let mut args = vn_command_vkCmdBeginRenderPass {
-            commandBuffer: VkCommandBuffer(0x9001),
+            commandBuffer: VkCommandBuffer::forged(0x9001),
             ..Default::default()
         };
         assert_eq!(run!(|h: &mut Handlers| h.vkCmdBeginRenderPass(&mut args)), Some(MISSING));
@@ -8146,7 +8169,7 @@ mod tests {
             vn_command_vkGetPhysicalDeviceQueueFamilyProperties as Cmd,
         };
 
-        const PD: VkPhysicalDevice = VkPhysicalDevice(0x711);
+        const PD: VkPhysicalDevice = VkPhysicalDevice::forged(0x711);
         /// More families than the guest will make room for, so a short answer is a real one.
         const FAMILIES: u32 = 3;
 
@@ -8271,7 +8294,7 @@ mod tests {
             vn_command_vkGetPhysicalDeviceToolProperties as Cmd,
         };
 
-        const PD: VkPhysicalDevice = VkPhysicalDevice(0x711);
+        const PD: VkPhysicalDevice = VkPhysicalDevice::forged(0x711);
         const TOOLS: u32 = 2;
 
         unsafe extern "C" fn tools(
@@ -8476,7 +8499,7 @@ mod tests {
             assert!(!out.is_null(), "the handler refuses a probe with nowhere to answer");
             SAW.with_borrow_mut(|v| {
                 v.push(Probe {
-                    pd: pd.0,
+                    pd: pd.raw(),
                     format: format.0,
                     ty: ty.0,
                     tiling: tiling.0,
@@ -8506,7 +8529,7 @@ mod tests {
             .add(
                 ObjectId(GUEST_PD),
                 VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE,
-                HostHandle(HOST_PD),
+                HostHandle::forged(HOST_PD),
                 None,
             )
             .expect("a fresh id");
@@ -8514,7 +8537,7 @@ mod tests {
         // Six values, no two alike, so a pair passed in the wrong order cannot look right.
         let mut props = VkImageFormatProperties::default();
         let mut q = ty::vn_command_vkGetPhysicalDeviceImageFormatProperties::default();
-        q.physicalDevice = VkPhysicalDevice(GUEST_PD);
+        q.physicalDevice = VkPhysicalDevice::forged(GUEST_PD);
         q.format = VkFormat(37);
         q.r#type = VkImageType(1);
         q.tiling = VkImageTiling(2);
@@ -8584,7 +8607,7 @@ mod tests {
             out: *mut VkMemoryRequirements,
         ) {
             assert!(!out.is_null());
-            SAW.with_borrow_mut(|s| s.buffers.push(buffer.0));
+            SAW.with_borrow_mut(|s| s.buffers.push(buffer.raw()));
         }
         unsafe extern "C" fn image_reqs(
             _d: VkDevice,
@@ -8592,7 +8615,7 @@ mod tests {
             out: *mut VkMemoryRequirements,
         ) {
             assert!(!out.is_null());
-            SAW.with_borrow_mut(|s| s.images.push(image.0));
+            SAW.with_borrow_mut(|s| s.images.push(image.raw()));
         }
         unsafe extern "C" fn peers(
             _d: VkDevice,
@@ -8620,7 +8643,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -8646,21 +8669,21 @@ mod tests {
             note: None,
             journal: &mut jrnl,
         };
-        let device = VkDevice(DEVICE);
+        let device = VkDevice::forged(DEVICE);
 
         // Buffer and image requirements have identical shapes and adjacent entry points; each has
         // to reach its own.
         let mut reqs = VkMemoryRequirements::default();
         let mut args = vn_command_vkGetBufferMemoryRequirements::default();
         args.device = device;
-        args.buffer = VkBuffer(0x111);
+        args.buffer = VkBuffer::forged(0x111);
         args.plant_pMemoryRequirements(&mut reqs);
         h.vkGetBufferMemoryRequirements(&mut args);
 
         let mut reqs = VkMemoryRequirements::default();
         let mut args = vn_command_vkGetImageMemoryRequirements::default();
         args.device = device;
-        args.image = VkImage(0x222);
+        args.image = VkImage::forged(0x222);
         args.plant_pMemoryRequirements(&mut reqs);
         h.vkGetImageMemoryRequirements(&mut args);
 
@@ -9789,7 +9812,7 @@ mod tests {
         ) -> VkResult {
             ASKED.with(|n| n.set(n.get() + 1));
             // SAFETY: the caller's local.
-            unsafe { *out = VkDeviceMemory(0x9000) };
+            unsafe { *out = VkDeviceMemory::forged(0x9000) };
             VkResult::VK_SUCCESS
         }
 
@@ -9809,9 +9832,9 @@ mod tests {
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkAllocateMemory(allocate);
         fns.plant_vkFreeMemory(free);
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         // Not host-visible, so nothing is padded and the cap is measured in the guest's numbers.
-        driver.plant_memory_types(VkDevice(DEVICE), &[VkMemoryPropertyFlags(0)]);
+        driver.plant_memory_types(VkDevice::forged(DEVICE), &[VkMemoryPropertyFlags(0)]);
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
@@ -9843,9 +9866,9 @@ mod tests {
             memoryTypeIndex: 0,
         };
 
-        let mut first_out = VkDeviceMemory(0x6001);
+        let mut first_out = VkDeviceMemory::forged(0x6001);
         let mut first = Alloc::default();
-        first.device = VkDevice(DEVICE);
+        first.device = VkDevice::forged(DEVICE);
         first.pAllocateInfo = Some(Decoded::planted(&info));
         first.plant_pMemory(&mut first_out);
         h.vkAllocateMemory(&mut first);
@@ -9853,9 +9876,9 @@ mod tests {
         assert_eq!(first.ret, VkResult::VK_SUCCESS);
         assert_eq!(ASKED.with(Cell::get), 1);
 
-        let mut second_out = VkDeviceMemory(0x6002);
+        let mut second_out = VkDeviceMemory::forged(0x6002);
         let mut second = Alloc::default();
-        second.device = VkDevice(DEVICE);
+        second.device = VkDevice::forged(DEVICE);
         second.pAllocateInfo = Some(Decoded::planted(&info));
         second.plant_pMemory(&mut second_out);
         h.vkAllocateMemory(&mut second);
@@ -10029,7 +10052,7 @@ mod tests {
             let handle = FIRST + CREATES.with_borrow(|c| c.len() as u64);
             CREATES.with_borrow_mut(|c| c.push(handle));
             // SAFETY: the renderer passes `out` pointing at a fence it owns, as Vulkan's contract.
-            unsafe { *out = VkFence(handle) };
+            unsafe { *out = VkFence::forged(handle) };
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn destroy_fence(
@@ -10057,13 +10080,13 @@ mod tests {
         fns.plant_vkDestroyFence(destroy_fence);
         fns.plant_vkDeviceWaitIdle(wait_idle);
         fns.plant_vkDestroyDevice(destroy_device);
-        ctx.driver.plant_device(VkDevice(DEVICE), fns);
+        ctx.driver.plant_device(VkDevice::forged(DEVICE), fns);
         ctx.objects
             .borrow_mut()
             .add(
                 ObjectId(GUEST_DEVICE),
                 VkObjectType::VK_OBJECT_TYPE_DEVICE,
-                HostHandle(DEVICE),
+                HostHandle::forged(DEVICE),
                 None,
             )
             .expect("a fresh id");
@@ -10085,7 +10108,7 @@ mod tests {
         CREATES.with_borrow(|c| assert_eq!(c.len(), 1, "the driver was asked once: {c:x?}"));
         assert_eq!(
             ctx.objects.lookup(ObjectId(FENCE), VkObjectType::VK_OBJECT_TYPE_FENCE.0),
-            Lookup::Found(HostHandle(FIRST)),
+            Lookup::Found(HostHandle::forged(FIRST)),
             "the id still names the object it named first"
         );
     }
@@ -10104,7 +10127,7 @@ mod tests {
         // SAFETY: `out` has room for `room` elements, which the count just said.
         let out = unsafe { core::slice::from_raw_parts_mut(out, room) };
         for (e, h) in out.iter_mut().zip(HANDED) {
-            *e = super::super::proto::types::VkPhysicalDevice(h);
+            *e = super::super::proto::types::VkPhysicalDevice::forged(h);
         }
         VkResult::VK_SUCCESS
     }
@@ -10160,7 +10183,7 @@ mod tests {
             .add(
                 ObjectId(INSTANCE),
                 VkObjectType::VK_OBJECT_TYPE_INSTANCE,
-                HostHandle(INSTANCE),
+                HostHandle::forged(INSTANCE),
                 None,
             )
             .unwrap();
@@ -10203,7 +10226,7 @@ mod tests {
         for (id, host) in IDS.iter().zip(HANDED) {
             assert_eq!(
                 objects.lookup(ObjectId(*id), PD.0),
-                Lookup::Found(HostHandle(host)),
+                Lookup::Found(HostHandle::forged(host)),
                 "id {id} holds the handle it was first given"
             );
         }
@@ -10222,7 +10245,7 @@ mod tests {
         for (id, host) in IDS.iter().zip(HANDED) {
             assert_eq!(
                 objects.lookup(ObjectId(*id), PD.0),
-                Lookup::Found(HostHandle(host)),
+                Lookup::Found(HostHandle::forged(host)),
                 "and id {id} still holds what it held"
             );
         }
@@ -10252,7 +10275,7 @@ mod tests {
             .add(
                 ObjectId(INSTANCE),
                 VkObjectType::VK_OBJECT_TYPE_INSTANCE,
-                HostHandle(INSTANCE),
+                HostHandle::forged(INSTANCE),
                 None,
             )
             .unwrap();
@@ -10305,7 +10328,7 @@ mod tests {
         for (id, host) in IDS.iter().zip(HANDED) {
             assert_eq!(
                 objects.lookup(ObjectId(*id), PD.0),
-                Lookup::Found(HostHandle(host)),
+                Lookup::Found(HostHandle::forged(host)),
                 "id {id} still holds the handle it was first given"
             );
         }
@@ -10333,7 +10356,7 @@ mod tests {
             out: *mut VkQueue,
         ) {
             // SAFETY: the driver wrapper passes its own local.
-            unsafe { *out = VkQueue(QUEUE) };
+            unsafe { *out = VkQueue::forged(QUEUE) };
         }
 
         fn ask(h: &mut dyn Commands, objects: &Shared, id: u64) {
@@ -10364,14 +10387,14 @@ mod tests {
             .add(
                 ObjectId(GUEST_DEVICE),
                 VkObjectType::VK_OBJECT_TYPE_DEVICE,
-                HostHandle(DEVICE),
+                HostHandle::forged(DEVICE),
                 None,
             )
             .unwrap();
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkGetDeviceQueue2(get_queue);
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -10403,13 +10426,13 @@ mod tests {
         assert!(h.rejected().is_none(), "the first ask is served");
         ask(&mut h, &objects, ID);
         assert!(h.rejected().is_none(), "asking again is how a guest works, not a repeat create");
-        assert_eq!(objects.lookup(ObjectId(ID), Q.0), Lookup::Found(HostHandle(QUEUE)));
+        assert_eq!(objects.lookup(ObjectId(ID), Q.0), Lookup::Found(HostHandle::forged(QUEUE)));
         assert_eq!(objects.borrow().of_type(Q).count(), 1, "one queue, asked for twice");
 
         ask(&mut h, &objects, AGAIN);
         assert!(h.take_rejected().is_some(), "a second name for the same queue is refused");
         assert_eq!(objects.lookup(ObjectId(AGAIN), Q.0), Lookup::Missing, "and names nothing");
-        assert_eq!(objects.lookup(ObjectId(ID), Q.0), Lookup::Found(HostHandle(QUEUE)));
+        assert_eq!(objects.lookup(ObjectId(ID), Q.0), Lookup::Found(HostHandle::forged(QUEUE)));
 
         h.driver.abandon_planted();
     }
@@ -10470,7 +10493,7 @@ mod tests {
             vn_command_vkGetPhysicalDeviceFeatures2,
         };
 
-        const PD: VkPhysicalDevice = VkPhysicalDevice(0x9001);
+        const PD: VkPhysicalDevice = VkPhysicalDevice::forged(0x9001);
 
         /// A driver that answers through the chain, which is what a real one does.
         unsafe extern "C" fn features(pd: VkPhysicalDevice, out: *mut VkPhysicalDeviceFeatures2) {
@@ -10906,7 +10929,7 @@ mod tests {
             vn_command_vkEnumeratePhysicalDeviceGroups as Cmd,
         };
 
-        const INSTANCE: VkInstance = VkInstance(0x5000);
+        const INSTANCE: VkInstance = VkInstance::forged(0x5000);
         const HOSTS: [u64; 2] = [0xfeed_0001, 0xfeed_0002];
         const IDS: [u64; 2] = [11, 12];
 
@@ -10924,8 +10947,8 @@ mod tests {
             // SAFETY: `count` is the length the caller sized the array to.
             let out = unsafe { core::slice::from_raw_parts_mut(out, *count as usize) };
             out[0].physicalDeviceCount = 2;
-            out[0].physicalDevices[0] = VkPhysicalDevice(HOSTS[0]);
-            out[0].physicalDevices[1] = VkPhysicalDevice(HOSTS[1]);
+            out[0].physicalDevices[0] = VkPhysicalDevice::forged(HOSTS[0]);
+            out[0].physicalDevices[1] = VkPhysicalDevice::forged(HOSTS[1]);
             *count = 1;
             VkResult::VK_SUCCESS
         }
@@ -10937,7 +10960,7 @@ mod tests {
                 .add(
                     ObjectId(*id),
                     VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE,
-                    HostHandle(host),
+                    HostHandle::forged(host),
                     None,
                 )
                 .unwrap();
@@ -10984,7 +11007,7 @@ mod tests {
         assert!(h.rejected().is_none());
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         assert_eq!(
-            [props[0].physicalDevices[0].0, props[0].physicalDevices[1].0],
+            [props[0].physicalDevices[0].raw(), props[0].physicalDevices[1].raw()],
             IDS,
             "the guest reads back the ids it chose, not the handles the driver returned"
         );
@@ -11043,7 +11066,7 @@ mod tests {
         use super::super::proto::info;
         use super::super::proto::types::{VkExtensionProperties, VkPhysicalDevice};
 
-        const PD: VkPhysicalDevice = VkPhysicalDevice(7);
+        const PD: VkPhysicalDevice = VkPhysicalDevice::forged(7);
 
         // What a driver hands back: two the protocol knows, two it does not.
         let mut driver = Driver::new(Account::for_test(None));
@@ -11081,7 +11104,7 @@ mod tests {
         assert_ne!(advertised[0].specVersion, 0);
 
         // A physical device nobody enumerated has nothing to say, rather than a panic.
-        assert!(driver.advertised_extensions(VkPhysicalDevice(999)).is_empty());
+        assert!(driver.advertised_extensions(VkPhysicalDevice::forged(999)).is_empty());
         let _ = VkExtensionProperties::default();
 
         driver.abandon_planted();
@@ -11097,7 +11120,7 @@ mod tests {
     fn a_device_whose_extensions_could_not_be_read_is_not_a_device_with_none() {
         use super::super::proto::types::{VkExtensionProperties, VkPhysicalDevice};
 
-        const PD: VkPhysicalDevice = VkPhysicalDevice(7);
+        const PD: VkPhysicalDevice = VkPhysicalDevice::forged(7);
 
         unsafe extern "C" fn refuse(
             _pd: VkPhysicalDevice,
@@ -11138,14 +11161,14 @@ mod tests {
         };
 
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_extensions(VkPhysicalDevice(1), &["VK_KHR_external_memory_fd"]);
+        driver.plant_extensions(VkPhysicalDevice::forged(1), &["VK_KHR_external_memory_fd"]);
         let objects = Shared::new();
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
 
         let mut n = 0u32;
         let mut args = Cmd::default();
-        args.physicalDevice = VkPhysicalDevice(1);
+        args.physicalDevice = VkPhysicalDevice::forged(1);
         args.plant_pPropertyCount(&mut n);
         args.plant_pLayerName(c"VK_LAYER_KHRONOS_validation");
 
@@ -11191,7 +11214,7 @@ mod tests {
             vn_command_vkGetPhysicalDeviceQueueFamilyProperties2 as Cmd,
         };
 
-        const PD: VkPhysicalDevice = VkPhysicalDevice(0x33);
+        const PD: VkPhysicalDevice = VkPhysicalDevice::forged(0x33);
         const FAMILIES: u32 = 3;
 
         unsafe extern "C" fn families(
@@ -11308,7 +11331,7 @@ mod tests {
             vn_command_vkGetImageDrmFormatModifierPropertiesEXT,
         };
 
-        const DEVICE: VkDevice = VkDevice(0x700);
+        const DEVICE: VkDevice = VkDevice::forged(0x700);
 
         // A device whose table has no `VK_EXT_image_drm_format_modifier` in it.
         let mut driver = Driver::new(Account::for_test(None));
@@ -11317,7 +11340,7 @@ mod tests {
         let mut props = VkImageDrmFormatModifierPropertiesEXT::default();
         let mut args = vn_command_vkGetImageDrmFormatModifierPropertiesEXT::default();
         args.device = DEVICE;
-        args.image = VkImage(1);
+        args.image = VkImage::forged(1);
         args.plant_pProperties(&mut props);
 
         let objects = Shared::new();
@@ -11480,7 +11503,7 @@ mod tests {
 
             fn vkCreateFence(&mut self, args: &mut vn_command_vkCreateFence<'_>) {
                 let out = args.handle_pFence_mut().expect("the decoder owes a place to write");
-                *out = VkFence(HOST);
+                *out = VkFence::forged(HOST);
             }
 
             fn object_created(
@@ -11512,7 +11535,7 @@ mod tests {
         let objects = Shared::new();
         objects
             .borrow_mut()
-            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(1), None)
+            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle::forged(1), None)
             .unwrap();
         let mut h = Driver { objects: &objects };
 
@@ -11532,7 +11555,7 @@ mod tests {
         // Registered under the guest's id, holding the driver's handle. Neither half swapped.
         assert_eq!(
             objects.lookup(ObjectId(FENCE), VkObjectType::VK_OBJECT_TYPE_FENCE.0),
-            Lookup::Found(HostHandle(HOST))
+            Lookup::Found(HostHandle::forged(HOST))
         );
         assert_eq!(
             objects.lookup(ObjectId(HOST), VkObjectType::VK_OBJECT_TYPE_FENCE.0),
@@ -11574,7 +11597,7 @@ mod tests {
             .add(
                 ObjectId(PHYSICAL_DEVICE),
                 VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE,
-                HostHandle(PHYSICAL_DEVICE),
+                HostHandle::forged(PHYSICAL_DEVICE),
                 None,
             )
             .unwrap();
@@ -11661,7 +11684,7 @@ mod tests {
             .add(
                 ObjectId(INSTANCE),
                 VkObjectType::VK_OBJECT_TYPE_INSTANCE,
-                HostHandle(INSTANCE),
+                HostHandle::forged(INSTANCE),
                 None,
             )
             .unwrap();
@@ -11766,7 +11789,7 @@ mod tests {
             // SAFETY: `out` has room for `room` elements, which the count just said.
             let out = unsafe { core::slice::from_raw_parts_mut(out, room) };
             for (e, h) in out.iter_mut().zip(HOST) {
-                *e = VkPhysicalDevice(h);
+                *e = VkPhysicalDevice::forged(h);
             }
             // Fewer than asked for: the driver has two, and says so.
             unsafe { *n = HOST.len() as u32 };
@@ -11782,7 +11805,7 @@ mod tests {
             // SAFETY: both are the caller's locals, and the array is null on the count query.
             unsafe {
                 if props.is_null() {
-                    LEARNED.with_borrow_mut(|l| l.push(pd.0));
+                    LEARNED.with_borrow_mut(|l| l.push(pd.raw()));
                     *n = 0;
                 } else {
                     *n = 0;
@@ -11797,7 +11820,7 @@ mod tests {
             .add(
                 ObjectId(INSTANCE),
                 VkObjectType::VK_OBJECT_TYPE_INSTANCE,
-                HostHandle(INSTANCE),
+                HostHandle::forged(INSTANCE),
                 None,
             )
             .unwrap();
@@ -11856,7 +11879,7 @@ mod tests {
         for (id, host) in IDS.iter().zip(HOST) {
             assert_eq!(
                 objects.lookup(ObjectId(*id), VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE.0),
-                Lookup::Found(HostHandle(host)),
+                Lookup::Found(HostHandle::forged(host)),
                 "id {id} holds the handle from its own slot"
             );
         }
@@ -11884,10 +11907,11 @@ mod tests {
         // for instead would have it walk two devices' worth of handles plus whatever the third
         // slot was left holding -- while every other assertion above still passed.
         let mut n = IDS.len() as u32;
-        let mut wire: [VkPhysicalDevice; 3] = core::array::from_fn(|i| VkPhysicalDevice(IDS[i]));
-        let mut shadow = [VkPhysicalDevice(0); 3];
+        let mut wire: [VkPhysicalDevice; 3] =
+            core::array::from_fn(|i| VkPhysicalDevice::forged(IDS[i]));
+        let mut shadow = [VkPhysicalDevice::forged(0); 3];
         let mut args = vn_command_vkEnumeratePhysicalDevices::default();
-        args.instance = VkInstance(INSTANCE);
+        args.instance = VkInstance::forged(INSTANCE);
         args.plant_pPhysicalDeviceCount(&mut n);
         args.plant_pPhysicalDevices(&mut wire);
         args.plant_handle_pPhysicalDevices(&mut shadow);
@@ -11898,7 +11922,7 @@ mod tests {
             "the guest is told how many it got, not how many it asked for"
         );
         assert_eq!(
-            shadow.map(|p| p.0),
+            shadow.map(|p| p.raw()),
             [HOST[0], HOST[1], 0],
             "and the slots past that answer are left as they were"
         );
@@ -11958,7 +11982,7 @@ mod tests {
             // A real create that succeeds returns a handle, and `Driver::create_object` asserts
             // it -- a null one here would be testing that assert rather than the refusal.
             // SAFETY: the caller's local.
-            unsafe { *out = VkShaderModule(0x5000) };
+            unsafe { *out = VkShaderModule::forged(0x5000) };
             VkResult::VK_SUCCESS
         }
 
@@ -11979,11 +12003,11 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(POOL),
-            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
 
         let todo = Unimplemented::default();
@@ -12016,7 +12040,7 @@ mod tests {
         // null pointer with a non-zero size, and pushing whatever the layout last held would hand
         // the next draw constants the guest never sent -- so the answer is not an empty push.
         let mut args = vn_command_vkCmdPushConstants::default();
-        args.commandBuffer = VkCommandBuffer(CB.0);
+        args.commandBuffer = VkCommandBuffer::forged(CB.0);
         args.plant_size(16);
         h.vkCmdPushConstants(&mut args);
         assert!(h.rejected().is_some(), "sixteen bytes of nothing is not a push");
@@ -12027,7 +12051,7 @@ mod tests {
         // end of what the guest sent.
         let info = VkShaderModuleCreateInfo { codeSize: 7, ..Default::default() };
         let mut args = vn_command_vkCreateShaderModule::default();
-        args.device = VkDevice(DEVICE);
+        args.device = VkDevice::forged(DEVICE);
         args.pCreateInfo = Some(Decoded::planted(&info));
         h.vkCreateShaderModule(&mut args);
         assert!(h.rejected().is_some(), "seven bytes is not a whole number of words");
@@ -12037,7 +12061,7 @@ mod tests {
         // there is no entry point to call -- and inventing a success would tell the guest work it
         // is waiting on has been queued.
         let mut args = vn_command_vkQueueSubmit::default();
-        args.queue = VkQueue(0xdead);
+        args.queue = VkQueue::forged(0xdead);
         let submits: [VkSubmitInfo; 0] = [];
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit(&mut args);
@@ -12052,14 +12076,14 @@ mod tests {
         // hold just as well against a handler that refuses everything.
         let values = [1u8, 2, 3, 4];
         let mut args = vn_command_vkCmdPushConstants::default();
-        args.commandBuffer = VkCommandBuffer(CB.0);
+        args.commandBuffer = VkCommandBuffer::forged(CB.0);
         args.plant_pValues(&values);
         h.vkCmdPushConstants(&mut args);
         assert!(h.rejected().is_none());
 
         let info = VkShaderModuleCreateInfo { codeSize: 8, ..Default::default() };
         let mut args = vn_command_vkCreateShaderModule::default();
-        args.device = VkDevice(DEVICE);
+        args.device = VkDevice::forged(DEVICE);
         args.pCreateInfo = Some(Decoded::planted(&info));
         h.vkCreateShaderModule(&mut args);
         assert!(h.rejected().is_none());
@@ -12125,7 +12149,9 @@ mod tests {
         ) -> VkResult {
             // SAFETY: the wrapper passes the slice's own pointer and length.
             let srcs = unsafe { core::slice::from_raw_parts(srcs, n as usize) };
-            SAW.with_borrow_mut(|w| w.merged.push((dst.0, srcs.iter().map(|c| c.0).collect())));
+            SAW.with_borrow_mut(|w| {
+                w.merged.push((dst.raw(), srcs.iter().map(|c| c.raw()).collect()))
+            });
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn conversion(
@@ -12136,7 +12162,7 @@ mod tests {
         ) -> VkResult {
             SAW.with_borrow_mut(|w| w.conversions += 1);
             // SAFETY: the caller's local.
-            unsafe { *out = VkSamplerYcbcrConversion(0x9c) };
+            unsafe { *out = VkSamplerYcbcrConversion::forged(0x9c) };
             VkResult::VK_SUCCESS
         }
 
@@ -12147,7 +12173,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -12179,8 +12205,8 @@ mod tests {
         let mut size = 0usize;
         {
             let mut args = vn_command_vkGetPipelineCacheData::default();
-            args.device = VkDevice(DEVICE);
-            args.pipelineCache = VkPipelineCache(CACHE);
+            args.device = VkDevice::forged(DEVICE);
+            args.pipelineCache = VkPipelineCache::forged(CACHE);
             args.plant_pDataSize(&mut size);
             h.vkGetPipelineCacheData(&mut args);
             assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
@@ -12195,8 +12221,8 @@ mod tests {
         let mut size = short.len();
         {
             let mut args = vn_command_vkGetPipelineCacheData::default();
-            args.device = VkDevice(DEVICE);
-            args.pipelineCache = VkPipelineCache(CACHE);
+            args.device = VkDevice::forged(DEVICE);
+            args.pipelineCache = VkPipelineCache::forged(CACHE);
             args.plant_pDataSize(&mut size);
             args.plant_pData(&mut short);
             h.vkGetPipelineCacheData(&mut args);
@@ -12210,8 +12236,8 @@ mod tests {
         let mut size = full.len();
         {
             let mut args = vn_command_vkGetPipelineCacheData::default();
-            args.device = VkDevice(DEVICE);
-            args.pipelineCache = VkPipelineCache(CACHE);
+            args.device = VkDevice::forged(DEVICE);
+            args.pipelineCache = VkPipelineCache::forged(CACHE);
             args.plant_pDataSize(&mut size);
             args.plant_pData(&mut full);
             h.vkGetPipelineCacheData(&mut args);
@@ -12221,10 +12247,10 @@ mod tests {
         assert_eq!(full[..5], BLOB);
 
         // Merge: every source, under the destination.
-        let srcs = [VkPipelineCache(0x501), VkPipelineCache(0x502)];
+        let srcs = [VkPipelineCache::forged(0x501), VkPipelineCache::forged(0x502)];
         let mut args = vn_command_vkMergePipelineCaches::default();
-        args.device = VkDevice(DEVICE);
-        args.dstCache = VkPipelineCache(CACHE);
+        args.device = VkDevice::forged(DEVICE);
+        args.dstCache = VkPipelineCache::forged(CACHE);
         args.plant_pSrcCaches(&srcs);
         h.vkMergePipelineCaches(&mut args);
         assert!(h.rejected().is_none());
@@ -12233,18 +12259,22 @@ mod tests {
 
         // A YCbCr conversion is a plain create: the driver's handle lands in the shadow.
         let info = VkSamplerYcbcrConversionCreateInfo::default();
-        let mut wire = VkSamplerYcbcrConversion(77);
-        let mut shadow = VkSamplerYcbcrConversion(0);
+        let mut wire = VkSamplerYcbcrConversion::forged(77);
+        let mut shadow = VkSamplerYcbcrConversion::forged(0);
         let mut args = vn_command_vkCreateSamplerYcbcrConversion::default();
-        args.device = VkDevice(DEVICE);
+        args.device = VkDevice::forged(DEVICE);
         args.pCreateInfo = Some(Decoded::planted(&info));
         args.plant_pYcbcrConversion(&mut wire);
         args.plant_handle_pYcbcrConversion(&mut shadow);
         h.vkCreateSamplerYcbcrConversion(&mut args);
         assert!(h.rejected().is_none());
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
-        assert_eq!(shadow, VkSamplerYcbcrConversion(0x9c));
-        assert_eq!(wire, VkSamplerYcbcrConversion(77), "the guest's id on the wire is left alone");
+        assert_eq!(shadow, VkSamplerYcbcrConversion::forged(0x9c));
+        assert_eq!(
+            wire,
+            VkSamplerYcbcrConversion::forged(77),
+            "the guest's id on the wire is left alone"
+        );
         SAW.with_borrow(|w| assert_eq!(w.conversions, 1));
 
         h.driver.abandon_planted();
@@ -12281,7 +12311,7 @@ mod tests {
         ) -> VkResult {
             // SAFETY: the wrapper passes the slice's own pointer and length.
             let sets = unsafe { core::slice::from_raw_parts(sets, n as usize) };
-            SAW.with_borrow_mut(|w| w.push((pool.0, sets.iter().map(|s| s.0).collect())));
+            SAW.with_borrow_mut(|w| w.push((pool.raw(), sets.iter().map(|s| s.raw()).collect())));
             VkResult::VK_SUCCESS
         }
 
@@ -12290,13 +12320,13 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkDescriptorPool(POOL),
+            VkDevice::forged(DEVICE),
+            VkDescriptorPool::forged(POOL),
             &[
-                (VkDescriptorSet(SETS[0].0), ObjectId(SETS[0].1)),
-                (VkDescriptorSet(SETS[1].0), ObjectId(SETS[1].1)),
+                (VkDescriptorSet::forged(SETS[0].0), ObjectId(SETS[0].1)),
+                (VkDescriptorSet::forged(SETS[1].0), ObjectId(SETS[1].1)),
             ],
         );
 
@@ -12327,10 +12357,10 @@ mod tests {
         };
 
         // Only the first: GTK frees a set at a time, and the second has to survive it.
-        let one = [VkDescriptorSet(SETS[0].0)];
+        let one = [VkDescriptorSet::forged(SETS[0].0)];
         let mut args = vn_command_vkFreeDescriptorSets::default();
-        args.device = VkDevice(DEVICE);
-        args.descriptorPool = VkDescriptorPool(POOL);
+        args.device = VkDevice::forged(DEVICE);
+        args.descriptorPool = VkDescriptorPool::forged(POOL);
         args.plant_pDescriptorSets(&one);
         h.vkFreeDescriptorSets(&mut args);
         assert!(
@@ -12341,12 +12371,14 @@ mod tests {
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         SAW.with_borrow(|w| assert_eq!(w, &[(POOL, vec![SETS[0].0])], "that set, under its pool"));
         assert_eq!(
-            h.driver.pool_child_id(VkDescriptorPool(POOL), VkDescriptorSet(SETS[0].0)),
+            h.driver
+                .pool_child_id(VkDescriptorPool::forged(POOL), VkDescriptorSet::forged(SETS[0].0)),
             None,
             "the pool no longer holds what was freed"
         );
         assert_eq!(
-            h.driver.pool_child_id(VkDescriptorPool(POOL), VkDescriptorSet(SETS[1].0)),
+            h.driver
+                .pool_child_id(VkDescriptorPool::forged(POOL), VkDescriptorSet::forged(SETS[1].0)),
             Some(ObjectId(SETS[1].1)),
             "and still holds what was not"
         );
@@ -12354,8 +12386,8 @@ mod tests {
         // Freeing nothing is not a failure, and does not reach the driver.
         let none: [VkDescriptorSet; 0] = [];
         let mut args = vn_command_vkFreeDescriptorSets::default();
-        args.device = VkDevice(DEVICE);
-        args.descriptorPool = VkDescriptorPool(POOL);
+        args.device = VkDevice::forged(DEVICE);
+        args.descriptorPool = VkDescriptorPool::forged(POOL);
         args.plant_pDescriptorSets(&none);
         h.vkFreeDescriptorSets(&mut args);
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
@@ -12365,25 +12397,26 @@ mod tests {
         // pair: the driver would free it from the wrong pool, and the pool that holds it would
         // go on holding a handle the driver has reused.
         const OTHER: u64 = 8;
-        h.driver.plant_pool(VkDevice(DEVICE), VkDescriptorPool(OTHER), &[]);
-        let two = [VkDescriptorSet(SETS[1].0)];
+        h.driver.plant_pool(VkDevice::forged(DEVICE), VkDescriptorPool::forged(OTHER), &[]);
+        let two = [VkDescriptorSet::forged(SETS[1].0)];
         let mut args = vn_command_vkFreeDescriptorSets::default();
-        args.device = VkDevice(DEVICE);
-        args.descriptorPool = VkDescriptorPool(OTHER);
+        args.device = VkDevice::forged(DEVICE);
+        args.descriptorPool = VkDescriptorPool::forged(OTHER);
         args.plant_pDescriptorSets(&two);
         h.vkFreeDescriptorSets(&mut args);
         assert!(h.take_rejected().is_some(), "a run that is not the pool's is refused");
         SAW.with_borrow(|w| assert_eq!(w.len(), 1, "and never reached the driver"));
         assert_eq!(
-            h.driver.pool_child_id(VkDescriptorPool(POOL), VkDescriptorSet(SETS[1].0)),
+            h.driver
+                .pool_child_id(VkDescriptorPool::forged(POOL), VkDescriptorSet::forged(SETS[1].0)),
             Some(ObjectId(SETS[1].1)),
             "its own pool still holds it"
         );
 
         // So is a set freed twice: the second time it is nobody's.
         let mut args = vn_command_vkFreeDescriptorSets::default();
-        args.device = VkDevice(DEVICE);
-        args.descriptorPool = VkDescriptorPool(POOL);
+        args.device = VkDevice::forged(DEVICE);
+        args.descriptorPool = VkDescriptorPool::forged(POOL);
         args.plant_pDescriptorSets(&one);
         h.vkFreeDescriptorSets(&mut args);
         assert!(h.take_rejected().is_some(), "a set already freed is not the pool's to free again");
@@ -12452,7 +12485,7 @@ mod tests {
                 )
             };
             SAW.with_borrow_mut(|w| {
-                w.bound.push((first, s.iter().map(|h| h.0).collect(), o.to_vec()))
+                w.bound.push((first, s.iter().map(|h| h.raw()).collect(), o.to_vec()))
             });
         }
 
@@ -12472,7 +12505,7 @@ mod tests {
             _submits: *const VkSubmitInfo,
             fence: VkFence,
         ) -> VkResult {
-            SAW.with_borrow_mut(|w| w.submitted.push((n, fence.0)));
+            SAW.with_borrow_mut(|w| w.submitted.push((n, fence.raw())));
             VkResult::VK_SUCCESS
         }
 
@@ -12497,13 +12530,13 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(POOL),
-            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
-        driver.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
+        driver.plant_queue(VkDevice::forged(DEVICE), VkQueue::forged(QUEUE));
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -12530,11 +12563,11 @@ mod tests {
             note: None,
             journal: &mut jrnl,
         };
-        let cb = VkCommandBuffer(CB.0);
+        let cb = VkCommandBuffer::forged(CB.0);
 
         // Two sets, three dynamic offsets. A layout with no dynamic descriptors legitimately
         // binds none of the second, so the two counts are genuinely independent.
-        let sets = [VkDescriptorSet(0x300), VkDescriptorSet(0x400)];
+        let sets = [VkDescriptorSet::forged(0x300), VkDescriptorSet::forged(0x400)];
         let offsets = [16u32, 32, 48];
         let mut args = vn_command_vkCmdBindDescriptorSets::default();
         args.commandBuffer = cb;
@@ -12551,7 +12584,7 @@ mod tests {
         let writes = [VkWriteDescriptorSet::default(); 3];
         let copies = [VkCopyDescriptorSet::default(); 1];
         let mut args = vn_command_vkUpdateDescriptorSets::default();
-        args.device = VkDevice(DEVICE);
+        args.device = VkDevice::forged(DEVICE);
         args.plant_pDescriptorWrites(&writes);
         args.plant_pDescriptorCopies(&copies);
         h.vkUpdateDescriptorSets(&mut args);
@@ -12572,8 +12605,8 @@ mod tests {
         // No work at all, which is how a guest signals a fence. It has to reach the driver.
         let submits: [VkSubmitInfo; 0] = [];
         let mut args = vn_command_vkQueueSubmit::default();
-        args.queue = VkQueue(QUEUE);
-        args.fence = VkFence(0x77);
+        args.queue = VkQueue::forged(QUEUE);
+        args.fence = VkFence::forged(0x77);
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit(&mut args);
         assert!(h.rejected().is_none(), "an empty submit is a fence signal, not a botched command");
@@ -12630,7 +12663,7 @@ mod tests {
             // SAFETY: the wrapper passes its slice's own pointer and length.
             let out = unsafe { core::slice::from_raw_parts_mut(out, n as usize) };
             for (e, h) in out.iter_mut().zip(MADE) {
-                *e = VkPipeline(h);
+                *e = VkPipeline::forged(h);
             }
             VkResult::VK_ERROR_INVALID_SHADER_NV
         }
@@ -12640,7 +12673,7 @@ mod tests {
             pipeline: VkPipeline,
             _alloc: *const VkAllocationCallbacks,
         ) {
-            DESTROYED.with_borrow_mut(|d| d.push(pipeline.0));
+            DESTROYED.with_borrow_mut(|d| d.push(pipeline.raw()));
         }
 
         let mut fns = crate::vulkan::Device::default();
@@ -12649,7 +12682,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -12678,10 +12711,10 @@ mod tests {
         };
 
         let infos = [VkGraphicsPipelineCreateInfo::default(); 3];
-        let mut wire: [VkPipeline; 3] = core::array::from_fn(|i| VkPipeline(IDS[i]));
-        let mut shadow = [VkPipeline(0); 3];
+        let mut wire: [VkPipeline; 3] = core::array::from_fn(|i| VkPipeline::forged(IDS[i]));
+        let mut shadow = [VkPipeline::forged(0); 3];
         let mut args = vn_command_vkCreateGraphicsPipelines::default();
-        args.device = VkDevice(DEVICE);
+        args.device = VkDevice::forged(DEVICE);
         args.plant_pCreateInfos(&infos);
         args.plant_pPipelines(&mut wire);
         args.plant_handle_pPipelines(&mut shadow);
@@ -12705,7 +12738,7 @@ mod tests {
             );
         });
         assert_eq!(
-            shadow.map(|p| p.0),
+            shadow.map(|p| p.raw()),
             [0, 0, 0],
             "and no destroyed handle is left in the reply's shadow"
         );
@@ -12737,7 +12770,12 @@ mod tests {
         let objects = Shared::new();
         objects
             .borrow_mut()
-            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
+            .add(
+                ObjectId(DEVICE),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                HostHandle::forged(DEVICE),
+                None,
+            )
             .unwrap();
 
         // The object table has the device; the driver does not. That is exactly the split the
@@ -12967,12 +13005,17 @@ mod tests {
         let objects = Shared::new();
         {
             let mut t = objects.borrow_mut();
-            t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(1), None)
-                .unwrap();
+            t.add(
+                ObjectId(DEVICE),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                HostHandle::forged(1),
+                None,
+            )
+            .unwrap();
             t.add(
                 ObjectId(BUFFER),
                 VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER,
-                HostHandle(2),
+                HostHandle::forged(2),
                 Some(ObjectId(DEVICE)),
             )
             .unwrap();
@@ -13034,8 +13077,8 @@ mod tests {
         // There is no device, so the driver refuses the whole run -- which is the only way to
         // reach the refusal path without a driver that fails on demand.
         let infos = [VkGraphicsPipelineCreateInfo::default(); IDS.len()];
-        let mut ids = IDS.map(VkPipeline);
-        let mut shadow = [VkPipeline(0); IDS.len()];
+        let mut ids = IDS.map(VkPipeline::forged);
+        let mut shadow = [VkPipeline::forged(0); IDS.len()];
         let mut args = vn_command_vkCreateGraphicsPipelines::default();
         args.plant_pCreateInfos(&infos);
         args.plant_pPipelines(&mut ids);
@@ -13094,14 +13137,14 @@ mod tests {
             // SAFETY: the wrapper passes the shadow slice's own pointer and length.
             let outs = unsafe { core::slice::from_raw_parts_mut(out, count as usize) };
             for (slot, host) in outs.iter_mut().zip(HOST) {
-                *slot = VkPipeline(host);
+                *slot = VkPipeline::forged(host);
             }
-            SAW.with_borrow_mut(|s| s.runs.push((count, cache.0)));
+            SAW.with_borrow_mut(|s| s.runs.push((count, cache.raw())));
             VkResult::VK_SUCCESS
         }
 
         unsafe extern "C" fn dispatch(cb: VkCommandBuffer, x: u32, y: u32, z: u32) {
-            SAW.with_borrow_mut(|s| s.dispatches.push((cb.0, x, y, z)));
+            SAW.with_borrow_mut(|s| s.dispatches.push((cb.raw(), x, y, z)));
         }
 
         let mut fns = crate::vulkan::Device::default();
@@ -13110,11 +13153,11 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(POOL),
-            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
 
         let todo = Unimplemented::default();
@@ -13144,11 +13187,11 @@ mod tests {
         };
 
         let infos = [VkComputePipelineCreateInfo::default(); IDS.len()];
-        let mut wire = IDS.map(VkPipeline);
-        let mut shadow = [VkPipeline(0); IDS.len()];
+        let mut wire = IDS.map(VkPipeline::forged);
+        let mut shadow = [VkPipeline::forged(0); IDS.len()];
         let mut args = vn_command_vkCreateComputePipelines::default();
-        args.device = VkDevice(DEVICE);
-        args.pipelineCache = VkPipelineCache(CACHE);
+        args.device = VkDevice::forged(DEVICE);
+        args.pipelineCache = VkPipelineCache::forged(CACHE);
         args.plant_pCreateInfos(&infos);
         args.plant_pPipelines(&mut wire);
         args.plant_handle_pPipelines(&mut shadow);
@@ -13159,13 +13202,13 @@ mod tests {
         SAW.with_borrow(|s| {
             assert_eq!(s.runs, vec![(IDS.len() as u32, CACHE)], "one run, the guest's own cache");
         });
-        assert_eq!(shadow.map(|p| p.0), HOST, "the driver's handles land in the shadow");
-        assert_eq!(wire.map(|p| p.0), IDS, "and the guest's ids are left alone");
+        assert_eq!(shadow.map(|p| p.raw()), HOST, "the driver's handles land in the shadow");
+        assert_eq!(wire.map(|p| p.raw()), IDS, "and the guest's ids are left alone");
 
         // Group counts in three separate arguments: a wrapper that reordered them would still
         // record a dispatch, and every count-based oracle would read the same.
         let mut args = vn_command_vkCmdDispatch {
-            commandBuffer: VkCommandBuffer(CB.0),
+            commandBuffer: VkCommandBuffer::forged(CB.0),
             groupCountX: 5,
             groupCountY: 6,
             groupCountZ: 7,
@@ -13200,7 +13243,12 @@ mod tests {
         let objects = Shared::new();
         objects
             .borrow_mut()
-            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(0x9000), None)
+            .add(
+                ObjectId(DEVICE),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                HostHandle::forged(0x9000),
+                None,
+            )
             .expect("a device for it to hang off");
 
         let mut driver = Driver::new(Account::for_test(None));
@@ -13235,16 +13283,16 @@ mod tests {
         h.object_created(
             VkObjectType::VK_OBJECT_TYPE_PIPELINE,
             ObjectId(PIPELINE),
-            HostHandle(0),
+            HostHandle::forged(0),
             Some(ObjectId(DEVICE)),
         );
 
         // The fiction still does its one job: a later command naming the id decodes, against the
-        // id itself. Naming it as another kind of object does not.
+        // id itself, which the decoder makes of it. Naming it as another kind of object does not.
         let table = objects.borrow();
         assert_eq!(
             table.lookup(ObjectId(PIPELINE), VkObjectType::VK_OBJECT_TYPE_PIPELINE.0),
-            Lookup::Found(HostHandle(PIPELINE)),
+            Lookup::Fiction,
             "the rest of the stream still decodes"
         );
         assert_eq!(
@@ -13284,8 +13332,8 @@ mod tests {
 
         const DEVICE: u64 = 3;
         const POOL: u64 = 40;
-        const HOST_POOL: VkQueryPool = VkQueryPool(0x50);
-        const CB: VkCommandBuffer = VkCommandBuffer(0x30);
+        const HOST_POOL: VkQueryPool = VkQueryPool::forged(0x50);
+        const CB: VkCommandBuffer = VkCommandBuffer::forged(0x30);
 
         thread_local! {
             static READS: RefCell<u32> = const { RefCell::new(0) };
@@ -13334,7 +13382,7 @@ mod tests {
             stride: VkDeviceSize,
             flags: VkQueryResultFlags,
         ) {
-            saw("copy", first.into(), count.into(), buffer.0);
+            saw("copy", first.into(), count.into(), buffer.raw());
             saw("copy'", offset.0, stride.0, flags.0.into());
         }
         unsafe extern "C" fn create(
@@ -13387,11 +13435,20 @@ mod tests {
         let objects = Shared::new();
         objects
             .borrow_mut()
-            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
+            .add(
+                ObjectId(DEVICE),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                HostHandle::forged(DEVICE),
+                None,
+            )
             .unwrap();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
-        driver.plant_pool(VkDevice(DEVICE), VkCommandPool(0x20), &[(CB, ObjectId(9))]);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(0x20),
+            &[(CB, ObjectId(9))],
+        );
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -13417,7 +13474,7 @@ mod tests {
             note: None,
             journal: &mut jrnl,
         };
-        let device = VkDevice(DEVICE);
+        let device = VkDevice::forged(DEVICE);
 
         /// A read of `count` 32-bit results from the start of the pool, four bytes apart.
         fn read<'a>(device: VkDevice, count: u32) -> vn_command_vkGetQueryPoolResults<'a> {
@@ -13435,8 +13492,8 @@ mod tests {
             queryCount: 2,
             ..Default::default()
         };
-        let mut id = VkQueryPool(POOL);
-        let mut shadow = VkQueryPool(0);
+        let mut id = VkQueryPool::forged(POOL);
+        let mut shadow = VkQueryPool::forged(0);
         let mut args = vn_command_vkCreateQueryPool::default();
         args.device = device;
         args.pCreateInfo = Some(Decoded::planted(&info));
@@ -13511,7 +13568,7 @@ mod tests {
             queryPool: HOST_POOL,
             firstQuery: 1,
             queryCount: 1,
-            dstBuffer: VkBuffer(0x60),
+            dstBuffer: VkBuffer::forged(0x60),
             dstOffset: VkDeviceSize(0x70),
             stride: VkDeviceSize(0x80),
             flags: VkQueryResultFlags(0x1),
@@ -13649,8 +13706,8 @@ mod tests {
         };
         // What the decoder hands a handler: the guest's chosen ids in the wire member, and a
         // parallel run of zeroed shadows for the host handles that are never going to arrive.
-        let mut asked = IDS.map(VkCommandBuffer);
-        let mut shadow = [VkCommandBuffer(0); IDS.len()];
+        let mut asked = IDS.map(VkCommandBuffer::forged);
+        let mut shadow = [VkCommandBuffer::forged(0); IDS.len()];
         // The count is `pAllocateInfo`'s, so the planters set only the pointers -- which is the
         // shape the decoder leaves too.
         let mut args = vn_command_vkAllocateCommandBuffers::default();
@@ -13740,12 +13797,17 @@ mod tests {
         let objects = Shared::new();
         {
             let mut t = objects.borrow_mut();
-            t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(1), None)
-                .unwrap();
+            t.add(
+                ObjectId(DEVICE),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                HostHandle::forged(1),
+                None,
+            )
+            .unwrap();
             t.add(
                 ObjectId(POOL),
                 VkObjectType::VK_OBJECT_TYPE_COMMAND_POOL,
-                HostHandle(2),
+                HostHandle::forged(2),
                 Some(ObjectId(DEVICE)),
             )
             .unwrap();
@@ -13753,7 +13815,7 @@ mod tests {
                 t.add(
                     ObjectId(*id),
                     VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER,
-                    HostHandle(100 + i as u64),
+                    HostHandle::forged(100 + i as u64),
                     Some(ObjectId(DEVICE)),
                 )
                 .unwrap();
@@ -13804,17 +13866,17 @@ mod tests {
         {
             let mut t = objects.borrow_mut();
             for (host, id) in BUFFERS {
-                t.add(ObjectId(id), COMMAND_BUFFER, HostHandle(host), None).unwrap();
+                t.add(ObjectId(id), COMMAND_BUFFER, HostHandle::forged(host), None).unwrap();
             }
         }
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(POOL),
-            &BUFFERS.map(|(host, id)| (VkCommandBuffer(host), ObjectId(id))),
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &BUFFERS.map(|(host, id)| (VkCommandBuffer::forged(host), ObjectId(id))),
         );
         assert_eq!(
             objects.lookup(ObjectId(BUFFERS[0].1), COMMAND_BUFFER.0),
-            Lookup::Found(HostHandle(11))
+            Lookup::Found(HostHandle::forged(11))
         );
 
         let todo = Unimplemented::default();
@@ -13846,8 +13908,8 @@ mod tests {
         // keyed by. There is no device registered, so the driver call is skipped -- the object
         // table is what is under test.
         let mut args = vn_command_vkDestroyCommandPool {
-            device: VkDevice(DEVICE),
-            commandPool: VkCommandPool(POOL),
+            device: VkDevice::forged(DEVICE),
+            commandPool: VkCommandPool::forged(POOL),
             ..Default::default()
         };
         h.vkDestroyCommandPool(&mut args);
@@ -13897,23 +13959,23 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         {
             let mut t = objects.borrow_mut();
             for (host, id) in SETS.iter().copied().chain([SURVIVOR]) {
-                t.add(ObjectId(id), SET, HostHandle(host), None).unwrap();
+                t.add(ObjectId(id), SET, HostHandle::forged(host), None).unwrap();
             }
         }
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkDescriptorPool(POOL),
-            &SETS.map(|(host, id)| (VkDescriptorSet(host), ObjectId(id))),
+            VkDevice::forged(DEVICE),
+            VkDescriptorPool::forged(POOL),
+            &SETS.map(|(host, id)| (VkDescriptorSet::forged(host), ObjectId(id))),
         );
         // A second pool, so the reset is shown to take its own sets and not simply everything.
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkDescriptorPool(OTHER_POOL),
-            &[(VkDescriptorSet(SURVIVOR.0), ObjectId(SURVIVOR.1))],
+            VkDevice::forged(DEVICE),
+            VkDescriptorPool::forged(OTHER_POOL),
+            &[(VkDescriptorSet::forged(SURVIVOR.0), ObjectId(SURVIVOR.1))],
         );
 
         let todo = Unimplemented::default();
@@ -13943,8 +14005,8 @@ mod tests {
         };
 
         let mut args = vn_command_vkResetDescriptorPool {
-            device: VkDevice(DEVICE),
-            descriptorPool: VkDescriptorPool(POOL),
+            device: VkDevice::forged(DEVICE),
+            descriptorPool: VkDescriptorPool::forged(POOL),
             ..Default::default()
         };
         h.vkResetDescriptorPool(&mut args);
@@ -13959,13 +14021,16 @@ mod tests {
         }
         assert_eq!(
             objects.lookup(ObjectId(SURVIVOR.1), SET.0),
-            Lookup::Found(HostHandle(SURVIVOR.0)),
+            Lookup::Found(HostHandle::forged(SURVIVOR.0)),
             "another pool's sets are untouched"
         );
 
         // The pool itself survives a reset, which is the whole difference from a destroy: it must
         // still be open to allocate from.
-        assert!(driver.pool_is_open(VkDescriptorPool(POOL)), "a reset pool goes on taking sets");
+        assert!(
+            driver.pool_is_open(VkDescriptorPool::forged(POOL)),
+            "a reset pool goes on taking sets"
+        );
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
         driver.abandon_planted();
@@ -14002,7 +14067,7 @@ mod tests {
             t.add(
                 ObjectId(1),
                 VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY,
-                HostHandle(0x1000),
+                HostHandle::forged(0x1000),
                 None,
             )
             .expect("add");
@@ -14065,23 +14130,23 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         {
             let mut t = objects.borrow_mut();
             for (host, id) in MINE.iter().copied().chain([THEIRS]) {
-                t.add(ObjectId(id), CB, HostHandle(host), None).unwrap();
+                t.add(ObjectId(id), CB, HostHandle::forged(host), None).unwrap();
             }
         }
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(POOL),
-            &MINE.map(|(host, id)| (VkCommandBuffer(host), ObjectId(id))),
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &MINE.map(|(host, id)| (VkCommandBuffer::forged(host), ObjectId(id))),
         );
         // A second pool, so the reset is shown to name its own buffers and not simply everything.
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(OTHER_POOL),
-            &[(VkCommandBuffer(THEIRS.0), ObjectId(THEIRS.1))],
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(OTHER_POOL),
+            &[(VkCommandBuffer::forged(THEIRS.0), ObjectId(THEIRS.1))],
         );
         let want: Vec<ObjectKey> = {
             let t = objects.borrow();
@@ -14115,8 +14180,8 @@ mod tests {
         };
 
         let mut args = vn_command_vkResetCommandPool {
-            device: VkDevice(DEVICE),
-            commandPool: VkCommandPool(POOL),
+            device: VkDevice::forged(DEVICE),
+            commandPool: VkCommandPool::forged(POOL),
             ..Default::default()
         };
         h.vkResetCommandPool(&mut args);
@@ -14132,7 +14197,7 @@ mod tests {
         for (host, id) in MINE {
             assert_eq!(
                 objects.lookup(ObjectId(id), CB.0),
-                Lookup::Found(HostHandle(host)),
+                Lookup::Found(HostHandle::forged(host)),
                 "buffer {id} is still named after a reset"
             );
         }
@@ -14183,20 +14248,20 @@ mod tests {
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn fence(_d: VkDevice, h: VkFence, _a: *const VkAllocationCallbacks) {
-            saw("fence", h.0);
+            saw("fence", h.raw());
         }
         unsafe extern "C" fn image(_d: VkDevice, h: VkImage, _a: *const VkAllocationCallbacks) {
-            saw("image", h.0);
+            saw("image", h.raw());
         }
         unsafe extern "C" fn pool(
             _d: VkDevice,
             h: VkCommandPool,
             _a: *const VkAllocationCallbacks,
         ) {
-            saw("pool", h.0);
+            saw("pool", h.raw());
         }
         unsafe extern "C" fn device(h: VkDevice, _a: *const VkAllocationCallbacks) {
-            saw("device", h.0);
+            saw("device", h.raw());
         }
 
         let mut fns = crate::vulkan::Device::default();
@@ -14208,30 +14273,35 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         {
             let mut t = objects.borrow_mut();
-            t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
-                .unwrap();
+            t.add(
+                ObjectId(DEVICE),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                HostHandle::forged(DEVICE),
+                None,
+            )
+            .unwrap();
             let under = Some(ObjectId(DEVICE));
             t.add(
                 ObjectId(FENCE.0),
                 VkObjectType::VK_OBJECT_TYPE_FENCE,
-                HostHandle(FENCE.1),
+                HostHandle::forged(FENCE.1),
                 under,
             )
             .unwrap();
             t.add(
                 ObjectId(IMAGE.0),
                 VkObjectType::VK_OBJECT_TYPE_IMAGE,
-                HostHandle(IMAGE.1),
+                HostHandle::forged(IMAGE.1),
                 under,
             )
             .unwrap();
             t.add(
                 ObjectId(POOL.0),
                 VkObjectType::VK_OBJECT_TYPE_COMMAND_POOL,
-                HostHandle(POOL.1),
+                HostHandle::forged(POOL.1),
                 under,
             )
             .unwrap();
@@ -14313,10 +14383,10 @@ mod tests {
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn fence(_d: VkDevice, h: VkFence, _a: *const VkAllocationCallbacks) {
-            saw("fence", h.0);
+            saw("fence", h.raw());
         }
         unsafe extern "C" fn device(h: VkDevice, _a: *const VkAllocationCallbacks) {
-            saw("device", h.0);
+            saw("device", h.raw());
         }
 
         let mut fns = crate::vulkan::Device::default();
@@ -14329,15 +14399,20 @@ mod tests {
             &Budget::with_cap(None, false),
             String::new(),
         );
-        ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
+        ctx.driver_mut().plant_device(VkDevice::forged(DEVICE), fns);
         {
             let mut t = ctx.objects().borrow_mut();
-            t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
-                .unwrap();
+            t.add(
+                ObjectId(DEVICE),
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                HostHandle::forged(DEVICE),
+                None,
+            )
+            .unwrap();
             t.add(
                 ObjectId(FENCE.0),
                 VkObjectType::VK_OBJECT_TYPE_FENCE,
-                HostHandle(FENCE.1),
+                HostHandle::forged(FENCE.1),
                 Some(ObjectId(DEVICE)),
             )
             .unwrap();
@@ -14377,25 +14452,26 @@ mod tests {
             t.add(
                 ObjectId(INSTANCE),
                 VkObjectType::VK_OBJECT_TYPE_INSTANCE,
-                HostHandle(INSTANCE),
+                HostHandle::forged(INSTANCE),
                 None,
             )
             .unwrap();
             t.add(
                 ObjectId(PHYSICAL_DEVICE),
                 VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE,
-                HostHandle(PHYSICAL_DEVICE),
+                HostHandle::forged(PHYSICAL_DEVICE),
                 Some(ObjectId(INSTANCE)),
             )
             .unwrap();
             t.add(
                 ObjectId(DEVICE),
                 VkObjectType::VK_OBJECT_TYPE_DEVICE,
-                HostHandle(DEVICE),
+                HostHandle::forged(DEVICE),
                 Some(ObjectId(PHYSICAL_DEVICE)),
             )
             .unwrap();
-            t.add(ObjectId(FENCE), FENCE_TY, HostHandle(0xfeed), Some(ObjectId(DEVICE))).unwrap();
+            t.add(ObjectId(FENCE), FENCE_TY, HostHandle::forged(0xfeed), Some(ObjectId(DEVICE)))
+                .unwrap();
         }
 
         let todo = Unimplemented::default();
@@ -14475,16 +14551,21 @@ mod tests {
             t.add(
                 ObjectId(DEVICE_A),
                 VkObjectType::VK_OBJECT_TYPE_DEVICE,
-                HostHandle(DEVICE_A),
+                HostHandle::forged(DEVICE_A),
                 None,
             )
             .unwrap();
-            t.add(ObjectId(FENCE_ID), FENCE, HostHandle(FENCE_HOST), Some(ObjectId(DEVICE_A)))
-                .unwrap();
+            t.add(
+                ObjectId(FENCE_ID),
+                FENCE,
+                HostHandle::forged(FENCE_HOST),
+                Some(ObjectId(DEVICE_A)),
+            )
+            .unwrap();
         }
         assert_eq!(
             objects.lookup(ObjectId(FENCE_ID), FENCE.0),
-            Lookup::Found(HostHandle(FENCE_HOST))
+            Lookup::Found(HostHandle::forged(FENCE_HOST))
         );
 
         let todo = Unimplemented::default();
@@ -14604,7 +14685,7 @@ mod tests {
             SAW.with_borrow_mut(|s| {
                 s.vertex_buffers.push((
                     first,
-                    b.iter().map(|h| h.0).collect(),
+                    b.iter().map(|h| h.raw()).collect(),
                     o.iter().map(|v| v.0).collect(),
                 ))
             });
@@ -14642,11 +14723,11 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(POOL),
-            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
 
         let todo = Unimplemented::default();
@@ -14674,7 +14755,7 @@ mod tests {
             note: None,
             journal: &mut jrnl,
         };
-        let cb = VkCommandBuffer(CB.0);
+        let cb = VkCommandBuffer::forged(CB.0);
 
         // One counted array: three viewports, and a first-index that is not zero so that a
         // wrapper passing the count where the index goes cannot pass unnoticed.
@@ -14691,7 +14772,7 @@ mod tests {
         });
 
         // Two arrays under one count: they have to arrive the same length and stay paired.
-        let buffers = [VkBuffer(0x100), VkBuffer(0x200)];
+        let buffers = [VkBuffer::forged(0x100), VkBuffer::forged(0x200)];
         let offsets = [VkDeviceSize(64), VkDeviceSize(128)];
         let mut args = vn_command_vkCmdBindVertexBuffers::default();
         args.commandBuffer = cb;
@@ -14732,7 +14813,7 @@ mod tests {
         // And a command buffer the driver has no device for stops the ring rather than being
         // recorded into nothing.
         let mut args = vn_command_vkCmdSetViewport::default();
-        args.commandBuffer = VkCommandBuffer(0xdead);
+        args.commandBuffer = VkCommandBuffer::forged(0xdead);
         args.plant_pViewports(&vps);
         h.vkCmdSetViewport(&mut args);
         assert!(h.rejected().is_some(), "there is no device to record into");
@@ -14909,11 +14990,11 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(POOL),
-            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
 
         let todo = Unimplemented::default();
@@ -14950,7 +15031,7 @@ mod tests {
             });
         let vertex_offset = 9i32;
         let mut args = vn_command_vkCmdDrawMultiIndexedEXT::default();
-        args.commandBuffer = VkCommandBuffer(CB.0);
+        args.commandBuffer = VkCommandBuffer::forged(CB.0);
         args.instanceCount = 1;
         args.stride = GUEST_STRIDE;
         args.pVertexOffset = Some(&vertex_offset);
@@ -15043,7 +15124,7 @@ mod tests {
             SAW.with_borrow_mut(|s| {
                 s.bind2.push((
                     first,
-                    b.iter().map(|h| h.0).collect(),
+                    b.iter().map(|h| h.raw()).collect(),
                     o.iter().map(|v| v.0).collect(),
                     opt(sizes),
                     opt(strides),
@@ -15058,11 +15139,11 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(POOL),
-            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
 
         let todo = Unimplemented::default();
@@ -15090,7 +15171,7 @@ mod tests {
             note: None,
             journal: &mut jrnl,
         };
-        let cb = VkCommandBuffer(CB.0);
+        let cb = VkCommandBuffer::forged(CB.0);
 
         // Four distinct floats: a wrapper that passed the aggregate by value would put them in
         // the wrong registers, and one that passed the first would land three zeroes.
@@ -15117,7 +15198,7 @@ mod tests {
         // All four arrays, then only the two mandatory ones. An absent array is null and not an
         // empty slice: Vulkan reads null as "not supplied" and an empty one is a count of zero
         // the guest never sent.
-        let buffers = [VkBuffer(0x100), VkBuffer(0x200)];
+        let buffers = [VkBuffer::forged(0x100), VkBuffer::forged(0x200)];
         let offsets = [VkDeviceSize(8), VkDeviceSize(16)];
         let sizes = [VkDeviceSize(32), VkDeviceSize(64)];
         let strides = [VkDeviceSize(128), VkDeviceSize(256)];
@@ -15215,18 +15296,18 @@ mod tests {
 
         fn driver_with(fns: crate::vulkan::Device) -> Driver {
             let mut driver = Driver::new(Account::for_test(None));
-            driver.plant_device(VkDevice(DEVICE), fns);
+            driver.plant_device(VkDevice::forged(DEVICE), fns);
             driver.plant_pool(
-                VkDevice(DEVICE),
-                VkCommandPool(POOL),
-                &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+                VkDevice::forged(DEVICE),
+                VkCommandPool::forged(POOL),
+                &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
             );
             driver
         }
 
         fn call(h: &mut Handlers<'_>) {
             let mut args = vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT {
-                commandBuffer: VkCommandBuffer(CB.0),
+                commandBuffer: VkCommandBuffer::forged(CB.0),
                 aspectMask: VkImageAspectFlags(ASPECTS),
                 ..Default::default()
             };
@@ -15329,7 +15410,7 @@ mod tests {
                 // the length of the array it was given.
                 let out = unsafe { core::slice::from_raw_parts_mut(out, n) };
                 for (e, h) in out.iter_mut().zip(HOST) {
-                    *e = VkCommandBuffer(h);
+                    *e = VkCommandBuffer::forged(h);
                 }
             }
             r
@@ -15340,8 +15421,8 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
-        driver.plant_pool(VkDevice(DEVICE), VkCommandPool(POOL), &[]);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(VkDevice::forged(DEVICE), VkCommandPool::forged(POOL), &[]);
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -15372,15 +15453,16 @@ mod tests {
         // What the decoder would have built: the guest's ids on the wire, a shadow of the same
         // length beside them, and the count inside the create-info that sized both.
         let info = VkCommandBufferAllocateInfo {
-            commandPool: VkCommandPool(POOL),
+            commandPool: VkCommandPool::forged(POOL),
             level: VkCommandBufferLevel::VK_COMMAND_BUFFER_LEVEL_PRIMARY,
             commandBufferCount: IDS.len() as u32,
             ..Default::default()
         };
-        let mut wire: [VkCommandBuffer; 3] = core::array::from_fn(|i| VkCommandBuffer(IDS[i]));
-        let mut shadow = [VkCommandBuffer(0); 3];
+        let mut wire: [VkCommandBuffer; 3] =
+            core::array::from_fn(|i| VkCommandBuffer::forged(IDS[i]));
+        let mut shadow = [VkCommandBuffer::forged(0); 3];
         let mut args = vn_command_vkAllocateCommandBuffers::default();
-        args.device = VkDevice(DEVICE);
+        args.device = VkDevice::forged(DEVICE);
         args.plant_pAllocateInfo(Some(Decoded::planted(&info)));
         args.plant_pCommandBuffers(&mut wire);
         args.plant_handle_pCommandBuffers(&mut shadow);
@@ -15391,14 +15473,14 @@ mod tests {
         SAW.with_borrow(|s| {
             assert_eq!(s, &[(3, 3)], "the count it was told and the room it was given are one");
         });
-        assert_eq!(shadow.map(|c| c.0), HOST, "the driver's handles land in the shadow");
-        assert_eq!(wire.map(|c| c.0), IDS, "and the guest's ids on the wire are left alone");
+        assert_eq!(shadow.map(|c| c.raw()), HOST, "the driver's handles land in the shadow");
+        assert_eq!(wire.map(|c| c.raw()), IDS, "and the guest's ids on the wire are left alone");
 
         // Both names of every object, paired the way the guest sent them. A run recorded in the
         // wrong order resolves every id to a live object -- someone else's.
         for (host, id) in HOST.iter().zip(IDS) {
             assert_eq!(
-                h.driver.pool_child_id(VkCommandPool(POOL), VkCommandBuffer(*host)),
+                h.driver.pool_child_id(VkCommandPool::forged(POOL), VkCommandBuffer::forged(*host)),
                 Some(ObjectId(id)),
                 "the pool holds {host:#x} under the id the guest named it by"
             );
@@ -15409,9 +15491,9 @@ mod tests {
         // absorbed -- and the guest asked for a whole run, so it is every id or none.
         ANSWER.with_borrow_mut(|a| *a = VkResult::VK_ERROR_OUT_OF_POOL_MEMORY);
         // A fresh set of ids, so a ghost found below is this run's and not the last one's.
-        let mut shadow = [VkCommandBuffer(0); 3];
+        let mut shadow = [VkCommandBuffer::forged(0); 3];
         let mut args = vn_command_vkAllocateCommandBuffers::default();
-        args.device = VkDevice(DEVICE);
+        args.device = VkDevice::forged(DEVICE);
         args.plant_pAllocateInfo(Some(Decoded::planted(&info)));
         args.plant_pCommandBuffers(&mut wire);
         args.plant_handle_pCommandBuffers(&mut shadow);
@@ -15470,7 +15552,7 @@ mod tests {
             // SAFETY: the wrapper passes a slice's own pointer and its own length.
             let regions = unsafe { core::slice::from_raw_parts(p, count as usize) };
             SAW.with_borrow_mut(|s| {
-                s.push((src.0, layout.0, dst.0, regions.len() as u32));
+                s.push((src.raw(), layout.0, dst.raw(), regions.len() as u32));
             });
         }
 
@@ -15479,11 +15561,11 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(POOL),
-            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
 
         let todo = Unimplemented::default();
@@ -15514,10 +15596,10 @@ mod tests {
 
         let regions = [VkBufferImageCopy::default(); 3];
         let mut args = vn_command_vkCmdCopyImageToBuffer::default();
-        args.commandBuffer = VkCommandBuffer(CB.0);
-        args.srcImage = VkImage(0x44);
+        args.commandBuffer = VkCommandBuffer::forged(CB.0);
+        args.srcImage = VkImage::forged(0x44);
         args.srcImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        args.dstBuffer = VkBuffer(0x55);
+        args.dstBuffer = VkBuffer::forged(0x55);
         args.plant_pRegions(&regions);
         h.vkCmdCopyImageToBuffer(&mut args);
 
@@ -15578,7 +15660,7 @@ mod tests {
             _p: *const VkImageBlit,
             filter: VkFilter,
         ) {
-            SAW.with_borrow_mut(|s| s.blits.push((src.0, dst.0, count, filter.0)));
+            SAW.with_borrow_mut(|s| s.blits.push((src.raw(), dst.raw(), count, filter.0)));
         }
 
         unsafe extern "C" fn copy(
@@ -15591,7 +15673,13 @@ mod tests {
             _p: *const VkImageCopy,
         ) {
             SAW.with_borrow_mut(|s| {
-                s.copies.push((src.0, src_layout.0 as u32, dst.0, dst_layout.0 as u32, count))
+                s.copies.push((
+                    src.raw(),
+                    src_layout.0 as u32,
+                    dst.raw(),
+                    dst_layout.0 as u32,
+                    count,
+                ))
             });
         }
 
@@ -15607,7 +15695,9 @@ mod tests {
             // and length for the ranges.
             let (c, ranges) = unsafe { (&*color, core::slice::from_raw_parts(p, count as usize)) };
             let first = ranges.first().map(|r| r.baseMipLevel).unwrap_or(u32::MAX);
-            SAW.with_borrow_mut(|s| s.cleared_image.push((image.0, unsafe { c.uint32[0] }, first)));
+            SAW.with_borrow_mut(|s| {
+                s.cleared_image.push((image.raw(), unsafe { c.uint32[0] }, first))
+            });
         }
 
         unsafe extern "C" fn clear_attachments(
@@ -15630,7 +15720,7 @@ mod tests {
         ) {
             // SAFETY: the wrapper passes the slice's own pointer and its length in bytes.
             let bytes = unsafe { core::slice::from_raw_parts(values.cast::<u8>(), size as usize) };
-            SAW.with_borrow_mut(|s| s.pushed.push((layout.0, offset, bytes.to_vec())));
+            SAW.with_borrow_mut(|s| s.pushed.push((layout.raw(), offset, bytes.to_vec())));
         }
 
         let mut fns = crate::vulkan::Device::default();
@@ -15642,11 +15732,11 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(POOL),
-            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
 
         let todo = Unimplemented::default();
@@ -15674,15 +15764,15 @@ mod tests {
             note: None,
             journal: &mut jrnl,
         };
-        let cb = VkCommandBuffer(CB.0);
+        let cb = VkCommandBuffer::forged(CB.0);
 
         // A counted array with a scalar behind it: the filter follows the pointer, so a wrapper
         // that passes the count and pointer in the wrong order still compiles and lands here.
         let regions = [VkImageBlit::default(); 2];
         let mut args = vn_command_vkCmdBlitImage::default();
         args.commandBuffer = cb;
-        args.srcImage = VkImage(0x11);
-        args.dstImage = VkImage(0x22);
+        args.srcImage = VkImage::forged(0x11);
+        args.dstImage = VkImage::forged(0x22);
         args.filter = VkFilter::VK_FILTER_LINEAR;
         args.plant_pRegions(&regions);
         h.vkCmdBlitImage(&mut args);
@@ -15703,9 +15793,9 @@ mod tests {
         let regions = [VkImageCopy::default(); 3];
         let mut args = vn_command_vkCmdCopyImage::default();
         args.commandBuffer = cb;
-        args.srcImage = VkImage(0x66);
+        args.srcImage = VkImage::forged(0x66);
         args.srcImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        args.dstImage = VkImage(0x77);
+        args.dstImage = VkImage::forged(0x77);
         args.dstImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         args.plant_pRegions(&regions);
         h.vkCmdCopyImage(&mut args);
@@ -15734,7 +15824,7 @@ mod tests {
         let ranges = [VkImageSubresourceRange { baseMipLevel: 4, ..Default::default() }];
         let mut args = vn_command_vkCmdClearColorImage::default();
         args.commandBuffer = cb;
-        args.image = VkImage(0x33);
+        args.image = VkImage::forged(0x33);
         args.pColor = Some(&color);
         args.plant_pRanges(&ranges);
         h.vkCmdClearColorImage(&mut args);
@@ -15766,7 +15856,7 @@ mod tests {
         let bytes = [0xde_u8, 0xad, 0xbe, 0xef, 0x11, 0x22];
         let mut args = vn_command_vkCmdPushConstants::default();
         args.commandBuffer = cb;
-        args.layout = VkPipelineLayout(0x44);
+        args.layout = VkPipelineLayout::forged(0x44);
         args.offset = 8;
         args.plant_pValues(&bytes);
         h.vkCmdPushConstants(&mut args);
@@ -15837,11 +15927,11 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         driver.plant_pool(
-            VkDevice(DEVICE),
-            VkCommandPool(POOL),
-            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
 
         let todo = Unimplemented::default();
@@ -15882,7 +15972,7 @@ mod tests {
         let clear = |h: &mut Handlers<'_>, rects: &[Rect]| {
             let rects: Vec<VkClearRect> = rects.iter().copied().map(rect).collect();
             let mut args = vn_command_vkCmdClearAttachments::default();
-            args.commandBuffer = VkCommandBuffer(CB.0);
+            args.commandBuffer = VkCommandBuffer::forged(CB.0);
             args.plant_pAttachments(&attachments);
             args.plant_pRects(&rects);
             h.vkCmdClearAttachments(&mut args);
@@ -15964,7 +16054,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -15992,8 +16082,8 @@ mod tests {
         };
 
         let mut args = vn_command_vkResetFenceResourceMESA {
-            device: VkDevice(DEVICE),
-            fence: VkFence(FENCE),
+            device: VkDevice::forged(DEVICE),
+            fence: VkFence::forged(FENCE),
             ..Default::default()
         };
         h.vkResetFenceResourceMESA(&mut args);
@@ -16030,8 +16120,8 @@ mod tests {
         // A device the guest never made. The handle is the guest's, so this is a rejection and
         // never an assert.
         let mut args = vn_command_vkResetFenceResourceMESA {
-            device: VkDevice(DEVICE + 1),
-            fence: VkFence(FENCE),
+            device: VkDevice::forged(DEVICE + 1),
+            fence: VkFence::forged(FENCE),
             ..Default::default()
         };
         h.vkResetFenceResourceMESA(&mut args);
@@ -16078,7 +16168,7 @@ mod tests {
             _p: *const VkSubmitInfo2,
             fence: VkFence,
         ) -> VkResult {
-            SAW.with_borrow_mut(|s| s.push((queue.0, count, fence.0)));
+            SAW.with_borrow_mut(|s| s.push((queue.raw(), count, fence.raw())));
             VkResult::VK_SUCCESS
         }
 
@@ -16089,9 +16179,9 @@ mod tests {
                 fns.plant_vkQueueSubmit2(submit2);
             }
             let mut driver = Driver::new(Account::for_test(None));
-            driver.plant_device(VkDevice(DEVICE), fns);
-            driver.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
-            driver.plant_semaphore(VkSemaphore(TIMELINE), driver::SemaphoreKind::Timeline);
+            driver.plant_device(VkDevice::forged(DEVICE), fns);
+            driver.plant_queue(VkDevice::forged(DEVICE), VkQueue::forged(QUEUE));
+            driver.plant_semaphore(VkSemaphore::forged(TIMELINE), driver::SemaphoreKind::Timeline);
             driver
         }
 
@@ -16131,7 +16221,7 @@ mod tests {
         // guest's and both have to arrive: the fence is what every later wait in the frame is
         // keyed by, and the value is what a `vkGetSemaphoreCounterValue` will be checked against.
         let signal = [VkSemaphoreSubmitInfo {
-            semaphore: VkSemaphore(TIMELINE),
+            semaphore: VkSemaphore::forged(TIMELINE),
             value: 7,
             ..Default::default()
         }];
@@ -16141,15 +16231,15 @@ mod tests {
             ..Default::default()
         }];
         let mut args = vn_command_vkQueueSubmit2::default();
-        args.queue = VkQueue(QUEUE);
-        args.fence = VkFence(FENCE);
+        args.queue = VkQueue::forged(QUEUE);
+        args.fence = VkFence::forged(FENCE);
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit2(&mut args);
         assert!(h.rejected().is_none(), "a well-formed submit is not a refusal");
         assert_eq!(args.ret, VkResult::VK_SUCCESS, "the driver's answer is the guest's");
         SAW.with_borrow(|s| assert_eq!(*s, [(QUEUE, 1, FENCE)]));
         assert_eq!(
-            h.driver.semaphore_requested(VkSemaphore(TIMELINE)),
+            h.driver.semaphore_requested(VkSemaphore::forged(TIMELINE)),
             7,
             "the signal inside the submit info is what raises the timeline"
         );
@@ -16158,8 +16248,8 @@ mod tests {
         // slice goes through as a submit of zero rather than being turned away.
         SAW.with_borrow_mut(Vec::clear);
         let mut args = vn_command_vkQueueSubmit2::default();
-        args.queue = VkQueue(QUEUE);
-        args.fence = VkFence(FENCE);
+        args.queue = VkQueue::forged(QUEUE);
+        args.fence = VkFence::forged(FENCE);
         args.plant_pSubmits(&[]);
         h.vkQueueSubmit2(&mut args);
         assert!(h.rejected().is_none(), "submitting nothing is legal");
@@ -16173,7 +16263,7 @@ mod tests {
             (Unimplemented::default(), BTreeMap::new(), None, None, Journal::new());
         let mut h = handlers!(&mut driver, &todo, &mut rings, &mut reply, &mut monitor, &mut jrnl);
         let mut args = vn_command_vkQueueSubmit2::default();
-        args.queue = VkQueue(QUEUE);
+        args.queue = VkQueue::forged(QUEUE);
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit2(&mut args);
         assert_eq!(
@@ -16184,7 +16274,7 @@ mod tests {
 
         // And a queue this context never retrieved, which is the other refusal.
         let mut args = vn_command_vkQueueSubmit2::default();
-        args.queue = VkQueue(QUEUE + 1);
+        args.queue = VkQueue::forged(QUEUE + 1);
         args.plant_pSubmits(&submits);
         h.take_rejected();
         h.vkQueueSubmit2(&mut args);
@@ -16235,7 +16325,7 @@ mod tests {
             _p: *const VkSubmitInfo,
             fence: VkFence,
         ) -> VkResult {
-            SAW.with_borrow_mut(|s| s.submits.push((queue.0, count, fence.0)));
+            SAW.with_borrow_mut(|s| s.submits.push((queue.raw(), count, fence.raw())));
             VkResult::VK_SUCCESS
         }
 
@@ -16291,8 +16381,8 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        driver.plant_device(VkDevice(DEVICE), fns);
-        driver.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_queue(VkDevice::forged(DEVICE), VkQueue::forged(QUEUE));
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -16325,8 +16415,8 @@ mod tests {
         // -- would leave the guest waiting on something nothing signals.
         let submits = [VkSubmitInfo::default(); 2];
         let mut args = vn_command_vkQueueSubmit::default();
-        args.queue = VkQueue(QUEUE);
-        args.fence = VkFence(99);
+        args.queue = VkQueue::forged(QUEUE);
+        args.fence = VkFence::forged(99);
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit(&mut args);
         assert!(h.rejected().is_none());
@@ -16335,15 +16425,15 @@ mod tests {
 
         // Three fences to reset, then a wait on two of them. `waitAll` and the timeout are the
         // guest's own: a wait that returned early would be a lie it cannot tell from the truth.
-        let fences = [VkFence(1), VkFence(2), VkFence(3)];
+        let fences = [VkFence::forged(1), VkFence::forged(2), VkFence::forged(3)];
         let mut args = vn_command_vkResetFences::default();
-        args.device = VkDevice(DEVICE);
+        args.device = VkDevice::forged(DEVICE);
         args.plant_pFences(&fences);
         h.vkResetFences(&mut args);
         SAW.with_borrow(|s| assert_eq!(s.reset, [3]));
 
         let mut args = vn_command_vkWaitForFences::default();
-        args.device = VkDevice(DEVICE);
+        args.device = VkDevice::forged(DEVICE);
         args.plant_pFences(&fences[..2]);
         args.waitAll = VkBool32(1);
         // Two slices' worth, against a driver that never signals: the wait is made in slices
@@ -16379,10 +16469,12 @@ mod tests {
         SAW.with_borrow(|s| assert_eq!(s.waited.len(), 3, "and asks the driver nothing"));
 
         // The import that stands in for a signal the host never saw.
-        let info =
-            VkImportSemaphoreResourceInfoMESA { semaphore: VkSemaphore(5), ..Default::default() };
+        let info = VkImportSemaphoreResourceInfoMESA {
+            semaphore: VkSemaphore::forged(5),
+            ..Default::default()
+        };
         let mut args = vn_command_vkImportSemaphoreResourceMESA {
-            device: VkDevice(DEVICE),
+            device: VkDevice::forged(DEVICE),
             pImportSemaphoreResourceInfo: Some(Decoded::planted(&info)),
             ..Default::default()
         };
@@ -16394,8 +16486,8 @@ mod tests {
         // the descriptor it produced was closed -- an fd leaked once per frame is a renderer that
         // runs out of them.
         let mut args = vn_command_vkWaitSemaphoreResourceMESA {
-            device: VkDevice(DEVICE),
-            semaphore: VkSemaphore(5),
+            device: VkDevice::forged(DEVICE),
+            semaphore: VkSemaphore::forged(5),
             ..Default::default()
         };
         h.vkWaitSemaphoreResourceMESA(&mut args);
@@ -16432,12 +16524,12 @@ mod tests {
         // A resource id the C asserts on. The number is the guest's, so it is a rejection here --
         // an assert would hand a guest the power to abort the process.
         let info = VkImportSemaphoreResourceInfoMESA {
-            semaphore: VkSemaphore(5),
+            semaphore: VkSemaphore::forged(5),
             resourceId: 1,
             ..Default::default()
         };
         let mut args = vn_command_vkImportSemaphoreResourceMESA {
-            device: VkDevice(DEVICE),
+            device: VkDevice::forged(DEVICE),
             pImportSemaphoreResourceInfo: Some(Decoded::planted(&info)),
             ..Default::default()
         };
@@ -16450,11 +16542,13 @@ mod tests {
         // commands a guest reaches an extension through, the predicate is what stands between a
         // driver we cannot serve on and a guest that can kill the process by asking.
         const BARE: u64 = 8;
-        h.driver.plant_device(VkDevice(BARE), crate::vulkan::Device::default());
-        let info =
-            VkImportSemaphoreResourceInfoMESA { semaphore: VkSemaphore(5), ..Default::default() };
+        h.driver.plant_device(VkDevice::forged(BARE), crate::vulkan::Device::default());
+        let info = VkImportSemaphoreResourceInfoMESA {
+            semaphore: VkSemaphore::forged(5),
+            ..Default::default()
+        };
         let mut args = vn_command_vkImportSemaphoreResourceMESA {
-            device: VkDevice(BARE),
+            device: VkDevice::forged(BARE),
             pImportSemaphoreResourceInfo: Some(Decoded::planted(&info)),
             ..Default::default()
         };
@@ -16470,7 +16564,7 @@ mod tests {
         // handle nothing vouches for.
         h.take_rejected();
         let mut args = vn_command_vkQueueSubmit::default();
-        args.queue = VkQueue(4242);
+        args.queue = VkQueue::forged(4242);
         args.plant_pSubmits(&submits);
         h.vkQueueSubmit(&mut args);
         assert!(h.rejected().is_some(), "a queue with no device behind it must poison the ring");
@@ -16605,7 +16699,7 @@ mod tests {
             fence: VkFence,
             _a: *const VkAllocationCallbacks,
         ) {
-            SAW.with_borrow_mut(|s| s.destroyed.push(fence.0));
+            SAW.with_borrow_mut(|s| s.destroyed.push(fence.raw()));
         }
         unsafe extern "C" fn idle(_d: VkDevice) -> VkResult {
             VkResult::VK_SUCCESS
@@ -16625,23 +16719,23 @@ mod tests {
             fns.plant_vkDestroyFence(destroy_fence);
             fns.plant_vkDeviceWaitIdle(idle);
             fns.plant_vkDestroyDevice(destroy_device);
-            ctx.driver.plant_device(VkDevice(DEVICE), fns);
+            ctx.driver.plant_device(VkDevice::forged(DEVICE), fns);
             let mut table = ctx.objects.borrow_mut();
             for (id, host, kind) in [
                 (GUEST_DEV, DEVICE, VkObjectType::VK_OBJECT_TYPE_DEVICE),
                 (GUEST_FENCE_A, HOST_FENCE_A, VkObjectType::VK_OBJECT_TYPE_FENCE),
                 (GUEST_FENCE_B, HOST_FENCE_B, VkObjectType::VK_OBJECT_TYPE_FENCE),
             ] {
-                table.add(ObjectId(id), kind, HostHandle(host), None).expect("a fresh id");
+                table.add(ObjectId(id), kind, HostHandle::forged(host), None).expect("a fresh id");
             }
             drop(table);
             ctx
         }
 
         fn wire_wait(fence: u64) -> Vec<u8> {
-            let fences = [VkFence(fence)];
+            let fences = [VkFence::forged(fence)];
             let mut args = ty::vn_command_vkWaitForFences::default();
-            args.device = VkDevice(GUEST_DEV);
+            args.device = VkDevice::forged(GUEST_DEV);
             args.waitAll = VkBool32(1);
             args.timeout = u64::MAX;
             args.plant_pFences(&fences);
@@ -16652,8 +16746,8 @@ mod tests {
                 ser::vn_sizeof_vkDestroyFence_args,
                 ser::vn_encode_vkDestroyFence_args,
                 ty::vn_command_vkDestroyFence {
-                    device: VkDevice(GUEST_DEV),
-                    fence: VkFence(fence),
+                    device: VkDevice::forged(GUEST_DEV),
+                    fence: VkFence::forged(fence),
                     ..Default::default()
                 },
                 0
@@ -16664,7 +16758,7 @@ mod tests {
                 ser::vn_sizeof_vkDestroyDevice_args,
                 ser::vn_encode_vkDestroyDevice_args,
                 ty::vn_command_vkDestroyDevice {
-                    device: VkDevice(GUEST_DEV),
+                    device: VkDevice::forged(GUEST_DEV),
                     ..Default::default()
                 },
                 0

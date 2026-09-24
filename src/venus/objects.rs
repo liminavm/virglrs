@@ -565,11 +565,15 @@ impl Objects for Table {
             // as it is for a real object: an unserved create does not buy the guest the right to
             // name its id as something else.
             Some(Slot::Fiction { ty: t, under }) if t.0 == ty && self.fiction_stands(*under) => {
-                Lookup::Found(HostHandle(id.0))
+                Lookup::Fiction
             }
             Some(Slot::Fiction { .. }) => Lookup::Missing,
             None => Lookup::Missing,
         }
+    }
+
+    fn id_of(&self, ty: i32, host: HostHandle) -> Option<ObjectId> {
+        self.id_of_handle(VkObjectType(ty), host)
     }
 }
 
@@ -596,24 +600,24 @@ mod tests {
         use super::super::cs::Handle;
         use super::super::proto::types::VkBuffer;
 
-        let slot = VkBuffer(0x1234);
-        assert_eq!(slot.host(), HostHandle(0x1234));
+        let slot = VkBuffer::forged(0x1234);
+        assert_eq!(slot.host(), HostHandle::forged(0x1234));
         assert_eq!(slot.guest_id(), ObjectId(0x1234));
-        assert_eq!(VkBuffer::from_host(HostHandle(0x1234)), slot);
-        assert_eq!(VkBuffer::null(), VkBuffer(0));
+        assert_eq!(VkBuffer::from_host(HostHandle::forged(0x1234)), slot);
+        assert_eq!(VkBuffer::null(), VkBuffer::forged(0));
 
         // What the table records is the host's name, under the guest's.
         let mut t = Table::new();
-        t.add(ObjectId(7), BUFFER, HostHandle(0xfeed), None).unwrap();
-        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle(0xfeed)));
-        assert_eq!(t.id_of_handle(BUFFER, HostHandle(0xfeed)), Some(ObjectId(7)));
+        t.add(ObjectId(7), BUFFER, HostHandle::forged(0xfeed), None).unwrap();
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle::forged(0xfeed)));
+        assert_eq!(t.id_of_handle(BUFFER, HostHandle::forged(0xfeed)), Some(ObjectId(7)));
     }
 
     #[test]
     fn a_registered_object_resolves_only_under_its_own_type() {
         let mut t = Table::new();
-        t.add(ObjectId(7), BUFFER, HostHandle(0xdead_beef), None).unwrap();
-        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle(0xdead_beef)));
+        t.add(ObjectId(7), BUFFER, HostHandle::forged(0xdead_beef), None).unwrap();
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle::forged(0xdead_beef)));
         // The whole point of the table: an id is not a capability for every object type.
         assert_eq!(t.lookup(ObjectId(7), IMAGE.0), Lookup::Missing);
     }
@@ -632,8 +636,8 @@ mod tests {
         t.add_ghost(ObjectId(7));
         assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Ghost);
 
-        t.add(ObjectId(7), BUFFER, HostHandle(1), None).unwrap();
-        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle(1)));
+        t.add(ObjectId(7), BUFFER, HostHandle::forged(1), None).unwrap();
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle::forged(1)));
     }
 
     /// The state the two-container shape allowed and this one cannot represent.
@@ -644,13 +648,13 @@ mod tests {
     #[test]
     fn a_refused_create_never_ghosts_an_id_that_already_names_something() {
         let mut t = Table::new();
-        t.add(ObjectId(7), BUFFER, HostHandle(1), None).unwrap();
+        t.add(ObjectId(7), BUFFER, HostHandle::forged(1), None).unwrap();
 
         // A guest naming a live id in a create, and a driver that refuses that create. Nothing
         // changed, so the object still there is the truth.
         t.add_ghost(ObjectId(7));
         assert!(!t.is_ghost(ObjectId(7)));
-        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle(1)));
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle::forged(1)));
 
         // And after the guest destroys it the id names nothing at all. A ghost surviving here is
         // the whole bug: every later command naming the id would be swallowed as one lost command
@@ -674,15 +678,18 @@ mod tests {
     #[test]
     fn an_id_may_not_be_zero_or_reused_while_it_is_live() {
         let mut t = Table::new();
-        assert_eq!(t.add(ObjectId(0), BUFFER, HostHandle(1), None), Err(AddError::ZeroId));
-        t.add(ObjectId(7), BUFFER, HostHandle(1), None).unwrap();
-        assert_eq!(t.add(ObjectId(7), IMAGE, HostHandle(2), None), Err(AddError::Duplicate));
+        assert_eq!(t.add(ObjectId(0), BUFFER, HostHandle::forged(1), None), Err(AddError::ZeroId));
+        t.add(ObjectId(7), BUFFER, HostHandle::forged(1), None).unwrap();
+        assert_eq!(
+            t.add(ObjectId(7), IMAGE, HostHandle::forged(2), None),
+            Err(AddError::Duplicate)
+        );
         // Still the original: a refused insert must not have disturbed it.
-        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle(1)));
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle::forged(1)));
 
         t.remove(ObjectId(7)).unwrap();
-        t.add(ObjectId(7), IMAGE, HostHandle(2), None).unwrap();
-        assert_eq!(t.lookup(ObjectId(7), IMAGE.0), Lookup::Found(HostHandle(2)));
+        t.add(ObjectId(7), IMAGE, HostHandle::forged(2), None).unwrap();
+        assert_eq!(t.lookup(ObjectId(7), IMAGE.0), Lookup::Found(HostHandle::forged(2)));
     }
 
     /// What the generation is actually for.
@@ -694,15 +701,15 @@ mod tests {
     #[test]
     fn an_orphans_stale_key_does_not_come_to_name_whatever_reuses_its_slot() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap();
-        t.add(ObjectId(2), IMAGE, HostHandle(20), Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle::forged(10), None).unwrap();
+        t.add(ObjectId(2), IMAGE, HostHandle::forged(20), Some(ObjectId(1))).unwrap();
         // Takes the child with it, and hands both their places back to be used again. Id 2 keeps
         // its entry: nothing walked back here to delete it, which is the whole trade.
         t.remove(ObjectId(1)).unwrap();
 
-        let newcomer = t.add(ObjectId(3), IMAGE, HostHandle(30), None);
+        let newcomer = t.add(ObjectId(3), IMAGE, HostHandle::forged(30), None);
         assert_eq!(newcomer, Ok(()));
-        assert_eq!(t.lookup(ObjectId(3), IMAGE.0), Lookup::Found(HostHandle(30)));
+        assert_eq!(t.lookup(ObjectId(3), IMAGE.0), Lookup::Found(HostHandle::forged(30)));
         // Same slot, same object type, different occupant. The generation is the only thing
         // separating them, and a guest naming id 2 must not be handed 30.
         assert_eq!(t.lookup(ObjectId(2), IMAGE.0), Lookup::Missing);
@@ -713,20 +720,20 @@ mod tests {
     #[test]
     fn destroying_a_parent_takes_every_generation_below_it() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap();
-        t.add(ObjectId(2), IMAGE, HostHandle(20), Some(ObjectId(1))).unwrap();
-        t.add(ObjectId(3), IMAGE, HostHandle(30), Some(ObjectId(2))).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle::forged(10), None).unwrap();
+        t.add(ObjectId(2), IMAGE, HostHandle::forged(20), Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(3), IMAGE, HostHandle::forged(30), Some(ObjectId(2))).unwrap();
         // A sibling tree that must survive: a cascade that took everything would pass a test that
         // only looked down one branch.
-        t.add(ObjectId(4), BUFFER, HostHandle(40), None).unwrap();
-        t.add(ObjectId(5), IMAGE, HostHandle(50), Some(ObjectId(4))).unwrap();
+        t.add(ObjectId(4), BUFFER, HostHandle::forged(40), None).unwrap();
+        t.add(ObjectId(5), IMAGE, HostHandle::forged(50), Some(ObjectId(4))).unwrap();
 
         t.remove(ObjectId(1)).unwrap();
         for id in [1, 2, 3] {
             assert!(t.get(ObjectId(id)).is_none(), "id {id} died with the root above it");
         }
-        assert_eq!(t.lookup(ObjectId(4), BUFFER.0), Lookup::Found(HostHandle(40)));
-        assert_eq!(t.lookup(ObjectId(5), IMAGE.0), Lookup::Found(HostHandle(50)));
+        assert_eq!(t.lookup(ObjectId(4), BUFFER.0), Lookup::Found(HostHandle::forged(40)));
+        assert_eq!(t.lookup(ObjectId(5), IMAGE.0), Lookup::Found(HostHandle::forged(50)));
         assert_eq!(t.len(), 2);
     }
 
@@ -736,8 +743,8 @@ mod tests {
     #[test]
     fn an_id_orphaned_by_its_parents_destroy_is_reusable_without_being_cleaned_up() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap();
-        t.add(ObjectId(2), IMAGE, HostHandle(20), Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle::forged(10), None).unwrap();
+        t.add(ObjectId(2), IMAGE, HostHandle::forged(20), Some(ObjectId(1))).unwrap();
         t.remove(ObjectId(1)).unwrap();
 
         assert_eq!(t.lookup(ObjectId(2), IMAGE.0), Lookup::Missing);
@@ -745,8 +752,8 @@ mod tests {
         // must not report one -- the host handle is already gone.
         assert!(t.remove(ObjectId(2)).is_none());
         // And the id is not burned: the guest may name a new object by it.
-        t.add(ObjectId(2), BUFFER, HostHandle(21), None).unwrap();
-        assert_eq!(t.lookup(ObjectId(2), BUFFER.0), Lookup::Found(HostHandle(21)));
+        t.add(ObjectId(2), BUFFER, HostHandle::forged(21), None).unwrap();
+        assert_eq!(t.lookup(ObjectId(2), BUFFER.0), Lookup::Found(HostHandle::forged(21)));
     }
 
     /// A slot cycled many times still does not hand a stale key back its object.
@@ -759,13 +766,13 @@ mod tests {
     #[test]
     fn a_slot_cycled_over_and_over_never_hands_an_orphan_its_object_back() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap();
-        t.add(ObjectId(2), IMAGE, HostHandle(20), Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle::forged(10), None).unwrap();
+        t.add(ObjectId(2), IMAGE, HostHandle::forged(20), Some(ObjectId(1))).unwrap();
         t.remove(ObjectId(1)).unwrap();
         // Id 2 is now an orphan holding a key to a slot that is back in circulation.
 
         for round in 0..500u64 {
-            t.add(ObjectId(3), IMAGE, HostHandle(1000 + round), None).unwrap();
+            t.add(ObjectId(3), IMAGE, HostHandle::forged(1000 + round), None).unwrap();
             assert_eq!(
                 t.lookup(ObjectId(2), IMAGE.0),
                 Lookup::Missing,
@@ -780,23 +787,30 @@ mod tests {
     #[test]
     fn a_create_under_an_owner_that_is_already_gone_still_registers() {
         let mut t = Table::new();
-        t.add(ObjectId(9), BUFFER, HostHandle(90), Some(ObjectId(1))).unwrap();
-        assert_eq!(t.lookup(ObjectId(9), BUFFER.0), Lookup::Found(HostHandle(90)));
+        t.add(ObjectId(9), BUFFER, HostHandle::forged(90), Some(ObjectId(1))).unwrap();
+        assert_eq!(t.lookup(ObjectId(9), BUFFER.0), Lookup::Found(HostHandle::forged(90)));
     }
 
     #[test]
     fn draining_hands_back_every_handle_that_needs_destroying() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap();
-        t.add(ObjectId(2), IMAGE, HostHandle(20), None).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle::forged(10), None).unwrap();
+        t.add(ObjectId(2), IMAGE, HostHandle::forged(20), None).unwrap();
         // One of them hangs off the other, so a drain that walked the tree would hand back only
         // the root. Teardown wants every live handle: Vulkan is being told about each one.
-        t.add(ObjectId(3), IMAGE, HostHandle(30), Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(3), IMAGE, HostHandle::forged(30), Some(ObjectId(1))).unwrap();
         let mut got: Vec<_> = t.take_all().into_iter().map(|d| (d.handle, d.device)).collect();
         got.sort_unstable();
         // Every live handle, and each with the device it has to be destroyed on: 30 hangs off the
         // buffer, which is not a device, so it inherits the nothing above it.
-        assert_eq!(got, [(HostHandle(10), None), (HostHandle(20), None), (HostHandle(30), None)]);
+        assert_eq!(
+            got,
+            [
+                (HostHandle::forged(10), None),
+                (HostHandle::forged(20), None),
+                (HostHandle::forged(30), None)
+            ]
+        );
         assert!(t.is_empty());
     }
 
@@ -807,10 +821,10 @@ mod tests {
     #[test]
     fn a_drained_object_names_the_device_it_was_made_on_however_deep_it_sits() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap(); // stands in for the instance
-        t.add(ObjectId(2), DEVICE, HostHandle(20), Some(ObjectId(1))).unwrap();
-        t.add(ObjectId(3), IMAGE, HostHandle(30), Some(ObjectId(2))).unwrap();
-        t.add(ObjectId(4), IMAGE, HostHandle(40), Some(ObjectId(3))).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle::forged(10), None).unwrap(); // stands in for the instance
+        t.add(ObjectId(2), DEVICE, HostHandle::forged(20), Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(3), IMAGE, HostHandle::forged(30), Some(ObjectId(2))).unwrap();
+        t.add(ObjectId(4), IMAGE, HostHandle::forged(40), Some(ObjectId(3))).unwrap();
         let mut got: Vec<_> = t.take_all().into_iter().map(|d| (d.handle, d.device)).collect();
         got.sort_unstable();
         // The root and the device itself are destroyed as themselves, not on a device; everything
@@ -818,10 +832,10 @@ mod tests {
         assert_eq!(
             got,
             [
-                (HostHandle(10), None),
-                (HostHandle(20), None),
-                (HostHandle(30), Some(VkDevice(20))),
-                (HostHandle(40), Some(VkDevice(20))),
+                (HostHandle::forged(10), None),
+                (HostHandle::forged(20), None),
+                (HostHandle::forged(30), Some(VkDevice::forged(20))),
+                (HostHandle::forged(40), Some(VkDevice::forged(20))),
             ]
         );
     }
@@ -970,7 +984,7 @@ mod every_sequence {
         let want: Vec<HostHandle> = taken.iter().map(|(h, ..)| *h).collect();
         assert_eq!(got, want, "a destroy list is not exactly what it took, after {ops:?}");
         for d in doomed {
-            assert!(d.handle.0 >= MINTED, "a destroy list names a fiction, after {ops:?}");
+            assert!(d.handle.raw() >= MINTED, "a destroy list names a fiction, after {ops:?}");
             let (_, key, device) = before.iter().find(|(h, ..)| *h == d.handle).unwrap();
             let want = if Some(*key) == root { None } else { *device };
             assert_eq!(d.device, want, "destroyed on the wrong device, after {ops:?}");
@@ -1122,16 +1136,13 @@ mod every_sequence {
             for ty in TYPES {
                 let live = t.get(id).filter(|o| o.ty == ty).map(|o| o.handle);
                 match t.lookup(id, ty.0) {
-                    Lookup::Found(h) if Some(h) == live => {}
                     Lookup::Found(h) => {
+                        assert_eq!(Some(h), live, "a lookup found a stranger, after {ops:?}")
+                    }
+                    Lookup::Fiction => {
                         assert!(
                             live.is_none() && t.get(id).is_none(),
                             "a fiction shadows a live object, after {ops:?}"
-                        );
-                        assert_eq!(
-                            h,
-                            HostHandle(id.0),
-                            "a fiction resolves to a handle, after {ops:?}"
                         );
                         seen.fictions_resolved += 1;
                     }
@@ -1163,7 +1174,7 @@ mod every_sequence {
                 continue;
             }
             let mut next = t.clone();
-            let h = HostHandle(MINTED + ops.len() as u64);
+            let h = HostHandle::forged(MINTED + ops.len() as u64);
             ops.push(op);
             let key = apply(&mut next, op, h, ops, seen);
             if let Some(k) = key {
@@ -1219,5 +1230,9 @@ impl Shared {
 impl Objects for Shared {
     fn lookup(&self, id: ObjectId, ty: i32) -> Lookup {
         self.0.borrow().lookup(id, ty)
+    }
+
+    fn id_of(&self, ty: i32, host: HostHandle) -> Option<ObjectId> {
+        self.0.borrow().id_of(ty, host)
     }
 }

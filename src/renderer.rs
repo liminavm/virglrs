@@ -2240,7 +2240,7 @@ mod tests {
         t.add(
             crate::venus::cs::ObjectId(1),
             crate::venus::proto::types::VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY,
-            crate::venus::cs::HostHandle(1),
+            crate::venus::cs::HostHandle::forged(1),
             None,
         )
         .expect("a fresh table takes any id");
@@ -2562,7 +2562,7 @@ mod tests {
             .add(
                 ObjectId(66),
                 crate::venus::proto::types::VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY,
-                crate::venus::cs::HostHandle(0x9000),
+                crate::venus::cs::HostHandle::forged(0x9000),
                 None,
             )
             .unwrap();

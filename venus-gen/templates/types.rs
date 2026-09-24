@@ -45,7 +45,46 @@ ${newtype(ty.name, inner)}\
 
 % for ty in GEN.supported_types[VkType.HANDLE]:
 /// ${'Dispatchable' if ty.dispatchable else 'Non-dispatchable'} handle.
-${newtype(ty.name, 'u64', plain=False)}\
+///
+/// The driver hands one to Vulkan, which follows it as a host pointer, so a handle made up from a
+/// number is memory the driver was never given. The field is private and the one constructor is
+/// `unsafe`: only the decoder, which reads the guest's word into an id slot or resolves it through
+/// the object table, and the driver's calls that Vulkan writes one through, can make one. A
+/// handler has neither, so it can pass on what the guest named and nothing it made.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[repr(transparent)]
+pub struct ${ty.name}(u64);
+
+impl ${ty.name} {
+    /// `VK_NULL_HANDLE`: no object, which Vulkan takes wherever a handle is optional.
+    pub const NULL: Self = Self(0);
+
+    pub const fn is_null(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The word in the slot, for reading. Reading is not what needs vouching for; making one is.
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Put `raw` in a handle slot.
+    ///
+    /// # Safety
+    ///
+    /// `raw` is a handle of this type that Vulkan gave this process and that is still alive, or
+    /// the guest's id for an object in a slot nothing hands to the driver as a handle.
+    pub unsafe fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// A handle a test made up, which no Vulkan call will ever see.
+    #[cfg(test)]
+    pub const fn forged(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 % endfor
 
 % for ty in GEN.supported_types[VkType.ENUM]:

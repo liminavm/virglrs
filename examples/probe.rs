@@ -31,7 +31,7 @@ fn main() {
 
     let app = VkApplicationInfo { apiVersion: 1 << 22 | 3 << 12, ..Default::default() };
     let ci = VkInstanceCreateInfo { pApplicationInfo: &app, ..Default::default() };
-    let mut inst = VkInstance(0);
+    let mut inst = VkInstance::NULL;
     // SAFETY: `ci` and `inst` outlive the call; a null allocator is what the spec means by
     // "use the default".
     let r = unsafe { (g.vkCreateInstance())(&ci, core::ptr::null(), &mut inst) };
@@ -42,7 +42,7 @@ fn main() {
     let mut n: u32 = 0;
     // SAFETY: the count query with a null array is the spec's own two-call idiom.
     unsafe { (i.vkEnumeratePhysicalDevices())(inst, &mut n, core::ptr::null_mut()) };
-    let mut pds = vec![VkPhysicalDevice(0); n as usize];
+    let mut pds = vec![VkPhysicalDevice::NULL; n as usize];
     // SAFETY: `pds` has room for `n`, which is what the count query just said.
     unsafe { (i.vkEnumeratePhysicalDevices())(inst, &mut n, pds.as_mut_ptr()) };
     println!("physical devices {n}");
@@ -99,7 +99,7 @@ fn main() {
         pQueueCreateInfos: &q,
         ..Default::default()
     };
-    let mut dev = VkDevice(0);
+    let mut dev = VkDevice::NULL;
     // SAFETY: `dci` and everything it points at outlive the call.
     let r = unsafe { (i.vkCreateDevice())(pd, &dci, core::ptr::null(), &mut dev) };
     assert_eq!(r.0, 0, "vkCreateDevice");
