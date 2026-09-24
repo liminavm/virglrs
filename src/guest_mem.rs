@@ -46,6 +46,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub struct GuestMap {
     ptr: NonNull<u8>,
     len: usize,
+    /// What these pages cost, for pages this renderer minted at the guest's request; `None` for a
+    /// mapping of memory someone else owns, such as a descriptor the VMM imported. Held here so it
+    /// is credited when the pages go -- the last share of the mapping, not the resource that
+    /// asked for it: a ring keeps its pages past the resource's unref.
+    charge: Option<crate::budget::Charge>,
 }
 
 // SAFETY: `GuestMap` is a pointer and a length, and every method that touches the memory does so
@@ -106,7 +111,7 @@ impl GuestMap {
         }
         // SAFETY: mmap returned something other than MAP_FAILED, so it is a valid mapping of
         // `len` bytes and is never null.
-        Ok(GuestMap { ptr: unsafe { NonNull::new_unchecked(ptr.cast::<u8>()) }, len })
+        Ok(GuestMap { ptr: unsafe { NonNull::new_unchecked(ptr.cast::<u8>()) }, len, charge: None })
     }
 
     /// Map `len` bytes of fresh anonymous memory, rounded up to whole pages.
@@ -144,7 +149,7 @@ impl GuestMap {
         }
         // SAFETY: mmap returned something other than MAP_FAILED, so it is a valid mapping of
         // `len` bytes and is never null.
-        Ok(GuestMap { ptr: unsafe { NonNull::new_unchecked(ptr.cast::<u8>()) }, len })
+        Ok(GuestMap { ptr: unsafe { NonNull::new_unchecked(ptr.cast::<u8>()) }, len, charge: None })
     }
 
     /// Where the mapping starts in this process.
@@ -161,6 +166,17 @@ impl GuestMap {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// These pages, holding what they cost.
+    ///
+    /// The charge is for exactly the mapped length -- one number, so a charge taken for the size
+    /// the guest asked and a mapping rounded up to whole pages cannot both stand.
+    pub fn charged(mut self, charge: crate::budget::Charge) -> GuestMap {
+        assert_eq!(charge.size(), self.len as u64, "a mapping is charged for its whole length");
+        assert!(self.charge.is_none(), "a mapping is charged once");
+        self.charge = Some(charge);
+        self
     }
 
     /// The address of a naturally aligned 32-bit word at `at`, or `None` if it does not lie

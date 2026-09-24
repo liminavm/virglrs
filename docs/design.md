@@ -310,9 +310,14 @@ buildable throughout as the A-side reference.
   encoder that does not exist yet when it runs; the copy is the price of keeping them apart.
   Two pieces of the budget land after the ledger itself: `VK_EXT_memory_budget`, which is the
   only backpressure that reaches a guest at all and needs
-  `vkGetPhysicalDeviceMemoryProperties2` intercepted rather than forwarded; and the HostShm
-  blob carrier in `renderer.rs`, which is a second host allocator the C charges and this tree
-  does not yet.
+  `vkGetPhysicalDeviceMemoryProperties2` intercepted rather than forwarded; and the pages a
+  `HOST3D` blob with no id asks the host to mint (`HostShm` in `renderer.rs`, where a ring or a
+  reply stream lives). The C charges those to nobody, which leaves a guest free to mint host
+  memory no cap sees; here they are charged to the context that asked and refused past the cap,
+  and the charge rides inside the mapping, because a running ring holds its own share of the
+  pages past the resource's unref. Unlike a refused allocation, a refused mint leaves the context
+  running: the guest maps the blob as it creates it, so the failed map tells it at once, and its
+  driver answers the call that wanted the memory with out-of-memory.
   Midpoint gate, before any VM: both corpora replay to completion, their scores match
   the fixtures pinned from the C build, **and every handler whose contents matter
   carries its own witness**. Replay strips replies and needs no display, so score
@@ -922,13 +927,6 @@ waiting on a call rather than on work.
 
 These are not decisions. Each is settled in shape and unwritten in code, and each is here so that
 it survives the session it was found in.
-
-- **`HostShm` is minted and never charged.** The blob carrier in `renderer.rs` is the one host
-  allocation left outside the ledger — the C bills it as `"shm carrier"` -- and it is not the
-  same shape as an IOSurface: `Resource::shm()` hands the `Arc<GuestMap>` out to venus's ring, so
-  the pages can outlive the `HostShm` that minted them and the charge has to live inside that
-  `Arc`, not beside it. That makes `ShmResources` carry a `Charged<GuestMap>`, which is why it is
-  its own piece of work rather than a line in the vrend one.
 
 - **The libkrun opaque-journal branch is parked and ready.** `limina-p5-opaque-journal` merges into
   `third_party/libkrun`'s `limina` branch with a `third_party/manifest.toml` bump. Nothing blocks

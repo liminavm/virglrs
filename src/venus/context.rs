@@ -439,6 +439,24 @@ impl Context {
         Arc::clone(&self.fatal)
     }
 
+    /// Take `size` bytes for host memory this context asked the host to mint outside
+    /// `vkAllocateMemory` -- the shared memory a ring or a reply stream lives in -- or refuse them.
+    ///
+    /// Refused, the context is left running, unlike a refused allocation. The guest maps every
+    /// such blob the moment it creates it, so the refusal reaches it at once as a failed map, and
+    /// its driver turns that into an out-of-memory error at the call that wanted the memory --
+    /// nothing is left holding a blob that does not exist, which is the whole reason a refused
+    /// allocation stops its context.
+    pub fn admit_host_shm(
+        &self,
+        size: u64,
+    ) -> Result<crate::budget::Charge, crate::budget::Refused> {
+        let account = self.driver.account();
+        account
+            .try_charge("host shm", size)
+            .inspect_err(|refused| account.report_answered_refusal(*refused))
+    }
+
     pub fn objects(&self) -> &Shared {
         &self.objects
     }

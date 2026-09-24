@@ -265,6 +265,7 @@ fn errno(e: renderer::Error) -> c_int {
         | ClassicRefused(_)
         | ClaimRefused(_) => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
+        OverBudget(_) => -libc::ENOMEM,
         NotExportable => -libc::EINVAL,
         // The C answers a readback it cannot serve with a bare -1, and the VMM tells it apart
         // from an errno.
@@ -915,15 +916,15 @@ fn classic_desc(a: &ResourceCreateArgs) -> Result<(ResourceHandle, ClassicArgs),
 
 /// The blob the ABI's create args describe.
 ///
-/// `ctx_id` is dropped: nothing reads it today, and when host3d blobs land its Rust shape is
-/// `Option<ContextId>` rather than a `u32`, because a guest-memory blob legitimately has no context
-/// and zero is how the ABI spells that.
-/// The C's flat argument struct as the two operations it actually encodes.
+/// The C's flat argument struct as the three operations it actually encodes, told apart by
+/// `blob_mem` and `blob_id` and then spent: the renderer never sees either.
 ///
 /// `blob_id` means something only for a blob whose storage is the host's: the C reads it solely on
 /// the `HOST3D` path and ignores it everywhere else, and a guest-storage blob carrying a non-zero
-/// id would otherwise arrive here as an export of memory no context was named for. Reconciled
-/// once, here, because this is the boundary that knows what the ABI meant.
+/// id would otherwise arrive here as an export of memory no context was named for. `ctx_id` is
+/// read on the same path and no other: a guest-storage blob legitimately has no context, and zero
+/// is how the ABI spells that. Reconciled once, here, because this is the boundary that knows
+/// what the ABI meant.
 fn blob_desc(a: &CreateBlobArgs) -> Option<renderer::BlobDesc> {
     let source = match (a.blob_mem, a.blob_id) {
         // An export names memory in some context's table, so a request that names no context
@@ -932,14 +933,14 @@ fn blob_desc(a: &CreateBlobArgs) -> Option<renderer::BlobDesc> {
         (crate::abi::BLOB_MEM_HOST3D, id) if id != 0 => {
             renderer::BlobSource::InContext { ctx: ContextId::new(a.ctx_id)?, id: BlobId(id) }
         }
-        _ => renderer::BlobSource::HostMinted,
+        // A mint is charged to the context that asked, so one that names no context is refused
+        // by the same rule: there is nobody to charge.
+        (crate::abi::BLOB_MEM_HOST3D, _) => {
+            renderer::BlobSource::HostMinted { ctx: ContextId::new(a.ctx_id)? }
+        }
+        _ => renderer::BlobSource::Guest,
     };
-    Some(renderer::BlobDesc {
-        blob_mem: a.blob_mem,
-        blob_flags: a.blob_flags,
-        source,
-        size: a.size,
-    })
+    Some(renderer::BlobDesc { blob_flags: a.blob_flags, source, size: a.size })
 }
 
 #[unsafe(no_mangle)]
@@ -3142,13 +3143,13 @@ mod tests {
         assert_eq!(ResourceHandle::new(0), None);
     }
 
-    /// Likewise, and additionally which of the two operations the flat args encode.
+    /// Likewise, and additionally which of the three operations the flat args encode.
     ///
     /// `blob_id` is meaningful only on the `HOST3D` path. Everywhere else the ABI carries whatever
     /// the guest put there and the C ignores it, so reading it unconditionally would turn a
     /// guest-storage blob into an export of memory nobody named a context for.
     #[test]
-    fn the_abi_blob_args_say_which_of_the_two_blobs_was_asked_for() {
+    fn the_abi_blob_args_say_which_of_the_three_blobs_was_asked_for() {
         let host3d = crate::abi::BLOB_MEM_HOST3D;
         let a = CreateBlobArgs {
             res_handle: 1,
@@ -3163,7 +3164,6 @@ mod tests {
         assert_eq!(
             blob_desc(&a),
             Some(renderer::BlobDesc {
-                blob_mem: host3d,
                 blob_flags: 4,
                 source: renderer::BlobSource::InContext {
                     ctx: ContextId::new(2).unwrap(),
@@ -3174,19 +3174,27 @@ mod tests {
             "a host3d blob naming an id is that context's to resolve"
         );
 
-        // A zero id on the same path is the other operation entirely.
+        // A zero id on the same path is another operation entirely, charged to the context.
         let minted = CreateBlobArgs { blob_id: 0, ..a };
         assert_eq!(
-            blob_desc(&minted).expect("a mint needs no context").source,
-            renderer::BlobSource::HostMinted
+            blob_desc(&minted).expect("a mint").source,
+            renderer::BlobSource::HostMinted { ctx: ContextId::new(2).unwrap() }
         );
+        // With nobody to charge it is refused, as the C refuses any host3d blob with no context.
+        let unpaid = CreateBlobArgs { ctx_id: 0, ..minted };
+        assert_eq!(blob_desc(&unpaid), None, "a mint with no context has no payer");
 
         // And an id set on a path that has no host storage is the guest's leftover, not a request.
         let guest = CreateBlobArgs { blob_mem: crate::abi::BLOB_MEM_GUEST_VRAM, ..a };
         assert_eq!(
-            blob_desc(&guest).expect("guest storage needs no context").source,
-            renderer::BlobSource::HostMinted,
+            blob_desc(&guest).expect("guest storage").source,
+            renderer::BlobSource::Guest,
             "the C reads blob_id only for host3d; reading it here would invent an export"
+        );
+        let no_ctx = CreateBlobArgs { ctx_id: 0, ..guest };
+        assert_eq!(
+            blob_desc(&no_ctx).expect("guest storage needs no context").source,
+            renderer::BlobSource::Guest,
         );
 
         // An export naming no context names no memory: there is no table to resolve the id in.
@@ -3214,5 +3222,9 @@ mod tests {
         }
         assert_eq!(errno(RendererUnimplemented), -libc::ENOTSUP);
         assert_ne!(errno(RendererUnimplemented), errno(RendererAbsent));
+        // A cap is the host running out of memory for this guest, which is what ENOMEM says --
+        // not that the guest asked for something malformed.
+        let refused = crate::budget::Refused { what: "host shm", wanted: 1, live: 0, cap: 0 };
+        assert_eq!(errno(OverBudget(refused)), -libc::ENOMEM);
     }
 }

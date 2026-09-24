@@ -445,6 +445,23 @@ impl Account {
     /// also what a dozen unrelated venus transport failures look like -- so a refusal that did
     /// not name itself would be read as a transport bug.
     pub fn report_refusal(&self, refused: Refused) {
+        self.report(
+            refused,
+            if self.budget.kills_context() {
+                "killing this context deliberately"
+            } else {
+                "returning an error the guest will not read"
+            },
+        );
+    }
+
+    /// The same, for a refusal the guest is told of at once and can act on -- so the context is
+    /// left running, whatever the cap's mode, and the line says so rather than announcing a kill.
+    pub fn report_answered_refusal(&self, refused: Refused) {
+        self.report(refused, "leaving this context running; the guest sees out-of-memory");
+    }
+
+    fn report(&self, refused: Refused, then: &str) {
         let ledger = self.budget.ledger.lock().expect("the budget ledger");
         eprintln!(
             "[virglrs] {GRAMMAR}: REFUSING a {} {} allocation for {}",
@@ -453,13 +470,8 @@ impl Account {
             named(self.ctx.id(), ledger.name_of(self.ctx.id())),
         );
         eprintln!(
-            "[virglrs] {GRAMMAR}:   and {}: this is limina's host-memory cap ({CAP_ENV}), not \
+            "[virglrs] {GRAMMAR}:   and {then}: this is limina's host-memory cap ({CAP_ENV}), not \
              the GPU running out of memory",
-            if self.budget.kills_context() {
-                "killing this context deliberately"
-            } else {
-                "returning an error the guest will not read"
-            },
         );
         self.budget.report_locked(&ledger, "at refusal");
     }

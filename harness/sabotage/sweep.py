@@ -2020,6 +2020,30 @@ SABOTAGES = [
         """        *a = Armed::new(a.every, Default::default());""",
         'the_decoder_counters_outlive_the_window',
     ),
+    (
+        'pages the host mints for a context are credited as soon as they are charged',
+        'src/renderer.rs',
+        """            Ok((fd, map)) => Ok(HostShm { fd, map: Arc::new(map.charged(charge)) }),""",
+        """            Ok((fd, map)) => Ok(HostShm { fd, map: Arc::new({ drop(charge); map }) }),""",
+        'host_minted_pages_are_charged_to_the_context_that_asked',
+    ),
+    (
+        'a refused host-minted blob stops its context',
+        'src/venus/context.rs',
+        """            .inspect_err(|refused| account.report_answered_refusal(*refused))""",
+        """            .inspect_err(|refused| {
+                account.report_answered_refusal(*refused);
+                self.fatal.store(true, Ordering::Release);
+            })""",
+        'host_minted_pages_are_charged_to_the_context_that_asked',
+    ),
+    (
+        'a classic context mints host pages for nothing',
+        'src/renderer.rs',
+        """                        Ok(crate::budget::Classic::open(&self.budget).charge("host shm", size))""",
+        """                        Ok(crate::budget::Classic::open(&crate::budget::Budget::with_cap(None, false)).charge("host shm", size))""",
+        'only_a_blob_that_asks_the_host_for_memory_is_given_any',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

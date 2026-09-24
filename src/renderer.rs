@@ -100,6 +100,8 @@ pub enum Error {
     /// A restore was handed a journal its renderer would not read, or fed one to a context that
     /// is not being rebuilt, for the reason given.
     JournalRefused(&'static str),
+    /// The host memory budget refused memory a context asked the host to mint.
+    OverBudget(crate::budget::Refused),
 }
 
 /// A read or a write of an allocation's bytes, in the renderer's vocabulary. One function for
@@ -156,6 +158,7 @@ impl std::fmt::Display for Error {
             Error::NoContext => "no such context",
             Error::RendererAbsent => "this build was not initialized to serve that capset",
             Error::RendererUnimplemented => "no renderer serves that capset yet",
+            Error::OverBudget(_) => "the host memory budget refused the allocation",
             Error::NotExportable => "the resource has no descriptor to export",
             Error::Poisoned => "the context is poisoned",
             Error::NoRing => "no such running ring in that context",
@@ -197,20 +200,26 @@ impl std::error::Error for Error {}
 /// place that knows. What it resolves *to* is spelled out: see [`BlobStorage`] and [`Backing`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlobSource {
-    /// The guest asks the host for memory it does not yet have.
-    HostMinted,
+    /// The guest's own pages, described by the resource's iov: there is nothing host-side to
+    /// mint or to publish.
+    Guest,
+    /// `ctx` asks the host for memory it does not yet have -- the shared memory a venus ring or
+    /// reply stream lives in. The context is named because it pays: minted pages are host memory
+    /// held on a guest's behalf, and a guest that could mint them for free could take the host
+    /// past any cap.
+    HostMinted { ctx: ContextId },
     /// A context publishes something it already holds, under the id it holds it by.
     InContext { ctx: ContextId, id: BlobId },
 }
 
 /// Host memory the guest maps, or a handle a context exported.
 ///
-/// `blob_mem` and `blob_flags` stay bare integers until the blob path is served: naming their
-/// values means rejecting the ones we do not know, and a rejection nothing exercises is a
-/// rejection nobody has checked.
+/// `blob_flags` stays a bare integer until the blob path is served: naming its values means
+/// rejecting the ones we do not know, and a rejection nothing exercises is a rejection nobody has
+/// checked. The ABI's `blob_mem` is not here at all: all it decides is which [`BlobSource`] this
+/// is, and the shim spends it deciding that.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BlobDesc {
-    pub blob_mem: u32,
     pub blob_flags: u32,
     pub source: BlobSource,
     pub size: u64,
@@ -222,7 +231,10 @@ impl std::fmt::Display for BlobDesc {
     /// these two things was asked for and are already spent by the time anyone reads this.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.source {
-            BlobSource::HostMinted => write!(f, "{} bytes of new host memory", self.size),
+            BlobSource::Guest => write!(f, "{} bytes of the guest's own pages", self.size),
+            BlobSource::HostMinted { ctx } => {
+                write!(f, "{} bytes of new host memory for ctx {ctx}", self.size)
+            }
             BlobSource::InContext { ctx, id } => {
                 write!(f, "{} bytes of ctx {ctx}'s blob {id}", self.size)
             }
@@ -286,19 +298,24 @@ pub struct HostShm {
 }
 
 impl HostShm {
-    /// Mint memory for a blob, if this is the kind of blob that needs it.
+    /// Mint `len` bytes for a blob, rounded up to whole pages, and charge them.
     ///
-    /// Mirrors the C's `vkr_context_get_blob`: a host-minted blob reaches
-    /// `vkr_context_create_resource_from_shm`, an export publishes memory that already exists.
-    fn for_blob(handle: ResourceHandle, desc: &BlobDesc) -> Result<Option<HostShm>, Error> {
-        if desc.blob_mem != crate::abi::BLOB_MEM_HOST3D
-            || !matches!(desc.source, BlobSource::HostMinted)
-        {
-            return Ok(None);
-        }
-        let len = usize::try_from(desc.size).map_err(|_| Error::Unmappable)?;
+    /// Mirrors the C's `vkr_context_create_resource_from_shm`, which charges nothing: the pages
+    /// are the host's all the same, and a guest minting them in a loop would otherwise hold host
+    /// memory no cap sees. The charge goes into the mapping, so it is credited when the last
+    /// share of the pages goes -- a running ring holds one past the resource's unref.
+    fn mint(
+        handle: ResourceHandle,
+        len: u64,
+        charge: impl FnOnce(u64) -> Result<crate::budget::Charge, Error>,
+    ) -> Result<HostShm, Error> {
+        let len = usize::try_from(len)
+            .ok()
+            .and_then(crate::guest_mem::page_round)
+            .ok_or(Error::Unmappable)?;
+        let charge = charge(len as u64)?;
         match crate::guest_mem::anonymous_shm(len, "virglrs-shmem") {
-            Ok((fd, map)) => Ok(Some(HostShm { fd, map: Arc::new(map) })),
+            Ok((fd, map)) => Ok(HostShm { fd, map: Arc::new(map.charged(charge)) }),
             Err(e) => {
                 eprintln!("[virglrs] resource {handle}: cannot mint {len} shm bytes: {e}");
                 Err(Error::Unmappable)
@@ -723,14 +740,24 @@ impl Renderer {
         config: Config,
         contexts: Option<Box<dyn vrend::egl::GlContexts>>,
     ) -> Result<Renderer, vrend::vrend::InitError> {
+        // Before either arm, and once: a build serving only classic has a cap too, and two
+        // ledgers would be two answers to the one question the cap is asked.
+        Renderer::with_budget(fences, config, contexts, crate::budget::Budget::from_env())
+    }
+
+    /// [`Renderer::new`] with the budget given rather than the one configured -- the tests' way
+    /// to a cap, for the reason [`crate::budget::Budget::with_cap`] gives.
+    fn with_budget(
+        fences: Box<dyn FenceSink>,
+        config: Config,
+        contexts: Option<Box<dyn vrend::egl::GlContexts>>,
+        budget: Arc<crate::budget::Budget>,
+    ) -> Result<Renderer, vrend::vrend::InitError> {
         // Built here and shared into venus, rather than reached through the renderer: a ring
         // thread needs the table long after the call that created its ring returned, and it must
         // not need the renderer to get it.
         let resources: Arc<RwLock<crate::Map<ResourceHandle, Resource>>> = Arc::default();
         let condemned = vrend::resource::Condemned::default();
-        // Before either arm, and once: a build serving only classic has a cap too, and two
-        // ledgers would be two answers to the one question the cap is asked.
-        let budget = crate::budget::Budget::from_env();
         let traces = vrend::debug::Traces::from_env();
         let debug = vrend::debug::Switches::from_env();
         let fences = Retirement::start(fences, debug);
@@ -840,10 +867,26 @@ impl Renderer {
     ) -> Result<(), Error> {
         self.free_handle(handle)?;
         let storage = match desc.source {
-            BlobSource::HostMinted => match HostShm::for_blob(handle, &desc)? {
-                Some(shm) => BlobStorage::Minted(shm),
-                None => BlobStorage::Guest,
-            },
+            BlobSource::Guest => BlobStorage::Guest,
+            BlobSource::HostMinted { ctx } => {
+                let shm = match self.bound(ctx)? {
+                    Bound::Venus(v) => {
+                        let venus = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
+                        HostShm::mint(handle, desc.size, |size| {
+                            venus
+                                .with_context(v, |c| c.admit_host_shm(size))
+                                .ok_or(Error::NoContext)?
+                                .map_err(Error::OverBudget)
+                        })?
+                    }
+                    // Classic cannot refuse -- see [`crate::budget::Classic`] -- so it counts.
+                    Bound::Classic(_) => HostShm::mint(handle, desc.size, |size| {
+                        Ok(crate::budget::Classic::open(&self.budget).charge("host shm", size))
+                    })?,
+                    Bound::Unserved => return Err(Error::RendererUnimplemented),
+                };
+                BlobStorage::Minted(shm)
+            }
             BlobSource::InContext { ctx, id } => match self.bound(ctx)? {
                 Bound::Classic(ctx) => {
                     return self.claim_described(handle, ctx, id, desc, iov);
@@ -2355,7 +2398,6 @@ mod tests {
             blob,
             Backing::Blob {
                 desc: BlobDesc {
-                    blob_mem: crate::abi::BLOB_MEM_HOST3D,
                     blob_flags: 1,
                     source: BlobSource::InContext { ctx: one, id: BlobId(66) },
                     size: 2048,
@@ -2491,20 +2533,23 @@ mod tests {
         );
     }
 
-    /// The two questions `HostShm::for_blob` answers, and it answers them from the source alone.
+    /// Whether a blob is given memory, decided from its source alone.
     ///
-    /// One entry point serves two different guest requests: one asks the renderer to supply
-    /// memory, the other names memory a context already has and asks for it to be published.
-    /// Minting for the second kind would hand the guest fresh zeroed pages where it expected the
-    /// contents of a `VkDeviceMemory` -- a wrong answer that looks like a working one.
+    /// One entry point serves three different guest requests: one asks the renderer to supply
+    /// memory, one names memory a context already has and asks for it to be published, and one
+    /// brings the guest's own pages. Minting for the second kind would hand the guest fresh zeroed
+    /// pages where it expected the contents of a `VkDeviceMemory` -- a wrong answer that looks
+    /// like a working one.
     #[test]
     fn only_a_blob_that_asks_the_host_for_memory_is_given_any() {
         let mut r = renderer(Config::default());
+        // Classic, so no renderer has to come up: a mint only needs a context to charge.
+        let payer = ContextId::new(2).unwrap();
+        r.context_create(payer, CapsetId::Virgl, "minting".into()).expect("a context");
 
         let minted = BlobDesc {
-            blob_mem: crate::abi::BLOB_MEM_HOST3D,
             blob_flags: 1,
-            source: BlobSource::HostMinted,
+            source: BlobSource::HostMinted { ctx: payer },
             // The size the venus corpus asks for a ring resource: not a whole number of pages.
             size: 0x24000 - 1,
         };
@@ -2520,6 +2565,7 @@ mod tests {
         let page = crate::guest_mem::page_size();
         assert_eq!(map.len() % page, 0, "the mapping is a whole number of pages");
         assert!(map.len() >= 0x24000 - 1, "and covers everything that was asked for");
+        assert_eq!(r.budget().classic(), map.len() as u64, "and classic is charged for it");
 
         // A blob naming something a context already holds gets no memory of its own. There is
         // no such context in this build, so the resolution is refused before either renderer is
@@ -2540,7 +2586,7 @@ mod tests {
         );
 
         // And so does a blob in memory that is not the host's to mint.
-        let vram = BlobDesc { blob_mem: crate::abi::BLOB_MEM_GUEST_VRAM, ..minted };
+        let vram = BlobDesc { source: BlobSource::Guest, ..minted };
         r.resource_create_blob(ResourceHandle::new(3).unwrap(), vram, Vec::new()).expect("created");
         assert!(
             r.with_resource(ResourceHandle::new(3).unwrap(), |res| res.shm().cloned())
@@ -2584,7 +2630,6 @@ mod tests {
             host: None,
             backing: Backing::Blob {
                 desc: BlobDesc {
-                    blob_mem: crate::abi::BLOB_MEM_HOST3D,
                     blob_flags: 1,
                     source: BlobSource::InContext { ctx: one, id: BlobId(66) },
                     size: 4096,
@@ -2669,9 +2714,8 @@ mod tests {
                 host: None,
                 backing: Backing::Blob {
                     desc: BlobDesc {
-                        blob_mem: crate::abi::BLOB_MEM_HOST3D,
                         blob_flags: 1,
-                        source: BlobSource::HostMinted,
+                        source: BlobSource::HostMinted { ctx: one },
                         size: 4096,
                     },
                     storage: BlobStorage::Guest,
@@ -2791,7 +2835,6 @@ mod tests {
                 host: None,
                 backing: Backing::Blob {
                     desc: BlobDesc {
-                        blob_mem: crate::abi::BLOB_MEM_HOST3D,
                         blob_flags: 1,
                         source: BlobSource::InContext { ctx: one, id: BlobId(66) },
                         size: 2048,
@@ -2839,7 +2882,6 @@ mod tests {
                 host: None,
                 backing: Backing::Blob {
                     desc: BlobDesc {
-                        blob_mem: crate::abi::BLOB_MEM_HOST3D,
                         blob_flags: 1,
                         source: BlobSource::InContext { ctx: one, id: BlobId(67) },
                         size: 4096,
@@ -2873,12 +2915,10 @@ mod tests {
     #[test]
     fn an_export_of_nothing_is_not_an_export_refused() {
         let mut r = renderer(Config::default());
-        let minted = BlobDesc {
-            blob_mem: crate::abi::BLOB_MEM_HOST3D,
-            blob_flags: 1,
-            source: BlobSource::HostMinted,
-            size: 4096,
-        };
+        let payer = ContextId::new(1).unwrap();
+        r.context_create(payer, CapsetId::Virgl, "minting".into()).expect("a context");
+        let minted =
+            BlobDesc { blob_flags: 1, source: BlobSource::HostMinted { ctx: payer }, size: 4096 };
         let blob = ResourceHandle::new(1).unwrap();
         r.resource_create_blob(blob, minted, Vec::new()).expect("created");
         assert_eq!(
@@ -2902,11 +2942,12 @@ mod tests {
     #[test]
     fn a_blob_says_where_it_lives_and_everything_else_refuses_to() {
         let mut r = renderer(Config::default());
+        let payer = ContextId::new(1).unwrap();
+        r.context_create(payer, CapsetId::Virgl, "minting".into()).expect("a context");
 
         let minted = BlobDesc {
-            blob_mem: crate::abi::BLOB_MEM_HOST3D,
             blob_flags: 1,
-            source: BlobSource::HostMinted,
+            source: BlobSource::HostMinted { ctx: payer },
             size: 0x24000 - 1,
         };
         let blob = ResourceHandle::new(1).unwrap();
@@ -2921,7 +2962,7 @@ mod tests {
 
         // Memory the host never mapped has no address to give, and saying so is the difference
         // between a VMM reporting a failed guest mmap and one publishing a wild pointer.
-        let vram = BlobDesc { blob_mem: crate::abi::BLOB_MEM_GUEST_VRAM, ..minted };
+        let vram = BlobDesc { source: BlobSource::Guest, ..minted };
         let elsewhere = ResourceHandle::new(2).unwrap();
         r.resource_create_blob(elsewhere, vram, Vec::new()).expect("created");
         assert_eq!(r.resource_host_mapping(elsewhere), Err(Error::NotMappable));
@@ -2931,6 +2972,63 @@ mod tests {
             Err(Error::NoResource),
             "a handle that names nothing is not the same as a resource that maps nothing"
         );
+    }
+
+    /// Pages the host mints for a context are charged to it, and refused past the cap.
+    ///
+    /// They are host memory held on the guest's behalf like any allocation, and a guest that could
+    /// mint them for nothing could create ring resources until the host ran out. The charge lives
+    /// with the pages rather than the resource: a running ring holds its own share of them, so
+    /// they stand past the resource's unref and are credited only when that share goes.
+    #[test]
+    fn host_minted_pages_are_charged_to_the_context_that_asked() {
+        let page = crate::guest_mem::page_size() as u64;
+        let budget = crate::budget::Budget::with_cap(Some(4 * page), false);
+        let mut r = Renderer::with_budget(
+            Box::new(NoSink),
+            Config { venus: true, ..Config::default() },
+            None,
+            Arc::clone(&budget),
+        )
+        .expect("no vrend is asked for");
+        let one = ContextId::new(1).unwrap();
+        r.context_create(one, CapsetId::Venus, "ringer".into()).expect("a fresh id");
+
+        // Not a whole number of pages, so what is charged is visibly the mapping and not the ask.
+        let ring = BlobDesc {
+            blob_flags: 1,
+            source: BlobSource::HostMinted { ctx: one },
+            size: 2 * page + 1,
+        };
+        let blob = ResourceHandle::new(1).unwrap();
+        r.resource_create_blob(blob, ring, Vec::new()).expect("within the cap");
+        let map = r.with_resource(blob, |res| res.shm().cloned()).expect("there").expect("pages");
+        assert_eq!(map.len() as u64, 3 * page);
+        assert_eq!(budget.live_for(one), 3 * page, "the context that asked holds the pages");
+
+        let over = ResourceHandle::new(2).unwrap();
+        assert!(
+            matches!(
+                r.resource_create_blob(over, ring, Vec::new()),
+                Err(Error::OverBudget(crate::budget::Refused { what: "host shm", .. }))
+            ),
+            "a second ring past the cap is refused"
+        );
+        assert!(r.with_resource(over, |_| ()).is_none(), "and leaves no resource behind");
+        assert_eq!(budget.live_for(one), 3 * page, "nor any charge");
+        let venus = r.venus.as_ref().expect("venus was asked for");
+        assert_eq!(
+            venus.with_context(r.venus_ctx(one).expect("venus"), |c| c.fatal()),
+            Some(false),
+            "a refused mint leaves the context running: the guest is told at once, and can act"
+        );
+
+        // `map` is the share a ring thread holds: the pages outlive the resource, and so does
+        // what they cost.
+        r.resource_unref(blob);
+        assert_eq!(budget.live_for(one), 3 * page, "the ring's share still holds the pages");
+        drop(map);
+        assert_eq!(budget.live_for(one), 0, "credited when the last share goes");
     }
 
     /// A real descriptor to hand over. Any would do; a pipe's read end is the cheapest.
@@ -3028,7 +3126,6 @@ mod tests {
             blob,
             Backing::Blob {
                 desc: BlobDesc {
-                    blob_mem: crate::abi::BLOB_MEM_HOST3D,
                     blob_flags: 1,
                     source: BlobSource::InContext { ctx: one, id: BlobId(MEM.0) },
                     size: 4096,
@@ -3093,7 +3190,6 @@ mod tests {
             blob,
             Backing::Blob {
                 desc: BlobDesc {
-                    blob_mem: crate::abi::BLOB_MEM_HOST3D,
                     blob_flags: 1,
                     source: BlobSource::InContext { ctx: two, id: BlobId(66) },
                     size: 4096,
@@ -3142,7 +3238,6 @@ mod tests {
             blob,
             Backing::Blob {
                 desc: BlobDesc {
-                    blob_mem: crate::abi::BLOB_MEM_HOST3D,
                     blob_flags: 1,
                     source: BlobSource::InContext { ctx: one, id: BlobId(66) },
                     size: 4096,
