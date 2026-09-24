@@ -700,6 +700,8 @@ pub struct Renderer {
     venus: Option<venus::vkr::Vkr>,
     /// The classic renderer, likewise.
     vrend: Option<vrend::vrend::Vrend>,
+    /// limina's trace knobs, read once here and handed to the classic renderer with the rest.
+    traces: vrend::debug::Traces,
     /// Retirement outlives whoever can still retire through it, including the classic fence waiter
     /// `vrend` owns -- a `fence::Handle` keeps the thread alive, so the order these fields are
     /// declared or dropped in does not decide whether a fence in flight is delivered.
@@ -727,13 +729,7 @@ impl Renderer {
         // Before either arm, and once: a build serving only classic has a cap too, and two
         // ledgers would be two answers to the one question the cap is asked.
         let budget = crate::budget::Budget::from_env();
-        // Said at startup, not left to the first hit: a diagnostic that only ever speaks when it
-        // finds something cannot be told, from its silence, from one that was never compiled in.
-        // limina builds `third_party/virglrs`, not whichever clone the change was written in, so
-        // "the trace printed nothing" is a claim about the build before it is one about the run.
-        if std::env::var_os("LIMINA_READBACK_TRACE").is_some() {
-            eprintln!("[virglrs] readback trace armed: blank scanout readbacks will be named");
-        }
+        let traces = vrend::debug::Traces::from_env();
         let fences = Retirement::start(fences);
         let vrend = if config.vrend {
             Some(vrend::vrend::Vrend::new(
@@ -742,6 +738,7 @@ impl Renderer {
                 fences.handle(),
                 contexts,
                 condemned.clone(),
+                traces,
             )?)
         } else {
             None
@@ -756,6 +753,7 @@ impl Renderer {
                 .then(|| venus::vkr::Vkr::new(config, resources.clone(), &budget, fences.handle())),
             budget,
             vrend,
+            traces,
             fences,
         })
     }
@@ -1070,9 +1068,7 @@ impl Renderer {
         // through: the context stream's transfer is traced in `vrend::context`, and a transfer
         // named by the VMM never touches it. Both have to be silent for "nothing wrote it" to
         // mean anything.
-        if direction == transfer::Direction::ToHost
-            && std::env::var_os("LIMINA_READBACK_TRACE").is_some()
-        {
+        if direction == transfer::Direction::ToHost && self.traces.readback {
             // Filtered on the resource resolving to a classic IOSurface, the same resolution the
             // blank-readback trace makes -- so the two name the same surfaces or neither does.
             if let Some(surface) = self.classic_surface(handle) {
@@ -1920,6 +1916,7 @@ impl Renderer {
         stride: usize,
         height: u32,
     ) -> Option<u32> {
+        let traces = self.traces;
         if let Some(surface) = self.classic_surface(handle) {
             if !surface.readable() {
                 // The minting host has nowhere else to go: an IOSurface that will not map is the
@@ -1932,12 +1929,12 @@ impl Renderer {
                     // Read while the surface is borrowed; the round trip below needs `&mut self`.
                     let id = surface.id().0;
                     let rows = self.read_classic_through_export(handle, dst, stride, height)?;
-                    trace_blank_readback("exported", handle, id, dst, stride, rows);
+                    trace_blank_readback(traces, "exported", handle, id, dst, stride, rows);
                     return Some(rows);
                 }
             }
             let rows = surface.read_rows(dst, stride, height);
-            trace_blank_readback("classic", handle, surface.id().0, dst, stride, rows);
+            trace_blank_readback(traces, "classic", handle, surface.id().0, dst, stride, rows);
             return Some(rows);
         }
         let storage = self.resource_storage(handle)?;
@@ -1946,7 +1943,7 @@ impl Renderer {
             return None;
         }
         let rows = surface.read_rows(dst, stride, height);
-        trace_blank_readback("shared", handle, surface.id().0, dst, stride, rows);
+        trace_blank_readback(traces, "shared", handle, surface.id().0, dst, stride, rows);
         Some(rows)
     }
 
@@ -2178,6 +2175,7 @@ impl Renderer {
 /// that match are therefore not proof that two surfaces are the same one, and nothing here may
 /// grow into a lookup by id.
 fn trace_blank_readback(
+    traces: vrend::debug::Traces,
     kind: &str,
     handle: ResourceHandle,
     surface_id: u32,
@@ -2185,7 +2183,7 @@ fn trace_blank_readback(
     stride: usize,
     rows: u32,
 ) {
-    if std::env::var_os("LIMINA_READBACK_TRACE").is_none() {
+    if !traces.readback {
         return;
     }
     // Sampled across the height, not just row 0: a frame painted below the top row is a picture

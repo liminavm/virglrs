@@ -119,6 +119,8 @@ impl Todo {
 /// resources, the guest's pages, and the winsys for sub-context switches.
 pub struct Host<'a> {
     pub gl: &'a Gl,
+    /// limina's trace knobs, as the renderer read them when it was built.
+    pub traces: super::debug::Traces,
     /// Which batch is running, for the one thing that has to know: whether a copy of a guest's
     /// pages was already taken since the guest last had a chance to write them.
     pub batch: u64,
@@ -1121,7 +1123,7 @@ pub(super) fn trace_scanout_write(
     dst: ResourceHandle,
     src: Option<ResourceHandle>,
 ) {
-    if std::env::var_os("LIMINA_READBACK_TRACE").is_none() {
+    if !host.traces.readback {
         return;
     }
     let Ok(res) = host.resource(cmd, dst) else { return };
@@ -2728,8 +2730,9 @@ impl Context {
         // check that poisons runs once the whole command is done, so it knows the command and not
         // the call. NOTE that draining here CONSUMES the error, so a traced run does not poison
         // on it -- the trace is for finding the call, never for deciding whether there was one.
+        let gl_trace = host.traces.gl;
         let probe = |what: &str| {
-            if std::env::var_os("LIMINA_GL_TRACE").is_some() {
+            if gl_trace {
                 let e = gl.drain_errors();
                 if e != GL_NO_ERROR {
                     eprintln!("[virglrs] vrend: sampler view: {what} left GL error {e:#x}");
@@ -2949,7 +2952,7 @@ impl Context {
                             first_layer,
                             layers as GLuint,
                         );
-                        if std::env::var_os("LIMINA_GL_TRACE").is_some() {
+                        if gl_trace {
                             eprintln!(
                                 "[virglrs] vrend: sampler view: texture_view of resource {:?} \
                              ({}x{} {}, immutable {}, surface {}, supports_view \
@@ -3001,7 +3004,7 @@ impl Context {
         }
         // Catch-all: an error the two probes above did not claim came from one of the other calls
         // on this path, and the description is what says which resource provoked it.
-        if std::env::var_os("LIMINA_GL_TRACE").is_some() {
+        if gl_trace {
             let e = gl.drain_errors();
             if e != GL_NO_ERROR {
                 let res = host.resource(cmd, v.resource)?;
@@ -3688,7 +3691,7 @@ impl Context {
         // The context and the geometry are the load-bearing half: an id alone cannot say whether
         // a rotation of surfaces is the compositor's framebuffers or a client's swapchain, and
         // reading a compositor into one was how this trace was misread once already.
-        if std::env::var_os("LIMINA_READBACK_TRACE").is_some()
+        if host.traces.readback
             && let Some(image) = s.textures.minted()
         {
             let id = image.surface().id().0;

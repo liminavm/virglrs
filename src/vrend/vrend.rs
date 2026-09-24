@@ -127,6 +127,13 @@ pub struct Vrend {
     /// charges is the IOSurfaces this arm mints and nothing else; ordinary GL storage is the
     /// driver's and this process cannot see it.
     budget: crate::budget::Classic,
+    /// limina's trace knobs, as the renderer read them when it was built.
+    traces: super::debug::Traces,
+    /// `VIRGLRS_FENCE_FINISH=1`: every fence finishes every context inline, on this thread -- the
+    /// behaviour the fence path replaced, kept so the two can be compared on one build the way the
+    /// cost of the finish was measured in the first place. Retirement still goes through the
+    /// waiter's queue, so the comparison changes what a fence costs and not what it means.
+    fence_finish: bool,
 }
 
 /// The versions tried, newest first -- the GLES rows of the C's `gl_versions` ladder.
@@ -220,6 +227,7 @@ impl Vrend {
         fences: crate::fence::Handle,
         contexts: Option<Box<dyn GlContexts>>,
         condemned: resource::Condemned,
+        traces: super::debug::Traces,
     ) -> Result<Vrend, InitError> {
         let fences_for_inline = fences.clone();
         // An embedder's winsys arrives with ctx0 already made and current, because its display is
@@ -343,6 +351,8 @@ impl Vrend {
             batch: 0,
             pixels: resource::Refresh::default(),
             budget: crate::budget::Classic::open(budget),
+            traces,
+            fence_finish: std::env::var("VIRGLRS_FENCE_FINISH").as_deref() == Ok("1"),
         })
     }
 
@@ -408,9 +418,12 @@ impl Vrend {
             staging,
             waiter: _,
             fences: _,
+            traces,
+            fence_finish: _,
         } = self;
         let host = Host {
             batch: *batch,
+            traces: *traces,
             tally,
             staging,
             budget,
@@ -1031,14 +1044,7 @@ impl Vrend {
     /// decision has four exits and an instrument that must be remembered at each of them is one
     /// that will be missing from the fifth.
     fn decide_fence(&mut self, on: Option<ContextId>) -> Answer {
-        // `VIRGLRS_FENCE_FINISH=1` puts the old behaviour back -- every context finished inline,
-        // on this thread -- so the two can be compared on one build the way the cost of the finish
-        // was measured in the first place. Retirement still goes through the waiter's queue, so
-        // the comparison changes what the fence costs and not what it means.
-        static FORCE_FINISH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let forced = *FORCE_FINISH
-            .get_or_init(|| std::env::var("VIRGLRS_FENCE_FINISH").as_deref() == Ok("1"));
-        if forced {
+        if self.fence_finish {
             self.finish_all();
             return Answer::Ordered;
         }
@@ -1436,6 +1442,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         let present: Vec<&str> = v.features.present().map(|f| f.name()).collect();
@@ -1469,6 +1476,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
 
@@ -1532,6 +1540,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         assert!(
@@ -1586,6 +1595,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
 
@@ -1640,6 +1650,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
@@ -1711,6 +1722,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         assert!(v.features.has(Feature::timer_query), "the premise: this driver has timer queries");
@@ -1810,6 +1822,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         assert!(v.features.has(Feature::timer_query), "the premise: this driver has timer queries");
@@ -1877,6 +1890,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         let before = budget.classic();
@@ -1934,6 +1948,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
@@ -2009,6 +2024,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
@@ -2074,6 +2090,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
@@ -2117,6 +2134,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
@@ -2184,6 +2202,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         let bgra = super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM");
@@ -2305,6 +2324,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         let mut wire = Vec::new();
@@ -2443,6 +2463,7 @@ mod tests {
             retire.handle(),
             None,
             condemned.clone(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
         let bgra = super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM");
@@ -2521,6 +2542,7 @@ mod tests {
             retire.handle(),
             None,
             crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
         )
         .expect("vrend comes up");
 
