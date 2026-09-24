@@ -2021,6 +2021,24 @@ SABOTAGES = [
         'the_decoder_counters_outlive_the_window',
     ),
     (
+        'the VideoToolbox warm-up is never started',
+        'src/videotoolbox.rs',
+        """    if !support.decodes(Codec::Vp9) {
+        return None;
+    }""",
+        """    if support.decodes(Codec::Vp9) {
+        return None;
+    }""",
+        'after_the_warm_up_a_first_session_of_another_codec_is_cheap',
+    ),
+    (
+        'the VideoToolbox warm-up thread builds no session',
+        'src/videotoolbox.rs',
+        """        if let Err(status) = Session::create(key) {""",
+        """        if let Err(status) = Err::<(), _>(Status(0)).map(|()| drop(key)) {""",
+        'after_the_warm_up_a_first_session_of_another_codec_is_cheap',
+    ),
+    (
         'pages the host mints for a context are credited as soon as they are charged',
         'src/renderer.rs',
         """            Ok((fd, map)) => Ok(HostShm { fd, map: Arc::new(map.charged(charge)) }),""",

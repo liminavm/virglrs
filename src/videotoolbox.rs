@@ -129,6 +129,36 @@ impl Support {
     }
 }
 
+/// Build and drop one session on a thread of its own, so the first frame a guest decodes does not
+/// pay for the process's first session.
+///
+/// A process's first session costs ~50 ms, whatever the codec, and every later one ~3 ms, again
+/// whatever the codec: the first warms VideoToolbox as a whole, not a decoder (measured with
+/// `examples/first-session.rs`, every order of VP9, H.264 and HEVC). Paid on the decode thread by a
+/// guest's first frame, it filled the codec's queue while the player submitted ahead, and END_FRAME
+/// then held the control queue for ~65 ms at the start of every first playback.
+///
+/// VP9 is the codec to warm with because its configuration is a constant record; the parameter-set
+/// codecs would need a stream's SPS. A host without it warms nothing and pays the cost as before.
+pub fn warm_up(support: &Support) -> Option<std::thread::JoinHandle<()>> {
+    if !support.decodes(Codec::Vp9) {
+        return None;
+    }
+    let warming = std::thread::Builder::new().name("virglrs-vt-warm".into()).spawn(|| {
+        let key = SessionKey {
+            width: 1280,
+            height: 720,
+            pixels: PixelFormat::BiPlanar420,
+            config: Configuration::vp9(0, 8, 1),
+        };
+        // Nothing depends on it: a failure only means the first real session pays as before.
+        if let Err(status) = Session::create(key) {
+            eprintln!("[virglrs] video: warming VideoToolbox built no session ({status:?})");
+        }
+    });
+    Some(warming.expect("spawning the VideoToolbox warm-up thread"))
+}
+
 // ------------------------------------------------------------------ CoreFoundation
 
 /// An opaque CoreFoundation object. Every foreign handle below is one, distinguished by the

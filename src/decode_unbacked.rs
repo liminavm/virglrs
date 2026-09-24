@@ -68,6 +68,11 @@ impl Support {
     }
 }
 
+/// Warm the decoder ahead of the first frame. There is none to warm.
+pub fn warm_up(_support: &Support) -> Option<std::thread::JoinHandle<()>> {
+    None
+}
+
 /// Why a session could not be built. Opaque: there is no platform status to carry.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Status;

@@ -271,6 +271,9 @@ impl Vrend {
         let formats = Table::probe(&gl, &features);
         let video = config.video.then(decode::Support::probe);
         if let Some(support) = video {
+            // Detached: the thread holds nothing of the renderer, and a real session built while
+            // it is still running only pays what it would have paid anyway.
+            drop(decode::warm_up(&support));
             let names: Vec<&str> = decode::Codec::ALL
                 .iter()
                 .filter(|c| support.decodes(**c))
