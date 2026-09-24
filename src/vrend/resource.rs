@@ -25,9 +25,7 @@ use crate::budget::Charged;
 use crate::budget::{Charge, Classic};
 use crate::guest_mem::{Iov, PixelSource};
 use crate::ids::ResourceHandle;
-#[cfg(target_os = "macos")]
-use crate::surface::PixelFormat;
-use crate::surface::{Adoptable, Held, PlanarFormat, Surface};
+use crate::surface::{Adoptable, Held, PixelFormat, PlanarFormat, Surface};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -2167,6 +2165,29 @@ fn mint_surface(
     None
 }
 
+/// The pixel format a resource's presentable storage takes, or `None` for a resource that gets
+/// none: a scanout or a shared buffer, single-level, single-sample and 2D, in one of the four
+/// 32-bit formats both an IOSurface and a dma-buf name.
+///
+/// One gate for both hosts, because what a resource is *for* does not change with the host: a
+/// resource given a surface on one is the one that carries a descriptor on the other. Two copies
+/// would let the hosts disagree about which resources are presentable, and every score that reads
+/// a scanout would then diverge for a reason that is not the renderer's arithmetic.
+fn presentable_format(a: &Args) -> Option<PixelFormat> {
+    if !a.bind.has(Bind::SCANOUT) && !a.bind.has(Bind::SHARED) {
+        return None;
+    }
+    if a.target != TextureTarget::Texture2d || a.last_level != 0 || a.nr_samples > 1 || a.depth != 1
+    {
+        return None;
+    }
+    match a.format.name() {
+        "B8G8R8A8_UNORM" | "B8G8R8X8_UNORM" => Some(PixelFormat::Bgra),
+        "R8G8B8A8_UNORM" | "R8G8B8X8_UNORM" => Some(PixelFormat::Rgba),
+        _ => None,
+    }
+}
+
 /// `vrend_resource_iosurface_init`: the IOSurface a resource's storage is, when it is one.
 ///
 /// A scanout is the compositor's framebuffer; a shared buffer is every buffer gbm hands out,
@@ -2179,19 +2200,8 @@ fn mint_surface(
 /// the system or the driver refuses: the fallback is never removed, only reported.
 #[cfg(target_os = "macos")]
 fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args) -> Option<Image> {
+    let format = presentable_format(a)?;
     let scanout = a.bind.has(Bind::SCANOUT);
-    if !scanout && !a.bind.has(Bind::SHARED) {
-        return None;
-    }
-    if a.target != TextureTarget::Texture2d || a.last_level != 0 || a.nr_samples > 1 || a.depth != 1
-    {
-        return None;
-    }
-    let format = match a.format.name() {
-        "B8G8R8A8_UNORM" | "B8G8R8X8_UNORM" => PixelFormat::Bgra,
-        "R8G8B8A8_UNORM" | "R8G8B8X8_UNORM" => PixelFormat::Rgba,
-        _ => return None,
-    };
     if !features.adopts_iosurfaces() {
         // Known at init and reported there; the resource keeps ordinary GL storage. Ahead of the
         // mint, not after it: a surface minted here would be dropped unused, and its charge taken
@@ -2609,13 +2619,8 @@ fn export_surface(_winsys: &Winsys, _a: &Args, _name: TextureName) -> Option<Arc
     None
 }
 
-/// A descriptor of a texture's own storage, for the resources a compositor will want to import.
-///
-/// The gate is `mint_surface`'s, and deliberately so: the same binds, the same shape, the same
-/// four formats. What a resource is *for* does not change with the host, and a resource that
-/// would have been given a surface on one host is the one that should carry a descriptor on the
-/// other -- otherwise the two hosts disagree about which resources are presentable, and every
-/// score that reads a scanout diverges for a reason that is not the renderer's arithmetic.
+/// A descriptor of a texture's own storage, for the resources a compositor will want to import:
+/// those [`presentable_format`] names, as on the minting host.
 ///
 /// No charge is taken. The bytes are the texture's, which GL already allocated and this renderer
 /// already accounts for; a descriptor of them is a second name for memory that is counted once.
@@ -2627,33 +2632,11 @@ fn export_surface(_winsys: &Winsys, _a: &Args, _name: TextureName) -> Option<Arc
 /// property of the driver and does not change, and a compositor creates resources by the hundred.
 #[cfg(not(target_os = "macos"))]
 fn export_surface(winsys: &Winsys, a: &Args, name: TextureName) -> Option<Arc<dyn Held>> {
-    use crate::surface::PixelFormat;
-
-    if !a.bind.has(Bind::SCANOUT) && !a.bind.has(Bind::SHARED) {
-        return None;
-    }
-    if a.target != TextureTarget::Texture2d || a.last_level != 0 || a.nr_samples > 1 || a.depth != 1
-    {
-        return None;
-    }
-    let format = match a.format.name() {
-        "B8G8R8A8_UNORM" | "B8G8R8X8_UNORM" => PixelFormat::Bgra,
-        "R8G8B8A8_UNORM" | "R8G8B8X8_UNORM" => PixelFormat::Rgba,
-        _ => return None,
-    };
-    // Said once, each way -- and that needs a latch each way. A needle that only fires on
-    // failure reads the same when the export works and when the gate above quietly stopped
-    // matching anything, and "no refusals in the log" is exactly the reading this renderer has
-    // been caught trusting before. One latch for both lines would print whichever came first and
-    // then go silent, so a refusal after a success would be the invisible case again.
-    static EXPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let first = |said: &std::sync::atomic::AtomicBool| {
-        !said.swap(true, std::sync::atomic::Ordering::Relaxed)
-    };
+    let format = presentable_format(a)?;
+    // Said once each way; see `egl::Said`.
     match winsys.export_texture(name, a.width, a.height, format) {
         Ok(surface) => {
-            if first(&EXPORTED) {
+            if winsys.said.first(true) {
                 let l = *surface.layout();
                 eprintln!(
                     "[virglrs] vrend: scanouts export as dma-bufs: {}x{} {} is fourcc {:#010x} \
@@ -2669,7 +2652,7 @@ fn export_surface(winsys: &Winsys, a: &Args, name: TextureName) -> Option<Arc<dy
             Some(Arc::new(surface) as Arc<dyn Held>)
         }
         Err(e) => {
-            if first(&REFUSED) {
+            if winsys.said.first(false) {
                 eprintln!(
                     "[virglrs] vrend: this driver exports no dma-buf for a {}x{} {} resource \
                      ({e}); scanouts are read back through the CPU instead",

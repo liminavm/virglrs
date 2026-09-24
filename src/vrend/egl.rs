@@ -230,6 +230,26 @@ pub struct Winsys {
     flavour: Flavour,
     version: Version,
     extensions: BTreeSet<String>,
+    /// Which of [`Winsys::export_texture`]'s two answers has been reported.
+    pub said: Said,
+}
+
+/// Whether a driver's answer to a question it answers the same way every time has been reported
+/// yet, each way. A needle that only fires on failure reads the same when the thing works and
+/// when the gate in front of it quietly stopped matching anything, so success is said too -- and
+/// one latch for both would print whichever came first and then hide a refusal after a success.
+#[derive(Default)]
+pub struct Said {
+    yes: std::sync::atomic::AtomicBool,
+    no: std::sync::atomic::AtomicBool,
+}
+
+impl Said {
+    /// Whether the answer `ok` is being given for the first time.
+    pub fn first(&self, ok: bool) -> bool {
+        let latch = if ok { &self.yes } else { &self.no };
+        !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// An EGL context on the winsys's display. Destroyed with it; cannot outlive the display.
@@ -522,6 +542,7 @@ impl Winsys {
             flavour,
             version: Version { major: major as u32, minor: minor as u32 },
             extensions,
+            said: Said::default(),
         })
     }
 
@@ -585,7 +606,11 @@ impl Winsys {
         };
         let shared = Arc::new(Shared { egl, display, backing: Backing::Embedder(contexts) });
         let ctx0 = Context { shared: Arc::clone(&shared), ctx };
-        Ok((Winsys { shared, flavour, version, extensions }, ctx0, version_made))
+        Ok((
+            Winsys { shared, flavour, version, extensions, said: Said::default() },
+            ctx0,
+            version_made,
+        ))
     }
 
     pub fn flavour(&self) -> Flavour {
