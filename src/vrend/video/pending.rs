@@ -119,6 +119,7 @@ struct Counters {
     replaces: Window,
     queue: Window,
     decoded: DecodeWindows,
+    uploads: Window,
 }
 
 /// Where a decode's time goes on its codec's thread.
@@ -222,6 +223,19 @@ impl Unsettled {
     pub fn take_decode_times(&self) -> DecodeTimes {
         let d = &self.0.decoded;
         DecodeTimes { queued: d.queued.take(), session: d.session.take(), write: d.write.take() }
+    }
+
+    /// Record one plane uploaded on the render thread, from mapping the picture to the upload's
+    /// return. Only a per-plane target -- the stock tier's shape -- uploads there; delivery records
+    /// straight into the counters its picture carries, and this is the same window.
+    #[cfg(test)]
+    fn record_upload(&self, took: Duration) {
+        self.0.uploads.record(took);
+    }
+
+    /// The render thread's plane uploads since the last call. Taken, like [`Self::take_waits`].
+    pub fn take_uploads(&self) -> Waited {
+        self.0.uploads.take()
     }
 
     /// Every wait for the decoder since the last call. Taken, so each report covers its own
@@ -408,7 +422,9 @@ fn deliver(pending: Pending, gl: &Gl, name: TextureName, planes: Option<&Planes>
             planes.expect("a composite recipe is only attached to a composite target").delivered()
         }
         (Recipe::Plane(upload), Outcome::Picture(picture)) => {
+            let began = Instant::now();
             upload_plane(gl, name, upload, picture);
+            pending.counted.0.uploads.record(began.elapsed());
             false
         }
         // Nothing reached the target, or the recipe and the outcome are for different kinds of
@@ -673,5 +689,19 @@ mod tests {
         assert_eq!(times.session.total, Duration::from_millis(3));
         assert_eq!(unsettled.take_decode_times(), DecodeTimes::default(), "taken per window");
         assert_eq!(unsettled.take_waits(), Stalls::default(), "a decode is not a wait");
+    }
+
+    /// A render-thread upload is counted on its own, not as a wait or a decode phase.
+    #[test]
+    fn a_plane_upload_is_counted_apart_from_waits_and_decodes() {
+        let unsettled = Unsettled::default();
+        unsettled.record_upload(Duration::from_millis(2));
+        unsettled.record_upload(Duration::from_millis(4));
+        let uploads = unsettled.take_uploads();
+        assert_eq!((uploads.count, uploads.total), (2, Duration::from_millis(6)));
+        assert_eq!(uploads.longest, Duration::from_millis(4));
+        assert_eq!(unsettled.take_uploads(), Waited::default(), "taken per window");
+        assert_eq!(unsettled.take_waits(), Stalls::default(), "an upload is not a wait");
+        assert_eq!(unsettled.take_decode_times(), DecodeTimes::default());
     }
 }

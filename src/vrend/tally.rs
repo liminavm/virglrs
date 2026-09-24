@@ -510,6 +510,19 @@ impl Armed {
                 t.queued.count,
             );
         }
+        // Per-plane targets upload each plane on this thread when it settles, which asynchronous
+        // decode left behind; the stock tier's targets all take that path.
+        let u = a.settles.take_uploads();
+        if u.count > 0 {
+            eprintln!(
+                "[virglrs] vrend video: {} plane uploads on the render thread  {:.2} ms in all  \
+                 {:.2} ms mean  max {:.2} ms  (over {secs:.1}s{note})",
+                u.count,
+                u.total.as_secs_f64() * 1e3,
+                u.total.as_secs_f64() * 1e3 / u.count as f64,
+                u.longest.as_secs_f64() * 1e3,
+            );
+        }
         // What video costs the submitting thread, printed only for a window that decoded. The
         // maximum is the number that matters: it is how long one command held up every context.
         if a.video_commands > 0 {
