@@ -582,6 +582,9 @@ mod tests {
 /// Diff the framing against the C it was ported from.
 #[cfg(all(test, feature = "video-oracle"))]
 mod oracle {
+    // The oracle is the C tree, reached through its own ABI.
+    #![allow(unsafe_code)]
+
     use super::*;
 
     unsafe extern "C" {

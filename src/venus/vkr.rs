@@ -599,6 +599,10 @@ impl Vkr {
 
 #[cfg(test)]
 mod tests {
+    // The fakes stand in for the Vulkan driver, and a driver writes through the pointers it is
+    // handed. Test code, which a handler's `unsafe` would not be.
+    #![allow(unsafe_code)]
+
     use super::*;
     use crate::guest_mem::GuestMap;
     use crate::ids::ResourceHandle;

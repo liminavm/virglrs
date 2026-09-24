@@ -23,10 +23,12 @@ pub mod current;
 pub mod debug;
 pub mod decode;
 pub mod dirty;
+#[allow(unsafe_code)]
 pub mod egl;
 pub mod encode;
 pub mod features;
 pub mod formats;
+#[allow(unsafe_code)]
 pub mod gl;
 pub mod journal;
 pub mod pipe;

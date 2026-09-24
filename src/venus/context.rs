@@ -5601,6 +5601,10 @@ impl Commands for Handlers<'_> {
 
 #[cfg(test)]
 mod tests {
+    // The fakes stand in for the Vulkan driver, and a driver writes through the pointers it is
+    // handed. Test code, which a handler's `unsafe` would not be.
+    #![allow(unsafe_code)]
+
     /// A resource table with nothing in it, for the tests that are not about rings. A ring
     /// handler reaching for a resource here gets the same answer a guest naming a bogus one does.
     struct NoResources;

@@ -2230,6 +2230,9 @@ pub fn unsupported_renderers(config: Config) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    // A pipe and its descriptors are how these tests watch a file descriptor change hands.
+    #![allow(unsafe_code)]
+
     /// Some allocation key, for the tests whose subject is not an allocation's lifetime.
     ///
     /// `Exporter` names the allocation a blob came from, and every blob has one -- but a test about

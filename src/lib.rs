@@ -10,6 +10,12 @@
 //! What is real here: the ABI types, the resource table, the context table, fence tracking and
 //! asynchronous fence retirement. What is not: both renderers. Every entry point belonging to a
 //! later phase returns `-ENOTSUP` rather than a plausible success -- see `ffi::todo_phase`.
+//!
+//! `unsafe` lives in the modules `CLAUDE.md` names and nowhere else, and the build says so: it is
+//! denied here and allowed only at those modules' declarations. A module that starts needing it is
+//! a module whose types are wrong, and the error is where that conversation starts.
+
+#![deny(unsafe_code)]
 
 /// The prefix every refusal is printed under, whichever renderer refused.
 ///
@@ -44,26 +50,33 @@ pub const REFUSED: &str = "[virglrs] refused:";
 /// its `BTreeMap`, and says why.
 pub type Map<K, V> = rustc_hash::FxHashMap<K, V>;
 
+#[allow(unsafe_code)]
 pub mod abi;
 pub mod budget;
 pub mod config;
 #[cfg(target_os = "macos")]
 #[path = "videotoolbox.rs"]
+#[allow(unsafe_code)]
 pub mod decode;
 #[cfg(not(target_os = "macos"))]
 #[path = "decode_unbacked.rs"]
 pub mod decode;
 #[cfg(not(target_os = "macos"))]
+#[allow(unsafe_code)]
 pub mod dmabuf;
 pub mod fence;
+#[allow(unsafe_code)]
 pub mod ffi;
+#[allow(unsafe_code)]
 pub mod guest_mem;
 pub mod ids;
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 pub mod metal;
 pub mod renderer;
 pub mod stats;
 pub mod surface;
 pub mod venus;
 pub mod vrend;
+#[allow(unsafe_code)]
 pub mod vulkan;

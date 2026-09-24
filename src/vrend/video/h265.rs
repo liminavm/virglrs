@@ -1052,6 +1052,9 @@ mod tests {
 /// Diff the three sets and the slice inspection against the C they were ported from.
 #[cfg(all(test, feature = "video-oracle"))]
 mod oracle {
+    // The oracle is the C tree, reached through its own ABI.
+    #![allow(unsafe_code)]
+
     use super::*;
 
     unsafe extern "C" {

@@ -10,11 +10,14 @@
 
 pub mod capset;
 pub mod context;
+#[allow(unsafe_code)]
 pub mod cs;
+#[allow(unsafe_code)]
 pub mod driver;
 pub mod journal;
 pub mod monitor;
 pub mod objects;
+#[allow(unsafe_code)]
 pub mod proto;
 pub mod ring;
 pub mod ring_thread;

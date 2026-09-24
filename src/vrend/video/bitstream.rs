@@ -430,6 +430,9 @@ mod tests {
 /// check it is to drive both sides from one script and compare what comes out.
 #[cfg(all(test, feature = "video-oracle"))]
 mod oracle {
+    // The oracle is the C tree, reached through its own ABI.
+    #![allow(unsafe_code)]
+
     use super::*;
 
     const OP_RAW: u32 = 0;

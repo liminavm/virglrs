@@ -2366,6 +2366,9 @@ mod tests {
 /// Diff the layout and the sequence header against the C they were ported from.
 #[cfg(all(test, feature = "video-oracle"))]
 mod oracle {
+    // The oracle is the C tree, reached through its own ABI.
+    #![allow(unsafe_code)]
+
     use super::*;
 
     unsafe extern "C" {
