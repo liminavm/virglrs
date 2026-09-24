@@ -1478,7 +1478,7 @@ mod tests {
     }
 
     /// What a test publisher was told, in order. Other tests mint concurrently without the mint
-    /// lock and are published too, so every assertion filters by the id it minted.
+    /// lock and are published too, so every assertion reads through a [`Watched`] surface.
     #[derive(Default)]
     struct Recorder {
         events: std::sync::Mutex<Vec<(&'static str, u32, bool)>>,
@@ -1504,10 +1504,38 @@ mod tests {
         }
     }
 
+    /// One surface's place in the record, taken right after it is minted.
+    ///
+    /// Filtering by id alone is not enough, because ids are recycled: a surface another test
+    /// minted and released before this one can have held the same id, and one minted after this
+    /// one dies can take it again. Right after the mint the id is this surface's, so the last
+    /// publish under it is this surface's own; its events run from there to its release.
+    struct Watched {
+        id: SurfaceId,
+        from: usize,
+    }
+
     impl Recorder {
-        fn about(&self, id: SurfaceId) -> Vec<(&'static str, bool)> {
+        fn watch(&self, id: SurfaceId) -> Watched {
             let events = self.events.lock().unwrap();
-            events.iter().filter(|e| e.1 == id.0).map(|e| (e.0, e.2)).collect()
+            let from = events
+                .iter()
+                .rposition(|e| e.0 == "publish" && e.1 == id.0)
+                .expect("a surface minted under a publisher was published");
+            Watched { id, from }
+        }
+
+        fn about(&self, w: &Watched) -> Vec<(&'static str, bool)> {
+            let events = self.events.lock().unwrap();
+            let mine = events[w.from..].iter().filter(|e| e.1 == w.id.0);
+            let mut out = Vec::new();
+            for e in mine {
+                out.push((e.0, e.2));
+                if e.0 == "release" {
+                    break;
+                }
+            }
+            out
         }
     }
 
@@ -1537,14 +1565,15 @@ mod tests {
 
         let surface = Surface::scanout(64, 32, PixelFormat::Bgra, 64 * 4).expect("minted");
         let id = surface.id();
+        let it = recorder.watch(id);
         assert!(!a_stranger_finds(id), "no stranger can reach it by id");
-        assert_eq!(recorder.about(id), [("publish", true)], "the publisher got a right to it");
+        assert_eq!(recorder.about(&it), [("publish", true)], "the publisher got a right to it");
 
         assert!(republish(id.0), "and can ask for it again while it lives");
-        assert_eq!(recorder.about(id).len(), 2);
+        assert_eq!(recorder.about(&it).len(), 2);
 
         drop(surface);
-        let events = recorder.about(id);
+        let events = recorder.about(&it);
         assert_eq!(events.len(), 3, "released exactly once");
         assert_eq!(events[2].0, "release");
         assert!(!republish(id.0), "and never handed over again");
@@ -1559,8 +1588,9 @@ mod tests {
 
         let surface = Surface::planar(64, 32, PlanarFormat::BiPlanar420).expect("minted");
         let id = surface.id();
+        let it = recorder.watch(id);
         assert!(!a_stranger_finds(id), "no stranger can reach it by id");
-        assert_eq!(recorder.about(id), [("publish", true)]);
+        assert_eq!(recorder.about(&it), [("publish", true)]);
     }
 
     /// The debug oracle reads surfaces by id from another process, so it can ask for them to be
@@ -1573,13 +1603,14 @@ mod tests {
 
         let surface = Surface::scanout(64, 32, PixelFormat::Bgra, 64 * 4).expect("minted");
         let id = surface.id();
+        let it = recorder.watch(id);
         assert!(a_stranger_finds(id), "global for the oracle");
-        assert_eq!(recorder.about(id), [("publish", true)], "and handed over all the same");
+        assert_eq!(recorder.about(&it), [("publish", true)], "and handed over all the same");
 
         // A global surface is the one kind whose aliveness a lookup can witness, so this is
         // where the ordering is checked: the release goes out while the id still names it.
         drop(surface);
-        assert_eq!(recorder.about(id)[1..], [("release", true)], "released before it died");
+        assert_eq!(recorder.about(&it)[1..], [("release", true)], "released before it died");
     }
 
     /// The pitch is the caller's, because the importer's layout is the caller's. A surface that
