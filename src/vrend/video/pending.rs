@@ -118,6 +118,15 @@ struct Counters {
     reads: Window,
     replaces: Window,
     queue: Window,
+    decoded: DecodeWindows,
+}
+
+/// Where a decode's time goes on its codec's thread.
+#[derive(Default)]
+struct DecodeWindows {
+    queued: Window,
+    session: Window,
+    write: Window,
 }
 
 /// One kind of wait the render thread made for the decoder, counted since the last report.
@@ -154,6 +163,28 @@ pub struct Waited {
     pub longest: Duration,
 }
 
+/// Where the decode thread's time went, per phase, in a report's window.
+///
+/// `queued` is from the send to the decode thread taking the job, `session` is the VideoToolbox
+/// decode, and `write` is copying the picture into a composite target's planes (none for a
+/// per-plane target, whose planes upload on the render thread). A fence taken behind a decode
+/// waits at most the sum, which is what makes these the bound on how long one context's decode
+/// can hold back another's fences.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct DecodeTimes {
+    pub queued: Waited,
+    pub session: Waited,
+    pub write: Waited,
+}
+
+/// One decode's phases, measured on the decode thread; see [`DecodeTimes`].
+#[derive(Clone, Copy, Default)]
+pub struct Phases {
+    pub queued: Duration,
+    pub session: Option<Duration>,
+    pub write: Option<Duration>,
+}
+
 /// Every way the render thread waits for the decoder, each counted on its own.
 ///
 /// Only `reads` is a read outrunning its picture. The other two are waits END_FRAME itself makes,
@@ -172,6 +203,25 @@ impl Unsettled {
     /// Whether any target anywhere has a picture not yet settled.
     pub fn any(&self) -> bool {
         self.0.pending.load(Ordering::Acquire) != 0
+    }
+
+    /// Record one decode's phases. Called on the decode thread; a phase that did not run -- a
+    /// session that could not be built, a picture with no planes to write -- is not counted.
+    pub fn record_decode(&self, phases: Phases) {
+        let d = &self.0.decoded;
+        d.queued.record(phases.queued);
+        if let Some(took) = phases.session {
+            d.session.record(took);
+        }
+        if let Some(took) = phases.write {
+            d.write.record(took);
+        }
+    }
+
+    /// The decode thread's phase times since the last call. Taken, like [`Self::take_waits`].
+    pub fn take_decode_times(&self) -> DecodeTimes {
+        let d = &self.0.decoded;
+        DecodeTimes { queued: d.queued.take(), session: d.session.take(), write: d.write.take() }
     }
 
     /// Every wait for the decoder since the last call. Taken, so each report covers its own
@@ -600,5 +650,28 @@ mod tests {
         assert_eq!(stalls.queue.count, 1);
         assert!(stalls.queue.total >= Duration::from_millis(30), "the wait was {stalls:?}");
         assert_eq!(stalls.reads.count, 0, "a full queue is not a read");
+    }
+
+    /// A decode's phases land in their own windows, and a phase that did not run is not counted
+    /// as one that took no time.
+    #[test]
+    fn a_decode_records_only_the_phases_it_ran() {
+        let unsettled = Unsettled::default();
+        unsettled.record_decode(Phases {
+            queued: Duration::from_millis(1),
+            session: Some(Duration::from_millis(3)),
+            write: Some(Duration::from_millis(2)),
+        });
+        unsettled.record_decode(Phases {
+            queued: Duration::from_millis(5),
+            session: None,
+            write: None,
+        });
+        let times = unsettled.take_decode_times();
+        assert_eq!((times.queued.count, times.session.count, times.write.count), (2, 1, 1));
+        assert_eq!(times.queued.longest, Duration::from_millis(5));
+        assert_eq!(times.session.total, Duration::from_millis(3));
+        assert_eq!(unsettled.take_decode_times(), DecodeTimes::default(), "taken per window");
+        assert_eq!(unsettled.take_waits(), Stalls::default(), "a decode is not a wait");
     }
 }
