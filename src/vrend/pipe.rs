@@ -53,6 +53,122 @@ pub mod slots {
     /// `VREND_MAX_COMBINED_SSBO_BINDING_POINTS`: the SSBO binding points share one 32-bit mask
     /// across every stage.
     pub const MAX_COMBINED_SSBO_BINDING_POINTS: u32 = 32;
+
+    /// A slot index of one kind, its range checked once where it is made, and a mask and an
+    /// array that only it can index.
+    ///
+    /// The index arrives in shader operands and declarations as whatever the guest wrote. An index
+    /// checked at each use is one use away from indexing past the array or shifting a mask bit
+    /// round onto slot 0. The only way to a slot is `new`, so the array, the mask and the bit all
+    /// take a value that is already in range, and nothing downstream checks again.
+    macro_rules! slot {
+        ($(#[$m:meta])* $slot:ident, $mask:ident, $per:ident, $count:expr) => {
+            $(#[$m])*
+            #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+            pub struct $slot(u8);
+
+            const _: () = assert!($count <= 32, "a slot's mask is 32 bits wide");
+
+            impl $slot {
+                pub const COUNT: usize = $count;
+
+                /// The slot `index` names, if there is one.
+                pub fn new(index: impl TryInto<usize>) -> Option<Self> {
+                    let index = index.try_into().ok()?;
+                    (index < Self::COUNT).then(|| Self(index as u8))
+                }
+
+                pub fn index(self) -> usize {
+                    usize::from(self.0)
+                }
+
+                pub fn bit(self) -> u32 {
+                    1 << self.0
+                }
+
+                /// Every slot, in order.
+                pub fn all() -> impl Iterator<Item = Self> {
+                    (0..Self::COUNT as u8).map(Self)
+                }
+            }
+
+            #[doc = concat!("A set of [`", stringify!($slot), "`]s.")]
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+            pub struct $mask(u32);
+
+            impl $mask {
+                pub fn insert(&mut self, slot: $slot) {
+                    self.0 |= slot.bit();
+                }
+
+                pub fn contains(self, slot: $slot) -> bool {
+                    self.0 & slot.bit() != 0
+                }
+
+                /// How many slots are in the set.
+                pub fn len(self) -> u32 {
+                    self.0.count_ones()
+                }
+
+                pub fn is_empty(self) -> bool {
+                    self.0 == 0
+                }
+
+                /// How many slots in the set come before `slot`.
+                pub fn count_below(self, slot: $slot) -> u32 {
+                    (self.0 & (slot.bit() - 1)).count_ones()
+                }
+
+                /// The slots in the set, in order.
+                pub fn iter(self) -> impl Iterator<Item = $slot> {
+                    $slot::all().filter(move |s| self.contains(*s))
+                }
+
+                /// The set as a bit per slot, for the state that carries it on as a plain mask.
+                pub fn bits(self) -> u32 {
+                    self.0
+                }
+            }
+
+            #[doc = concat!("One `T` per [`", stringify!($slot), "`], indexed by nothing else.")]
+            #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+            pub struct $per<T>([T; $count]);
+
+            impl<T: Default + Copy> Default for $per<T> {
+                fn default() -> Self {
+                    Self([T::default(); $count])
+                }
+            }
+
+            impl<T> core::ops::Index<$slot> for $per<T> {
+                type Output = T;
+                fn index(&self, slot: $slot) -> &T {
+                    &self.0[slot.index()]
+                }
+            }
+
+            impl<T> core::ops::IndexMut<$slot> for $per<T> {
+                fn index_mut(&mut self, slot: $slot) -> &mut T {
+                    &mut self.0[slot.index()]
+                }
+            }
+
+            impl<T> $per<T> {
+                pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+                    self.0.iter_mut()
+                }
+            }
+        };
+    }
+
+    slot!(
+        /// A sampler a shader samples through: `SAMP[n]`, and the sampler view it names.
+        SamplerSlot, SamplerMask, PerSampler, MAX_SAMPLERS
+    );
+    slot!(
+        /// A shader image: `IMAGE[n]`.
+        ImageSlot, ImageMask, PerImage, MAX_SHADER_IMAGES
+    );
 }
 
 /// An enum whose values are the wire's integers, parsed by `from_wire` and written by `wire`.

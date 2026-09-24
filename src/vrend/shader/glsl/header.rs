@@ -8,10 +8,11 @@
 use super::exit::{blockname, blockvarname, emit_fog_fixup_hdr};
 use super::tex::internalformat_string;
 use super::{
-    Context, Failure, Image, Io, IoDir, MAX_SO_OUTPUTS, Qual, Sampler, Strings, bit32, bit64, emit,
-    gs_input_prim_to_size, hdr, prim_to_name, prim_to_tes_name, proc_prefix, req,
-    samplertype_is_shadow, spacing_string, stage_output_name_prefix,
+    ARRAY_STARTS_AT_A_SLOT, Context, Failure, Image, Io, IoDir, MAX_SO_OUTPUTS, Qual, Sampler,
+    Strings, bit32, bit64, emit, gs_input_prim_to_size, hdr, prim_to_name, prim_to_tes_name,
+    proc_prefix, req, samplertype_is_shadow, spacing_string, stage_output_name_prefix,
 };
+use crate::vrend::pipe::slots::{ImageSlot, SamplerSlot};
 use crate::vrend::shader::{
     AdvancedBlend, Config, FragmentInfo, Info, Key, sampler_return_conv, sampler_type_conv,
 };
@@ -318,17 +319,13 @@ fn emit_ios_common(ctx: &mut Context<'_>) -> u32 {
 
     if ctx.info.is_indirect(File::Sampler) {
         for a in ctx.sampler_arrays.clone() {
-            let sampler = ctx.samplers[a.first as usize];
+            let sampler = ctx.samplers[SamplerSlot::new(a.first).expect(ARRAY_STARTS_AT_A_SLOT)];
             emit_sampler_decl(ctx, a.first as u32, a.array_size, sampler);
         }
     } else {
-        let nsamp = 32 - ctx.samplers_used.leading_zeros();
-        for i in 0..nsamp {
-            if ctx.samplers_used & bit32(i) == 0 {
-                continue;
-            }
-            let sampler = ctx.samplers[i as usize];
-            emit_sampler_decl(ctx, i, 0, sampler);
+        for i in ctx.samplers_used.iter() {
+            let sampler = ctx.samplers[i];
+            emit_sampler_decl(ctx, i.index() as u32, 0, sampler);
         }
     }
 
@@ -337,22 +334,19 @@ fn emit_ios_common(ctx: &mut Context<'_>) -> u32 {
             ctx.bufs,
             "uniform int {}_texlod[{}];\n",
             proc_prefix(ctx.info.processor),
-            ctx.samplers_used.count_ones()
+            ctx.samplers_used.len()
         );
     }
 
     if ctx.info.is_indirect(File::Image) {
         for a in ctx.image_arrays.clone() {
-            let image = ctx.images[a.first as usize];
+            let image = ctx.images[ImageSlot::new(a.first).expect(ARRAY_STARTS_AT_A_SLOT)];
             emit_image_decl(ctx, a.first as u32, a.array_size, image);
         }
     } else {
-        let mut mask = ctx.images_used_mask;
-        while mask != 0 {
-            let i = mask.trailing_zeros();
-            mask &= mask - 1;
-            let image = ctx.images[i as usize];
-            emit_image_decl(ctx, i, 0, image);
+        for i in ctx.images_used_mask.iter() {
+            let image = ctx.images[i];
+            emit_image_decl(ctx, i.index() as u32, 0, image);
         }
     }
 

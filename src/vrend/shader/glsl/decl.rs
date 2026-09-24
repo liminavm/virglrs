@@ -5,11 +5,12 @@
 //! context, and the first pass that runs ahead of it.
 
 use super::{
-    Context, Failure, Immed, Io, MAX_IMMEDIATE, MAX_IO, MAX_SAMPLERS, MAX_SYSTEM_VALUES,
-    TEMP_REGISTERS, TempRange, VecType, bit32, fail, req, samplertype_is_shadow,
-    samplertype_to_req_bits, stage_output_name_prefix, sysval,
+    ARRAY_STARTS_AT_A_SLOT, Context, Failure, Immed, Io, MAX_IMMEDIATE, MAX_IO, MAX_SAMPLERS,
+    MAX_SYSTEM_VALUES, Sampler, TEMP_REGISTERS, TempRange, VecType, bit32, fail, req,
+    samplertype_is_shadow, samplertype_to_req_bits, stage_output_name_prefix, sysval,
 };
 use crate::vrend::pipe::Swizzle;
+use crate::vrend::pipe::slots::{ImageSlot, SamplerSlot};
 use crate::vrend::proto::Format;
 use crate::vrend::shader::{
     Array, MAX_CLIP_OR_CULL_DISTANCES, MAX_COMBINED_SSBO_BINDING_POINTS, MAX_SHADER_IMAGES,
@@ -196,7 +197,7 @@ fn allocate_temp_range(
 }
 
 /// `add_images`.
-fn add_images(ctx: &mut Context<'_>, first: usize, last: usize, img_decl: &ImageInfo) {
+fn add_images(ctx: &mut Context<'_>, first: ImageSlot, last: ImageSlot, img_decl: &ImageInfo) {
     let descr = Format::from_wire(u32::from(img_decl.format)).and_then(Format::describe);
     if let Some(d) = descr {
         let sw = |i: usize| d.swizzle[i];
@@ -224,22 +225,24 @@ fn add_images(ctx: &mut Context<'_>, first: usize, last: usize, img_decl: &Image
         }
     }
 
-    for i in first..=last {
+    for i in ImageSlot::all().filter(|i| (first..=last).contains(i)) {
         ctx.images[i].decl = *img_decl;
         ctx.images[i].vflag = false;
-        ctx.images_used_mask |= bit32(i as u32);
+        ctx.images_used_mask.insert(i);
         if !samplertype_is_shadow(ctx.images[i].decl.resource) {
             ctx.shader_req_bits |= samplertype_to_req_bits(ctx.images[i].decl.resource);
         }
     }
+    let (first, last) = (first.index(), last.index());
 
     if ctx.info.is_indirect(File::Image) {
         if let Some(last_array) = ctx.image_arrays.last().copied() {
             // A run consecutive to the last array with the same declaration extends it.
+            let prev = ImageSlot::new(last_array.first).expect(ARRAY_STARTS_AT_A_SLOT);
+            let this = ImageSlot::new(first).expect("declared above");
             if last_array.first + last_array.array_size == first as i32
-                && ctx.images[last_array.first as usize].decl == ctx.images[first].decl
-                && ctx.images[last_array.first as usize].image_return
-                    == ctx.images[first].image_return
+                && ctx.images[prev].decl == ctx.images[this].decl
+                && ctx.images[prev].image_return == ctx.images[this].image_return
             {
                 ctx.image_arrays.last_mut().expect("checked").array_size +=
                     (last - first + 1) as i32;
@@ -258,19 +261,26 @@ fn add_images(ctx: &mut Context<'_>, first: usize, last: usize, img_decl: &Image
 }
 
 /// `add_samplers`.
-fn add_samplers(ctx: &mut Context<'_>, first: usize, last: usize, ty: Texture, ret: ReturnType) {
+fn add_samplers(
+    ctx: &mut Context<'_>,
+    first: SamplerSlot,
+    last: SamplerSlot,
+    ty: Texture,
+    ret: ReturnType,
+) {
     if ret == ReturnType::Sint || ret == ReturnType::Uint {
         ctx.shader_req_bits |= req::INTS;
     }
-    for i in first..=last {
+    for i in SamplerSlot::all().filter(|i| (first..=last).contains(i)) {
         ctx.samplers[i].ret = ret;
         ctx.samplers[i].ty = ty;
     }
+    let (first, last) = (first.index(), last.index());
     if ctx.info.is_indirect(File::Sampler) {
         if let Some(last_array) = ctx.sampler_arrays.last().copied()
             && last_array.first + last_array.array_size == first as i32
-            && ctx.samplers[last_array.first as usize].ty == ty
-            && ctx.samplers[last_array.first as usize].ret == ret
+            && ctx.samplers[SamplerSlot::new(last_array.first).expect(ARRAY_STARTS_AT_A_SLOT)]
+                == (Sampler { ty, ret })
         {
             ctx.sampler_arrays.last_mut().expect("checked").array_size += (last - first + 1) as i32;
             return;
@@ -862,19 +872,24 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
             allocate_temp_range(ctx, first as i32, last as i32, array_id as i32)?;
         }
         File::Sampler => {
-            ctx.samplers_used |= bit32(last);
+            // Only the last of the range is marked, as the C marks it.
+            let Some(last) = SamplerSlot::new(last) else {
+                return fail(format!("Sampler exceeded, max is {MAX_SAMPLERS}"));
+            };
+            ctx.samplers_used.insert(last);
         }
         File::SamplerView => {
             if first > last {
                 return fail(format!("Wrong range: First ({first}) > Last ({last})"));
             }
-            if last as usize >= MAX_SAMPLERS {
+            let (Some(first), Some(last)) = (SamplerSlot::new(first), SamplerSlot::new(last))
+            else {
                 return fail(format!("Sampler view exceeded, max is {MAX_SAMPLERS}"));
-            }
+            };
             add_samplers(
                 ctx,
-                first as usize,
-                last as usize,
+                first,
+                last,
                 decl.sampler_view.resource,
                 decl.sampler_view.return_type[0],
             );
@@ -886,10 +901,10 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
             ctx.shader_req_bits |= req::IMAGE_LOAD_STORE;
             ctx.shader_req_bits |= req::EXPLICIT_UNIFORM_LOCATION;
             ctx.shader_req_bits |= req::EXPLICIT_ATTRIB_LOCATION;
-            if last as usize >= MAX_SHADER_IMAGES {
+            let (Some(first), Some(last)) = (ImageSlot::new(first), ImageSlot::new(last)) else {
                 return fail(format!("Image view exceeded, max is {MAX_SHADER_IMAGES}"));
-            }
-            add_images(ctx, first as usize, last as usize, &decl.image);
+            };
+            add_images(ctx, first, last, &decl.image);
         }
         File::Buffer => {
             if first + u32::from(ctx.key.ssbo_binding_offset) >= MAX_COMBINED_SSBO_BINDING_POINTS {

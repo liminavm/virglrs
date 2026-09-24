@@ -15,6 +15,7 @@ use super::{
     Context, Failure, Io, IoDeclaration, IoDir, MAX_IMMEDIATE, MAX_IO, Qual, VecType, bit32, bit64,
     emit, fail, proc_prefix, req, stage_output_name_prefix, swiz_char,
 };
+use crate::vrend::pipe::slots::{ImageSlot, SamplerSlot};
 use crate::vrend::shader::Key;
 use crate::vrend::tgsi::info::OpType;
 use crate::vrend::tgsi::{
@@ -32,11 +33,44 @@ pub(super) struct DestInfo {
     pub dest_index: i32,
 }
 
+/// What an instruction's sources name that selects a binding: the sampler, image, buffer or
+/// memory it reads, from whichever such operand came last -- the C's `sreg_index`, which held
+/// all of them as one integer and let a buffer's index be read as a sampler's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(super) enum Binding {
+    /// No source names one.
+    #[default]
+    None,
+    Sampler(SamplerSlot),
+    /// `None` is an index past the last image slot, which each opcode answers in its own way.
+    Image(Option<ImageSlot>),
+    /// A buffer, shared memory or an atomic counter, by the index the guest wrote.
+    Other(i32),
+}
+
+impl Binding {
+    pub fn sampler(self) -> Option<SamplerSlot> {
+        match self {
+            Binding::Sampler(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The image slot an image source names, or `None` for a slot past the last or a source
+    /// that is not an image.
+    pub fn image(self) -> Option<ImageSlot> {
+        match self {
+            Binding::Image(i) => i,
+            _ => None,
+        }
+    }
+}
+
 /// `source_info`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(super) struct SourceInfo {
     pub svec4: Qual,
-    pub sreg_index: i32,
+    pub binding: Binding,
     pub tg4_has_component: bool,
     pub override_no_wm: [bool; 5],
     pub override_no_cast: [bool; 5],
@@ -1035,7 +1069,11 @@ fn get_source_info(
                 } else {
                     ctx.src_bufs[i] = format!("{}samp{}{}", cname, src.index, swizzle);
                 }
-                sinfo.sreg_index = i32::from(src.index);
+                // Scan refuses a sampler operand past the last slot, so this is never `None`.
+                let Some(sampler) = SamplerSlot::new(src.index) else {
+                    return false;
+                };
+                sinfo.binding = Binding::Sampler(sampler);
             }
             File::Image => {
                 let cname = proc_prefix(ctx.prog_type);
@@ -1063,15 +1101,15 @@ fn get_source_info(
                 } else {
                     ctx.src_bufs[i] = format!("{}img{}{}", cname, src.index, swizzle);
                 }
-                sinfo.sreg_index = i32::from(src.index);
+                sinfo.binding = Binding::Image(ImageSlot::new(src.index));
             }
             File::Buffer => {
                 ctx.src_bufs[i] = make_ssbo_varstring(ctx, src.index as u32);
-                sinfo.sreg_index = i32::from(src.index);
+                sinfo.binding = Binding::Other(i32::from(src.index));
             }
             File::Memory => {
                 ctx.src_bufs[i] = "values".to_string();
-                sinfo.sreg_index = i32::from(src.index);
+                sinfo.binding = Binding::Other(i32::from(src.index));
             }
             File::Immediate => {
                 if src.index < 0 || src.index as usize >= MAX_IMMEDIATE {
@@ -1302,7 +1340,7 @@ fn get_source_info(
                         break;
                     }
                 }
-                sinfo.sreg_index = i32::from(src.index);
+                sinfo.binding = Binding::Other(i32::from(src.index));
             }
             _ => return false,
         }
@@ -1923,11 +1961,8 @@ pub(super) fn iter_instruction(ctx: &mut Context<'_>, inst: &Instruction) -> Res
             // this instruction.
             let mut linst = *inst;
             if inst.tex().texture == Texture::Array2d
-                && sinfo.sreg_index >= 0
-                && Key::view_mask_get(
-                    &ctx.key.sampler_views_lower_array_mask,
-                    sinfo.sreg_index as usize,
-                )
+                && let Some(sampler) = sinfo.binding.sampler()
+                && Key::view_mask_get(&ctx.key.sampler_views_lower_array_mask, sampler.index())
             {
                 let mut t = linst.tex();
                 t.texture = Texture::D2;
@@ -1936,8 +1971,8 @@ pub(super) fn iter_instruction(ctx: &mut Context<'_>, inst: &Instruction) -> Res
             translate_tex(ctx, &linst, &sinfo, &dinfo, &srcs, dst0, wm);
         }
         Lodq => emit_lodq(ctx, inst, &sinfo, &dinfo, &srcs, dst0, wm),
-        Txq => emit_txq(ctx, inst, sinfo.sreg_index, &srcs, dst0, wm),
-        Txqs => emit_txqs(ctx, inst, sinfo.sreg_index, &srcs, dst0),
+        Txq => emit_txq(ctx, inst, sinfo.binding, &srcs, dst0, wm),
+        Txqs => emit_txqs(ctx, inst, sinfo.binding, &srcs, dst0),
         I2f => emit!(ctx.bufs, "{} = {}(ivec4({}){});\n", dst0, dstconv, srcs[0], wm),
         I2d => emit!(ctx.bufs, "{} = {}(ivec4({}));\n", dst0, dstconv, srcs[0]),
         D2f => emit!(ctx.bufs, "{} = {}({});\n", dst0, dstconv, srcs[0]),
@@ -2201,7 +2236,8 @@ pub(super) fn iter_instruction(ctx: &mut Context<'_>, inst: &Instruction) -> Res
             rewrite_1d_image_coordinate(ctx, inst);
             let srcs: Vec<String> = ctx.src_bufs[..4].to_vec();
             // An obvious out-of-bounds load loads zero.
-            if sinfo.sreg_index < 0 || !translate_load(ctx, inst, &sinfo, &dinfo, &srcs, dst0, wm) {
+            let negative = matches!(sinfo.binding, Binding::Other(i) if i < 0);
+            if negative || !translate_load(ctx, inst, &sinfo, &dinfo, &srcs, dst0, wm) {
                 emit!(ctx.bufs, "{} = vec4(0.0, 0.0, 0.0, 0.0){};\n", dst0, wm);
             }
         }

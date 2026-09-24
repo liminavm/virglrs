@@ -4,13 +4,14 @@
 //! Texture sampling and queries, and image, buffer and shared-memory access: the instructions
 //! whose translation depends on the resource they touch.
 
-use super::inst::{DestInfo, SourceInfo};
+use super::inst::{Binding, DestInfo, SourceInfo};
 use super::{
-    Context, MAX_IMMEDIATE, MAX_SAMPLERS, Qual, bit32, emit, proc_prefix, samplertype_is_shadow,
+    Context, MAX_IMMEDIATE, Qual, bit32, emit, proc_prefix, samplertype_is_shadow,
     samplertype_to_req_bits, swiz_char, swizzle_string, wm_string,
 };
+use crate::vrend::pipe::slots::{ImageSlot, SamplerSlot};
 use crate::vrend::proto::Format;
-use crate::vrend::shader::{Key, MAX_SHADER_BUFFERS, MAX_SHADER_IMAGES};
+use crate::vrend::shader::{Key, MAX_SHADER_BUFFERS};
 use crate::vrend::tgsi::{
     File, Instruction, MemoryQualifier, Opcode, ReturnType, Texture, WRITEMASK_W, WRITEMASK_X,
     WRITEMASK_XY, WRITEMASK_XYZ,
@@ -81,29 +82,36 @@ fn is_r32_format(virgl_format: u16) -> bool {
     matches!(name, Some("R32_FLOAT" | "R32_SINT" | "R32_UINT"))
 }
 
-/// `set_texture_reqs`.
-#[must_use = "false refuses the shader, and the translation must fail on it"]
-pub(super) fn set_texture_reqs(ctx: &mut Context<'_>, inst: &Instruction, sreg_index: i32) -> bool {
-    if sreg_index < 0 || sreg_index as usize >= MAX_SAMPLERS {
-        eprintln!("[virglrs] Sampler view exceeded, max is {MAX_SAMPLERS}");
-        return false;
-    }
+/// `set_texture_reqs`, and the sampler a texture instruction samples through.
+///
+/// `None` refuses the shader: the instruction's sampler position names no sampler. The C took
+/// whatever index came last, so a buffer's there was read as a sampler's.
+#[must_use = "None refuses the shader, and the translation must fail on it"]
+pub(super) fn set_texture_reqs(
+    ctx: &mut Context<'_>,
+    inst: &Instruction,
+    binding: Binding,
+) -> Option<SamplerSlot> {
+    let Some(sampler) = binding.sampler() else {
+        eprintln!("[virglrs] a texture instruction names no sampler");
+        return None;
+    };
     let texture = inst.tex().texture;
-    ctx.samplers[sreg_index as usize].ty = texture;
+    ctx.samplers[sampler].ty = texture;
     ctx.shader_req_bits |= samplertype_to_req_bits(texture);
     if ctx.cfg.glsl_version >= 140
         && ctx.shader_req_bits & (super::req::SAMPLER_RECT | super::req::SAMPLER_BUF) != 0
     {
         ctx.glsl_ver_required = ctx.require_glsl_ver(140);
     }
-    true
+    Some(sampler)
 }
 
 /// `emit_txq`.
 pub(super) fn emit_txq(
     ctx: &mut Context<'_>,
     inst: &Instruction,
-    sreg_index: i32,
+    binding: Binding,
     srcs: &[String],
     dst: &str,
     writemask: &str,
@@ -114,10 +122,10 @@ pub(super) fn emit_txq(
     let dtypeprefix = Qual::IntBitsToFloat;
     let texture = inst.tex().texture;
 
-    if !set_texture_reqs(ctx, inst, sreg_index) {
+    let Some(sampler) = set_texture_reqs(ctx, inst, binding) else {
         ctx.bufs.set_error();
         return;
-    }
+    };
 
     // No LOD for these texture types; RECT is emulated with a plain 2D texture, which wants
     // LOD 0.
@@ -138,12 +146,7 @@ pub(super) fn emit_txq(
                 twm = WRITEMASK_W;
             }
             let src = &inst.src[1];
-            let mut gles_sampler_index = 0;
-            for i in 0..src.index.max(0) as u32 {
-                if ctx.samplers_used & bit32(i) != 0 {
-                    gles_sampler_index += 1;
-                }
-            }
+            let gles_sampler_index = ctx.samplers_used.count_below(sampler);
             let sampler_str = if ctx.info.is_indirect(File::Sampler) && src.indirect {
                 format!("addr{}+{}", src.ind.index, gles_sampler_index)
             } else {
@@ -210,14 +213,14 @@ pub(super) fn emit_txq(
 pub(super) fn emit_txqs(
     ctx: &mut Context<'_>,
     inst: &Instruction,
-    sreg_index: i32,
+    binding: Binding,
     srcs: &[String],
     dst: &str,
 ) {
     let sampler_index = 0;
     let dtypeprefix = Qual::IntBitsToFloat;
     ctx.shader_req_bits |= super::req::TXQS;
-    if !set_texture_reqs(ctx, inst, sreg_index) {
+    if set_texture_reqs(ctx, inst, binding).is_none() {
         ctx.bufs.set_error();
         return;
     }
@@ -430,7 +433,7 @@ pub(super) fn emit_lodq(
     writemask: &str,
 ) {
     ctx.shader_req_bits |= super::req::LODQ;
-    if !set_texture_reqs(ctx, inst, sinfo.sreg_index) {
+    if set_texture_reqs(ctx, inst, sinfo.binding).is_none() {
         ctx.bufs.set_error();
         return;
     }
@@ -483,14 +486,14 @@ pub(super) fn translate_tex(
     let texture = inst.tex().texture;
     let num_offsets = inst.tex().num_offsets;
 
-    if !set_texture_reqs(ctx, inst, sinfo.sreg_index) {
+    let Some(slot) = set_texture_reqs(ctx, inst, sinfo.binding) else {
         ctx.bufs.set_error();
         return;
-    }
+    };
 
     let is_shad = samplertype_is_shadow(texture);
 
-    match ctx.samplers[sinfo.sreg_index as usize].ret {
+    match ctx.samplers[slot].ret {
         ReturnType::Sint => {
             if dinfo.dstconv != Qual::Int {
                 dtypeprefix = Qual::IntBitsToFloat;
@@ -690,7 +693,7 @@ pub(super) fn translate_tex(
     // The coordinate is unnormalised for all but the texel fetch.
     let mut coord = srcs[0].clone();
     if inst.opcode != Opcode::Txf
-        && Key::view_mask_get(&ctx.key.sampler_views_emulated_rect_mask, sinfo.sreg_index as usize)
+        && Key::view_mask_get(&ctx.key.sampler_views_emulated_rect_mask, slot.index())
     {
         // No LOD for these texture types; RECT is emulated with a plain 2D texture, which
         // wants LOD 0.
@@ -791,11 +794,8 @@ pub(super) fn translate_tex(
                 offset
             );
 
-            if Key::view_mask_get(
-                &ctx.key.sampler_views_lower_swizzle_mask,
-                sinfo.sreg_index as usize,
-            ) {
-                let packed_swizzles = ctx.key.tex_swizzle[sinfo.sreg_index as usize];
+            if Key::view_mask_get(&ctx.key.sampler_views_lower_swizzle_mask, slot.index()) {
+                let packed_swizzles = ctx.key.tex_swizzle[slot.index()];
                 ctx.bufs.emit("   val = vec4(");
                 for i in 0..4 {
                     if i > 0 {
@@ -1018,19 +1018,16 @@ fn is_coherent(inst: &Instruction) -> bool {
 fn set_image_qualifier(
     ctx: &mut Context<'_>,
     inst: &Instruction,
-    reg_index: i32,
+    image: Option<ImageSlot>,
     indirect: bool,
 ) -> bool {
     if is_coherent(inst) {
         if indirect {
-            let mut mask = ctx.images_used_mask;
-            while mask != 0 {
-                let i = mask.trailing_zeros() as usize;
-                mask &= mask - 1;
+            for i in ctx.images_used_mask.iter() {
                 ctx.images[i].coherent = true;
             }
-        } else if reg_index >= 0 && (reg_index as usize) < MAX_SHADER_IMAGES {
-            ctx.images[reg_index as usize].coherent = true;
+        } else if let Some(i) = image {
+            ctx.images[i].coherent = true;
         } else {
             return false;
         }
@@ -1130,23 +1127,24 @@ pub(super) fn translate_store(
         return;
     }
     if dst_reg.file == File::Image {
-        if dinfo.dest_index as usize >= MAX_SHADER_IMAGES {
+        let Some(image) = ImageSlot::new(dinfo.dest_index) else {
             ctx.bufs.set_error();
             return;
-        }
+        };
         // A write to an image that does not exist is dropped.
-        if bit32(dinfo.dest_index as u32) & ctx.images_used_mask == 0 {
+        if !ctx.images_used_mask.contains(image) {
             return;
         }
-        if !set_image_qualifier(ctx, inst, i32::from(inst.src[0].index), inst.src[0].indirect) {
+        // The C asks about the store's coordinate register here, not its destination image
+        // (`vrend_shader.c` `translate_store`), and this keeps that: a coherent store marks the
+        // image whose slot number the coordinate's register happens to share.
+        let coordinate = ImageSlot::new(inst.src[0].index);
+        if !set_image_qualifier(ctx, inst, coordinate, inst.src[0].indirect) {
             ctx.bufs.set_error();
             return;
         }
 
-        let resource = ctx
-            .images
-            .get(dst_reg.index.max(0) as usize)
-            .map_or(Texture::Buffer, |i| i.decl.resource);
+        let resource = ctx.images[image].decl.resource;
         let (coord_prefix, is_ms) = coord_prefix(resource);
         let conversion = if sinfo.override_no_cast[0] { "" } else { Qual::FloatBitsToInt.s() };
         let (_, itype) = internalformat_string(inst.memory.map_or(0, |m| m.format));
@@ -1276,20 +1274,19 @@ pub(super) fn translate_load(
 ) -> bool {
     let src = &inst.src[0];
     if src.file == File::Image {
-        // A load from an image that is not used is dropped. The C tests `>` here, which admits
-        // the slot one past the array; its mask bit then wraps onto slot 0's and the read runs
-        // off the end. The store path has `>=`, and so does this.
-        if sinfo.sreg_index < 0 || sinfo.sreg_index as usize >= MAX_SHADER_IMAGES {
+        // A load from an image that is not used, or from a slot past the last, is dropped. The
+        // C tests `>` here, which admits the slot one past the array; its mask bit then wraps
+        // onto slot 0's and the read runs off the end. An `ImageSlot` has no such value.
+        let Some(sreg) = sinfo.binding.image() else {
+            return false;
+        };
+        if !ctx.images_used_mask.contains(sreg) {
             return false;
         }
-        if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {
-            return false;
-        }
-        if !set_image_qualifier(ctx, inst, i32::from(src.index), src.indirect) {
+        if !set_image_qualifier(ctx, inst, Some(sreg), src.indirect) {
             ctx.bufs.set_error();
             return false;
         }
-        let sreg = sinfo.sreg_index as usize;
         let (coord_prefix, is_ms) = coord_prefix(ctx.images[sreg].decl.resource);
         let conversion = if sinfo.override_no_cast[1] { "" } else { Qual::FloatBitsToInt.s() };
         let (_, itype) = internalformat_string(ctx.images[sreg].decl.format);
@@ -1489,12 +1486,18 @@ pub(super) fn translate_atomic(
     let stypecast;
     let mut cas_str = String::new();
 
-    if src.file == File::Image {
-        if sinfo.sreg_index < 0 || sinfo.sreg_index as usize >= MAX_SHADER_IMAGES {
+    let image = if src.file == File::Image {
+        let Some(image) = sinfo.binding.image() else {
             ctx.bufs.set_error();
             return;
-        }
-        let (_, itype) = internalformat_string(ctx.images[sinfo.sreg_index as usize].decl.format);
+        };
+        Some(image)
+    } else {
+        None
+    };
+
+    if let Some(image) = image {
+        let (_, itype) = internalformat_string(ctx.images[image].decl.format);
         match itype {
             ReturnType::Sint => {
                 stypeprefix = Qual::FloatBitsToInt;
@@ -1530,13 +1533,12 @@ pub(super) fn translate_atomic(
         cas_str = format!(", {}({}({}))", stypecast.s(), stypeprefix.s(), srcs[3]);
     }
 
-    if src.file == File::Image {
-        let sreg = sinfo.sreg_index as usize;
+    if let Some(sreg) = image {
         let (coord_prefix, is_ms) = coord_prefix(ctx.images[sreg].decl.resource);
         let conversion = if sinfo.override_no_cast[1] { "" } else { Qual::FloatBitsToInt.s() };
         let ms_str = if is_ms { format!(", int({}.w)", srcs[1]) } else { String::new() };
 
-        if !set_image_qualifier(ctx, inst, i32::from(src.index), src.indirect) {
+        if !set_image_qualifier(ctx, inst, Some(sreg), src.indirect) {
             ctx.bufs.set_error();
             return;
         }

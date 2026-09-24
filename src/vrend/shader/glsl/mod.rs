@@ -22,9 +22,10 @@ mod tex;
 use std::fmt;
 
 use super::{
-    Array, Config, Info, InterpInfo, IoArray, IoArrayInfo, Key, MAX_SHADER_BUFFERS,
-    MAX_SHADER_IMAGES, MAX_SO_OUTPUTS, POLYGON_STIPPLE_SIZE, VarInfo,
+    Array, Config, Info, InterpInfo, IoArray, IoArrayInfo, Key, MAX_SHADER_BUFFERS, MAX_SO_OUTPUTS,
+    POLYGON_STIPPLE_SIZE, VarInfo,
 };
+use crate::vrend::pipe::slots::{ImageMask, PerImage, PerSampler, SamplerMask};
 use crate::vrend::pipe::{LogicOp, PrimType};
 use crate::vrend::proto::StreamOutput;
 use crate::vrend::tgsi::{
@@ -124,6 +125,9 @@ pub(super) const MAX_IO: usize = 64;
 const MAX_SYSTEM_VALUES: usize = 32;
 /// The C's `samplers[32]`.
 pub(super) use crate::vrend::pipe::slots::MAX_SAMPLERS;
+/// A sampler or image array is recorded from a declaration whose slots were checked, so it
+/// starts at one.
+pub(super) const ARRAY_STARTS_AT_A_SLOT: &str = "an array starts at a declared slot";
 /// `MAX_IMMEDIATE`.
 const MAX_IMMEDIATE: usize = 1024;
 /// How many temporary registers a 16-bit register index can name.
@@ -430,8 +434,8 @@ pub(super) struct Context<'a> {
     /// How many temporary registers the declarations so far span, arrays included.
     pub temps_declared: u32,
 
-    pub samplers: [Sampler; MAX_SAMPLERS],
-    pub samplers_used: u32,
+    pub samplers: PerSampler<Sampler>,
+    pub samplers_used: SamplerMask,
 
     pub ssbo_first_binding: u32,
     pub ssbo_used_mask: u32,
@@ -442,8 +446,8 @@ pub(super) struct Context<'a> {
     pub ssbo_memory_qualifier: [u8; MAX_SHADER_BUFFERS],
     pub ssbo_last_binding: i32,
 
-    pub images: [Image; MAX_SHADER_IMAGES],
-    pub images_used_mask: u32,
+    pub images: PerImage<Image>,
+    pub images_used_mask: ImageMask,
     pub image_last_binding: i32,
 
     pub image_arrays: Vec<Array>,
@@ -554,8 +558,8 @@ impl<'a> Context<'a> {
             generic_ios: GenericIos::default(),
             temp_ranges: Vec::new(),
             temps_declared: 0,
-            samplers: [Sampler::default(); MAX_SAMPLERS],
-            samplers_used: 0,
+            samplers: PerSampler::default(),
+            samplers_used: SamplerMask::default(),
             ssbo_first_binding: u32::MAX,
             ssbo_used_mask: 0,
             ssbo_atomic_mask: 0,
@@ -564,8 +568,8 @@ impl<'a> Context<'a> {
             ssbo_integer_mask: 0,
             ssbo_memory_qualifier: [0; MAX_SHADER_BUFFERS],
             ssbo_last_binding: -1,
-            images: [Image::default(); MAX_SHADER_IMAGES],
-            images_used_mask: 0,
+            images: PerImage::default(),
+            images_used_mask: ImageMask::default(),
             image_last_binding: -1,
             image_arrays: Vec::new(),
             sampler_arrays: Vec::new(),
@@ -1114,8 +1118,8 @@ fn fill_var_sinfo(ctx: &Context<'_>, sinfo: &mut VarInfo) {
 /// `fill_sinfo`.
 pub(super) fn fill_sinfo(ctx: &mut Context<'_>, sinfo: &mut Info) {
     sinfo.use_pervertex_in = ctx.has_pervertex;
-    sinfo.samplers_used_mask = ctx.samplers_used;
-    sinfo.images_used_mask = ctx.images_used_mask;
+    sinfo.samplers_used_mask = ctx.samplers_used.bits();
+    sinfo.images_used_mask = ctx.images_used_mask.bits();
     sinfo.image_binding_offset = u32::from(ctx.key.image_binding_offset);
     sinfo.image_last_binding = i32::from(ctx.key.image_binding_offset) + ctx.image_last_binding;
     sinfo.num_consts = ctx.num_consts;
@@ -1221,6 +1225,7 @@ pub fn create_passthrough_tcs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vrend::shader::MAX_SHADER_IMAGES;
     use crate::vrend::tgsi::fixture;
 
     /// The host's configuration when the corpus was recorded: GLES 3.1 on zink over
@@ -1364,19 +1369,32 @@ mod tests {
         }
     }
 
-    /// A texture query whose sampler operand names a slot past the last sampler is refused at
-    /// translation. The C ignores the refusal for the three queries and emits GLSL naming
-    /// whatever the operand was, which only the GL compiler then rejects; a sampling
-    /// instruction was already refused here.
+    /// A texture instruction whose sampler position holds anything but a sampler is refused.
     ///
-    /// The operand is a buffer, not a sampler: the scanner refuses a `SAMP` that far out on its
-    /// own, and would say nothing about the instruction. A buffer index is what reaches here.
+    /// The C kept one index for the last sampler, image, buffer or memory operand, and a texture
+    /// instruction read it as a sampler's whatever file it came from. So a `BUFFER` there was
+    /// taken for a sampler: in range it named a sampler the shader never declared, and past the
+    /// 128 sampler views it indexed the key's view masks off their end -- a `2D_ARRAY` fetch
+    /// asks them before anything else looks at the operand, and that was an abort. The scanner
+    /// already refuses a `SAMP` past the last slot, so a buffer is the only way to reach either.
+    ///
+    /// The in-range buffers are what make this about the operand's kind: a bound on the index
+    /// alone admits them.
     #[test]
-    fn a_texture_query_past_the_last_sampler_is_refused() {
+    fn a_texture_instruction_whose_sampler_is_a_buffer_is_refused() {
         for (what, inst) in [
-            ("TXQ", format!("TXQ TEMP[0], IMM[0].xxxx, BUFFER[{MAX_SAMPLERS}], 2D")),
-            ("TXQS", format!("TXQS TEMP[0], BUFFER[{MAX_SAMPLERS}], 2D_MSAA")),
-            ("LODQ", format!("LODQ TEMP[0], IN[0], BUFFER[{MAX_SAMPLERS}], 2D")),
+            ("TEX", "TEX TEMP[0], IN[0], BUFFER[0], 2D".to_string()),
+            ("TXQ", "TXQ TEMP[0], IMM[0].xxxx, BUFFER[0], 2D".to_string()),
+            ("TXQS", "TXQS TEMP[0], BUFFER[0], 2D_MSAA".to_string()),
+            ("LODQ", "LODQ TEMP[0], IN[0], BUFFER[0], 2D".to_string()),
+            (
+                "TXQ past the samplers",
+                format!("TXQ TEMP[0], IMM[0].xxxx, BUFFER[{MAX_SAMPLERS}], 2D"),
+            ),
+            (
+                "a 2D_ARRAY fetch past the sampler views",
+                format!("TEX TEMP[0], IN[0], BUFFER[{}], 2D_ARRAY", 2 * 64),
+            ),
         ] {
             let tgsi = format!(
                 "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL TEMP[0]\n\
@@ -1388,10 +1406,30 @@ mod tests {
                 convert(&corpus_cfg(), &program, 0, &Key::default(), &StreamOutput::default());
             assert!(
                 translated.is_err(),
-                "{what} on sampler {MAX_SAMPLERS} is refused, not emitted:\n{}",
+                "{what} on a buffer is refused, not emitted:\n{}",
                 translated.map(|(s, _, _)| s.source()).unwrap_or_default()
             );
         }
+    }
+
+    /// A sampler declared past the last slot is refused. The scanner bounds a sampler operand
+    /// but not a declaration, and the C marked the declaration with a shift by its index, which
+    /// for slot 32 wraps onto slot 0: the header then declares a sampler the guest never named.
+    #[test]
+    fn a_sampler_declared_past_the_last_slot_is_refused() {
+        let tgsi = format!(
+            "FRAG\nDCL SAMP[{MAX_SAMPLERS}]\nDCL OUT[0], COLOR\nIMM[0] FLT32 {{0, 0, 0, 0}}\n\
+             \x20 0: MOV OUT[0], IMM[0]\n  1: END\n"
+        );
+        let shader = tgsi::text::parse(tgsi.as_bytes(), u32::MAX).expect("the shader parses");
+        let program = tgsi::Program::scan(shader).expect("the shader scans");
+        let translated =
+            convert(&corpus_cfg(), &program, 0, &Key::default(), &StreamOutput::default());
+        assert!(
+            translated.is_err(),
+            "SAMP[{MAX_SAMPLERS}] is refused, not declared:\n{}",
+            translated.map(|(s, _, _)| s.source()).unwrap_or_default()
+        );
     }
 
     /// The clip and cull distance counts arrive as properties the guest wrote, and the translator

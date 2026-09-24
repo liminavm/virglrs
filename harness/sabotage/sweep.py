@@ -1313,11 +1313,18 @@ SABOTAGES = [
         'a_classic_replay_begun_twice_keeps_the_journal_it_was_handed',
     ),
     (
-        'an image load one past the last slot is let through to the image array',
-        'src/vrend/shader/glsl/tex.rs',
-        'if sinfo.sreg_index < 0 || sinfo.sreg_index as usize >= MAX_SHADER_IMAGES {\n            return false;\n        }\n        if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {',
-        'if sinfo.sreg_index < 0 || sinfo.sreg_index as usize > MAX_SHADER_IMAGES {\n            return false;\n        }\n        if bit32(sinfo.sreg_index as u32) & ctx.images_used_mask == 0 {',
+        'a slot one past the last is minted, as the C admitted it for an image load',
+        'src/vrend/pipe.rs',
+        '(index < Self::COUNT).then(|| Self(index as u8))',
+        '(index <= Self::COUNT).then(|| Self(index as u8))',
         'an_image_load_past_the_last_slot_loads_zero',
+    ),
+    (
+        'a sampler declared past the last slot wraps onto a low one',
+        'src/vrend/shader/glsl/decl.rs',
+        'let Some(last) = SamplerSlot::new(last) else {',
+        'let Some(last) = SamplerSlot::new(last % MAX_SAMPLERS as u32) else {',
+        'a_sampler_declared_past_the_last_slot_is_refused',
     ),
     (
         "a clip distance count past the hardware limit is stored a byte wide and summed",
@@ -1936,42 +1943,38 @@ SABOTAGES = [
         'temporaries_past_the_register_space_are_refused',
     ),
     (
-        'a TXQ past the last sampler is emitted',
-        'src/vrend/shader/glsl/tex.rs',
-        """    let texture = inst.tex().texture;
-
-    if !set_texture_reqs(ctx, inst, sreg_index) {
-        ctx.bufs.set_error();
-        return;
-    }""",
-        """    let texture = inst.tex().texture;
-
-    let _ = set_texture_reqs(ctx, inst, sreg_index);""",
-        'a_texture_query_past_the_last_sampler_is_refused',
+        'a buffer operand is taken for the sampler a texture instruction samples through',
+        'src/vrend/shader/glsl/inst.rs',
+        """            Binding::Sampler(s) => Some(s),
+            _ => None,""",
+        """            Binding::Sampler(s) => Some(s),
+            Binding::Other(i) => SamplerSlot::new(i),
+            _ => None,""",
+        'a_texture_instruction_whose_sampler_is_a_buffer_is_refused',
     ),
     (
-        'a TXQS past the last sampler is emitted',
+        'a TXQS whose sampler is not a sampler is emitted',
         'src/vrend/shader/glsl/tex.rs',
         """    ctx.shader_req_bits |= super::req::TXQS;
-    if !set_texture_reqs(ctx, inst, sreg_index) {
+    if set_texture_reqs(ctx, inst, binding).is_none() {
         ctx.bufs.set_error();
         return;
     }""",
         """    ctx.shader_req_bits |= super::req::TXQS;
-    let _ = set_texture_reqs(ctx, inst, sreg_index);""",
-        'a_texture_query_past_the_last_sampler_is_refused',
+    let _ = set_texture_reqs(ctx, inst, binding);""",
+        'a_texture_instruction_whose_sampler_is_a_buffer_is_refused',
     ),
     (
-        'a LODQ past the last sampler is emitted',
+        'a LODQ whose sampler is not a sampler is emitted',
         'src/vrend/shader/glsl/tex.rs',
         """    ctx.shader_req_bits |= super::req::LODQ;
-    if !set_texture_reqs(ctx, inst, sinfo.sreg_index) {
+    if set_texture_reqs(ctx, inst, sinfo.binding).is_none() {
         ctx.bufs.set_error();
         return;
     }""",
         """    ctx.shader_req_bits |= super::req::LODQ;
-    let _ = set_texture_reqs(ctx, inst, sinfo.sreg_index);""",
-        'a_texture_query_past_the_last_sampler_is_refused',
+    let _ = set_texture_reqs(ctx, inst, sinfo.binding);""",
+        'a_texture_instruction_whose_sampler_is_a_buffer_is_refused',
     ),
     (
         'an export of a handle naming nothing is answered as not exportable',
