@@ -922,6 +922,14 @@ waiting on a call rather than on work.
 These are not decisions. Each is settled in shape and unwritten in code, and each is here so that
 it survives the session it was found in.
 
+- **The proc table resolves a promoted command only by its core name.** `render_proc_table` in
+  `venus-gen/rustgen.py` emits one `get(c"vkFoo")` per command, so on a device older than the
+  version that promoted it, a command the device exposes only as `vkFooKHR` or `vkFooEXT` loads
+  as null and every `try_` accessor refuses it. The C picks the alias by version and extension
+  (`vn_util_init_device_proc_table`). KosmicKrisp and anv report 1.4, so no host here reaches it;
+  a strictly conforming 1.3 driver would. The fix is in the generator: fall back through the
+  command's vk.xml aliases when the core name answers null.
+
 - **The libkrun opaque-journal branch is parked and ready.** `limina-p5-opaque-journal` merges into
   `third_party/libkrun`'s `limina` branch with a `third_party/manifest.toml` bump. Nothing blocks
   it now.
