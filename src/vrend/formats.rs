@@ -467,7 +467,7 @@ impl Table {
         for e in t.entries.iter_mut().flatten() {
             e.can_texture_storage = texture_storage_works(gl, e.gl.internalformat);
         }
-        if features.has(Feature::multisample) && features.has(Feature::storage_multisample) {
+        if features.multisample_textures() {
             for e in t.entries.iter_mut().flatten() {
                 // On GLES a multisample texture is only ever made with `glTexStorage2DMultisample`,
                 // so a format without storage has no multisample form.

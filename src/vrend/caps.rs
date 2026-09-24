@@ -548,9 +548,19 @@ impl CapsV2 {
         // afterwards would need the positions blanked to match, which also blanks the counts
         // still under the ceiling -- advertising a mode with no layout for it.
         c.v1.max_samples = capped_samples(c.v1.max_samples, sample_ceiling());
-        if has(Feature::storage_multisample) {
+        if features.multisample_textures() {
             c.v1.max_samples =
                 query_multisample_caps(gl, c.v1.max_samples, &mut c.sample_locations);
+        } else {
+            // The same answer the format table gives: no multisample texture of any format.
+            if c.v1.max_samples > 1 {
+                eprintln!(
+                    "[virglrs] vrend: advertising no multisampling: this host cannot make every \
+                     multisample texture a guest could then ask for (needs \
+                     GL_OES_texture_storage_multisample_2d_array)"
+                );
+            }
+            c.v1.max_samples = 1;
         }
         c.capability_bits |=
             cap::TGSI_INVARIANT | cap::SET_MIN_SAMPLES | cap::TGSI_PRECISE | cap::APP_TWEAK_SUPPORT;

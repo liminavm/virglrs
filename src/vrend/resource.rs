@@ -201,9 +201,12 @@ pub enum Refusal {
     UnimportableStorage(crate::vrend::egl::EglError),
     /// A multisample 2D *array*, on a host with no `glTexStorage3DMultisample`.
     ///
-    /// Split out from [`Refusal::UnsupportedMultisampleFormat`] because it cannot claim that
-    /// one's justification: the format IS advertised as multisampling, and the capset has no
-    /// per-target bit to say the array form is missing. See [`Justification::Unjustified`].
+    /// Such a host advertises no multisampling at all ([`Features::multisample_textures`]), so its
+    /// table multisamples no format and [`Refusal::UnsupportedMultisampleFormat`] answers first.
+    /// This stands behind that for a table that says otherwise, rather than reaching for an entry
+    /// point the driver does not have.
+    ///
+    /// [`Features::multisample_textures`]: crate::vrend::features::Features::multisample_textures
     MultisampleArrayUnsupported,
 }
 
@@ -215,7 +218,7 @@ pub enum Refusal {
 /// command naming a handle nothing created. The symptom is a hang several commands away,
 /// attributed to the wrong thing, and no care taken at the refusal site changes that.
 ///
-/// So a refusal is only ever safe for one of two reasons, and [`Refusal::justification`] is an
+/// So a refusal is only ever safe for one of three reasons, and [`Refusal::justification`] is an
 /// exhaustive match: a new variant does not compile until it says which. That is the whole
 /// mechanism -- the compiler cannot tell whether the answer is *true*, but it can insist the
 /// question is answered, in a place where a false answer is one grep from the capset that would
@@ -232,11 +235,6 @@ pub enum Justification {
     /// nothing knew until it was asked; the guest dies, and the alternative is a resource that
     /// is not there.
     HostRefused,
-    /// **Nothing in the capset excludes this.** A guest is told yes and then refused, invisibly.
-    /// Every refusal here is a known bug, and naming them makes the list finite and countable
-    /// instead of a property nobody checks; the test below pins the list so a new one cannot be
-    /// added quietly.
-    Unjustified(&'static str),
 }
 
 impl Refusal {
@@ -300,10 +298,11 @@ impl Refusal {
             // memory the host has not got.
             Refusal::OutOfHostMemory => J::HostRefused,
 
-            Refusal::MultisampleArrayUnsupported => J::Unjustified(
-                "the capset has no per-target multisample bit, so a format advertised as \
-                 multisampling is refused for its array form; closing it means advertising no \
-                 multisample without glTexStorage3DMultisample, at the cost of 2D MSAA",
+            // No per-target bit exists, so a host that cannot make the array form advertises
+            // no multisample format at all.
+            Refusal::MultisampleArrayUnsupported => J::NotAdvertised(
+                "caps_v2.supported_multisample_formats, empty without \
+                 Features::multisample_textures",
             ),
         }
     }
@@ -3202,27 +3201,13 @@ mod tests {
         Refusal::MultisampleArrayUnsupported,
     ];
 
-    /// A refusal a guest can be handed after the capset told it yes is a bug, and there is
-    /// exactly one.
+    /// Every refusal that claims the capset excluded it names the field that does.
     ///
-    /// This does not test behaviour; it pins a count. The refusals that cannot name an
-    /// advertisement are the ones that kill a guest silently, and leaving them as a property
-    /// nobody enumerates is how the texture-buffer refusal survived. Adding another fails here,
-    /// and closing this one is a deliberate change to what the capset promises -- which is what
-    /// editing this list should feel like.
+    /// A refusal a guest can be handed after the capset told it yes has no variant of
+    /// [`Justification`] to claim, so it does not compile. What the compiler cannot tell is
+    /// whether a claimed field really excludes the case; it can insist the claim points somewhere.
     #[test]
-    fn only_one_refusal_cannot_point_at_the_capset() {
-        let unjustified: Vec<&Refusal> = EVERY_REFUSAL
-            .iter()
-            .filter(|r| matches!(r.justification(), Justification::Unjustified(_)))
-            .collect();
-        assert_eq!(
-            unjustified,
-            [&Refusal::MultisampleArrayUnsupported],
-            "a refusal with nothing in the capset behind it is a guest told yes and then killed"
-        );
-        // And every advertisement claimed names a capset field. The compiler cannot tell whether
-        // the field really excludes the case; it can insist the claim points somewhere.
+    fn every_advertised_refusal_names_a_capset_field() {
         for r in EVERY_REFUSAL {
             if let Justification::NotAdvertised(field) = r.justification() {
                 assert!(field.starts_with("caps_v"), "{r:?} names {field:?}, not a capset field");
@@ -3335,11 +3320,11 @@ mod tests {
                             {
                                 theirs = false;
                             }
-                            // The one deviation the capset cannot cover, and the only refusal
-                            // in the tree that admits as much: see
-                            // `Refusal::MultisampleArrayUnsupported` and the justification it
-                            // declares. Asserted rather than waved through, so that if it is
-                            // ever closed this stops matching and has to be removed.
+                            // A table that multisamples a format on a host with no array entry
+                            // point is one the probe never builds (see
+                            // `Features::multisample_textures`), and the sweep builds it anyway.
+                            // The C would reach for the missing entry point; this refuses, and
+                            // says which refusal.
                             if theirs
                                 && a.nr_samples > 1
                                 && gl_target(a.target, a.nr_samples)

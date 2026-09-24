@@ -245,6 +245,20 @@ impl Features {
         self.has(Feature::egl_image)
     }
 
+    /// Whether this host can make every multisample texture a guest told it multisamples may ask
+    /// for: 2D, and a 2D array.
+    ///
+    /// One answer for the two places a guest learns it -- the sample count and the per-format
+    /// mask -- because the capset has no per-target bit. A host with 2D multisampling and no
+    /// `glTexStorage3DMultisample` would otherwise advertise a format as multisampling and then
+    /// refuse its array form, and a refused create reaches no guest. So such a host advertises no
+    /// multisampling at all: a guest that is told none never asks.
+    pub fn multisample_textures(&self) -> bool {
+        self.has(Feature::multisample)
+            && self.has(Feature::storage_multisample)
+            && self.has(Feature::storage_multisample_2d_array)
+    }
+
     /// Decide every feature from a context's version and the extensions it advertises.
     pub fn probe(gles_version: u32, extensions: impl IntoIterator<Item = String>) -> Features {
         let extensions: BTreeSet<String> = extensions.into_iter().collect();
@@ -352,5 +366,16 @@ mod tests {
         assert!(g.has(Feature::geometry_shader));
         assert!(g.has(Feature::arb_buffer_storage));
         assert!(!g.has(Feature::gles_khr_robustness));
+    }
+
+    /// Multisampling is advertised only where every multisample texture can be made: GLES 3.1
+    /// has the 2D form and not the array form, so without the OES extension it has none.
+    #[test]
+    fn multisample_textures_need_the_array_form_too() {
+        assert!(!Features::probe(31, []).multisample_textures(), "3.1 has no array form");
+        let ext = ["GL_OES_texture_storage_multisample_2d_array".to_string()];
+        assert!(Features::probe(31, ext).multisample_textures(), "the extension supplies it");
+        assert!(Features::probe(32, []).multisample_textures(), "3.2 has it in core");
+        assert!(!Features::probe(30, []).multisample_textures(), "3.0 has no storage at all");
     }
 }

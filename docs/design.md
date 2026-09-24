@@ -878,10 +878,6 @@ to have it, each because reproducing the C would mean reproducing a defect.
 Each of these is a question about the renderers rather than about the harness, and each is
 waiting on a call rather than on work.
 
-- **`MultisampleArrayUnsupported` is latent.** `vrend/resource.rs` refuses a multisampled array
-  texture. Nothing on this host asks for one, so no corpus scores it and no boot has hit it. It is
-  a known refusal waiting for either a workload that needs it or a decision that it never will be.
-
 - **A blob typed with a planar format gets no picture.** The C converts one: `SET_TYPE` on an
   NV12, NV21, I420 or YV12 blob runs a CPU YUV-to-RGBA pass over the guest's planes into an RGBA
   texture at luma resolution. virglrs refuses it by name in `fill_texture` and blanks the

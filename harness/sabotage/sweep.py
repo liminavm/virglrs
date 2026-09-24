@@ -2073,6 +2073,30 @@ SABOTAGES = [
         };""",
         'the_maintenance6_binding_commands_hand_the_driver_the_guests_struct',
     ),
+    (
+        'a host with no multisample arrays still counts as multisampling',
+        'src/vrend/features.rs',
+        """            && self.has(Feature::storage_multisample)
+            && self.has(Feature::storage_multisample_2d_array)""",
+        """            && self.has(Feature::storage_multisample)""",
+        'multisample_textures_need_the_array_form_too',
+    ),
+    (
+        'the sample count ignores the missing array form',
+        'src/vrend/caps.rs',
+        """        if features.multisample_textures() {
+            c.v1.max_samples =""",
+        """        if has(Feature::storage_multisample) {
+            c.v1.max_samples =""",
+        'without_multisample_arrays_no_multisampling_is_advertised',
+    ),
+    (
+        'the format table multisamples without the array form',
+        'src/vrend/formats.rs',
+        """        if features.multisample_textures() {""",
+        """        if features.has(Feature::multisample) && features.has(Feature::storage_multisample) {""",
+        'without_multisample_arrays_no_multisampling_is_advertised',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

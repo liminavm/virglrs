@@ -1467,6 +1467,62 @@ mod tests {
         }
     }
 
+    /// A host that cannot make a multisample array texture advertises no multisampling, in both
+    /// places a guest reads it.
+    ///
+    /// The capset has no per-target bit, so advertising the 2D form alone would tell a guest a
+    /// format multisamples and then refuse its array form -- and a refused create reaches no
+    /// guest. The host here has the array form, so the host without it is this one with the
+    /// feature withdrawn, probed again against the same live driver.
+    #[test]
+    fn without_multisample_arrays_no_multisampling_is_advertised() {
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        let multisampled = |c: &caps::CapsV2| {
+            (0..super::super::proto::FORMAT_MAX)
+                .filter_map(super::super::proto::Format::from_wire)
+                .filter(|f| *f != super::super::proto::Format::NONE)
+                .filter(|f| c.supported_multisample_formats.has(*f))
+                .count()
+        };
+
+        // The control: this host multisamples, so a zero below is the withdrawal and not the host.
+        assert!(v.features.multisample_textures(), "the host this runs on has the array form");
+        assert!(v.caps.v1.max_samples > 1, "and advertises more than one sample");
+        assert!(multisampled(&v.caps) > 0, "and at least one multisampling format");
+
+        // Probed again from the same driver, as `Vrend::new` probes it, and then withdrawn.
+        let mut without = Features::probe(v.features.gles_version, v.gl.extensions());
+        without.reconcile(&v.gl);
+        assert!(without.multisample_textures(), "the re-probe sees what the first probe saw");
+        without.clear(Feature::storage_multisample_2d_array);
+        let table = Table::probe(&v.gl, &without);
+        let caps = caps::CapsV2::probe(&v.gl, &without, &v.limits, &table, None);
+        assert_eq!(caps.v1.max_samples, 1, "no sample count above one");
+        assert_eq!(multisampled(&caps), 0, "no format multisamples");
+        assert_eq!(caps.sample_locations, [0; 8], "and no sample positions for counts not offered");
+        assert!(table.entries().all(|e| !e.can_multisample), "the table agrees with the caps");
+    }
+
     /// What a cursor readback will and will not answer for, against a live driver.
     ///
     /// The refusals are the interesting half: this is reached with nothing but a resource handle,
