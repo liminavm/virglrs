@@ -23,6 +23,7 @@
 //! it -- alive for as long as nobody read the target.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -114,9 +115,57 @@ pub struct Unsettled(Arc<Counters>);
 #[derive(Default)]
 struct Counters {
     pending: AtomicUsize,
+    reads: Window,
+    replaces: Window,
+    queue: Window,
+}
+
+/// One kind of wait the render thread made for the decoder, counted since the last report.
+#[derive(Default)]
+struct Window {
     waits: AtomicU64,
     waited_us: AtomicU64,
     longest_us: AtomicU64,
+}
+
+impl Window {
+    fn record(&self, took: Duration) {
+        let us = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        self.waited_us.fetch_add(us, Ordering::Relaxed);
+        self.longest_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    fn take(&self) -> Waited {
+        Waited {
+            count: self.waits.swap(0, Ordering::Relaxed),
+            total: Duration::from_micros(self.waited_us.swap(0, Ordering::Relaxed)),
+            longest: Duration::from_micros(self.longest_us.swap(0, Ordering::Relaxed)),
+        }
+    }
+}
+
+/// How often one kind of wait happened in a report's window, how long it took in all, and the
+/// longest single one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Waited {
+    pub count: u64,
+    pub total: Duration,
+    pub longest: Duration,
+}
+
+/// Every way the render thread waits for the decoder, each counted on its own.
+///
+/// Only `reads` is a read outrunning its picture. The other two are waits END_FRAME itself makes,
+/// which a read count cannot see: `replaces` is a decode into a target whose previous picture has
+/// not landed and was never read, and `queue` is a decode sent into a codec whose queue is full.
+/// Under a clamped or overloaded host all three grow, and telling them apart from plain CPU
+/// denial is what they are for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Stalls {
+    pub reads: Waited,
+    pub replaces: Waited,
+    pub queue: Waited,
 }
 
 impl Unsettled {
@@ -125,13 +174,14 @@ impl Unsettled {
         self.0.pending.load(Ordering::Acquire) != 0
     }
 
-    /// The reads that waited for a picture since the last call, how long they waited in all, and
-    /// the longest single wait. Taken, so each report covers its own window.
-    pub fn take_waits(&self) -> (u64, Duration, Duration) {
-        let waits = self.0.waits.swap(0, Ordering::Relaxed);
-        let total = Duration::from_micros(self.0.waited_us.swap(0, Ordering::Relaxed));
-        let longest = Duration::from_micros(self.0.longest_us.swap(0, Ordering::Relaxed));
-        (waits, total, longest)
+    /// Every wait for the decoder since the last call. Taken, so each report covers its own
+    /// window.
+    pub fn take_waits(&self) -> Stalls {
+        Stalls {
+            reads: self.0.reads.take(),
+            replaces: self.0.replaces.take(),
+            queue: self.0.queue.take(),
+        }
     }
 
     fn count(&self) -> Counted {
@@ -140,17 +190,21 @@ impl Unsettled {
     }
 }
 
+/// Send `item` into a bounded queue, counting the send as a queue wait in `unsettled` if the queue
+/// was full and the render thread had to block for room.
+pub fn enqueue<T>(queue: &SyncSender<T>, item: T, unsettled: &Unsettled) {
+    let item = match queue.try_send(item) {
+        Ok(()) => return,
+        Err(TrySendError::Full(item)) => item,
+        Err(TrySendError::Disconnected(_)) => panic!("a codec's decode thread outlives its queue"),
+    };
+    let began = Instant::now();
+    queue.send(item).expect("a codec's decode thread outlives its queue");
+    unsettled.0.queue.record(began.elapsed());
+}
+
 /// One unit of [`Unsettled`], given back on drop.
 struct Counted(Arc<Counters>);
-
-impl Counters {
-    fn waited(&self, took: Duration) {
-        let us = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
-        self.waits.fetch_add(1, Ordering::Relaxed);
-        self.waited_us.fetch_add(us, Ordering::Relaxed);
-        self.longest_us.fetch_max(us, Ordering::Relaxed);
-    }
-}
 
 impl Drop for Counted {
     fn drop(&mut self) {
@@ -230,10 +284,17 @@ impl Slot {
     /// decoded into twice before anything read it must still end up holding the first picture
     /// if the second decode fails, which is what a synchronous decode left it holding. It is
     /// rare -- a guest reusing a target before anything read it -- and it costs one wait.
+    ///
+    /// Such a wait is counted as a replacement, not as a read (see [`Stalls`]).
     pub fn attach(&self, gl: &Gl, name: TextureName, planes: Option<&Planes>, pending: Pending) {
         let replaced = self.lock().replace(pending);
         if let Some(replaced) = replaced {
+            let began = (!replaced.landing.is_landed()).then(Instant::now);
+            let counters = Arc::clone(&replaced.counted.0);
             deliver(replaced, gl, name, planes);
+            if let Some(began) = began {
+                counters.replaces.record(began.elapsed());
+            }
         }
     }
 
@@ -275,7 +336,7 @@ impl Slot {
         let counted = Arc::clone(&pending.counted.0);
         let fill = deliver(pending, gl, name, planes);
         if let Some(began) = began {
-            counted.waited(began.elapsed());
+            counted.reads.record(began.elapsed());
         }
         Settled::Delivered { waited, fill }
     }
@@ -469,11 +530,12 @@ mod tests {
             Settled::Delivered { waited: true, fill: false }
         );
         lander.join().expect("the lander finishes");
-        let (waits, waited, longest) = unsettled.take_waits();
-        assert_eq!(waits, 1);
-        assert!(waited >= Duration::from_millis(30), "the wait was {waited:?}");
-        assert_eq!(waited, longest);
-        assert_eq!(unsettled.take_waits().0, 0, "each report takes its own window");
+        let stalls = unsettled.take_waits();
+        assert_eq!(stalls.reads.count, 1);
+        assert!(stalls.reads.total >= Duration::from_millis(30), "the wait was {stalls:?}");
+        assert_eq!(stalls.reads.total, stalls.reads.longest);
+        assert_eq!((stalls.replaces.count, stalls.queue.count), (0, 0), "a read is only a read");
+        assert_eq!(unsettled.take_waits(), Stalls::default(), "each report takes its own window");
     }
 
     /// A second decode into a target that nothing read yet delivers the first picture before it
@@ -505,6 +567,38 @@ mod tests {
         lander.join().expect("the lander finishes");
         assert!(landed_by_the_attach, "the attach did not wait for the first picture");
         assert!(slot.in_flight(), "the second is what is pending now");
-        assert_eq!(unsettled.take_waits().0, 0, "replacing is not a read");
+        let stalls = unsettled.take_waits();
+        assert_eq!(stalls.reads.count, 0, "replacing is not a read");
+        assert_eq!(stalls.replaces.count, 1, "the wait for the first picture was not counted");
+        assert!(stalls.replaces.total > Duration::ZERO);
+    }
+
+    /// A send into a queue with room is not a wait, and costs nothing to count.
+    #[test]
+    fn a_send_into_a_queue_with_room_is_not_counted() {
+        let unsettled = Unsettled::default();
+        let (queue, _jobs) = std::sync::mpsc::sync_channel(1);
+        enqueue(&queue, 1u32, &unsettled);
+        assert_eq!(unsettled.take_waits(), Stalls::default());
+    }
+
+    /// A send into a full queue blocks the render thread until the decode thread makes room, and
+    /// that wait is counted as the queue's, not as a read's.
+    #[test]
+    fn a_send_into_a_full_queue_waits_and_is_counted() {
+        let unsettled = Unsettled::default();
+        let (queue, jobs) = std::sync::mpsc::sync_channel(1);
+        enqueue(&queue, 1u32, &unsettled);
+        let drainer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            let taken: Vec<u32> = jobs.iter().take(2).collect();
+            taken
+        });
+        enqueue(&queue, 2u32, &unsettled);
+        assert_eq!(drainer.join().expect("the drainer finishes"), vec![1, 2], "order is kept");
+        let stalls = unsettled.take_waits();
+        assert_eq!(stalls.queue.count, 1);
+        assert!(stalls.queue.total >= Duration::from_millis(30), "the wait was {stalls:?}");
+        assert_eq!(stalls.reads.count, 0, "a full queue is not a read");
     }
 }

@@ -1775,11 +1775,25 @@ SABOTAGES = [
     (
         'a second decode into a target drops the first picture instead of delivering it',
         'src/vrend/video/pending.rs',
-        """        if let Some(replaced) = replaced {
-            deliver(replaced, gl, name, planes);
-        }""",
-        """        drop(replaced);""",
+        """            deliver(replaced, gl, name, planes);
+            if let Some(began) = began {""",
+        """            drop(replaced);
+            if let Some(began) = began {""",
         'a_target_decoded_into_twice_takes_the_first_picture_before_the_second',
+    ),
+    (
+        'a decode into a target whose picture is still decoding waits without being counted',
+        'src/vrend/video/pending.rs',
+        """                counters.replaces.record(began.elapsed());""",
+        """                let _ = (&counters, began);""",
+        'a_target_decoded_into_twice_takes_the_first_picture_before_the_second',
+    ),
+    (
+        'a decode sent into a full queue waits without being counted',
+        'src/vrend/video/pending.rs',
+        """    unsettled.0.queue.record(began.elapsed());""",
+        """    let _ = (unsettled, began);""",
+        'a_send_into_a_full_queue_waits_and_is_counted',
     ),
 ]
 

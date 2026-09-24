@@ -780,7 +780,8 @@ struct Worker {
 }
 
 impl Decoder {
-    fn send(&mut self, job: Job) {
+    /// Blocks while the codec's queue is full, which [`pending::enqueue`] counts.
+    fn send(&mut self, job: Job, unsettled: &pending::Unsettled) {
         self.newest = Some(Arc::clone(&job.landing));
         let worker = self.worker.get_or_insert_with(|| {
             let (jobs, queue) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
@@ -790,7 +791,7 @@ impl Decoder {
                 .expect("spawning a codec's decode thread");
             Worker { jobs, thread }
         });
-        worker.jobs.send(job).expect("a codec's decode thread outlives its queue");
+        pending::enqueue(&worker.jobs, job, unsettled);
     }
 
     /// The newest decode, if it has not landed yet.
@@ -1053,19 +1054,22 @@ impl Submit for HostDecoder<'_> {
             _ => (Write::Nothing, None),
         };
         let (width, height) = shape.extent();
-        self.decoder.send(Job {
-            codec: handle,
-            name: self.codec,
-            width,
-            height,
-            config: shape.configuration(),
-            pixels: destination.map(|(_, pixels)| pixels),
-            unit: unit.to_vec(),
-            misreturned: shape.misreturned(),
-            withheld: matches!(delivery, Delivery::Withheld(_)),
-            write,
-            landing,
-        });
+        self.decoder.send(
+            Job {
+                codec: handle,
+                name: self.codec,
+                width,
+                height,
+                config: shape.configuration(),
+                pixels: destination.map(|(_, pixels)| pixels),
+                unit: unit.to_vec(),
+                misreturned: shape.misreturned(),
+                withheld: matches!(delivery, Delivery::Withheld(_)),
+                write,
+                landing,
+            },
+            self.unsettled,
+        );
         if let Some(buffer) = synchronous {
             buffer.settle(self.gl);
         }

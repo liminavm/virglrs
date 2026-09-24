@@ -470,17 +470,25 @@ impl Armed {
                 mb_s(a.stream_transfer_bytes, a.stream_transfer_busy),
             );
         }
-        // Reads that outran the decoder: each blocked this thread until its picture landed, which
-        // is the stall asynchronous decode removes, back in miniature. Taken whether or not this
-        // window decoded, since a read can wait on a decode queued in the window before.
-        let (waits, waited, longest) = a.settles.take_waits();
-        if waits > 0 {
-            eprintln!(
-                "[virglrs] vrend video: {waits} reads waited for a picture  {:.2} ms in all  \
-                 max {:.2} ms  (over {secs:.1}s{note})",
-                waited.as_secs_f64() * 1e3,
-                longest.as_secs_f64() * 1e3,
-            );
+        // Waits for the decoder, each kind on its own line. Reads that outran it are the stall
+        // asynchronous decode removes, back in miniature; a replacement is a decode into a target
+        // whose last picture had not landed; a full queue is a decode thread that fell behind.
+        // Taken whether or not this window decoded, since each can wait on an earlier decode.
+        let stalls = a.settles.take_waits();
+        for (what, w) in [
+            ("reads waited for a picture", stalls.reads),
+            ("decodes waited to replace a picture still decoding", stalls.replaces),
+            ("decodes waited for room in the queue", stalls.queue),
+        ] {
+            if w.count > 0 {
+                eprintln!(
+                    "[virglrs] vrend video: {} {what}  {:.2} ms in all  max {:.2} ms  \
+                     (over {secs:.1}s{note})",
+                    w.count,
+                    w.total.as_secs_f64() * 1e3,
+                    w.longest.as_secs_f64() * 1e3,
+                );
+            }
         }
         // What video costs the submitting thread, printed only for a window that decoded. The
         // maximum is the number that matters: it is how long one command held up every context.
