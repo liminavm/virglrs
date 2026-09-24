@@ -1906,6 +1906,44 @@ SABOTAGES = [
         'a_surface_label_skips_zero_when_the_count_wraps',
     ),
     (
+        'a TXQ past the last sampler is emitted',
+        'src/vrend/shader/glsl/tex.rs',
+        """    let texture = inst.tex().texture;
+
+    if !set_texture_reqs(ctx, inst, sreg_index) {
+        ctx.bufs.set_error();
+        return;
+    }""",
+        """    let texture = inst.tex().texture;
+
+    let _ = set_texture_reqs(ctx, inst, sreg_index);""",
+        'a_texture_query_past_the_last_sampler_is_refused',
+    ),
+    (
+        'a TXQS past the last sampler is emitted',
+        'src/vrend/shader/glsl/tex.rs',
+        """    ctx.shader_req_bits |= super::req::TXQS;
+    if !set_texture_reqs(ctx, inst, sreg_index) {
+        ctx.bufs.set_error();
+        return;
+    }""",
+        """    ctx.shader_req_bits |= super::req::TXQS;
+    let _ = set_texture_reqs(ctx, inst, sreg_index);""",
+        'a_texture_query_past_the_last_sampler_is_refused',
+    ),
+    (
+        'a LODQ past the last sampler is emitted',
+        'src/vrend/shader/glsl/tex.rs',
+        """    ctx.shader_req_bits |= super::req::LODQ;
+    if !set_texture_reqs(ctx, inst, sinfo.sreg_index) {
+        ctx.bufs.set_error();
+        return;
+    }""",
+        """    ctx.shader_req_bits |= super::req::LODQ;
+    let _ = set_texture_reqs(ctx, inst, sinfo.sreg_index);""",
+        'a_texture_query_past_the_last_sampler_is_refused',
+    ),
+    (
         'an export of a handle naming nothing is answered as not exportable',
         'src/renderer.rs',
         """        self.with_resource(handle, |_| ()).ok_or(Error::NoResource)?;""",

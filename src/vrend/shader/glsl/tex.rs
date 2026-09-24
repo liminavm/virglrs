@@ -82,6 +82,7 @@ fn is_r32_format(virgl_format: u16) -> bool {
 }
 
 /// `set_texture_reqs`.
+#[must_use = "false refuses the shader, and the translation must fail on it"]
 pub(super) fn set_texture_reqs(ctx: &mut Context<'_>, inst: &Instruction, sreg_index: i32) -> bool {
     if sreg_index < 0 || sreg_index as usize >= MAX_SAMPLERS {
         eprintln!("[virglrs] Sampler view exceeded, max is {MAX_SAMPLERS}");
@@ -113,7 +114,10 @@ pub(super) fn emit_txq(
     let dtypeprefix = Qual::IntBitsToFloat;
     let texture = inst.tex().texture;
 
-    set_texture_reqs(ctx, inst, sreg_index);
+    if !set_texture_reqs(ctx, inst, sreg_index) {
+        ctx.bufs.set_error();
+        return;
+    }
 
     // No LOD for these texture types; RECT is emulated with a plain 2D texture, which wants
     // LOD 0.
@@ -213,7 +217,10 @@ pub(super) fn emit_txqs(
     let sampler_index = 0;
     let dtypeprefix = Qual::IntBitsToFloat;
     ctx.shader_req_bits |= super::req::TXQS;
-    set_texture_reqs(ctx, inst, sreg_index);
+    if !set_texture_reqs(ctx, inst, sreg_index) {
+        ctx.bufs.set_error();
+        return;
+    }
     let texture = inst.tex().texture;
     if texture != Texture::Msaa2d && texture != Texture::Msaa2dArray {
         ctx.bufs.set_error();
@@ -289,6 +296,7 @@ pub(super) fn get_temp(ctx: &mut Context<'_>, indirect_dim: bool, dim: i32, reg:
 }
 
 /// `fill_offset_buffer`: the offset argument of a texture instruction.
+#[must_use = "false refuses the shader, and the translation must fail on it"]
 fn fill_offset_buffer(ctx: &mut Context<'_>, inst: &Instruction, offset_buf: &mut String) -> bool {
     let off = inst.tex_offsets[0];
     let texture = inst.tex().texture;
@@ -380,6 +388,7 @@ fn fill_offset_buffer(ctx: &mut Context<'_>, inst: &Instruction, offset_buf: &mu
     }
 }
 
+#[must_use = "false refuses the shader, and the translation must fail on it"]
 fn fill_immediate_offset(
     texture: Texture,
     val: [u32; 4],
@@ -421,7 +430,10 @@ pub(super) fn emit_lodq(
     writemask: &str,
 ) {
     ctx.shader_req_bits |= super::req::LODQ;
-    set_texture_reqs(ctx, inst, sinfo.sreg_index);
+    if !set_texture_reqs(ctx, inst, sinfo.sreg_index) {
+        ctx.bufs.set_error();
+        return;
+    }
 
     emit!(ctx.bufs, "{} = {}(textureQueryLOD({}, ", dst, dinfo.dstconv.s(), srcs[1]);
     match inst.tex().texture {
@@ -1002,6 +1014,7 @@ fn is_coherent(inst: &Instruction) -> bool {
 }
 
 /// `set_image_qualifier`.
+#[must_use = "false refuses the shader, and the translation must fail on it"]
 fn set_image_qualifier(
     ctx: &mut Context<'_>,
     inst: &Instruction,
@@ -1026,6 +1039,7 @@ fn set_image_qualifier(
 }
 
 /// `set_memory_qualifier`.
+#[must_use = "false refuses the shader, and the translation must fail on it"]
 fn set_memory_qualifier(
     ctx: &mut Context<'_>,
     inst: &Instruction,
@@ -1250,6 +1264,7 @@ fn emit_load_mem(
 }
 
 /// `translate_load`.
+#[must_use = "false refuses the shader, and the translation must fail on it"]
 pub(super) fn translate_load(
     ctx: &mut Context<'_>,
     inst: &Instruction,

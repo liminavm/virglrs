@@ -1332,6 +1332,36 @@ mod tests {
         );
     }
 
+    /// A texture query whose sampler operand names a slot past the last sampler is refused at
+    /// translation. The C ignores the refusal for the three queries and emits GLSL naming
+    /// whatever the operand was, which only the GL compiler then rejects; a sampling
+    /// instruction was already refused here.
+    ///
+    /// The operand is a buffer, not a sampler: the scanner refuses a `SAMP` that far out on its
+    /// own, and would say nothing about the instruction. A buffer index is what reaches here.
+    #[test]
+    fn a_texture_query_past_the_last_sampler_is_refused() {
+        for (what, inst) in [
+            ("TXQ", format!("TXQ TEMP[0], IMM[0].xxxx, BUFFER[{MAX_SAMPLERS}], 2D")),
+            ("TXQS", format!("TXQS TEMP[0], BUFFER[{MAX_SAMPLERS}], 2D_MSAA")),
+            ("LODQ", format!("LODQ TEMP[0], IN[0], BUFFER[{MAX_SAMPLERS}], 2D")),
+        ] {
+            let tgsi = format!(
+                "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL TEMP[0]\n\
+                 IMM[0] INT32 {{0, 0, 0, 0}}\n  0: {inst}\n  1: MOV OUT[0], TEMP[0]\n  2: END\n"
+            );
+            let shader = tgsi::text::parse(tgsi.as_bytes(), u32::MAX).expect("the shader parses");
+            let program = tgsi::Program::scan(shader).expect("the shader scans");
+            let translated =
+                convert(&corpus_cfg(), &program, 0, &Key::default(), &StreamOutput::default());
+            assert!(
+                translated.is_err(),
+                "{what} on sampler {MAX_SAMPLERS} is refused, not emitted:\n{}",
+                translated.map(|(s, _, _)| s.source()).unwrap_or_default()
+            );
+        }
+    }
+
     /// The clip and cull distance counts arrive as properties the guest wrote, and the translator
     /// adds the two wherever it asks whether either was set. Both are stored a byte wide, as the C
     /// stores them; the C promotes to `int` for the sum and this does not, so two counts that add

@@ -185,6 +185,7 @@ fn find_io_index(io: &[Io], index: i32) -> Option<usize> {
 }
 
 /// `get_destination_info`. Fills `ctx.dst_bufs`, the fp64 originals, and the writemask.
+#[must_use = "false refuses the shader, and the translation must fail on it"]
 fn get_destination_info(
     ctx: &mut Context<'_>,
     inst: &Instruction,
@@ -607,6 +608,7 @@ fn load_clipdist_fs(
 
 /// `get_source_info`. Fills `ctx.src_bufs` and, for the interpolation opcodes, the swizzle of
 /// the first operand that the caller applies to the result instead.
+#[must_use = "false refuses the shader, and the translation must fail on it"]
 fn get_source_info(
     ctx: &mut Context<'_>,
     inst: &Instruction,
