@@ -2090,6 +2090,24 @@ def main():
             # extended to cover.
             print('RED       %-58s the suite hung: nothing on that path ends on its own' % name)
             continue
+        # A sabotaged tree that does not build fails exactly as a catch does, and is one only if
+        # the compiler refused the defect rather than the sabotage's own spelling. An error
+        # inside the replacement text is the entry being uncompilable -- a refactor renamed what
+        # it names, and scored as caught it would read red forever while measuring nothing. An
+        # error anywhere else is the type system refusing what the edit broke, which is the
+        # catch this project prefers to a test.
+        if 'error: could not compile' in r.stderr:
+            start = original.index(old)
+            first = original.count('\n', 0, start) + 1
+            last = first + new.count('\n')
+            at = re.findall(r'^\s*--> (\S+?):(\d+):\d+', r.stderr, re.M)
+            if any(f == rel and first <= int(n) <= last for f, n in at):
+                holes.append(name)
+                print('BROKEN    %-58s the sabotage does not compile as written' % name)
+            else:
+                where = ', '.join(sorted({'%s:%s' % a for a in at})[:2]) or 'the build'
+                print('RED       %-58s the build refused it: %s' % (name, where))
+            continue
         if r.returncode == 0:
             holes.append(name)
             print('SURVIVED  %s' % name)
