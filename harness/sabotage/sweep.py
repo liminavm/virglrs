@@ -1906,6 +1906,13 @@ SABOTAGES = [
         'a_surface_label_skips_zero_when_the_count_wraps',
     ),
     (
+        'temporaries may be declared past the register space',
+        'src/vrend/shader/glsl/decl.rs',
+        """    if ctx.temps_declared > TEMP_REGISTERS {""",
+        """    if false && ctx.temps_declared > TEMP_REGISTERS {""",
+        'temporaries_past_the_register_space_are_refused',
+    ),
+    (
         'a TXQ past the last sampler is emitted',
         'src/vrend/shader/glsl/tex.rs',
         """    let texture = inst.tex().texture;

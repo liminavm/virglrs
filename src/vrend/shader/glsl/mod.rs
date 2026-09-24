@@ -126,6 +126,8 @@ const MAX_SYSTEM_VALUES: usize = 32;
 pub(super) use crate::vrend::pipe::slots::MAX_SAMPLERS;
 /// `MAX_IMMEDIATE`.
 const MAX_IMMEDIATE: usize = 1024;
+/// How many temporary registers a 16-bit register index can name.
+const TEMP_REGISTERS: u32 = 1 << 16;
 
 /// `vec_type`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -425,6 +427,8 @@ pub(super) struct Context<'a> {
     pub generic_ios: GenericIos,
 
     pub temp_ranges: Vec<TempRange>,
+    /// How many temporary registers the declarations so far span, arrays included.
+    pub temps_declared: u32,
 
     pub samplers: [Sampler; MAX_SAMPLERS],
     pub samplers_used: u32,
@@ -549,6 +553,7 @@ impl<'a> Context<'a> {
             texcoord_ios: InterfaceBits::default(),
             generic_ios: GenericIos::default(),
             temp_ranges: Vec::new(),
+            temps_declared: 0,
             samplers: [Sampler::default(); MAX_SAMPLERS],
             samplers_used: 0,
             ssbo_first_binding: u32::MAX,
@@ -1330,6 +1335,33 @@ mod tests {
             "a load past the last slot loads zero:\n{}",
             strings.source()
         );
+    }
+
+    /// Temporaries are declared per register, so a declaration is bytes of guest text and
+    /// thousands of entries and header lines here. Two declarations of the whole register space
+    /// have declared some register twice, which no working shader does -- the C would emit a
+    /// duplicate `vec4 tempN;` and GL would refuse it -- and repeated, they are the guest asking
+    /// for as much host memory as its text can multiply. Refused at the declaration past the
+    /// space, before anything is allocated for it.
+    #[test]
+    fn temporaries_past_the_register_space_are_refused() {
+        let whole = "DCL TEMP[0..65535]\n";
+        for (copies, refused) in [(1, false), (2, true)] {
+            let tgsi = format!(
+                "FRAG\nDCL OUT[0], COLOR\n{}IMM[0] FLT32 {{0.0, 0.0, 0.0, 0.0}}\n\
+                 \x20 0: MOV OUT[0], IMM[0]\n  1: END\n",
+                whole.repeat(copies)
+            );
+            let shader = tgsi::text::parse(tgsi.as_bytes(), u32::MAX).expect("the shader parses");
+            let program = tgsi::Program::scan(shader).expect("the shader scans");
+            let translated =
+                convert(&corpus_cfg(), &program, 0, &Key::default(), &StreamOutput::default());
+            assert_eq!(
+                translated.is_err(),
+                refused,
+                "{copies} declarations of the whole register space",
+            );
+        }
     }
 
     /// A texture query whose sampler operand names a slot past the last sampler is refused at

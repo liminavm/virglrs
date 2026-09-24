@@ -5,9 +5,9 @@
 //! context, and the first pass that runs ahead of it.
 
 use super::{
-    Context, Failure, Immed, Io, MAX_IMMEDIATE, MAX_IO, MAX_SAMPLERS, MAX_SYSTEM_VALUES, TempRange,
-    VecType, bit32, fail, req, samplertype_is_shadow, samplertype_to_req_bits,
-    stage_output_name_prefix, sysval,
+    Context, Failure, Immed, Io, MAX_IMMEDIATE, MAX_IO, MAX_SAMPLERS, MAX_SYSTEM_VALUES,
+    TEMP_REGISTERS, TempRange, VecType, bit32, fail, req, samplertype_is_shadow,
+    samplertype_to_req_bits, stage_output_name_prefix, sysval,
 };
 use crate::vrend::pipe::Swizzle;
 use crate::vrend::proto::Format;
@@ -160,8 +160,26 @@ fn sysvalue_map(name: Semantic) -> Option<(&'static str, u64, bool)> {
     })
 }
 
-/// `allocate_temp_range`.
-fn allocate_temp_range(ctx: &mut Context<'_>, first: i32, last: i32, array_id: i32) {
+/// `allocate_temp_range`, refusing a declaration that takes the shader past the registers a
+/// temporary's index can name.
+///
+/// Each register outside an array is its own entry and its own header line, so a declaration is
+/// a few bytes of guest text multiplied into as much host memory as it spans. Past the register
+/// space some register has been declared twice, which the C would emit as a duplicate `vec4
+/// tempN;` that GL refuses anyway; refusing here costs no working shader and bounds what the
+/// multiplication can reach. The C has no bound but its `realloc` failing, and an allocation
+/// failure here is an abort.
+fn allocate_temp_range(
+    ctx: &mut Context<'_>,
+    first: i32,
+    last: i32,
+    array_id: i32,
+) -> Result<(), Failure> {
+    let span = (last - first + 1) as u32;
+    ctx.temps_declared = ctx.temps_declared.saturating_add(span);
+    if ctx.temps_declared > TEMP_REGISTERS {
+        return fail(format!("Temporaries declared past the {TEMP_REGISTERS} registers there are"));
+    }
     if array_id > 0 {
         ctx.temp_ranges.push(TempRange { first, last, array_id, precise_result: false });
     } else {
@@ -174,6 +192,7 @@ fn allocate_temp_range(ctx: &mut Context<'_>, first: i32, last: i32, array_id: i
             });
         }
     }
+    Ok(())
 }
 
 /// `add_images`.
@@ -840,7 +859,7 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
             if first > last {
                 return fail(format!("Wrong range: First ({first}) > Last ({last})"));
             }
-            allocate_temp_range(ctx, first as i32, last as i32, array_id as i32);
+            allocate_temp_range(ctx, first as i32, last as i32, array_id as i32)?;
         }
         File::Sampler => {
             ctx.samplers_used |= bit32(last);
