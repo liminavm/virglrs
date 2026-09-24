@@ -893,8 +893,8 @@ SABOTAGES = [
         'src/venus/driver.rs',
         """        let share = storage.clone();""",
         """        let share = match storage {
-            Storage::Linear(s) => Storage::Linear(Arc::clone(s)),
             Storage::Texture(_) => return Err(ExportError::NotMappable),
+            other => other.clone(),
         };""",
         'memory_is_published_once_and_leaves_the_census_when_it_is',
     ),
@@ -990,8 +990,8 @@ SABOTAGES = [
         'src/venus/driver.rs',
         """        let share = storage.clone();""",
         """        let share = match storage {
-            Storage::Texture(s) => Storage::Texture(Arc::clone(s)),
             Storage::Linear(_) => return Err(ExportError::NotMappable),
+            other => other.clone(),
         };""",
         '',
     ),
