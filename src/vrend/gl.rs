@@ -2052,7 +2052,7 @@ impl Gl {
     pub fn bind_image_texture(
         &self,
         unit: ImageUnit,
-        texture: TextureName,
+        texture: Option<TextureName>,
         level: GLint,
         layered: bool,
         layer: GLint,
@@ -2063,7 +2063,7 @@ impl Gl {
         unsafe {
             self.t.glBindImageTexture()(
                 unit.0,
-                texture.0,
+                texture.map_or(0, |t| t.0),
                 level,
                 layered as GLboolean,
                 layer,

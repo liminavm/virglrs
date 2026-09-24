@@ -103,6 +103,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `--no-destroy` writes the arming control.
 - `make-flatshade-corpus.py` — writes a synthetic classic corpus that changes only the
   rasterizer between two draws into one target (see `fixtures/flatshade.score` below).
+- `make-image-corpus.py` — writes a synthetic classic corpus that stores through a shader image
+  of some of an array texture's layers (see `fixtures/image.score` below).
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
   then the whole stream in execution order through the limina replay ABI, and scores the result.
@@ -719,6 +721,17 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   draw when the second ran through the first draw's program. RGBA and one target are both
   load-bearing: a BGRA target or a second framebuffer bind would mark the shader dirty for its
   own reason and the fixture would be measuring that instead.
+
+  `image.score` gates a shader image over a subset of an array texture's layers. GL binds an
+  image as one layer or as all of them, so the C serves a range by binding a texture view of it
+  (`vrend_draw_bind_images_shader`); a renderer that does not writes nothing, or writes through
+  whatever the image unit held from an earlier draw. No recorded session reaches this, so
+  `make-image-corpus.py` writes `vm/captures/image.bin`: a four-layer `R32_FLOAT` array, one draw
+  whose fragment shader stores 1.0 and 0.5 into the first and second layers of an image of layers
+  1 to 2, then four draws that each sample one layer of the whole texture into a 2D offscreen.
+  The C reads layer 1 back red at full strength, layer 2 at half, and layers 0 and 3 black; the
+  store's own target is scored as the control that its draw ran. Run it as
+  `./vrend-replay.sh ../vm/captures/image.bin --renderer rs --expect fixtures/image.score`.
 
   `teardown.score` gates two lifetimes a real guest reaches constantly and no oracle here was
   watching: a program destroyed out from under the one that is bound, and a sub-context destroyed

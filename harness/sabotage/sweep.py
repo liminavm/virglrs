@@ -1870,6 +1870,13 @@ SABOTAGES = [
         'a_create_over_a_bound_shaders_handle_keeps_both_across_a_rebuild',
     ),
     (
+        'an image over some of an array\'s layers binds all of them',
+        'src/vrend/context/draw.rs',
+        """        (true, layers) => ImageLayers::Range { first, layers },""",
+        """        (true, _) => ImageLayers::Whole,""",
+        'an_image_reads_its_layers_as_the_c_does',
+    ),
+    (
         'an shm mapping may run past the end of its descriptor',
         'src/guest_mem.rs',
         """        if len as u64 > held {""",

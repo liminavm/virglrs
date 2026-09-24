@@ -855,8 +855,19 @@ pub struct ImageView {
     pub resource: ResourceHandle,
     pub format: Format,
     pub access: ImageAccess,
-    pub layer_offset: u32,
-    pub level_size: u32,
+    pub span: ImageSpan,
+}
+
+/// What a shader image sees of its resource. The wire's two dwords mean a byte range of a buffer
+/// or a layer range of a texture by the resource's kind, which is read once, when the image is
+/// set; the image names its resource by handle, so a draw that finds the handle naming the other
+/// kind binds nothing rather than read one span as the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageSpan {
+    /// Bytes of a buffer, within the host's texel limit.
+    Bytes { offset: u32, size: u32 },
+    /// One level of a texture, and its layers, first to last inclusive and in that order.
+    Layers { level: u32, first: u32, last: u32 },
 }
 
 pub struct SubContext {
@@ -3991,13 +4002,14 @@ impl Context {
                         return Err(Fault::Unimplemented { cmd, what: "shader images" });
                     }
                     let res = host.resource(cmd, r)?;
-                    match res.storage {
+                    let span = match res.storage {
                         Storage::Texture { .. } => {
                             let (first, last) =
                                 (im.layer_offset & 0xffff, (im.layer_offset >> 16) & 0xffff);
-                            if last.wrapping_sub(first).wrapping_add(1) & 0xffff == 0 {
+                            if last < first {
                                 return Err(Fault::OutOfRange { cmd, what: "image layers" });
                             }
+                            ImageSpan::Layers { level: im.level_size, first, last }
                         }
                         Storage::Buffer { .. } => {
                             // A buffer image is a texel range: `layer_offset` and `level_size`
@@ -4018,18 +4030,16 @@ impl Context {
                             if texels > u64::from(host.limits.max_texture_buffer_size) {
                                 return Err(Fault::OutOfRange { cmd, what: "image buffer range" });
                             }
+                            ImageSpan::Bytes { offset: im.layer_offset, size: im.level_size }
                         }
-                        _ => {}
-                    }
+                        // Staging and host memory have no GL object to bind.
+                        Storage::Guest | Storage::Host(_) => {
+                            return Err(Fault::IllegalResource { cmd, handle: r });
+                        }
+                    };
                     self.sub_mut().images[stage.index()].insert(
                         slot,
-                        ImageView {
-                            resource: r,
-                            format: im.format,
-                            access: im.access,
-                            layer_offset: im.layer_offset,
-                            level_size: im.level_size,
-                        },
+                        ImageView { resource: r, format: im.format, access: im.access, span },
                     );
                 }
             }

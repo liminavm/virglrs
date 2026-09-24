@@ -49,6 +49,7 @@ generator_for() {
         flatshade.bin) echo "harness/replay/make-flatshade-corpus.py" ;;
         surface.bin) echo "harness/replay/make-surface-corpus.py" ;;
         teardown.bin) echo "harness/replay/make-teardown-corpus.py" ;;
+        image.bin)   echo "harness/replay/make-image-corpus.py" ;;
         *)           echo "" ;;
     esac
 }

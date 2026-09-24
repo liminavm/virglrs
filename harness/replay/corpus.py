@@ -30,6 +30,8 @@ CCMD_SET_SAMPLER_VIEWS = 10
 CCMD_BLIT = 16
 CCMD_BIND_SAMPLER_STATES = 18
 CCMD_BIND_SHADER = 31
+CCMD_SET_SHADER_IMAGES = 35
+CCMD_MEMORY_BARRIER = 36
 CCMD_SET_SUB_CTX = 28
 CCMD_CREATE_SUB_CTX = 29
 CCMD_DESTROY_SUB_CTX = 30
@@ -49,6 +51,7 @@ B8G8R8A8_UNORM, B8G8R8X8_UNORM = 1, 2
 R8G8B8A8_UNORM, R8G8B8X8_UNORM = 67, 134
 B8G8R8A8_SRGB, B8G8R8X8_SRGB = 100, 101
 R32G32B32A32_FLOAT = 31
+R32_FLOAT = 28
 Z32_FLOAT, Z24X8_UNORM, S8_UINT_Z24_UNORM = 18, 21, 20
 
 BIND_DEPTH_STENCIL = 1 << 0
@@ -63,6 +66,8 @@ PIPE_MASK_RGBA = 0xF
 PIPE_MASK_Z = 0x10
 PIPE_CLEAR_COLOR0 = 1 << 2
 FILTER_NEAREST, FILTER_LINEAR = 0, 1
+IMAGE_ACCESS_READ, IMAGE_ACCESS_WRITE = 1, 2
+BARRIER_ALL = (1 << 14) - 1
 PRIM_TRIANGLES, PRIM_TRIANGLE_STRIP = 4, 5
 
 CTX = 1
@@ -141,14 +146,15 @@ class Corpus:
 
     # ---- objects ----
 
-    def shader(self, handle, stage, text):
+    def shader(self, handle, stage, text, tokens=None):
         """CREATE_OBJECT(SHADER). The text is TGSI, NUL-terminated and dword-padded; num_tokens
-        must be non-zero or the translator refuses it."""
+        must be non-zero or the translator refuses it, and large enough for the tokens the text
+        parses to, which a line count is not once instructions carry several operands."""
         blob = text.encode() + b"\0"
         blob += b"\0" * (-len(blob) % 4)
         dw = list(struct.unpack("<%dI" % (len(blob) // 4), blob))
-        self.emit(CCMD_CREATE_OBJECT, OBJ_SHADER,
-                  [handle, stage, len(blob), text.count("\n") + 2, 0] + dw)
+        tokens = text.count("\n") + 2 if tokens is None else tokens
+        self.emit(CCMD_CREATE_OBJECT, OBJ_SHADER, [handle, stage, len(blob), tokens, 0] + dw)
 
     def rasterizer(self, handle, flatshade=False):
         """A rasterizer that does nothing but let the quad through: no cull, filled, and the
@@ -223,6 +229,21 @@ class Corpus:
 
     def bind_sampler_states(self, stage, states, start_slot=0):
         self.emit(CCMD_BIND_SAMPLER_STATES, 0, [stage, start_slot] + list(states))
+
+    def set_shader_images(self, stage, images, start_slot=0):
+        """Each image is (resource, format, access, first_layer, last_layer, level), a texture's
+        layer range at one level, or None for an empty slot."""
+        body = [stage, start_slot]
+        for im in images:
+            if im is None:
+                body += [0] * 5
+                continue
+            res, fmt, access, first, last, level = im
+            body += [fmt, access, first | (last << 16), level, res]
+        self.emit(CCMD_SET_SHADER_IMAGES, 0, body)
+
+    def memory_barrier(self, flags=BARRIER_ALL):
+        self.emit(CCMD_MEMORY_BARRIER, 0, [flags])
 
     def set_viewport(self, w, h):
         """A viewport covering the whole target, y up -- the scale/translate pair gallium sends

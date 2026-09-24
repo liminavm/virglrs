@@ -1323,67 +1323,33 @@ impl Context {
             if prog.img_locs[s].get(i as usize).copied().flatten().is_none() {
                 continue;
             }
-            let Some(res) = host.bound_resource_mut(iview.resource) else {
-                continue;
-            };
-            let Some(entry) = formats.get(iview.format) else {
-                continue;
-            };
-            let (tex_id, level, first_layer, layered) = match &mut res.storage {
-                Storage::Buffer { name, tbo, .. } => {
-                    let tbo_tex = *tbo.get_or_insert_with(|| gl.gen_texture());
-                    // `set_shader_images` admits a buffer image only with one of these widths.
-                    let bs = iview.format.describe().map_or(1, |d| d.block_bytes());
-                    let format = match bs {
-                        16 => GL_RGBA32UI,
-                        8 => GL_RG32UI,
-                        4 => GL_R32UI,
-                        2 => GL_R16UI,
-                        _ => GL_R8UI,
-                    };
-                    gl.bind_buffer(GL_TEXTURE_BUFFER, Some(*name));
-                    gl.bind_texture(GL_TEXTURE_BUFFER, Some(tbo_tex));
-                    if features.has(Feature::arb_or_gles_ext_texture_buffer) {
-                        let range = if features.has(Feature::texture_buffer_range) {
-                            let bs = bs as usize;
-                            let size = iview.level_size as usize / bs;
-                            Some((iview.layer_offset as usize, size * bs))
-                        } else {
-                            None
-                        };
-                        gl.tex_buffer(format, *name, range);
-                    }
-                    (tbo_tex, 0, 0, true)
-                }
-                Storage::Texture(t) => {
-                    let level = iview.level_size;
-                    let first = iview.layer_offset & 0xffff;
-                    let last = (iview.layer_offset >> 16) & 0xffff;
-                    let depth = res.args.array_size.max(res.args.depth);
-                    let layered =
-                        !((res.args.array_size > 1 || res.args.depth > 1) && first == last);
-                    let num_layers = last.wrapping_sub(first).wrapping_add(1);
-                    if layered && (first != 0 || num_layers != depth) {
-                        host.todo.note("image views of a layer subset");
-                        continue;
-                    }
-                    (t.name, level as GLint, first as GLint, layered)
-                }
-                _ => continue,
-            };
             let access = match iview.access {
                 ImageAccess::Read => GL_READ_ONLY,
                 ImageAccess::Write => GL_WRITE_ONLY,
                 ImageAccess::ReadWrite => GL_READ_WRITE,
             };
+            let bound = formats.get(iview.format).and_then(|entry| {
+                let res = host.bound_resource_mut(iview.resource)?;
+                image_binding(gl, features, formats, res, iview.format, iview.span)
+                    .map(|b| (b, entry.gl.internalformat))
+            });
+            // A unit the program reads that cannot be bound is emptied, not left holding what
+            // an earlier draw bound there.
+            let Some((b, internalformat)) = bound else {
+                if matches!(iview.span, ImageSpan::Layers { first, last, .. } if first != last) {
+                    host.todo.note("image views of a layer subset that cannot be viewed");
+                }
+                gl.bind_image_texture(image_unit, None, 0, false, 0, GL_READ_ONLY, GL_R32UI);
+                continue;
+            };
             gl.bind_image_texture(
                 image_unit,
-                tex_id,
-                level,
-                layered,
-                first_layer,
+                Some(b.texture),
+                b.level,
+                b.layered,
+                b.layer,
                 access,
-                entry.gl.internalformat,
+                internalformat,
             );
         }
     }
@@ -1791,9 +1757,124 @@ impl Context {
     }
 }
 
+/// What a shader image binds: `glBindImageTexture`'s texture, level and layer arguments.
+struct ImageBinding {
+    texture: TextureName,
+    level: GLint,
+    layered: bool,
+    layer: GLint,
+}
+
+/// Which of a texture's layers an image over `first..=last` reaches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ImageLayers {
+    /// Every layer, through the texture itself.
+    Whole,
+    /// One layer of an array or 3D texture, bound unlayered.
+    One(u32),
+    /// Some layers but not all, which only a texture view of them can bind.
+    Range { first: u32, layers: u32 },
+}
+
+/// The C's reading of an image's layer range (`vrend_draw_bind_images_shader`) over a texture of
+/// `array_size` layers and `depth` slices. `None` for a range past the texture's last layer.
+fn image_layers(first: u32, last: u32, array_size: u32, depth: u32) -> Option<ImageLayers> {
+    let total = array_size.max(depth);
+    if last >= total {
+        return None;
+    }
+    let layered = !((array_size > 1 || depth > 1) && first == last);
+    Some(match (layered, last - first + 1) {
+        (false, _) => ImageLayers::One(first),
+        (true, layers) if first == 0 && layers == total => ImageLayers::Whole,
+        (true, layers) => ImageLayers::Range { first, layers },
+    })
+}
+
+/// What an image of `format` over `res` binds, or `None` when nothing can be: a span of the
+/// other kind of resource than the one it was set over, or a layer range with no view to serve it.
+fn image_binding(
+    gl: &Gl,
+    features: &Features,
+    formats: &Table,
+    res: &mut Resource,
+    format: Format,
+    span: ImageSpan,
+) -> Option<ImageBinding> {
+    let (args, viewable) = (res.args, res.supports_view());
+    match (&mut res.storage, span) {
+        (Storage::Buffer { name, tbo, .. }, ImageSpan::Bytes { offset, size }) => {
+            let tbo_tex = *tbo.get_or_insert_with(|| gl.gen_texture());
+            // `set_shader_images` admits a buffer image only with one of these widths.
+            let bs = format.describe().map_or(1, |d| d.block_bytes());
+            let internal = match bs {
+                16 => GL_RGBA32UI,
+                8 => GL_RG32UI,
+                4 => GL_R32UI,
+                2 => GL_R16UI,
+                _ => GL_R8UI,
+            };
+            gl.bind_buffer(GL_TEXTURE_BUFFER, Some(*name));
+            gl.bind_texture(GL_TEXTURE_BUFFER, Some(tbo_tex));
+            if features.has(Feature::arb_or_gles_ext_texture_buffer) {
+                let range = features.has(Feature::texture_buffer_range).then(|| {
+                    let bs = bs as usize;
+                    (offset as usize, size as usize / bs * bs)
+                });
+                gl.tex_buffer(internal, *name, range);
+            }
+            Some(ImageBinding { texture: tbo_tex, level: 0, layered: true, layer: 0 })
+        }
+        (Storage::Texture(t), ImageSpan::Layers { level, first, last }) => {
+            let level = level as GLint;
+            match image_layers(first, last, args.array_size, args.depth)? {
+                ImageLayers::Whole => {
+                    Some(ImageBinding { texture: t.name, level, layered: true, layer: 0 })
+                }
+                ImageLayers::One(layer) => Some(ImageBinding {
+                    texture: t.name,
+                    level,
+                    layered: false,
+                    layer: layer as GLint,
+                }),
+                ImageLayers::Range { first, layers } => {
+                    // The resource's views span every level, where the C's spans only the one it
+                    // binds, so `level` names the same level of the view as of the texture.
+                    let src =
+                        t.immutable.filter(|_| viewable && features.has(Feature::texture_view))?;
+                    let internalformat = formats.get(args.format)?.gl.internalformat;
+                    let key = ViewKey { format: args.format, first_layer: first, layers };
+                    let view = t.view(gl, src, key, internalformat, args.last_level + 1);
+                    Some(ImageBinding { texture: view, level, layered: true, layer: 0 })
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An image over some of an array's layers is a range for a view, not the whole texture and
+    /// not nothing: `image.bin` is its pixel gate, and this pins the reading it rests on.
+    #[test]
+    fn an_image_reads_its_layers_as_the_c_does() {
+        use ImageLayers::*;
+        // A plain 2D texture has one layer, and it is the whole of it.
+        assert_eq!(image_layers(0, 0, 1, 1), Some(Whole));
+        assert_eq!(image_layers(1, 1, 1, 1), None, "a layer the texture does not have");
+        // Four layers: all of them, some of them, one of them, and one past the end.
+        assert_eq!(image_layers(0, 3, 4, 1), Some(Whole));
+        assert_eq!(image_layers(1, 2, 4, 1), Some(Range { first: 1, layers: 2 }));
+        assert_eq!(image_layers(0, 2, 4, 1), Some(Range { first: 0, layers: 3 }));
+        assert_eq!(image_layers(2, 2, 4, 1), Some(One(2)));
+        assert_eq!(image_layers(0, 4, 4, 1), None);
+        // A 3D texture's slices read the same way.
+        assert_eq!(image_layers(0, 7, 1, 8), Some(Whole));
+        assert_eq!(image_layers(3, 3, 1, 8), Some(One(3)));
+    }
 
     /// The hazard the slot's serial exists to answer: the program list shifts under a bound slot
     /// whenever a variant is destroyed, and an index that did not move with it would name a

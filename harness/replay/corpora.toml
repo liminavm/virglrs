@@ -22,6 +22,18 @@ size = 84156
 generated = "harness/replay/make-blit-corpus.py"
 
 [[corpus]]
+name = "flatshade.bin"
+sha256 = "f9020907ef1f7efe9c13b6d553fd22978dfe64de89fdd01f5d3d8d16829d8d2f"
+size = 1928
+generated = "harness/replay/make-flatshade-corpus.py"
+
+[[corpus]]
+name = "image.bin"
+sha256 = "05426fa3850f856b6fed78dec346adfbe009218befcd28cf26335f085a14d949"
+size = 5532
+generated = "harness/replay/make-image-corpus.py"
+
+[[corpus]]
 name = "sampled.bin"
 sha256 = "f6f6eb80167dde9080d8656fa1c2077557472f6dba62f1ddaa3e16167a3e8c47"
 size = 279024
@@ -32,12 +44,6 @@ name = "sampler.bin"
 sha256 = "41a7fad521d677be66be9c9e6b6cfcbed4fac10fb94e815c74f29cb2bbdcc8a6"
 size = 19152
 generated = "harness/replay/make-sampler-corpus.py"
-
-[[corpus]]
-name = "flatshade.bin"
-sha256 = "f9020907ef1f7efe9c13b6d553fd22978dfe64de89fdd01f5d3d8d16829d8d2f"
-size = 1928
-generated = "harness/replay/make-flatshade-corpus.py"
 
 [[corpus]]
 name = "surface.bin"
