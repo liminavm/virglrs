@@ -499,10 +499,12 @@ impl Armed {
             };
             eprintln!(
                 "[virglrs] vrend video: decode thread  queued {:.2} ms mean  max {:.2} ms  \
-                 session {:.2} ms mean  max {:.2} ms  write {:.2} ms mean  max {:.2} ms  \
+                 create {} max {:.2} ms  session {:.2} ms mean  max {:.2} ms  write {:.2} ms mean  max {:.2} ms  \
                  (n={} decode over {secs:.1}s{note})",
                 mean(t.queued),
                 t.queued.longest.as_secs_f64() * 1e3,
+                t.create.count,
+                t.create.longest.as_secs_f64() * 1e3,
                 mean(t.session),
                 t.session.longest.as_secs_f64() * 1e3,
                 mean(t.write),

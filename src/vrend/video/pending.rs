@@ -126,6 +126,7 @@ struct Counters {
 #[derive(Default)]
 struct DecodeWindows {
     queued: Window,
+    create: Window,
     session: Window,
     write: Window,
 }
@@ -166,14 +167,15 @@ pub struct Waited {
 
 /// Where the decode thread's time went, per phase, in a report's window.
 ///
-/// `queued` is from the send to the decode thread taking the job, `session` is the VideoToolbox
-/// decode, and `write` is copying the picture into a composite target's planes (none for a
+/// `queued` is from the send to the decode thread taking the job, `create` is building (or
+/// adopting) a VideoToolbox session when the frame's shape needs a new one, `session` is the decode, and `write` is copying the picture into a composite target's planes (none for a
 /// per-plane target, whose planes upload on the render thread). A fence taken behind a decode
 /// waits at most the sum, which is what makes these the bound on how long one context's decode
 /// can hold back another's fences.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct DecodeTimes {
     pub queued: Waited,
+    pub create: Waited,
     pub session: Waited,
     pub write: Waited,
 }
@@ -182,6 +184,7 @@ pub struct DecodeTimes {
 #[derive(Clone, Copy, Default)]
 pub struct Phases {
     pub queued: Duration,
+    pub create: Option<Duration>,
     pub session: Option<Duration>,
     pub write: Option<Duration>,
 }
@@ -211,6 +214,9 @@ impl Unsettled {
     pub fn record_decode(&self, phases: Phases) {
         let d = &self.0.decoded;
         d.queued.record(phases.queued);
+        if let Some(took) = phases.create {
+            d.create.record(took);
+        }
         if let Some(took) = phases.session {
             d.session.record(took);
         }
@@ -222,7 +228,12 @@ impl Unsettled {
     /// The decode thread's phase times since the last call. Taken, like [`Self::take_waits`].
     pub fn take_decode_times(&self) -> DecodeTimes {
         let d = &self.0.decoded;
-        DecodeTimes { queued: d.queued.take(), session: d.session.take(), write: d.write.take() }
+        DecodeTimes {
+            queued: d.queued.take(),
+            create: d.create.take(),
+            session: d.session.take(),
+            write: d.write.take(),
+        }
     }
 
     /// Record one plane uploaded on the render thread, from mapping the picture to the upload's
@@ -675,16 +686,19 @@ mod tests {
         let unsettled = Unsettled::default();
         unsettled.record_decode(Phases {
             queued: Duration::from_millis(1),
+            create: Some(Duration::from_millis(40)),
             session: Some(Duration::from_millis(3)),
             write: Some(Duration::from_millis(2)),
         });
         unsettled.record_decode(Phases {
             queued: Duration::from_millis(5),
+            create: None,
             session: None,
             write: None,
         });
         let times = unsettled.take_decode_times();
         assert_eq!((times.queued.count, times.session.count, times.write.count), (2, 1, 1));
+        assert_eq!((times.create.count, times.create.longest), (1, Duration::from_millis(40)));
         assert_eq!(times.queued.longest, Duration::from_millis(5));
         assert_eq!(times.session.total, Duration::from_millis(3));
         assert_eq!(unsettled.take_decode_times(), DecodeTimes::default(), "taken per window");

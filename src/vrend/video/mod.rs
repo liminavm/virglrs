@@ -939,7 +939,9 @@ fn decode_one(
     // Rebuilt only when the frame's shape actually changes: a rebuild takes the reference
     // pictures with it, and every frame after one that did not need it then predicts from an
     // empty buffer -- which decodes "successfully" and looks like slightly wrong colour.
-    if !session.as_ref().is_some_and(|s| s.serves(&key)) && !adopt(session, &key, handle) {
+    let began = std::time::Instant::now();
+    let rebuilt = !session.as_ref().is_some_and(|s| s.serves(&key));
+    if rebuilt && !adopt(session, &key, handle) {
         match Session::create(key) {
             Ok(created) => *session = Some(created),
             Err(status) => {
@@ -954,6 +956,9 @@ fn decode_one(
                 return pending::Outcome::Nothing;
             }
         }
+    }
+    if rebuilt {
+        phases.create = Some(began.elapsed());
     }
     let live = session.as_mut().expect("a session was just built or kept");
 
