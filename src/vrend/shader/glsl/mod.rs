@@ -1412,6 +1412,37 @@ mod tests {
         }
     }
 
+    /// A coherent image store marks the image it writes as coherent, and nothing else.
+    ///
+    /// The coordinate register is the one the C asked about: `TEMP[0]` left `IMAGE[1]` declared
+    /// without the qualifier, and a coordinate in `TEMP[40]` refused the shader outright, since
+    /// no image slot has that number.
+    #[test]
+    fn a_coherent_image_store_marks_the_image_it_writes() {
+        for coord in [0, 40] {
+            let tgsi = format!(
+                "FRAG\nDCL IMAGE[1], 2D, PIPE_FORMAT_R32_FLOAT, WR\nDCL OUT[0], COLOR\n\
+                 DCL TEMP[0..40]\nIMM[0] FLT32 {{0, 0, 0, 0}}\n\
+                 \x20 0: STORE IMAGE[1], TEMP[{coord}], TEMP[1], 2D, PIPE_FORMAT_R32_FLOAT, COHERENT\n\
+                 \x20 1: MOV OUT[0], IMM[0]\n  2: END\n"
+            );
+            let shader = tgsi::text::parse(tgsi.as_bytes(), u32::MAX).expect("the shader parses");
+            let program = tgsi::Program::scan(shader).expect("the shader scans");
+            let (strings, _, _) =
+                convert(&corpus_cfg(), &program, 0, &Key::default(), &StreamOutput::default())
+                    .unwrap_or_else(|e| panic!("coordinate TEMP[{coord}]: {e}"));
+            let source = strings.source();
+            let decl = source
+                .lines()
+                .find(|l| l.contains("uniform") && l.contains("img1"))
+                .unwrap_or_else(|| panic!("IMAGE[1] is declared:\n{source}"));
+            assert!(
+                decl.contains("coherent"),
+                "coordinate TEMP[{coord}]: IMAGE[1] is declared coherent: {decl}"
+            );
+        }
+    }
+
     /// A sampler declared past the last slot is refused. The scanner bounds a sampler operand
     /// but not a declaration, and the C marked the declaration with a shift by its index, which
     /// for slot 32 wraps onto slot 0: the header then declares a sampler the guest never named.

@@ -1943,6 +1943,13 @@ SABOTAGES = [
         'temporaries_past_the_register_space_are_refused',
     ),
     (
+        "a coherent image store marks the image its coordinate register names",
+        'src/vrend/shader/glsl/tex.rs',
+        'if !set_image_qualifier(ctx, inst, Some(image), dst_reg.indirect) {',
+        'if !set_image_qualifier(ctx, inst, ImageSlot::new(inst.src[0].index), inst.src[0].indirect) {',
+        'a_coherent_image_store_marks_the_image_it_writes',
+    ),
+    (
         'a buffer operand is taken for the sampler a texture instruction samples through',
         'src/vrend/shader/glsl/inst.rs',
         """            Binding::Sampler(s) => Some(s),

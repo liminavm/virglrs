@@ -1135,11 +1135,10 @@ pub(super) fn translate_store(
         if !ctx.images_used_mask.contains(image) {
             return;
         }
-        // The C asks about the store's coordinate register here, not its destination image
-        // (`vrend_shader.c` `translate_store`), and this keeps that: a coherent store marks the
-        // image whose slot number the coordinate's register happens to share.
-        let coordinate = ImageSlot::new(inst.src[0].index);
-        if !set_image_qualifier(ctx, inst, coordinate, inst.src[0].indirect) {
+        // The image a coherent store marks is the one it writes. The C passes the coordinate
+        // register here (`vrend_shader.c` `translate_store`), which marks whichever image shares
+        // its number and refuses the shader when the register is past the last image slot.
+        if !set_image_qualifier(ctx, inst, Some(image), dst_reg.indirect) {
             ctx.bufs.set_error();
             return;
         }
