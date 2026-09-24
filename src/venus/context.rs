@@ -9990,6 +9990,7 @@ mod tests {
         ) -> VkResult {
             let handle = FIRST + CREATES.with_borrow(|c| c.len() as u64);
             CREATES.with_borrow_mut(|c| c.push(handle));
+            // SAFETY: the renderer passes `out` pointing at a fence it owns, as Vulkan's contract.
             unsafe { *out = VkFence(handle) };
             VkResult::VK_SUCCESS
         }

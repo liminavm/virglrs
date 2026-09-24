@@ -473,6 +473,7 @@ impl Winsys {
             )
         };
         if display == proc::EGL_NO_DISPLAY {
+            // SAFETY: takes nothing and reads this thread's last EGL error.
             let code = unsafe { egl.eglGetError()() };
             return Err(EglError { call: "eglGetPlatformDisplay", code });
         }

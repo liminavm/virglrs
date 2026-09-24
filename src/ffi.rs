@@ -2040,9 +2040,12 @@ fn malloc_bytes(bytes: &[u8]) -> Option<*mut c_void> {
     if bytes.is_empty() {
         // Not an error, and not a null pointer either: a caller handed a null buffer reads it as
         // failure. One byte nobody looks at costs less than that ambiguity.
+        // SAFETY: `malloc` takes any size and answers a fresh allocation or null, and null is
+        // checked before the pointer goes anywhere.
         let p = unsafe { libc::malloc(1) };
         return (!p.is_null()).then_some(p);
     }
+    // SAFETY: as above; the size is the slice's, so it is one the caller could hold.
     let p = unsafe { libc::malloc(bytes.len()) };
     if p.is_null() {
         return None;
@@ -2342,6 +2345,8 @@ pub extern "C" fn virgl_renderer_limina_memory_census(
         let buf = if n == 0 {
             core::ptr::null_mut()
         } else {
+            // SAFETY: `malloc` answers a fresh allocation or null, checked below. The size cannot
+            // overflow: `n` counts allocations the driver holds, each already a live object.
             let p = unsafe { libc::malloc(n * 2 * size_of::<u64>()) }.cast::<u64>();
             if p.is_null() {
                 return ENOMEM;
