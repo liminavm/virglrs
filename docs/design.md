@@ -38,41 +38,27 @@ un-vendoring venus-protocol), across 172 commits.
 
 ## The contract Limina depends on
 
-The C dylib exports 69 `virgl_*` symbols; libkrun references 62 of them (`nm -gU`
-on the dylib intersected with the symbols libkrun names). The harness pins all 69 —
-what this tree exports is ours to define, while who calls what moves without warning —
-but these are the ones with known callers:
+limina's libkrun fork compiles this crate in and calls its Rust API; no libkrun code calls a
+`virgl_renderer_*` symbol. `rutabaga_gfx/src/virgl_renderer.rs` holds a `Renderer` and names
+the rest of the contract in its signatures: the id newtypes, `Config`, `FenceSink`, the blob
+and classic resource descriptions, and venus's `Submitted`, `Wait` and `Answered`, which carry a
+batch that suspended on a driver wait back to the VMM and its answer back in. The IOSurface
+handover is `metal::republish`, the snapshot family is the `Renderer`'s `journal_*` and
+`replay_*` methods, which the virtio-gpu restore in `devices/src/virtio/gpu/virtio_gpu.rs`
+drives.
 
-- The classic surface bound by `rutabaga_gfx/src/generated/virgl_renderer_bindings.rs`
-  — init, cleanup, contexts, fences, resources (create/blob/import/export/map/unmap/
-  iov), transfers, `submit_cmd`, caps, poll — including the IOSurface family
-  (`resource_get_iosurface_id`, `resource_sync_iosurface`, `resource_read_iosurface`,
-  `republish_iosurface`, `resource_get_map_ptr`) that carries the zero-copy present
-  and the Mach-port publish.
-- The `virgl_renderer_limina_*` family, hand-declared in
-  `rutabaga_gfx/src/virgl_renderer.rs` and called from
-  `devices/src/virtio/gpu/journal.rs`: `journal_export/seq/unpin`,
-  `replay_begin/submit/ring_cmd/end`, `memory_census/read/write`,
-  `sync_export/restore`, `classic_content_export/restore`, `dump_state`.
+The C ABI in `ffi.rs` is the harness's surface, not limina's: it is the only one the reference
+leg has, so both legs are driven through it. `harness/abi/symbols.txt` and
+`symbols-limina.txt` pin its exported symbols against that leg, and the harness pins struct
+layouts as well as symbols -- a layout mismatch compiles clean and corrupts at runtime.
 
-**The ABI is layouts, not only symbols.** libkrun's bindgen pins the layout of
-`virgl_renderer_callbacks` (its version negotiation and `write_context_fence`),
-`virgl_renderer_resource_create_args`, and the blob/import arg structs. A layout
-mismatch compiles clean and corrupts at runtime, and no existing test would catch
-it — so P0 pins the symbol list *and* struct layouts as harness fixtures the Rust
-build is diffed against.
-
-Behavioural contract, not just symbols: `RENDER_SERVER | THREAD_SYNC |
-ASYNC_FENCE_CB` must retire venus fences **asynchronously** through
-`write_context_fence`, or the guest hangs in `vkQueueWaitIdle`. Asynchronously is not
-enough on its own: a fence on a ring the guest bound a queue to must also retire only
-once that queue has *finished*, which is what an empty `vkQueueSubmit` carrying a real
-`VkFence` buys. Retired on arrival it says the work is done when it has only been
-submitted, and a guest that hands another context a buffer on the strength of it is
-handing over a render still in flight. `virgl_renderer_init`
-must accept the flag word libkrun passes (`VENUS | USE_EGL | USE_GLES |
-USE_SURFACELESS | THREAD_SYNC | ASYNC_FENCE_CB | RENDER_SERVER | USE_VIDEO`) and
-advertise exactly the capsets those flags imply.
+Behavioural contract, not just signatures: venus fences retire **asynchronously** through the
+`FenceSink` the VMM installs, or the guest hangs in `vkQueueWaitIdle`. Asynchronously is not
+enough on its own: a fence on a ring the guest bound a queue to must also retire only once that
+queue has *finished*, which is what an empty `vkQueueSubmit` carrying a real `VkFence` buys.
+Retired on arrival it says the work is done when it has only been submitted, and a guest that
+hands another context a buffer on the strength of it is handing over a render still in flight.
+The capsets advertised are exactly the ones `Config` asks to serve.
 
 ## What we delete rather than port
 
@@ -109,7 +95,7 @@ invariants a port owes, none of which the C encodes as a type:
   never be synced.
 - **`read_iosurface` writes top-down BGRA and its stride is in BYTES.** Passing a pixel
   width yields a quarter-width image tiled four across and squashed four down.
-- **`republish_iosurface` is keyed by id, not by resource** — the resource may be gone
+- **`metal::republish` is keyed by id, not by resource** — the resource may be gone
   while the surface lives — and the registry is process-global and mutex-guarded, so it
   must be safe off the renderer thread.
 - **`get_map_ptr` is called eagerly at blob create** and its pointer feeds `hv_vm_map`,

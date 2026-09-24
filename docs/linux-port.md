@@ -433,7 +433,8 @@ replayers and the spelling is a private debug ABI. Renaming it is worth doing on
 is open for another reason, because `harness/abi/symbols.txt` and `symbols-limina.txt` pin the
 exported list against the reference leg and both trees would have to move together.
 `virgl_renderer_republish_iosurface` is the same coupling and not the free deletion it looks like:
-our `ffi.rs` answers `EINVAL` and nothing calls it, but the fork implements it over a Mach port
+nothing calls the symbol -- libkrun calls `metal::republish`, which `ffi.rs` forwards to on macOS
+and answers `EINVAL` for elsewhere -- but the fork implements it over a Mach port
 (`limina_republish_surface`) and both symbol fixtures name it, so dropping it here alone would
 make virglrs export less than the leg it is scored against.
 
