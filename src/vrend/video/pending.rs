@@ -239,7 +239,7 @@ impl Unsettled {
     /// Record one plane uploaded on the render thread, from mapping the picture to the upload's
     /// return. Only a per-plane target -- the stock tier's shape -- uploads there; delivery records
     /// straight into the counters its picture carries, and this is the same window.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn record_upload(&self, took: Duration) {
         self.0.uploads.record(took);
     }
