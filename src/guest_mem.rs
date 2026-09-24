@@ -62,11 +62,30 @@ impl GuestMap {
     /// The descriptor is borrowed, not consumed: the resource that owns it goes on owning it, and
     /// the mapping stays valid after the descriptor is closed, which is what POSIX guarantees and
     /// what lets a ring outlive the resource handle it was created from.
+    ///
+    /// `len` is the VMM's word for how big the resource is, and the descriptor is asked too. A
+    /// mapping may run past the end of its file -- `mmap` allows it -- but the pages past the
+    /// end have nothing behind them, and the first read or write of one is a `SIGBUS` that takes
+    /// the worker down. So a length the descriptor does not hold is refused here, the one place
+    /// that has both numbers, as the dma-buf mapping refuses one past what `lseek` reports.
     pub fn shm(fd: BorrowedFd<'_>, len: usize) -> io::Result<GuestMap> {
         if len == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "cannot map an empty resource",
+            ));
+        }
+        // SAFETY: `stat` is plain old data, so all-zeroes is a valid value to hand `fstat`.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a live borrowed descriptor, and a local for the answer.
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let held = u64::try_from(st.st_size).unwrap_or(0);
+        if len as u64 > held {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{len} bytes described over a descriptor that holds {held}"),
             ));
         }
         // SAFETY: a null hint lets the kernel choose the address; `len` is non-zero; the
@@ -780,6 +799,16 @@ mod tests {
         f.set_len(len as u64).expect("sized");
         std::fs::remove_file(&file).expect("unlinked; the descriptor keeps it alive");
         OwnedFd::from(f)
+    }
+
+    /// A length past the end of the descriptor is refused rather than mapped: the pages past the
+    /// end have nothing behind them, and touching one is a `SIGBUS`.
+    #[test]
+    fn a_mapping_longer_than_its_descriptor_is_refused() {
+        let fd = shm_fd(0x1000);
+        let refused = GuestMap::shm(fd.as_fd(), 0x2000);
+        assert!(refused.is_err(), "two pages described over a one-page descriptor");
+        assert!(GuestMap::shm(fd.as_fd(), 0x1000).is_ok(), "and what it holds maps");
     }
 
     #[test]

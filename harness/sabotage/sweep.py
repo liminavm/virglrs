@@ -1840,6 +1840,13 @@ SABOTAGES = [
         'a_replay_that_poisons_its_context_stops_and_says_so',
     ),
     (
+        'an shm mapping may run past the end of its descriptor',
+        'src/guest_mem.rs',
+        """        if len as u64 > held {""",
+        """        if len as u64 > held && held == u64::MAX {""",
+        'a_mapping_longer_than_its_descriptor_is_refused',
+    ),
+    (
         "a refused typing drops the exporter's storage",
         'src/vrend/resource.rs',
         """        adopted.map_err(|why| (self, why))""",
