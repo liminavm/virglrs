@@ -15,7 +15,7 @@
 
 use super::blitter;
 use super::caps;
-use super::context::{Context, Fault, Guest, Host, NotReplaying, Todo};
+use super::context::{Context, Fault, Guest, Host, Todo, Unfed};
 use super::current::{Current, GlContext};
 use super::egl::{self, EglError, Flavour, GlContexts, Version, Winsys};
 use super::features::{Feature, Features};
@@ -161,6 +161,8 @@ pub enum ReplayRefused {
     /// The context is not between `replay_begin` and `replay_end`, so it is live and a journal
     /// fed to it would be replayed over what the guest has built since.
     NotReplaying,
+    /// A retained command poisoned the context, and the feed stopped there.
+    Poisoned,
 }
 
 /// Whether a blob of `size` bytes may be published from a resource of `width` bytes.
@@ -516,11 +518,12 @@ impl Vrend {
             return Err(ReplayRefused::NoContext);
         }
         let (mut host, contexts) = self.split(id, guest);
-        contexts
-            .get_mut(&id)
-            .expect("checked above")
-            .replay_upto(&mut host, upto)
-            .map_err(|NotReplaying| ReplayRefused::NotReplaying)
+        contexts.get_mut(&id).expect("checked above").replay_upto(&mut host, upto).map_err(|why| {
+            match why {
+                Unfed::NotReplaying => ReplayRefused::NotReplaying,
+                Unfed::Poisoned => ReplayRefused::Poisoned,
+            }
+        })
     }
 
     /// Finish rebuilding a classic context, and report what it could not use.
@@ -1962,6 +1965,52 @@ mod tests {
             Ok(retained),
             "what was fed is what the rebuilt context retains"
         );
+        v.context_destroy(ctx, &NoGuest);
+    }
+
+    /// A retained command this renderer cannot frame back poisons the rebuilt context, and the
+    /// feed says so and stops, rather than reporting a clean rebuild of a context that will refuse
+    /// everything the guest sends next.
+    #[test]
+    fn a_replay_that_poisons_its_context_stops_and_says_so() {
+        use crate::vrend::journal::{Entry, Step, serialize};
+        use std::borrow::Cow;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+        )
+        .expect("vrend comes up");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &NoGuest).expect("a context");
+
+        // A header promising nine dwords with none behind it: nothing frames it. Then a
+        // `CREATE_SUB_CTX` that would be fine on its own, which the feed must not reach.
+        let torn = vec![vec![crate::vrend::proto::Cmd::CreateObject as u32 | 9 << 16]];
+        let fine = vec![vec![(1 << 16) | 29, 1]];
+        let journal = serialize(&[
+            Entry { seq: Seq(1), step: Step::Feed { sub: 0, chunks: Cow::Borrowed(&torn) } },
+            Entry { seq: Seq(2), step: Step::Feed { sub: 0, chunks: Cow::Borrowed(&fine) } },
+        ]);
+        assert!(v.replay_begin(ctx));
+        assert_eq!(v.journal_restore(ctx, &journal), Ok(2));
+        assert_eq!(
+            v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)),
+            Err(ReplayRefused::Poisoned),
+            "the rebuild reports the context it poisoned"
+        );
+        assert!(v.replay_end(ctx));
         v.context_destroy(ctx, &NoGuest);
     }
 

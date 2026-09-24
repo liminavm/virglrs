@@ -1293,7 +1293,7 @@ SABOTAGES = [
     (
         'a journal fed to a live classic context is fed as though it were replaying',
         'src/vrend/context.rs',
-        '        if self.replay.is_none() {\n            return Err(NotReplaying);\n        }',
+        '        if self.replay.is_none() {\n            return Err(Unfed::NotReplaying);\n        }',
         '        if self.replay.is_none() {\n            return Ok(());\n        }',
         'a_journal_fed_to_a_live_classic_context_is_refused',
     ),
@@ -1831,6 +1831,13 @@ SABOTAGES = [
         """        if ret == ret {
             self.note_submit(submits.get(), fence);""",
         'a_refused_submit_leaves_no_fence_pending_and_no_signal_requested',
+    ),
+    (
+        'a classic replay feeds past the command that poisoned its context',
+        'src/vrend/context.rs',
+        """            if self.replay_one(host, sub, &chunks).is_err() {""",
+        """            if self.replay_one(host, sub, &chunks).is_err() && seq.0 == u64::MAX {""",
+        'a_replay_that_poisons_its_context_stops_and_says_so',
     ),
     (
         "a refused typing drops the exporter's storage",

@@ -1483,6 +1483,7 @@ impl Renderer {
                     ReplayRefused::NotReplaying => {
                         Error::JournalRefused(vrend::context::NOT_REPLAYING)
                     }
+                    ReplayRefused::Poisoned => Error::Poisoned,
                 })
             }
             Bound::Venus(c) => self

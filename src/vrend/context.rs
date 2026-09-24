@@ -640,6 +640,17 @@ pub struct NotReplaying;
 /// [`NotReplaying`], in the words the journal's other refusals use.
 pub const NOT_REPLAYING: &str = "the context is not replaying";
 
+/// Why [`Context::replay_upto`] fed nothing more.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unfed {
+    /// See [`NotReplaying`].
+    NotReplaying,
+    /// A retained command could not be framed, which poisons the context even in a replay (see
+    /// [`Context::submit`]). The feed stops there: what follows names a world this rebuild no
+    /// longer built.
+    Poisoned,
+}
+
 /// A sub-context's objects, each holding the commands that created it.
 ///
 /// A plain map plus a second map of retained dwords would be two records of one fact, and the
@@ -1562,9 +1573,9 @@ impl Context {
     /// Called more than once, with a rising watermark, because the VMM interleaves its own
     /// rebuilding with this one: some of what these commands name is created on its side, and it
     /// knows where in this order that happens.
-    pub fn replay_upto(&mut self, host: &mut Host<'_>, upto: Seq) -> Result<(), NotReplaying> {
+    pub fn replay_upto(&mut self, host: &mut Host<'_>, upto: Seq) -> Result<(), Unfed> {
         if self.replay.is_none() {
-            return Err(NotReplaying);
+            return Err(Unfed::NotReplaying);
         }
         loop {
             let r = self.replay.as_ref().expect("no command ends the replay it is fed in");
@@ -1574,13 +1585,28 @@ impl Context {
             }
             // Cloned out of the journal rather than borrowed: running the command needs `self`
             // mutably, and an entry is one command, not a frame's worth of data.
-            let (sub, chunks) = (e.sub, e.chunks.clone());
-            self.replay.as_mut().expect("no command ends the replay it is fed in").fed += 1;
-            self.replay_one(host, sub, &chunks);
+            let (seq, sub, chunks) = (e.seq, e.sub, e.chunks.clone());
+            let r = self.replay.as_mut().expect("no command ends the replay it is fed in");
+            r.fed += 1;
+            let left = r.entries.len() - r.fed;
+            if self.replay_one(host, sub, &chunks).is_err() {
+                eprintln!(
+                    "[virglrs] vrend: ctx {} replay stopped at seq {seq}; {left} entries abandoned",
+                    host.ctx.get(),
+                );
+                return Err(Unfed::Poisoned);
+            }
         }
     }
 
-    fn replay_one(&mut self, host: &mut Host<'_>, sub: u32, chunks: &[Vec<u32>]) {
+    /// Feed one journal entry. `Err` only when it poisoned the context: every other fault is
+    /// dropped and counted inside [`Context::submit`].
+    fn replay_one(
+        &mut self,
+        host: &mut Host<'_>,
+        sub: u32,
+        chunks: &[Vec<u32>],
+    ) -> Result<(), Fault> {
         let id = SubContextId(sub);
         if chunks.is_empty() {
             // The one step that is not a command: the journal names the sub-context to make, and
@@ -1589,14 +1615,13 @@ impl Context {
                 eprintln!("[virglrs] vrend: replay: sub-context {sub}: no GL context: {e}");
                 self.note_drop("CreateSubCtx");
             }
-            return;
+            return Ok(());
         }
         self.set_sub_ctx(host, id);
         for c in chunks {
-            // The fault is dropped and counted inside `submit`; the context is not poisoned, so
-            // the result carries nothing this level has to act on.
-            let _ = self.submit(host, c);
+            self.submit(host, c)?;
         }
+        Ok(())
     }
 
     /// End the rebuild, and say what could not be used.
