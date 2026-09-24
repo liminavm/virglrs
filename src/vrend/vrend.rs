@@ -2195,6 +2195,102 @@ mod tests {
         v.context_destroy(ctx, &AllAttached);
     }
 
+    /// A view names its resource by handle, and the guest may free that handle and reuse it for a
+    /// resource of the other kind while the view lives. A view made over a texture carries no
+    /// element range -- its dwords are a layer range, here one reading as a plane index -- so
+    /// binding it once the handle names a buffer is refused, rather than read as a range nothing
+    /// checked.
+    #[test]
+    fn a_texture_view_is_refused_once_its_handle_names_a_buffer() {
+        use crate::vrend::context::Fault;
+        use crate::vrend::encode::encode;
+        use crate::vrend::pipe::{ShaderStage, Swizzle};
+        use crate::vrend::proto::{Cmd, Command, Object, SamplerView};
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let condemned = crate::vrend::resource::Condemned::default();
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            condemned.clone(),
+        )
+        .expect("vrend comes up");
+        let bgra = super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM");
+        let res = ResourceHandle::new(1).expect("a resource handle is non-zero");
+        let args = |target, bind, width| resource::Args {
+            target,
+            format: bgra,
+            bind,
+            width,
+            height: 1,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags(0),
+        };
+        v.resource_create(res, args(TextureTarget::Texture2d, resource::Bind::SAMPLER_VIEW, 16))
+            .expect("a texture");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &AllAttached).expect("a context");
+        let view = crate::vrend::proto::ObjectHandle::new(5).expect("non-zero");
+        let mut wire = Vec::new();
+        let object = Object::SamplerView(SamplerView {
+            resource: res,
+            format: bgra,
+            target: TextureTarget::Texture2d,
+            // Layers 1 to 0: a plane index on a planar texture, spent on this one. Read as
+            // elements, the range ends before it begins.
+            first_element_or_layers: 1,
+            last_element_or_levels: 0,
+            swizzle: [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+        });
+        encode(&Command::CreateObject { handle: view, object }, &mut wire);
+        v.submit(ctx, &wire, &AllAttached).expect("the context is here").expect("a view");
+
+        // The renderer's table lets the texture go, and the guest reuses its handle for a buffer.
+        drop(crate::vrend::resource::Claim::new(res, &condemned));
+        v.resource_create(res, args(TextureTarget::Buffer, resource::Bind::SAMPLER_VIEW, 64))
+            .expect("a texture buffer under the freed handle");
+
+        wire.clear();
+        let stage = ShaderStage::Fragment;
+        encode(
+            &Command::SetSamplerViews { stage, start_slot: 0, views: vec![Some(view)] },
+            &mut wire,
+        );
+        let refused = v.submit(ctx, &wire, &AllAttached).expect("the context is here");
+        assert!(
+            matches!(
+                refused,
+                Err(Fault::IllegalResource { cmd: Cmd::SetSamplerViews, handle }) if handle == res
+            ),
+            "a view made over a texture does not bind a buffer: {refused:?}"
+        );
+        v.context_destroy(ctx, &AllAttached);
+    }
+
     /// A read from the control queue -- here the texture a scanout is flushed from -- waits for
     /// the picture decoding into it, and leaves nothing pending behind.
     #[test]

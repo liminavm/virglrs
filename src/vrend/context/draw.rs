@@ -1220,7 +1220,10 @@ impl Context {
                             gl.bind_sampler(next_sampler_id, Some(id));
                         }
                     }
-                    let levels = view.last_level.wrapping_sub(view.first_level).wrapping_add(1);
+                    let levels = match view.span {
+                        Span::Levels { first, last } => last.wrapping_sub(first).wrapping_add(1),
+                        Span::Elements(_) => 0,
+                    };
                     let levels = if levels != 0 { levels } else { res.args.last_level + 1 };
                     levels_used = levels_used.max(sampler_index + 1);
                     levels_out[sampler_index] = levels as GLint;

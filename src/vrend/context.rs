@@ -534,13 +534,42 @@ pub struct View {
     pub skip_srgb_decode: bool,
     /// A texture view of the resource, when one was needed and could be made.
     pub view: Option<TextureName>,
-    pub first_layer: u32,
-    pub last_layer: u32,
-    pub first_level: u32,
-    pub last_level: u32,
-    pub first_element: u32,
-    pub last_element: u32,
+    pub span: Span,
     pub gl_swizzle: [GLint; 4],
+}
+
+/// What a view sees of its resource, which is a different thing for a buffer than for a
+/// texture. The resource the view was made over decides which, and the view names that resource
+/// only by handle: a bind that finds the handle naming the other kind refuses it rather than read
+/// one span as the other.
+pub enum Span {
+    Elements(Elements),
+    /// Mip levels, first to last inclusive, as the guest sent them.
+    Levels {
+        first: u32,
+        last: u32,
+    },
+}
+
+/// A buffer view's element range, checked against the host's texel limit when the view was made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Elements {
+    first: u32,
+    count: u32,
+}
+
+impl Elements {
+    /// `first..=last`, or `None` when that is empty or ends past `limit` texels.
+    fn within(first: u32, last: u32, limit: u32) -> Option<Elements> {
+        let count = last.checked_sub(first)?.checked_add(1)?;
+        (u64::from(first) + u64::from(count) <= u64::from(limit))
+            .then_some(Elements { first, count })
+    }
+
+    /// The range as a byte offset and a byte size, for texels `block` bytes wide.
+    fn bytes(self, block: usize) -> (usize, usize) {
+        (self.first as usize * block, self.count as usize * block)
+    }
 }
 
 impl View {
@@ -2657,24 +2686,30 @@ impl Context {
             }
         };
         let mut target = resource::gl_target(v.target, res.args.nr_samples);
-        if is_buffer {
+        let elements = if is_buffer {
             target = tex_target;
             // A buffer view is an element range, first to last inclusive. The C binds one
             // past the host's texel limit shortened to fit and reports the view made; the
             // range is the guest's claim about the resource, and a claim past the limit is
             // refused here instead.
             let (first, last) = (v.first_element_or_layers, v.last_element_or_levels);
-            let count = u64::from(last.wrapping_sub(first)).wrapping_add(1);
-            if u64::from(first) + count > u64::from(host.limits.max_texture_buffer_size) {
-                return Err(Fault::OutOfRange { cmd, what: "buffer view range" });
-            }
-        }
+            Some(
+                Elements::within(first, last, host.limits.max_texture_buffer_size)
+                    .ok_or(Fault::OutOfRange { cmd, what: "buffer view range" })?,
+            )
+        } else {
+            None
+        };
         let (mut first_layer, mut last_layer, first_level, last_level) = (
             v.first_element_or_layers & 0xffff,
             (v.first_element_or_layers >> 16) & 0xffff,
             v.last_element_or_levels & 0xff,
             (v.last_element_or_levels >> 8) & 0xff,
         );
+        let span = match elements {
+            Some(e) => Span::Elements(e),
+            None => Span::Levels { first: first_level, last: last_level },
+        };
         let desc = v.format.describe();
         let mut swizzle = v.swizzle;
         if !desc.is_some_and(|d| d.has_alpha() || d.is_depth_or_stencil()) {
@@ -2931,12 +2966,7 @@ impl Context {
                 && res.args.format.describe().is_some_and(|d| d.is_srgb())
                 && !desc.is_some_and(|d| d.is_srgb()),
             view,
-            first_layer,
-            last_layer,
-            first_level,
-            last_level,
-            first_element: v.first_element_or_layers,
-            last_element: v.last_element_or_levels,
+            span,
             gl_swizzle,
         })
     }
@@ -3747,8 +3777,8 @@ impl Context {
             let (gl, features, formats) = (host.gl, host.features, host.formats);
             let mut buffer_view = false;
             let res = host.resource_mut(cmd, view.resource)?;
-            match &mut res.storage {
-                Storage::Texture(t) if view.view.is_none() => {
+            match (&mut res.storage, &view.span) {
+                (Storage::Texture(t), Span::Levels { first, last }) if view.view.is_none() => {
                     let (name, target) = (t.name, t.target);
                     gl.bind_texture(view.target, Some(name));
                     let desc = view.format.describe();
@@ -3762,14 +3792,14 @@ impl Context {
                         };
                         gl.tex_parameter_i(target, GL_DEPTH_STENCIL_TEXTURE_MODE, mode as GLint);
                     }
-                    gl.tex_parameter_i(target, GL_TEXTURE_BASE_LEVEL, view.first_level as GLint);
-                    gl.tex_parameter_i(target, GL_TEXTURE_MAX_LEVEL, view.last_level as GLint);
+                    gl.tex_parameter_i(target, GL_TEXTURE_BASE_LEVEL, *first as GLint);
+                    gl.tex_parameter_i(target, GL_TEXTURE_MAX_LEVEL, *last as GLint);
                     for (c, s) in view.gl_swizzle.iter().enumerate() {
                         gl.tex_parameter_i(target, GL_TEXTURE_SWIZZLE_R + c as GLenum, *s);
                     }
                 }
-                Storage::Texture { .. } => {}
-                Storage::Buffer { name, tbo, .. } => {
+                (Storage::Texture(_), Span::Levels { .. }) => {}
+                (Storage::Buffer { name, tbo, .. }, Span::Elements(elements)) => {
                     // `create_sampler_view` refused every range on a host without buffer
                     // textures, whose limit is zero; this is the same fact, said once more.
                     if !features.has(Feature::arb_or_gles_ext_texture_buffer) {
@@ -3789,17 +3819,14 @@ impl Context {
                     let range = if features.has(Feature::texture_buffer_range) {
                         // Within the host's limit: `create_sampler_view` refused any other.
                         let bs = view.format.describe().map_or(1, |d| d.block_bytes()) as usize;
-                        let offset = view.first_element as usize;
-                        let size = (view.last_element as usize) - offset + 1;
-                        Some((offset * bs, size * bs))
+                        Some(elements.bytes(bs))
                     } else {
                         None
                     };
                     gl.tex_buffer(ifmt, *name, range);
                 }
-                Storage::Guest | Storage::Host(_) => {
-                    return Err(Fault::IllegalResource { cmd, handle: view.resource });
-                }
+                // The handle names a resource of another kind than the one the view was made over.
+                _ => return Err(Fault::IllegalResource { cmd, handle: view.resource }),
             }
             let sub = self.sub_mut();
             sub.units[stage.index()].set_view(slot, Some(*h));

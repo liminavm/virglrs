@@ -1840,6 +1840,13 @@ SABOTAGES = [
         'a_replay_that_poisons_its_context_stops_and_says_so',
     ),
     (
+        'a sampler view binds whatever kind of resource its handle names now',
+        'src/vrend/context.rs',
+        """                (Storage::Texture(_), Span::Levels { .. }) => {}""",
+        """                (Storage::Texture(_) | Storage::Buffer { .. }, Span::Levels { .. }) => {}""",
+        'a_texture_view_is_refused_once_its_handle_names_a_buffer',
+    ),
+    (
         'an shm mapping may run past the end of its descriptor',
         'src/guest_mem.rs',
         """        if len as u64 > held {""",
