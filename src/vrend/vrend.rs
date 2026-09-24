@@ -1771,6 +1771,94 @@ mod tests {
         v.context_destroy(ctx, &AllAttached);
     }
 
+    /// A query result the guest's pages are too short to take stays owed to them: the shadow
+    /// holds it, and the next attach of pages that can hold it writes it there. Marked as
+    /// delivered instead, it is lost -- the attach writes nothing to pages it believes agree.
+    #[test]
+    fn a_query_result_the_pages_cannot_take_stays_owed() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::pipe::QueryType;
+        use crate::vrend::proto::{Command, Object, QueryCreate};
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        /// Every resource attached, over the same eight bytes of pages: half a query result.
+        struct ShortPages([crate::abi::GuestIov; 1]);
+        impl Guest for ShortPages {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                Some(Iov::new(&self.0))
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let pages = |buf: &mut [u8]| {
+            [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(buf.as_mut_ptr().cast()),
+                len: buf.len(),
+            }]
+        };
+        let mut short = [0u8; 8];
+        let guest = ShortPages(pages(&mut short));
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+        )
+        .expect("vrend comes up");
+        assert!(v.features.has(Feature::timer_query), "the premise: this driver has timer queries");
+        let res = ResourceHandle::new(1).expect("a resource handle is non-zero");
+        v.resource_create(
+            res,
+            resource::Args {
+                target: TextureTarget::Buffer,
+                format: super::super::proto::Format::from_wire(64).expect("R8_UNORM"),
+                bind: resource::Bind::CUSTOM,
+                width: 16,
+                height: 1,
+                depth: 1,
+                array_size: 1,
+                last_level: 0,
+                nr_samples: 0,
+                flags: resource::ResourceFlags(0),
+            },
+        )
+        .expect("a host-memory buffer");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &guest).expect("a context");
+        let query = crate::vrend::proto::ObjectHandle::new(1).expect("non-zero");
+        let create = QueryCreate { kind: QueryType::Timestamp, index: 0, offset: 0, resource: res };
+        let mut wire = Vec::new();
+        encode(&Command::CreateObject { handle: query, object: Object::Query(create) }, &mut wire);
+        encode(&Command::EndQuery(query), &mut wire);
+        v.submit(ctx, &wire, &guest).expect("the context is here").expect("recorded");
+        v.finish_all();
+        let mut wire = Vec::new();
+        encode(&Command::GetQueryResult { query, wait: true }, &mut wire);
+        v.submit(ctx, &wire, &guest).expect("the context is here").expect("read back");
+        v.context_destroy(ctx, &guest);
+
+        let mut whole = [0u8; 16];
+        let entries = pages(&mut whole);
+        let slot = v.resources.sync().get_mut(&res).and_then(resource::Slot::resource_mut);
+        let Some(resource::Storage::Host(shadow)) = slot.map(|r| &mut r.storage) else {
+            panic!("a CUSTOM buffer is host memory");
+        };
+        assert!(shadow.mirror_into(&Iov::new(&entries)), "sixteen bytes of pages hold it");
+        assert_eq!(whole[..4], 1u32.to_le_bytes(), "VIRGL_QUERY_STATE_DONE reaches the pages");
+    }
+
     /// A CUSTOM buffer is host memory the guest sized, so it is in the ledger at that size.
     ///
     /// Its width is whatever the create said -- mesa's video bitstream buffers are CUSTOM and

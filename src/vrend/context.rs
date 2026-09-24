@@ -4520,21 +4520,15 @@ impl Context {
             shadow.bytes_mut()[..16].copy_from_slice(&state);
             wrote_shadow = true;
         }
-        // The result goes to both sides, so they agree afterwards -- unless there are no pages,
-        // in which case the shadow is ahead and says so.
-        match guest.pages(ctx, resource) {
-            Some(pages) => {
-                let _ = pages.copy_in(0, &state);
-                if let Storage::Host(shadow) = &mut res.storage {
-                    shadow.mirrored();
-                }
+        // The result goes to both sides, so they agree afterwards -- unless the pages did not take
+        // it, being absent or too short, in which case the shadow is ahead and says so.
+        let delivered = guest.pages(ctx, resource).is_some_and(|pages| pages.copy_in(0, &state));
+        if let Storage::Host(shadow) = &mut res.storage {
+            if delivered {
+                shadow.mirrored();
+            } else if wrote_shadow {
+                shadow.unmirrored();
             }
-            None if wrote_shadow => {
-                if let Storage::Host(shadow) = &mut res.storage {
-                    shadow.unmirrored();
-                }
-            }
-            None => {}
         }
         Ok(())
     }

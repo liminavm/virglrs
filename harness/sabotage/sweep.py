@@ -1877,6 +1877,13 @@ SABOTAGES = [
         'an_image_reads_its_layers_as_the_c_does',
     ),
     (
+        'a query result the pages refused is marked as delivered',
+        'src/vrend/context.rs',
+        """        let delivered = guest.pages(ctx, resource).is_some_and(|pages| pages.copy_in(0, &state));""",
+        """        let delivered = guest.pages(ctx, resource).is_some_and(|pages| pages.copy_in(0, &state) || true);""",
+        'a_query_result_the_pages_cannot_take_stays_owed',
+    ),
+    (
         'an shm mapping may run past the end of its descriptor',
         'src/guest_mem.rs',
         """        if len as u64 > held {""",
