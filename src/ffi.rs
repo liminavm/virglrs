@@ -670,14 +670,14 @@ fn export_query(q: &mut abi::ExportQuery) -> c_int {
     let Some(handle) = ResourceHandle::new(q.in_resource_id) else {
         return EINVAL;
     };
-    // The resource has to exist whatever the answer is about it, and a caller asking about one
-    // that does not is a different mistake from one asking about a resource that cannot export.
-    if with(None, |r| r.with_resource(handle, |_| ())).is_none() {
-        return EINVAL;
-    }
-    let exported = with(Err(renderer::Error::NotExportable), |r| r.resource_export(handle));
+    // One question, under one lock: asked apart, the resource could go between them and be
+    // answered as one that cannot export.
+    let exported = with(Err(renderer::Error::NoResource), |r| r.resource_export(handle));
     let (fd, layout) = match exported {
         Ok((fd, _, layout)) => (fd, layout),
+        // The resource has to exist whatever the answer is about it, and a caller asking about
+        // one that does not is a different mistake from one asking about one that cannot export.
+        Err(renderer::Error::NoResource) => return EINVAL,
         Err(_) => {
             // Not exportable, said the way the header says it. The descriptor slot stays `-1`
             // and the caller is told no layout is being claimed rather than a plausible one.
@@ -1275,7 +1275,7 @@ pub extern "C" fn virgl_renderer_resource_export_blob(
     let Some(handle) = ResourceHandle::new(res_id) else {
         return EINVAL;
     };
-    let exported = with(Err(renderer::Error::NotExportable), |r| r.resource_export(handle));
+    let exported = with(Err(renderer::Error::NoResource), |r| r.resource_export(handle));
     let (owned, kind, _) = match exported {
         Ok(it) => it,
         Err(e) => return errno(e),

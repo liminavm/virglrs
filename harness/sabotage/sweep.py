@@ -1907,6 +1907,13 @@ SABOTAGES = [
         'a_surface_label_skips_zero_when_the_count_wraps',
     ),
     (
+        'an export of a handle naming nothing is answered as not exportable',
+        'src/renderer.rs',
+        """        self.with_resource(handle, |_| ()).ok_or(Error::NoResource)?;""",
+        """        self.with_resource(handle, |_| ());""",
+        'an_export_of_nothing_is_not_an_export_refused',
+    ),
+    (
         'an shm mapping may run past the end of its descriptor',
         'src/guest_mem.rs',
         """        if len as u64 > held {""",

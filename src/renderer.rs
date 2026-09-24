@@ -1824,14 +1824,16 @@ impl Renderer {
     /// own storage and closing one does not close the other. Handing over the renderer's own
     /// would make every export the last one.
     ///
-    /// `Err` is the answer on a host that mints storage instead of exporting it, and for a
-    /// resource that has no presentable storage at all. Neither is a failure to report: the
-    /// caller asked how this could be exported and was told it could not, which is what it has
-    /// to handle anyway.
+    /// `Err(NotExportable)` is the answer on a host that mints storage instead of exporting it,
+    /// and for a resource that has no presentable storage at all. Neither is a failure to report:
+    /// the caller asked how this could be exported and was told it could not, which is what it
+    /// has to handle anyway. `Err(NoResource)` is the other answer, about the question rather than
+    /// the resource: the handle names nothing.
     pub fn resource_export(
         &mut self,
         handle: ResourceHandle,
     ) -> Result<(std::os::fd::OwnedFd, FdType, crate::surface::Layout), Error> {
+        self.with_resource(handle, |_| ()).ok_or(Error::NoResource)?;
         self.with_surface(handle, |surface| {
             let (fd, layout) = surface.export()?;
             Some((fd, FdType::DmaBuf, layout))
@@ -2839,6 +2841,31 @@ mod tests {
             "pages resolve for the context attached to them, exporter or not"
         );
         assert!(table.bytes(one, linear).is_none(), "and not for the exporter once detached");
+    }
+
+    /// Asking how a resource exports is a question about a resource, and a handle naming none is
+    /// told so rather than told the resource cannot export: the header answers those two
+    /// differently, and a shim that had to ask twice to tell them apart could be told both.
+    #[test]
+    fn an_export_of_nothing_is_not_an_export_refused() {
+        let mut r = renderer(Config::default());
+        let minted = BlobDesc {
+            blob_mem: crate::abi::BLOB_MEM_HOST3D,
+            blob_flags: 1,
+            source: BlobSource::HostMinted,
+            size: 4096,
+        };
+        let blob = ResourceHandle::new(1).unwrap();
+        r.resource_create_blob(blob, minted, Vec::new()).expect("created");
+        assert_eq!(
+            r.resource_export(blob).err(),
+            Some(Error::NotExportable),
+            "pages the host minted have no descriptor to give"
+        );
+        assert_eq!(
+            r.resource_export(ResourceHandle::new(2).unwrap()).err(),
+            Some(Error::NoResource)
+        );
     }
 
     /// The VMM publishes a blob by asking where it lives, and it asks *after* the create --
