@@ -2044,6 +2044,35 @@ SABOTAGES = [
         """                        Ok(crate::budget::Classic::open(&crate::budget::Budget::with_cap(None, false)).charge("host shm", size))""",
         'only_a_blob_that_asks_the_host_for_memory_is_given_any',
     ),
+    (
+        'vkCmdPushDescriptorSet2 is recorded as nothing',
+        'src/venus/context.rs',
+        """        let done = self.driver.cmd_push_descriptor_set2(args.commandBuffer, info);""",
+        """        let done = Some(()).filter(|_| info.get().set == u32::MAX);""",
+        'the_maintenance6_binding_commands_hand_the_driver_the_guests_struct',
+    ),
+    (
+        'vkCmdBindDescriptorSets2 goes to the plain entry point',
+        'src/venus/driver.rs',
+        """        let f = self.recorder(cb)?.try_vkCmdBindDescriptorSets2()?;
+        // SAFETY: as `cmd_push_descriptor_set2`.
+        unsafe { f(cb, info.get()) };""",
+        """        let i = info.get();
+        // SAFETY: sabotage -- the same arrays through the older command, stage flags dropped.
+        unsafe {
+            (self.recorder(cb)?.vkCmdBindDescriptorSets())(
+                cb,
+                VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_GRAPHICS,
+                i.layout,
+                i.firstSet,
+                i.descriptorSetCount,
+                i.pDescriptorSets,
+                i.dynamicOffsetCount,
+                i.pDynamicOffsets,
+            )
+        };""",
+        'the_maintenance6_binding_commands_hand_the_driver_the_guests_struct',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

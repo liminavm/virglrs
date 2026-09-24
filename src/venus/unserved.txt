@@ -1,10 +1,13 @@
 # The venus commands this build does not serve, and why each one is here.
 #
-# The capset's extension mask is built from what the pinned vk.xml can *serialize*, which is every
-# command below as well as the ones we serve. So a guest may legally send any of these, and each
-# one poisons its context. That is the right answer -- a zeroed reply is shaped exactly like a
-# successful one, so there is no safe way to continue -- but it is only the right answer while the
-# set is a decision rather than an accident.
+# A guest may legally send any of these. It is offered every extension the host driver has and the
+# pinned vk.xml can *serialize* (our `vkEnumerateDeviceExtensionProperties` answer; the capset's
+# mask only says which structs its encoder may use), and every core command of the version it is
+# told -- and a third of the lines below are core, down to 1.0, which no extension list can take
+# back. So the ledger is closed by serving, never by hiding. Each of these poisons its context.
+# That is the right answer -- a zeroed reply is shaped exactly like a successful one, so there is
+# no safe way to continue -- but it is only the right answer while the set is a decision rather
+# than an accident.
 #
 # This file is that decision, and a bare list of names could not be: it says nothing about whether
 # a line is work we owe or a command nothing here can reach. So each line carries a
@@ -63,7 +66,6 @@ vkCmdBeginConditionalRenderingEXT                  wanted:conditional-rendering
 vkCmdBeginQueryIndexedEXT                          wanted:transform-feedback
 vkCmdBeginRenderPass2                              wanted:render-pass2
 vkCmdBeginTransformFeedbackEXT                     wanted:transform-feedback
-vkCmdBindDescriptorSets2                           wanted:maintenance6-binding
 vkCmdBindIndexBuffer2                              wanted:indexed-and-indirect-draw
 vkCmdBindResourceHeapEXT                           out-of-reach:descriptor-heap
 vkCmdBindSamplerHeapEXT                            out-of-reach:descriptor-heap
@@ -98,9 +100,7 @@ vkCmdEndTransformFeedbackEXT                       wanted:transform-feedback
 vkCmdExecuteCommands                               wanted:secondary-command-buffers
 vkCmdNextSubpass                                   wanted:render-pass2
 vkCmdNextSubpass2                                  wanted:render-pass2
-vkCmdPushConstants2                                wanted:maintenance6-binding
 vkCmdPushDataEXT                                   out-of-reach:descriptor-heap
-vkCmdPushDescriptorSet2                            wanted:maintenance6-binding
 vkCmdResolveImage                                  wanted:image-copy-core
 vkCmdResolveImage2                                 wanted:copy-commands2
 vkCmdSetAlphaToCoverageEnableEXT                   wanted:extended-dynamic-state3

@@ -38,17 +38,18 @@ use super::proto::types::{
     vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
     vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginQuery,
     vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBeginRendering,
-    vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindIndexBuffer,
-    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers,
-    vn_command_vkCmdBindVertexBuffers2, vn_command_vkCmdBlitImage,
-    vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer,
-    vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImage,
+    vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindDescriptorSets2,
+    vn_command_vkCmdBindIndexBuffer, vn_command_vkCmdBindPipeline,
+    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBindVertexBuffers2,
+    vn_command_vkCmdBlitImage, vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage,
+    vn_command_vkCmdCopyBuffer, vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImage,
     vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyQueryPoolResults,
     vn_command_vkCmdDispatch, vn_command_vkCmdDraw, vn_command_vkCmdDrawMultiEXT,
     vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndQuery, vn_command_vkCmdEndRenderPass,
     vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
     vn_command_vkCmdPipelineBarrier2, vn_command_vkCmdPushConstants,
-    vn_command_vkCmdPushDescriptorSet, vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2,
+    vn_command_vkCmdPushConstants2, vn_command_vkCmdPushDescriptorSet,
+    vn_command_vkCmdPushDescriptorSet2, vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2,
     vn_command_vkCmdResetQueryPool, vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT,
     vn_command_vkCmdSetBlendConstants, vn_command_vkCmdSetCullMode, vn_command_vkCmdSetDepthBias,
     vn_command_vkCmdSetDepthBoundsTestEnable, vn_command_vkCmdSetDepthCompareOp,
@@ -4942,6 +4943,24 @@ impl Commands for Handlers<'_> {
             args.set,
             args.pDescriptorWrites(),
         );
+        self.recorded(done);
+    }
+
+    fn vkCmdPushDescriptorSet2(&mut self, args: &mut vn_command_vkCmdPushDescriptorSet2<'_>) {
+        let Some(info) = self.names(args.pPushDescriptorSetInfo) else { return };
+        let done = self.driver.cmd_push_descriptor_set2(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdBindDescriptorSets2(&mut self, args: &mut vn_command_vkCmdBindDescriptorSets2<'_>) {
+        let Some(info) = self.names(args.pBindDescriptorSetsInfo) else { return };
+        let done = self.driver.cmd_bind_descriptor_sets2(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdPushConstants2(&mut self, args: &mut vn_command_vkCmdPushConstants2<'_>) {
+        let Some(info) = self.names(args.pPushConstantsInfo) else { return };
+        let done = self.driver.cmd_push_constants2(args.commandBuffer, info);
         self.recorded(done);
     }
 
@@ -14846,9 +14865,9 @@ mod tests {
 
     /// Every command the protocol defines is either served or written down as not served.
     ///
-    /// The capset tells a guest it may send any of them -- its mask is built from what the pinned
-    /// vk.xml can *serialize*, not from what this build handles -- so the unserved set is a
-    /// live part of the interface and not an implementation detail. It was invisible until this
+    /// A guest may send any of them -- what it is offered is built from what the pinned vk.xml can
+    /// *serialize* and the version it is told, not from what this build handles -- so the
+    /// unserved set is a live part of the interface and not an implementation detail. It was invisible until this
     /// test: three seated-desktop boots found three of its members one at a time, four minutes
     /// each, and the fourth would have cost another four.
     ///
@@ -15638,6 +15657,194 @@ mod tests {
                  for another"
             );
         });
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The maintenance6 binding commands hand the driver the struct the guest sent, and nothing
+    /// rebuilt from it.
+    ///
+    /// All three are core in Vulkan 1.4, so a guest on a 1.4 device may send them whatever the
+    /// extensions say, and until these handlers each poisoned its context. What the driver is
+    /// handed is the decoded struct itself: a handler that copied it out field by field would
+    /// have to be kept in step with every member and `pNext` the struct grows.
+    #[test]
+    fn the_maintenance6_binding_commands_hand_the_driver_the_guests_struct() {
+        use super::super::proto::types::{
+            VkBindDescriptorSetsInfo, VkCommandBuffer, VkCommandPool, VkDescriptorSet, VkDevice,
+            VkPipelineLayout, VkPushConstantsInfo, VkPushDescriptorSetInfo, VkShaderStageFlags,
+            VkWriteDescriptorSet, vn_command_vkCmdBindDescriptorSets2,
+            vn_command_vkCmdPushConstants2, vn_command_vkCmdPushDescriptorSet2,
+        };
+        use crate::budget::Account;
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        /// What each stub was handed: the struct's address, and the fields read through it.
+        #[derive(Default)]
+        struct Saw {
+            pushed_sets: Vec<(usize, u64, u32, u32)>,
+            bound: Vec<(usize, u64, u32, u32, u32)>,
+            pushed: Vec<(usize, u64, u32, Vec<u8>)>,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        unsafe extern "C" fn push_set(_cb: VkCommandBuffer, info: *const VkPushDescriptorSetInfo) {
+            // SAFETY: the wrapper passes the reference it was handed.
+            let i = unsafe { &*info };
+            SAW.with_borrow_mut(|s| {
+                s.pushed_sets.push((info.addr(), i.layout.raw(), i.set, i.descriptorWriteCount))
+            });
+        }
+
+        unsafe extern "C" fn bind(_cb: VkCommandBuffer, info: *const VkBindDescriptorSetsInfo) {
+            // SAFETY: as above.
+            let i = unsafe { &*info };
+            SAW.with_borrow_mut(|s| {
+                s.bound.push((
+                    info.addr(),
+                    i.layout.raw(),
+                    i.firstSet,
+                    i.descriptorSetCount,
+                    i.dynamicOffsetCount,
+                ))
+            });
+        }
+
+        unsafe extern "C" fn push(_cb: VkCommandBuffer, info: *const VkPushConstantsInfo) {
+            // SAFETY: as above, and `pValues` holds `size` bytes -- the test built it so.
+            let i = unsafe { &*info };
+            let bytes =
+                unsafe { core::slice::from_raw_parts(i.pValues.cast::<u8>(), i.size as usize) };
+            SAW.with_borrow_mut(|s| {
+                s.pushed.push((info.addr(), i.layout.raw(), i.offset, bytes.to_vec()))
+            });
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdPushDescriptorSet2(push_set);
+        fns.plant_vkCmdBindDescriptorSets2(bind);
+        fns.plant_vkCmdPushConstants2(push);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        let writes = [VkWriteDescriptorSet::default(); 2];
+        let set_info = VkPushDescriptorSetInfo {
+            stageFlags: VkShaderStageFlags(1),
+            layout: VkPipelineLayout::forged(0x21),
+            set: 3,
+            descriptorWriteCount: writes.len() as u32,
+            pDescriptorWrites: writes.as_ptr(),
+            ..Default::default()
+        };
+        let mut args = vn_command_vkCmdPushDescriptorSet2 {
+            commandBuffer: cb,
+            pPushDescriptorSetInfo: Some(Decoded::planted(&set_info)),
+            ..Default::default()
+        };
+        h.vkCmdPushDescriptorSet2(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+
+        let sets = [VkDescriptorSet::forged(0x31), VkDescriptorSet::forged(0x32)];
+        let offsets = [0u32; 3];
+        let bind_info = VkBindDescriptorSetsInfo {
+            stageFlags: VkShaderStageFlags(1),
+            layout: VkPipelineLayout::forged(0x22),
+            firstSet: 1,
+            descriptorSetCount: sets.len() as u32,
+            pDescriptorSets: sets.as_ptr(),
+            dynamicOffsetCount: offsets.len() as u32,
+            pDynamicOffsets: offsets.as_ptr(),
+            ..Default::default()
+        };
+        let mut args = vn_command_vkCmdBindDescriptorSets2 {
+            commandBuffer: cb,
+            pBindDescriptorSetsInfo: Some(Decoded::planted(&bind_info)),
+            ..Default::default()
+        };
+        h.vkCmdBindDescriptorSets2(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+
+        let values = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let push_info = VkPushConstantsInfo {
+            stageFlags: VkShaderStageFlags(1),
+            layout: VkPipelineLayout::forged(0x23),
+            offset: 16,
+            size: values.len() as u32,
+            pValues: values.as_ptr().cast(),
+            ..Default::default()
+        };
+        let mut args = vn_command_vkCmdPushConstants2 {
+            commandBuffer: cb,
+            pPushConstantsInfo: Some(Decoded::planted(&push_info)),
+            ..Default::default()
+        };
+        h.vkCmdPushConstants2(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                s.pushed_sets,
+                [((&raw const set_info).addr(), 0x21, 3, 2)],
+                "the guest's own struct, with its layout, set and both writes"
+            );
+            assert_eq!(
+                s.bound,
+                [((&raw const bind_info).addr(), 0x22, 1, 2, 3)],
+                "the guest's own struct, with both sets and all three offsets"
+            );
+            assert_eq!(
+                s.pushed,
+                [((&raw const push_info).addr(), 0x23, 16, values.to_vec())],
+                "the guest's own struct, with its offset and every byte"
+            );
+        });
+
+        // A command that names no struct has said nothing to forward.
+        let mut args = vn_command_vkCmdPushConstants2 { commandBuffer: cb, ..Default::default() };
+        h.vkCmdPushConstants2(&mut args);
+        assert!(h.rejected().is_some(), "a push with no struct is refused, not forwarded");
+        assert_eq!(SAW.with_borrow(|s| s.pushed.len()), 1, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();

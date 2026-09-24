@@ -22,17 +22,17 @@ use crate::ids::{ContextId, FenceId, RingIdx};
 use super::cs::{self, Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
 use super::objects::Doomed;
 use super::proto::types::{
-    VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBool32, VkBuffer, VkBufferCopy,
-    VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView, VkCalibratedTimestampInfoKHR,
-    VkClearAttachment, VkClearColorValue, VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo,
-    VkCommandBufferResetFlags, VkCommandPool, VkCompareOp, VkCopyDescriptorSet,
-    VkCopyImageToImageInfo, VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA,
-    VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags,
-    VkDependencyInfo, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
-    VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
-    VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo,
-    VkExtensionProperties, VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
-    VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
+    VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBindDescriptorSetsInfo,
+    VkBool32, VkBuffer, VkBufferCopy, VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView,
+    VkCalibratedTimestampInfoKHR, VkClearAttachment, VkClearColorValue, VkClearRect,
+    VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags, VkCommandPool,
+    VkCompareOp, VkCopyDescriptorSet, VkCopyImageToImageInfo, VkCopyImageToMemoryInfo,
+    VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA,
+    VkCullModeFlags, VkDependencyFlags, VkDependencyInfo, VkDescriptorPool, VkDescriptorSet,
+    VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo,
+    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent,
+    VkExportMemoryAllocateInfo, VkExtensionProperties, VkExternalFenceHandleTypeFlagBits,
+    VkExternalImageFormatProperties, VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
     VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceCreateFlags, VkFenceCreateInfo,
@@ -49,15 +49,16 @@ use super::proto::types::{
     VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo, VkPhysicalDeviceImageFormatInfo2,
     VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties, VkPipeline,
     VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
-    VkPipelineStageFlags, VkPipelineStageFlags2, VkPrimitiveTopology, VkQueryControlFlags,
-    VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType,
-    VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingInfo, VkResult,
-    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
-    VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
-    VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
-    VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags,
-    VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo, VkSubmitInfo2,
-    VkSubpassContents, VkTimelineSemaphoreSubmitInfo, VkViewport, VkWriteDescriptorSet,
+    VkPipelineStageFlags, VkPipelineStageFlags2, VkPrimitiveTopology, VkPushConstantsInfo,
+    VkPushDescriptorSetInfo, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
+    VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
+    VkRenderPassBeginInfo, VkRenderingInfo, VkResult, VkRingMonitorInfoMESA, VkSampleCountFlagBits,
+    VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo,
+    VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo,
+    VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags,
+    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
+    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassContents, VkTimelineSemaphoreSubmitInfo,
+    VkViewport, VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
@@ -3937,6 +3938,49 @@ impl Driver {
         // SAFETY: as above; the count is the slice's own length, and every pointer inside a
         // write addresses the same arena the slice came from.
         unsafe { f(cb, bind_point, layout, set, writes.len() as u32, writes.as_ptr()) };
+        Some(())
+    }
+
+    /// `vkCmdPushDescriptorSet2`, `vkCmdBindDescriptorSets2` and `vkCmdPushConstants2`: the
+    /// maintenance6 forms, which carry the older commands' arguments in one struct and may chain
+    /// the pipeline layout itself where the handle would go.
+    ///
+    /// Plain forwards, as the C's are. The decoder reconciled every count in the struct with the
+    /// array beside it -- a guest that sends one without the other has poisoned its stream before
+    /// a handler runs -- and translated every handle, the chained layout's included.
+    pub fn cmd_push_descriptor_set2(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkPushDescriptorSetInfo>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdPushDescriptorSet2()?;
+        // SAFETY: as above; `info` is a struct the decoder built, so every pointer in it and in
+        // what it chains addresses the arena, sized by the count beside it.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_push_descriptor_set2`].
+    pub fn cmd_bind_descriptor_sets2(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkBindDescriptorSetsInfo>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdBindDescriptorSets2()?;
+        // SAFETY: as `cmd_push_descriptor_set2`.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_push_descriptor_set2`].
+    pub fn cmd_push_constants2(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkPushConstantsInfo>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdPushConstants2()?;
+        // SAFETY: as `cmd_push_descriptor_set2`.
+        unsafe { f(cb, info.get()) };
         Some(())
     }
 
