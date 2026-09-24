@@ -1833,6 +1833,13 @@ SABOTAGES = [
         'a_refused_submit_leaves_no_fence_pending_and_no_signal_requested',
     ),
     (
+        "a refused typing drops the exporter's storage",
+        'src/vrend/resource.rs',
+        """        adopted.map_err(|why| (self, why))""",
+        """        adopted.map_err(|why| (Untyped { storage: None }, why))""",
+        'a_refused_set_type_keeps_the_exporters_storage',
+    ),
+    (
         'a refused vkQueueSubmit2 still records what it promised',
         'src/venus/driver.rs',
         """        if ret == VkResult::VK_SUCCESS {

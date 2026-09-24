@@ -576,6 +576,8 @@ impl Untyped {
     /// and the guest would composite the one nobody draws into.
     /// A refusal hands the storage back, so a rejected upgrade leaves the handle exactly as it
     /// was rather than deleting it: there is no path that loses a resource by failing to type it.
+    /// That is kept by shape, not by care: the work is [`Untyped::adopt`], which only borrows the
+    /// storage, so no refusal inside it can have moved the share anywhere.
     ///
     /// Three outcomes, and each answers to whoever caused it.
     ///
@@ -606,6 +608,27 @@ impl Untyped {
         modifier: u64,
         batch: u64,
     ) -> Result<Resource, (Untyped, Refusal)> {
+        let adopted = self
+            .adopt(gl, winsys, features, formats, limits, args, pixels, planes, modifier, batch);
+        adopted.map_err(|why| (self, why))
+    }
+
+    /// [`Untyped::upgrade`]'s work, on a borrow of the storage. The image an adopt makes holds a
+    /// share of its own, so the untyped value is left exactly as it came in whatever happens.
+    #[allow(clippy::too_many_arguments)]
+    fn adopt(
+        &self,
+        gl: &Gl,
+        winsys: &Winsys,
+        features: &Features,
+        formats: &Table,
+        limits: &Limits,
+        args: Args,
+        pixels: Option<&PixelSource<'_>>,
+        planes: &[Plane],
+        modifier: u64,
+        batch: u64,
+    ) -> Result<Resource, Refusal> {
         // Plane zero is the image. The rest are named in a description of storage that has none
         // of its own, and read by nothing here -- so the fill below wants the first, and the
         // description below wants them all. One value, read two ways, rather than a `plane`
@@ -614,15 +637,14 @@ impl Untyped {
         // A blob being given a type is always given a texture's. The guest states the target,
         // so this asks rather than assumes: `gl_target` has no answer for a buffer and would
         // abort on one, and a guest must never be able to do that.
-        let gl_target = match plan(features, formats, limits, &args) {
-            Ok(Plan::Texture { gl_target }) => gl_target,
-            Ok(_) => return Err((self, Refusal::NotTextureStorage)),
-            Err(e) => return Err((self, e)),
+        let gl_target = match plan(features, formats, limits, &args)? {
+            Plan::Texture { gl_target } => gl_target,
+            _ => return Err(Refusal::NotTextureStorage),
         };
         // Whose fault a refused import is depends entirely on who supplied the layout, and that
         // is exactly what the two shapes of storage record -- so they are handled apart rather
         // than joined into one call with a flag beside it saying whom to blame.
-        let image = match self.storage {
+        let image = match &self.storage {
             // Either there is no storage here, or this host adopts none -- said once at init.
             // Neither is news, and neither means there are no pixels: the fill below reads them
             // where they are.
@@ -631,7 +653,7 @@ impl Untyped {
             // Minted here, to a layout chosen here, on a host that says it adopts what it
             // mints. A refusal is then this renderer's own defect and it crashes: degrading would
             // hide it behind a window that renders the wrong thing.
-            Some(Adoptable::Minted(held)) => match winsys.image_from_surface(held) {
+            Some(Adoptable::Minted(held)) => match winsys.image_from_surface(Arc::clone(held)) {
                 Ok(image) => Some(image),
                 Err(e) => panic!(
                     "the driver adopts minted storage but refused a minted {}x{} {} one: {e}",
@@ -642,18 +664,14 @@ impl Untyped {
             },
             // The exporting driver's own answer about its own image -- but the image's modifier
             // is the *guest's* choice and the importer is a second driver, which may not support
-            // it. So this one is refused, and the share is handed back with the slot: a guest
-            // that asks for a modifier this host's GL cannot import gets a resource it cannot
-            // create, and not a dead worker.
-            Some(Adoptable::Exported(held)) => match winsys.image_from_surface(Arc::clone(&held)) {
-                Ok(image) => Some(image),
-                Err(e) => {
-                    return Err((
-                        Untyped { storage: Some(Adoptable::Exported(held)) },
-                        Refusal::UnimportableStorage(e),
-                    ));
-                }
-            },
+            // it. So this one is refused, and the share stays with the slot: a guest that asks
+            // for a modifier this host's GL cannot import gets a resource it cannot create, and
+            // not a dead worker.
+            Some(Adoptable::Exported(held)) => Some(
+                winsys
+                    .image_from_surface(Arc::clone(held))
+                    .map_err(Refusal::UnimportableStorage)?,
+            ),
             // Storage with no layout of its own, read under the one this command carries -- the
             // only description of it there will ever be, because the driver laid out a buffer and
             // a buffer has no format, no tiling and no layout to report. That makes it the
@@ -664,35 +682,14 @@ impl Untyped {
             // it is refused -- never asserted, because a guest must not be able to abort the
             // host.
             Some(Adoptable::Unread(storage)) => {
-                let held = match describe(&storage, &args, planes, modifier) {
-                    Ok(held) => held,
-                    Err(why) => {
-                        return Err((
-                            Untyped { storage: Some(Adoptable::Unread(storage)) },
-                            Refusal::UndescribableStorage(why),
-                        ));
-                    }
-                };
-                match winsys.image_from_surface(held) {
-                    Ok(image) => Some(image),
-                    Err(e) => {
-                        return Err((
-                            Untyped { storage: Some(Adoptable::Unread(storage)) },
-                            Refusal::UnimportableStorage(e),
-                        ));
-                    }
-                }
+                let held = describe(storage, &args, planes, modifier)
+                    .map_err(Refusal::UndescribableStorage)?;
+                Some(winsys.image_from_surface(held).map_err(Refusal::UnimportableStorage)?)
             }
         };
-        // The share is gone into the image, or was never there; a refusal past this point has
-        // nothing left to hand back but an empty slot, which is what the handle already was.
         // No planes: this is a resource adopting a surface it was handed, and a composite
         // target is never one of those -- it mints its own, and its planes are cut from that.
-        let storage =
-            match alloc_texture(gl, winsys, features, formats, &args, gl_target, image, None) {
-                Ok(s) => s,
-                Err(e) => return Err((Untyped { storage: None }, e)),
-            };
+        let storage = alloc_texture(gl, winsys, features, formats, &args, gl_target, image, None)?;
         // Whether an image backs the storage is read off the storage, not carried alongside it:
         // the adopt can fail at either step, and a second boolean tracking it would be a copy of
         // this fact that the retry above is exactly the thing to make disagree.

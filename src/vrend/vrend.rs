@@ -1813,6 +1813,88 @@ mod tests {
         assert_eq!(budget.classic() - before, 65536, "the ledger holds the buffer's width");
     }
 
+    /// A blob whose typing is refused keeps the exporter's share: the handle stays untyped with
+    /// the storage it was attached with, as if the SET_TYPE had never come.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refused_set_type_keeps_the_exporters_storage() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::Command;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let retire = crate::fence::Retirement::start(Box::new(Discard));
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+        )
+        .expect("vrend comes up");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &AllAttached).expect("a context");
+
+        let surface = crate::metal::Surface::scanout(64, 8, surface::PixelFormat::Bgra, 256)
+            .expect("the system minted a surface");
+        let held: Arc<dyn surface::Held> = Arc::new(surface);
+        let res = ResourceHandle::new(1).expect("a resource handle is non-zero");
+        v.resource_attach_blob(ctx, res, Some(surface::Adoptable::Exported(Arc::clone(&held))));
+
+        // A zero width describes no image, so the typing is refused before anything is adopted.
+        let mut wire = Vec::new();
+        encode(
+            &Command::PipeResourceSetType {
+                resource: res,
+                format: super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM"),
+                bind: 0,
+                width: 0,
+                height: 8,
+                usage: 0,
+                modifier: 0,
+                planes: vec![crate::vrend::proto::Plane { stride: 256, offset: 0 }],
+            },
+            &mut wire,
+        );
+        let refused = v.submit(ctx, &wire, &AllAttached).expect("the context is here");
+        assert!(
+            matches!(
+                refused,
+                Err(crate::vrend::context::Fault::RefusedResource {
+                    why: resource::Refusal::ZeroWidth,
+                    ..
+                })
+            ),
+            "the typing reaches the adopt and is refused there: {refused:?}"
+        );
+
+        let kept = match v.resources.sync().get(&res) {
+            Some(resource::Slot::Untyped(u)) => u.surface().map(Arc::clone),
+            Some(resource::Slot::Resource(_)) => panic!("a refused typing typed the handle"),
+            None => panic!("a refused typing deleted the handle"),
+        };
+        let kept = kept.expect("the slot still holds the exporter's share");
+        assert!(Arc::ptr_eq(&kept, &held), "and it is the same share");
+        v.context_destroy(ctx, &AllAttached);
+    }
+
     #[test]
     fn the_version_string_parses_the_way_epoxy_reads_it() {
         assert_eq!(parse_gles_version("OpenGL ES 3.1 Mesa 26.0.0"), 31);
