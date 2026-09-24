@@ -1884,6 +1884,13 @@ SABOTAGES = [
         'a_query_result_the_pages_cannot_take_stays_owed',
     ),
     (
+        'a transfer on a context the resource is not attached to answers no resource',
+        'src/renderer.rs',
+        """                    return Err(Error::NotAttached);""",
+        """                    return Err(Error::NoResource);""",
+        'a_transfer_on_a_context_the_resource_is_not_attached_to_is_refused_as_such',
+    ),
+    (
         'an shm mapping may run past the end of its descriptor',
         'src/guest_mem.rs',
         """        if len as u64 > held {""",

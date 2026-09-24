@@ -239,6 +239,7 @@ fn errno(e: renderer::Error) -> c_int {
     match e {
         ResourceExists
         | NoResource
+        | NotAttached
         | ContextExists
         | NoContext
         | RendererAbsent

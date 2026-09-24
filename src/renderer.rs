@@ -44,6 +44,8 @@ pub enum Error {
     ResourceExists,
     /// No resource under that handle.
     NoResource,
+    /// The resource is live, but not attached to the context that named it.
+    NotAttached,
     /// The guest reused a context id that is still live.
     ContextExists,
     /// No context under that id.
@@ -138,6 +140,7 @@ impl std::fmt::Display for Error {
         let s = match self {
             Error::ResourceExists => "that resource handle is already live",
             Error::NoResource => "no such resource",
+            Error::NotAttached => "the resource is not attached to that context",
             Error::ContextExists => "that context id is already live",
             Error::NoContext => "no such context",
             Error::RendererAbsent => "this build was not initialized to serve that capset",
@@ -1074,7 +1077,7 @@ impl Renderer {
         let ctx = match ctx {
             Some(c) => {
                 if !attached.contains(&c) {
-                    return Err(Error::NoResource);
+                    return Err(Error::NotAttached);
                 }
                 Some(self.classic_ctx(c)?)
             }
@@ -2409,6 +2412,56 @@ mod tests {
             r.resource_present_waits_on(scanout),
             None,
             "two could have, and one fence cannot answer for both"
+        );
+    }
+
+    /// A transfer named on a context answers for that context: a resource it has not attached is
+    /// not one it can reach, and saying so is a different answer from there being no resource.
+    #[test]
+    fn a_transfer_on_a_context_the_resource_is_not_attached_to_is_refused_as_such() {
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut r =
+            Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
+                .expect("vrend comes up");
+        let ctx = ContextId::new(1).expect("a context id");
+        r.context_create(ctx, CapsetId::Virgl, "reading".into()).expect("a context");
+        let res = ResourceHandle::new(1).expect("a handle");
+        r.resource_create(
+            res,
+            ClassicArgs {
+                target: crate::vrend::pipe::TextureTarget::Texture2d,
+                format: crate::vrend::proto::Format::from_wire(1).expect("a format"),
+                bind: crate::vrend::resource::Bind::SAMPLER_VIEW,
+                width: 4,
+                height: 4,
+                depth: 1,
+                array_size: 1,
+                last_level: 0,
+                nr_samples: 0,
+                flags: crate::vrend::resource::ResourceFlags::default(),
+            },
+            Vec::new(),
+        )
+        .expect("a texture");
+        let info = transfer::Info {
+            level: 0,
+            stride: 0,
+            layer_stride: 0,
+            offset: 0,
+            region: crate::vrend::proto::Box3 { x: 0, y: 0, z: 0, width: 4, height: 4, depth: 1 },
+            synchronized: false,
+        };
+        let read = transfer::Direction::ToGuest;
+        assert_eq!(
+            r.transfer(res, Some(ctx), read, &info, Vec::new()),
+            Err(Error::NotAttached),
+            "the context never attached it"
+        );
+        let nothing = ResourceHandle::new(2).expect("a handle");
+        assert_eq!(
+            r.transfer(nothing, Some(ctx), read, &info, Vec::new()),
+            Err(Error::NoResource),
+            "a handle naming nothing is still that"
         );
     }
 
