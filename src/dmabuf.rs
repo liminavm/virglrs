@@ -138,12 +138,18 @@ impl PlanarFormat {
 /// **Not an IOSurface id, and not a handle anything outside this process can resolve.** A
 /// descriptor is what crosses a process boundary here; this exists because the renderer's own
 /// plumbing -- scores, journal entries, the census -- names a surface by a small integer, and
-/// that plumbing is shared with the host where the integer is globally meaningful. Monotonic and
-/// never reused, so a stale id names nothing rather than something else, which the global
-/// IOSurface ids cannot promise.
+/// that plumbing is shared with the host where the integer is globally meaningful. It is a label
+/// and nothing looks a surface up by it: counted up from 1, unique for the first 2^32 exports,
+/// and never 0, which the C ABI answers for a resource with no surface at all.
 fn next_id() -> SurfaceId {
     static NEXT: AtomicU32 = AtomicU32::new(1);
-    SurfaceId(NEXT.fetch_add(1, Ordering::Relaxed))
+    let id = NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(id_after(n)));
+    SurfaceId(id.expect("the update always answers"))
+}
+
+/// The label after `n`: the next one up, past 0 when the count wraps.
+fn id_after(n: u32) -> u32 {
+    n.checked_add(1).unwrap_or(1)
 }
 
 /// A read-write mapping of an exported descriptor, and the only thing that unmaps one.
@@ -766,6 +772,14 @@ impl crate::surface::Held for Described {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A surface label is never 0, which the C ABI answers for no surface, even once the count
+    /// has gone all the way round.
+    #[test]
+    fn a_surface_label_skips_zero_when_the_count_wraps() {
+        assert_eq!(super::id_after(1), 2);
+        assert_eq!(super::id_after(u32::MAX), 1);
+    }
 
     /// A descriptor over ordinary shared memory, so the layout and CPU paths can be exercised
     /// without a Vulkan driver. It is a real dma-buf in every respect this module can observe --

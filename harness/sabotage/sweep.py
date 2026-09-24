@@ -1900,6 +1900,13 @@ SABOTAGES = [
         'only_the_oes_entry_point_makes_a_host_bind_egl_images',
     ),
     (
+        'a dma-buf surface label wraps to zero',
+        'src/dmabuf.rs',
+        """    n.checked_add(1).unwrap_or(1)""",
+        """    n.wrapping_add(1)""",
+        'a_surface_label_skips_zero_when_the_count_wraps',
+    ),
+    (
         'an shm mapping may run past the end of its descriptor',
         'src/guest_mem.rs',
         """        if len as u64 > held {""",
