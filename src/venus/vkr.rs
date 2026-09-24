@@ -54,6 +54,8 @@ pub enum Error {
     Poisoned,
     /// A journal was fed to a context that is not between `replay_begin` and `replay_end`.
     NotReplaying,
+    /// The context would not take the journal it was handed, for this reason.
+    JournalRefused(&'static str),
 }
 
 /// Everything venus owns. Present exactly when the renderer was initialized to serve venus, which
@@ -546,10 +548,10 @@ impl Vkr {
     }
 
     /// Hand a context the journal it will be rebuilt from.
-    pub fn journal_restore(&mut self, ctx: VenusCtx, bytes: &[u8]) -> Result<usize, &'static str> {
-        let ctx = self.contexts.get(&ctx.id()).ok_or("no such context")?;
+    pub fn journal_restore(&mut self, ctx: VenusCtx, bytes: &[u8]) -> Result<usize, Error> {
+        let ctx = self.contexts.get(&ctx.id()).ok_or(Error::NoContext)?;
         let mut ctx = ctx.lock().expect("a context lock is never poisoned");
-        ctx.journal_restore(bytes)
+        ctx.journal_restore(bytes).map_err(Error::JournalRefused)
     }
 
     /// Feed a context's restored entries up to `upto`.
@@ -1407,7 +1409,7 @@ mod tests {
         // Live now: the ring thread is running.
         assert_eq!(
             v.journal_restore(ctx_id(), &blob),
-            Err(NOT_REPLAYING),
+            Err(Error::JournalRefused(NOT_REPLAYING)),
             "a live context takes no journal"
         );
         assert_eq!(

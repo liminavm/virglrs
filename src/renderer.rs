@@ -132,6 +132,17 @@ fn venus_error(e: venus::vkr::Error) -> Error {
         venus::vkr::Error::NoRing => Error::NoRing,
         venus::vkr::Error::Poisoned => Error::Poisoned,
         venus::vkr::Error::NotReplaying => Error::JournalRefused(venus::context::NOT_REPLAYING),
+        venus::vkr::Error::JournalRefused(why) => Error::JournalRefused(why),
+    }
+}
+
+/// A classic replay step's refusal, as the renderer reports it.
+fn replay_error(e: ReplayRefused) -> Error {
+    match e {
+        ReplayRefused::NoContext => Error::NoContext,
+        ReplayRefused::NotReplaying => Error::JournalRefused(vrend::context::NOT_REPLAYING),
+        ReplayRefused::Poisoned => Error::Poisoned,
+        ReplayRefused::JournalRefused(why) => Error::JournalRefused(why),
     }
 }
 
@@ -1450,24 +1461,36 @@ impl Renderer {
         let (which, restored) = match self.bound(ctx)? {
             Bound::Classic(c) => (
                 "vrend",
-                self.vrend.as_mut().ok_or(Error::RendererAbsent)?.journal_restore(c, bytes),
+                self.vrend
+                    .as_mut()
+                    .ok_or(Error::RendererAbsent)?
+                    .journal_restore(c, bytes)
+                    .map_err(replay_error),
             ),
-            Bound::Venus(c) => ("venus", self.venus_mut()?.journal_restore(c, bytes)),
+            Bound::Venus(c) => {
+                ("venus", self.venus_mut()?.journal_restore(c, bytes).map_err(venus_error))
+            }
             Bound::Unserved => return Err(Error::RendererUnimplemented),
         };
-        restored.map_err(|why| {
+        restored.inspect_err(|e| {
             // The blob has been through a snapshot file since it was written. Saying which way it
             // is wrong is the difference between a bug that can be found and a resume that is
             // merely black.
-            eprintln!("[virglrs] {which}: ctx {}: journal refused: {why}", ctx.get());
-            Error::JournalRefused(why)
+            if let Error::JournalRefused(why) = e {
+                eprintln!("[virglrs] {which}: ctx {}: journal refused: {why}", ctx.get());
+            }
         })
     }
 
     /// Begin rebuilding a context from its journal.
     pub fn replay_begin(&mut self, ctx: ContextId) -> Result<(), Error> {
         match self.bound(ctx)? {
-            Bound::Classic(c) => self.vrend_answered(|v| v.replay_begin(c)),
+            Bound::Classic(c) => self
+                .vrend
+                .as_mut()
+                .ok_or(Error::RendererAbsent)?
+                .replay_begin(c)
+                .map_err(replay_error),
             Bound::Venus(c) => self.venus_mut()?.replay_begin(c).map_err(venus_error),
             Bound::Unserved => Err(Error::RendererUnimplemented),
         }
@@ -1479,13 +1502,7 @@ impl Renderer {
             Bound::Classic(c) => {
                 let table = self.resources.read().expect("the resource lock is never poisoned");
                 let v = self.vrend.as_mut().ok_or(Error::RendererAbsent)?;
-                v.replay_upto(c, &*table, crate::vrend::journal::Seq(upto)).map_err(|e| match e {
-                    ReplayRefused::NoContext => Error::NoContext,
-                    ReplayRefused::NotReplaying => {
-                        Error::JournalRefused(vrend::context::NOT_REPLAYING)
-                    }
-                    ReplayRefused::Poisoned => Error::Poisoned,
-                })
+                v.replay_upto(c, &*table, crate::vrend::journal::Seq(upto)).map_err(replay_error)
             }
             Bound::Venus(c) => self
                 .venus_mut()?
@@ -1498,19 +1515,15 @@ impl Renderer {
     /// Finish rebuilding a context, and start whatever the journal built.
     pub fn replay_end(&mut self, ctx: ContextId) -> Result<(), Error> {
         match self.bound(ctx)? {
-            Bound::Classic(c) => self.vrend_answered(|v| v.replay_end(c)),
+            Bound::Classic(c) => self
+                .vrend
+                .as_mut()
+                .ok_or(Error::RendererAbsent)?
+                .replay_end(c)
+                .map_err(replay_error),
             Bound::Venus(c) => self.venus_mut()?.replay_end(c).map_err(venus_error),
             Bound::Unserved => Err(Error::RendererUnimplemented),
         }
-    }
-
-    /// Run a classic replay step whose only refusal is "that context is not here".
-    fn vrend_answered(
-        &mut self,
-        f: impl FnOnce(&mut vrend::vrend::Vrend) -> bool,
-    ) -> Result<(), Error> {
-        let v = self.vrend.as_mut().ok_or(Error::RendererAbsent)?;
-        if f(v) { Ok(()) } else { Err(Error::NoContext) }
     }
 
     /// One classic context's resource contents, for the VMM to store beside its journal.

@@ -163,6 +163,8 @@ pub enum ReplayRefused {
     NotReplaying,
     /// A retained command poisoned the context, and the feed stopped there.
     Poisoned,
+    /// The context would not take the journal it was handed, for this reason.
+    JournalRefused(&'static str),
 }
 
 /// Whether a blob of `size` bytes may be published from a resource of `width` bytes.
@@ -486,15 +488,10 @@ impl Vrend {
             .collect()
     }
 
-    /// Begin rebuilding a classic context. `false` if it is not here.
-    pub fn replay_begin(&mut self, ctx: ClassicCtx) -> bool {
-        match self.contexts.get_mut(&ctx.id()) {
-            Some(c) => {
-                c.replay_begin();
-                true
-            }
-            None => false,
-        }
+    /// Begin rebuilding a classic context.
+    pub fn replay_begin(&mut self, ctx: ClassicCtx) -> Result<(), ReplayRefused> {
+        self.contexts.get_mut(&ctx.id()).ok_or(ReplayRefused::NoContext)?.replay_begin();
+        Ok(())
     }
 
     /// Hand a classic context the journal it will be rebuilt from.
@@ -502,8 +499,12 @@ impl Vrend {
         &mut self,
         ctx: ClassicCtx,
         bytes: &[u8],
-    ) -> Result<usize, &'static str> {
-        self.contexts.get_mut(&ctx.id()).ok_or("no such context")?.replay_restore(bytes)
+    ) -> Result<usize, ReplayRefused> {
+        self.contexts
+            .get_mut(&ctx.id())
+            .ok_or(ReplayRefused::NoContext)?
+            .replay_restore(bytes)
+            .map_err(ReplayRefused::JournalRefused)
     }
 
     /// Feed a classic context's retained commands up to `upto`.
@@ -527,14 +528,9 @@ impl Vrend {
     }
 
     /// Finish rebuilding a classic context, and report what it could not use.
-    pub fn replay_end(&mut self, ctx: ClassicCtx) -> bool {
-        match self.contexts.get_mut(&ctx.id()) {
-            Some(c) => {
-                c.replay_end();
-                true
-            }
-            None => false,
-        }
+    pub fn replay_end(&mut self, ctx: ClassicCtx) -> Result<(), ReplayRefused> {
+        self.contexts.get_mut(&ctx.id()).ok_or(ReplayRefused::NoContext)?.replay_end();
+        Ok(())
     }
 
     // ---- contexts ----
@@ -2029,7 +2025,7 @@ mod tests {
 
         assert_eq!(
             v.journal_restore(ctx, &journal),
-            Err(NOT_REPLAYING),
+            Err(ReplayRefused::JournalRefused(NOT_REPLAYING)),
             "handed outside a replay span, the journal is refused"
         );
         assert_eq!(
@@ -2040,14 +2036,14 @@ mod tests {
 
         v.context_destroy(ctx, &NoGuest);
         v.context_create(ctx, &NoGuest).expect("a fresh context to rebuild");
-        assert!(v.replay_begin(ctx));
+        v.replay_begin(ctx).expect("the context is here");
         assert_eq!(
             v.journal_restore(ctx, &journal),
             Ok(retained),
             "inside the span the same journal is taken"
         );
         v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)).expect("and fed");
-        assert!(v.replay_end(ctx));
+        v.replay_end(ctx).expect("the context is here");
         let rebuilt = v.journal_export(ctx).expect("the rebuilt context exports its journal");
         assert_eq!(
             entries(&rebuilt),
@@ -2092,14 +2088,14 @@ mod tests {
             Entry { seq: Seq(1), step: Step::Feed { sub: 0, chunks: Cow::Borrowed(&torn) } },
             Entry { seq: Seq(2), step: Step::Feed { sub: 0, chunks: Cow::Borrowed(&fine) } },
         ]);
-        assert!(v.replay_begin(ctx));
+        v.replay_begin(ctx).expect("the context is here");
         assert_eq!(v.journal_restore(ctx, &journal), Ok(2));
         assert_eq!(
             v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)),
             Err(ReplayRefused::Poisoned),
             "the rebuild reports the context it poisoned"
         );
-        assert!(v.replay_end(ctx));
+        v.replay_end(ctx).expect("the context is here");
         v.context_destroy(ctx, &NoGuest);
     }
 
@@ -2136,11 +2132,11 @@ mod tests {
         v.context_destroy(ctx, &NoGuest);
 
         v.context_create(ctx, &NoGuest).expect("a fresh context to rebuild");
-        assert!(v.replay_begin(ctx));
+        v.replay_begin(ctx).expect("the context is here");
         assert_eq!(v.journal_restore(ctx, &journal), Ok(retained));
-        assert!(v.replay_begin(ctx));
+        v.replay_begin(ctx).expect("the context is here");
         v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)).expect("the context is replaying");
-        assert!(v.replay_end(ctx));
+        v.replay_end(ctx).expect("the context is here");
         let rebuilt = v.journal_export(ctx).expect("the rebuilt context exports its journal");
         assert_eq!(
             entries(&rebuilt),
@@ -2276,7 +2272,7 @@ mod tests {
         let journal = v.journal_export(ctx).expect("a live context exports its journal");
         v.context_destroy(ctx, &AllAttached);
         v.context_create(ctx, &AllAttached).expect("a fresh context to rebuild");
-        assert!(v.replay_begin(ctx));
+        v.replay_begin(ctx).expect("the context is here");
         v.journal_restore(ctx, &journal).expect("the journal is taken");
         v.replay_upto(ctx, &AllAttached, Seq(u64::MAX)).expect("and fed");
         let dropped = v.contexts.get_mut(&ctx.id()).expect("the context").replay_end();
@@ -2329,7 +2325,7 @@ mod tests {
         let journal = v.journal_export(ctx).expect("a live context exports its journal");
         v.context_destroy(ctx, &NoGuest);
         v.context_create(ctx, &NoGuest).expect("a fresh context to rebuild");
-        assert!(v.replay_begin(ctx));
+        v.replay_begin(ctx).expect("the context is here");
         v.journal_restore(ctx, &journal).expect("the journal is taken");
         v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)).expect("and fed");
         let dropped = v.contexts.get_mut(&ctx.id()).expect("the context").replay_end();
