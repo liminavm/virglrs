@@ -28,7 +28,6 @@ use crate::vrend::proto::Box3;
 use crate::vrend::resource::{Args as ClassicArgs, Refusal};
 use crate::vrend::transfer;
 use crate::vrend::vrend::{ClaimRefused, ReplayRefused};
-use std::collections::BTreeMap;
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(test)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
@@ -554,9 +553,6 @@ pub struct Context {
     /// belongs to, and it cannot change once the context exists.
     pub capset: CapsetId,
     pub name: String,
-    /// The last fence id created on each ring. A ring's fences retire in creation order, so this
-    /// is what a later phase checks a retirement against.
-    pub last_fence: BTreeMap<RingIdx, FenceId>,
 }
 
 /// A context resolved to the renderer that serves it.
@@ -1113,8 +1109,7 @@ impl Renderer {
         // every caller comes through, so no reader downstream has to know the buffer's width or
         // remember to do it: what a log line prints in brackets is a name, not a field.
         let name = name.trim_matches(|c: char| c.is_whitespace() || c == '\0').to_owned();
-        self.contexts
-            .insert(id, Context { id, capset, name: name.clone(), last_fence: BTreeMap::new() });
+        self.contexts.insert(id, Context { id, capset, name: name.clone() });
         // A venus context gets venus state, a classic one vrend's; anything else gets a context
         // and nothing behind it, and finds out when it submits.
         match self.bound(id).expect("inserted just above") {
@@ -1240,10 +1235,9 @@ impl Renderer {
         ring: RingIdx,
         fence: FenceId,
     ) -> Result<(), Error> {
-        let Some(c) = self.contexts.get_mut(&ctx) else {
+        if !self.contexts.contains_key(&ctx) {
             return Err(Error::NoContext);
-        };
-        c.last_fence.insert(ring, fence);
+        }
         // Each renderer orders the fence behind the work it answers for, and each does it off
         // this thread: `Vrend` takes a sync for the GL work, venus puts an empty submit on the
         // queue the ring names. Retirement going through a thread whatever satisfied the fence
