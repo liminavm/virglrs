@@ -288,6 +288,9 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   see, applied to a clean tree, tested, and reverted; `RED` names the test that noticed and
   `SURVIVED` names a hole. Every edit asserts it matched, because a sweep reporting `RED` for an
   edit it never made is worse than no sweep. Add an entry with each witness rather than after.
+  Plain `cargo test` does not run this crate's doctests, so the `compile_fail` ones that hold a
+  type-level gate -- a Vulkan handle only `unsafe` can make -- run with `cargo test --doc`, and
+  their sweep entries say `doc:`.
 
   **The host memory budget is invisible to every other gate, and that is the point.** With no
   cap configured nothing is ever refused, so a replay scores identically whether the ledger is

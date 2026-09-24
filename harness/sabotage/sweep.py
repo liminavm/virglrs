@@ -35,7 +35,9 @@ RS = ROOT
 # A filter of the form `kani:<harness>` runs that one Kani proof instead of `cargo test`: the
 # property is stated for every input up to a bound, so the witness is the proof, not a test.
 # `loom:<test>` runs one loom model, built with `--cfg loom` in its own target directory so the
-# two builds do not evict each other.
+# two builds do not evict each other. `doc:<filter>` runs the doctests under that filter, which
+# plain `cargo test` does not run in this crate: a `compile_fail` doctest is how a property the
+# type system holds is shown to hold.
 SABOTAGES = [
     (
         'an array accessor hands its handler one element fewer',
@@ -1910,21 +1912,21 @@ SABOTAGES = [
         'venus-gen/templates/types.rs',
         """pub struct ${ty.name}(u64);""",
         """pub struct ${ty.name}(pub u64);""",
-        'venus::cs::Handle',
+        'doc:venus::cs::Handle',
     ),
     (
         'a Vulkan handle can be made from a number without unsafe',
         'venus-gen/templates/types.rs',
         """    pub unsafe fn from_raw(raw: u64) -> Self {""",
         """    pub fn from_raw(raw: u64) -> Self {""",
-        'venus::cs::Handle',
+        'doc:venus::cs::Handle',
     ),
     (
         'a host handle can be built from any number, and from_host makes it a handle',
         'src/venus/cs.rs',
         """pub struct HostHandle(u64);""",
         """pub struct HostHandle(pub u64);""",
-        'venus::cs::Handle',
+        'doc:venus::cs::Handle',
     ),
     (
         'temporaries may be declared past the register space',
@@ -2051,13 +2053,15 @@ def command(filt):
     if filt and filt.startswith('loom:'):
         env = dict(os.environ, RUSTFLAGS='--cfg loom', CARGO_TARGET_DIR=str(RS / 'target/loom'))
         return ['cargo', 'test', '--lib', filt[len('loom:'):]], env
+    if filt and filt.startswith('doc:'):
+        return ['cargo', 'test', '--doc', filt[len('doc:'):]], None
     return ['cargo', 'test'] + ([filt] if filt else []), None
 
 
 def separate(filt):
     """Whether an entry's witness is one `cargo test` does not run, and so needs its own
     baseline and its own clock."""
-    return bool(filt) and filt.startswith(('kani:', 'loom:'))
+    return bool(filt) and filt.startswith(('kani:', 'loom:', 'doc:'))
 
 
 def main():
@@ -2145,6 +2149,8 @@ def main():
         # panic line instead. Reporting a count from whichever of those happened to be there is
         # how a sweep comes to claim coverage it cannot point at.
         named = re.findall(r"^    (\S+::\S+)$", r.stdout, re.M)
+        if not named and filt and filt.startswith('doc:'):
+            named = re.findall(r"^    (\S+\.rs - \S+ \(line \d+\))$", r.stdout, re.M)
         if not named and filt and filt.startswith('kani:'):
             named = ['%s: %s' % (filt, d) for d in
                      re.findall(r'Status: FAILURE\n\t - Description: "(.*)"', r.stdout)[:1]]
