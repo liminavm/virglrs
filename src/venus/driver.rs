@@ -63,7 +63,8 @@ use super::proto::types::{
     VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags,
     VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo, VkSubmitInfo2,
     VkSubpassBeginInfo, VkSubpassContents, VkSubpassEndInfo, VkTimelineSemaphoreSubmitInfo,
-    VkViewport, VkWriteDescriptorSet,
+    VkVertexInputAttributeDescription2EXT, VkVertexInputBindingDescription2EXT, VkViewport,
+    VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
@@ -4857,6 +4858,31 @@ impl Driver {
         let f = self.recorder(cb)?.try_vkCmdEndConditionalRenderingEXT()?;
         // SAFETY: as above.
         unsafe { f(cb) };
+        Some(())
+    }
+
+    /// `vkCmdSetVertexInputEXT`: the whole vertex input state, as two arrays that are counted
+    /// separately and mean different things -- bindings, and the attributes read through them.
+    ///
+    /// Neither count governs the other, so neither is derived from the other: each is its own
+    /// slice's length. Either may be empty.
+    pub fn cmd_set_vertex_input(
+        &self,
+        cb: VkCommandBuffer,
+        bindings: cs::Decoded<'_, [VkVertexInputBindingDescription2EXT]>,
+        attributes: cs::Decoded<'_, [VkVertexInputAttributeDescription2EXT]>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetVertexInputEXT()?;
+        // SAFETY: as above; each count is its own slice's length.
+        unsafe {
+            f(
+                cb,
+                bindings.len() as u32,
+                bindings.as_ptr(),
+                attributes.len() as u32,
+                attributes.as_ptr(),
+            )
+        };
         Some(())
     }
 

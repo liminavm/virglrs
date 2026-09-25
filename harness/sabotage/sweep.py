@@ -2240,6 +2240,13 @@ SABOTAGES = [
         """        let _f = self.recorder(cb)?.try_vkCmdEndConditionalRenderingEXT()?;""",
         'conditional_rendering_hands_the_driver_the_guests_struct',
     ),
+    (
+        'vertex-input-attribute-count-from-bindings',
+        'src/venus/driver.rs',
+        """                attributes.len() as u32,""",
+        """                bindings.len() as u32,""",
+        'vertex_input_hands_the_driver_both_arrays_with_their_own_counts',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

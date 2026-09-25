@@ -75,17 +75,17 @@ use super::proto::types::{
     vn_command_vkCmdSetScissor, vn_command_vkCmdSetScissorWithCount,
     vn_command_vkCmdSetStencilCompareMask, vn_command_vkCmdSetStencilOp,
     vn_command_vkCmdSetStencilReference, vn_command_vkCmdSetStencilTestEnable,
-    vn_command_vkCmdSetStencilWriteMask, vn_command_vkCmdSetViewport,
-    vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents,
-    vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2,
-    vn_command_vkCopyImageToImage, vn_command_vkCopyImageToMemoryMESA,
-    vn_command_vkCopyMemoryToImageMESA, vn_command_vkCreateBuffer, vn_command_vkCreateBufferView,
-    vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
-    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
-    vn_command_vkCreateDescriptorUpdateTemplate, vn_command_vkCreateDevice,
-    vn_command_vkCreateEvent, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
-    vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
-    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCmdSetStencilWriteMask, vn_command_vkCmdSetVertexInputEXT,
+    vn_command_vkCmdSetViewport, vn_command_vkCmdSetViewportWithCount,
+    vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents, vn_command_vkCmdWaitEvents2,
+    vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2, vn_command_vkCopyImageToImage,
+    vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
+    vn_command_vkCreateBuffer, vn_command_vkCreateBufferView, vn_command_vkCreateCommandPool,
+    vn_command_vkCreateComputePipelines, vn_command_vkCreateDescriptorPool,
+    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDescriptorUpdateTemplate,
+    vn_command_vkCreateDevice, vn_command_vkCreateEvent, vn_command_vkCreateFence,
+    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
+    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
     vn_command_vkCreateRenderPass2, vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
     vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
@@ -5473,6 +5473,16 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkCmdEndConditionalRenderingEXT<'_>,
     ) {
         let done = self.driver.cmd_end_conditional_rendering(args.commandBuffer);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetVertexInputEXT(&mut self, args: &mut vn_command_vkCmdSetVertexInputEXT<'_>) {
+        // Two arrays under two counts, as in `vkCmdClearAttachments`; each slice carries its own.
+        let done = self.driver.cmd_set_vertex_input(
+            args.commandBuffer,
+            args.pVertexBindingDescriptions(),
+            args.pVertexAttributeDescriptions(),
+        );
         self.recorded(done);
     }
 
@@ -15324,7 +15334,7 @@ mod tests {
         ] {
             assert!(served.contains(shape), "the parser missed a handler that is there: {shape}");
         }
-        for absent in ["vkQueueBindSparse", "vkCmdSetVertexInputEXT"] {
+        for absent in ["vkQueueBindSparse", "vkCmdTraceRaysKHR"] {
             assert!(!served.contains(absent), "the parser invented a handler: {absent}");
         }
 
@@ -17831,6 +17841,122 @@ mod tests {
         });
         assert!(h.rejected().is_some(), "a command with no struct is refused, not forwarded");
         assert_eq!(SAW.with_borrow(Vec::len), 2, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// `vkCmdSetVertexInputEXT` hands the driver both of the guest's arrays, each with its own
+    /// count.
+    ///
+    /// Two bindings and three attributes, unequal on purpose: both counts are `u32` and the two
+    /// pointers differ only in type, so a wrapper that passes one count for both still compiles.
+    #[test]
+    fn vertex_input_hands_the_driver_both_arrays_with_their_own_counts() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandPool, VkDevice, VkVertexInputAttributeDescription2EXT,
+            VkVertexInputBindingDescription2EXT, vn_command_vkCmdSetVertexInputEXT,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Each call: the binding strides, then the attribute locations.
+        thread_local! {
+            static SAW: RefCell<Vec<(Vec<u32>, Vec<u32>)>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn set(
+            _: VkCommandBuffer,
+            nb: u32,
+            pb: *const VkVertexInputBindingDescription2EXT,
+            na: u32,
+            pa: *const VkVertexInputAttributeDescription2EXT,
+        ) {
+            // SAFETY: the wrapper passes each slice's own pointer and length.
+            let (b, a) = unsafe {
+                (
+                    core::slice::from_raw_parts(pb, nb as usize),
+                    core::slice::from_raw_parts(pa, na as usize),
+                )
+            };
+            SAW.with_borrow_mut(|s| {
+                s.push((
+                    b.iter().map(|b| b.stride).collect(),
+                    a.iter().map(|a| a.location).collect(),
+                ))
+            });
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetVertexInputEXT(set);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let bindings = [
+            VkVertexInputBindingDescription2EXT { stride: 12, ..Default::default() },
+            VkVertexInputBindingDescription2EXT { stride: 20, ..Default::default() },
+        ];
+        let attributes = [
+            VkVertexInputAttributeDescription2EXT { location: 0, ..Default::default() },
+            VkVertexInputAttributeDescription2EXT { location: 1, ..Default::default() },
+            VkVertexInputAttributeDescription2EXT { location: 4, ..Default::default() },
+        ];
+        let mut args = vn_command_vkCmdSetVertexInputEXT::default();
+        args.commandBuffer = VkCommandBuffer::forged(CB.0);
+        args.plant_pVertexBindingDescriptions(&bindings);
+        args.plant_pVertexAttributeDescriptions(&attributes);
+        h.vkCmdSetVertexInputEXT(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                *s,
+                [(vec![12, 20], vec![0, 1, 4])],
+                "both bindings and all three attributes, each array under its own count"
+            );
+        });
+
+        // A command buffer the driver has no pool record for has no device to record through.
+        let mut args = vn_command_vkCmdSetVertexInputEXT::default();
+        args.commandBuffer = VkCommandBuffer::forged(99);
+        h.vkCmdSetVertexInputEXT(&mut args);
+        assert!(h.rejected().is_some(), "an unknown command buffer is refused");
+        assert_eq!(SAW.with_borrow(Vec::len), 1, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();

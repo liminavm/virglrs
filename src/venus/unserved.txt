@@ -106,7 +106,6 @@ vkCmdSetRayTracingPipelineStackSizeKHR             out-of-reach:ray-tracing-pipe
 vkCmdSetSampleLocationsEnableEXT                   wanted:extended-dynamic-state3
 vkCmdSetSampleMaskEXT                              wanted:extended-dynamic-state3
 vkCmdSetTessellationDomainOriginEXT                wanted:extended-dynamic-state3
-vkCmdSetVertexInputEXT                             wanted:vertex-input-dynamic-state
 vkCmdTraceRaysIndirect2KHR                         out-of-reach:ray-tracing-maintenance1
 vkCmdTraceRaysIndirectKHR                          out-of-reach:ray-tracing-pipeline
 vkCmdTraceRaysKHR                                  out-of-reach:ray-tracing-pipeline
