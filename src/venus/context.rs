@@ -42,21 +42,22 @@ use super::proto::types::{
     vn_command_vkCmdBindDescriptorSets2, vn_command_vkCmdBindIndexBuffer,
     vn_command_vkCmdBindIndexBuffer2, vn_command_vkCmdBindPipeline,
     vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBindVertexBuffers2,
-    vn_command_vkCmdBlitImage, vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage,
-    vn_command_vkCmdClearDepthStencilImage, vn_command_vkCmdCopyBuffer,
-    vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImage,
-    vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyQueryPoolResults,
-    vn_command_vkCmdDispatch, vn_command_vkCmdDispatchBase, vn_command_vkCmdDispatchIndirect,
-    vn_command_vkCmdDraw, vn_command_vkCmdDrawIndexed, vn_command_vkCmdDrawIndexedIndirect,
-    vn_command_vkCmdDrawIndexedIndirectCount, vn_command_vkCmdDrawIndirect,
-    vn_command_vkCmdDrawIndirectCount, vn_command_vkCmdDrawMultiEXT,
+    vn_command_vkCmdBlitImage, vn_command_vkCmdBlitImage2, vn_command_vkCmdClearAttachments,
+    vn_command_vkCmdClearColorImage, vn_command_vkCmdClearDepthStencilImage,
+    vn_command_vkCmdCopyBuffer, vn_command_vkCmdCopyBuffer2, vn_command_vkCmdCopyBufferToImage,
+    vn_command_vkCmdCopyBufferToImage2, vn_command_vkCmdCopyImage, vn_command_vkCmdCopyImage2,
+    vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyImageToBuffer2,
+    vn_command_vkCmdCopyQueryPoolResults, vn_command_vkCmdDispatch, vn_command_vkCmdDispatchBase,
+    vn_command_vkCmdDispatchIndirect, vn_command_vkCmdDraw, vn_command_vkCmdDrawIndexed,
+    vn_command_vkCmdDrawIndexedIndirect, vn_command_vkCmdDrawIndexedIndirectCount,
+    vn_command_vkCmdDrawIndirect, vn_command_vkCmdDrawIndirectCount, vn_command_vkCmdDrawMultiEXT,
     vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndQuery, vn_command_vkCmdEndRenderPass,
     vn_command_vkCmdEndRenderPass2, vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer,
     vn_command_vkCmdNextSubpass, vn_command_vkCmdNextSubpass2, vn_command_vkCmdPipelineBarrier,
     vn_command_vkCmdPipelineBarrier2, vn_command_vkCmdPushConstants,
     vn_command_vkCmdPushConstants2, vn_command_vkCmdPushDescriptorSet,
     vn_command_vkCmdPushDescriptorSet2, vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2,
-    vn_command_vkCmdResetQueryPool, vn_command_vkCmdResolveImage,
+    vn_command_vkCmdResetQueryPool, vn_command_vkCmdResolveImage, vn_command_vkCmdResolveImage2,
     vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT, vn_command_vkCmdSetBlendConstants,
     vn_command_vkCmdSetColorWriteEnableEXT, vn_command_vkCmdSetCullMode,
     vn_command_vkCmdSetDepthBias, vn_command_vkCmdSetDepthBiasEnable,
@@ -5341,6 +5342,42 @@ impl Commands for Handlers<'_> {
             color,
             ranges,
         );
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyBuffer2(&mut self, args: &mut vn_command_vkCmdCopyBuffer2<'_>) {
+        let Some(info) = self.names(args.pCopyBufferInfo) else { return };
+        let done = self.driver.cmd_copy_buffer2(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyImage2(&mut self, args: &mut vn_command_vkCmdCopyImage2<'_>) {
+        let Some(info) = self.names(args.pCopyImageInfo) else { return };
+        let done = self.driver.cmd_copy_image2(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyBufferToImage2(&mut self, args: &mut vn_command_vkCmdCopyBufferToImage2<'_>) {
+        let Some(info) = self.names(args.pCopyBufferToImageInfo) else { return };
+        let done = self.driver.cmd_copy_buffer_to_image2(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyImageToBuffer2(&mut self, args: &mut vn_command_vkCmdCopyImageToBuffer2<'_>) {
+        let Some(info) = self.names(args.pCopyImageToBufferInfo) else { return };
+        let done = self.driver.cmd_copy_image_to_buffer2(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdBlitImage2(&mut self, args: &mut vn_command_vkCmdBlitImage2<'_>) {
+        let Some(info) = self.names(args.pBlitImageInfo) else { return };
+        let done = self.driver.cmd_blit_image2(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdResolveImage2(&mut self, args: &mut vn_command_vkCmdResolveImage2<'_>) {
+        let Some(info) = self.names(args.pResolveImageInfo) else { return };
+        let done = self.driver.cmd_resolve_image2(args.commandBuffer, info);
         self.recorded(done);
     }
 
@@ -16924,6 +16961,161 @@ mod tests {
         });
         assert!(h.rejected().is_some(), "an end with no struct is refused, not forwarded");
         assert_eq!(SAW.with_borrow(Vec::len), 5, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The six `copy_commands2` forms hand the driver the struct the guest sent.
+    ///
+    /// Core in 1.3, so a guest may send them whatever its extensions say. Each carries its 1.0
+    /// twin's arguments -- images, layouts, regions -- in one struct, so the only thing a handler
+    /// can get wrong is handing over something other than that struct.
+    #[test]
+    fn the_copy_commands2_hand_the_driver_the_guests_struct() {
+        use super::super::proto::types::{
+            VkBlitImageInfo2, VkCommandBuffer, VkCommandPool, VkCopyBufferInfo2,
+            VkCopyBufferToImageInfo2, VkCopyImageInfo2, VkCopyImageToBufferInfo2, VkDevice,
+            VkResolveImageInfo2, vn_command_vkCmdBlitImage2, vn_command_vkCmdCopyBuffer2,
+            vn_command_vkCmdCopyBufferToImage2, vn_command_vkCmdCopyImage2,
+            vn_command_vkCmdCopyImageToBuffer2, vn_command_vkCmdResolveImage2,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, usize)>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn copybuffer2(_: VkCommandBuffer, info: *const VkCopyBufferInfo2) {
+            SAW.with_borrow_mut(|s| s.push(("CopyBuffer2", info.addr())));
+        }
+        unsafe extern "C" fn copyimage2(_: VkCommandBuffer, info: *const VkCopyImageInfo2) {
+            SAW.with_borrow_mut(|s| s.push(("CopyImage2", info.addr())));
+        }
+        unsafe extern "C" fn copybuffertoimage2(
+            _: VkCommandBuffer,
+            info: *const VkCopyBufferToImageInfo2,
+        ) {
+            SAW.with_borrow_mut(|s| s.push(("CopyBufferToImage2", info.addr())));
+        }
+        unsafe extern "C" fn copyimagetobuffer2(
+            _: VkCommandBuffer,
+            info: *const VkCopyImageToBufferInfo2,
+        ) {
+            SAW.with_borrow_mut(|s| s.push(("CopyImageToBuffer2", info.addr())));
+        }
+        unsafe extern "C" fn blitimage2(_: VkCommandBuffer, info: *const VkBlitImageInfo2) {
+            SAW.with_borrow_mut(|s| s.push(("BlitImage2", info.addr())));
+        }
+        unsafe extern "C" fn resolveimage2(_: VkCommandBuffer, info: *const VkResolveImageInfo2) {
+            SAW.with_borrow_mut(|s| s.push(("ResolveImage2", info.addr())));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdCopyBuffer2(copybuffer2);
+        fns.plant_vkCmdCopyImage2(copyimage2);
+        fns.plant_vkCmdCopyBufferToImage2(copybuffertoimage2);
+        fns.plant_vkCmdCopyImageToBuffer2(copyimagetobuffer2);
+        fns.plant_vkCmdBlitImage2(blitimage2);
+        fns.plant_vkCmdResolveImage2(resolveimage2);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        let copybuffer2_info = VkCopyBufferInfo2::default();
+        let copyimage2_info = VkCopyImageInfo2::default();
+        let copybuffertoimage2_info = VkCopyBufferToImageInfo2::default();
+        let copyimagetobuffer2_info = VkCopyImageToBufferInfo2::default();
+        let blitimage2_info = VkBlitImageInfo2::default();
+        let resolveimage2_info = VkResolveImageInfo2::default();
+
+        h.vkCmdCopyBuffer2(&mut vn_command_vkCmdCopyBuffer2 {
+            commandBuffer: cb,
+            pCopyBufferInfo: Some(Decoded::planted(&copybuffer2_info)),
+            ..Default::default()
+        });
+        h.vkCmdCopyImage2(&mut vn_command_vkCmdCopyImage2 {
+            commandBuffer: cb,
+            pCopyImageInfo: Some(Decoded::planted(&copyimage2_info)),
+            ..Default::default()
+        });
+        h.vkCmdCopyBufferToImage2(&mut vn_command_vkCmdCopyBufferToImage2 {
+            commandBuffer: cb,
+            pCopyBufferToImageInfo: Some(Decoded::planted(&copybuffertoimage2_info)),
+            ..Default::default()
+        });
+        h.vkCmdCopyImageToBuffer2(&mut vn_command_vkCmdCopyImageToBuffer2 {
+            commandBuffer: cb,
+            pCopyImageToBufferInfo: Some(Decoded::planted(&copyimagetobuffer2_info)),
+            ..Default::default()
+        });
+        h.vkCmdBlitImage2(&mut vn_command_vkCmdBlitImage2 {
+            commandBuffer: cb,
+            pBlitImageInfo: Some(Decoded::planted(&blitimage2_info)),
+            ..Default::default()
+        });
+        h.vkCmdResolveImage2(&mut vn_command_vkCmdResolveImage2 {
+            commandBuffer: cb,
+            pResolveImageInfo: Some(Decoded::planted(&resolveimage2_info)),
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        SAW.with_borrow(|s| {
+            let want = [
+                ("CopyBuffer2", (&raw const copybuffer2_info).addr()),
+                ("CopyImage2", (&raw const copyimage2_info).addr()),
+                ("CopyBufferToImage2", (&raw const copybuffertoimage2_info).addr()),
+                ("CopyImageToBuffer2", (&raw const copyimagetobuffer2_info).addr()),
+                ("BlitImage2", (&raw const blitimage2_info).addr()),
+                ("ResolveImage2", (&raw const resolveimage2_info).addr()),
+            ];
+            assert_eq!(*s, want, "each command once, handed the guest's own struct");
+        });
+
+        // A copy that names no struct has said nothing to forward.
+        h.vkCmdCopyBuffer2(&mut vn_command_vkCmdCopyBuffer2 {
+            commandBuffer: cb,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_some(), "a copy with no struct is refused, not forwarded");
+        assert_eq!(SAW.with_borrow(Vec::len), 6, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();

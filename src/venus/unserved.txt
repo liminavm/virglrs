@@ -69,15 +69,10 @@ vkCmdBeginTransformFeedbackEXT                     wanted:transform-feedback
 vkCmdBindResourceHeapEXT                           out-of-reach:descriptor-heap
 vkCmdBindSamplerHeapEXT                            out-of-reach:descriptor-heap
 vkCmdBindTransformFeedbackBuffersEXT               wanted:transform-feedback
-vkCmdBlitImage2                                    wanted:copy-commands2
 vkCmdBuildAccelerationStructuresIndirectKHR        out-of-reach:acceleration-structure
 vkCmdBuildAccelerationStructuresKHR                out-of-reach:acceleration-structure
 vkCmdCopyAccelerationStructureKHR                  out-of-reach:acceleration-structure
 vkCmdCopyAccelerationStructureToMemoryKHR          out-of-reach:acceleration-structure
-vkCmdCopyBuffer2                                   wanted:copy-commands2
-vkCmdCopyBufferToImage2                            wanted:copy-commands2
-vkCmdCopyImage2                                    wanted:copy-commands2
-vkCmdCopyImageToBuffer2                            wanted:copy-commands2
 vkCmdCopyMemoryToAccelerationStructureKHR          out-of-reach:acceleration-structure
 vkCmdDrawIndirectByteCountEXT                      wanted:transform-feedback
 vkCmdDrawMeshTasksEXT                              out-of-reach:mesh-shader
@@ -89,7 +84,6 @@ vkCmdEndRendering2KHR                              out-of-reach:maintenance10
 vkCmdEndTransformFeedbackEXT                       wanted:transform-feedback
 vkCmdExecuteCommands                               wanted:secondary-command-buffers
 vkCmdPushDataEXT                                   out-of-reach:descriptor-heap
-vkCmdResolveImage2                                 wanted:copy-commands2
 vkCmdSetAlphaToCoverageEnableEXT                   wanted:extended-dynamic-state3
 vkCmdSetAlphaToOneEnableEXT                        wanted:extended-dynamic-state3
 vkCmdSetColorBlendAdvancedEXT                      wanted:extended-dynamic-state3

@@ -2185,6 +2185,13 @@ SABOTAGES = [
         """        unsafe { (d.vkCmdNextSubpass())(cb, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE) };""",
         'the_render_pass2_commands_hand_the_driver_the_guests_structs',
     ),
+    (
+        'vkCmdBlitImage2 is recorded as nothing',
+        'src/venus/context.rs',
+        """        let done = self.driver.cmd_blit_image2(args.commandBuffer, info);""",
+        """        let done = Some(()).filter(|_| info.get().regionCount != u32::MAX);""",
+        'the_copy_commands2_hand_the_driver_the_guests_struct',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

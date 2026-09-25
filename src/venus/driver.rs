@@ -23,16 +23,17 @@ use super::cs::{self, Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
 use super::objects::Doomed;
 use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBindDescriptorSetsInfo,
-    VkBool32, VkBuffer, VkBufferCopy, VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView,
-    VkCalibratedTimestampInfoKHR, VkClearAttachment, VkClearColorValue, VkClearDepthStencilValue,
-    VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
-    VkCommandPool, VkCompareOp, VkCopyDescriptorSet, VkCopyImageToImageInfo,
-    VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo,
-    VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags, VkDependencyInfo,
-    VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
-    VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA,
-    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties,
-    VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
+    VkBlitImageInfo2, VkBool32, VkBuffer, VkBufferCopy, VkBufferImageCopy, VkBufferMemoryBarrier,
+    VkBufferView, VkCalibratedTimestampInfoKHR, VkClearAttachment, VkClearColorValue,
+    VkClearDepthStencilValue, VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo,
+    VkCommandBufferResetFlags, VkCommandPool, VkCompareOp, VkCopyBufferInfo2,
+    VkCopyBufferToImageInfo2, VkCopyDescriptorSet, VkCopyImageInfo2, VkCopyImageToBufferInfo2,
+    VkCopyImageToImageInfo, VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA,
+    VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags,
+    VkDependencyInfo, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
+    VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
+    VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo,
+    VkExtensionProperties, VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
     VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
@@ -53,8 +54,8 @@ use super::proto::types::{
     VkPipelineStageFlags, VkPipelineStageFlags2, VkPrimitiveTopology, VkPushConstantsInfo,
     VkPushDescriptorSetInfo, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
     VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
-    VkRenderPassBeginInfo, VkRenderingInfo, VkResult, VkRingMonitorInfoMESA, VkSampleCountFlagBits,
-    VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo,
+    VkRenderPassBeginInfo, VkRenderingInfo, VkResolveImageInfo2, VkResult, VkRingMonitorInfoMESA,
+    VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo,
     VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo,
     VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags,
     VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
@@ -4691,6 +4692,86 @@ impl Driver {
                 ranges.as_ptr(),
             )
         };
+        Some(())
+    }
+
+    /// `vkCmdCopyBuffer2` and the five other `VK_KHR_copy_commands2` forms, core in 1.3: each
+    /// carries its 1.0 twin's arguments in one struct, regions and all, so each is a forward of
+    /// the struct the decoder built -- every count in it already reconciled with its array.
+    pub fn cmd_copy_buffer2(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkCopyBufferInfo2>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdCopyBuffer2()?;
+        // SAFETY: as above; `info` and every array it points at are arena allocations live for
+        // the call.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_copy_buffer2`].
+    pub fn cmd_copy_image2(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkCopyImageInfo2>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdCopyImage2()?;
+        // SAFETY: as above; `info` and every array it points at are arena allocations live for
+        // the call.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_copy_buffer2`].
+    pub fn cmd_copy_buffer_to_image2(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkCopyBufferToImageInfo2>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdCopyBufferToImage2()?;
+        // SAFETY: as above; `info` and every array it points at are arena allocations live for
+        // the call.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_copy_buffer2`].
+    pub fn cmd_copy_image_to_buffer2(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkCopyImageToBufferInfo2>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdCopyImageToBuffer2()?;
+        // SAFETY: as above; `info` and every array it points at are arena allocations live for
+        // the call.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_copy_buffer2`].
+    pub fn cmd_blit_image2(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkBlitImageInfo2>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdBlitImage2()?;
+        // SAFETY: as above; `info` and every array it points at are arena allocations live for
+        // the call.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_copy_buffer2`].
+    pub fn cmd_resolve_image2(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkResolveImageInfo2>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdResolveImage2()?;
+        // SAFETY: as above; `info` and every array it points at are arena allocations live for
+        // the call.
+        unsafe { f(cb, info.get()) };
         Some(())
     }
 
