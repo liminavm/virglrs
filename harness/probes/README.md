@@ -76,3 +76,4 @@ On the host, for the positive control, the loader and headers are Homebrew's:
 | `color_write_enable.c` | `color-write-enable` | 1 | 5/5 on anv, Intel Iris Plus (ICL GT2), Vulkan 1.4; KosmicKrisp lacks the extension | not yet run |
 | `indexed_and_indirect_draw.c` | `indexed-and-indirect-draw` | 8 | 12/12 on KosmicKrisp, Apple M1 Max, and on anv, Intel Iris Plus (ICL GT2), both Vulkan 1.4 | not yet run |
 | `image_copy_core.c` | `image-copy-core` | 3 | 6/6 on KosmicKrisp, Apple M1 Max, and on anv, Intel Iris Plus (ICL GT2), both Vulkan 1.4 | not yet run |
+| `core_dynamic_state.c` | `core-dynamic-state` | 4 | 4/4 on anv, Intel Iris Plus (ICL GT2); 3/3 on KosmicKrisp, Apple M1 Max, which lacks stippled lines; both Vulkan 1.4. Depth bounds and device mask are scored by the log only | not yet run |
