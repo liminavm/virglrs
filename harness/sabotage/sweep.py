@@ -2206,6 +2206,17 @@ SABOTAGES = [
         """        let done = Some(()).filter(|_| info.get().depthBiasClamp.is_finite() || true);""",
         'depth_bias2_hands_the_driver_the_guests_struct',
     ),
+    (
+        'vkCmdSetLogicOpEXT always sets COPY',
+        'src/venus/driver.rs',
+        """        let f = self.recorder(cb)?.try_vkCmdSetLogicOpEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, op) };""",
+        """        let f = self.recorder(cb)?.try_vkCmdSetLogicOpEXT()?;
+        // SAFETY: sabotage -- the guest's op replaced.
+        unsafe { f(cb, VkLogicOp::VK_LOGIC_OP_COPY) };""",
+        'logic_op_hands_the_driver_the_guests_op',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

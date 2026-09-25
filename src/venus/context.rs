@@ -66,22 +66,22 @@ use super::proto::types::{
     vn_command_vkCmdSetDepthTestEnable, vn_command_vkCmdSetDepthWriteEnable,
     vn_command_vkCmdSetDeviceMask, vn_command_vkCmdSetEvent, vn_command_vkCmdSetEvent2,
     vn_command_vkCmdSetFrontFace, vn_command_vkCmdSetLineStipple, vn_command_vkCmdSetLineWidth,
-    vn_command_vkCmdSetPatchControlPointsEXT, vn_command_vkCmdSetPrimitiveRestartEnable,
-    vn_command_vkCmdSetPrimitiveTopology, vn_command_vkCmdSetRasterizerDiscardEnable,
-    vn_command_vkCmdSetScissor, vn_command_vkCmdSetScissorWithCount,
-    vn_command_vkCmdSetStencilCompareMask, vn_command_vkCmdSetStencilOp,
-    vn_command_vkCmdSetStencilReference, vn_command_vkCmdSetStencilTestEnable,
-    vn_command_vkCmdSetStencilWriteMask, vn_command_vkCmdSetViewport,
-    vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents,
-    vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2,
-    vn_command_vkCopyImageToImage, vn_command_vkCopyImageToMemoryMESA,
-    vn_command_vkCopyMemoryToImageMESA, vn_command_vkCreateBuffer, vn_command_vkCreateBufferView,
-    vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
-    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
-    vn_command_vkCreateDescriptorUpdateTemplate, vn_command_vkCreateDevice,
-    vn_command_vkCreateEvent, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
-    vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
-    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCmdSetLogicOpEXT, vn_command_vkCmdSetPatchControlPointsEXT,
+    vn_command_vkCmdSetPrimitiveRestartEnable, vn_command_vkCmdSetPrimitiveTopology,
+    vn_command_vkCmdSetRasterizerDiscardEnable, vn_command_vkCmdSetScissor,
+    vn_command_vkCmdSetScissorWithCount, vn_command_vkCmdSetStencilCompareMask,
+    vn_command_vkCmdSetStencilOp, vn_command_vkCmdSetStencilReference,
+    vn_command_vkCmdSetStencilTestEnable, vn_command_vkCmdSetStencilWriteMask,
+    vn_command_vkCmdSetViewport, vn_command_vkCmdSetViewportWithCount,
+    vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents, vn_command_vkCmdWaitEvents2,
+    vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2, vn_command_vkCopyImageToImage,
+    vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
+    vn_command_vkCreateBuffer, vn_command_vkCreateBufferView, vn_command_vkCreateCommandPool,
+    vn_command_vkCreateComputePipelines, vn_command_vkCreateDescriptorPool,
+    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDescriptorUpdateTemplate,
+    vn_command_vkCreateDevice, vn_command_vkCreateEvent, vn_command_vkCreateFence,
+    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
+    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
     vn_command_vkCreateRenderPass2, vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
     vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
@@ -5423,6 +5423,11 @@ impl Commands for Handlers<'_> {
     fn vkCmdSetDepthBias2EXT(&mut self, args: &mut vn_command_vkCmdSetDepthBias2EXT<'_>) {
         let Some(info) = self.names(args.pDepthBiasInfo) else { return };
         let done = self.driver.cmd_set_depth_bias2(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetLogicOpEXT(&mut self, args: &mut vn_command_vkCmdSetLogicOpEXT<'_>) {
+        let done = self.driver.cmd_set_logic_op(args.commandBuffer, args.logicOp);
         self.recorded(done);
     }
 
@@ -17368,6 +17373,91 @@ mod tests {
             ..Default::default()
         });
         assert!(h.rejected().is_some(), "a command with no struct is refused, not forwarded");
+        assert_eq!(SAW.with_borrow(Vec::len), 1, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// `vkCmdSetLogicOpEXT` hands the driver the guest's op, and XOR rather than a default.
+    #[test]
+    fn logic_op_hands_the_driver_the_guests_op() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandPool, VkDevice, VkLogicOp, vn_command_vkCmdSetLogicOpEXT,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Each call, as its name and what it was handed: a struct's address, or the scalars.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<u64>)>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn cmd_set_logic_op_e_x_t(_: VkCommandBuffer, op: VkLogicOp) {
+            SAW.with_borrow_mut(|s| s.push(("CmdSetLogicOpEXT", vec![op.0 as u64])));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetLogicOpEXT(cmd_set_logic_op_e_x_t);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        h.vkCmdSetLogicOpEXT(&mut vn_command_vkCmdSetLogicOpEXT {
+            commandBuffer: cb,
+            logicOp: VkLogicOp::VK_LOGIC_OP_XOR,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<u64>); 1] =
+                [("CmdSetLogicOpEXT", vec![VkLogicOp::VK_LOGIC_OP_XOR.0 as u64])];
+            assert_eq!(*s, want, "each command once, handed what the guest sent");
+        });
+
+        // A command buffer the driver has no pool record for has no device to record through.
+        h.vkCmdSetLogicOpEXT(&mut vn_command_vkCmdSetLogicOpEXT {
+            commandBuffer: VkCommandBuffer::forged(99),
+            ..Default::default()
+        });
+        assert!(h.rejected().is_some(), "an unknown command buffer is refused");
         assert_eq!(SAW.with_borrow(Vec::len), 1, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.

@@ -44,8 +44,8 @@ use super::proto::types::{
     VkImageLayout, VkImageMemoryBarrier, VkImageResolve, VkImageSubresourceRange, VkImageTiling,
     VkImageToMemoryCopy, VkImageType, VkImageUsageFlags, VkImageView,
     VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR,
-    VkIndexType, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier,
-    VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags, VkMemoryPropertyFlagBits,
+    VkIndexType, VkInstance, VkInstanceCreateInfo, VkLogicOp, VkMemoryAllocateInfo,
+    VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags, VkMemoryPropertyFlagBits,
     VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy,
     VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType,
     VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo, VkPhysicalDeviceImageFormatInfo2,
@@ -4785,6 +4785,14 @@ impl Driver {
         let f = self.recorder(cb)?.try_vkCmdSetDepthBias2EXT()?;
         // SAFETY: as above; `info` is a struct the decoder built, live for the call.
         unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// `vkCmdSetLogicOpEXT`, the one `VK_EXT_extended_dynamic_state2` setter that was unserved.
+    pub fn cmd_set_logic_op(&self, cb: VkCommandBuffer, op: VkLogicOp) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetLogicOpEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, op) };
         Some(())
     }
 
