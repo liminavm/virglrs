@@ -50,9 +50,10 @@
 #
 # What a Linux guest reaches, measured on anv with the poisoning taken out so a boot could count
 # more than one: vkmark's whole scene set, twice over with its non-default options, reaches
-# nothing on this list at all. zink reaches exactly `vkCmdSetColorWriteEnableEXT`, the same
-# command from glmark2 on wayland and from kmscube on KMS. A GNOME desktop with a venus client
-# on it -- vkcube composited by gnome-shell -- reaches nothing on this list either.
+# nothing on this list at all. Nor does zink: the one command it sent, from glmark2 on wayland
+# and from kmscube on KMS, was `vkCmdSetColorWriteEnableEXT`, which is served. A GNOME desktop
+# with a venus client on it -- vkcube composited by gnome-shell -- reaches nothing on this list
+# either.
 #
 # So a workload census cannot enumerate this file: the first unserved command kills the context,
 # so a boot discovers exactly one and says nothing about the rest. Reach these deliberately, with
@@ -108,7 +109,6 @@ vkCmdSetAlphaToOneEnableEXT                        wanted:extended-dynamic-state
 vkCmdSetColorBlendAdvancedEXT                      wanted:extended-dynamic-state3
 vkCmdSetColorBlendEnableEXT                        wanted:extended-dynamic-state3
 vkCmdSetColorBlendEquationEXT                      wanted:extended-dynamic-state3
-vkCmdSetColorWriteEnableEXT                        wanted:color-write-enable
 vkCmdSetColorWriteMaskEXT                          wanted:extended-dynamic-state3
 vkCmdSetConservativeRasterizationModeEXT           wanted:extended-dynamic-state3
 vkCmdSetDepthBias2EXT                              wanted:depth-bias-control

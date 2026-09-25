@@ -2115,6 +2115,13 @@ SABOTAGES = [
         """        if features.has(Feature::multisample) && features.has(Feature::storage_multisample) {""",
         'without_multisample_arrays_no_multisampling_is_advertised',
     ),
+    (
+        'vkCmdSetColorWriteEnableEXT tells the driver one switch fewer',
+        'src/venus/driver.rs',
+        """        unsafe { f(cb, enables.len() as u32, enables.as_ptr()) };""",
+        """        unsafe { f(cb, enables.len().saturating_sub(1) as u32, enables.as_ptr()) };""",
+        'color_write_enable_hands_the_driver_every_switch',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

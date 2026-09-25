@@ -3851,6 +3851,23 @@ impl Driver {
         Some(())
     }
 
+    /// `vkCmdSetColorWriteEnableEXT`: one switch per colour attachment, masking every write to
+    /// it on or off.
+    ///
+    /// The count is the slice's own length, so the driver reads exactly the switches the guest
+    /// sent. zink emits this wherever `VK_EXT_color_write_enable` is on, which on anv is every
+    /// GL client.
+    pub fn cmd_set_color_write_enable(
+        &self,
+        cb: VkCommandBuffer,
+        enables: &[VkBool32],
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetColorWriteEnableEXT()?;
+        // SAFETY: as above; the count is the slice's own length.
+        unsafe { f(cb, enables.len() as u32, enables.as_ptr()) };
+        Some(())
+    }
+
     // The recording commands the seated desktop sends that this build did not serve. Nothing
     // here reshapes anything: each is the guest's arguments handed to the driver, because
     // handle translation already happened in the decoder. The split between the panicking

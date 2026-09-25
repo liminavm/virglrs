@@ -51,7 +51,8 @@ use super::proto::types::{
     vn_command_vkCmdPushConstants2, vn_command_vkCmdPushDescriptorSet,
     vn_command_vkCmdPushDescriptorSet2, vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2,
     vn_command_vkCmdResetQueryPool, vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT,
-    vn_command_vkCmdSetBlendConstants, vn_command_vkCmdSetCullMode, vn_command_vkCmdSetDepthBias,
+    vn_command_vkCmdSetBlendConstants, vn_command_vkCmdSetColorWriteEnableEXT,
+    vn_command_vkCmdSetCullMode, vn_command_vkCmdSetDepthBias,
     vn_command_vkCmdSetDepthBoundsTestEnable, vn_command_vkCmdSetDepthCompareOp,
     vn_command_vkCmdSetDepthTestEnable, vn_command_vkCmdSetDepthWriteEnable,
     vn_command_vkCmdSetEvent, vn_command_vkCmdSetEvent2, vn_command_vkCmdSetFrontFace,
@@ -4992,6 +4993,15 @@ impl Commands for Handlers<'_> {
         let done = self
             .driver
             .cmd_set_attachment_feedback_loop_enable(args.commandBuffer, args.aspectMask);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetColorWriteEnableEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetColorWriteEnableEXT<'_>,
+    ) {
+        let done =
+            self.driver.cmd_set_color_write_enable(args.commandBuffer, args.pColorWriteEnables());
         self.recorded(done);
     }
 
@@ -15845,6 +15855,93 @@ mod tests {
         h.vkCmdPushConstants2(&mut args);
         assert!(h.rejected().is_some(), "a push with no struct is refused, not forwarded");
         assert_eq!(SAW.with_borrow(|s| s.pushed.len()), 1, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// `vkCmdSetColorWriteEnableEXT` hands the driver every switch the guest sent, in order.
+    ///
+    /// zink sends it wherever the extension is on, which on anv is every GL client, so until this
+    /// handler each of them poisoned its context on its first frame. The switches are mixed so
+    /// that a wrapper dropping one, or passing a count other than the slice's own, lands wrong.
+    #[test]
+    fn color_write_enable_hands_the_driver_every_switch() {
+        use super::super::proto::types::{
+            VkBool32, VkCommandBuffer, VkCommandPool, VkDevice,
+            vn_command_vkCmdSetColorWriteEnableEXT,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        thread_local! {
+            static SAW: RefCell<Vec<Vec<VkBool32>>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn set(_cb: VkCommandBuffer, count: u32, p: *const VkBool32) {
+            // SAFETY: the wrapper passes a slice's own pointer and length.
+            let s = unsafe { core::slice::from_raw_parts(p, count as usize) };
+            SAW.with_borrow_mut(|saw| saw.push(s.to_vec()));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetColorWriteEnableEXT(set);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let switches = [VkBool32(1), VkBool32(0), VkBool32(1)];
+        let mut args = vn_command_vkCmdSetColorWriteEnableEXT::default();
+        args.commandBuffer = VkCommandBuffer::forged(CB.0);
+        args.plant_pColorWriteEnables(&switches);
+        h.vkCmdSetColorWriteEnableEXT(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+        SAW.with_borrow(|s| {
+            assert_eq!(*s, [switches.to_vec()], "all three switches, in the guest's order");
+        });
+
+        // A command buffer the driver has no pool record for has no device to record through.
+        let mut args = vn_command_vkCmdSetColorWriteEnableEXT::default();
+        args.commandBuffer = VkCommandBuffer::forged(99);
+        args.plant_pColorWriteEnables(&switches);
+        h.vkCmdSetColorWriteEnableEXT(&mut args);
+        assert!(h.rejected().is_some(), "an unknown command buffer is refused");
+        assert_eq!(SAW.with_borrow(Vec::len), 1, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
