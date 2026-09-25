@@ -147,7 +147,7 @@ vkGetAccelerationStructureDeviceAddressKHR         out-of-reach:acceleration-str
 vkGetDeferredOperationMaxConcurrencyKHR            not-in-reference:deferred-operation
 vkGetDeferredOperationResultKHR                    not-in-reference:deferred-operation
 vkGetDeviceAccelerationStructureCompatibilityKHR   out-of-reach:acceleration-structure
-vkGetDeviceQueue                                   wanted:device-queue
+vkGetDeviceQueue                                   not-in-reference:device-queue
 vkGetImageOpaqueCaptureDataEXT                     out-of-reach:descriptor-heap
 vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR  out-of-reach:cooperative-matrix
 vkGetPhysicalDeviceDescriptorSizeEXT               out-of-reach:descriptor-heap
