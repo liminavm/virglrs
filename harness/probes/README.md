@@ -84,3 +84,5 @@ On the host, for the positive control, the loader and headers are Homebrew's:
 | `logic_op.c` | `extended-dynamic-state2` | 1 | 3/3 on anv, Intel Iris Plus (ICL GT2), Vulkan 1.4; KosmicKrisp lacks `extendedDynamicState2LogicOp` | not yet run |
 | `vertex_input.c` | `vertex-input-dynamic-state` | 1 | 7/7 on anv, Intel Iris Plus (ICL GT2), Vulkan 1.4; KosmicKrisp lacks the extension | not yet run |
 | `fragment_shading_rate.c` | `fragment-shading-rate` | 2 | 14/14 on anv, Intel Iris Plus (ICL GT2), Vulkan 1.4; KosmicKrisp lacks the extension | not yet run |
+| `transform_feedback.c` | `transform-feedback` | 6 | 15/15 on anv, Intel Iris Plus (ICL GT2), Vulkan 1.4. 8/15 on KosmicKrisp, Apple M1 Max, whose emulated transform feedback writes no counter buffer, captures a draw whole or not at all, and answers no stream query; there a run through venus is held to the same 8 | not yet run |
+| `sample_locations.c` | `sample-locations` | 1 | 5/5 on KosmicKrisp, Apple M1 Max, and on anv, Intel Iris Plus (ICL GT2), both Vulkan 1.4 | not yet run |
