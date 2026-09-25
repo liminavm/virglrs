@@ -121,13 +121,11 @@ vkCmdWriteAccelerationStructuresPropertiesKHR      out-of-reach:acceleration-str
 vkCopyAccelerationStructureKHR                     not-in-reference:acceleration-structure
 vkCreateAccelerationStructureKHR                   out-of-reach:acceleration-structure
 vkCreateDeferredOperationKHR                       not-in-reference:deferred-operation
-vkCreateDescriptorUpdateTemplate                   wanted:descriptor-update-template
 vkCreatePrivateDataSlot                            not-in-reference:private-data
 vkCreateRayTracingPipelinesKHR                     out-of-reach:ray-tracing-pipeline
 vkDeferredOperationJoinKHR                         not-in-reference:deferred-operation
 vkDestroyAccelerationStructureKHR                  out-of-reach:acceleration-structure
 vkDestroyDeferredOperationKHR                      not-in-reference:deferred-operation
-vkDestroyDescriptorUpdateTemplate                  wanted:descriptor-update-template
 vkDestroyPrivateDataSlot                           not-in-reference:private-data
 vkEnumerateDeviceLayerProperties                   not-in-reference:layer-enumeration
 vkEnumerateInstanceLayerProperties                 not-in-reference:layer-enumeration

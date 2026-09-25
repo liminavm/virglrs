@@ -2192,6 +2192,13 @@ SABOTAGES = [
         """        let done = Some(()).filter(|_| info.get().regionCount != u32::MAX);""",
         'the_copy_commands2_hand_the_driver_the_guests_struct',
     ),
+    (
+        'vkDestroyDescriptorUpdateTemplate goes through the panicking accessor',
+        'src/venus/context.rs',
+        """            |d| d.try_vkDestroyDescriptorUpdateTemplate(),""",
+        """            |d| Some(d.vkDestroyDescriptorUpdateTemplate()),""",
+        'descriptor_update_templates_are_made_and_destroyed_through_the_device',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

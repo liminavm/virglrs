@@ -77,23 +77,24 @@ use super::proto::types::{
     vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
     vn_command_vkCreateBuffer, vn_command_vkCreateBufferView, vn_command_vkCreateCommandPool,
     vn_command_vkCreateComputePipelines, vn_command_vkCreateDescriptorPool,
-    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateEvent,
-    vn_command_vkCreateFence, vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines,
-    vn_command_vkCreateImage, vn_command_vkCreateImageView, vn_command_vkCreateInstance,
-    vn_command_vkCreatePipelineCache, vn_command_vkCreatePipelineLayout,
-    vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass, vn_command_vkCreateRenderPass2,
-    vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
+    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDescriptorUpdateTemplate,
+    vn_command_vkCreateDevice, vn_command_vkCreateEvent, vn_command_vkCreateFence,
+    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
+    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
+    vn_command_vkCreateRenderPass2, vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
     vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
     vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer, vn_command_vkDestroyBufferView,
     vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
-    vn_command_vkDestroyDescriptorSetLayout, vn_command_vkDestroyDevice, vn_command_vkDestroyEvent,
-    vn_command_vkDestroyFence, vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage,
-    vn_command_vkDestroyImageView, vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline,
-    vn_command_vkDestroyPipelineCache, vn_command_vkDestroyPipelineLayout,
-    vn_command_vkDestroyQueryPool, vn_command_vkDestroyRenderPass, vn_command_vkDestroyRingMESA,
-    vn_command_vkDestroySampler, vn_command_vkDestroySamplerYcbcrConversion,
-    vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle,
-    vn_command_vkEndCommandBuffer, vn_command_vkEnumerateDeviceExtensionProperties,
+    vn_command_vkDestroyDescriptorSetLayout, vn_command_vkDestroyDescriptorUpdateTemplate,
+    vn_command_vkDestroyDevice, vn_command_vkDestroyEvent, vn_command_vkDestroyFence,
+    vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
+    vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
+    vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyQueryPool,
+    vn_command_vkDestroyRenderPass, vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler,
+    vn_command_vkDestroySamplerYcbcrConversion, vn_command_vkDestroySemaphore,
+    vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle, vn_command_vkEndCommandBuffer,
+    vn_command_vkEnumerateDeviceExtensionProperties,
     vn_command_vkEnumerateInstanceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
     vn_command_vkEnumeratePhysicalDeviceGroups, vn_command_vkEnumeratePhysicalDevices,
     vn_command_vkExecuteCommandStreamsMESA, vn_command_vkFlushMappedMemoryRanges,
@@ -2881,6 +2882,43 @@ impl Commands for Handlers<'_> {
         handle_pRenderPass_mut
     );
     simple_destroy!(vkDestroyRenderPass, vn_command_vkDestroyRenderPass, renderPass);
+
+    /// A descriptor update template, core in 1.1.
+    ///
+    /// The guest venus driver builds templates guest-side and never sends these two, so nothing
+    /// measured here reaches them; they are served because the C serves them and a guest may send
+    /// them. The entry points go through `try_` for the same reason `vkCreateRenderPass2`'s does.
+    fn vkCreateDescriptorUpdateTemplate(
+        &mut self,
+        args: &mut vn_command_vkCreateDescriptorUpdateTemplate<'_>,
+    ) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        let host = self.driver.create_object(
+            args.device,
+            |d| d.try_vkCreateDescriptorUpdateTemplate(),
+            info,
+            args.pAllocator,
+        );
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant(
+            "vkCreateDescriptorUpdateTemplate",
+            args.pDescriptorUpdateTemplate(),
+            args.handle_pDescriptorUpdateTemplate_mut(),
+            host,
+        );
+    }
+
+    fn vkDestroyDescriptorUpdateTemplate(
+        &mut self,
+        args: &mut vn_command_vkDestroyDescriptorUpdateTemplate<'_>,
+    ) {
+        self.driver.destroy_object(
+            args.device,
+            |d| d.try_vkDestroyDescriptorUpdateTemplate(),
+            args.descriptorUpdateTemplate,
+            args.pAllocator,
+        );
+    }
 
     /// Not a [`simple_create`]: core in 1.2, so the entry point is the device's to have, and a
     /// device without it answers a failed create rather than aborting the worker. The pass it
@@ -17116,6 +17154,121 @@ mod tests {
         });
         assert!(h.rejected().is_some(), "a copy with no struct is refused, not forwarded");
         assert_eq!(SAW.with_borrow(Vec::len), 6, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// A descriptor update template is made from the guest's struct and destroyed by its handle,
+    /// and a device without the entry points answers a failed create and ignores the destroy.
+    #[test]
+    fn descriptor_update_templates_are_made_and_destroyed_through_the_device() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkDescriptorUpdateTemplate,
+            VkDescriptorUpdateTemplateCreateInfo, VkDevice,
+            vn_command_vkCreateDescriptorUpdateTemplate,
+            vn_command_vkDestroyDescriptorUpdateTemplate,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const BARE: u64 = 4;
+        const TEMPLATE: u64 = 0x7e;
+
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, usize)>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn create(
+            _: VkDevice,
+            info: *const VkDescriptorUpdateTemplateCreateInfo,
+            _: *const VkAllocationCallbacks,
+            out: *mut VkDescriptorUpdateTemplate,
+        ) -> VkResult {
+            SAW.with_borrow_mut(|s| s.push(("create", info.addr())));
+            // SAFETY: the caller's local.
+            unsafe { *out = VkDescriptorUpdateTemplate::forged(TEMPLATE) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy(
+            _: VkDevice,
+            t: VkDescriptorUpdateTemplate,
+            _: *const VkAllocationCallbacks,
+        ) {
+            SAW.with_borrow_mut(|s| s.push(("destroy", t.raw() as usize)));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateDescriptorUpdateTemplate(create);
+        fns.plant_vkDestroyDescriptorUpdateTemplate(destroy);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_device(VkDevice::forged(BARE), crate::vulkan::Device::default());
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let info = VkDescriptorUpdateTemplateCreateInfo::default();
+        let mut args = vn_command_vkCreateDescriptorUpdateTemplate::default();
+        args.device = VkDevice::forged(DEVICE);
+        args.pCreateInfo = Some(Decoded::planted(&info));
+        h.vkCreateDescriptorUpdateTemplate(&mut args);
+        assert_eq!(args.ret, VkResult::VK_SUCCESS, "a device that has it makes the template");
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+
+        h.vkDestroyDescriptorUpdateTemplate(&mut vn_command_vkDestroyDescriptorUpdateTemplate {
+            device: VkDevice::forged(DEVICE),
+            descriptorUpdateTemplate: VkDescriptorUpdateTemplate::forged(TEMPLATE),
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+
+        SAW.with_borrow(|s| {
+            let want = [("create", (&raw const info).addr()), ("destroy", TEMPLATE as usize)];
+            assert_eq!(*s, want, "made from the guest's struct, destroyed by its handle");
+        });
+
+        // A device without the entry points: a failed create, and a destroy with nothing to do.
+        let mut args = vn_command_vkCreateDescriptorUpdateTemplate::default();
+        args.device = VkDevice::forged(BARE);
+        args.pCreateInfo = Some(Decoded::planted(&info));
+        h.vkCreateDescriptorUpdateTemplate(&mut args);
+        assert_eq!(
+            args.ret,
+            VkResult::VK_ERROR_INITIALIZATION_FAILED,
+            "no entry point is a failed create, not a call through null"
+        );
+        h.vkDestroyDescriptorUpdateTemplate(&mut vn_command_vkDestroyDescriptorUpdateTemplate {
+            device: VkDevice::forged(BARE),
+            descriptorUpdateTemplate: VkDescriptorUpdateTemplate::forged(TEMPLATE),
+            ..Default::default()
+        });
+        assert_eq!(SAW.with_borrow(Vec::len), 2, "and neither reached a driver");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
