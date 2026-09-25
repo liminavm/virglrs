@@ -267,6 +267,39 @@ impl Pools {
     }
 }
 
+/// The counter buffers of a transform feedback begin or end: where each stream's byte count is
+/// resumed from or saved to.
+///
+/// Both arrays are optional and share one count. With neither, the count still reaches the
+/// driver, which reads it as how many streams are named and captures from offset zero; with
+/// either, it is that array's length, so the pair cannot disagree past this type.
+pub struct XfbCounters<'a> {
+    first: u32,
+    count: u32,
+    buffers: Option<&'a [VkBuffer]>,
+    offsets: Option<&'a [VkDeviceSize]>,
+}
+
+impl<'a> XfbCounters<'a> {
+    /// The counters from the decoder's view of them. Each array present is `count` long, which
+    /// the decoder guarantees by reading both through the same count.
+    pub fn new(
+        first: u32,
+        count: u32,
+        buffers: Option<&'a [VkBuffer]>,
+        offsets: Option<&'a [VkDeviceSize]>,
+    ) -> Self {
+        let n = count as usize;
+        assert!(buffers.is_none_or(|b| b.len() == n), "one count governs both arrays");
+        assert!(offsets.is_none_or(|o| o.len() == n), "one count governs both arrays");
+        Self { first, count, buffers, offsets }
+    }
+
+    fn raw(&self) -> (u32, u32, *const VkBuffer, *const VkDeviceSize) {
+        (self.first, self.count, optional(self.buffers), optional(self.offsets))
+    }
+}
+
 /// Why a query command was not put to the driver.
 ///
 /// Every command that names a query by index is measured against the pool's record first,
@@ -279,6 +312,9 @@ pub enum QueryRefused {
     NoDevice,
     /// The device exports no `vkResetQueryPool`, having advertised the feature that needs it.
     NoHostReset,
+    /// The device exports no entry point for the command, having advertised the extension that
+    /// needs it.
+    NotExported,
     /// The pool has no record here: created before this renderer kept one, or never by it.
     UnknownPool,
     /// The queries named run past the pool's end.
@@ -4904,6 +4940,74 @@ impl Driver {
         Some(())
     }
 
+    /// `vkCmdBindTransformFeedbackBuffersEXT`: the buffers vertex streams are captured into.
+    ///
+    /// Three arrays under one count, the sizes optional, as [`Self::cmd_bind_vertex_buffers2`].
+    pub fn cmd_bind_transform_feedback_buffers(
+        &self,
+        cb: VkCommandBuffer,
+        first: u32,
+        buffers: &[VkBuffer],
+        offsets: &[VkDeviceSize],
+        sizes: Option<&[VkDeviceSize]>,
+    ) -> Option<()> {
+        let n = buffers.len();
+        assert_eq!(offsets.len(), n, "one count governs every array");
+        assert!(sizes.is_none_or(|s| s.len() == n), "one count governs every array");
+        let f = self.recorder(cb)?.try_vkCmdBindTransformFeedbackBuffersEXT()?;
+        // SAFETY: as above; the count is the length every array present shares, and absent sizes
+        // are the null the driver reads as "to the end of each buffer".
+        unsafe { f(cb, first, n as u32, buffers.as_ptr(), offsets.as_ptr(), optional(sizes)) };
+        Some(())
+    }
+
+    /// `vkCmdBeginTransformFeedbackEXT`: start capturing, resuming from the byte counts in
+    /// `counters` if there are any.
+    pub fn cmd_begin_transform_feedback(
+        &self,
+        cb: VkCommandBuffer,
+        counters: XfbCounters<'_>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdBeginTransformFeedbackEXT()?;
+        let (first, n, buffers, offsets) = counters.raw();
+        // SAFETY: as above; `raw` rebuilds the count from the arrays it measures.
+        unsafe { f(cb, first, n, buffers, offsets) };
+        Some(())
+    }
+
+    /// `vkCmdEndTransformFeedbackEXT`: stop capturing, saving the byte counts into `counters` if
+    /// there are any.
+    pub fn cmd_end_transform_feedback(
+        &self,
+        cb: VkCommandBuffer,
+        counters: XfbCounters<'_>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdEndTransformFeedbackEXT()?;
+        let (first, n, buffers, offsets) = counters.raw();
+        // SAFETY: as above; `raw` rebuilds the count from the arrays it measures.
+        unsafe { f(cb, first, n, buffers, offsets) };
+        Some(())
+    }
+
+    /// `vkCmdDrawIndirectByteCountEXT`: a draw whose vertex count is the byte count a transform
+    /// feedback pass left in `counter`, divided by `stride`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cmd_draw_indirect_byte_count(
+        &self,
+        cb: VkCommandBuffer,
+        instances: u32,
+        first_instance: u32,
+        counter: VkBuffer,
+        counter_offset: VkDeviceSize,
+        vertex_offset: u32,
+        stride: u32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdDrawIndirectByteCountEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, instances, first_instance, counter, counter_offset, vertex_offset, stride) };
+        Some(())
+    }
+
     /// The depth and stencil twin of [`Self::cmd_clear_color_image`].
     pub fn cmd_clear_depth_stencil_image(
         &self,
@@ -5080,6 +5184,40 @@ impl Driver {
         facts.holds(query, 1)?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdEndQuery())(cb, pool, query) };
+        Ok(())
+    }
+
+    /// `vkCmdBeginQueryIndexedEXT`: [`Self::cmd_begin_query`] on one vertex stream of a
+    /// transform feedback query, held to the pool the same way.
+    pub fn cmd_begin_query_indexed(
+        &self,
+        cb: VkCommandBuffer,
+        pool: VkQueryPool,
+        query: u32,
+        flags: VkQueryControlFlags,
+        index: u32,
+    ) -> Result<(), QueryRefused> {
+        let (d, facts) = self.query_recorder(cb, pool)?;
+        facts.holds(query, 1)?;
+        let f = d.try_vkCmdBeginQueryIndexedEXT().ok_or(QueryRefused::NotExported)?;
+        // SAFETY: as above, and a query the pool holds.
+        unsafe { f(cb, pool, query, flags, index) };
+        Ok(())
+    }
+
+    /// `vkCmdEndQueryIndexedEXT`, the end of [`Self::cmd_begin_query_indexed`].
+    pub fn cmd_end_query_indexed(
+        &self,
+        cb: VkCommandBuffer,
+        pool: VkQueryPool,
+        query: u32,
+        index: u32,
+    ) -> Result<(), QueryRefused> {
+        let (d, facts) = self.query_recorder(cb, pool)?;
+        facts.holds(query, 1)?;
+        let f = d.try_vkCmdEndQueryIndexedEXT().ok_or(QueryRefused::NotExported)?;
+        // SAFETY: as above, and a query the pool holds.
+        unsafe { f(cb, pool, query, index) };
         Ok(())
     }
 
@@ -11796,6 +11934,24 @@ mod tests {
         unsafe extern "C" fn end(_cb: VkCommandBuffer, _p: VkQueryPool, query: u32) {
             asked("end", query, 1);
         }
+        // An indexed query records its stream where the others record a count.
+        unsafe extern "C" fn begin_indexed(
+            _cb: VkCommandBuffer,
+            _p: VkQueryPool,
+            query: u32,
+            _f: VkQueryControlFlags,
+            index: u32,
+        ) {
+            asked("begin_indexed", query, index);
+        }
+        unsafe extern "C" fn end_indexed(
+            _cb: VkCommandBuffer,
+            _p: VkQueryPool,
+            query: u32,
+            index: u32,
+        ) {
+            asked("end_indexed", query, index);
+        }
         unsafe extern "C" fn cmd_reset(
             _cb: VkCommandBuffer,
             _p: VkQueryPool,
@@ -11831,6 +11987,8 @@ mod tests {
         fns.plant_vkGetQueryPoolResults(results);
         fns.plant_vkCmdBeginQuery(begin);
         fns.plant_vkCmdEndQuery(end);
+        fns.plant_vkCmdBeginQueryIndexedEXT(begin_indexed);
+        fns.plant_vkCmdEndQueryIndexedEXT(end_indexed);
         fns.plant_vkCmdResetQueryPool(cmd_reset);
         fns.plant_vkCmdWriteTimestamp(timestamp);
         fns.plant_vkCmdCopyQueryPoolResults(copy);
@@ -11884,6 +12042,8 @@ mod tests {
         assert_eq!(d.cmd_begin_query(CB, POOL, 3, VkQueryControlFlags(0)), Ok(()));
         assert_eq!(d.cmd_end_query(CB, POOL, 3), Ok(()));
         assert_eq!(d.cmd_write_timestamp(CB, STAGE, POOL, 3), Ok(()));
+        assert_eq!(d.cmd_begin_query_indexed(CB, POOL, 3, VkQueryControlFlags(0), 2), Ok(()));
+        assert_eq!(d.cmd_end_query_indexed(CB, POOL, 3, 2), Ok(()));
         let r = d.query_pool_results(DEVICE, POOL, 0, 4, &mut buf[..16], VkDeviceSize(4), NONE);
         assert_eq!(r, Ok(VkResult::VK_NOT_READY), "the driver's answer, as it gave it");
         ASKED.with_borrow(|a| {
@@ -11896,6 +12056,8 @@ mod tests {
                     ("begin", 3, 1),
                     ("end", 3, 1),
                     ("timestamp", 3, 1),
+                    ("begin_indexed", 3, 2),
+                    ("end_indexed", 3, 2),
                     ("results", 0, 4),
                     ("bytes", 16, 0),
                 ],
@@ -11929,6 +12091,8 @@ mod tests {
         assert_eq!(d.cmd_begin_query(CB, POOL, 4, VkQueryControlFlags(0)), out_of_pool);
         assert_eq!(d.cmd_end_query(CB, POOL, u32::MAX), out_of_pool);
         assert_eq!(d.cmd_write_timestamp(CB, STAGE, POOL, 4), out_of_pool);
+        assert_eq!(d.cmd_begin_query_indexed(CB, POOL, 4, VkQueryControlFlags(0), 0), out_of_pool);
+        assert_eq!(d.cmd_end_query_indexed(CB, POOL, u32::MAX, 0), out_of_pool);
         assert_eq!(
             d.query_pool_results(DEVICE, POOL, 3, 2, &mut buf, VkDeviceSize(4), NONE),
             read_out_of_pool

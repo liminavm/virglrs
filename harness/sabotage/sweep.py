@@ -2263,6 +2263,28 @@ SABOTAGES = [
                     count.set(n + 1);""",
         'fragment_shading_rates_are_counted_then_written',
     ),
+    (
+        'indexed-query-not-held-to-pool',
+        'src/venus/driver.rs',
+        """facts.holds(query, 1)?;
+        let f = d.try_vkCmdBeginQueryIndexedEXT()""",
+        """let f = d.try_vkCmdBeginQueryIndexedEXT()""",
+        'every_query_index_is_held_to_the_pool',
+    ),
+    (
+        'xfb-counter-offsets-dropped',
+        'src/venus/driver.rs',
+        """optional(self.buffers), optional(self.offsets))""",
+        """optional(self.buffers), core::ptr::null())""",
+        'transform_feedback_hands_the_driver_the_guests_arrays',
+    ),
+    (
+        'xfb-bind-sizes-dropped',
+        'src/venus/driver.rs',
+        """offsets.as_ptr(), optional(sizes))""",
+        """offsets.as_ptr(), core::ptr::null())""",
+        'transform_feedback_hands_the_driver_the_guests_arrays',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

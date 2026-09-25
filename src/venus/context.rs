@@ -22,7 +22,7 @@ use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Decoded, Guest, HostHandle, ObjectId, guest_face};
 use super::driver::{
     self, Answered, Driver, DriverWait, ExportError, Exported, InFlight, MemoryError, NoSubmit2,
-    NoSyncFd, NotATimeline,
+    NoSyncFd, NotATimeline, XfbCounters,
 };
 use super::journal::{self, Journal, Owner, Seq};
 use super::monitor::Monitor;
@@ -38,24 +38,28 @@ use super::proto::types::{
     vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
     vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2,
     vn_command_vkCmdBeginConditionalRenderingEXT, vn_command_vkCmdBeginQuery,
-    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBeginRenderPass2,
-    vn_command_vkCmdBeginRendering, vn_command_vkCmdBindDescriptorSets,
+    vn_command_vkCmdBeginQueryIndexedEXT, vn_command_vkCmdBeginRenderPass,
+    vn_command_vkCmdBeginRenderPass2, vn_command_vkCmdBeginRendering,
+    vn_command_vkCmdBeginTransformFeedbackEXT, vn_command_vkCmdBindDescriptorSets,
     vn_command_vkCmdBindDescriptorSets2, vn_command_vkCmdBindIndexBuffer,
     vn_command_vkCmdBindIndexBuffer2, vn_command_vkCmdBindPipeline,
-    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBindVertexBuffers2,
-    vn_command_vkCmdBlitImage, vn_command_vkCmdBlitImage2, vn_command_vkCmdClearAttachments,
-    vn_command_vkCmdClearColorImage, vn_command_vkCmdClearDepthStencilImage,
-    vn_command_vkCmdCopyBuffer, vn_command_vkCmdCopyBuffer2, vn_command_vkCmdCopyBufferToImage,
+    vn_command_vkCmdBindTransformFeedbackBuffersEXT, vn_command_vkCmdBindVertexBuffers,
+    vn_command_vkCmdBindVertexBuffers2, vn_command_vkCmdBlitImage, vn_command_vkCmdBlitImage2,
+    vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage,
+    vn_command_vkCmdClearDepthStencilImage, vn_command_vkCmdCopyBuffer,
+    vn_command_vkCmdCopyBuffer2, vn_command_vkCmdCopyBufferToImage,
     vn_command_vkCmdCopyBufferToImage2, vn_command_vkCmdCopyImage, vn_command_vkCmdCopyImage2,
     vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyImageToBuffer2,
     vn_command_vkCmdCopyQueryPoolResults, vn_command_vkCmdDispatch, vn_command_vkCmdDispatchBase,
     vn_command_vkCmdDispatchIndirect, vn_command_vkCmdDraw, vn_command_vkCmdDrawIndexed,
     vn_command_vkCmdDrawIndexedIndirect, vn_command_vkCmdDrawIndexedIndirectCount,
-    vn_command_vkCmdDrawIndirect, vn_command_vkCmdDrawIndirectCount, vn_command_vkCmdDrawMultiEXT,
+    vn_command_vkCmdDrawIndirect, vn_command_vkCmdDrawIndirectByteCountEXT,
+    vn_command_vkCmdDrawIndirectCount, vn_command_vkCmdDrawMultiEXT,
     vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndConditionalRenderingEXT,
-    vn_command_vkCmdEndQuery, vn_command_vkCmdEndRenderPass, vn_command_vkCmdEndRenderPass2,
-    vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer, vn_command_vkCmdNextSubpass,
-    vn_command_vkCmdNextSubpass2, vn_command_vkCmdPipelineBarrier,
+    vn_command_vkCmdEndQuery, vn_command_vkCmdEndQueryIndexedEXT, vn_command_vkCmdEndRenderPass,
+    vn_command_vkCmdEndRenderPass2, vn_command_vkCmdEndRendering,
+    vn_command_vkCmdEndTransformFeedbackEXT, vn_command_vkCmdFillBuffer,
+    vn_command_vkCmdNextSubpass, vn_command_vkCmdNextSubpass2, vn_command_vkCmdPipelineBarrier,
     vn_command_vkCmdPipelineBarrier2, vn_command_vkCmdPushConstants,
     vn_command_vkCmdPushConstants2, vn_command_vkCmdPushDescriptorSet,
     vn_command_vkCmdPushDescriptorSet2, vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2,
@@ -2217,6 +2221,7 @@ impl Handlers<'_> {
                     Q::NoHostReset => {
                         "reset a query pool from the host on a device that exports no reset"
                     }
+                    Q::NotExported => "recorded a query command the device does not export",
                     Q::UnknownPool => "named a query pool this renderer has no record of",
                     Q::OutOfPool => "named queries past the end of the pool",
                     Q::OutOfRoom => "asked for query results past the room it offered",
@@ -5531,6 +5536,65 @@ impl Commands for Handlers<'_> {
         self.recorded(done);
     }
 
+    fn vkCmdBindTransformFeedbackBuffersEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdBindTransformFeedbackBuffersEXT<'_>,
+    ) {
+        // Three arrays under one count, as `vkCmdBindVertexBuffers2`.
+        let done = self.driver.cmd_bind_transform_feedback_buffers(
+            args.commandBuffer,
+            args.firstBinding,
+            args.pBuffers(),
+            args.pOffsets(),
+            args.pSizes(),
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdBeginTransformFeedbackEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdBeginTransformFeedbackEXT<'_>,
+    ) {
+        let counters = XfbCounters::new(
+            args.firstCounterBuffer,
+            args.counterBufferCount(),
+            args.pCounterBuffers(),
+            args.pCounterBufferOffsets(),
+        );
+        let done = self.driver.cmd_begin_transform_feedback(args.commandBuffer, counters);
+        self.recorded(done);
+    }
+
+    fn vkCmdEndTransformFeedbackEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdEndTransformFeedbackEXT<'_>,
+    ) {
+        let counters = XfbCounters::new(
+            args.firstCounterBuffer,
+            args.counterBufferCount(),
+            args.pCounterBuffers(),
+            args.pCounterBufferOffsets(),
+        );
+        let done = self.driver.cmd_end_transform_feedback(args.commandBuffer, counters);
+        self.recorded(done);
+    }
+
+    fn vkCmdDrawIndirectByteCountEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdDrawIndirectByteCountEXT<'_>,
+    ) {
+        let done = self.driver.cmd_draw_indirect_byte_count(
+            args.commandBuffer,
+            args.instanceCount,
+            args.firstInstance,
+            args.counterBuffer,
+            args.counterBufferOffset,
+            args.counterOffset,
+            args.vertexStride,
+        );
+        self.recorded(done);
+    }
+
     fn vkCmdClearDepthStencilImage(
         &mut self,
         args: &mut vn_command_vkCmdClearDepthStencilImage<'_>,
@@ -5618,6 +5682,27 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdEndQuery(&mut self, args: &mut vn_command_vkCmdEndQuery<'_>) {
         let done = self.driver.cmd_end_query(args.commandBuffer, args.queryPool, args.query);
+        self.queried(done);
+    }
+
+    fn vkCmdBeginQueryIndexedEXT(&mut self, args: &mut vn_command_vkCmdBeginQueryIndexedEXT<'_>) {
+        let done = self.driver.cmd_begin_query_indexed(
+            args.commandBuffer,
+            args.queryPool,
+            args.query,
+            args.flags,
+            args.index,
+        );
+        self.queried(done);
+    }
+
+    fn vkCmdEndQueryIndexedEXT(&mut self, args: &mut vn_command_vkCmdEndQueryIndexedEXT<'_>) {
+        let done = self.driver.cmd_end_query_indexed(
+            args.commandBuffer,
+            args.queryPool,
+            args.query,
+            args.index,
+        );
         self.queried(done);
     }
 
@@ -18200,6 +18285,214 @@ mod tests {
         h.vkGetPhysicalDeviceFragmentShadingRatesKHR(&mut args);
         assert!(h.rejected().is_some(), "a query with no count is refused");
 
+        h.driver.abandon_planted();
+    }
+
+    /// The four transform feedback recording commands hand the driver the guest's arrays and
+    /// scalars, and an absent optional array as null.
+    ///
+    /// The bind carries all three arrays and the begin both counter arrays; the end carries
+    /// neither, so its count reaches the driver with two nulls, as Vulkan reads "capture from
+    /// offset zero". A wrapper that forwarded a present array as null, or an absent one as a
+    /// dangling pointer, reads back wrong here.
+    #[test]
+    fn transform_feedback_hands_the_driver_the_guests_arrays() {
+        use super::super::proto::types::{
+            VkBuffer, VkCommandBuffer, VkCommandPool, VkDevice, VkDeviceSize,
+            vn_command_vkCmdBeginTransformFeedbackEXT,
+            vn_command_vkCmdBindTransformFeedbackBuffersEXT,
+            vn_command_vkCmdDrawIndirectByteCountEXT, vn_command_vkCmdEndTransformFeedbackEXT,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+        // Stands in for a null array in what the stubs record.
+        const NULL: u64 = u64::MAX;
+
+        // Each call, as its name and what it was handed: scalars, then the arrays' contents.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<u64>)>> = const { RefCell::new(Vec::new()) };
+        }
+
+        /// The contents of an array the driver was handed, or `NULL` for a null one.
+        fn read<T: Copy>(p: *const T, n: u32, v: impl Fn(T) -> u64) -> Vec<u64> {
+            if p.is_null() {
+                return vec![NULL];
+            }
+            // SAFETY: the wrapper passes each array with the count it is sized by.
+            unsafe { core::slice::from_raw_parts(p, n as usize) }.iter().map(|&t| v(t)).collect()
+        }
+        fn handle(b: VkBuffer) -> u64 {
+            b.raw()
+        }
+        fn size(s: VkDeviceSize) -> u64 {
+            s.0
+        }
+
+        unsafe extern "C" fn bind(
+            _: VkCommandBuffer,
+            first: u32,
+            n: u32,
+            buffers: *const VkBuffer,
+            offsets: *const VkDeviceSize,
+            sizes: *const VkDeviceSize,
+        ) {
+            let mut v = vec![first.into(), n.into()];
+            v.extend(read(buffers, n, handle));
+            v.extend(read(offsets, n, size));
+            v.extend(read(sizes, n, size));
+            SAW.with_borrow_mut(|s| s.push(("bind", v)));
+        }
+        fn counters(
+            what: &'static str,
+            first: u32,
+            n: u32,
+            buffers: *const VkBuffer,
+            offsets: *const VkDeviceSize,
+        ) {
+            let mut v = vec![first.into(), n.into()];
+            v.extend(read(buffers, n, handle));
+            v.extend(read(offsets, n, size));
+            SAW.with_borrow_mut(|s| s.push((what, v)));
+        }
+        unsafe extern "C" fn begin(
+            _: VkCommandBuffer,
+            first: u32,
+            n: u32,
+            buffers: *const VkBuffer,
+            offsets: *const VkDeviceSize,
+        ) {
+            counters("begin", first, n, buffers, offsets);
+        }
+        unsafe extern "C" fn end(
+            _: VkCommandBuffer,
+            first: u32,
+            n: u32,
+            buffers: *const VkBuffer,
+            offsets: *const VkDeviceSize,
+        ) {
+            counters("end", first, n, buffers, offsets);
+        }
+        unsafe extern "C" fn draw(
+            _: VkCommandBuffer,
+            instances: u32,
+            first_instance: u32,
+            counter: VkBuffer,
+            counter_offset: VkDeviceSize,
+            vertex_offset: u32,
+            stride: u32,
+        ) {
+            let v = vec![
+                instances.into(),
+                first_instance.into(),
+                handle(counter),
+                counter_offset.0,
+                vertex_offset.into(),
+                stride.into(),
+            ];
+            SAW.with_borrow_mut(|s| s.push(("draw", v)));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdBindTransformFeedbackBuffersEXT(bind);
+        fns.plant_vkCmdBeginTransformFeedbackEXT(begin);
+        fns.plant_vkCmdEndTransformFeedbackEXT(end);
+        fns.plant_vkCmdDrawIndirectByteCountEXT(draw);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        let buffers = [VkBuffer::forged(0x40), VkBuffer::forged(0x41)];
+        let offsets = [VkDeviceSize(16), VkDeviceSize(32)];
+        let sizes = [VkDeviceSize(256), VkDeviceSize(512)];
+        let mut args = vn_command_vkCmdBindTransformFeedbackBuffersEXT::default();
+        args.commandBuffer = cb;
+        args.firstBinding = 1;
+        args.plant_pBuffers(&buffers);
+        args.plant_pOffsets(&offsets);
+        args.plant_pSizes(&sizes);
+        h.vkCmdBindTransformFeedbackBuffersEXT(&mut args);
+
+        let counter_buffers = [VkBuffer::forged(0x50)];
+        let counter_offsets = [VkDeviceSize(8)];
+        let mut args = vn_command_vkCmdBeginTransformFeedbackEXT::default();
+        args.commandBuffer = cb;
+        args.firstCounterBuffer = 2;
+        args.plant_pCounterBuffers(&counter_buffers);
+        args.plant_pCounterBufferOffsets(&counter_offsets);
+        h.vkCmdBeginTransformFeedbackEXT(&mut args);
+
+        let mut args = vn_command_vkCmdEndTransformFeedbackEXT::default();
+        args.commandBuffer = cb;
+        args.plant_counterBufferCount(2);
+        h.vkCmdEndTransformFeedbackEXT(&mut args);
+
+        h.vkCmdDrawIndirectByteCountEXT(&mut vn_command_vkCmdDrawIndirectByteCountEXT {
+            commandBuffer: cb,
+            instanceCount: 3,
+            firstInstance: 1,
+            counterBuffer: VkBuffer::forged(0x50),
+            counterBufferOffset: VkDeviceSize(8),
+            counterOffset: 4,
+            vertexStride: 12,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<u64>); 4] = [
+                ("bind", vec![1, 2, 0x40, 0x41, 16, 32, 256, 512]),
+                ("begin", vec![2, 1, 0x50, 8]),
+                ("end", vec![0, 2, NULL, NULL]),
+                ("draw", vec![3, 1, 0x50, 8, 4, 12]),
+            ];
+            assert_eq!(*s, want, "each command once, handed what the guest sent");
+        });
+
+        // A command buffer the driver has no pool record for has no device to record through.
+        h.vkCmdDrawIndirectByteCountEXT(&mut vn_command_vkCmdDrawIndirectByteCountEXT {
+            commandBuffer: VkCommandBuffer::forged(99),
+            ..Default::default()
+        });
+        assert!(h.rejected().is_some(), "an unknown command buffer is refused");
+        assert_eq!(SAW.with_borrow(Vec::len), 4, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
     }
 

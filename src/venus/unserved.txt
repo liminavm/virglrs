@@ -63,23 +63,17 @@
 # answers some commands guest-side without asking the host at all, so a probe can report `ok` for
 # a command that was refused: measured on the events group, where vkCreateEvent was refused and
 # the next four checks still passed. `[virglrs] refused:` is the oracle. The program is not.
-vkCmdBeginQueryIndexedEXT                          wanted:transform-feedback
-vkCmdBeginTransformFeedbackEXT                     wanted:transform-feedback
 vkCmdBindResourceHeapEXT                           out-of-reach:descriptor-heap
 vkCmdBindSamplerHeapEXT                            out-of-reach:descriptor-heap
-vkCmdBindTransformFeedbackBuffersEXT               wanted:transform-feedback
 vkCmdBuildAccelerationStructuresIndirectKHR        out-of-reach:acceleration-structure
 vkCmdBuildAccelerationStructuresKHR                out-of-reach:acceleration-structure
 vkCmdCopyAccelerationStructureKHR                  out-of-reach:acceleration-structure
 vkCmdCopyAccelerationStructureToMemoryKHR          out-of-reach:acceleration-structure
 vkCmdCopyMemoryToAccelerationStructureKHR          out-of-reach:acceleration-structure
-vkCmdDrawIndirectByteCountEXT                      wanted:transform-feedback
 vkCmdDrawMeshTasksEXT                              out-of-reach:mesh-shader
 vkCmdDrawMeshTasksIndirectCountEXT                 out-of-reach:mesh-shader
 vkCmdDrawMeshTasksIndirectEXT                      out-of-reach:mesh-shader
-vkCmdEndQueryIndexedEXT                            wanted:transform-feedback
 vkCmdEndRendering2KHR                              out-of-reach:maintenance10
-vkCmdEndTransformFeedbackEXT                       wanted:transform-feedback
 vkCmdExecuteCommands                               wanted:secondary-command-buffers
 vkCmdPushDataEXT                                   out-of-reach:descriptor-heap
 vkCmdSetAlphaToCoverageEnableEXT                   wanted:extended-dynamic-state3
