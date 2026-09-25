@@ -73,7 +73,6 @@ vkCmdBindTransformFeedbackBuffersEXT               wanted:transform-feedback
 vkCmdBlitImage2                                    wanted:copy-commands2
 vkCmdBuildAccelerationStructuresIndirectKHR        out-of-reach:acceleration-structure
 vkCmdBuildAccelerationStructuresKHR                out-of-reach:acceleration-structure
-vkCmdClearDepthStencilImage                        wanted:image-copy-core
 vkCmdCopyAccelerationStructureKHR                  out-of-reach:acceleration-structure
 vkCmdCopyAccelerationStructureToMemoryKHR          out-of-reach:acceleration-structure
 vkCmdCopyBuffer2                                   wanted:copy-commands2
@@ -94,7 +93,6 @@ vkCmdExecuteCommands                               wanted:secondary-command-buff
 vkCmdNextSubpass                                   wanted:render-pass2
 vkCmdNextSubpass2                                  wanted:render-pass2
 vkCmdPushDataEXT                                   out-of-reach:descriptor-heap
-vkCmdResolveImage                                  wanted:image-copy-core
 vkCmdResolveImage2                                 wanted:copy-commands2
 vkCmdSetAlphaToCoverageEnableEXT                   wanted:extended-dynamic-state3
 vkCmdSetAlphaToOneEnableEXT                        wanted:extended-dynamic-state3
@@ -133,7 +131,6 @@ vkCmdSetVertexInputEXT                             wanted:vertex-input-dynamic-s
 vkCmdTraceRaysIndirect2KHR                         out-of-reach:ray-tracing-maintenance1
 vkCmdTraceRaysIndirectKHR                          out-of-reach:ray-tracing-pipeline
 vkCmdTraceRaysKHR                                  out-of-reach:ray-tracing-pipeline
-vkCmdUpdateBuffer                                  wanted:image-copy-core
 vkCmdWriteAccelerationStructuresPropertiesKHR      out-of-reach:acceleration-structure
 vkCopyAccelerationStructureKHR                     not-in-reference:acceleration-structure
 vkCreateAccelerationStructureKHR                   out-of-reach:acceleration-structure

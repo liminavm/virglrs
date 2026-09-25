@@ -2140,6 +2140,30 @@ SABOTAGES = [
         """        let ([bx, by, bz], [x, y, z]) = (groups, groups);""",
         'the_indexed_and_indirect_draws_hand_the_driver_every_argument_in_place',
     ),
+    (
+        'vkCmdResolveImage gives the destination the source layout',
+        'src/venus/driver.rs',
+        """            (d.vkCmdResolveImage())(
+                cb,
+                src,
+                src_layout,
+                dst,
+                dst_layout,""",
+        """            (d.vkCmdResolveImage())(
+                cb,
+                src,
+                src_layout,
+                dst,
+                src_layout,""",
+        'the_core_clear_resolve_and_update_hand_the_driver_what_the_guest_sent',
+    ),
+    (
+        'vkCmdUpdateBuffer writes one byte short',
+        'src/venus/driver.rs',
+        """                VkDeviceSize(data.len() as u64),""",
+        """                VkDeviceSize(data.len() as u64 - 1),""",
+        'the_core_clear_resolve_and_update_hand_the_driver_what_the_guest_sent',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

@@ -24,22 +24,23 @@ use super::objects::Doomed;
 use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBindDescriptorSetsInfo,
     VkBool32, VkBuffer, VkBufferCopy, VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView,
-    VkCalibratedTimestampInfoKHR, VkClearAttachment, VkClearColorValue, VkClearRect,
-    VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags, VkCommandPool,
-    VkCompareOp, VkCopyDescriptorSet, VkCopyImageToImageInfo, VkCopyImageToMemoryInfo,
-    VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA,
-    VkCullModeFlags, VkDependencyFlags, VkDependencyInfo, VkDescriptorPool, VkDescriptorSet,
-    VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo,
-    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent,
-    VkExportMemoryAllocateInfo, VkExtensionProperties, VkExternalFenceHandleTypeFlagBits,
-    VkExternalImageFormatProperties, VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
+    VkCalibratedTimestampInfoKHR, VkClearAttachment, VkClearColorValue, VkClearDepthStencilValue,
+    VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
+    VkCommandPool, VkCompareOp, VkCopyDescriptorSet, VkCopyImageToImageInfo,
+    VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo,
+    VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags, VkDependencyInfo,
+    VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
+    VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA,
+    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties,
+    VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
+    VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
     VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceCreateFlags, VkFenceCreateInfo,
     VkFenceGetFdInfoKHR, VkFilter, VkFormat, VkFramebuffer, VkFrontFace,
     VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlags, VkImageBlit, VkImageCopy,
     VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties, VkImageFormatProperties2,
-    VkImageLayout, VkImageMemoryBarrier, VkImageSubresourceRange, VkImageTiling,
+    VkImageLayout, VkImageMemoryBarrier, VkImageResolve, VkImageSubresourceRange, VkImageTiling,
     VkImageToMemoryCopy, VkImageType, VkImageUsageFlags, VkImageView,
     VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR,
     VkIndexType, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier,
@@ -4586,6 +4587,86 @@ impl Driver {
                 color,
                 ranges.len() as u32,
                 ranges.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    /// The depth and stencil twin of [`Self::cmd_clear_color_image`].
+    pub fn cmd_clear_depth_stencil_image(
+        &self,
+        cb: VkCommandBuffer,
+        image: VkImage,
+        layout: VkImageLayout,
+        value: &VkClearDepthStencilValue,
+        ranges: &[VkImageSubresourceRange],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the count is the slice's own length, and the value is a reference.
+        unsafe {
+            (d.vkCmdClearDepthStencilImage())(
+                cb,
+                image,
+                layout,
+                value,
+                ranges.len() as u32,
+                ranges.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    /// `vkCmdResolveImage`: a multisampled image averaged down into a single-sampled one. The
+    /// same shape as [`Self::cmd_copy_image`], each image with its own layout.
+    pub fn cmd_resolve_image(
+        &self,
+        cb: VkCommandBuffer,
+        src: VkImage,
+        src_layout: VkImageLayout,
+        dst: VkImage,
+        dst_layout: VkImageLayout,
+        regions: &[VkImageResolve],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the count is the slice's own length.
+        unsafe {
+            (d.vkCmdResolveImage())(
+                cb,
+                src,
+                src_layout,
+                dst,
+                dst_layout,
+                regions.len() as u32,
+                regions.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    /// `vkCmdUpdateBuffer`, whose `dataSize` is the length of the bytes and nothing else -- the
+    /// same reconciliation as [`Self::cmd_push_constants`].
+    ///
+    /// Empty bytes write nothing, and a zero `dataSize` is itself invalid usage, so no call is
+    /// made: the command buffer is still resolved, as in [`Self::cmd_clear_attachments`].
+    pub fn cmd_update_buffer(
+        &self,
+        cb: VkCommandBuffer,
+        dst: VkBuffer,
+        offset: VkDeviceSize,
+        data: &[u8],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        if data.is_empty() {
+            return Some(());
+        }
+        // SAFETY: as above; the size is the slice's own length in bytes.
+        unsafe {
+            (d.vkCmdUpdateBuffer())(
+                cb,
+                dst,
+                offset,
+                VkDeviceSize(data.len() as u64),
+                data.as_ptr().cast(),
             )
         };
         Some(())

@@ -42,7 +42,8 @@ use super::proto::types::{
     vn_command_vkCmdBindIndexBuffer, vn_command_vkCmdBindIndexBuffer2,
     vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers,
     vn_command_vkCmdBindVertexBuffers2, vn_command_vkCmdBlitImage,
-    vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer,
+    vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage,
+    vn_command_vkCmdClearDepthStencilImage, vn_command_vkCmdCopyBuffer,
     vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImage,
     vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyQueryPoolResults,
     vn_command_vkCmdDispatch, vn_command_vkCmdDispatchBase, vn_command_vkCmdDispatchIndirect,
@@ -54,19 +55,20 @@ use super::proto::types::{
     vn_command_vkCmdPipelineBarrier2, vn_command_vkCmdPushConstants,
     vn_command_vkCmdPushConstants2, vn_command_vkCmdPushDescriptorSet,
     vn_command_vkCmdPushDescriptorSet2, vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2,
-    vn_command_vkCmdResetQueryPool, vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT,
-    vn_command_vkCmdSetBlendConstants, vn_command_vkCmdSetColorWriteEnableEXT,
-    vn_command_vkCmdSetCullMode, vn_command_vkCmdSetDepthBias,
-    vn_command_vkCmdSetDepthBoundsTestEnable, vn_command_vkCmdSetDepthCompareOp,
-    vn_command_vkCmdSetDepthTestEnable, vn_command_vkCmdSetDepthWriteEnable,
-    vn_command_vkCmdSetEvent, vn_command_vkCmdSetEvent2, vn_command_vkCmdSetFrontFace,
-    vn_command_vkCmdSetLineWidth, vn_command_vkCmdSetPatchControlPointsEXT,
-    vn_command_vkCmdSetPrimitiveRestartEnable, vn_command_vkCmdSetPrimitiveTopology,
-    vn_command_vkCmdSetRasterizerDiscardEnable, vn_command_vkCmdSetScissor,
-    vn_command_vkCmdSetScissorWithCount, vn_command_vkCmdSetStencilCompareMask,
-    vn_command_vkCmdSetStencilOp, vn_command_vkCmdSetStencilReference,
-    vn_command_vkCmdSetStencilTestEnable, vn_command_vkCmdSetStencilWriteMask,
-    vn_command_vkCmdSetViewport, vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdWaitEvents,
+    vn_command_vkCmdResetQueryPool, vn_command_vkCmdResolveImage,
+    vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT, vn_command_vkCmdSetBlendConstants,
+    vn_command_vkCmdSetColorWriteEnableEXT, vn_command_vkCmdSetCullMode,
+    vn_command_vkCmdSetDepthBias, vn_command_vkCmdSetDepthBoundsTestEnable,
+    vn_command_vkCmdSetDepthCompareOp, vn_command_vkCmdSetDepthTestEnable,
+    vn_command_vkCmdSetDepthWriteEnable, vn_command_vkCmdSetEvent, vn_command_vkCmdSetEvent2,
+    vn_command_vkCmdSetFrontFace, vn_command_vkCmdSetLineWidth,
+    vn_command_vkCmdSetPatchControlPointsEXT, vn_command_vkCmdSetPrimitiveRestartEnable,
+    vn_command_vkCmdSetPrimitiveTopology, vn_command_vkCmdSetRasterizerDiscardEnable,
+    vn_command_vkCmdSetScissor, vn_command_vkCmdSetScissorWithCount,
+    vn_command_vkCmdSetStencilCompareMask, vn_command_vkCmdSetStencilOp,
+    vn_command_vkCmdSetStencilReference, vn_command_vkCmdSetStencilTestEnable,
+    vn_command_vkCmdSetStencilWriteMask, vn_command_vkCmdSetViewport,
+    vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents,
     vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2,
     vn_command_vkCopyImageToImage, vn_command_vkCopyImageToMemoryMESA,
     vn_command_vkCopyMemoryToImageMESA, vn_command_vkCreateBuffer, vn_command_vkCreateBufferView,
@@ -5257,6 +5259,48 @@ impl Commands for Handlers<'_> {
             color,
             ranges,
         );
+        self.recorded(done);
+    }
+
+    fn vkCmdClearDepthStencilImage(
+        &mut self,
+        args: &mut vn_command_vkCmdClearDepthStencilImage<'_>,
+    ) {
+        // The value is what the clear is for, as the colour is for `vkCmdClearColorImage`.
+        let Some(value) = self.names(args.pDepthStencil) else { return };
+        let ranges = args.pRanges();
+        let done = self.driver.cmd_clear_depth_stencil_image(
+            args.commandBuffer,
+            args.image,
+            args.imageLayout,
+            value,
+            ranges,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdResolveImage(&mut self, args: &mut vn_command_vkCmdResolveImage<'_>) {
+        let regions = args.pRegions();
+        let done = self.driver.cmd_resolve_image(
+            args.commandBuffer,
+            args.srcImage,
+            args.srcImageLayout,
+            args.dstImage,
+            args.dstImageLayout,
+            regions,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdUpdateBuffer(&mut self, args: &mut vn_command_vkCmdUpdateBuffer<'_>) {
+        // As with `vkCmdPushConstants`: a size with no bytes behind it would have the driver
+        // write whatever it found, and the bytes are the command.
+        let Some(data) = args.pData() else {
+            self.reject("updated a buffer without saying with what");
+            return;
+        };
+        let done =
+            self.driver.cmd_update_buffer(args.commandBuffer, args.dstBuffer, args.dstOffset, data);
         self.recorded(done);
     }
 
@@ -16306,6 +16350,188 @@ mod tests {
         });
         assert!(h.rejected().is_some(), "an unknown command buffer is refused");
         assert_eq!(SAW.with_borrow(Vec::len), 8, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The three 1.0 transfer commands that were unserved hand the driver what the guest sent:
+    /// a depth-stencil clear's value and ranges, a resolve's two images on their own sides, and
+    /// an update's bytes measured by themselves.
+    #[test]
+    fn the_core_clear_resolve_and_update_hand_the_driver_what_the_guest_sent() {
+        use super::super::proto::types::{
+            VkBuffer, VkClearDepthStencilValue, VkCommandBuffer, VkCommandPool, VkDevice,
+            VkDeviceSize, VkImage, VkImageLayout, VkImageResolve, VkImageSubresourceRange,
+            vn_command_vkCmdClearDepthStencilImage, vn_command_vkCmdResolveImage,
+            vn_command_vkCmdUpdateBuffer,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        #[derive(Default)]
+        struct Saw {
+            cleared: Vec<(u64, i32, u32, u32, Vec<u32>)>,
+            resolved: Vec<(u64, i32, u64, i32, u32)>,
+            updated: Vec<(u64, u64, Vec<u8>)>,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        unsafe extern "C" fn clear(
+            _cb: VkCommandBuffer,
+            image: VkImage,
+            layout: VkImageLayout,
+            value: *const VkClearDepthStencilValue,
+            count: u32,
+            p: *const VkImageSubresourceRange,
+        ) {
+            // SAFETY: the wrapper passes a reference for the value and a slice's own pointer
+            // and length for the ranges.
+            let (v, ranges) = unsafe { (&*value, core::slice::from_raw_parts(p, count as usize)) };
+            let mips = ranges.iter().map(|r| r.baseMipLevel).collect();
+            SAW.with_borrow_mut(|s| {
+                s.cleared.push((image.raw(), layout.0, v.depth.to_bits(), v.stencil, mips))
+            });
+        }
+
+        unsafe extern "C" fn resolve(
+            _cb: VkCommandBuffer,
+            src: VkImage,
+            src_layout: VkImageLayout,
+            dst: VkImage,
+            dst_layout: VkImageLayout,
+            count: u32,
+            _p: *const VkImageResolve,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.resolved.push((src.raw(), src_layout.0, dst.raw(), dst_layout.0, count))
+            });
+        }
+
+        unsafe extern "C" fn update(
+            _cb: VkCommandBuffer,
+            dst: VkBuffer,
+            offset: VkDeviceSize,
+            size: VkDeviceSize,
+            data: *const core::ffi::c_void,
+        ) {
+            // SAFETY: the wrapper passes the slice's own pointer and its length in bytes.
+            let bytes = unsafe { core::slice::from_raw_parts(data.cast::<u8>(), size.0 as usize) };
+            SAW.with_borrow_mut(|s| s.updated.push((dst.raw(), offset.0, bytes.to_vec())));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdClearDepthStencilImage(clear);
+        fns.plant_vkCmdResolveImage(resolve);
+        fns.plant_vkCmdUpdateBuffer(update);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        let value = VkClearDepthStencilValue { depth: 0.25, stencil: 0x5a };
+        let ranges = [
+            VkImageSubresourceRange { baseMipLevel: 2, ..Default::default() },
+            VkImageSubresourceRange { baseMipLevel: 3, ..Default::default() },
+        ];
+        let mut args = vn_command_vkCmdClearDepthStencilImage::default();
+        args.commandBuffer = cb;
+        args.image = VkImage::forged(0x11);
+        args.imageLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        args.pDepthStencil = Some(&value);
+        args.plant_pRanges(&ranges);
+        h.vkCmdClearDepthStencilImage(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+
+        // Two layouts that differ, so a wrapper mirroring one side into the other is caught.
+        let regions = [VkImageResolve::default(); 3];
+        let mut args = vn_command_vkCmdResolveImage::default();
+        args.commandBuffer = cb;
+        args.srcImage = VkImage::forged(0x22);
+        args.srcImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        args.dstImage = VkImage::forged(0x33);
+        args.dstImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_GENERAL;
+        args.plant_pRegions(&regions);
+        h.vkCmdResolveImage(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+
+        // Eight bytes at an offset of 16, so the length cannot pass for the offset.
+        let bytes = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut args = vn_command_vkCmdUpdateBuffer::default();
+        args.commandBuffer = cb;
+        args.dstBuffer = VkBuffer::forged(0x44);
+        args.dstOffset = VkDeviceSize(16);
+        args.plant_dataSize(VkDeviceSize(bytes.len() as u64));
+        args.plant_pData(&bytes);
+        h.vkCmdUpdateBuffer(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+
+        SAW.with_borrow(|s| {
+            let transfer_dst = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL.0;
+            assert_eq!(
+                s.cleared,
+                [(0x11, transfer_dst, 0.25f32.to_bits(), 0x5a, vec![2, 3])],
+                "the image, its layout, the guest's depth and stencil, and both ranges"
+            );
+            assert_eq!(
+                s.resolved,
+                [(
+                    0x22,
+                    VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL.0,
+                    0x33,
+                    VkImageLayout::VK_IMAGE_LAYOUT_GENERAL.0,
+                    3
+                )],
+                "each image with its own layout, and all three regions"
+            );
+            assert_eq!(s.updated, [(0x44, 16, bytes.to_vec())], "the offset and every byte");
+        });
+
+        // A size with no bytes behind it: writing would put whatever the driver found into the
+        // guest's buffer.
+        let mut args = vn_command_vkCmdUpdateBuffer::default();
+        args.commandBuffer = cb;
+        args.plant_dataSize(VkDeviceSize(4));
+        h.vkCmdUpdateBuffer(&mut args);
+        assert!(h.rejected().is_some(), "a size with no bytes behind it stops the ring");
+        assert_eq!(SAW.with_borrow(|s| s.updated.len()), 1, "and updates nothing");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
