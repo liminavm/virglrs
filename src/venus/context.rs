@@ -64,33 +64,44 @@ use super::proto::types::{
     vn_command_vkCmdPushConstants2, vn_command_vkCmdPushDescriptorSet,
     vn_command_vkCmdPushDescriptorSet2, vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2,
     vn_command_vkCmdResetQueryPool, vn_command_vkCmdResolveImage, vn_command_vkCmdResolveImage2,
+    vn_command_vkCmdSetAlphaToCoverageEnableEXT, vn_command_vkCmdSetAlphaToOneEnableEXT,
     vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT, vn_command_vkCmdSetBlendConstants,
-    vn_command_vkCmdSetColorWriteEnableEXT, vn_command_vkCmdSetCullMode,
-    vn_command_vkCmdSetDepthBias, vn_command_vkCmdSetDepthBias2EXT,
+    vn_command_vkCmdSetColorBlendAdvancedEXT, vn_command_vkCmdSetColorBlendEnableEXT,
+    vn_command_vkCmdSetColorBlendEquationEXT, vn_command_vkCmdSetColorWriteEnableEXT,
+    vn_command_vkCmdSetColorWriteMaskEXT, vn_command_vkCmdSetConservativeRasterizationModeEXT,
+    vn_command_vkCmdSetCullMode, vn_command_vkCmdSetDepthBias, vn_command_vkCmdSetDepthBias2EXT,
     vn_command_vkCmdSetDepthBiasEnable, vn_command_vkCmdSetDepthBounds,
-    vn_command_vkCmdSetDepthBoundsTestEnable, vn_command_vkCmdSetDepthCompareOp,
-    vn_command_vkCmdSetDepthTestEnable, vn_command_vkCmdSetDepthWriteEnable,
-    vn_command_vkCmdSetDeviceMask, vn_command_vkCmdSetEvent, vn_command_vkCmdSetEvent2,
+    vn_command_vkCmdSetDepthBoundsTestEnable, vn_command_vkCmdSetDepthClampEnableEXT,
+    vn_command_vkCmdSetDepthClipEnableEXT, vn_command_vkCmdSetDepthClipNegativeOneToOneEXT,
+    vn_command_vkCmdSetDepthCompareOp, vn_command_vkCmdSetDepthTestEnable,
+    vn_command_vkCmdSetDepthWriteEnable, vn_command_vkCmdSetDeviceMask, vn_command_vkCmdSetEvent,
+    vn_command_vkCmdSetEvent2, vn_command_vkCmdSetExtraPrimitiveOverestimationSizeEXT,
     vn_command_vkCmdSetFragmentShadingRateKHR, vn_command_vkCmdSetFrontFace,
-    vn_command_vkCmdSetLineStipple, vn_command_vkCmdSetLineWidth, vn_command_vkCmdSetLogicOpEXT,
-    vn_command_vkCmdSetPatchControlPointsEXT, vn_command_vkCmdSetPrimitiveRestartEnable,
-    vn_command_vkCmdSetPrimitiveTopology, vn_command_vkCmdSetRasterizerDiscardEnable,
+    vn_command_vkCmdSetLineRasterizationModeEXT, vn_command_vkCmdSetLineStipple,
+    vn_command_vkCmdSetLineStippleEnableEXT, vn_command_vkCmdSetLineWidth,
+    vn_command_vkCmdSetLogicOpEXT, vn_command_vkCmdSetLogicOpEnableEXT,
+    vn_command_vkCmdSetPatchControlPointsEXT, vn_command_vkCmdSetPolygonModeEXT,
+    vn_command_vkCmdSetPrimitiveRestartEnable, vn_command_vkCmdSetPrimitiveTopology,
+    vn_command_vkCmdSetProvokingVertexModeEXT, vn_command_vkCmdSetRasterizationSamplesEXT,
+    vn_command_vkCmdSetRasterizationStreamEXT, vn_command_vkCmdSetRasterizerDiscardEnable,
     vn_command_vkCmdSetRenderingAttachmentLocations,
     vn_command_vkCmdSetRenderingInputAttachmentIndices, vn_command_vkCmdSetSampleLocationsEXT,
+    vn_command_vkCmdSetSampleLocationsEnableEXT, vn_command_vkCmdSetSampleMaskEXT,
     vn_command_vkCmdSetScissor, vn_command_vkCmdSetScissorWithCount,
     vn_command_vkCmdSetStencilCompareMask, vn_command_vkCmdSetStencilOp,
     vn_command_vkCmdSetStencilReference, vn_command_vkCmdSetStencilTestEnable,
-    vn_command_vkCmdSetStencilWriteMask, vn_command_vkCmdSetVertexInputEXT,
-    vn_command_vkCmdSetViewport, vn_command_vkCmdSetViewportWithCount,
-    vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents, vn_command_vkCmdWaitEvents2,
-    vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2, vn_command_vkCopyImageToImage,
-    vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
-    vn_command_vkCreateBuffer, vn_command_vkCreateBufferView, vn_command_vkCreateCommandPool,
-    vn_command_vkCreateComputePipelines, vn_command_vkCreateDescriptorPool,
-    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDescriptorUpdateTemplate,
-    vn_command_vkCreateDevice, vn_command_vkCreateEvent, vn_command_vkCreateFence,
-    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
-    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCmdSetStencilWriteMask, vn_command_vkCmdSetTessellationDomainOriginEXT,
+    vn_command_vkCmdSetVertexInputEXT, vn_command_vkCmdSetViewport,
+    vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents,
+    vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2,
+    vn_command_vkCopyImageToImage, vn_command_vkCopyImageToMemoryMESA,
+    vn_command_vkCopyMemoryToImageMESA, vn_command_vkCreateBuffer, vn_command_vkCreateBufferView,
+    vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
+    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
+    vn_command_vkCreateDescriptorUpdateTemplate, vn_command_vkCreateDevice,
+    vn_command_vkCreateEvent, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
+    vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
+    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
     vn_command_vkCreateRenderPass2, vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
     vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
@@ -5592,6 +5603,201 @@ impl Commands for Handlers<'_> {
             args.counterOffset,
             args.vertexStride,
         );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetTessellationDomainOriginEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetTessellationDomainOriginEXT<'_>,
+    ) {
+        let done =
+            self.driver.cmd_set_tessellation_domain_origin(args.commandBuffer, args.domainOrigin);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDepthClampEnableEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetDepthClampEnableEXT<'_>,
+    ) {
+        let done =
+            self.driver.cmd_set_depth_clamp_enable(args.commandBuffer, args.depthClampEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetPolygonModeEXT(&mut self, args: &mut vn_command_vkCmdSetPolygonModeEXT<'_>) {
+        let done = self.driver.cmd_set_polygon_mode(args.commandBuffer, args.polygonMode);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetRasterizationSamplesEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetRasterizationSamplesEXT<'_>,
+    ) {
+        let done = self
+            .driver
+            .cmd_set_rasterization_samples(args.commandBuffer, args.rasterizationSamples);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetAlphaToCoverageEnableEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetAlphaToCoverageEnableEXT<'_>,
+    ) {
+        let done = self
+            .driver
+            .cmd_set_alpha_to_coverage_enable(args.commandBuffer, args.alphaToCoverageEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetAlphaToOneEnableEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetAlphaToOneEnableEXT<'_>,
+    ) {
+        let done =
+            self.driver.cmd_set_alpha_to_one_enable(args.commandBuffer, args.alphaToOneEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetLogicOpEnableEXT(&mut self, args: &mut vn_command_vkCmdSetLogicOpEnableEXT<'_>) {
+        let done = self.driver.cmd_set_logic_op_enable(args.commandBuffer, args.logicOpEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetRasterizationStreamEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetRasterizationStreamEXT<'_>,
+    ) {
+        let done =
+            self.driver.cmd_set_rasterization_stream(args.commandBuffer, args.rasterizationStream);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetConservativeRasterizationModeEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetConservativeRasterizationModeEXT<'_>,
+    ) {
+        let done = self.driver.cmd_set_conservative_rasterization_mode(
+            args.commandBuffer,
+            args.conservativeRasterizationMode,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetExtraPrimitiveOverestimationSizeEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetExtraPrimitiveOverestimationSizeEXT<'_>,
+    ) {
+        let done = self.driver.cmd_set_extra_primitive_overestimation_size(
+            args.commandBuffer,
+            args.extraPrimitiveOverestimationSize,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDepthClipEnableEXT(&mut self, args: &mut vn_command_vkCmdSetDepthClipEnableEXT<'_>) {
+        let done = self.driver.cmd_set_depth_clip_enable(args.commandBuffer, args.depthClipEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetSampleLocationsEnableEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetSampleLocationsEnableEXT<'_>,
+    ) {
+        let done = self
+            .driver
+            .cmd_set_sample_locations_enable(args.commandBuffer, args.sampleLocationsEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetProvokingVertexModeEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetProvokingVertexModeEXT<'_>,
+    ) {
+        let done =
+            self.driver.cmd_set_provoking_vertex_mode(args.commandBuffer, args.provokingVertexMode);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetLineRasterizationModeEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetLineRasterizationModeEXT<'_>,
+    ) {
+        let done = self
+            .driver
+            .cmd_set_line_rasterization_mode(args.commandBuffer, args.lineRasterizationMode);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetLineStippleEnableEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetLineStippleEnableEXT<'_>,
+    ) {
+        let done =
+            self.driver.cmd_set_line_stipple_enable(args.commandBuffer, args.stippledLineEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDepthClipNegativeOneToOneEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetDepthClipNegativeOneToOneEXT<'_>,
+    ) {
+        let done = self
+            .driver
+            .cmd_set_depth_clip_negative_one_to_one(args.commandBuffer, args.negativeOneToOne);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetColorBlendEnableEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetColorBlendEnableEXT<'_>,
+    ) {
+        let done = self.driver.cmd_set_color_blend_enable(
+            args.commandBuffer,
+            args.firstAttachment,
+            args.pColorBlendEnables(),
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetColorBlendEquationEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetColorBlendEquationEXT<'_>,
+    ) {
+        let done = self.driver.cmd_set_color_blend_equation(
+            args.commandBuffer,
+            args.firstAttachment,
+            args.pColorBlendEquations(),
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetColorWriteMaskEXT(&mut self, args: &mut vn_command_vkCmdSetColorWriteMaskEXT<'_>) {
+        let done = self.driver.cmd_set_color_write_mask(
+            args.commandBuffer,
+            args.firstAttachment,
+            args.pColorWriteMasks(),
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetColorBlendAdvancedEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetColorBlendAdvancedEXT<'_>,
+    ) {
+        let done = self.driver.cmd_set_color_blend_advanced(
+            args.commandBuffer,
+            args.firstAttachment,
+            args.pColorBlendAdvanced(),
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetSampleMaskEXT(&mut self, args: &mut vn_command_vkCmdSetSampleMaskEXT<'_>) {
+        let Some(mask) = args.pSampleMask() else {
+            self.reject("set a sample mask without sending one");
+            return;
+        };
+        let done = self.driver.cmd_set_sample_mask(args.commandBuffer, args.samples(), mask);
         self.recorded(done);
     }
 
@@ -18491,6 +18697,544 @@ mod tests {
         });
         assert!(h.rejected().is_some(), "an unknown command buffer is refused");
         assert_eq!(SAW.with_borrow(Vec::len), 4, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// Every scalar setter of `VK_EXT_extended_dynamic_state3` hands the driver the value the
+    /// guest sent. Each value differs from its type's default, so a dropped argument reads back
+    /// wrong.
+    #[test]
+    fn the_extended_dynamic_state3_scalar_setters_hand_the_driver_the_guests_values() {
+        use super::super::proto::types::{
+            VkBool32, VkCommandBuffer, VkCommandPool, VkConservativeRasterizationModeEXT, VkDevice,
+            VkLineRasterizationMode, VkPolygonMode, VkProvokingVertexModeEXT,
+            VkSampleCountFlagBits, VkTessellationDomainOrigin,
+            vn_command_vkCmdSetAlphaToCoverageEnableEXT, vn_command_vkCmdSetAlphaToOneEnableEXT,
+            vn_command_vkCmdSetConservativeRasterizationModeEXT,
+            vn_command_vkCmdSetDepthClampEnableEXT, vn_command_vkCmdSetDepthClipEnableEXT,
+            vn_command_vkCmdSetDepthClipNegativeOneToOneEXT,
+            vn_command_vkCmdSetExtraPrimitiveOverestimationSizeEXT,
+            vn_command_vkCmdSetLineRasterizationModeEXT, vn_command_vkCmdSetLineStippleEnableEXT,
+            vn_command_vkCmdSetLogicOpEnableEXT, vn_command_vkCmdSetPolygonModeEXT,
+            vn_command_vkCmdSetProvokingVertexModeEXT, vn_command_vkCmdSetRasterizationSamplesEXT,
+            vn_command_vkCmdSetRasterizationStreamEXT, vn_command_vkCmdSetSampleLocationsEnableEXT,
+            vn_command_vkCmdSetTessellationDomainOriginEXT,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Each call, as its name and what it was handed: a struct's address, or the scalars.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<u64>)>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn cmd_set_tessellation_domain_origin_e_x_t(
+            _: VkCommandBuffer,
+            domain_origin: VkTessellationDomainOrigin,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetTessellationDomainOriginEXT", vec![domain_origin.0 as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_depth_clamp_enable_e_x_t(
+            _: VkCommandBuffer,
+            depth_clamp_enable: VkBool32,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetDepthClampEnableEXT", vec![depth_clamp_enable.0 as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_polygon_mode_e_x_t(
+            _: VkCommandBuffer,
+            polygon_mode: VkPolygonMode,
+        ) {
+            SAW.with_borrow_mut(|s| s.push(("CmdSetPolygonModeEXT", vec![polygon_mode.0 as u64])));
+        }
+        unsafe extern "C" fn cmd_set_rasterization_samples_e_x_t(
+            _: VkCommandBuffer,
+            rasterization_samples: VkSampleCountFlagBits,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetRasterizationSamplesEXT", vec![rasterization_samples.0 as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_alpha_to_coverage_enable_e_x_t(
+            _: VkCommandBuffer,
+            alpha_to_coverage_enable: VkBool32,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetAlphaToCoverageEnableEXT", vec![alpha_to_coverage_enable.0 as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_alpha_to_one_enable_e_x_t(
+            _: VkCommandBuffer,
+            alpha_to_one_enable: VkBool32,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetAlphaToOneEnableEXT", vec![alpha_to_one_enable.0 as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_logic_op_enable_e_x_t(
+            _: VkCommandBuffer,
+            logic_op_enable: VkBool32,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetLogicOpEnableEXT", vec![logic_op_enable.0 as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_rasterization_stream_e_x_t(
+            _: VkCommandBuffer,
+            rasterization_stream: u32,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetRasterizationStreamEXT", vec![rasterization_stream.into()]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_conservative_rasterization_mode_e_x_t(
+            _: VkCommandBuffer,
+            conservative_rasterization_mode: VkConservativeRasterizationModeEXT,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push((
+                    "CmdSetConservativeRasterizationModeEXT",
+                    vec![conservative_rasterization_mode.0 as u64],
+                ))
+            });
+        }
+        unsafe extern "C" fn cmd_set_extra_primitive_overestimation_size_e_x_t(
+            _: VkCommandBuffer,
+            extra_primitive_overestimation_size: f32,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push((
+                    "CmdSetExtraPrimitiveOverestimationSizeEXT",
+                    vec![extra_primitive_overestimation_size.to_bits().into()],
+                ))
+            });
+        }
+        unsafe extern "C" fn cmd_set_depth_clip_enable_e_x_t(
+            _: VkCommandBuffer,
+            depth_clip_enable: VkBool32,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetDepthClipEnableEXT", vec![depth_clip_enable.0 as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_sample_locations_enable_e_x_t(
+            _: VkCommandBuffer,
+            sample_locations_enable: VkBool32,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetSampleLocationsEnableEXT", vec![sample_locations_enable.0 as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_provoking_vertex_mode_e_x_t(
+            _: VkCommandBuffer,
+            provoking_vertex_mode: VkProvokingVertexModeEXT,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetProvokingVertexModeEXT", vec![provoking_vertex_mode.0 as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_line_rasterization_mode_e_x_t(
+            _: VkCommandBuffer,
+            line_rasterization_mode: VkLineRasterizationMode,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetLineRasterizationModeEXT", vec![line_rasterization_mode.0 as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_line_stipple_enable_e_x_t(
+            _: VkCommandBuffer,
+            stippled_line_enable: VkBool32,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetLineStippleEnableEXT", vec![stippled_line_enable.0 as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_depth_clip_negative_one_to_one_e_x_t(
+            _: VkCommandBuffer,
+            negative_one_to_one: VkBool32,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetDepthClipNegativeOneToOneEXT", vec![negative_one_to_one.0 as u64]))
+            });
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetTessellationDomainOriginEXT(cmd_set_tessellation_domain_origin_e_x_t);
+        fns.plant_vkCmdSetDepthClampEnableEXT(cmd_set_depth_clamp_enable_e_x_t);
+        fns.plant_vkCmdSetPolygonModeEXT(cmd_set_polygon_mode_e_x_t);
+        fns.plant_vkCmdSetRasterizationSamplesEXT(cmd_set_rasterization_samples_e_x_t);
+        fns.plant_vkCmdSetAlphaToCoverageEnableEXT(cmd_set_alpha_to_coverage_enable_e_x_t);
+        fns.plant_vkCmdSetAlphaToOneEnableEXT(cmd_set_alpha_to_one_enable_e_x_t);
+        fns.plant_vkCmdSetLogicOpEnableEXT(cmd_set_logic_op_enable_e_x_t);
+        fns.plant_vkCmdSetRasterizationStreamEXT(cmd_set_rasterization_stream_e_x_t);
+        fns.plant_vkCmdSetConservativeRasterizationModeEXT(
+            cmd_set_conservative_rasterization_mode_e_x_t,
+        );
+        fns.plant_vkCmdSetExtraPrimitiveOverestimationSizeEXT(
+            cmd_set_extra_primitive_overestimation_size_e_x_t,
+        );
+        fns.plant_vkCmdSetDepthClipEnableEXT(cmd_set_depth_clip_enable_e_x_t);
+        fns.plant_vkCmdSetSampleLocationsEnableEXT(cmd_set_sample_locations_enable_e_x_t);
+        fns.plant_vkCmdSetProvokingVertexModeEXT(cmd_set_provoking_vertex_mode_e_x_t);
+        fns.plant_vkCmdSetLineRasterizationModeEXT(cmd_set_line_rasterization_mode_e_x_t);
+        fns.plant_vkCmdSetLineStippleEnableEXT(cmd_set_line_stipple_enable_e_x_t);
+        fns.plant_vkCmdSetDepthClipNegativeOneToOneEXT(
+            cmd_set_depth_clip_negative_one_to_one_e_x_t,
+        );
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        h.vkCmdSetTessellationDomainOriginEXT(
+            &mut vn_command_vkCmdSetTessellationDomainOriginEXT {
+                commandBuffer: cb,
+                domainOrigin: VkTessellationDomainOrigin(1),
+                ..Default::default()
+            },
+        );
+        h.vkCmdSetDepthClampEnableEXT(&mut vn_command_vkCmdSetDepthClampEnableEXT {
+            commandBuffer: cb,
+            depthClampEnable: VkBool32(1),
+            ..Default::default()
+        });
+        h.vkCmdSetPolygonModeEXT(&mut vn_command_vkCmdSetPolygonModeEXT {
+            commandBuffer: cb,
+            polygonMode: VkPolygonMode(2),
+            ..Default::default()
+        });
+        h.vkCmdSetRasterizationSamplesEXT(&mut vn_command_vkCmdSetRasterizationSamplesEXT {
+            commandBuffer: cb,
+            rasterizationSamples: VkSampleCountFlagBits(4),
+            ..Default::default()
+        });
+        h.vkCmdSetAlphaToCoverageEnableEXT(&mut vn_command_vkCmdSetAlphaToCoverageEnableEXT {
+            commandBuffer: cb,
+            alphaToCoverageEnable: VkBool32(1),
+            ..Default::default()
+        });
+        h.vkCmdSetAlphaToOneEnableEXT(&mut vn_command_vkCmdSetAlphaToOneEnableEXT {
+            commandBuffer: cb,
+            alphaToOneEnable: VkBool32(1),
+            ..Default::default()
+        });
+        h.vkCmdSetLogicOpEnableEXT(&mut vn_command_vkCmdSetLogicOpEnableEXT {
+            commandBuffer: cb,
+            logicOpEnable: VkBool32(1),
+            ..Default::default()
+        });
+        h.vkCmdSetRasterizationStreamEXT(&mut vn_command_vkCmdSetRasterizationStreamEXT {
+            commandBuffer: cb,
+            rasterizationStream: 3,
+            ..Default::default()
+        });
+        h.vkCmdSetConservativeRasterizationModeEXT(
+            &mut vn_command_vkCmdSetConservativeRasterizationModeEXT {
+                commandBuffer: cb,
+                conservativeRasterizationMode: VkConservativeRasterizationModeEXT(2),
+                ..Default::default()
+            },
+        );
+        h.vkCmdSetExtraPrimitiveOverestimationSizeEXT(
+            &mut vn_command_vkCmdSetExtraPrimitiveOverestimationSizeEXT {
+                commandBuffer: cb,
+                extraPrimitiveOverestimationSize: 0.75,
+                ..Default::default()
+            },
+        );
+        h.vkCmdSetDepthClipEnableEXT(&mut vn_command_vkCmdSetDepthClipEnableEXT {
+            commandBuffer: cb,
+            depthClipEnable: VkBool32(1),
+            ..Default::default()
+        });
+        h.vkCmdSetSampleLocationsEnableEXT(&mut vn_command_vkCmdSetSampleLocationsEnableEXT {
+            commandBuffer: cb,
+            sampleLocationsEnable: VkBool32(1),
+            ..Default::default()
+        });
+        h.vkCmdSetProvokingVertexModeEXT(&mut vn_command_vkCmdSetProvokingVertexModeEXT {
+            commandBuffer: cb,
+            provokingVertexMode: VkProvokingVertexModeEXT(1),
+            ..Default::default()
+        });
+        h.vkCmdSetLineRasterizationModeEXT(&mut vn_command_vkCmdSetLineRasterizationModeEXT {
+            commandBuffer: cb,
+            lineRasterizationMode: VkLineRasterizationMode(3),
+            ..Default::default()
+        });
+        h.vkCmdSetLineStippleEnableEXT(&mut vn_command_vkCmdSetLineStippleEnableEXT {
+            commandBuffer: cb,
+            stippledLineEnable: VkBool32(1),
+            ..Default::default()
+        });
+        h.vkCmdSetDepthClipNegativeOneToOneEXT(
+            &mut vn_command_vkCmdSetDepthClipNegativeOneToOneEXT {
+                commandBuffer: cb,
+                negativeOneToOne: VkBool32(1),
+                ..Default::default()
+            },
+        );
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<u64>); 16] = [
+                ("CmdSetTessellationDomainOriginEXT", vec![1]),
+                ("CmdSetDepthClampEnableEXT", vec![1]),
+                ("CmdSetPolygonModeEXT", vec![2]),
+                ("CmdSetRasterizationSamplesEXT", vec![4]),
+                ("CmdSetAlphaToCoverageEnableEXT", vec![1]),
+                ("CmdSetAlphaToOneEnableEXT", vec![1]),
+                ("CmdSetLogicOpEnableEXT", vec![1]),
+                ("CmdSetRasterizationStreamEXT", vec![3]),
+                ("CmdSetConservativeRasterizationModeEXT", vec![2]),
+                ("CmdSetExtraPrimitiveOverestimationSizeEXT", vec![0.75f32.to_bits().into()]),
+                ("CmdSetDepthClipEnableEXT", vec![1]),
+                ("CmdSetSampleLocationsEnableEXT", vec![1]),
+                ("CmdSetProvokingVertexModeEXT", vec![1]),
+                ("CmdSetLineRasterizationModeEXT", vec![3]),
+                ("CmdSetLineStippleEnableEXT", vec![1]),
+                ("CmdSetDepthClipNegativeOneToOneEXT", vec![1]),
+            ];
+            assert_eq!(*s, want, "each command once, handed what the guest sent");
+        });
+
+        // A command buffer the driver has no pool record for has no device to record through.
+        h.vkCmdSetTessellationDomainOriginEXT(
+            &mut vn_command_vkCmdSetTessellationDomainOriginEXT {
+                commandBuffer: VkCommandBuffer::forged(99),
+                ..Default::default()
+            },
+        );
+        assert!(h.rejected().is_some(), "an unknown command buffer is refused");
+        assert_eq!(SAW.with_borrow(Vec::len), 16, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The array setters of `VK_EXT_extended_dynamic_state3` hand the driver every element the
+    /// guest sent, from the guest's first attachment, and the sample mask as many words as its
+    /// sample count needs.
+    ///
+    /// Each array has a different length, so a count taken from the wrong place reads back
+    /// wrong. A sample mask command with no mask is refused.
+    #[test]
+    fn the_extended_dynamic_state3_array_setters_hand_the_driver_every_element() {
+        use super::super::proto::types::{
+            VkBlendFactor, VkBlendOp, VkBlendOverlapEXT, VkBool32, VkColorBlendAdvancedEXT,
+            VkColorBlendEquationEXT, VkColorComponentFlags, VkCommandBuffer, VkCommandPool,
+            VkDevice, VkSampleCountFlagBits, VkSampleMask,
+            vn_command_vkCmdSetColorBlendAdvancedEXT, vn_command_vkCmdSetColorBlendEnableEXT,
+            vn_command_vkCmdSetColorBlendEquationEXT, vn_command_vkCmdSetColorWriteMaskEXT,
+            vn_command_vkCmdSetSampleMaskEXT,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Each call, as its name and what it was handed: the first attachment, then one number
+        // per element.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<u64>)>> = const { RefCell::new(Vec::new()) };
+        }
+        fn saw<T>(what: &'static str, first: u32, n: u32, p: *const T, v: impl Fn(&T) -> u64) {
+            // SAFETY: the wrapper passes each array with its own length.
+            let a = unsafe { core::slice::from_raw_parts(p, n as usize) };
+            let mut got = vec![u64::from(first)];
+            got.extend(a.iter().map(v));
+            SAW.with_borrow_mut(|s| s.push((what, got)));
+        }
+
+        unsafe extern "C" fn enable(_: VkCommandBuffer, first: u32, n: u32, p: *const VkBool32) {
+            saw("enable", first, n, p, |b| b.0.into());
+        }
+        unsafe extern "C" fn equation(
+            _: VkCommandBuffer,
+            first: u32,
+            n: u32,
+            p: *const VkColorBlendEquationEXT,
+        ) {
+            saw("equation", first, n, p, |e| e.alphaBlendOp.0 as u64);
+        }
+        unsafe extern "C" fn mask(
+            _: VkCommandBuffer,
+            first: u32,
+            n: u32,
+            p: *const VkColorComponentFlags,
+        ) {
+            saw("mask", first, n, p, |m| m.0.into());
+        }
+        unsafe extern "C" fn advanced(
+            _: VkCommandBuffer,
+            first: u32,
+            n: u32,
+            p: *const VkColorBlendAdvancedEXT,
+        ) {
+            saw("advanced", first, n, p, |a| a.advancedBlendOp.0 as u64);
+        }
+        unsafe extern "C" fn sample_mask(
+            _: VkCommandBuffer,
+            samples: VkSampleCountFlagBits,
+            p: *const VkSampleMask,
+        ) {
+            // The words 64 samples need: the driver reads this many whatever it was handed.
+            saw("sample_mask", samples.0 as u32, 2, p, |m| m.0.into());
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetColorBlendEnableEXT(enable);
+        fns.plant_vkCmdSetColorBlendEquationEXT(equation);
+        fns.plant_vkCmdSetColorWriteMaskEXT(mask);
+        fns.plant_vkCmdSetColorBlendAdvancedEXT(advanced);
+        fns.plant_vkCmdSetSampleMaskEXT(sample_mask);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        let enables = [VkBool32(1)];
+        let mut args = vn_command_vkCmdSetColorBlendEnableEXT::default();
+        args.commandBuffer = cb;
+        args.firstAttachment = 1;
+        args.plant_pColorBlendEnables(&enables);
+        h.vkCmdSetColorBlendEnableEXT(&mut args);
+
+        let eq = |op| VkColorBlendEquationEXT {
+            srcColorBlendFactor: VkBlendFactor(1),
+            dstColorBlendFactor: VkBlendFactor(0),
+            colorBlendOp: VkBlendOp(0),
+            srcAlphaBlendFactor: VkBlendFactor(1),
+            dstAlphaBlendFactor: VkBlendFactor(0),
+            alphaBlendOp: VkBlendOp(op),
+        };
+        let equations = [eq(1), eq(2)];
+        let mut args = vn_command_vkCmdSetColorBlendEquationEXT::default();
+        args.commandBuffer = cb;
+        args.firstAttachment = 2;
+        args.plant_pColorBlendEquations(&equations);
+        h.vkCmdSetColorBlendEquationEXT(&mut args);
+
+        let masks =
+            [VkColorComponentFlags(0xf), VkColorComponentFlags(0x1), VkColorComponentFlags(0x8)];
+        let mut args = vn_command_vkCmdSetColorWriteMaskEXT::default();
+        args.commandBuffer = cb;
+        args.firstAttachment = 3;
+        args.plant_pColorWriteMasks(&masks);
+        h.vkCmdSetColorWriteMaskEXT(&mut args);
+
+        let adv = |op| VkColorBlendAdvancedEXT {
+            advancedBlendOp: VkBlendOp(op),
+            srcPremultiplied: VkBool32(1),
+            dstPremultiplied: VkBool32(1),
+            blendOverlap: VkBlendOverlapEXT(0),
+            clampResults: VkBool32(0),
+        };
+        let advanced_ops = [adv(1000148000), adv(1000148001), adv(1000148002), adv(1000148003)];
+        let mut args = vn_command_vkCmdSetColorBlendAdvancedEXT::default();
+        args.commandBuffer = cb;
+        args.firstAttachment = 4;
+        args.plant_pColorBlendAdvanced(&advanced_ops);
+        h.vkCmdSetColorBlendAdvancedEXT(&mut args);
+
+        let words = [VkSampleMask(0xf0), VkSampleMask(0x0f)];
+        let mut args = vn_command_vkCmdSetSampleMaskEXT::default();
+        args.commandBuffer = cb;
+        args.plant_samples(VkSampleCountFlagBits(64));
+        args.plant_pSampleMask(&words);
+        h.vkCmdSetSampleMaskEXT(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<u64>); 5] = [
+                ("enable", vec![1, 1]),
+                ("equation", vec![2, 1, 2]),
+                ("mask", vec![3, 0xf, 0x1, 0x8]),
+                ("advanced", vec![4, 1000148000, 1000148001, 1000148002, 1000148003]),
+                ("sample_mask", vec![64, 0xf0, 0x0f]),
+            ];
+            assert_eq!(*s, want, "each command once, handed every element the guest sent");
+        });
+
+        let mut args = vn_command_vkCmdSetSampleMaskEXT::default();
+        args.commandBuffer = cb;
+        args.plant_samples(VkSampleCountFlagBits(64));
+        h.vkCmdSetSampleMaskEXT(&mut args);
+        assert!(h.rejected().is_some(), "a sample mask command with no mask is refused");
+        assert_eq!(SAW.with_borrow(Vec::len), 5, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();

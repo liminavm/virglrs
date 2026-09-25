@@ -25,17 +25,18 @@ use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBindDescriptorSetsInfo,
     VkBlitImageInfo2, VkBool32, VkBuffer, VkBufferCopy, VkBufferImageCopy, VkBufferMemoryBarrier,
     VkBufferView, VkCalibratedTimestampInfoKHR, VkClearAttachment, VkClearColorValue,
-    VkClearDepthStencilValue, VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo,
-    VkCommandBufferResetFlags, VkCommandPool, VkCompareOp, VkConditionalRenderingBeginInfoEXT,
-    VkCopyBufferInfo2, VkCopyBufferToImageInfo2, VkCopyDescriptorSet, VkCopyImageInfo2,
-    VkCopyImageToBufferInfo2, VkCopyImageToImageInfo, VkCopyImageToMemoryInfo,
-    VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA,
-    VkCullModeFlags, VkDependencyFlags, VkDependencyInfo, VkDepthBiasInfoEXT, VkDescriptorPool,
-    VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
-    VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA,
-    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties, VkExtent2D,
-    VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
-    VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
+    VkClearDepthStencilValue, VkClearRect, VkColorBlendAdvancedEXT, VkColorBlendEquationEXT,
+    VkColorComponentFlags, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
+    VkCommandPool, VkCompareOp, VkConditionalRenderingBeginInfoEXT,
+    VkConservativeRasterizationModeEXT, VkCopyBufferInfo2, VkCopyBufferToImageInfo2,
+    VkCopyDescriptorSet, VkCopyImageInfo2, VkCopyImageToBufferInfo2, VkCopyImageToImageInfo,
+    VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo,
+    VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags, VkDependencyInfo,
+    VkDepthBiasInfoEXT, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
+    VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
+    VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo,
+    VkExtensionProperties, VkExtent2D, VkExternalFenceHandleTypeFlagBits,
+    VkExternalImageFormatProperties, VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
     VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceCreateFlags, VkFenceCreateInfo,
@@ -45,26 +46,28 @@ use super::proto::types::{
     VkImageFormatProperties2, VkImageLayout, VkImageMemoryBarrier, VkImageResolve,
     VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy, VkImageType, VkImageUsageFlags,
     VkImageView, VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA,
-    VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance, VkInstanceCreateInfo, VkLogicOp,
-    VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags,
-    VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA,
-    VkMemoryToImageCopy, VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT,
-    VkObjectType, VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo,
-    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceMemoryBudgetPropertiesEXT,
-    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
-    VkPipelineLayout, VkPipelineStageFlagBits, VkPipelineStageFlags, VkPipelineStageFlags2,
-    VkPrimitiveTopology, VkPushConstantsInfo, VkPushDescriptorSetInfo, VkQueryControlFlags,
+    VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance, VkInstanceCreateInfo,
+    VkLineRasterizationMode, VkLogicOp, VkMemoryAllocateInfo, VkMemoryBarrier,
+    VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags, VkMemoryPropertyFlagBits,
+    VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy,
+    VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType,
+    VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo, VkPhysicalDeviceImageFormatInfo2,
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties, VkPipeline,
+    VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
+    VkPipelineStageFlags, VkPipelineStageFlags2, VkPolygonMode, VkPrimitiveTopology,
+    VkProvokingVertexModeEXT, VkPushConstantsInfo, VkPushDescriptorSetInfo, VkQueryControlFlags,
     VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType,
     VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingAttachmentLocationInfo,
     VkRenderingInfo, VkRenderingInputAttachmentIndexInfo, VkResolveImageInfo2, VkResult,
-    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampler,
-    VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR,
-    VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType,
-    VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule,
-    VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo,
-    VkSubmitInfo2, VkSubpassBeginInfo, VkSubpassContents, VkSubpassEndInfo,
-    VkTimelineSemaphoreSubmitInfo, VkVertexInputAttributeDescription2EXT,
-    VkVertexInputBindingDescription2EXT, VkViewport, VkWriteDescriptorSet,
+    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampleMask,
+    VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo,
+    VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo,
+    VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags,
+    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
+    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassBeginInfo, VkSubpassContents,
+    VkSubpassEndInfo, VkTessellationDomainOrigin, VkTimelineSemaphoreSubmitInfo,
+    VkVertexInputAttributeDescription2EXT, VkVertexInputBindingDescription2EXT, VkViewport,
+    VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
@@ -5005,6 +5008,281 @@ impl Driver {
         let f = self.recorder(cb)?.try_vkCmdDrawIndirectByteCountEXT()?;
         // SAFETY: as above.
         unsafe { f(cb, instances, first_instance, counter, counter_offset, vertex_offset, stride) };
+        Some(())
+    }
+
+    /// `vkCmdSetTessellationDomainOriginEXT` and the other scalar setters of
+    /// `VK_EXT_extended_dynamic_state3`: one piece of pipeline state each, set at record time
+    /// instead of baked into the pipeline. Each forwards the guest's value as sent.
+    pub fn cmd_set_tessellation_domain_origin(
+        &self,
+        cb: VkCommandBuffer,
+        domain_origin: VkTessellationDomainOrigin,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetTessellationDomainOriginEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, domain_origin) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_depth_clamp_enable(
+        &self,
+        cb: VkCommandBuffer,
+        depth_clamp_enable: VkBool32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetDepthClampEnableEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, depth_clamp_enable) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_polygon_mode(
+        &self,
+        cb: VkCommandBuffer,
+        polygon_mode: VkPolygonMode,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetPolygonModeEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, polygon_mode) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_rasterization_samples(
+        &self,
+        cb: VkCommandBuffer,
+        rasterization_samples: VkSampleCountFlagBits,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetRasterizationSamplesEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, rasterization_samples) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_alpha_to_coverage_enable(
+        &self,
+        cb: VkCommandBuffer,
+        alpha_to_coverage_enable: VkBool32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetAlphaToCoverageEnableEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, alpha_to_coverage_enable) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_alpha_to_one_enable(
+        &self,
+        cb: VkCommandBuffer,
+        alpha_to_one_enable: VkBool32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetAlphaToOneEnableEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, alpha_to_one_enable) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_logic_op_enable(
+        &self,
+        cb: VkCommandBuffer,
+        logic_op_enable: VkBool32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetLogicOpEnableEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, logic_op_enable) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_rasterization_stream(
+        &self,
+        cb: VkCommandBuffer,
+        rasterization_stream: u32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetRasterizationStreamEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, rasterization_stream) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_conservative_rasterization_mode(
+        &self,
+        cb: VkCommandBuffer,
+        conservative_rasterization_mode: VkConservativeRasterizationModeEXT,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetConservativeRasterizationModeEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, conservative_rasterization_mode) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_extra_primitive_overestimation_size(
+        &self,
+        cb: VkCommandBuffer,
+        extra_primitive_overestimation_size: f32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetExtraPrimitiveOverestimationSizeEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, extra_primitive_overestimation_size) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_depth_clip_enable(
+        &self,
+        cb: VkCommandBuffer,
+        depth_clip_enable: VkBool32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetDepthClipEnableEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, depth_clip_enable) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_sample_locations_enable(
+        &self,
+        cb: VkCommandBuffer,
+        sample_locations_enable: VkBool32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetSampleLocationsEnableEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, sample_locations_enable) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_provoking_vertex_mode(
+        &self,
+        cb: VkCommandBuffer,
+        provoking_vertex_mode: VkProvokingVertexModeEXT,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetProvokingVertexModeEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, provoking_vertex_mode) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_line_rasterization_mode(
+        &self,
+        cb: VkCommandBuffer,
+        line_rasterization_mode: VkLineRasterizationMode,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetLineRasterizationModeEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, line_rasterization_mode) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_line_stipple_enable(
+        &self,
+        cb: VkCommandBuffer,
+        stippled_line_enable: VkBool32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetLineStippleEnableEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, stippled_line_enable) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_tessellation_domain_origin`].
+    pub fn cmd_set_depth_clip_negative_one_to_one(
+        &self,
+        cb: VkCommandBuffer,
+        negative_one_to_one: VkBool32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetDepthClipNegativeOneToOneEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, negative_one_to_one) };
+        Some(())
+    }
+
+    /// The four setters of `VK_EXT_extended_dynamic_state3` that take one value per color
+    /// attachment, from `first` on. The count is the slice's own length; none of the element
+    /// types holds a pointer, so a slice of them is all the driver reads.
+    fn cmd_set_per_attachment<T>(
+        &self,
+        cb: VkCommandBuffer,
+        first: u32,
+        values: &[T],
+        pick: impl FnOnce(
+            &DeviceFns,
+        ) -> Option<unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const T)>,
+    ) -> Option<()> {
+        let f = self.recorder(cb).and_then(pick)?;
+        // SAFETY: as above; the count is the slice's own length.
+        unsafe { f(cb, first, values.len() as u32, values.as_ptr()) };
+        Some(())
+    }
+
+    /// `vkCmdSetColorBlendEnableEXT`: blending on or off, per attachment. See [`Self::cmd_set_per_attachment`].
+    pub fn cmd_set_color_blend_enable(
+        &self,
+        cb: VkCommandBuffer,
+        first: u32,
+        enables: &[VkBool32],
+    ) -> Option<()> {
+        self.cmd_set_per_attachment(cb, first, enables, |d| d.try_vkCmdSetColorBlendEnableEXT())
+    }
+
+    /// `vkCmdSetColorBlendEquationEXT`: the blend factors and operations, per attachment. See [`Self::cmd_set_per_attachment`].
+    pub fn cmd_set_color_blend_equation(
+        &self,
+        cb: VkCommandBuffer,
+        first: u32,
+        equations: &[VkColorBlendEquationEXT],
+    ) -> Option<()> {
+        self.cmd_set_per_attachment(cb, first, equations, |d| d.try_vkCmdSetColorBlendEquationEXT())
+    }
+
+    /// `vkCmdSetColorWriteMaskEXT`: which components are written, per attachment. See [`Self::cmd_set_per_attachment`].
+    pub fn cmd_set_color_write_mask(
+        &self,
+        cb: VkCommandBuffer,
+        first: u32,
+        masks: &[VkColorComponentFlags],
+    ) -> Option<()> {
+        self.cmd_set_per_attachment(cb, first, masks, |d| d.try_vkCmdSetColorWriteMaskEXT())
+    }
+
+    /// `vkCmdSetColorBlendAdvancedEXT`: the advanced blend operation, per attachment. See [`Self::cmd_set_per_attachment`].
+    pub fn cmd_set_color_blend_advanced(
+        &self,
+        cb: VkCommandBuffer,
+        first: u32,
+        advanced: &[VkColorBlendAdvancedEXT],
+    ) -> Option<()> {
+        self.cmd_set_per_attachment(cb, first, advanced, |d| d.try_vkCmdSetColorBlendAdvancedEXT())
+    }
+
+    /// `vkCmdSetSampleMaskEXT`: which samples a fragment may cover, one bit per sample in words
+    /// of 32.
+    ///
+    /// The mask's length is not sent; it is `samples` rounded up to words, which is how the
+    /// decoder sized it, and the driver reads that many. The assert holds the two to the same
+    /// arithmetic.
+    pub fn cmd_set_sample_mask(
+        &self,
+        cb: VkCommandBuffer,
+        samples: VkSampleCountFlagBits,
+        mask: &[VkSampleMask],
+    ) -> Option<()> {
+        assert_eq!(
+            mask.len() as i128,
+            (i128::from(samples.0) + 31) / 32,
+            "the mask is as many words as the samples need"
+        );
+        let f = self.recorder(cb)?.try_vkCmdSetSampleMaskEXT()?;
+        // SAFETY: as above; `mask` is the length the driver reads for `samples`.
+        unsafe { f(cb, samples, mask.as_ptr()) };
         Some(())
     }
 

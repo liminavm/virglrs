@@ -2292,6 +2292,20 @@ SABOTAGES = [
         """return a""",
         'a_computed_length_does_not_overflow_on_the_guests_number',
     ),
+    (
+        'eds3-overestimation-size-dropped',
+        'src/venus/driver.rs',
+        """unsafe { f(cb, extra_primitive_overestimation_size) };""",
+        """unsafe { f(cb, 0.0) };""",
+        'the_extended_dynamic_state3_scalar_setters_hand_the_driver_the_guests_values',
+    ),
+    (
+        'eds3-per-attachment-first-dropped',
+        'src/venus/driver.rs',
+        """unsafe { f(cb, first, values.len() as u32, values.as_ptr()) };""",
+        """unsafe { f(cb, 0, values.len() as u32, values.as_ptr()) };""",
+        'the_extended_dynamic_state3_array_setters_hand_the_driver_every_element',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
