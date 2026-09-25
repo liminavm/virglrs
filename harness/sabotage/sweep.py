@@ -2224,6 +2224,13 @@ SABOTAGES = [
         """        let done = Some(()).filter(|_| info.get().sampleLocationsCount != u32::MAX);""",
         'sample_locations_hand_the_driver_the_guests_struct',
     ),
+    (
+        'vkCmdSetRenderingInputAttachmentIndices is recorded as nothing',
+        'src/venus/context.rs',
+        """        let done = self.driver.cmd_set_rendering_input_attachment_indices(args.commandBuffer, info);""",
+        """        let done = Some(()).filter(|_| info.get().colorAttachmentCount != u32::MAX);""",
+        'the_rendering_location_setters_hand_the_driver_the_guests_structs',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

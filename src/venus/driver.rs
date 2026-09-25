@@ -54,7 +54,8 @@ use super::proto::types::{
     VkPipelineStageFlags, VkPipelineStageFlags2, VkPrimitiveTopology, VkPushConstantsInfo,
     VkPushDescriptorSetInfo, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
     VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
-    VkRenderPassBeginInfo, VkRenderingInfo, VkResolveImageInfo2, VkResult, VkRingMonitorInfoMESA,
+    VkRenderPassBeginInfo, VkRenderingAttachmentLocationInfo, VkRenderingInfo,
+    VkRenderingInputAttachmentIndexInfo, VkResolveImageInfo2, VkResult, VkRingMonitorInfoMESA,
     VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampler, VkSamplerYcbcrConversion,
     VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
     VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
@@ -4805,6 +4806,32 @@ impl Driver {
         info: cs::Decoded<'_, VkSampleLocationsInfoEXT>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdSetSampleLocationsEXT()?;
+        // SAFETY: as above; `info` is a struct the decoder built, live for the call.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// `vkCmdSetRenderingAttachmentLocations` and `vkCmdSetRenderingInputAttachmentIndices`, core
+    /// in 1.4 from `VK_KHR_dynamic_rendering_local_read`: each remaps a dynamic rendering's
+    /// attachments through a struct carrying its own arrays, so each is a forward of that struct.
+    pub fn cmd_set_rendering_attachment_locations(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkRenderingAttachmentLocationInfo>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetRenderingAttachmentLocations()?;
+        // SAFETY: as above; `info` is a struct the decoder built, live for the call.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_set_rendering_attachment_locations`].
+    pub fn cmd_set_rendering_input_attachment_indices(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkRenderingInputAttachmentIndexInfo>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetRenderingInputAttachmentIndices()?;
         // SAFETY: as above; `info` is a struct the decoder built, live for the call.
         unsafe { f(cb, info.get()) };
         Some(())

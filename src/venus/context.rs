@@ -68,7 +68,8 @@ use super::proto::types::{
     vn_command_vkCmdSetFrontFace, vn_command_vkCmdSetLineStipple, vn_command_vkCmdSetLineWidth,
     vn_command_vkCmdSetLogicOpEXT, vn_command_vkCmdSetPatchControlPointsEXT,
     vn_command_vkCmdSetPrimitiveRestartEnable, vn_command_vkCmdSetPrimitiveTopology,
-    vn_command_vkCmdSetRasterizerDiscardEnable, vn_command_vkCmdSetSampleLocationsEXT,
+    vn_command_vkCmdSetRasterizerDiscardEnable, vn_command_vkCmdSetRenderingAttachmentLocations,
+    vn_command_vkCmdSetRenderingInputAttachmentIndices, vn_command_vkCmdSetSampleLocationsEXT,
     vn_command_vkCmdSetScissor, vn_command_vkCmdSetScissorWithCount,
     vn_command_vkCmdSetStencilCompareMask, vn_command_vkCmdSetStencilOp,
     vn_command_vkCmdSetStencilReference, vn_command_vkCmdSetStencilTestEnable,
@@ -5435,6 +5436,24 @@ impl Commands for Handlers<'_> {
     fn vkCmdSetSampleLocationsEXT(&mut self, args: &mut vn_command_vkCmdSetSampleLocationsEXT<'_>) {
         let Some(info) = self.names(args.pSampleLocationsInfo) else { return };
         let done = self.driver.cmd_set_sample_locations(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetRenderingAttachmentLocations(
+        &mut self,
+        args: &mut vn_command_vkCmdSetRenderingAttachmentLocations<'_>,
+    ) {
+        let Some(info) = self.names(args.pLocationInfo) else { return };
+        let done = self.driver.cmd_set_rendering_attachment_locations(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetRenderingInputAttachmentIndices(
+        &mut self,
+        args: &mut vn_command_vkCmdSetRenderingInputAttachmentIndices<'_>,
+    ) {
+        let Some(info) = self.names(args.pInputAttachmentIndexInfo) else { return };
+        let done = self.driver.cmd_set_rendering_input_attachment_indices(args.commandBuffer, info);
         self.recorded(done);
     }
 
@@ -17559,6 +17578,129 @@ mod tests {
         });
         assert!(h.rejected().is_some(), "a command with no struct is refused, not forwarded");
         assert_eq!(SAW.with_borrow(Vec::len), 1, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The two local-read remapping commands hand the driver the structs the guest sent.
+    #[test]
+    fn the_rendering_location_setters_hand_the_driver_the_guests_structs() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandPool, VkDevice, VkRenderingAttachmentLocationInfo,
+            VkRenderingInputAttachmentIndexInfo, vn_command_vkCmdSetRenderingAttachmentLocations,
+            vn_command_vkCmdSetRenderingInputAttachmentIndices,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Each call, as its name and what it was handed: a struct's address, or the scalars.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<u64>)>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn cmd_set_rendering_attachment_locations(
+            _: VkCommandBuffer,
+            info: *const VkRenderingAttachmentLocationInfo,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetRenderingAttachmentLocations", vec![info.addr() as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_set_rendering_input_attachment_indices(
+            _: VkCommandBuffer,
+            info: *const VkRenderingInputAttachmentIndexInfo,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetRenderingInputAttachmentIndices", vec![info.addr() as u64]))
+            });
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetRenderingAttachmentLocations(cmd_set_rendering_attachment_locations);
+        fns.plant_vkCmdSetRenderingInputAttachmentIndices(
+            cmd_set_rendering_input_attachment_indices,
+        );
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        let cmd_set_rendering_attachment_locations_info =
+            VkRenderingAttachmentLocationInfo::default();
+        let cmd_set_rendering_input_attachment_indices_info =
+            VkRenderingInputAttachmentIndexInfo::default();
+
+        h.vkCmdSetRenderingAttachmentLocations(
+            &mut vn_command_vkCmdSetRenderingAttachmentLocations {
+                commandBuffer: cb,
+                pLocationInfo: Some(Decoded::planted(&cmd_set_rendering_attachment_locations_info)),
+                ..Default::default()
+            },
+        );
+        h.vkCmdSetRenderingInputAttachmentIndices(
+            &mut vn_command_vkCmdSetRenderingInputAttachmentIndices {
+                commandBuffer: cb,
+                pInputAttachmentIndexInfo: Some(Decoded::planted(
+                    &cmd_set_rendering_input_attachment_indices_info,
+                )),
+                ..Default::default()
+            },
+        );
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<u64>); 2] = [
+                ("CmdSetRenderingAttachmentLocations", vec![(&raw const cmd_set_rendering_attachment_locations_info).addr() as u64]),
+                ("CmdSetRenderingInputAttachmentIndices", vec![(&raw const cmd_set_rendering_input_attachment_indices_info).addr() as u64]),
+            ];
+            assert_eq!(*s, want, "each command once, handed what the guest sent");
+        });
+
+        // A command that names no struct has said nothing to forward.
+        h.vkCmdSetRenderingAttachmentLocations(
+            &mut vn_command_vkCmdSetRenderingAttachmentLocations {
+                commandBuffer: cb,
+                ..Default::default()
+            },
+        );
+        assert!(h.rejected().is_some(), "a command with no struct is refused, not forwarded");
+        assert_eq!(SAW.with_borrow(Vec::len), 2, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
