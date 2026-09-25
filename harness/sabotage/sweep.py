@@ -2199,6 +2199,13 @@ SABOTAGES = [
         """            |d| Some(d.vkDestroyDescriptorUpdateTemplate()),""",
         'descriptor_update_templates_are_made_and_destroyed_through_the_device',
     ),
+    (
+        'vkCmdSetDepthBias2EXT is recorded as nothing',
+        'src/venus/context.rs',
+        """        let done = self.driver.cmd_set_depth_bias2(args.commandBuffer, info);""",
+        """        let done = Some(()).filter(|_| info.get().depthBiasClamp.is_finite() || true);""",
+        'depth_bias2_hands_the_driver_the_guests_struct',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

@@ -91,7 +91,6 @@ vkCmdSetColorBlendEnableEXT                        wanted:extended-dynamic-state
 vkCmdSetColorBlendEquationEXT                      wanted:extended-dynamic-state3
 vkCmdSetColorWriteMaskEXT                          wanted:extended-dynamic-state3
 vkCmdSetConservativeRasterizationModeEXT           wanted:extended-dynamic-state3
-vkCmdSetDepthBias2EXT                              wanted:depth-bias-control
 vkCmdSetDepthClampEnableEXT                        wanted:extended-dynamic-state3
 vkCmdSetDepthClampRangeEXT                         out-of-reach:shader-object
 vkCmdSetDepthClipEnableEXT                         wanted:extended-dynamic-state3

@@ -30,7 +30,7 @@ use super::proto::types::{
     VkCopyBufferToImageInfo2, VkCopyDescriptorSet, VkCopyImageInfo2, VkCopyImageToBufferInfo2,
     VkCopyImageToImageInfo, VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA,
     VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags,
-    VkDependencyInfo, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
+    VkDependencyInfo, VkDepthBiasInfoEXT, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
     VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
     VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo,
     VkExtensionProperties, VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
@@ -4771,6 +4771,19 @@ impl Driver {
         let f = self.recorder(cb)?.try_vkCmdResolveImage2()?;
         // SAFETY: as above; `info` and every array it points at are arena allocations live for
         // the call.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// `vkCmdSetDepthBias2EXT`: the depth bias as a struct, whose chain may say how the constant
+    /// factor is to be read (`VkDepthBiasRepresentationInfoEXT`). A forward of that struct.
+    pub fn cmd_set_depth_bias2(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkDepthBiasInfoEXT>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetDepthBias2EXT()?;
+        // SAFETY: as above; `info` is a struct the decoder built, live for the call.
         unsafe { f(cb, info.get()) };
         Some(())
     }
