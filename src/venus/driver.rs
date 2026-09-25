@@ -2064,7 +2064,7 @@ impl Driver {
             Some(t) => t.initialValue,
             None => 0,
         };
-        let sem = self.create_object(device, |d| d.vkCreateSemaphore(), info, alloc)?;
+        let sem = self.create_object(device, |d| Some(d.vkCreateSemaphore()), info, alloc)?;
         self.semaphores.insert(sem, SemaphoreFacts { kind, requested });
         Ok(sem)
     }
@@ -2360,7 +2360,7 @@ impl Driver {
         info: cs::Decoded<'_, VkQueryPoolCreateInfo>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkQueryPool, VkResult> {
-        let pool = self.create_object(device, |d| d.vkCreateQueryPool(), info, alloc)?;
+        let pool = self.create_object(device, |d| Some(d.vkCreateQueryPool()), info, alloc)?;
         self.query_pools.insert(pool, QueryFacts::of(info.get()));
         Ok(pool)
     }
@@ -3019,22 +3019,30 @@ impl Driver {
         device: VkDevice,
         proc: impl FnOnce(
             &DeviceFns,
-        ) -> unsafe extern "C" fn(
-            VkDevice,
-            *const I,
-            *const VkAllocationCallbacks,
-            *mut T,
-        ) -> VkResult,
+        ) -> Option<
+            unsafe extern "C" fn(
+                VkDevice,
+                *const I,
+                *const VkAllocationCallbacks,
+                *mut T,
+            ) -> VkResult,
+        >,
         info: cs::Decoded<'_, I>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<T, VkResult> {
         let Some(d) = self.devices.get(&device) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
+        // A create later than 1.0 whose entry point this driver does not export: the guest
+        // asked for an object its device cannot make, which is an answer to give it rather
+        // than a call through null or an abort.
+        let Some(create) = proc(&d.fns) else {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        };
         let mut out = T::null();
         // SAFETY: `device` is a handle in this table, `info` and `alloc` are the decoder's arena
         // allocations live for this call, and `out` is a local.
-        let r = unsafe { proc(&d.fns)(device, info.get(), ptr(alloc), &mut out) };
+        let r = unsafe { create(device, info.get(), ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -3049,7 +3057,10 @@ impl Driver {
     pub fn destroy_object<T: Handle>(
         &self,
         device: VkDevice,
-        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks),
+        proc: impl FnOnce(
+            &DeviceFns,
+        )
+            -> Option<unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks)>,
         object: T,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) {
@@ -3060,9 +3071,12 @@ impl Driver {
             // Vulkan makes destroying a null handle a legal no-op, and guests rely on it.
             return;
         }
+        // No entry point to destroy through is no entry point it could have been created
+        // through either, so there is nothing of this kind to destroy.
+        let Some(destroy) = proc(&d.fns) else { return };
         // SAFETY: `device` and `object` are handles this context created, and the generated
         // lifecycle hook removes the id from the object table exactly once, so this runs once.
-        unsafe { proc(&d.fns)(device, object, ptr(alloc)) };
+        unsafe { destroy(device, object, ptr(alloc)) };
     }
 
     /// Allocate a run of objects from a pool: `vkAllocateX(device, info, out)`.
@@ -3483,12 +3497,14 @@ impl Driver {
         device: VkDevice,
         proc: impl FnOnce(
             &DeviceFns,
-        ) -> unsafe extern "C" fn(
-            VkDevice,
-            *const I,
-            *const VkAllocationCallbacks,
-            *mut T,
-        ) -> VkResult,
+        ) -> Option<
+            unsafe extern "C" fn(
+                VkDevice,
+                *const I,
+                *const VkAllocationCallbacks,
+                *mut T,
+            ) -> VkResult,
+        >,
         info: cs::Decoded<'_, I>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<T, VkResult> {
@@ -3506,7 +3522,10 @@ impl Driver {
     pub fn destroy_pool<T: Handle>(
         &mut self,
         device: VkDevice,
-        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks),
+        proc: impl FnOnce(
+            &DeviceFns,
+        )
+            -> Option<unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks)>,
         pool: T,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Vec<ObjectId> {
@@ -6007,7 +6026,7 @@ impl Driver {
         // `usage` -- so every pointer in it is one the decoder vouched for in `info`, and this
         // borrow ends before `info`'s does.
         let vouched = unsafe { cs::Decoded::vouch(&linear) };
-        let host = self.create_object(device, |d| d.vkCreateImage(), vouched, alloc);
+        let host = self.create_object(device, |d| Some(d.vkCreateImage()), vouched, alloc);
         if let Ok(image) = host {
             self.note_image(image, &linear);
         }
@@ -11313,8 +11332,12 @@ mod tests {
 
         // No device is registered, so the driver call itself is skipped -- the bookkeeping is
         // what is under test, and it has to happen either way.
-        let mut orphans =
-            d.destroy_pool(DEVICE, |f| f.vkDestroyCommandPool(), VkCommandPool::forged(7), None);
+        let mut orphans = d.destroy_pool(
+            DEVICE,
+            |f| Some(f.vkDestroyCommandPool()),
+            VkCommandPool::forged(7),
+            None,
+        );
         orphans.sort_unstable_by_key(|i| i.0);
         assert_eq!(orphans, [ObjectId(110), ObjectId(120)], "every id in the pool, and no other");
         assert!(!d.pools.is_open(VkCommandPool::forged(7)));
@@ -11322,8 +11345,13 @@ mod tests {
         // And a second destroy of the same pool has nothing left to hand back: the ids must not
         // be removed from the object table twice, because the guest may have reused them.
         assert!(
-            d.destroy_pool(DEVICE, |f| f.vkDestroyCommandPool(), VkCommandPool::forged(7), None)
-                .is_empty()
+            d.destroy_pool(
+                DEVICE,
+                |f| Some(f.vkDestroyCommandPool()),
+                VkCommandPool::forged(7),
+                None
+            )
+            .is_empty()
         );
     }
 

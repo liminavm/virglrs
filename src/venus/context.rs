@@ -2391,7 +2391,8 @@ macro_rules! simple_create {
     ($cmd:ident, $args:ty, $info:ident, $out:ident, $shadow:ident) => {
         fn $cmd(&mut self, args: &mut $args) {
             let Some(info) = self.names(args.$info) else { return };
-            let host = self.driver.create_object(args.device, |d| d.$cmd(), info, args.pAllocator);
+            let host =
+                self.driver.create_object(args.device, |d| Some(d.$cmd()), info, args.pAllocator);
             args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
             self.plant(stringify!($cmd), args.$out(), args.$shadow(), host);
         }
@@ -2406,7 +2407,8 @@ macro_rules! pool_create {
     ($cmd:ident, $args:ty, $info:ident, $out:ident, $shadow:ident) => {
         fn $cmd(&mut self, args: &mut $args) {
             let Some(info) = self.names(args.$info) else { return };
-            let host = self.driver.create_pool(args.device, |d| d.$cmd(), info, args.pAllocator);
+            let host =
+                self.driver.create_pool(args.device, |d| Some(d.$cmd()), info, args.pAllocator);
             args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
             self.plant(stringify!($cmd), args.$out(), args.$shadow(), host);
         }
@@ -2417,8 +2419,12 @@ macro_rules! pool_create {
 macro_rules! pool_destroy {
     ($cmd:ident, $args:ty, $target:ident) => {
         fn $cmd(&mut self, args: &mut $args) {
-            let orphans =
-                self.driver.destroy_pool(args.device, |d| d.$cmd(), args.$target, args.pAllocator);
+            let orphans = self.driver.destroy_pool(
+                args.device,
+                |d| Some(d.$cmd()),
+                args.$target,
+                args.pAllocator,
+            );
             self.forget(orphans);
         }
     };
@@ -2429,7 +2435,12 @@ macro_rules! pool_destroy {
 macro_rules! simple_destroy {
     ($cmd:ident, $args:ty, $target:ident) => {
         fn $cmd(&mut self, args: &mut $args) {
-            self.driver.destroy_object(args.device, |d| d.$cmd(), args.$target, args.pAllocator);
+            self.driver.destroy_object(
+                args.device,
+                |d| Some(d.$cmd()),
+                args.$target,
+                args.pAllocator,
+            );
         }
     };
 }
@@ -2735,7 +2746,7 @@ impl Commands for Handlers<'_> {
         }
         self.driver.destroy_object(
             args.device,
-            |d| d.vkDestroyFence(),
+            |d| Some(d.vkDestroyFence()),
             args.fence,
             args.pAllocator,
         );
@@ -2761,7 +2772,7 @@ impl Commands for Handlers<'_> {
         }
         self.driver.destroy_object(
             args.device,
-            |d| d.vkDestroySemaphore(),
+            |d| Some(d.vkDestroySemaphore()),
             args.semaphore,
             args.pAllocator,
         );
@@ -2823,7 +2834,7 @@ impl Commands for Handlers<'_> {
         self.driver.forget_image(args.image);
         self.driver.destroy_object(
             args.device,
-            |d| d.vkDestroyImage(),
+            |d| Some(d.vkDestroyImage()),
             args.image,
             args.pAllocator,
         );
@@ -2968,7 +2979,7 @@ impl Commands for Handlers<'_> {
         self.driver.forget_query_pool(args.queryPool);
         self.driver.destroy_object(
             args.device,
-            |d| d.vkDestroyQueryPool(),
+            |d| Some(d.vkDestroyQueryPool()),
             args.queryPool,
             args.pAllocator,
         );
@@ -3027,7 +3038,7 @@ impl Commands for Handlers<'_> {
         }
         let host = self.driver.create_object(
             args.device,
-            |d| d.vkCreateShaderModule(),
+            |d| Some(d.vkCreateShaderModule()),
             info,
             args.pAllocator,
         );
