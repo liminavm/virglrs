@@ -21,16 +21,16 @@ use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Decoded, Guest, HostHandle, ObjectId, guest_face};
 use super::driver::{
-    self, Answered, Driver, DriverWait, ExportError, Exported, InFlight, MemoryError, NoSubmit2,
-    NoSyncFd, NotATimeline, XfbCounters,
+    self, Answered, Driver, DriverWait, ExportError, Exported, InFlight, Level, MemoryError,
+    NoSubmit2, NoSyncFd, NotATimeline, XfbCounters,
 };
 use super::journal::{self, Journal, Owner, Recording, Seq};
 use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{COMMAND_TYPES, Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkClearRect, VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDevice, VkDeviceMemory,
-    VkDeviceSize, VkFence, VkFlags, VkMemoryHeapFlagBits,
+    VkClearRect, VkCommandBufferLevel, VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDevice,
+    VkDeviceMemory, VkDeviceSize, VkFence, VkFlags, VkMemoryHeapFlagBits,
     VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType,
     VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkResult, VkRingCreateInfoMESA,
     VkRingMonitorInfoMESA, VkSemaphore, vn_command_vkAllocateCommandBuffers,
@@ -2251,6 +2251,10 @@ impl Handlers<'_> {
                 self.reject("frees from a pool on a device with no table here");
                 None
             }
+            Err(driver::FreeRefused::NotTheDevicesPool) => {
+                self.reject("frees from a pool the device it names does not own");
+                None
+            }
         }
     }
 
@@ -2445,7 +2449,10 @@ macro_rules! pool_destroy {
                 args.$target,
                 args.pAllocator,
             );
-            self.forget(orphans);
+            match orphans {
+                Some(orphans) => self.forget(orphans),
+                None => self.reject("destroyed a pool the device it names does not own"),
+            }
         }
     };
 }
@@ -3139,6 +3146,14 @@ impl Commands for Handlers<'_> {
         let device = args.device;
         let Some(info) = self.names(args.pAllocateInfo()) else { return };
         let pool = info.commandPool;
+        let level = match info.level {
+            VkCommandBufferLevel::VK_COMMAND_BUFFER_LEVEL_PRIMARY => Level::Primary,
+            VkCommandBufferLevel::VK_COMMAND_BUFFER_LEVEL_SECONDARY => Level::Secondary,
+            _ => {
+                self.reject("allocated command buffers at a level Vulkan does not define");
+                return;
+            }
+        };
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
         let named: Vec<ObjectId> = ids.iter().map(|h| h.id()).collect();
@@ -3150,6 +3165,7 @@ impl Commands for Handlers<'_> {
             info,
             out,
             &named,
+            level,
         );
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
@@ -3207,6 +3223,7 @@ impl Commands for Handlers<'_> {
             info,
             out,
             &named,
+            Level::Unleveled,
         );
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
@@ -5797,7 +5814,7 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdExecuteCommands(&mut self, args: &mut vn_command_vkCmdExecuteCommands<'_>) {
         if self.driver.cmd_execute_commands(args.commandBuffer, args.pCommandBuffers()).is_none() {
-            self.reject("executed command buffers that are not all of the primary's device");
+            self.reject("executed command buffers that are not all secondaries of its device");
         }
     }
 
@@ -6223,12 +6240,16 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkResetCommandPool(&mut self, args: &mut vn_command_vkResetCommandPool<'_>) {
-        args.ret = self.driver.object_flags_op(
+        let Some(ret) = self.driver.reset_pool(
             args.device,
             |d| d.vkResetCommandPool(),
             args.commandPool,
             args.flags,
-        );
+        ) else {
+            self.reject("reset a command pool the device it names does not own");
+            return;
+        };
+        args.ret = ret;
         // The journal's copy of the recycling. Every buffer this pool handed out keeps its handle
         // and its key, so nothing above can tell the recorder that their recordings are gone.
         if args.ret == VkResult::VK_SUCCESS {
@@ -6256,12 +6277,16 @@ impl Commands for Handlers<'_> {
     /// only when our own device lookup failed; in that case nothing was freed and forgetting the
     /// sets would poison the next command that legally named one.
     fn vkResetDescriptorPool(&mut self, args: &mut vn_command_vkResetDescriptorPool<'_>) {
-        args.ret = self.driver.object_flags_op(
+        let Some(ret) = self.driver.reset_pool(
             args.device,
             |d| d.vkResetDescriptorPool(),
             args.descriptorPool,
             args.flags,
-        );
+        ) else {
+            self.reject("reset a descriptor pool the device it names does not own");
+            return;
+        };
+        args.ret = ret;
         if args.ret == VkResult::VK_SUCCESS {
             let orphans = self.driver.recycle_pool(args.descriptorPool);
             // The journal needs no counterpart: every retained entry naming one of these sets is
@@ -7328,6 +7353,12 @@ mod tests {
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice::forged(DEVICE), fns);
+        // The pool the reset below names, open under the device it names.
+        driver.plant_pool::<VkCommandPool>(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(0x222),
+            &[],
+        );
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -19248,10 +19279,10 @@ mod tests {
     }
 
     /// `vkCmdExecuteCommands` hands the driver the secondaries the guest named, and only when
-    /// every one of them is a buffer of the primary's device.
+    /// every one of them is a secondary of the primary's device.
     ///
-    /// Vulkan requires the pairing and does not check it; a buffer of another device, or one this
-    /// renderer never allocated, would be the driver's undefined behaviour.
+    /// Vulkan requires both and does not check them; a buffer of another device, a primary, or
+    /// one this renderer never allocated would be the driver's undefined behaviour.
     #[test]
     fn execute_commands_runs_only_the_primarys_own_devices_buffers() {
         use super::super::proto::types::{
@@ -19263,6 +19294,7 @@ mod tests {
         const SECONDARY: VkCommandBuffer = VkCommandBuffer::forged(12);
         const SECOND_TOO: VkCommandBuffer = VkCommandBuffer::forged(13);
         const OTHER_DEVICES: VkCommandBuffer = VkCommandBuffer::forged(21);
+        const ANOTHER_PRIMARY: VkCommandBuffer = VkCommandBuffer::forged(14);
 
         // Each call: the primary, then the secondaries it was handed.
         thread_local! {
@@ -19278,22 +19310,34 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
-        for (device, pool, buffers) in [
+        // Device 3 holds a pool of primaries and one of secondaries; device 4 a pool of
+        // secondaries. Each of those facts is one the command has to check.
+        for (device, pool, level, buffers) in [
             (
                 3,
                 7,
-                &[
-                    (PRIMARY, ObjectId(110)),
-                    (SECONDARY, ObjectId(120)),
-                    (SECOND_TOO, ObjectId(130)),
-                ][..],
+                Level::Primary,
+                &[(PRIMARY, ObjectId(110)), (ANOTHER_PRIMARY, ObjectId(140))][..],
             ),
-            (4, 8, &[(OTHER_DEVICES, ObjectId(210))][..]),
+            (
+                3,
+                9,
+                Level::Secondary,
+                &[(SECONDARY, ObjectId(120)), (SECOND_TOO, ObjectId(130))][..],
+            ),
+            (4, 8, Level::Secondary, &[(OTHER_DEVICES, ObjectId(210))][..]),
         ] {
+            driver.plant_pool_at(
+                VkDevice::forged(device),
+                VkCommandPool::forged(pool),
+                level,
+                buffers,
+            );
+        }
+        for device in [3, 4] {
             let mut fns = crate::vulkan::Device::default();
             fns.plant_vkCmdExecuteCommands(execute);
             driver.plant_device(VkDevice::forged(device), fns);
-            driver.plant_pool(VkDevice::forged(device), VkCommandPool::forged(pool), buffers);
         }
 
         let todo = Unimplemented::default();
@@ -19339,6 +19383,10 @@ mod tests {
             "a buffer this renderer never allocated is refused"
         );
         assert!(!execute(VkCommandBuffer::forged(98), &[SECONDARY]), "so is an unknown primary");
+        assert!(
+            !execute(PRIMARY, &[SECONDARY, ANOTHER_PRIMARY]),
+            "a primary executed as a secondary is refused"
+        );
         SAW.with_borrow(|s| {
             assert_eq!(*s, [vec![11, 12, 13]], "only the first reached the driver, in order")
         });

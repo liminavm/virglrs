@@ -160,14 +160,30 @@ struct Pools {
     owner: BTreeMap<TypedHandle, TypedHandle>,
 }
 
+/// A command buffer's level, recorded with it when it is allocated. Every other pool child is
+/// `Unleveled`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Level {
+    Primary,
+    Secondary,
+    Unleveled,
+}
+
+/// One object a pool handed out: the guest id it was allocated under, and its level.
+#[derive(Clone, Copy, Debug)]
+struct Child {
+    id: ObjectId,
+    level: Level,
+}
+
 /// One live pool: the device that owns it, and what has been allocated from it.
 struct Pool {
     /// Recorded so a destroyed device can take its pools with it. Vulkan destroys them for us and
     /// says nothing, and a host handle the driver is free to reuse must stop being vouched for the
     /// moment that happens.
     device: VkDevice,
-    /// Host handle to the guest id it was allocated under.
-    children: BTreeMap<TypedHandle, ObjectId>,
+    /// Host handle to what the pool knows of it.
+    children: BTreeMap<TypedHandle, Child>,
 }
 
 impl Pools {
@@ -175,13 +191,25 @@ impl Pools {
         self.open.insert(TypedHandle::of(pool), Pool { device, children: BTreeMap::new() });
     }
 
+    #[cfg(test)]
     fn is_open<P: PoolOf>(&self, pool: P) -> bool {
         self.open.contains_key(&TypedHandle::of(pool))
     }
 
-    /// The device that owns a pool, if the pool is open here.
-    fn owner_of_pool<P: PoolOf>(&self, pool: P) -> Option<VkDevice> {
-        self.open.get(&TypedHandle::of(pool)).map(|p| p.device)
+    /// Whether `pool` is open here and owned by `device`.
+    ///
+    /// The one question every command naming a device and a pool together asks before the
+    /// driver is called. Vulkan takes the two as separate arguments and trusts that they belong
+    /// together, so a pool of another device is undefined behaviour in the driver; this is the
+    /// only place that knows the pairing, and so the only place that answers for it.
+    fn held_by<P: PoolOf>(&self, pool: P, device: VkDevice) -> bool {
+        self.open.get(&TypedHandle::of(pool)).is_some_and(|p| p.device == device)
+    }
+
+    /// The level of a pool child, if a pool here holds it.
+    fn level_of<T: Handle>(&self, handle: T) -> Option<Level> {
+        let handle = TypedHandle::of(handle);
+        Some(self.open.get(self.owner.get(&handle)?)?.children.get(&handle)?.level)
     }
 
     /// The device that owns the pool a handle came from.
@@ -196,6 +224,7 @@ impl Pools {
     fn adopt<P: PoolOf>(
         &mut self,
         pool: P,
+        level: Level,
         children: impl IntoIterator<Item = (P::Child, ObjectId)>,
     ) {
         let pool = TypedHandle::of(pool);
@@ -203,7 +232,7 @@ impl Pools {
             return;
         };
         for (handle, id) in children {
-            p.children.insert(TypedHandle::of(handle), id);
+            p.children.insert(TypedHandle::of(handle), Child { id, level });
             self.owner.insert(TypedHandle::of(handle), pool);
         }
     }
@@ -239,7 +268,7 @@ impl Pools {
         for handle in children.keys() {
             self.owner.remove(handle);
         }
-        children.into_values().collect()
+        children.into_values().map(|c| c.id).collect()
     }
 
     /// Empty a pool without closing it: what a *reset* does, as against the destroy `close` serves.
@@ -253,7 +282,7 @@ impl Pools {
         for handle in children.keys() {
             self.owner.remove(handle);
         }
-        children.into_values().collect()
+        children.into_values().map(|c| c.id).collect()
     }
 
     /// Forget every pool a device owned, because destroying the device destroyed them.
@@ -269,7 +298,7 @@ impl Pools {
                 for handle in children.keys() {
                     self.owner.remove(handle);
                 }
-                children.into_values()
+                children.into_values().map(|c| c.id)
             })
             .collect()
     }
@@ -340,6 +369,8 @@ pub enum FreeRefused {
     NoDevice,
     /// At least one object in the run is not the pool's -- another pool's, or already freed.
     NotFromThisPool,
+    /// The pool is not one the named device owns.
+    NotTheDevicesPool,
 }
 
 /// Why no memory was allocated.
@@ -3137,6 +3168,7 @@ impl Driver {
     /// into the place the generated lifecycle hook will read them from. `ids` is the same run of
     /// objects under the names the guest gave them, which the pool records alongside so that
     /// destroying it can take them out of the object table.
+    #[allow(clippy::too_many_arguments)]
     pub fn allocate_objects<P: PoolOf, I>(
         &mut self,
         device: VkDevice,
@@ -3148,6 +3180,7 @@ impl Driver {
         info: cs::Decoded<'_, I>,
         out: &mut [P::Child],
         ids: &[ObjectId],
+        level: Level,
     ) -> Result<(), VkResult> {
         let Some(d) = self.devices.get(&device) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
@@ -3157,7 +3190,8 @@ impl Driver {
         }
         // The pool is re-checked here for the same reason the device is: the guest may have
         // destroyed it, and an id the object table still resolves is not a live driver object.
-        if !self.pools.is_open(pool) {
+        // And it has to be this device's: see `Pools::held_by`.
+        if !self.pools.held_by(pool, device) {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         }
         // SAFETY: `device` is a handle in this table; `info` is an arena allocation live for the
@@ -3170,6 +3204,7 @@ impl Driver {
         // Both names of each object are recorded together; see `Pools`.
         self.pools.adopt(
             pool,
+            level,
             out.iter().copied().zip(ids.iter().copied()).filter(|(h, _)| h.host().raw() != 0),
         );
         Ok(())
@@ -3264,6 +3299,9 @@ impl Driver {
         objects: &[P::Child],
     ) -> Result<R, FreeRefused> {
         let d = self.devices.get(&device).ok_or(FreeRefused::NoDevice)?;
+        if !self.pools.held_by(pool, device) {
+            return Err(FreeRefused::NotTheDevicesPool);
+        }
         if !self.pools.all_from(pool, objects) {
             return Err(FreeRefused::NotFromThisPool);
         }
@@ -3500,8 +3538,20 @@ impl Driver {
         pool: P,
         children: &[(P::Child, ObjectId)],
     ) {
+        self.plant_pool_at(device, pool, Level::Primary, children);
+    }
+
+    /// [`Driver::plant_pool`], with the children at a level of the test's choosing.
+    #[cfg(test)]
+    pub(super) fn plant_pool_at<P: PoolOf>(
+        &mut self,
+        device: VkDevice,
+        pool: P,
+        level: Level,
+        children: &[(P::Child, ObjectId)],
+    ) {
         self.pools.open(device, pool);
-        self.pools.adopt(pool, children.iter().copied());
+        self.pools.adopt(pool, level, children.iter().copied());
     }
 
     /// Whether a pool is still open, for the test that a reset keeps it so where a destroy does
@@ -3520,7 +3570,7 @@ impl Driver {
     #[cfg(test)]
     pub(super) fn pool_child_id<P: PoolOf>(&self, pool: P, child: P::Child) -> Option<ObjectId> {
         let p = self.pools.open.get(&TypedHandle::of(pool))?;
-        p.children.get(&TypedHandle::of(child)).copied()
+        p.children.get(&TypedHandle::of(child)).map(|c| c.id)
     }
 
     /// Record a semaphore's kind without a create having run, so a planted table can reach the
@@ -3568,7 +3618,10 @@ impl Driver {
     /// is the only place their handles stop being live. Their guest ids come back for the caller
     /// to take out of the object table, which is what keeps a later command from resolving one
     /// and reaching the driver with a freed handle.
-    pub fn destroy_pool<T: Handle>(
+    ///
+    /// `None`, with nothing destroyed, when the pool is not one the device owns: see
+    /// `Pools::held_by`. A null pool is Vulkan's no-op, and destroys nothing either.
+    pub fn destroy_pool<T: PoolOf>(
         &mut self,
         device: VkDevice,
         proc: impl FnOnce(
@@ -3577,10 +3630,38 @@ impl Driver {
             -> Option<unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks)>,
         pool: T,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
-    ) -> Vec<ObjectId> {
+    ) -> Option<Vec<ObjectId>> {
+        if pool.host().raw() == 0 {
+            return Some(Vec::new());
+        }
+        if !self.pools.held_by(pool, device) {
+            return None;
+        }
         let orphans = self.pools.close(pool);
         self.destroy_object(device, proc, pool, alloc);
-        orphans
+        Some(orphans)
+    }
+
+    /// Reset a pool: `vkResetCommandPool`, `vkResetDescriptorPool`.
+    ///
+    /// A device with no table here answers `VK_ERROR_INITIALIZATION_FAILED`, as every forwarded
+    /// command does. `None`, with nothing reset, when the device is here and the pool is not
+    /// one it owns: see `Pools::held_by`. What a reset does to the pool's children is the
+    /// caller's, because the two resets differ exactly there.
+    pub fn reset_pool<P: PoolOf, F: Copy>(
+        &self,
+        device: VkDevice,
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, P, F) -> VkResult,
+        pool: P,
+        flags: F,
+    ) -> Option<VkResult> {
+        if !self.devices.contains_key(&device) {
+            return Some(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        }
+        if !self.pools.held_by(pool, device) {
+            return None;
+        }
+        Some(self.object_flags_op(device, proc, pool, flags))
     }
 
     /// Recycle a pool's allocations, handing back the guest ids that stopped naming anything.
@@ -3601,7 +3682,7 @@ impl Driver {
         self.pools
             .open
             .get(&TypedHandle::of(pool))
-            .map(|p| p.children.values().copied().collect())
+            .map(|p| p.children.values().map(|c| c.id).collect())
             .unwrap_or_default()
     }
 
@@ -5293,16 +5374,22 @@ impl Driver {
 
     /// `vkCmdExecuteCommands`: run secondary buffers' recordings from a primary.
     ///
-    /// `None` unless the primary and every secondary are command buffers of one device here.
-    /// Vulkan requires that and trusts the caller, and a buffer of another device is undefined
-    /// behaviour in the driver, so it is refused rather than forwarded.
+    /// `None` unless the primary and every secondary are command buffers of one device here, and
+    /// every buffer executed was allocated secondary. Vulkan requires both and trusts the caller:
+    /// a buffer of another device, or a primary executed as a secondary, is undefined behaviour
+    /// in the driver, so it is refused rather than forwarded. The buffer executing them may be
+    /// either level, because `VK_EXT_nested_command_buffer` lets a secondary execute secondaries.
     pub fn cmd_execute_commands(
         &self,
         cb: VkCommandBuffer,
         secondaries: &[VkCommandBuffer],
     ) -> Option<()> {
         let device = self.pools.device_of(cb)?;
-        if !secondaries.iter().all(|s| self.pools.device_of(*s) == Some(device)) {
+        let executable = |s: &VkCommandBuffer| {
+            self.pools.device_of(*s) == Some(device)
+                && self.pools.level_of(*s) == Some(Level::Secondary)
+        };
+        if !secondaries.iter().all(executable) {
             return None;
         }
         let d = self.recorder(cb)?;
@@ -6041,7 +6128,7 @@ impl Driver {
         flags: VkCommandPoolTrimFlags,
     ) -> Option<()> {
         let d = self.devices.get(&device)?;
-        if self.pools.owner_of_pool(pool) != Some(device) {
+        if !self.pools.held_by(pool, device) {
             return None;
         }
         let f = d.fns.try_vkTrimCommandPool()?;
@@ -12045,6 +12132,7 @@ mod tests {
         d.pools.open(DEVICE, VkCommandPool::forged(7));
         d.pools.adopt(
             VkCommandPool::forged(7),
+            Level::Primary,
             [
                 (VkCommandBuffer::forged(11), ObjectId(110)),
                 (VkCommandBuffer::forged(12), ObjectId(120)),
@@ -12053,26 +12141,29 @@ mod tests {
 
         // No device is registered, so the driver call itself is skipped -- the bookkeeping is
         // what is under test, and it has to happen either way.
-        let mut orphans = d.destroy_pool(
-            DEVICE,
-            |f| Some(f.vkDestroyCommandPool()),
-            VkCommandPool::forged(7),
-            None,
-        );
+        let mut orphans = d
+            .destroy_pool(
+                DEVICE,
+                |f| Some(f.vkDestroyCommandPool()),
+                VkCommandPool::forged(7),
+                None,
+            )
+            .expect("the device's own pool");
         orphans.sort_unstable_by_key(|i| i.0);
         assert_eq!(orphans, [ObjectId(110), ObjectId(120)], "every id in the pool, and no other");
         assert!(!d.pools.is_open(VkCommandPool::forged(7)));
 
-        // And a second destroy of the same pool has nothing left to hand back: the ids must not
-        // be removed from the object table twice, because the guest may have reused them.
-        assert!(
+        // And a second destroy of the same pool is refused: the pool is no longer open, so
+        // there is nothing to hand back, and the ids must not be removed from the object table
+        // twice, because the guest may have reused them.
+        assert_eq!(
             d.destroy_pool(
                 DEVICE,
                 |f| Some(f.vkDestroyCommandPool()),
                 VkCommandPool::forged(7),
                 None
-            )
-            .is_empty()
+            ),
+            None
         );
     }
 
@@ -12091,11 +12182,15 @@ mod tests {
 
         let mut d = Driver::new(Account::for_test(None));
         d.pools.open(VkDevice::forged(3), VkCommandPool::forged(SHARED));
-        d.pools
-            .adopt(VkCommandPool::forged(SHARED), [(VkCommandBuffer::forged(11), ObjectId(110))]);
+        d.pools.adopt(
+            VkCommandPool::forged(SHARED),
+            Level::Primary,
+            [(VkCommandBuffer::forged(11), ObjectId(110))],
+        );
         d.pools.open(VkDevice::forged(3), VkDescriptorPool::forged(SHARED));
         d.pools.adopt(
             VkDescriptorPool::forged(SHARED),
+            Level::Unleveled,
             [(VkDescriptorSet::forged(21), ObjectId(210))],
         );
 
@@ -12127,13 +12222,18 @@ mod tests {
         d.pools.open(VkDevice::forged(3), VkCommandPool::forged(7));
         d.pools.adopt(
             VkCommandPool::forged(7),
+            Level::Primary,
             [
                 (VkCommandBuffer::forged(11), ObjectId(110)),
                 (VkCommandBuffer::forged(12), ObjectId(120)),
             ],
         );
         d.pools.open(VkDevice::forged(4), VkCommandPool::forged(8));
-        d.pools.adopt(VkCommandPool::forged(8), [(VkCommandBuffer::forged(21), ObjectId(210))]);
+        d.pools.adopt(
+            VkCommandPool::forged(8),
+            Level::Primary,
+            [(VkCommandBuffer::forged(21), ObjectId(210))],
+        );
 
         let mut orphans = d.destroy_device(VkDevice::forged(3), &[]);
         orphans.sort_unstable_by_key(|i| i.0);
@@ -12175,6 +12275,130 @@ mod tests {
     #[test]
     fn a_zero_allocation_stays_zero() {
         assert_eq!(pad_for_blob(0, Some(HOST_VISIBLE), false), 0);
+    }
+
+    /// Every command that names a device and a pool together reaches the driver only when the
+    /// device owns the pool.
+    ///
+    /// Vulkan takes the two as separate arguments and trusts that they belong together. Each
+    /// command here names device A with device B's pool, and must be refused without the driver
+    /// being called; then each names A's own pool and gets through. One test for all of them,
+    /// because they share one check and a command that bypassed it would be invisible in any
+    /// other command's test.
+    #[test]
+    fn every_pool_command_is_held_to_the_pools_own_device() {
+        use super::super::proto::types::{
+            VkCommandBufferAllocateInfo, VkCommandPool, VkCommandPoolResetFlags,
+        };
+        use std::cell::RefCell;
+
+        const A: VkDevice = VkDevice::forged(3);
+        const B: VkDevice = VkDevice::forged(4);
+        const POOL_A: VkCommandPool = VkCommandPool::forged(0x20);
+        const POOL_B: VkCommandPool = VkCommandPool::forged(0x21);
+        const IN_B: VkCommandBuffer = VkCommandBuffer::forged(0x31);
+        const IN_A: VkCommandBuffer = VkCommandBuffer::forged(0x30);
+
+        // Which entry points the driver was asked through, in order.
+        thread_local! {
+            static SAW: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        }
+        fn saw(what: &'static str) {
+            SAW.with_borrow_mut(|s| s.push(what));
+        }
+        unsafe extern "C" fn allocate(
+            _d: VkDevice,
+            _i: *const VkCommandBufferAllocateInfo,
+            out: *mut VkCommandBuffer,
+        ) -> VkResult {
+            saw("allocate");
+            // SAFETY: the caller passes a one-element array.
+            unsafe { *out = VkCommandBuffer::forged(0x32) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            _p: VkCommandPool,
+            _n: u32,
+            _b: *const VkCommandBuffer,
+        ) {
+            saw("free");
+        }
+        unsafe extern "C" fn reset(
+            _d: VkDevice,
+            _p: VkCommandPool,
+            _f: VkCommandPoolResetFlags,
+        ) -> VkResult {
+            saw("reset");
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy(
+            _d: VkDevice,
+            _p: VkCommandPool,
+            _a: *const VkAllocationCallbacks,
+        ) {
+            saw("destroy");
+        }
+
+        let mut d = Driver::new(Account::for_test(None));
+        for device in [A, B] {
+            let mut fns = crate::vulkan::Device::default();
+            fns.plant_vkAllocateCommandBuffers(allocate);
+            fns.plant_vkFreeCommandBuffers(free);
+            fns.plant_vkResetCommandPool(reset);
+            fns.plant_vkDestroyCommandPool(destroy);
+            d.plant_device(device, fns);
+        }
+        d.plant_pool(A, POOL_A, &[(IN_A, ObjectId(300))]);
+        d.plant_pool(B, POOL_B, &[(IN_B, ObjectId(310))]);
+
+        let info = VkCommandBufferAllocateInfo { commandBufferCount: 1, ..Default::default() };
+        let flags = VkCommandPoolResetFlags(0);
+        let mut out = [VkCommandBuffer::NULL];
+
+        // Device A, device B's pool: every one refused, and the driver asked nothing.
+        let r = d.allocate_objects(
+            A,
+            POOL_B,
+            |f| f.vkAllocateCommandBuffers(),
+            cs::Decoded::planted(&info),
+            &mut out,
+            &[ObjectId(320)],
+            Level::Primary,
+        );
+        assert_eq!(r, Err(VkResult::VK_ERROR_INITIALIZATION_FAILED), "allocate");
+        let r = d.free_objects(A, |f| f.vkFreeCommandBuffers(), POOL_B, &[IN_B]);
+        assert_eq!(r, Err(FreeRefused::NotTheDevicesPool), "free");
+        assert_eq!(d.reset_pool(A, |f| f.vkResetCommandPool(), POOL_B, flags), None, "reset");
+        assert_eq!(
+            d.destroy_pool(A, |f| Some(f.vkDestroyCommandPool()), POOL_B, None),
+            None,
+            "destroy"
+        );
+        assert!(d.pools.is_open(POOL_B), "and B's pool is still open");
+        SAW.with_borrow(|s| assert!(s.is_empty(), "no refusal reached the driver: {s:?}"));
+
+        // Device A, its own pool: every one reaches the driver.
+        let r = d.allocate_objects(
+            A,
+            POOL_A,
+            |f| f.vkAllocateCommandBuffers(),
+            cs::Decoded::planted(&info),
+            &mut out,
+            &[ObjectId(320)],
+            Level::Primary,
+        );
+        assert_eq!(r, Ok(()));
+        assert_eq!(d.free_objects(A, |f| f.vkFreeCommandBuffers(), POOL_A, &[IN_A]), Ok(()));
+        assert_eq!(
+            d.reset_pool(A, |f| f.vkResetCommandPool(), POOL_A, flags),
+            Some(VkResult::VK_SUCCESS)
+        );
+        let orphans = d.destroy_pool(A, |f| Some(f.vkDestroyCommandPool()), POOL_A, None);
+        assert_eq!(orphans, Some(vec![ObjectId(320)]), "the buffer allocated above");
+        SAW.with_borrow(|s| assert_eq!(*s, ["allocate", "free", "reset", "destroy"]));
+
+        d.abandon_planted();
     }
 
     /// `vkTrimCommandPool` reaches the driver only for a pool the named device owns.

@@ -2307,14 +2307,11 @@ SABOTAGES = [
         'the_extended_dynamic_state3_array_setters_hand_the_driver_every_element',
     ),
     (
-        'vkTrimCommandPool trims a pool of another device',
+        "a pool is taken as the device's whatever device owns it",
         'src/venus/driver.rs',
-        """        if self.pools.owner_of_pool(pool) != Some(device) {
-            return None;
-        }
-""",
-        """""",
-        'a_pool_is_trimmed_only_through_its_own_device',
+        """self.open.get(&TypedHandle::of(pool)).is_some_and(|p| p.device == device)""",
+        """self.open.contains_key(&TypedHandle::of(pool))""",
+        'every_pool_command_is_held_to_the_pools_own_device',
     ),
     (
         'a primary replays after the secondary it executed is recorded again',
@@ -2342,12 +2339,27 @@ SABOTAGES = [
     (
         "vkCmdExecuteCommands runs another device's buffer",
         'src/venus/driver.rs',
-        """        if !secondaries.iter().all(|s| self.pools.device_of(*s) == Some(device)) {
+        """            self.pools.device_of(*s) == Some(device)
+                && self.pools.level_of(*s)""",
+        """            self.pools.level_of(*s)""",
+        'execute_commands_runs_only_the_primarys_own_devices_buffers',
+    ),
+    (
+        'vkCmdExecuteCommands runs a primary as a secondary',
+        'src/venus/driver.rs',
+        """                && self.pools.level_of(*s) == Some(Level::Secondary)""",
+        """                && self.pools.level_of(*s).is_some()""",
+        'execute_commands_runs_only_the_primarys_own_devices_buffers',
+    ),
+    (
+        "a trim is taken for the device's whatever device owns the pool",
+        'src/venus/driver.rs',
+        """        if !self.pools.held_by(pool, device) {
             return None;
         }
-""",
-        """""",
-        'execute_commands_runs_only_the_primarys_own_devices_buffers',
+        let f = d.fns.try_vkTrimCommandPool()?;""",
+        """        let f = d.fns.try_vkTrimCommandPool()?;""",
+        'a_pool_is_trimmed_only_through_its_own_device',
     ),
 ]
 
