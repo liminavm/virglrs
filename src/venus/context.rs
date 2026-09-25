@@ -24,7 +24,7 @@ use super::driver::{
     self, Answered, Driver, DriverWait, ExportError, Exported, InFlight, MemoryError, NoSubmit2,
     NoSyncFd, NotATimeline, XfbCounters,
 };
-use super::journal::{self, Journal, Owner, Seq};
+use super::journal::{self, Journal, Owner, Recording, Seq};
 use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{COMMAND_TYPES, Commands, vn_command_name, vn_dispatch_command};
@@ -1563,7 +1563,7 @@ fn record(
             return;
         };
         let refs = key_of(named.get(1..).unwrap_or_default());
-        h.journal.recorded(cmd_type, &wire, buffer, class == Recording::Resets, refs);
+        h.journal.recorded(cmd_type, &wire, buffer, class, refs);
         return;
     }
 
@@ -1642,22 +1642,13 @@ fn strip_reply_flag(wire: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Whether a command is part of a command buffer's recording, and whether it discards what was
-/// recorded before it.
-#[derive(PartialEq, Eq)]
-enum Recording {
-    /// It adds to the recording.
-    Adds,
-    /// It starts the recording over: `vkBeginCommandBuffer` and `vkResetCommandBuffer`.
-    Resets,
-}
-
 /// Classify by name rather than by a four-hundred-arm match.
 ///
 /// Every command that records into a buffer is spelled `vkCmd*` -- that is a naming rule of the
 /// Vulkan specification, not a coincidence of this generator, and it is why a new extension's
 /// commands are recorded without this function being touched. The three that bracket a recording
-/// are named individually because nothing in their spelling says so.
+/// are named individually because nothing in their spelling says so, and `vkCmdExecuteCommands`
+/// because it is the one `vkCmd*` whose recording depends on other buffers' recordings.
 ///
 /// `vkFreeCommandBuffers` is deliberately absent: it destroys the buffers, which takes their keys
 /// with them, and every recording naming one stops being true on its own.
@@ -1666,6 +1657,7 @@ fn recording_class(cmd: VkCommandTypeEXT) -> Option<Recording> {
         VkCommandTypeEXT::VK_COMMAND_TYPE_vkBeginCommandBuffer_EXT
         | VkCommandTypeEXT::VK_COMMAND_TYPE_vkResetCommandBuffer_EXT => Some(Recording::Resets),
         VkCommandTypeEXT::VK_COMMAND_TYPE_vkEndCommandBuffer_EXT => Some(Recording::Adds),
+        VkCommandTypeEXT::VK_COMMAND_TYPE_vkCmdExecuteCommands_EXT => Some(Recording::Executes),
         _ => vn_command_name(cmd).filter(|n| n.starts_with("vkCmd")).map(|_| Recording::Adds),
     }
 }
@@ -20221,6 +20213,12 @@ mod tests {
 
             assert!(resets(VkCommandTypeEXT::VK_COMMAND_TYPE_vkBeginCommandBuffer_EXT));
             assert!(resets(VkCommandTypeEXT::VK_COMMAND_TYPE_vkResetCommandBuffer_EXT));
+
+            // Adds, and names the recordings the export has to judge it by.
+            assert!(matches!(
+                recording_class(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCmdExecuteCommands_EXT),
+                Some(Recording::Executes)
+            ));
 
             // Not a recording. It destroys the buffers, which takes their keys with them, and
             // every recording naming one stops being true without anything being pruned. Keeping

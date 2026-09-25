@@ -139,6 +139,41 @@ struct Recorded {
     refs: Vec<ObjectKey>,
 }
 
+/// How a command changes the recording of the buffer it is filed under.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Recording {
+    /// It adds to the recording.
+    Adds,
+    /// It starts the recording over: `vkBeginCommandBuffer` and `vkResetCommandBuffer`.
+    Resets,
+    /// It adds to the recording and runs other buffers' recordings from it:
+    /// `vkCmdExecuteCommands`, whose references are the buffers it executes.
+    Executes,
+}
+
+/// One recording of a command buffer: its commands, which recording it is, and the recordings
+/// it depends on to still be one.
+#[derive(Debug)]
+struct Tape {
+    /// The seq of the command this recording began at: a begin or a reset, or the first command
+    /// filed under the buffer. No two recordings share one and a buffer's only ever grows, so it
+    /// names this recording and never a later one of the same buffer.
+    began: Seq,
+    commands: Vec<Recorded>,
+    /// Each buffer this recording executed, and the recording that buffer held when it did --
+    /// `None` when it held none. Vulkan invalidates a primary when a buffer it executes is begun
+    /// again, reset or freed, and replaying it then would run the secondary's *newer* recording
+    /// from a primary the guest can no longer submit. So a recording is only replayable while
+    /// every buffer it executed still holds the recording it saw.
+    executed: Vec<(ObjectKey, Option<Seq>)>,
+}
+
+impl Tape {
+    fn new(began: Seq) -> Tape {
+        Tape { began, commands: Vec::new(), executed: Vec::new() }
+    }
+}
+
 /// One retained command, wherever it is filed, as the export writes it.
 #[derive(Clone, Copy, Debug)]
 struct Out<'a> {
@@ -208,7 +243,7 @@ pub struct Journal {
     /// it, and a recording in `entries` does not typecheck. The export sees one stream either way,
     /// the same way it already does for `ring_state` — the merge is `seq`, which everything here
     /// carries and no two share.
-    recordings: BTreeMap<ObjectKey, Vec<Recorded>>,
+    recordings: BTreeMap<ObjectKey, Tape>,
     /// How much was worth keeping at the last compaction, and the baseline the next one is due
     /// against. See [`Journal::due`].
     kept: usize,
@@ -257,8 +292,10 @@ impl Journal {
 
     /// Retain a command as part of a command buffer's recording.
     ///
-    /// `resets` is `vkBeginCommandBuffer` and `vkResetCommandBuffer`, which discard whatever was
-    /// recorded before them — the one prune the keys cannot do, because the buffer outlives it.
+    /// [`Recording::Resets`] is `vkBeginCommandBuffer` and `vkResetCommandBuffer`, which discard
+    /// whatever was recorded before them — the one prune the keys cannot do, because the buffer
+    /// outlives it. [`Recording::Executes`] notes which recording each executed buffer holds now,
+    /// which is what the export judges this recording by.
     ///
     /// `refs` matters as much here as on a create. A recorded `vkCmdBindPipeline` names a pipeline
     /// the guest is free to destroy the moment the submission it belongs to has completed, leaving
@@ -269,16 +306,22 @@ impl Journal {
         cmd_type: u32,
         wire: &[u8],
         buffer: ObjectKey,
-        resets: bool,
+        how: Recording,
         refs: Vec<ObjectKey>,
     ) {
         let seq = self.seq.advance();
-        let entry = Recorded { seq, cmd_type, wire: wire.to_vec(), refs };
-        let recording = self.recordings.entry(buffer).or_default();
-        if resets {
-            recording.clear();
+        let executed: Vec<(ObjectKey, Option<Seq>)> = match how {
+            Recording::Executes => {
+                refs.iter().map(|b| (*b, self.recordings.get(b).map(|t| t.began))).collect()
+            }
+            Recording::Adds | Recording::Resets => Vec::new(),
+        };
+        let tape = self.recordings.entry(buffer).or_insert_with(|| Tape::new(seq));
+        if how == Recording::Resets {
+            *tape = Tape::new(seq);
         }
-        recording.push(entry);
+        tape.executed.extend(executed);
+        tape.commands.push(Recorded { seq, cmd_type, wire: wire.to_vec(), refs });
     }
 
     /// Discard every recording made from a command pool, which is what `vkResetCommandPool` does.
@@ -378,7 +421,7 @@ pub trait Live {
 impl Journal {
     /// How many commands this journal is holding, wherever they are filed.
     fn len(&self) -> usize {
-        self.entries.len() + self.recordings.values().map(Vec::len).sum::<usize>()
+        self.entries.len() + self.recordings.values().map(|t| t.commands.len()).sum::<usize>()
     }
 
     /// Is there enough dead weight here to be worth a pass over it?
@@ -421,13 +464,16 @@ impl Journal {
             i += 1;
             live
         });
-        self.recordings.retain(|_, rs| {
-            rs.retain(|_| {
+        self.recordings.retain(|b, t| {
+            t.commands.retain(|_| {
                 let live = keep.contains(&i);
                 i += 1;
                 live
             });
-            !rs.is_empty()
+            // A live buffer keeps its tape even with nothing on it worth replaying: which
+            // recording it is and what it executed are what a later export judges the commands
+            // it goes on to record by. A dead buffer's key never resolves again, so its tape can go.
+            !t.commands.is_empty() || live.holds(*b)
         });
         self.kept = self.len();
     }
@@ -462,9 +508,39 @@ impl Journal {
             .chain(
                 self.recordings
                     .iter()
-                    .flat_map(|(b, rs)| rs.iter().map(move |r| Item::Recording(*b, r))),
+                    .flat_map(|(b, t)| t.commands.iter().map(move |r| Item::Recording(*b, r))),
             )
             .collect();
+
+        // Which buffers' recordings can still replay. The buffer has to live, and every buffer it
+        // executed has to live and still hold the recording it executed. Then to a fixed point,
+        // because a secondary that can no longer replay takes down whatever executed it -- Vulkan
+        // invalidates the whole chain, and a primary replayed against a recording that is not
+        // there is the replay running commands the guest never ran.
+        let holds = |b: &ObjectKey, began: &Option<Seq>| {
+            live.holds(*b) && began.is_some() && self.recordings.get(b).map(|t| t.began) == *began
+        };
+        let mut replayable: BTreeSet<ObjectKey> = self
+            .recordings
+            .iter()
+            .filter(|(b, t)| live.holds(**b) && t.executed.iter().all(|(e, s)| holds(e, s)))
+            .map(|(b, _)| *b)
+            .collect();
+        loop {
+            let broken: Vec<ObjectKey> = replayable
+                .iter()
+                .filter(|b| {
+                    self.recordings[*b].executed.iter().any(|(e, _)| !replayable.contains(e))
+                })
+                .copied()
+                .collect();
+            if broken.is_empty() {
+                break;
+            }
+            for b in broken {
+                replayable.remove(&b);
+            }
+        }
 
         // Which entry created a given key, so a reference can be resolved to the command that
         // would rebuild it. Only a `Created` ever answers, and a recording is never one.
@@ -483,9 +559,10 @@ impl Journal {
         let mut queue: Vec<usize> = Vec::new();
         for (i, it) in all.iter().enumerate() {
             let true_still = match it {
-                // A recording is true while the buffer it is filed under lives -- read from the
-                // key, because that is the only place the buffer is written down.
-                Item::Recording(b, _) => live.holds(*b),
+                // A recording is true while the buffer it is filed under lives and everything it
+                // executed still holds what it executed -- read from the key, because that is the
+                // only place the buffer is written down.
+                Item::Recording(b, _) => replayable.contains(b),
                 Item::Kept(e) => match &e.about {
                     About::Created(keys) | About::Mutated(keys) => alive(keys),
                     About::Ring(_) | About::Context => true,
@@ -713,11 +790,11 @@ mod tests {
         let mut j = Journal::new();
         j.created(1, &[1; 4], vec![k[0]], Vec::new());
         for b in [k[1], k[2]] {
-            j.recorded(10, &[1; 4], b, true, Vec::new());
-            j.recorded(11, &[2; 4], b, false, Vec::new());
+            j.recorded(10, &[1; 4], b, Recording::Resets, Vec::new());
+            j.recorded(11, &[2; 4], b, Recording::Adds, Vec::new());
         }
         let before = j.entries.len();
-        j.recorded(10, &[7; 4], k[1], true, Vec::new());
+        j.recorded(10, &[7; 4], k[1], Recording::Resets, Vec::new());
         assert_eq!(j.entries.len(), before, "a begin that grew or shrank the vector walked it");
         assert_eq!(before, 1, "and the vector holds only the create; recordings are not in it");
         assert_eq!(j.recordings.len(), 2, "one recording per buffer, held under it");
@@ -736,10 +813,10 @@ mod tests {
         let k = keys(3);
         let mut j = Journal::new();
         for b in [k[0], k[1], k[2]] {
-            j.recorded(10, &[1; 4], b, true, Vec::new());
-            j.recorded(11, &[2; 4], b, false, Vec::new());
+            j.recorded(10, &[1; 4], b, Recording::Resets, Vec::new());
+            j.recorded(11, &[2; 4], b, Recording::Adds, Vec::new());
         }
-        j.recorded(10, &[9; 4], k[1], true, Vec::new());
+        j.recorded(10, &[9; 4], k[1], Recording::Resets, Vec::new());
         let out = j.retained(&Some_(vec![k[0], k[1], k[2]]));
         assert_eq!(out.len(), 5, "k[1] is back to one entry; the other two keep both");
         let wires: Vec<&[u8]> = out.iter().map(|e| e.wire).collect();
@@ -755,12 +832,141 @@ mod tests {
     fn beginning_a_buffer_discards_what_it_had_recorded() {
         let k = keys(1);
         let mut j = Journal::new();
-        j.recorded(10, &[1; 4], k[0], true, Vec::new());
-        j.recorded(11, &[2; 4], k[0], false, Vec::new());
-        j.recorded(10, &[3; 4], k[0], true, Vec::new());
+        j.recorded(10, &[1; 4], k[0], Recording::Resets, Vec::new());
+        j.recorded(11, &[2; 4], k[0], Recording::Adds, Vec::new());
+        j.recorded(10, &[3; 4], k[0], Recording::Resets, Vec::new());
         let out = j.retained(&Some_(vec![k[0]]));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].wire, vec![3; 4]);
+    }
+
+    /// A primary that executed a secondary replays with it, while the secondary still holds the
+    /// recording the primary executed.
+    #[test]
+    fn a_primary_replays_with_the_secondary_it_executed() {
+        let k = keys(2);
+        let (secondary, primary) = (k[0], k[1]);
+        let mut j = Journal::new();
+        j.recorded(1, &[1; 4], secondary, Recording::Resets, Vec::new());
+        j.recorded(2, &[2; 4], secondary, Recording::Adds, Vec::new());
+        j.recorded(3, &[3; 4], primary, Recording::Resets, Vec::new());
+        j.recorded(4, &[4; 4], primary, Recording::Executes, vec![secondary]);
+        let out = j.retained(&Some_(vec![secondary, primary]));
+        let wires: Vec<&[u8]> = out.iter().map(|e| e.wire).collect();
+        assert_eq!(wires, [&[1; 4][..], &[2; 4], &[3; 4], &[4; 4]], "both, in the guest's order");
+    }
+
+    /// Recording the secondary again invalidates the primary that executed it, and the primary's
+    /// recording goes -- all of it, not only the execute.
+    ///
+    /// Kept, it would replay its `vkCmdExecuteCommands` before the secondary's new recording
+    /// exists, against a buffer in its initial state; or, had the order fallen the other way,
+    /// run commands from a primary the guest can no longer submit. Dropping only the execute
+    /// would leave a primary that replays something the guest never recorded.
+    #[test]
+    fn recording_the_secondary_again_drops_the_primary_that_executed_it() {
+        let k = keys(2);
+        let (secondary, primary) = (k[0], k[1]);
+        let mut j = Journal::new();
+        j.recorded(1, &[1; 4], secondary, Recording::Resets, Vec::new());
+        j.recorded(3, &[3; 4], primary, Recording::Resets, Vec::new());
+        j.recorded(4, &[4; 4], primary, Recording::Executes, vec![secondary]);
+        j.recorded(1, &[5; 4], secondary, Recording::Resets, Vec::new());
+        j.recorded(2, &[6; 4], secondary, Recording::Adds, Vec::new());
+        let out = j.retained(&Some_(vec![secondary, primary]));
+        let wires: Vec<&[u8]> = out.iter().map(|e| e.wire).collect();
+        assert_eq!(wires, [&[5; 4][..], &[6; 4]], "the secondary's new recording, and no primary");
+
+        // Beginning the primary again is a new recording, judged on its own.
+        j.recorded(3, &[7; 4], primary, Recording::Resets, Vec::new());
+        j.recorded(4, &[8; 4], primary, Recording::Executes, vec![secondary]);
+        let out = j.retained(&Some_(vec![secondary, primary]));
+        assert_eq!(out.len(), 4, "the re-recorded primary executes what the secondary holds now");
+    }
+
+    /// A pool reset and a free end the secondary's recording too, and take the primary with it.
+    ///
+    /// Neither leaves the secondary a recording for the primary's to name: the reset discards it
+    /// and the free takes the key. A secondary executed while it held no recording at all is the
+    /// same case from the other end.
+    #[test]
+    fn a_secondary_reset_with_its_pool_or_freed_drops_the_primary() {
+        let k = keys(3);
+        let (secondary, primary, empty) = (k[0], k[1], k[2]);
+        let record = || {
+            let mut j = Journal::new();
+            j.recorded(1, &[1; 4], secondary, Recording::Resets, Vec::new());
+            j.recorded(3, &[3; 4], primary, Recording::Resets, Vec::new());
+            j.recorded(4, &[4; 4], primary, Recording::Executes, vec![secondary]);
+            j
+        };
+        let all = Some_(vec![secondary, primary, empty]);
+
+        let mut j = record();
+        j.pool_reset(&[secondary]);
+        assert!(j.retained(&all).is_empty(), "the pool reset discarded what the primary executed");
+
+        let j = record();
+        let out = j.retained(&Some_(vec![primary, empty]));
+        assert!(out.is_empty(), "a freed secondary invalidates the primary: {out:?}");
+
+        let mut j = Journal::new();
+        j.recorded(3, &[3; 4], primary, Recording::Resets, Vec::new());
+        j.recorded(4, &[4; 4], primary, Recording::Executes, vec![empty]);
+        assert!(j.retained(&all).is_empty(), "a secondary with no recording executes nothing");
+    }
+
+    /// Invalidation runs up the chain: a primary is only as replayable as what it executed is.
+    #[test]
+    fn an_invalid_secondary_takes_everything_that_executed_it() {
+        let k = keys(3);
+        let (inner, middle, outer) = (k[0], k[1], k[2]);
+        let mut j = Journal::new();
+        j.recorded(1, &[1; 4], inner, Recording::Resets, Vec::new());
+        j.recorded(1, &[2; 4], middle, Recording::Resets, Vec::new());
+        j.recorded(4, &[3; 4], middle, Recording::Executes, vec![inner]);
+        j.recorded(1, &[4; 4], outer, Recording::Resets, Vec::new());
+        j.recorded(4, &[5; 4], outer, Recording::Executes, vec![middle]);
+        let live = Some_(vec![inner, middle, outer]);
+        assert_eq!(j.retained(&live).len(), 5, "the whole chain replays while it holds");
+
+        j.recorded(1, &[6; 4], inner, Recording::Resets, Vec::new());
+        let out = j.retained(&live);
+        let wires: Vec<&[u8]> = out.iter().map(|e| e.wire).collect();
+        assert_eq!(
+            wires,
+            [&[6; 4][..]],
+            "the middle executed a recording that is gone, and the outer executed the middle"
+        );
+    }
+
+    /// Compaction changes nothing a later export would say about a primary it found invalid.
+    ///
+    /// Compacting drops an invalid primary's commands. If it dropped the tape with them, the
+    /// primary's next command would start a fresh tape that names nothing it executed, and the
+    /// compacted journal would replay it where the uncompacted one would not.
+    #[test]
+    fn compacting_an_invalid_primary_keeps_it_invalid() {
+        let k = keys(2);
+        let (secondary, primary) = (k[0], k[1]);
+        let live = Some_(vec![secondary, primary]);
+        let world = || {
+            let mut j = Journal::new();
+            j.recorded(1, &[1; 4], secondary, Recording::Resets, Vec::new());
+            j.recorded(3, &[3; 4], primary, Recording::Resets, Vec::new());
+            j.recorded(4, &[4; 4], primary, Recording::Executes, vec![secondary]);
+            j.recorded(1, &[5; 4], secondary, Recording::Resets, Vec::new());
+            j
+        };
+        let mut compacted = world();
+        let mut twin = world();
+        compacted.compact(&live);
+        for j in [&mut compacted, &mut twin] {
+            j.recorded(9, &[9; 4], primary, Recording::Adds, Vec::new());
+        }
+        assert_eq!(compacted.export(&live), twin.export(&live));
+        let out = twin.retained(&live);
+        assert!(!out.iter().any(|e| e.wire == vec![9; 4]), "the primary is still invalid");
     }
 
     /// The pipeline is destroyed and the buffer that binds it is not. Replaying the bind without
@@ -772,8 +978,8 @@ mod tests {
         let (pipeline, buffer) = (k[0], k[1]);
         let mut j = Journal::new();
         j.created(1, &[1; 4], vec![pipeline], Vec::new());
-        j.recorded(2, &[2; 4], buffer, true, Vec::new());
-        j.recorded(3, &[3; 4], buffer, false, vec![pipeline]);
+        j.recorded(2, &[2; 4], buffer, Recording::Resets, Vec::new());
+        j.recorded(3, &[3; 4], buffer, Recording::Adds, vec![pipeline]);
         let out = j.retained(&Some_(vec![buffer]));
         assert_eq!(out.len(), 3, "the pipeline's create has to replay for the bind to");
         assert_eq!(out[0].seq, Seq(1));
@@ -842,8 +1048,8 @@ mod tests {
         j.created(2, &[2; 4], vec![other_pool], Vec::new());
         j.created(3, &[3; 4], vec![mine], vec![pool]);
         j.created(4, &[4; 4], vec![theirs], vec![other_pool]);
-        j.recorded(5, &[5; 4], mine, true, Vec::new());
-        j.recorded(6, &[6; 4], theirs, true, Vec::new());
+        j.recorded(5, &[5; 4], mine, Recording::Resets, Vec::new());
+        j.recorded(6, &[6; 4], theirs, Recording::Resets, Vec::new());
 
         j.pool_reset(&[mine]);
 
@@ -1019,10 +1225,10 @@ mod tests {
         let mut j = Journal::new();
         // Interleaved on purpose: buffer A, a create, buffer B, A again, then ring state. Held
         // apart by container, these come back out in none of their storage orders.
-        j.recorded(10, &[1; 4], buf_a, true, Vec::new()); // seq 1
+        j.recorded(10, &[1; 4], buf_a, Recording::Resets, Vec::new()); // seq 1
         j.created(20, &[2; 4], vec![k[0]], Vec::new()); // seq 2
-        j.recorded(11, &[3; 4], buf_b, true, Vec::new()); // seq 3
-        j.recorded(12, &[4; 4], buf_a, false, Vec::new()); // seq 4
+        j.recorded(11, &[3; 4], buf_b, Recording::Resets, Vec::new()); // seq 3
+        j.recorded(12, &[4; 4], buf_a, Recording::Adds, Vec::new()); // seq 4
         j.ring(30, &[5; 4], r(0xfeed)); // seq 5
 
         let back = parse(&j.export(&Some_(vec![k[0], buf_a, buf_b])).expect("something to say"))
@@ -1054,9 +1260,9 @@ mod tests {
         j.mutated(7, &[7; 4], vec![k[5]], Vec::new()); // a bind into a dead one
         j.undid(8, &[8; 4], vec![k[3]], Vec::new()); // a free whose create is kept
         j.undid(9, &[9; 4], vec![k[4]], Vec::new()); // a free whose create is not
-        j.recorded(10, &[10; 4], k[6], true, Vec::new());
-        j.recorded(11, &[11; 4], k[6], false, vec![k[0]]);
-        j.recorded(12, &[12; 4], k[7], true, Vec::new());
+        j.recorded(10, &[10; 4], k[6], Recording::Resets, Vec::new());
+        j.recorded(11, &[11; 4], k[6], Recording::Adds, vec![k[0]]);
+        j.recorded(12, &[12; 4], k[7], Recording::Resets, Vec::new());
         j.ring_created(13, &[13; 4], r(0xaa));
         j.ring_latest(14, &[14; 4], Owner::Ring(r(0xaa)), Some(r(0xaa)));
         j
@@ -1093,7 +1299,7 @@ mod tests {
 
         // The world moves on, identically for both.
         for j in [&mut compacted, &mut twin] {
-            j.recorded(20, &[20; 4], k[6], true, Vec::new());
+            j.recorded(20, &[20; 4], k[6], Recording::Resets, Vec::new());
             j.mutated(21, &[21; 4], vec![k[2]], vec![k[1]]);
         }
 

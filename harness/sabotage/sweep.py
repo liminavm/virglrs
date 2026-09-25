@@ -2316,6 +2316,29 @@ SABOTAGES = [
         """""",
         'a_pool_is_trimmed_only_through_its_own_device',
     ),
+    (
+        'a primary replays after the secondary it executed is recorded again',
+        'src/venus/journal.rs',
+        """Item::Recording(b, _) => replayable.contains(b),""",
+        """Item::Recording(b, _) => live.holds(*b),""",
+        'recording_the_secondary_again_drops_the_primary_that_executed_it',
+    ),
+    (
+        'an invalid secondary does not invalidate what executed it',
+        'src/venus/journal.rs',
+        """            if broken.is_empty() {
+                break;""",
+        """            if !broken.is_empty() || broken.is_empty() {
+                break;""",
+        'an_invalid_secondary_takes_everything_that_executed_it',
+    ),
+    (
+        'compaction drops the tape of a live buffer it emptied',
+        'src/venus/journal.rs',
+        """!t.commands.is_empty() || live.holds(*b)""",
+        """!t.commands.is_empty()""",
+        'compacting_an_invalid_primary_keeps_it_invalid',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
