@@ -1,13 +1,17 @@
 # The venus commands this build does not serve, and why each one is here.
 #
-# A guest may legally send any of these. It is offered every extension the host driver has and the
-# pinned vk.xml can *serialize* (our `vkEnumerateDeviceExtensionProperties` answer; the capset's
-# mask only says which structs its encoder may use), and every core command of the version it is
-# told -- and a third of the lines below are core, down to 1.0, which no extension list can take
-# back. So the ledger is closed by serving, never by hiding. Each of these poisons its context.
-# That is the right answer -- a zeroed reply is shaped exactly like a successful one, so there is
-# no safe way to continue -- but it is only the right answer while the set is a decision rather
-# than an accident.
+# This file also decides what a guest is offered. Our `vkEnumerateDeviceExtensionProperties` answer
+# is every extension the host driver has and the pinned vk.xml can serialize, minus each one a
+# guest could only use by sending a line below -- and minus what depends on one of those. Every
+# status but `not-in-reference` withholds (`ledger::Status::withholds` says why); serving an
+# extension's last line is what puts it back. The capset's mask is not this list: it only says
+# which structs the guest's encoder may use.
+#
+# Withholding cannot close the ledger. Core commands of the version the guest is told are its to
+# send whatever the extension list says, and some lines below are core, down to 1.0. So the ledger
+# is closed by serving. A guest that sends a line anyway poisons its context. That is the right
+# answer -- a zeroed reply is shaped exactly like a successful one, so there is no safe way to
+# continue -- but it is only the right answer while the set is a decision rather than an accident.
 #
 # This file is that decision, and a bare list of names could not be: it says nothing about whether
 # a line is work we owe or a command nothing here can reach. So each line carries a

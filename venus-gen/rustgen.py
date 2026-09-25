@@ -60,7 +60,8 @@ PRIMITIVE_ZERO = {
 class RustGen:
     """Renders vk.xml's types as Rust. Holds no state beyond the model and the API constants."""
 
-    def __init__(self, gen, constants, bitfields=None, member_order=None, handle_parents=None):
+    def __init__(self, gen, constants, bitfields=None, member_order=None, handle_parents=None,
+                 extension_requirements=None):
         self.gen = gen
         # vk.xml's "API Constants" block, which the C generator never needs (it includes
         # vulkan.h) and which this one does: they are the static array dimensions.
@@ -74,6 +75,9 @@ class RustGen:
         # Each handle's owning handle. The model drops vk.xml's `parent`; `gen.handle_parents`
         # says why, and `pool_children` is the only thing that reads it.
         self.handle_parents = handle_parents or {}
+        # Each extension's `depends` and its commands, raw. `gen.extension_requirements` says why
+        # the model's copy will not do; `render_info` is the only thing that reads it.
+        self.extension_requirements = extension_requirements or {}
 
     # --- names ---
 
@@ -1332,6 +1336,7 @@ class RustGen:
             out.append('    ("%s", %d, %d),' % (e.name, e.number, e.version))
         out += ['];', '']
 
+        out += self._extension_wire(exts)
         out += ['/// The extension\'s entry, or `None` if this build does not serialize it.',
                 'pub fn extension(name: &str) -> Option<&\'static (&\'static str, u32, u32)> {',
                 '    EXTENSIONS.binary_search_by_key(&name, |e| e.0).ok().map(|i| &EXTENSIONS[i])',
@@ -1351,6 +1356,108 @@ class RustGen:
                 '}',
                 '']
         return '\n'.join(out)
+
+    def _depends(self, text):
+        """A vk.xml `depends` expression as an OR of ANDs of device extension names.
+
+        `,` is or and `+` is and, at one precedence and read left to right: `A+B,C` is
+        `(A+B),C`, as the registry's own `parse_dependency.py` parses it. A core version or an instance extension is
+        taken as met: the renderer runs on no device below the version venus needs, and instance
+        extensions are not in a device's list to be withheld from it. So `[[]]`, one empty AND,
+        is "always", and is also what no `depends` at all gives.
+        """
+        if not text:
+            return [[]]
+        instance = {n for n, (kind, _, _) in self.extension_requirements.items()
+                    if kind == 'instance'}
+        tokens = re.findall(r'[A-Za-z0-9_:]+|[(),+]', text)
+        assert ''.join(tokens) == text.replace(' ', ''), text
+        pos = 0
+
+        def expr():
+            nonlocal pos
+            clauses = term()
+            while pos < len(tokens) and tokens[pos] in ',+':
+                op = tokens[pos]
+                pos += 1
+                rhs = term()
+                clauses = (clauses + rhs if op == ','
+                           else [a + b for a in clauses for b in rhs])
+            return clauses
+
+        def term():
+            nonlocal pos
+            tok = tokens[pos]
+            pos += 1
+            if tok == '(':
+                inner = expr()
+                assert tokens[pos] == ')', text
+                pos += 1
+                return inner
+            assert tok.startswith('VK_') and '::' not in tok, (tok, text)
+            if tok.startswith('VK_VERSION_') or tok in instance:
+                return [[]]
+            return [[tok]]
+
+        clauses = expr()
+        assert pos == len(tokens), text
+        clauses = {frozenset(c) for c in clauses}
+        # An AND that holds whenever a smaller one does adds nothing to the OR.
+        clauses = [c for c in clauses if not any(o < c for o in clauses)]
+        return sorted(sorted(c) for c in clauses)
+
+    def _extension_wire(self, exts):
+        """What each serialized extension puts on the wire, and what it needs beside it.
+
+        The renderer declines to advertise an extension whose commands it does not serve, and
+        with it every extension that depends on one declined. Only commands the protocol
+        serializes are listed: nothing else can reach a handler, so nothing else can be unserved.
+        """
+        wire = {c.name for c in self.gen.supported_types[VkType.COMMAND]}
+        table = self.gen.reg.type_table
+
+        def canonical(names):
+            return sorted({table[n].name for n in names
+                           if n in table and table[n].name in wire})
+
+        def strs(names):
+            return '&[%s]' % ', '.join('"%s"' % n for n in names)
+
+        def cond(clauses):
+            return '&[%s]' % ', '.join(strs(c) for c in clauses)
+
+        out = ['/// What one extension puts on the wire, and what it needs beside it.',
+               '///',
+               '/// A condition is an OR of ANDs of device extension names, from vk.xml\'s',
+               '/// `depends`: `&[&[]]`, one empty AND, always holds.',
+               'pub struct ExtensionWire {',
+               '    pub name: &\'static str,',
+               '    /// What must be advertised with it.',
+               '    pub depends: &\'static [&\'static [&\'static str]],',
+               '    /// The commands it always adds.',
+               '    pub commands: &\'static [&\'static str],',
+               '    /// Commands it adds only while a condition holds.',
+               '    pub dependent: &\'static [(&\'static [&\'static [&\'static str]], &\'static [&\'static str])],',
+               '}',
+               '',
+               '/// Every serialized extension\'s wire, sorted by name like `EXTENSIONS`.',
+               'pub static EXTENSION_WIRE: &[ExtensionWire] = &[']
+        for e in exts:
+            kind, depends, requires = self.extension_requirements[e.name]
+            always, dependent = set(), {}
+            for dep, names in requires:
+                clauses = self._depends(dep)
+                if clauses == [[]]:
+                    always.update(canonical(names))
+                else:
+                    dependent.setdefault(tuple(map(tuple, clauses)), set()).update(
+                        canonical(names))
+            groups = [(c, sorted(n)) for c, n in sorted(dependent.items()) if n]
+            out.append('    ExtensionWire { name: "%s", depends: %s, commands: %s, dependent: &[%s] },'
+                       % (e.name, cond(self._depends(depends)), strs(sorted(always)),
+                          ', '.join('(%s, %s)' % (cond(c), strs(n)) for c, n in groups)))
+        out += ['];', '']
+        return out
 
     # --- the reply oracle's fill ---
 

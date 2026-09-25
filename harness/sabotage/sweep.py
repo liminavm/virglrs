@@ -2361,6 +2361,45 @@ SABOTAGES = [
         """        let f = d.fns.try_vkTrimCommandPool()?;""",
         'a_pool_is_trimmed_only_through_its_own_device',
     ),
+    (
+        'an extension whose commands are unserved is advertised',
+        'src/venus/driver.rs',
+        """        offered.retain(|name| served.contains(name));
+""",
+        """        let _ = served;
+""",
+        'no_advertised_extension_needs_a_command_this_build_does_not_serve',
+    ),
+    (
+        "a dependency's group counts whether or not the dependency is offered",
+        'src/venus/driver.rs',
+        """                let live = e.dependent.iter().filter(|(cond, _)| holds(cond, &offered));""",
+        """                let live = e.dependent.iter();""",
+        'a_dependent_command_withholds_its_extension_only_while_the_dependency_is_offered',
+    ),
+    (
+        'an extension is advertised without what it depends on',
+        'src/venus/driver.rs',
+        """                !holds(e.depends, &offered)
+                    ||""",
+        """                false
+                    ||""",
+        'an_extension_is_withheld_with_what_it_depends_on',
+    ),
+    (
+        'vkCreateDevice enables an extension it never offered',
+        'src/venus/driver.rs',
+        """        if guest.iter().any(|name| !advertised.contains(&name.as_str())) {""",
+        """        if guest.iter().any(|name| !advertised.contains(&name.as_str())) && false {""",
+        'a_device_cannot_enable_an_extension_it_was_not_offered',
+    ),
+    (
+        'not-in-reference lines withhold their extensions',
+        'src/venus/ledger.rs',
+        """        self != Status::NotInReference""",
+        """        true""",
+        'no_advertised_extension_needs_a_command_this_build_does_not_serve',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

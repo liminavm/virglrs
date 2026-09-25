@@ -104,6 +104,35 @@ def handle_parents(vk_xml):
     return parents
 
 
+def extension_requirements(xmls):
+    """Each Vulkan extension's `depends` expressions and the commands each `<require>` adds.
+
+    The model keeps neither faithfully. It reads `requires`, the attribute vk.xml replaced with
+    `depends`, and it flattens a `<require>`'s `depends` by stripping every parenthesis, which
+    reads `(A,B)+C` as `A,B+C`. The renderer needs both whole to decide which extensions it can
+    advertise, so they are read here raw and parsed by the generator.
+
+    Read from vk.xml and venus's private XMLs, which declare the protocol's own extensions.
+    Returns `{name: (type, depends, [(depends, [command])])}`, where a `depends` is the attribute's
+    text or None.
+    """
+    out = {}
+    exts = [e for xml in xmls for e in ET.parse(xml).getroot().iter('extension')]
+    for ext in exts:
+        if 'vulkan' not in ext.get('supported', '').split(','):
+            continue
+        requires = []
+        for req in ext.iter('require'):
+            if 'vulkan' not in req.get('api', 'vulkan').split(','):
+                continue
+            commands = [c.get('name') for c in req.iter('command')]
+            if commands:
+                requires.append((req.get('depends'), commands))
+        out[ext.get('name')] = (ext.get('type'), ext.get('depends'), requires)
+    assert out, 'no extensions in %s' % xmls
+    return out
+
+
 def check_template_engine(Template):
     """Refuse a mako that rewrites the templates while rendering them.
 
@@ -152,7 +181,9 @@ def main():
     rust = RustGen(gen, api_constants(vk_xml), bitfield_types(vk_xml),
                    member_order([vn_protocol.VN_PROTOCOL_VK_XML]
                                 + list(vn_protocol.VN_PROTOCOL_PRIVATE_XMLS)),
-                   handle_parents(vk_xml))
+                   handle_parents(vk_xml),
+                   extension_requirements([vn_protocol.VN_PROTOCOL_VK_XML]
+                                          + list(vn_protocol.VN_PROTOCOL_PRIVATE_XMLS)))
 
     check_template_engine(Template)
 

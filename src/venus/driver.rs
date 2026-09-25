@@ -20,6 +20,7 @@ use super::ring_thread::BarrierWaiter;
 use crate::ids::{ContextId, FenceId, RingIdx};
 
 use super::cs::{self, Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
+use super::ledger;
 use super::objects::Doomed;
 use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBindDescriptorSetsInfo,
@@ -417,6 +418,11 @@ pub struct Driver {
     /// always "does this driver have <name>", and a hand-maintained struct of booleans is a list
     /// that has to be extended every time a new name matters.
     physical_device_exts: BTreeMap<VkPhysicalDevice, BTreeSet<String>>,
+    /// The commands whose extensions are not advertised, read off `unserved.txt` once.
+    ///
+    /// Held here rather than read at each query so a test can stand a ledger of its own up in
+    /// its place, and so no test has to change when a command is served.
+    withheld: BTreeSet<&'static str>,
     /// How big each live allocation is, by the guest's id.
     ///
     /// Only the size. The handle and the owning device are the object table's to know, and this
@@ -1376,6 +1382,49 @@ fn ptr<T>(r: Option<cs::Decoded<'_, T>>) -> *const T {
     r.map_or(core::ptr::null(), |r| r.get() as *const T)
 }
 
+/// The extensions out of `offered` that can be advertised, given the commands this build does not
+/// serve.
+///
+/// One goes if a guest that enabled it could send an unserved command, or if something it depends
+/// on has gone. A command vk.xml requires only alongside another extension counts only while that
+/// other one is still offered -- `vkCmdDrawMeshTasksIndirectCountEXT` is `VK_EXT_mesh_shader`'s
+/// only with `VK_KHR_draw_indirect_count` -- so one leaving can switch another's group off, and
+/// another's dependency with it. The pass repeats until nothing more goes. What it keeps is always
+/// safe to advertise; it may keep less than the most that would be.
+fn served_extensions<'a>(
+    mut offered: BTreeSet<&'a str>,
+    unserved: &BTreeSet<&str>,
+) -> BTreeSet<&'a str> {
+    use crate::venus::proto::info::EXTENSION_WIRE;
+    let holds = |cond: &[&[&str]], offered: &BTreeSet<&str>| {
+        cond.iter().any(|all| all.iter().all(|name| offered.contains(name)))
+    };
+    loop {
+        let short: Vec<&str> = offered
+            .iter()
+            .copied()
+            .filter(|name| {
+                let Ok(i) = EXTENSION_WIRE.binary_search_by_key(name, |e| e.name) else {
+                    return false;
+                };
+                let e = &EXTENSION_WIRE[i];
+                let live = e.dependent.iter().filter(|(cond, _)| holds(cond, &offered));
+                !holds(e.depends, &offered)
+                    || e.commands
+                        .iter()
+                        .chain(live.flat_map(|(_, c)| c.iter()))
+                        .any(|c| unserved.contains(c))
+            })
+            .collect();
+        if short.is_empty() {
+            return offered;
+        }
+        for name in short {
+            offered.remove(name);
+        }
+    }
+}
+
 /// One extension name and version as Vulkan's own struct, or `None` for a name this build's
 /// vk.xml does not know.
 ///
@@ -1450,6 +1499,7 @@ impl Driver {
             instance: None,
             devices: BTreeMap::new(),
             physical_device_exts: BTreeMap::new(),
+            withheld: ledger::withheld(),
             memory: BTreeMap::new(),
             images: BTreeMap::new(),
             query_pools: BTreeMap::new(),
@@ -1642,11 +1692,25 @@ impl Driver {
     /// change for the life of the instance -- and a device it could not ask is not enumerated to
     /// the guest at all, so an empty answer here is a device the guest was never given.
     pub fn advertised_extensions(&self, pd: VkPhysicalDevice) -> Vec<VkExtensionProperties> {
+        self.advertised_names(pd).into_iter().filter_map(extension_properties).collect()
+    }
+
+    /// The names behind [`Driver::advertised_extensions`], which is also what `vkCreateDevice`
+    /// accepts: the guest may enable exactly what it was told it has.
+    ///
+    /// An extension this build serializes but does not serve is left off. Its commands are on
+    /// `unserved.txt`, so a guest that enabled it would be poisoned the first time it used it;
+    /// not being offered it is the answer a guest can act on. Which extensions that is follows
+    /// the ledger -- serving an extension's last command is what puts it back.
+    fn advertised_names(&self, pd: VkPhysicalDevice) -> Vec<&str> {
         let Some(names) = self.physical_device_exts.get(&pd) else {
             return Vec::new();
         };
-        let mut out: Vec<VkExtensionProperties> =
-            names.iter().filter_map(|name| extension_properties(name)).collect();
+        let mut offered: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| crate::venus::proto::info::extension(name).is_some())
+            .collect();
 
         // The two the Metal path provides, advertised even though the driver has neither.
         //
@@ -1664,9 +1728,15 @@ impl Driver {
         // here, and stripped from the list the device is created with, because the driver would
         // fail `vkCreateDevice` outright for an extension it does not have.
         if self.emulates_fd_external_memory(pd) {
-            out.extend(EMULATED_ON_THE_HOST.iter().filter_map(|n| extension_properties(n)));
+            offered.extend(
+                EMULATED_ON_THE_HOST
+                    .iter()
+                    .filter(|n| crate::venus::proto::info::extension(n).is_some()),
+            );
         }
-        out
+        let served = served_extensions(offered.iter().copied().collect(), &self.withheld);
+        offered.retain(|name| served.contains(name));
+        offered
     }
 
     /// Whether `EMULATED_ON_THE_HOST` on this physical device means this renderer rather than the
@@ -1739,6 +1809,13 @@ impl Driver {
             }
             .unwrap_or_default(),
         );
+        // An extension it was not told it has is one the driver would happily enable -- the host
+        // may well have it -- and this renderer would then fail to serve. The answer is the one a
+        // driver gives for an extension it lacks.
+        let advertised = self.advertised_names(pd);
+        if guest.iter().any(|name| !advertised.contains(&name.as_str())) {
+            return Err(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT);
+        }
         let wanted = self.device_extensions(pd, &guest.iter().map(|s| &**s).collect::<Vec<_>>());
 
         // The list Vulkan reads has to be NUL-terminated pointers, and both it and the strings it
@@ -3340,6 +3417,12 @@ impl Driver {
     #[cfg(test)]
     pub(super) fn plant_extensions(&mut self, pd: VkPhysicalDevice, names: &[&str]) {
         self.physical_device_exts.insert(pd, names.iter().map(|n| n.to_string()).collect());
+    }
+
+    /// Stand a ledger of the test's own up in place of `unserved.txt`.
+    #[cfg(test)]
+    pub(super) fn plant_withheld(&mut self, commands: &[&'static str]) {
+        self.withheld = commands.iter().copied().collect();
     }
 
     /// Stand an instance table up with no loader behind it, so an instance-level query has
@@ -8954,6 +9037,145 @@ mod tests {
                 "{want} is not claimed where nothing emulates it",
             );
         }
+    }
+
+    /// A guest is not offered an extension it could only use by sending a command this build
+    /// does not serve.
+    ///
+    /// Held against the real ledger rather than a planted one: every extension this build
+    /// serializes is offered at once, and whatever comes back must carry no withheld command in
+    /// any group its dependencies switch on. That stays true whatever is served next, and it
+    /// fails the day the filter goes -- `unserved.txt` has extensions on it for as long as it has
+    /// anything reachable.
+    #[test]
+    fn no_advertised_extension_needs_a_command_this_build_does_not_serve() {
+        use crate::venus::proto::info::{EXTENSION_WIRE, EXTENSIONS};
+        const PD: VkPhysicalDevice = VkPhysicalDevice::forged(1);
+
+        let mut driver = Driver::new(Account::for_test(None));
+        let everything: Vec<&str> = EXTENSIONS.iter().map(|e| e.0).collect();
+        driver.plant_extensions(PD, &everything);
+        let advertised: BTreeSet<&str> = driver.advertised_names(PD).into_iter().collect();
+        let withheld = ledger::withheld();
+        let holds =
+            |cond: &[&[&str]]| cond.iter().any(|all| all.iter().all(|d| advertised.contains(d)));
+
+        for e in EXTENSION_WIRE.iter().filter(|e| advertised.contains(e.name)) {
+            assert!(holds(e.depends), "{} is advertised without what it depends on", e.name);
+            let live = e.dependent.iter().filter(|(cond, _)| holds(cond));
+            for command in e.commands.iter().chain(live.flat_map(|(_, c)| c.iter())) {
+                assert!(
+                    !withheld.contains(command),
+                    "{} is advertised, and a guest that enables it can send {command}, which \
+                     unserved.txt says nothing here serves",
+                    e.name,
+                );
+            }
+        }
+        // `not-in-reference` withholds nothing: these are answered guest-side, and the guest has
+        // them whether or not the renderer serves a line of them.
+        for kept in ["VK_KHR_map_memory2", "VK_EXT_private_data"] {
+            assert!(advertised.contains(kept), "{kept} works without the renderer; keep it");
+        }
+    }
+
+    /// An extension's commands that vk.xml adds only alongside another extension count only
+    /// while that other one is advertised too.
+    #[test]
+    fn a_dependent_command_withholds_its_extension_only_while_the_dependency_is_offered() {
+        const ALONE: VkPhysicalDevice = VkPhysicalDevice::forged(1);
+        const BOTH: VkPhysicalDevice = VkPhysicalDevice::forged(2);
+
+        let mut driver = Driver::new(Account::for_test(None));
+        // `vkCmdPushDescriptorSet2` is `VK_KHR_maintenance6`'s only where
+        // `VK_KHR_push_descriptor` is enabled too, and is not push_descriptor's own.
+        driver.plant_withheld(&["vkCmdPushDescriptorSet2"]);
+        driver.plant_extensions(ALONE, &["VK_KHR_maintenance6"]);
+        driver.plant_extensions(BOTH, &["VK_KHR_maintenance6", "VK_KHR_push_descriptor"]);
+        assert_eq!(driver.advertised_names(ALONE), ["VK_KHR_maintenance6"]);
+        assert_eq!(driver.advertised_names(BOTH), ["VK_KHR_push_descriptor"]);
+
+        // And one the extension always adds withholds it outright.
+        driver.plant_withheld(&["vkCmdPushConstants2"]);
+        assert!(driver.advertised_names(ALONE).is_empty());
+    }
+
+    /// An extension goes with what it depends on: `VK_KHR_ray_query` adds no command of its own,
+    /// and is still not advertised once `VK_KHR_acceleration_structure` is not -- a guest may not
+    /// be offered one without the other.
+    #[test]
+    fn an_extension_is_withheld_with_what_it_depends_on() {
+        const PD: VkPhysicalDevice = VkPhysicalDevice::forged(1);
+        let offered = [
+            "VK_KHR_acceleration_structure",
+            "VK_KHR_deferred_host_operations",
+            "VK_KHR_ray_query",
+        ];
+
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_extensions(PD, &offered);
+        driver.plant_withheld(&[]);
+        assert_eq!(driver.advertised_names(PD), offered, "the positive control: all served");
+
+        driver.plant_withheld(&["vkCreateAccelerationStructureKHR"]);
+        assert_eq!(driver.advertised_names(PD), ["VK_KHR_deferred_host_operations"]);
+    }
+
+    /// The guest may enable what it was told it has and nothing else: an extension left off the
+    /// list is refused at `vkCreateDevice` as a driver refuses one it lacks, and the driver is
+    /// never asked -- it would have said yes, because the host has it.
+    #[test]
+    fn a_device_cannot_enable_an_extension_it_was_not_offered() {
+        use std::cell::Cell;
+        const PD: VkPhysicalDevice = VkPhysicalDevice::forged(1);
+        thread_local! {
+            static ASKED: Cell<u32> = const { Cell::new(0) };
+        }
+        unsafe extern "C" fn create(
+            _pd: VkPhysicalDevice,
+            _info: *const VkDeviceCreateInfo,
+            _alloc: *const VkAllocationCallbacks,
+            _out: *mut VkDevice,
+        ) -> VkResult {
+            ASKED.with(|a| a.set(a.get() + 1));
+            // Failing is what keeps this test from standing a device up behind no loader.
+            VkResult::VK_ERROR_INITIALIZATION_FAILED
+        }
+
+        let mut driver = Driver::new(Account::for_test(None));
+        let mut fns = InstanceFns::default();
+        fns.plant_vkCreateDevice(create);
+        driver.plant_instance(fns);
+        driver.plant_withheld(&["vkCmdDrawMeshTasksEXT"]);
+        driver.plant_extensions(PD, &["VK_EXT_mesh_shader", "VK_KHR_draw_indirect_count"]);
+
+        let create_with = |driver: &mut Driver, name: &std::ffi::CStr| {
+            let names = [name.as_ptr()];
+            let info = VkDeviceCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+                enabledExtensionCount: 1,
+                ppEnabledExtensionNames: names.as_ptr(),
+                ..Default::default()
+            };
+            driver.create_device(PD, cs::Decoded::planted(&info), None)
+        };
+
+        for refused in [c"VK_EXT_mesh_shader", c"VK_KHR_maintenance10"] {
+            assert_eq!(
+                create_with(&mut driver, refused),
+                Err(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT),
+                "{refused:?} was not offered",
+            );
+        }
+        assert_eq!(ASKED.with(Cell::get), 0, "a refused extension never reaches the driver");
+
+        // The positive control: an offered one is forwarded, and the driver's answer comes back.
+        assert_eq!(
+            create_with(&mut driver, c"VK_KHR_draw_indirect_count"),
+            Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+        );
+        assert_eq!(ASKED.with(Cell::get), 1);
+        driver.abandon_planted();
     }
 
     /// The query half of the same promise: a guest told it has dma-buf images must not then be
