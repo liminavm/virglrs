@@ -511,7 +511,7 @@ SABOTAGES = [
     (
         'a command a guest may send reaches no handler and is on no ledger',
         'src/venus/unserved.txt',
-        'vkQueueBindSparse                                  wanted:sparse-binding\n',
+        'vkQueueBindSparse                                  no-host-feature:sparse-binding\n',
         '',
         'venus::context::tests::every_command_the_protocol_defines_is_served_or_on_the_ledger',
     ),
