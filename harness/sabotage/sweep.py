@@ -1144,13 +1144,13 @@ SABOTAGES = [
     (
         'only the fd half of the emulated external memory is advertised',
         'src/venus/driver.rs',
-        """            out.extend(EMULATED_ON_THE_HOST.iter().filter_map(|n| extension_properties(n)));""",
-        """            out.extend(
-                EMULATED_ON_THE_HOST
+        """                EMULATED_ON_THE_HOST
+                    .iter()
+                    .filter(|n| crate::venus::proto::info::extension(n).is_some()),""",
+        """                EMULATED_ON_THE_HOST
                     .iter()
                     .take(1)
-                    .filter_map(|n| extension_properties(n)),
-            );""",
+                    .filter(|n| crate::venus::proto::info::extension(n).is_some()),""",
         '',
     ),
     (
