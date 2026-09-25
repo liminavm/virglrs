@@ -80,3 +80,5 @@ On the host, for the positive control, the loader and headers are Homebrew's:
 | `render_pass2.c` | `render-pass2` | 5 | 6/6 on KosmicKrisp, Apple M1 Max, and on anv, Intel Iris Plus (ICL GT2), both Vulkan 1.4 | not yet run |
 | `copy_commands2.c` | `copy-commands2` | 6 | 4/4 on KosmicKrisp, Apple M1 Max, and on anv, Intel Iris Plus (ICL GT2), both Vulkan 1.4 | not yet run |
 | `secondary_command_buffers.c` | `secondary-command-buffers` | 2 | 14/14 on KosmicKrisp, Apple M1 Max, and on anv, Intel Iris Plus (ICL GT2), both Vulkan 1.4. The trim is scored by the log only | not yet run |
+| `depth_bias2.c` | `depth-bias-control` | 1 | 5/5 on anv, Intel Iris Plus (ICL GT2), Vulkan 1.4; KosmicKrisp lacks the extension | not yet run |
+| `logic_op.c` | `extended-dynamic-state2` | 1 | 3/3 on anv, Intel Iris Plus (ICL GT2), Vulkan 1.4; KosmicKrisp lacks `extendedDynamicState2LogicOp` | not yet run |
