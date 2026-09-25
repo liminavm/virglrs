@@ -55,12 +55,13 @@ use super::proto::types::{
     VkPushDescriptorSetInfo, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
     VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
     VkRenderPassBeginInfo, VkRenderingInfo, VkResolveImageInfo2, VkResult, VkRingMonitorInfoMESA,
-    VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo,
-    VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo,
-    VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags,
-    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
-    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassBeginInfo, VkSubpassContents,
-    VkSubpassEndInfo, VkTimelineSemaphoreSubmitInfo, VkViewport, VkWriteDescriptorSet,
+    VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampler, VkSamplerYcbcrConversion,
+    VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
+    VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
+    VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags,
+    VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo, VkSubmitInfo2,
+    VkSubpassBeginInfo, VkSubpassContents, VkSubpassEndInfo, VkTimelineSemaphoreSubmitInfo,
+    VkViewport, VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
@@ -4793,6 +4794,19 @@ impl Driver {
         let f = self.recorder(cb)?.try_vkCmdSetLogicOpEXT()?;
         // SAFETY: as above.
         unsafe { f(cb, op) };
+        Some(())
+    }
+
+    /// `vkCmdSetSampleLocationsEXT`: custom sample positions, as a struct carrying its own array
+    /// of locations -- reconciled with its count by the decoder -- so a forward of that struct.
+    pub fn cmd_set_sample_locations(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkSampleLocationsInfoEXT>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetSampleLocationsEXT()?;
+        // SAFETY: as above; `info` is a struct the decoder built, live for the call.
+        unsafe { f(cb, info.get()) };
         Some(())
     }
 

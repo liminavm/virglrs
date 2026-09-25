@@ -107,7 +107,6 @@ vkCmdSetRasterizationStreamEXT                     wanted:extended-dynamic-state
 vkCmdSetRayTracingPipelineStackSizeKHR             out-of-reach:ray-tracing-pipeline
 vkCmdSetRenderingAttachmentLocations               wanted:dynamic-rendering-locations
 vkCmdSetRenderingInputAttachmentIndices            wanted:dynamic-rendering-locations
-vkCmdSetSampleLocationsEXT                         wanted:sample-locations
 vkCmdSetSampleLocationsEnableEXT                   wanted:extended-dynamic-state3
 vkCmdSetSampleMaskEXT                              wanted:extended-dynamic-state3
 vkCmdSetTessellationDomainOriginEXT                wanted:extended-dynamic-state3

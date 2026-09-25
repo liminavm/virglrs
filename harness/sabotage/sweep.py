@@ -2217,6 +2217,13 @@ SABOTAGES = [
         unsafe { f(cb, VkLogicOp::VK_LOGIC_OP_COPY) };""",
         'logic_op_hands_the_driver_the_guests_op',
     ),
+    (
+        'vkCmdSetSampleLocationsEXT is recorded as nothing',
+        'src/venus/context.rs',
+        """        let done = self.driver.cmd_set_sample_locations(args.commandBuffer, info);""",
+        """        let done = Some(()).filter(|_| info.get().sampleLocationsCount != u32::MAX);""",
+        'sample_locations_hand_the_driver_the_guests_struct',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
