@@ -748,6 +748,13 @@ class RustGen:
         guard = access if len(parts) > 1 or holders[0].ty.is_pointer() else None
         newtype = holders[-1].ty.base.category in (VkType.BASETYPE, VkType.ENUM, VkType.BITMASK)
 
+        # A length that is arithmetic on the member -- `(samples + 31) / 32` -- is evaluated in
+        # `i128`, where no member of 64 bits or fewer can overflow it. In the member's own type
+        # the guest picks a value that does, and an overflow check aborts the worker. What comes
+        # out is only a count to compare with the wire's, so a negative one is just a mismatch.
+        def widen(a):
+            return '(%s as i128)' % a if expr.strip() != name else a
+
         # When the holder is a reference member, the null check the C guards this read with is the
         # match itself, and there is no pointer left to dereference. `h` rather than a name from
         # vk.xml, so no member can shadow it.
@@ -756,7 +763,7 @@ class RustGen:
                 else ('(*h)' if newtype else '*h')
             if newtype:
                 access = '%s.0' % access
-            inner = expr.replace(name, access)
+            inner = expr.replace(name, widen(access))
             return 'match %s { Some(h) => (%s) as u64, None => 0 }' % (guard, inner)
 
         if len(parts) > 1:
@@ -765,7 +772,7 @@ class RustGen:
             access = '(*%s)' % access if newtype else '*%s' % access
         if newtype:
             access = '%s.0' % access
-        inner = expr.replace(name, access)
+        inner = expr.replace(name, widen(access))
         if guard:
             # SAFETY, at every use: the pointer came out of the decoder's arena, and the decode of
             # the member that holds it ran before the one this length belongs to.

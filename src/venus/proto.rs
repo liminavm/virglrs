@@ -542,6 +542,45 @@ mod tests {
         assert_eq!(enc.written()[8..], w[..]);
     }
 
+    /// A length that is arithmetic on a guest's number is computed where the number cannot
+    /// overflow it.
+    ///
+    /// vk.xml sizes a sample mask as `(samples + 31) / 32`, and `samples` is an `i32` the guest
+    /// chose. Evaluated in that type, a guest that sends `i32::MAX` overflows the addition, which
+    /// is an abort in any build with overflow checks -- the guest taking down the worker with
+    /// one field. The length is whatever the arithmetic says; a guest whose array does not match
+    /// it is refused like any other mismatched count.
+    #[test]
+    fn a_computed_length_does_not_overflow_on_the_guests_number() {
+        fn decode(samples: i32, masks: &[u32]) -> (bool, Option<Vec<u32>>) {
+            let mut parts: Vec<Vec<u8>> = vec![
+                7u64.to_le_bytes().to_vec(),
+                samples.to_le_bytes().to_vec(),
+                (masks.len() as u64).to_le_bytes().to_vec(),
+            ];
+            parts.extend(masks.iter().map(|m| m.to_le_bytes().to_vec()));
+            let w = wire(&parts.iter().map(Vec::as_slice).collect::<Vec<_>>());
+            let temp = Bump::new();
+            let hard = AtomicBool::new(false);
+            let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
+            let mut args = vn_command_vkCmdSetSampleMaskEXT::default();
+            vn_decode_vkCmdSetSampleMaskEXT_args_temp(&mut dec, &mut args);
+            // A failed decode is never dispatched, and its members are not what the accessor
+            // assumes, so only a clean one is read.
+            if dec.fatal() {
+                return (true, None);
+            }
+            (false, args.pSampleMask().map(|m| m.iter().map(|m| m.0).collect()))
+        }
+
+        assert_eq!(decode(64, &[1, 2]), (false, Some(vec![1, 2])), "64 samples, two words");
+        assert_eq!(decode(1, &[5]), (false, Some(vec![5])), "one sample, one word");
+        let (fatal, _) = decode(i32::MAX, &[1]);
+        assert!(fatal, "the largest count the guest can name is a mismatch, not an overflow");
+        let (fatal, _) = decode(i32::MIN, &[1]);
+        assert!(fatal, "and so is the most negative");
+    }
+
     /// The capset hands the guest a bitmask indexed by extension number, and the guest reads it
     /// to decide what it may send. A table that disagrees with what the serializer can actually
     /// decode is a protocol mismatch that shows up as a corrupt stream, not as an error.

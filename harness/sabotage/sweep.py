@@ -2285,6 +2285,13 @@ SABOTAGES = [
         """offsets.as_ptr(), core::ptr::null())""",
         'transform_feedback_hands_the_driver_the_guests_arrays',
     ),
+    (
+        'computed-length-in-member-type',
+        'venus-gen/rustgen.py',
+        """return '(%s as i128)' % a if expr.strip() != name else a""",
+        """return a""",
+        'a_computed_length_does_not_overflow_on_the_guests_number',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
