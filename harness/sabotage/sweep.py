@@ -2339,6 +2339,16 @@ SABOTAGES = [
         """!t.commands.is_empty()""",
         'compacting_an_invalid_primary_keeps_it_invalid',
     ),
+    (
+        "vkCmdExecuteCommands runs another device's buffer",
+        'src/venus/driver.rs',
+        """        if !secondaries.iter().all(|s| self.pools.device_of(*s) == Some(device)) {
+            return None;
+        }
+""",
+        """""",
+        'execute_commands_runs_only_the_primarys_own_devices_buffers',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

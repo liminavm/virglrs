@@ -58,12 +58,13 @@ use super::proto::types::{
     vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndConditionalRenderingEXT,
     vn_command_vkCmdEndQuery, vn_command_vkCmdEndQueryIndexedEXT, vn_command_vkCmdEndRenderPass,
     vn_command_vkCmdEndRenderPass2, vn_command_vkCmdEndRendering,
-    vn_command_vkCmdEndTransformFeedbackEXT, vn_command_vkCmdFillBuffer,
-    vn_command_vkCmdNextSubpass, vn_command_vkCmdNextSubpass2, vn_command_vkCmdPipelineBarrier,
-    vn_command_vkCmdPipelineBarrier2, vn_command_vkCmdPushConstants,
-    vn_command_vkCmdPushConstants2, vn_command_vkCmdPushDescriptorSet,
-    vn_command_vkCmdPushDescriptorSet2, vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2,
-    vn_command_vkCmdResetQueryPool, vn_command_vkCmdResolveImage, vn_command_vkCmdResolveImage2,
+    vn_command_vkCmdEndTransformFeedbackEXT, vn_command_vkCmdExecuteCommands,
+    vn_command_vkCmdFillBuffer, vn_command_vkCmdNextSubpass, vn_command_vkCmdNextSubpass2,
+    vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPipelineBarrier2,
+    vn_command_vkCmdPushConstants, vn_command_vkCmdPushConstants2,
+    vn_command_vkCmdPushDescriptorSet, vn_command_vkCmdPushDescriptorSet2,
+    vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2, vn_command_vkCmdResetQueryPool,
+    vn_command_vkCmdResolveImage, vn_command_vkCmdResolveImage2,
     vn_command_vkCmdSetAlphaToCoverageEnableEXT, vn_command_vkCmdSetAlphaToOneEnableEXT,
     vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT, vn_command_vkCmdSetBlendConstants,
     vn_command_vkCmdSetColorBlendAdvancedEXT, vn_command_vkCmdSetColorBlendEnableEXT,
@@ -5792,6 +5793,12 @@ impl Commands for Handlers<'_> {
         };
         let done = self.driver.cmd_set_sample_mask(args.commandBuffer, args.samples(), mask);
         self.recorded(done);
+    }
+
+    fn vkCmdExecuteCommands(&mut self, args: &mut vn_command_vkCmdExecuteCommands<'_>) {
+        if self.driver.cmd_execute_commands(args.commandBuffer, args.pCommandBuffers()).is_none() {
+            self.reject("executed command buffers that are not all of the primary's device");
+        }
     }
 
     fn vkCmdClearDepthStencilImage(
@@ -19235,6 +19242,106 @@ mod tests {
         h.vkCmdSetSampleMaskEXT(&mut args);
         assert!(h.rejected().is_some(), "a sample mask command with no mask is refused");
         assert_eq!(SAW.with_borrow(Vec::len), 5, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// `vkCmdExecuteCommands` hands the driver the secondaries the guest named, and only when
+    /// every one of them is a buffer of the primary's device.
+    ///
+    /// Vulkan requires the pairing and does not check it; a buffer of another device, or one this
+    /// renderer never allocated, would be the driver's undefined behaviour.
+    #[test]
+    fn execute_commands_runs_only_the_primarys_own_devices_buffers() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandPool, VkDevice, vn_command_vkCmdExecuteCommands,
+        };
+        use std::cell::RefCell;
+
+        const PRIMARY: VkCommandBuffer = VkCommandBuffer::forged(11);
+        const SECONDARY: VkCommandBuffer = VkCommandBuffer::forged(12);
+        const SECOND_TOO: VkCommandBuffer = VkCommandBuffer::forged(13);
+        const OTHER_DEVICES: VkCommandBuffer = VkCommandBuffer::forged(21);
+
+        // Each call: the primary, then the secondaries it was handed.
+        thread_local! {
+            static SAW: RefCell<Vec<Vec<u64>>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn execute(cb: VkCommandBuffer, n: u32, p: *const VkCommandBuffer) {
+            // SAFETY: the wrapper passes the slice with its own length.
+            let s = unsafe { core::slice::from_raw_parts(p, n as usize) };
+            SAW.with_borrow_mut(|saw| {
+                saw.push(std::iter::once(cb).chain(s.iter().copied()).map(|b| b.raw()).collect())
+            });
+        }
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        for (device, pool, buffers) in [
+            (
+                3,
+                7,
+                &[
+                    (PRIMARY, ObjectId(110)),
+                    (SECONDARY, ObjectId(120)),
+                    (SECOND_TOO, ObjectId(130)),
+                ][..],
+            ),
+            (4, 8, &[(OTHER_DEVICES, ObjectId(210))][..]),
+        ] {
+            let mut fns = crate::vulkan::Device::default();
+            fns.plant_vkCmdExecuteCommands(execute);
+            driver.plant_device(VkDevice::forged(device), fns);
+            driver.plant_pool(VkDevice::forged(device), VkCommandPool::forged(pool), buffers);
+        }
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let mut execute = |primary: VkCommandBuffer, secondaries: &[VkCommandBuffer]| {
+            let mut args = vn_command_vkCmdExecuteCommands::default();
+            args.commandBuffer = primary;
+            args.plant_pCommandBuffers(secondaries);
+            h.vkCmdExecuteCommands(&mut args);
+            h.rejected().is_none()
+        };
+        assert!(execute(PRIMARY, &[SECONDARY, SECOND_TOO]), "two of the primary's own device's");
+        assert!(
+            !execute(PRIMARY, &[SECONDARY, OTHER_DEVICES]),
+            "one of another device's is refused, whatever came before it"
+        );
+        assert!(
+            !execute(PRIMARY, &[VkCommandBuffer::forged(99)]),
+            "a buffer this renderer never allocated is refused"
+        );
+        assert!(!execute(VkCommandBuffer::forged(98), &[SECONDARY]), "so is an unknown primary");
+        SAW.with_borrow(|s| {
+            assert_eq!(*s, [vec![11, 12, 13]], "only the first reached the driver, in order")
+        });
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();

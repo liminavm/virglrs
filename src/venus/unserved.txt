@@ -79,7 +79,6 @@ vkCmdDrawMeshTasksEXT                              out-of-reach:mesh-shader
 vkCmdDrawMeshTasksIndirectCountEXT                 out-of-reach:mesh-shader
 vkCmdDrawMeshTasksIndirectEXT                      out-of-reach:mesh-shader
 vkCmdEndRendering2KHR                              out-of-reach:maintenance10
-vkCmdExecuteCommands                               wanted:secondary-command-buffers
 vkCmdPushDataEXT                                   out-of-reach:descriptor-heap
 vkCmdSetDepthClampRangeEXT                         out-of-reach:shader-object
 vkCmdSetRayTracingPipelineStackSizeKHR             out-of-reach:ray-tracing-pipeline

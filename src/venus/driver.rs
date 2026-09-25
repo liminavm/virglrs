@@ -5291,6 +5291,27 @@ impl Driver {
         Some(())
     }
 
+    /// `vkCmdExecuteCommands`: run secondary buffers' recordings from a primary.
+    ///
+    /// `None` unless the primary and every secondary are command buffers of one device here.
+    /// Vulkan requires that and trusts the caller, and a buffer of another device is undefined
+    /// behaviour in the driver, so it is refused rather than forwarded.
+    pub fn cmd_execute_commands(
+        &self,
+        cb: VkCommandBuffer,
+        secondaries: &[VkCommandBuffer],
+    ) -> Option<()> {
+        let device = self.pools.device_of(cb)?;
+        if !secondaries.iter().all(|s| self.pools.device_of(*s) == Some(device)) {
+            return None;
+        }
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; every secondary is a buffer of the primary's device, and the count is
+        // the slice's own length.
+        unsafe { (d.vkCmdExecuteCommands())(cb, secondaries.len() as u32, secondaries.as_ptr()) };
+        Some(())
+    }
+
     /// The depth and stencil twin of [`Self::cmd_clear_color_image`].
     pub fn cmd_clear_depth_stencil_image(
         &self,
