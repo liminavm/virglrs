@@ -73,3 +73,4 @@ On the host, for the positive control, the loader and headers are Homebrew's:
 | `buffer_view.c` | `buffer-view` | 2 | 3/3 on KosmicKrisp, Apple M1 Max, Vulkan 1.4 | not yet run |
 | `timestamps.c` | `timestamps` | 2 | 4/4 on KosmicKrisp, Apple M1 Max, Vulkan 1.4 | not yet run |
 | `maintenance6_binding.c` | `maintenance6-binding` | 3 | 6/6 on KosmicKrisp, Apple M1 Max, Vulkan 1.4 | 6/6, no refusal (Fedora 44, 2026-09-24) |
+| `color_write_enable.c` | `color-write-enable` | 1 | 5/5 on anv, Intel Iris Plus (ICL GT2), Vulkan 1.4; KosmicKrisp lacks the extension | not yet run |
