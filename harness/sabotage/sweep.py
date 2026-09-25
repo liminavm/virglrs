@@ -2231,6 +2231,15 @@ SABOTAGES = [
         """        let done = Some(()).filter(|_| info.get().colorAttachmentCount != u32::MAX);""",
         'the_rendering_location_setters_hand_the_driver_the_guests_structs',
     ),
+    (
+        'vkCmdEndConditionalRenderingEXT never reaches the driver',
+        'src/venus/driver.rs',
+        """        let f = self.recorder(cb)?.try_vkCmdEndConditionalRenderingEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb) };""",
+        """        let _f = self.recorder(cb)?.try_vkCmdEndConditionalRenderingEXT()?;""",
+        'conditional_rendering_hands_the_driver_the_guests_struct',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

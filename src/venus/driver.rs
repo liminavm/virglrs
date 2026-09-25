@@ -26,14 +26,15 @@ use super::proto::types::{
     VkBlitImageInfo2, VkBool32, VkBuffer, VkBufferCopy, VkBufferImageCopy, VkBufferMemoryBarrier,
     VkBufferView, VkCalibratedTimestampInfoKHR, VkClearAttachment, VkClearColorValue,
     VkClearDepthStencilValue, VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo,
-    VkCommandBufferResetFlags, VkCommandPool, VkCompareOp, VkCopyBufferInfo2,
-    VkCopyBufferToImageInfo2, VkCopyDescriptorSet, VkCopyImageInfo2, VkCopyImageToBufferInfo2,
-    VkCopyImageToImageInfo, VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA,
-    VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags,
-    VkDependencyInfo, VkDepthBiasInfoEXT, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
-    VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
-    VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo,
-    VkExtensionProperties, VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
+    VkCommandBufferResetFlags, VkCommandPool, VkCompareOp, VkConditionalRenderingBeginInfoEXT,
+    VkCopyBufferInfo2, VkCopyBufferToImageInfo2, VkCopyDescriptorSet, VkCopyImageInfo2,
+    VkCopyImageToBufferInfo2, VkCopyImageToImageInfo, VkCopyImageToMemoryInfo,
+    VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA,
+    VkCullModeFlags, VkDependencyFlags, VkDependencyInfo, VkDepthBiasInfoEXT, VkDescriptorPool,
+    VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
+    VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA,
+    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties,
+    VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
     VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
@@ -4834,6 +4835,28 @@ impl Driver {
         let f = self.recorder(cb)?.try_vkCmdSetRenderingInputAttachmentIndices()?;
         // SAFETY: as above; `info` is a struct the decoder built, live for the call.
         unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// `vkCmdBeginConditionalRenderingEXT` and its end: the draws between them run only if a
+    /// value in a guest buffer is non-zero, read on the GPU where the bounds are the guest's
+    /// own allocation's. The begin forwards the guest's struct; the end has nothing to forward.
+    pub fn cmd_begin_conditional_rendering(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkConditionalRenderingBeginInfoEXT>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdBeginConditionalRenderingEXT()?;
+        // SAFETY: as above; `info` is a struct the decoder built, live for the call.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_begin_conditional_rendering`].
+    pub fn cmd_end_conditional_rendering(&self, cb: VkCommandBuffer) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdEndConditionalRenderingEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb) };
         Some(())
     }
 

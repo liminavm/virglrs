@@ -36,7 +36,8 @@ use super::proto::types::{
     VkRingMonitorInfoMESA, VkSemaphore, vn_command_vkAllocateCommandBuffers,
     vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
     vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
-    vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginQuery,
+    vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2,
+    vn_command_vkCmdBeginConditionalRenderingEXT, vn_command_vkCmdBeginQuery,
     vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBeginRenderPass2,
     vn_command_vkCmdBeginRendering, vn_command_vkCmdBindDescriptorSets,
     vn_command_vkCmdBindDescriptorSets2, vn_command_vkCmdBindIndexBuffer,
@@ -51,9 +52,10 @@ use super::proto::types::{
     vn_command_vkCmdDispatchIndirect, vn_command_vkCmdDraw, vn_command_vkCmdDrawIndexed,
     vn_command_vkCmdDrawIndexedIndirect, vn_command_vkCmdDrawIndexedIndirectCount,
     vn_command_vkCmdDrawIndirect, vn_command_vkCmdDrawIndirectCount, vn_command_vkCmdDrawMultiEXT,
-    vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndQuery, vn_command_vkCmdEndRenderPass,
-    vn_command_vkCmdEndRenderPass2, vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer,
-    vn_command_vkCmdNextSubpass, vn_command_vkCmdNextSubpass2, vn_command_vkCmdPipelineBarrier,
+    vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndConditionalRenderingEXT,
+    vn_command_vkCmdEndQuery, vn_command_vkCmdEndRenderPass, vn_command_vkCmdEndRenderPass2,
+    vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer, vn_command_vkCmdNextSubpass,
+    vn_command_vkCmdNextSubpass2, vn_command_vkCmdPipelineBarrier,
     vn_command_vkCmdPipelineBarrier2, vn_command_vkCmdPushConstants,
     vn_command_vkCmdPushConstants2, vn_command_vkCmdPushDescriptorSet,
     vn_command_vkCmdPushDescriptorSet2, vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2,
@@ -5454,6 +5456,23 @@ impl Commands for Handlers<'_> {
     ) {
         let Some(info) = self.names(args.pInputAttachmentIndexInfo) else { return };
         let done = self.driver.cmd_set_rendering_input_attachment_indices(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdBeginConditionalRenderingEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdBeginConditionalRenderingEXT<'_>,
+    ) {
+        let Some(info) = self.names(args.pConditionalRenderingBegin) else { return };
+        let done = self.driver.cmd_begin_conditional_rendering(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdEndConditionalRenderingEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdEndConditionalRenderingEXT<'_>,
+    ) {
+        let done = self.driver.cmd_end_conditional_rendering(args.commandBuffer);
         self.recorded(done);
     }
 
@@ -17699,6 +17718,117 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert!(h.rejected().is_some(), "a command with no struct is refused, not forwarded");
+        assert_eq!(SAW.with_borrow(Vec::len), 2, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// `vkCmdBeginConditionalRenderingEXT` hands the driver the struct the guest sent, and the
+    /// end reaches the driver too.
+    #[test]
+    fn conditional_rendering_hands_the_driver_the_guests_struct() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandPool, VkConditionalRenderingBeginInfoEXT, VkDevice,
+            vn_command_vkCmdBeginConditionalRenderingEXT,
+            vn_command_vkCmdEndConditionalRenderingEXT,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Each call, as its name and what it was handed: a struct's address, or the scalars.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<u64>)>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn cmd_begin_conditional_rendering_e_x_t(
+            _: VkCommandBuffer,
+            info: *const VkConditionalRenderingBeginInfoEXT,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdBeginConditionalRenderingEXT", vec![info.addr() as u64]))
+            });
+        }
+        unsafe extern "C" fn cmd_end_conditional_rendering_e_x_t(_: VkCommandBuffer) {
+            SAW.with_borrow_mut(|s| s.push(("CmdEndConditionalRenderingEXT", vec![])));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdBeginConditionalRenderingEXT(cmd_begin_conditional_rendering_e_x_t);
+        fns.plant_vkCmdEndConditionalRenderingEXT(cmd_end_conditional_rendering_e_x_t);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        let cmd_begin_conditional_rendering_e_x_t_info =
+            VkConditionalRenderingBeginInfoEXT::default();
+
+        h.vkCmdBeginConditionalRenderingEXT(&mut vn_command_vkCmdBeginConditionalRenderingEXT {
+            commandBuffer: cb,
+            pConditionalRenderingBegin: Some(Decoded::planted(
+                &cmd_begin_conditional_rendering_e_x_t_info,
+            )),
+            ..Default::default()
+        });
+        h.vkCmdEndConditionalRenderingEXT(&mut vn_command_vkCmdEndConditionalRenderingEXT {
+            commandBuffer: cb,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<u64>); 2] = [
+                (
+                    "CmdBeginConditionalRenderingEXT",
+                    vec![(&raw const cmd_begin_conditional_rendering_e_x_t_info).addr() as u64],
+                ),
+                ("CmdEndConditionalRenderingEXT", vec![]),
+            ];
+            assert_eq!(*s, want, "each command once, handed what the guest sent");
+        });
+
+        // A command that names no struct has said nothing to forward.
+        h.vkCmdBeginConditionalRenderingEXT(&mut vn_command_vkCmdBeginConditionalRenderingEXT {
+            commandBuffer: cb,
+            ..Default::default()
+        });
         assert!(h.rejected().is_some(), "a command with no struct is refused, not forwarded");
         assert_eq!(SAW.with_borrow(Vec::len), 2, "and the driver never saw it");
 
