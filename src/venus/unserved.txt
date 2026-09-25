@@ -65,7 +65,6 @@
 # the next four checks still passed. `[virglrs] refused:` is the oracle. The program is not.
 vkCmdBeginConditionalRenderingEXT                  wanted:conditional-rendering
 vkCmdBeginQueryIndexedEXT                          wanted:transform-feedback
-vkCmdBeginRenderPass2                              wanted:render-pass2
 vkCmdBeginTransformFeedbackEXT                     wanted:transform-feedback
 vkCmdBindResourceHeapEXT                           out-of-reach:descriptor-heap
 vkCmdBindSamplerHeapEXT                            out-of-reach:descriptor-heap
@@ -86,12 +85,9 @@ vkCmdDrawMeshTasksIndirectCountEXT                 out-of-reach:mesh-shader
 vkCmdDrawMeshTasksIndirectEXT                      out-of-reach:mesh-shader
 vkCmdEndConditionalRenderingEXT                    wanted:conditional-rendering
 vkCmdEndQueryIndexedEXT                            wanted:transform-feedback
-vkCmdEndRenderPass2                                wanted:render-pass2
 vkCmdEndRendering2KHR                              out-of-reach:maintenance10
 vkCmdEndTransformFeedbackEXT                       wanted:transform-feedback
 vkCmdExecuteCommands                               wanted:secondary-command-buffers
-vkCmdNextSubpass                                   wanted:render-pass2
-vkCmdNextSubpass2                                  wanted:render-pass2
 vkCmdPushDataEXT                                   out-of-reach:descriptor-heap
 vkCmdResolveImage2                                 wanted:copy-commands2
 vkCmdSetAlphaToCoverageEnableEXT                   wanted:extended-dynamic-state3
@@ -134,7 +130,6 @@ vkCreateDeferredOperationKHR                       not-in-reference:deferred-ope
 vkCreateDescriptorUpdateTemplate                   wanted:descriptor-update-template
 vkCreatePrivateDataSlot                            not-in-reference:private-data
 vkCreateRayTracingPipelinesKHR                     out-of-reach:ray-tracing-pipeline
-vkCreateRenderPass2                                wanted:render-pass2
 vkDeferredOperationJoinKHR                         not-in-reference:deferred-operation
 vkDestroyAccelerationStructureKHR                  out-of-reach:acceleration-structure
 vkDestroyDeferredOperationKHR                      not-in-reference:deferred-operation

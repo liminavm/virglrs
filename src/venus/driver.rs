@@ -58,8 +58,8 @@ use super::proto::types::{
     VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo,
     VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags,
     VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
-    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassContents, VkTimelineSemaphoreSubmitInfo,
-    VkViewport, VkWriteDescriptorSet,
+    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassBeginInfo, VkSubpassContents,
+    VkSubpassEndInfo, VkTimelineSemaphoreSubmitInfo, VkViewport, VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
@@ -3767,6 +3767,53 @@ impl Driver {
         let d = self.recorder(cb)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdEndRenderPass())(cb) };
+        Some(())
+    }
+
+    pub fn cmd_next_subpass(&self, cb: VkCommandBuffer, contents: VkSubpassContents) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdNextSubpass())(cb, contents) };
+        Some(())
+    }
+
+    /// The `VK_KHR_create_renderpass2` forms of the render pass commands, core in 1.2: the
+    /// subpass contents move into a `VkSubpassBeginInfo`, and the end of a subpass gains a
+    /// `VkSubpassEndInfo` of its own, each a struct the decoder built.
+    pub fn cmd_begin_render_pass2(
+        &self,
+        cb: VkCommandBuffer,
+        begin: cs::Decoded<'_, VkRenderPassBeginInfo>,
+        subpass: cs::Decoded<'_, VkSubpassBeginInfo>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdBeginRenderPass2()?;
+        // SAFETY: as above; both structs are arena allocations live for the call.
+        unsafe { f(cb, begin.get(), subpass.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_begin_render_pass2`].
+    pub fn cmd_next_subpass2(
+        &self,
+        cb: VkCommandBuffer,
+        begin: cs::Decoded<'_, VkSubpassBeginInfo>,
+        end: cs::Decoded<'_, VkSubpassEndInfo>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdNextSubpass2()?;
+        // SAFETY: as above.
+        unsafe { f(cb, begin.get(), end.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_begin_render_pass2`].
+    pub fn cmd_end_render_pass2(
+        &self,
+        cb: VkCommandBuffer,
+        end: cs::Decoded<'_, VkSubpassEndInfo>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdEndRenderPass2()?;
+        // SAFETY: as above.
+        unsafe { f(cb, end.get()) };
         Some(())
     }
 

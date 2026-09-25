@@ -37,12 +37,12 @@ use super::proto::types::{
     vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
     vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
     vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginQuery,
-    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBeginRendering,
-    vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindDescriptorSets2,
-    vn_command_vkCmdBindIndexBuffer, vn_command_vkCmdBindIndexBuffer2,
-    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers,
-    vn_command_vkCmdBindVertexBuffers2, vn_command_vkCmdBlitImage,
-    vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage,
+    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBeginRenderPass2,
+    vn_command_vkCmdBeginRendering, vn_command_vkCmdBindDescriptorSets,
+    vn_command_vkCmdBindDescriptorSets2, vn_command_vkCmdBindIndexBuffer,
+    vn_command_vkCmdBindIndexBuffer2, vn_command_vkCmdBindPipeline,
+    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBindVertexBuffers2,
+    vn_command_vkCmdBlitImage, vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage,
     vn_command_vkCmdClearDepthStencilImage, vn_command_vkCmdCopyBuffer,
     vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImage,
     vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyQueryPoolResults,
@@ -51,7 +51,8 @@ use super::proto::types::{
     vn_command_vkCmdDrawIndexedIndirectCount, vn_command_vkCmdDrawIndirect,
     vn_command_vkCmdDrawIndirectCount, vn_command_vkCmdDrawMultiEXT,
     vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndQuery, vn_command_vkCmdEndRenderPass,
-    vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
+    vn_command_vkCmdEndRenderPass2, vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer,
+    vn_command_vkCmdNextSubpass, vn_command_vkCmdNextSubpass2, vn_command_vkCmdPipelineBarrier,
     vn_command_vkCmdPipelineBarrier2, vn_command_vkCmdPushConstants,
     vn_command_vkCmdPushConstants2, vn_command_vkCmdPushDescriptorSet,
     vn_command_vkCmdPushDescriptorSet2, vn_command_vkCmdResetEvent, vn_command_vkCmdResetEvent2,
@@ -79,19 +80,19 @@ use super::proto::types::{
     vn_command_vkCreateFence, vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines,
     vn_command_vkCreateImage, vn_command_vkCreateImageView, vn_command_vkCreateInstance,
     vn_command_vkCreatePipelineCache, vn_command_vkCreatePipelineLayout,
-    vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass, vn_command_vkCreateRingMESA,
-    vn_command_vkCreateSampler, vn_command_vkCreateSamplerYcbcrConversion,
-    vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
-    vn_command_vkDestroyBufferView, vn_command_vkDestroyCommandPool,
-    vn_command_vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorSetLayout,
-    vn_command_vkDestroyDevice, vn_command_vkDestroyEvent, vn_command_vkDestroyFence,
-    vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
-    vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
-    vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyQueryPool,
-    vn_command_vkDestroyRenderPass, vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler,
-    vn_command_vkDestroySamplerYcbcrConversion, vn_command_vkDestroySemaphore,
-    vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle, vn_command_vkEndCommandBuffer,
-    vn_command_vkEnumerateDeviceExtensionProperties,
+    vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass, vn_command_vkCreateRenderPass2,
+    vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
+    vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
+    vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer, vn_command_vkDestroyBufferView,
+    vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
+    vn_command_vkDestroyDescriptorSetLayout, vn_command_vkDestroyDevice, vn_command_vkDestroyEvent,
+    vn_command_vkDestroyFence, vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage,
+    vn_command_vkDestroyImageView, vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline,
+    vn_command_vkDestroyPipelineCache, vn_command_vkDestroyPipelineLayout,
+    vn_command_vkDestroyQueryPool, vn_command_vkDestroyRenderPass, vn_command_vkDestroyRingMESA,
+    vn_command_vkDestroySampler, vn_command_vkDestroySamplerYcbcrConversion,
+    vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle,
+    vn_command_vkEndCommandBuffer, vn_command_vkEnumerateDeviceExtensionProperties,
     vn_command_vkEnumerateInstanceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
     vn_command_vkEnumeratePhysicalDeviceGroups, vn_command_vkEnumeratePhysicalDevices,
     vn_command_vkExecuteCommandStreamsMESA, vn_command_vkFlushMappedMemoryRanges,
@@ -2880,6 +2881,21 @@ impl Commands for Handlers<'_> {
     );
     simple_destroy!(vkDestroyRenderPass, vn_command_vkDestroyRenderPass, renderPass);
 
+    /// Not a [`simple_create`]: core in 1.2, so the entry point is the device's to have, and a
+    /// device without it answers a failed create rather than aborting the worker. The pass it
+    /// makes is an ordinary `VkRenderPass`, destroyed by `vkDestroyRenderPass` above.
+    fn vkCreateRenderPass2(&mut self, args: &mut vn_command_vkCreateRenderPass2<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        let host = self.driver.create_object(
+            args.device,
+            |d| d.try_vkCreateRenderPass2(),
+            info,
+            args.pAllocator,
+        );
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateRenderPass2", args.pRenderPass(), args.handle_pRenderPass_mut(), host);
+    }
+
     simple_create!(
         vkCreateFramebuffer,
         vn_command_vkCreateFramebuffer,
@@ -4689,6 +4705,31 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdEndRenderPass(&mut self, args: &mut vn_command_vkCmdEndRenderPass<'_>) {
         let done = self.driver.cmd_end_render_pass(args.commandBuffer);
+        self.recorded(done);
+    }
+
+    fn vkCmdNextSubpass(&mut self, args: &mut vn_command_vkCmdNextSubpass<'_>) {
+        let done = self.driver.cmd_next_subpass(args.commandBuffer, args.contents);
+        self.recorded(done);
+    }
+
+    fn vkCmdBeginRenderPass2(&mut self, args: &mut vn_command_vkCmdBeginRenderPass2<'_>) {
+        let Some(begin) = self.names(args.pRenderPassBegin) else { return };
+        let Some(subpass) = self.names(args.pSubpassBeginInfo) else { return };
+        let done = self.driver.cmd_begin_render_pass2(args.commandBuffer, begin, subpass);
+        self.recorded(done);
+    }
+
+    fn vkCmdNextSubpass2(&mut self, args: &mut vn_command_vkCmdNextSubpass2<'_>) {
+        let Some(begin) = self.names(args.pSubpassBeginInfo) else { return };
+        let Some(end) = self.names(args.pSubpassEndInfo) else { return };
+        let done = self.driver.cmd_next_subpass2(args.commandBuffer, begin, end);
+        self.recorded(done);
+    }
+
+    fn vkCmdEndRenderPass2(&mut self, args: &mut vn_command_vkCmdEndRenderPass2<'_>) {
+        let Some(end) = self.names(args.pSubpassEndInfo) else { return };
+        let done = self.driver.cmd_end_render_pass2(args.commandBuffer, end);
         self.recorded(done);
     }
 
@@ -16698,6 +16739,191 @@ mod tests {
         });
         assert!(h.rejected().is_some(), "an unknown command buffer is refused");
         assert_eq!(SAW.with_borrow(Vec::len), 4, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The `renderpass2` commands hand the driver the structs the guest sent, and a device that
+    /// does not export `vkCreateRenderPass2` answers a failed create instead of aborting.
+    ///
+    /// All five are core in 1.2, and the four recording commands carry their subpass state in
+    /// structs rather than scalars, so what the driver must be handed is the guest's own struct.
+    /// The create is the first object create whose entry point the device may not have: before
+    /// `Driver::create_object` took a fallible accessor, a guest naming it on such a device
+    /// aborted the worker.
+    #[test]
+    fn the_render_pass2_commands_hand_the_driver_the_guests_structs() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkCommandBuffer, VkCommandPool, VkDevice, VkRenderPass,
+            VkRenderPassBeginInfo, VkRenderPassCreateInfo2, VkSubpassBeginInfo, VkSubpassContents,
+            VkSubpassEndInfo, vn_command_vkCmdBeginRenderPass2, vn_command_vkCmdEndRenderPass2,
+            vn_command_vkCmdNextSubpass, vn_command_vkCmdNextSubpass2,
+            vn_command_vkCreateRenderPass2,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const BARE: u64 = 4;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Each call, as its name and the addresses of the structs it was handed, or the scalar
+        // where the command takes one.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
+        }
+        fn saw(name: &'static str, args: &[usize]) {
+            SAW.with_borrow_mut(|s| s.push((name, args.to_vec())));
+        }
+
+        unsafe extern "C" fn create(
+            _: VkDevice,
+            info: *const VkRenderPassCreateInfo2,
+            _: *const VkAllocationCallbacks,
+            out: *mut VkRenderPass,
+        ) -> VkResult {
+            saw("CreateRenderPass2", &[info.addr()]);
+            // SAFETY: the caller's local.
+            unsafe { *out = VkRenderPass::forged(0x77) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn begin(
+            _: VkCommandBuffer,
+            info: *const VkRenderPassBeginInfo,
+            subpass: *const VkSubpassBeginInfo,
+        ) {
+            saw("BeginRenderPass2", &[info.addr(), subpass.addr()]);
+        }
+        unsafe extern "C" fn next(_: VkCommandBuffer, contents: VkSubpassContents) {
+            saw("NextSubpass", &[contents.0 as usize]);
+        }
+        unsafe extern "C" fn next2(
+            _: VkCommandBuffer,
+            begin: *const VkSubpassBeginInfo,
+            end: *const VkSubpassEndInfo,
+        ) {
+            saw("NextSubpass2", &[begin.addr(), end.addr()]);
+        }
+        unsafe extern "C" fn end2(_: VkCommandBuffer, end: *const VkSubpassEndInfo) {
+            saw("EndRenderPass2", &[end.addr()]);
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateRenderPass2(create);
+        fns.plant_vkCmdBeginRenderPass2(begin);
+        fns.plant_vkCmdNextSubpass(next);
+        fns.plant_vkCmdNextSubpass2(next2);
+        fns.plant_vkCmdEndRenderPass2(end2);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        // A device that exports none of it, as one older than 1.2 without the extension would.
+        driver.plant_device(VkDevice::forged(BARE), crate::vulkan::Device::default());
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        let info = VkRenderPassCreateInfo2::default();
+        let mut args = vn_command_vkCreateRenderPass2::default();
+        args.device = VkDevice::forged(DEVICE);
+        args.pCreateInfo = Some(Decoded::planted(&info));
+        h.vkCreateRenderPass2(&mut args);
+        assert_eq!(args.ret, VkResult::VK_SUCCESS, "a device that has it makes the pass");
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+
+        let pass_begin = VkRenderPassBeginInfo::default();
+        let subpass_begin = VkSubpassBeginInfo::default();
+        let subpass_end = VkSubpassEndInfo::default();
+        h.vkCmdBeginRenderPass2(&mut vn_command_vkCmdBeginRenderPass2 {
+            commandBuffer: cb,
+            pRenderPassBegin: Some(Decoded::planted(&pass_begin)),
+            pSubpassBeginInfo: Some(Decoded::planted(&subpass_begin)),
+            ..Default::default()
+        });
+        h.vkCmdNextSubpass(&mut vn_command_vkCmdNextSubpass {
+            commandBuffer: cb,
+            contents: VkSubpassContents::VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS,
+            ..Default::default()
+        });
+        h.vkCmdNextSubpass2(&mut vn_command_vkCmdNextSubpass2 {
+            commandBuffer: cb,
+            pSubpassBeginInfo: Some(Decoded::planted(&subpass_begin)),
+            pSubpassEndInfo: Some(Decoded::planted(&subpass_end)),
+            ..Default::default()
+        });
+        h.vkCmdEndRenderPass2(&mut vn_command_vkCmdEndRenderPass2 {
+            commandBuffer: cb,
+            pSubpassEndInfo: Some(Decoded::planted(&subpass_end)),
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        let (pass, sbegin, send) = (
+            (&raw const pass_begin).addr(),
+            (&raw const subpass_begin).addr(),
+            (&raw const subpass_end).addr(),
+        );
+        let secondary = VkSubpassContents::VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS.0 as usize;
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<usize>); 5] = [
+                ("CreateRenderPass2", vec![(&raw const info).addr()]),
+                ("BeginRenderPass2", vec![pass, sbegin]),
+                ("NextSubpass", vec![secondary]),
+                ("NextSubpass2", vec![sbegin, send]),
+                ("EndRenderPass2", vec![send]),
+            ];
+            assert_eq!(*s, want, "each command once, with the guest's own structs in place");
+        });
+
+        // A device without the entry point answers the guest, and the worker is still here.
+        let mut args = vn_command_vkCreateRenderPass2::default();
+        args.device = VkDevice::forged(BARE);
+        args.pCreateInfo = Some(Decoded::planted(&info));
+        h.vkCreateRenderPass2(&mut args);
+        assert_eq!(
+            args.ret,
+            VkResult::VK_ERROR_INITIALIZATION_FAILED,
+            "no entry point is a failed create, not a call through null"
+        );
+
+        // A subpass end the guest did not describe has nothing to forward.
+        h.vkCmdEndRenderPass2(&mut vn_command_vkCmdEndRenderPass2 {
+            commandBuffer: cb,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_some(), "an end with no struct is refused, not forwarded");
+        assert_eq!(SAW.with_borrow(Vec::len), 5, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();

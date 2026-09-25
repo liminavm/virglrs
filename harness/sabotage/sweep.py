@@ -2171,6 +2171,20 @@ SABOTAGES = [
         """        unsafe { (d.vkCmdSetDepthBounds())(cb, max, min) };""",
         'the_core_dynamic_state_setters_hand_the_driver_the_guests_values',
     ),
+    (
+        'vkCreateRenderPass2 goes through the panicking accessor',
+        'src/venus/context.rs',
+        """            |d| d.try_vkCreateRenderPass2(),""",
+        """            |d| Some(d.vkCreateRenderPass2()),""",
+        'the_render_pass2_commands_hand_the_driver_the_guests_structs',
+    ),
+    (
+        'vkCmdNextSubpass drops the guest\'s subpass contents',
+        'src/venus/driver.rs',
+        """        unsafe { (d.vkCmdNextSubpass())(cb, contents) };""",
+        """        unsafe { (d.vkCmdNextSubpass())(cb, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE) };""",
+        'the_render_pass2_commands_hand_the_driver_the_guests_structs',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
