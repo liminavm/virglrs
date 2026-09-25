@@ -102,17 +102,13 @@ vkCmdSetColorBlendEquationEXT                      wanted:extended-dynamic-state
 vkCmdSetColorWriteMaskEXT                          wanted:extended-dynamic-state3
 vkCmdSetConservativeRasterizationModeEXT           wanted:extended-dynamic-state3
 vkCmdSetDepthBias2EXT                              wanted:depth-bias-control
-vkCmdSetDepthBiasEnable                            wanted:core-dynamic-state
-vkCmdSetDepthBounds                                wanted:core-dynamic-state
 vkCmdSetDepthClampEnableEXT                        wanted:extended-dynamic-state3
 vkCmdSetDepthClampRangeEXT                         out-of-reach:shader-object
 vkCmdSetDepthClipEnableEXT                         wanted:extended-dynamic-state3
 vkCmdSetDepthClipNegativeOneToOneEXT               wanted:extended-dynamic-state3
-vkCmdSetDeviceMask                                 wanted:core-dynamic-state
 vkCmdSetExtraPrimitiveOverestimationSizeEXT        wanted:extended-dynamic-state3
 vkCmdSetFragmentShadingRateKHR                     wanted:fragment-shading-rate
 vkCmdSetLineRasterizationModeEXT                   wanted:extended-dynamic-state3
-vkCmdSetLineStipple                                wanted:core-dynamic-state
 vkCmdSetLineStippleEnableEXT                       wanted:extended-dynamic-state3
 vkCmdSetLogicOpEXT                                 wanted:extended-dynamic-state2
 vkCmdSetLogicOpEnableEXT                           wanted:extended-dynamic-state3

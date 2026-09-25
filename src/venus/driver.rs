@@ -4317,6 +4317,42 @@ impl Driver {
         Some(())
     }
 
+    pub fn cmd_set_depth_bias_enable(&self, cb: VkCommandBuffer, on: VkBool32) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetDepthBiasEnable()?;
+        // SAFETY: as above.
+        unsafe { f(cb, on) };
+        Some(())
+    }
+
+    /// `vkCmdSetDepthBounds`. Core 1.0, so the entry point is always exported, but only a
+    /// device with `depthBounds` does anything with it -- and neither KosmicKrisp nor the anv
+    /// here has it.
+    pub fn cmd_set_depth_bounds(&self, cb: VkCommandBuffer, min: f32, max: f32) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdSetDepthBounds())(cb, min, max) };
+        Some(())
+    }
+
+    pub fn cmd_set_device_mask(&self, cb: VkCommandBuffer, mask: u32) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetDeviceMask()?;
+        // SAFETY: as above.
+        unsafe { f(cb, mask) };
+        Some(())
+    }
+
+    pub fn cmd_set_line_stipple(
+        &self,
+        cb: VkCommandBuffer,
+        factor: u32,
+        pattern: u16,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetLineStipple()?;
+        // SAFETY: as above.
+        unsafe { f(cb, factor, pattern) };
+        Some(())
+    }
+
     pub fn cmd_set_patch_control_points(&self, cb: VkCommandBuffer, points: u32) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdSetPatchControlPointsEXT()?;
         // SAFETY: as above.

@@ -58,38 +58,40 @@ use super::proto::types::{
     vn_command_vkCmdResetQueryPool, vn_command_vkCmdResolveImage,
     vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT, vn_command_vkCmdSetBlendConstants,
     vn_command_vkCmdSetColorWriteEnableEXT, vn_command_vkCmdSetCullMode,
-    vn_command_vkCmdSetDepthBias, vn_command_vkCmdSetDepthBoundsTestEnable,
+    vn_command_vkCmdSetDepthBias, vn_command_vkCmdSetDepthBiasEnable,
+    vn_command_vkCmdSetDepthBounds, vn_command_vkCmdSetDepthBoundsTestEnable,
     vn_command_vkCmdSetDepthCompareOp, vn_command_vkCmdSetDepthTestEnable,
-    vn_command_vkCmdSetDepthWriteEnable, vn_command_vkCmdSetEvent, vn_command_vkCmdSetEvent2,
-    vn_command_vkCmdSetFrontFace, vn_command_vkCmdSetLineWidth,
-    vn_command_vkCmdSetPatchControlPointsEXT, vn_command_vkCmdSetPrimitiveRestartEnable,
-    vn_command_vkCmdSetPrimitiveTopology, vn_command_vkCmdSetRasterizerDiscardEnable,
-    vn_command_vkCmdSetScissor, vn_command_vkCmdSetScissorWithCount,
-    vn_command_vkCmdSetStencilCompareMask, vn_command_vkCmdSetStencilOp,
-    vn_command_vkCmdSetStencilReference, vn_command_vkCmdSetStencilTestEnable,
-    vn_command_vkCmdSetStencilWriteMask, vn_command_vkCmdSetViewport,
-    vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents,
-    vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2,
-    vn_command_vkCopyImageToImage, vn_command_vkCopyImageToMemoryMESA,
-    vn_command_vkCopyMemoryToImageMESA, vn_command_vkCreateBuffer, vn_command_vkCreateBufferView,
-    vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
-    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
-    vn_command_vkCreateDevice, vn_command_vkCreateEvent, vn_command_vkCreateFence,
-    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
-    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
-    vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
-    vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
-    vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
-    vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer, vn_command_vkDestroyBufferView,
-    vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
-    vn_command_vkDestroyDescriptorSetLayout, vn_command_vkDestroyDevice, vn_command_vkDestroyEvent,
-    vn_command_vkDestroyFence, vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage,
-    vn_command_vkDestroyImageView, vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline,
-    vn_command_vkDestroyPipelineCache, vn_command_vkDestroyPipelineLayout,
-    vn_command_vkDestroyQueryPool, vn_command_vkDestroyRenderPass, vn_command_vkDestroyRingMESA,
-    vn_command_vkDestroySampler, vn_command_vkDestroySamplerYcbcrConversion,
-    vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle,
-    vn_command_vkEndCommandBuffer, vn_command_vkEnumerateDeviceExtensionProperties,
+    vn_command_vkCmdSetDepthWriteEnable, vn_command_vkCmdSetDeviceMask, vn_command_vkCmdSetEvent,
+    vn_command_vkCmdSetEvent2, vn_command_vkCmdSetFrontFace, vn_command_vkCmdSetLineStipple,
+    vn_command_vkCmdSetLineWidth, vn_command_vkCmdSetPatchControlPointsEXT,
+    vn_command_vkCmdSetPrimitiveRestartEnable, vn_command_vkCmdSetPrimitiveTopology,
+    vn_command_vkCmdSetRasterizerDiscardEnable, vn_command_vkCmdSetScissor,
+    vn_command_vkCmdSetScissorWithCount, vn_command_vkCmdSetStencilCompareMask,
+    vn_command_vkCmdSetStencilOp, vn_command_vkCmdSetStencilReference,
+    vn_command_vkCmdSetStencilTestEnable, vn_command_vkCmdSetStencilWriteMask,
+    vn_command_vkCmdSetViewport, vn_command_vkCmdSetViewportWithCount,
+    vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents, vn_command_vkCmdWaitEvents2,
+    vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2, vn_command_vkCopyImageToImage,
+    vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
+    vn_command_vkCreateBuffer, vn_command_vkCreateBufferView, vn_command_vkCreateCommandPool,
+    vn_command_vkCreateComputePipelines, vn_command_vkCreateDescriptorPool,
+    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateEvent,
+    vn_command_vkCreateFence, vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines,
+    vn_command_vkCreateImage, vn_command_vkCreateImageView, vn_command_vkCreateInstance,
+    vn_command_vkCreatePipelineCache, vn_command_vkCreatePipelineLayout,
+    vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass, vn_command_vkCreateRingMESA,
+    vn_command_vkCreateSampler, vn_command_vkCreateSamplerYcbcrConversion,
+    vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
+    vn_command_vkDestroyBufferView, vn_command_vkDestroyCommandPool,
+    vn_command_vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorSetLayout,
+    vn_command_vkDestroyDevice, vn_command_vkDestroyEvent, vn_command_vkDestroyFence,
+    vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
+    vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
+    vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyQueryPool,
+    vn_command_vkDestroyRenderPass, vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler,
+    vn_command_vkDestroySamplerYcbcrConversion, vn_command_vkDestroySemaphore,
+    vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle, vn_command_vkEndCommandBuffer,
+    vn_command_vkEnumerateDeviceExtensionProperties,
     vn_command_vkEnumerateInstanceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
     vn_command_vkEnumeratePhysicalDeviceGroups, vn_command_vkEnumeratePhysicalDevices,
     vn_command_vkExecuteCommandStreamsMESA, vn_command_vkFlushMappedMemoryRanges,
@@ -4954,6 +4956,34 @@ impl Commands for Handlers<'_> {
         let done = self
             .driver
             .cmd_set_primitive_restart_enable(args.commandBuffer, args.primitiveRestartEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDepthBiasEnable(&mut self, args: &mut vn_command_vkCmdSetDepthBiasEnable<'_>) {
+        let done = self.driver.cmd_set_depth_bias_enable(args.commandBuffer, args.depthBiasEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDepthBounds(&mut self, args: &mut vn_command_vkCmdSetDepthBounds<'_>) {
+        let done = self.driver.cmd_set_depth_bounds(
+            args.commandBuffer,
+            args.minDepthBounds,
+            args.maxDepthBounds,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDeviceMask(&mut self, args: &mut vn_command_vkCmdSetDeviceMask<'_>) {
+        let done = self.driver.cmd_set_device_mask(args.commandBuffer, args.deviceMask);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetLineStipple(&mut self, args: &mut vn_command_vkCmdSetLineStipple<'_>) {
+        let done = self.driver.cmd_set_line_stipple(
+            args.commandBuffer,
+            args.lineStippleFactor,
+            args.lineStipplePattern,
+        );
         self.recorded(done);
     }
 
@@ -16532,6 +16562,131 @@ mod tests {
         h.vkCmdUpdateBuffer(&mut args);
         assert!(h.rejected().is_some(), "a size with no bytes behind it stops the ring");
         assert_eq!(SAW.with_borrow(|s| s.updated.len()), 1, "and updates nothing");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The four dynamic-state setters that were unserved hand the driver the guest's values, each
+    /// in its own position: the depth bounds' two floats are the pair a wrapper could swap and
+    /// still compile.
+    #[test]
+    fn the_core_dynamic_state_setters_hand_the_driver_the_guests_values() {
+        use super::super::proto::types::{
+            VkBool32, VkCommandBuffer, VkCommandPool, VkDevice, vn_command_vkCmdSetDepthBiasEnable,
+            vn_command_vkCmdSetDepthBounds, vn_command_vkCmdSetDeviceMask,
+            vn_command_vkCmdSetLineStipple,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Every call, as the command's name and its arguments' bits.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<u32>)>> = const { RefCell::new(Vec::new()) };
+        }
+        fn saw(name: &'static str, args: &[u32]) {
+            SAW.with_borrow_mut(|s| s.push((name, args.to_vec())));
+        }
+
+        unsafe extern "C" fn bias_enable(_: VkCommandBuffer, on: VkBool32) {
+            saw("DepthBiasEnable", &[on.0]);
+        }
+        unsafe extern "C" fn bounds(_: VkCommandBuffer, min: f32, max: f32) {
+            saw("DepthBounds", &[min.to_bits(), max.to_bits()]);
+        }
+        unsafe extern "C" fn device_mask(_: VkCommandBuffer, mask: u32) {
+            saw("DeviceMask", &[mask]);
+        }
+        unsafe extern "C" fn stipple(_: VkCommandBuffer, factor: u32, pattern: u16) {
+            saw("LineStipple", &[factor, pattern.into()]);
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetDepthBiasEnable(bias_enable);
+        fns.plant_vkCmdSetDepthBounds(bounds);
+        fns.plant_vkCmdSetDeviceMask(device_mask);
+        fns.plant_vkCmdSetLineStipple(stipple);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        h.vkCmdSetDepthBiasEnable(&mut vn_command_vkCmdSetDepthBiasEnable {
+            commandBuffer: cb,
+            depthBiasEnable: VkBool32(1),
+            ..Default::default()
+        });
+        h.vkCmdSetDepthBounds(&mut vn_command_vkCmdSetDepthBounds {
+            commandBuffer: cb,
+            minDepthBounds: 0.125,
+            maxDepthBounds: 0.75,
+            ..Default::default()
+        });
+        h.vkCmdSetDeviceMask(&mut vn_command_vkCmdSetDeviceMask {
+            commandBuffer: cb,
+            deviceMask: 0x5,
+            ..Default::default()
+        });
+        h.vkCmdSetLineStipple(&mut vn_command_vkCmdSetLineStipple {
+            commandBuffer: cb,
+            lineStippleFactor: 3,
+            lineStipplePattern: 0xf0f0,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<u32>); 4] = [
+                ("DepthBiasEnable", vec![1]),
+                ("DepthBounds", vec![0.125f32.to_bits(), 0.75f32.to_bits()]),
+                ("DeviceMask", vec![0x5]),
+                ("LineStipple", vec![3, 0xf0f0]),
+            ];
+            assert_eq!(*s, want, "each setter once, each value where the guest put it");
+        });
+
+        // A command buffer the driver has no pool record for has no device to record through.
+        h.vkCmdSetDepthBounds(&mut vn_command_vkCmdSetDepthBounds {
+            commandBuffer: VkCommandBuffer::forged(99),
+            ..Default::default()
+        });
+        assert!(h.rejected().is_some(), "an unknown command buffer is refused");
+        assert_eq!(SAW.with_borrow(Vec::len), 4, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();

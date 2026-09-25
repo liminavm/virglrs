@@ -2164,6 +2164,13 @@ SABOTAGES = [
         """                VkDeviceSize(data.len() as u64 - 1),""",
         'the_core_clear_resolve_and_update_hand_the_driver_what_the_guest_sent',
     ),
+    (
+        'vkCmdSetDepthBounds swaps its minimum and maximum',
+        'src/venus/driver.rs',
+        """        unsafe { (d.vkCmdSetDepthBounds())(cb, min, max) };""",
+        """        unsafe { (d.vkCmdSetDepthBounds())(cb, max, min) };""",
+        'the_core_dynamic_state_setters_hand_the_driver_the_guests_values',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
