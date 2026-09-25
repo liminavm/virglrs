@@ -15629,7 +15629,8 @@ mod tests {
         // Each line is a command and a `status:group`. The status is what makes the file a
         // decision rather than a list -- work we owe, versus a command nothing here can send --
         // so a line without one is not written down, it is only mentioned.
-        const STATUSES: [&str; 3] = ["wanted", "out-of-reach", "not-in-reference"];
+        const STATUSES: [&str; 4] =
+            ["wanted", "out-of-reach", "no-host-feature", "not-in-reference"];
         let listed: Vec<&str> = LEDGER
             .lines()
             .map(str::trim)
@@ -15643,7 +15644,7 @@ mod tests {
                 });
                 assert!(
                     STATUSES.contains(&status),
-                    "unknown status {status:?} on {name}; the three are {STATUSES:?}"
+                    "unknown status {status:?} on {name}; the four are {STATUSES:?}"
                 );
                 assert!(!group.is_empty(), "an empty group on {name}");
                 name

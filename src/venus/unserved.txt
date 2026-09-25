@@ -24,6 +24,11 @@
 #                     host, not the one at hand: a command out of reach on KosmicKrisp and
 #                     reachable on anv is `wanted`, and four groups below moved that way once the
 #                     Linux guest was asked.
+#   no-host-feature   The extension or core version is there, but the command needs a device
+#                     feature no supported host driver reports, so no host here can run it and no
+#                     probe could pass its positive control. `vkQueueBindSparse` needs
+#                     `sparseBinding`, false on KosmicKrisp and on anv. Wanted again when a host
+#                     reports the feature.
 #   not-in-reference  The C refuses it too. Mostly commands the venus driver answers guest-side
 #                     and never puts on the wire. Not a gap against the reference; a decision.
 #
@@ -106,7 +111,7 @@ vkGetPrivateData                                   not-in-reference:private-data
 vkGetRayTracingCaptureReplayShaderGroupHandlesKHR  out-of-reach:ray-tracing-pipeline
 vkGetRayTracingShaderGroupHandlesKHR               out-of-reach:ray-tracing-pipeline
 vkGetRayTracingShaderGroupStackSizeKHR             out-of-reach:ray-tracing-pipeline
-vkQueueBindSparse                                  wanted:sparse-binding
+vkQueueBindSparse                                  no-host-feature:sparse-binding
 vkRegisterCustomBorderColorEXT                     out-of-reach:descriptor-heap
 vkSetPrivateData                                   not-in-reference:private-data
 vkTrimCommandPool                                  wanted:secondary-command-buffers
