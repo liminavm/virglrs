@@ -114,7 +114,6 @@ vkGetRayTracingShaderGroupStackSizeKHR             out-of-reach:ray-tracing-pipe
 vkQueueBindSparse                                  no-host-feature:sparse-binding
 vkRegisterCustomBorderColorEXT                     out-of-reach:descriptor-heap
 vkSetPrivateData                                   not-in-reference:private-data
-vkTrimCommandPool                                  wanted:secondary-command-buffers
 vkUnmapMemory                                      not-in-reference:memory-unmap
 vkUnmapMemory2                                     not-in-reference:memory-unmap
 vkUnregisterCustomBorderColorEXT                   out-of-reach:descriptor-heap

@@ -2306,6 +2306,16 @@ SABOTAGES = [
         """unsafe { f(cb, 0, values.len() as u32, values.as_ptr()) };""",
         'the_extended_dynamic_state3_array_setters_hand_the_driver_every_element',
     ),
+    (
+        'vkTrimCommandPool trims a pool of another device',
+        'src/venus/driver.rs',
+        """        if self.pools.owner_of_pool(pool) != Some(device) {
+            return None;
+        }
+""",
+        """""",
+        'a_pool_is_trimmed_only_through_its_own_device',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

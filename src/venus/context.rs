@@ -162,9 +162,10 @@ use super::proto::types::{
     vn_command_vkSeekReplyCommandStreamMESA, vn_command_vkSetEvent,
     vn_command_vkSetReplyCommandStreamMESA, vn_command_vkSignalSemaphore,
     vn_command_vkSubmitVirtqueueSeqnoMESA, vn_command_vkTransitionImageLayout,
-    vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences, vn_command_vkWaitRingSeqnoMESA,
-    vn_command_vkWaitSemaphoreResourceMESA, vn_command_vkWaitSemaphores,
-    vn_command_vkWaitVirtqueueSeqnoMESA, vn_command_vkWriteRingExtraMESA,
+    vn_command_vkTrimCommandPool, vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences,
+    vn_command_vkWaitRingSeqnoMESA, vn_command_vkWaitSemaphoreResourceMESA,
+    vn_command_vkWaitSemaphores, vn_command_vkWaitVirtqueueSeqnoMESA,
+    vn_command_vkWriteRingExtraMESA,
 };
 use super::ring::{
     ReplyStream, ReplyStreamError, ResourceBytes, Ring, RingControl, RingError, ShmResources,
@@ -6216,6 +6217,12 @@ impl Commands for Handlers<'_> {
     /// naming them -- so forgetting them here would poison the next command that did, over a reset
     /// that was legal. This is the difference between a reset and the destroy `pool_destroy!`
     /// serves, and it does not carry over to `vkResetDescriptorPool`, which does free its sets.
+    fn vkTrimCommandPool(&mut self, args: &mut vn_command_vkTrimCommandPool<'_>) {
+        if self.driver.trim_command_pool(args.device, args.commandPool, args.flags).is_none() {
+            self.reject("trimmed a command pool its device does not own, or cannot trim");
+        }
+    }
+
     fn vkResetCommandPool(&mut self, args: &mut vn_command_vkResetCommandPool<'_>) {
         args.ret = self.driver.object_flags_op(
             args.device,

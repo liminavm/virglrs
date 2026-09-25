@@ -27,7 +27,7 @@ use super::proto::types::{
     VkBufferView, VkCalibratedTimestampInfoKHR, VkClearAttachment, VkClearColorValue,
     VkClearDepthStencilValue, VkClearRect, VkColorBlendAdvancedEXT, VkColorBlendEquationEXT,
     VkColorComponentFlags, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
-    VkCommandPool, VkCompareOp, VkConditionalRenderingBeginInfoEXT,
+    VkCommandPool, VkCommandPoolTrimFlags, VkCompareOp, VkConditionalRenderingBeginInfoEXT,
     VkConservativeRasterizationModeEXT, VkCopyBufferInfo2, VkCopyBufferToImageInfo2,
     VkCopyDescriptorSet, VkCopyImageInfo2, VkCopyImageToBufferInfo2, VkCopyImageToImageInfo,
     VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo,
@@ -177,6 +177,11 @@ impl Pools {
 
     fn is_open<P: PoolOf>(&self, pool: P) -> bool {
         self.open.contains_key(&TypedHandle::of(pool))
+    }
+
+    /// The device that owns a pool, if the pool is open here.
+    fn owner_of_pool<P: PoolOf>(&self, pool: P) -> Option<VkDevice> {
+        self.open.get(&TypedHandle::of(pool)).map(|p| p.device)
     }
 
     /// The device that owns the pool a handle came from.
@@ -6000,6 +6005,28 @@ impl Driver {
         };
         // SAFETY: as above; `flags` is a plain scalar off the wire.
         unsafe { proc(&d.fns)(device, target, flags) }
+    }
+
+    /// `vkTrimCommandPool`: hand the driver back what a pool holds and is not using.
+    ///
+    /// `None` when the device has no table here, when the pool is not one of that device's, or
+    /// when the device does not export the entry point. Vulkan takes the device and the pool as
+    /// two arguments and trusts the pairing, so a pool of another device is the driver's
+    /// undefined behaviour, and it is refused here instead.
+    pub fn trim_command_pool(
+        &self,
+        device: VkDevice,
+        pool: VkCommandPool,
+        flags: VkCommandPoolTrimFlags,
+    ) -> Option<()> {
+        let d = self.devices.get(&device)?;
+        if self.pools.owner_of_pool(pool) != Some(device) {
+            return None;
+        }
+        let f = d.fns.try_vkTrimCommandPool()?;
+        // SAFETY: `device` is a handle in this table and `pool` one of its open pools.
+        unsafe { f(device, pool, flags) };
+        Some(())
     }
 
     /// Bind memory to a single buffer or image: `vkBindBufferMemory`, `vkBindImageMemory`.
@@ -12127,6 +12154,58 @@ mod tests {
     #[test]
     fn a_zero_allocation_stays_zero() {
         assert_eq!(pad_for_blob(0, Some(HOST_VISIBLE), false), 0);
+    }
+
+    /// `vkTrimCommandPool` reaches the driver only for a pool the named device owns.
+    ///
+    /// Vulkan takes the device and the pool as two arguments and trusts that they belong
+    /// together. A guest that names another device's pool, or one that is not open here, would
+    /// have the driver trim a pool it never made.
+    #[test]
+    fn a_pool_is_trimmed_only_through_its_own_device() {
+        use super::super::proto::types::{VkCommandPool, VkCommandPoolTrimFlags};
+        use std::cell::RefCell;
+
+        const A: VkDevice = VkDevice::forged(3);
+        const B: VkDevice = VkDevice::forged(4);
+        const POOL_A: VkCommandPool = VkCommandPool::forged(0x20);
+        const POOL_B: VkCommandPool = VkCommandPool::forged(0x21);
+        const FLAGS: VkCommandPoolTrimFlags = VkCommandPoolTrimFlags(7);
+
+        // Each trim the driver saw: device, pool, flags.
+        thread_local! {
+            static SAW: RefCell<Vec<(u64, u64, u32)>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn trim(d: VkDevice, p: VkCommandPool, f: VkCommandPoolTrimFlags) {
+            SAW.with_borrow_mut(|s| s.push((d.raw(), p.raw(), f.0)));
+        }
+
+        let mut d = Driver::new(Account::for_test(None));
+        for device in [A, B] {
+            let mut fns = crate::vulkan::Device::default();
+            fns.plant_vkTrimCommandPool(trim);
+            d.plant_device(device, fns);
+        }
+        d.plant_pool(A, POOL_A, &[]);
+        d.plant_pool(B, POOL_B, &[]);
+
+        assert_eq!(d.trim_command_pool(A, POOL_A, FLAGS), Some(()), "a device's own pool");
+        assert_eq!(d.trim_command_pool(A, POOL_B, FLAGS), None, "another device's pool");
+        assert_eq!(
+            d.trim_command_pool(A, VkCommandPool::forged(0x22), FLAGS),
+            None,
+            "a pool that is not open here"
+        );
+        assert_eq!(
+            d.trim_command_pool(VkDevice::forged(9), POOL_A, FLAGS),
+            None,
+            "a device with no table"
+        );
+        SAW.with_borrow(|s| {
+            assert_eq!(*s, [(3, 0x20, 7)], "only the first reached the driver, with its flags")
+        });
+
+        d.abandon_planted();
     }
 
     /// Every command that names a query by index is held to the pool before the driver sees it.
