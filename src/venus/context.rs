@@ -39,12 +39,16 @@ use super::proto::types::{
     vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginQuery,
     vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBeginRendering,
     vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindDescriptorSets2,
-    vn_command_vkCmdBindIndexBuffer, vn_command_vkCmdBindPipeline,
-    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBindVertexBuffers2,
-    vn_command_vkCmdBlitImage, vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage,
-    vn_command_vkCmdCopyBuffer, vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImage,
+    vn_command_vkCmdBindIndexBuffer, vn_command_vkCmdBindIndexBuffer2,
+    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers,
+    vn_command_vkCmdBindVertexBuffers2, vn_command_vkCmdBlitImage,
+    vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer,
+    vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImage,
     vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyQueryPoolResults,
-    vn_command_vkCmdDispatch, vn_command_vkCmdDraw, vn_command_vkCmdDrawMultiEXT,
+    vn_command_vkCmdDispatch, vn_command_vkCmdDispatchBase, vn_command_vkCmdDispatchIndirect,
+    vn_command_vkCmdDraw, vn_command_vkCmdDrawIndexed, vn_command_vkCmdDrawIndexedIndirect,
+    vn_command_vkCmdDrawIndexedIndirectCount, vn_command_vkCmdDrawIndirect,
+    vn_command_vkCmdDrawIndirectCount, vn_command_vkCmdDrawMultiEXT,
     vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndQuery, vn_command_vkCmdEndRenderPass,
     vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
     vn_command_vkCmdPipelineBarrier2, vn_command_vkCmdPushConstants,
@@ -4716,6 +4720,94 @@ impl Commands for Handlers<'_> {
             args.groupCountX,
             args.groupCountY,
             args.groupCountZ,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDrawIndexed(&mut self, args: &mut vn_command_vkCmdDrawIndexed<'_>) {
+        let done = self.driver.cmd_draw_indexed(
+            args.commandBuffer,
+            args.indexCount,
+            args.instanceCount,
+            args.firstIndex,
+            args.vertexOffset,
+            args.firstInstance,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDrawIndirect(&mut self, args: &mut vn_command_vkCmdDrawIndirect<'_>) {
+        let done = self.driver.cmd_draw_indirect(
+            args.commandBuffer,
+            args.buffer,
+            args.offset,
+            args.drawCount,
+            args.stride,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDrawIndexedIndirect(&mut self, args: &mut vn_command_vkCmdDrawIndexedIndirect<'_>) {
+        let done = self.driver.cmd_draw_indexed_indirect(
+            args.commandBuffer,
+            args.buffer,
+            args.offset,
+            args.drawCount,
+            args.stride,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDrawIndirectCount(&mut self, args: &mut vn_command_vkCmdDrawIndirectCount<'_>) {
+        let done = self.driver.cmd_draw_indirect_count(
+            args.commandBuffer,
+            args.buffer,
+            args.offset,
+            args.countBuffer,
+            args.countBufferOffset,
+            args.maxDrawCount,
+            args.stride,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDrawIndexedIndirectCount(
+        &mut self,
+        args: &mut vn_command_vkCmdDrawIndexedIndirectCount<'_>,
+    ) {
+        let done = self.driver.cmd_draw_indexed_indirect_count(
+            args.commandBuffer,
+            args.buffer,
+            args.offset,
+            args.countBuffer,
+            args.countBufferOffset,
+            args.maxDrawCount,
+            args.stride,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDispatchIndirect(&mut self, args: &mut vn_command_vkCmdDispatchIndirect<'_>) {
+        let done = self.driver.cmd_dispatch_indirect(args.commandBuffer, args.buffer, args.offset);
+        self.recorded(done);
+    }
+
+    fn vkCmdDispatchBase(&mut self, args: &mut vn_command_vkCmdDispatchBase<'_>) {
+        let done = self.driver.cmd_dispatch_base(
+            args.commandBuffer,
+            [args.baseGroupX, args.baseGroupY, args.baseGroupZ],
+            [args.groupCountX, args.groupCountY, args.groupCountZ],
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdBindIndexBuffer2(&mut self, args: &mut vn_command_vkCmdBindIndexBuffer2<'_>) {
+        let done = self.driver.cmd_bind_index_buffer2(
+            args.commandBuffer,
+            args.buffer,
+            args.offset,
+            args.size,
+            args.indexType,
         );
         self.recorded(done);
     }
@@ -15942,6 +16034,278 @@ mod tests {
         h.vkCmdSetColorWriteEnableEXT(&mut args);
         assert!(h.rejected().is_some(), "an unknown command buffer is refused");
         assert_eq!(SAW.with_borrow(Vec::len), 1, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The indexed, indirect and based draws and dispatches hand the driver every argument in the
+    /// position the guest put it.
+    ///
+    /// All but the two count draws and the second index bind are core in 1.0, so no extension
+    /// list takes them back, and a native Vulkan client draws indexed on its first frame. Every
+    /// one is a run of scalars of the same few types, which is exactly where a transposition
+    /// compiles: so each argument below has a value no other argument shares.
+    #[test]
+    fn the_indexed_and_indirect_draws_hand_the_driver_every_argument_in_place() {
+        use super::super::proto::types::{
+            VkBuffer, VkCommandBuffer, VkCommandPool, VkDevice, VkDeviceSize, VkIndexType,
+            vn_command_vkCmdBindIndexBuffer2, vn_command_vkCmdDispatchBase,
+            vn_command_vkCmdDispatchIndirect, vn_command_vkCmdDrawIndexed,
+            vn_command_vkCmdDrawIndexedIndirect, vn_command_vkCmdDrawIndexedIndirectCount,
+            vn_command_vkCmdDrawIndirect, vn_command_vkCmdDrawIndirectCount,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Every call, as the command's name and its arguments widened to one integer type.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<i64>)>> = const { RefCell::new(Vec::new()) };
+        }
+        fn saw(name: &'static str, args: &[i64]) {
+            SAW.with_borrow_mut(|s| s.push((name, args.to_vec())));
+        }
+
+        unsafe extern "C" fn draw_indexed(
+            _: VkCommandBuffer,
+            a: u32,
+            b: u32,
+            c: u32,
+            d: i32,
+            e: u32,
+        ) {
+            saw("DrawIndexed", &[a.into(), b.into(), c.into(), d.into(), e.into()]);
+        }
+        unsafe extern "C" fn draw_indirect(
+            _: VkCommandBuffer,
+            buf: VkBuffer,
+            off: VkDeviceSize,
+            n: u32,
+            stride: u32,
+        ) {
+            saw("DrawIndirect", &[buf.raw() as i64, off.0 as i64, n.into(), stride.into()]);
+        }
+        unsafe extern "C" fn draw_indexed_indirect(
+            _: VkCommandBuffer,
+            buf: VkBuffer,
+            off: VkDeviceSize,
+            n: u32,
+            stride: u32,
+        ) {
+            saw("DrawIndexedIndirect", &[buf.raw() as i64, off.0 as i64, n.into(), stride.into()]);
+        }
+        unsafe extern "C" fn draw_indirect_count(
+            _: VkCommandBuffer,
+            buf: VkBuffer,
+            off: VkDeviceSize,
+            count: VkBuffer,
+            count_off: VkDeviceSize,
+            max: u32,
+            stride: u32,
+        ) {
+            saw(
+                "DrawIndirectCount",
+                &[
+                    buf.raw() as i64,
+                    off.0 as i64,
+                    count.raw() as i64,
+                    count_off.0 as i64,
+                    max.into(),
+                    stride.into(),
+                ],
+            );
+        }
+        unsafe extern "C" fn draw_indexed_indirect_count(
+            _: VkCommandBuffer,
+            buf: VkBuffer,
+            off: VkDeviceSize,
+            count: VkBuffer,
+            count_off: VkDeviceSize,
+            max: u32,
+            stride: u32,
+        ) {
+            saw(
+                "DrawIndexedIndirectCount",
+                &[
+                    buf.raw() as i64,
+                    off.0 as i64,
+                    count.raw() as i64,
+                    count_off.0 as i64,
+                    max.into(),
+                    stride.into(),
+                ],
+            );
+        }
+        unsafe extern "C" fn dispatch_indirect(
+            _: VkCommandBuffer,
+            buf: VkBuffer,
+            off: VkDeviceSize,
+        ) {
+            saw("DispatchIndirect", &[buf.raw() as i64, off.0 as i64]);
+        }
+        unsafe extern "C" fn dispatch_base(
+            _: VkCommandBuffer,
+            bx: u32,
+            by: u32,
+            bz: u32,
+            x: u32,
+            y: u32,
+            z: u32,
+        ) {
+            saw("DispatchBase", &[bx.into(), by.into(), bz.into(), x.into(), y.into(), z.into()]);
+        }
+        unsafe extern "C" fn bind_index2(
+            _: VkCommandBuffer,
+            buf: VkBuffer,
+            off: VkDeviceSize,
+            size: VkDeviceSize,
+            ty: VkIndexType,
+        ) {
+            saw("BindIndexBuffer2", &[buf.raw() as i64, off.0 as i64, size.0 as i64, ty.0.into()]);
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdDrawIndexed(draw_indexed);
+        fns.plant_vkCmdDrawIndirect(draw_indirect);
+        fns.plant_vkCmdDrawIndexedIndirect(draw_indexed_indirect);
+        fns.plant_vkCmdDrawIndirectCount(draw_indirect_count);
+        fns.plant_vkCmdDrawIndexedIndirectCount(draw_indexed_indirect_count);
+        fns.plant_vkCmdDispatchIndirect(dispatch_indirect);
+        fns.plant_vkCmdDispatchBase(dispatch_base);
+        fns.plant_vkCmdBindIndexBuffer2(bind_index2);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        h.vkCmdDrawIndexed(&mut vn_command_vkCmdDrawIndexed {
+            commandBuffer: cb,
+            indexCount: 1,
+            instanceCount: 2,
+            firstIndex: 3,
+            vertexOffset: -4,
+            firstInstance: 5,
+            ..Default::default()
+        });
+        h.vkCmdDrawIndirect(&mut vn_command_vkCmdDrawIndirect {
+            commandBuffer: cb,
+            buffer: VkBuffer::forged(0x21),
+            offset: VkDeviceSize(0x22),
+            drawCount: 0x23,
+            stride: 0x24,
+            ..Default::default()
+        });
+        h.vkCmdDrawIndexedIndirect(&mut vn_command_vkCmdDrawIndexedIndirect {
+            commandBuffer: cb,
+            buffer: VkBuffer::forged(0x31),
+            offset: VkDeviceSize(0x32),
+            drawCount: 0x33,
+            stride: 0x34,
+            ..Default::default()
+        });
+        h.vkCmdDrawIndirectCount(&mut vn_command_vkCmdDrawIndirectCount {
+            commandBuffer: cb,
+            buffer: VkBuffer::forged(0x41),
+            offset: VkDeviceSize(0x42),
+            countBuffer: VkBuffer::forged(0x43),
+            countBufferOffset: VkDeviceSize(0x44),
+            maxDrawCount: 0x45,
+            stride: 0x46,
+            ..Default::default()
+        });
+        h.vkCmdDrawIndexedIndirectCount(&mut vn_command_vkCmdDrawIndexedIndirectCount {
+            commandBuffer: cb,
+            buffer: VkBuffer::forged(0x51),
+            offset: VkDeviceSize(0x52),
+            countBuffer: VkBuffer::forged(0x53),
+            countBufferOffset: VkDeviceSize(0x54),
+            maxDrawCount: 0x55,
+            stride: 0x56,
+            ..Default::default()
+        });
+        h.vkCmdDispatchIndirect(&mut vn_command_vkCmdDispatchIndirect {
+            commandBuffer: cb,
+            buffer: VkBuffer::forged(0x61),
+            offset: VkDeviceSize(0x62),
+            ..Default::default()
+        });
+        h.vkCmdDispatchBase(&mut vn_command_vkCmdDispatchBase {
+            commandBuffer: cb,
+            baseGroupX: 0x71,
+            baseGroupY: 0x72,
+            baseGroupZ: 0x73,
+            groupCountX: 0x74,
+            groupCountY: 0x75,
+            groupCountZ: 0x76,
+            ..Default::default()
+        });
+        h.vkCmdBindIndexBuffer2(&mut vn_command_vkCmdBindIndexBuffer2 {
+            commandBuffer: cb,
+            buffer: VkBuffer::forged(0x81),
+            offset: VkDeviceSize(0x82),
+            size: VkDeviceSize(0x83),
+            indexType: VkIndexType::VK_INDEX_TYPE_UINT32,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        let uint32 = VkIndexType::VK_INDEX_TYPE_UINT32.0.into();
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<i64>); 8] = [
+                ("DrawIndexed", vec![1, 2, 3, -4, 5]),
+                ("DrawIndirect", vec![0x21, 0x22, 0x23, 0x24]),
+                ("DrawIndexedIndirect", vec![0x31, 0x32, 0x33, 0x34]),
+                ("DrawIndirectCount", vec![0x41, 0x42, 0x43, 0x44, 0x45, 0x46]),
+                ("DrawIndexedIndirectCount", vec![0x51, 0x52, 0x53, 0x54, 0x55, 0x56]),
+                ("DispatchIndirect", vec![0x61, 0x62]),
+                ("DispatchBase", vec![0x71, 0x72, 0x73, 0x74, 0x75, 0x76]),
+                ("BindIndexBuffer2", vec![0x81, 0x82, 0x83, uint32]),
+            ];
+            assert_eq!(*s, want, "each command once, each argument where the guest put it");
+        });
+
+        // A command buffer the driver has no pool record for has no device to record through.
+        h.vkCmdDrawIndexed(&mut vn_command_vkCmdDrawIndexed {
+            commandBuffer: VkCommandBuffer::forged(99),
+            ..Default::default()
+        });
+        assert!(h.rejected().is_some(), "an unknown command buffer is refused");
+        assert_eq!(SAW.with_borrow(Vec::len), 8, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();

@@ -3809,6 +3809,127 @@ impl Driver {
         Some(())
     }
 
+    pub fn cmd_draw_indexed(
+        &self,
+        cb: VkCommandBuffer,
+        indices: u32,
+        instances: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe {
+            (d.vkCmdDrawIndexed())(
+                cb,
+                indices,
+                instances,
+                first_index,
+                vertex_offset,
+                first_instance,
+            )
+        };
+        Some(())
+    }
+
+    // The indirect draws and dispatch. Each reads its parameters from a buffer of the guest's
+    // on the GPU, where the bounds are the guest's own allocation's -- the same footing as a
+    // copy's regions. `stride` is the spacing of those records in that buffer, so it is the
+    // guest's to choose and goes through as sent; it describes nothing in our arena, which is
+    // what separates it from `cmd_draw_multi`'s.
+
+    pub fn cmd_draw_indirect(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        draws: u32,
+        stride: u32,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdDrawIndirect())(cb, buffer, offset, draws, stride) };
+        Some(())
+    }
+
+    pub fn cmd_draw_indexed_indirect(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        draws: u32,
+        stride: u32,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdDrawIndexedIndirect())(cb, buffer, offset, draws, stride) };
+        Some(())
+    }
+
+    /// `vkCmdDrawIndirectCount`: an indirect draw whose count is itself read from a buffer, and
+    /// capped by `max_draws`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cmd_draw_indirect_count(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        count_buffer: VkBuffer,
+        count_offset: VkDeviceSize,
+        max_draws: u32,
+        stride: u32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdDrawIndirectCount()?;
+        // SAFETY: as above.
+        unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_draw_indirect_count`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn cmd_draw_indexed_indirect_count(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        count_buffer: VkBuffer,
+        count_offset: VkDeviceSize,
+        max_draws: u32,
+        stride: u32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdDrawIndexedIndirectCount()?;
+        // SAFETY: as above.
+        unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };
+        Some(())
+    }
+
+    pub fn cmd_dispatch_indirect(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdDispatchIndirect())(cb, buffer, offset) };
+        Some(())
+    }
+
+    /// `vkCmdDispatchBase`: a dispatch whose workgroup ids start at `base` rather than zero.
+    pub fn cmd_dispatch_base(
+        &self,
+        cb: VkCommandBuffer,
+        base: [u32; 3],
+        groups: [u32; 3],
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdDispatchBase()?;
+        let ([bx, by, bz], [x, y, z]) = (base, groups);
+        // SAFETY: as above.
+        unsafe { f(cb, bx, by, bz, x, y, z) };
+        Some(())
+    }
+
     pub fn cmd_set_viewport(
         &self,
         cb: VkCommandBuffer,
@@ -4011,6 +4132,23 @@ impl Driver {
         let d = self.recorder(cb)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdBindIndexBuffer())(cb, buffer, offset, index_type) };
+        Some(())
+    }
+
+    /// `vkCmdBindIndexBuffer2`: the index buffer bind with a size, so the driver can bound its
+    /// reads by it. `VK_WHOLE_SIZE` is the rest of the buffer, as in every other size on this
+    /// wire.
+    pub fn cmd_bind_index_buffer2(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        size: VkDeviceSize,
+        index_type: VkIndexType,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdBindIndexBuffer2()?;
+        // SAFETY: as above.
+        unsafe { f(cb, buffer, offset, size, index_type) };
         Some(())
     }
 

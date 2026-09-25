@@ -45,7 +45,7 @@
 # A `wanted` line is not a promise that anything reaches it today, and not a promise that nothing
 # does. A seated synoik session plus all 33 glmark2 scenes plus two indexed-draw probes refused
 # nothing, because zink emits `vkCmdDrawMultiIndexedEXT` -- which this build serves -- wherever
-# the plain `vkCmdDrawIndexed` below would appear. A stock Fedora 44 desktop, measured
+# a plain `vkCmdDrawIndexed` would appear. A stock Fedora 44 desktop, measured
 # 2026-09-08, refuses `vkCreateBufferView` repeatedly while it is merely running.
 #
 # What a Linux guest reaches, measured on anv with the poisoning taken out so a boot could count
@@ -67,7 +67,6 @@ vkCmdBeginConditionalRenderingEXT                  wanted:conditional-rendering
 vkCmdBeginQueryIndexedEXT                          wanted:transform-feedback
 vkCmdBeginRenderPass2                              wanted:render-pass2
 vkCmdBeginTransformFeedbackEXT                     wanted:transform-feedback
-vkCmdBindIndexBuffer2                              wanted:indexed-and-indirect-draw
 vkCmdBindResourceHeapEXT                           out-of-reach:descriptor-heap
 vkCmdBindSamplerHeapEXT                            out-of-reach:descriptor-heap
 vkCmdBindTransformFeedbackBuffersEXT               wanted:transform-feedback
@@ -82,14 +81,7 @@ vkCmdCopyBufferToImage2                            wanted:copy-commands2
 vkCmdCopyImage2                                    wanted:copy-commands2
 vkCmdCopyImageToBuffer2                            wanted:copy-commands2
 vkCmdCopyMemoryToAccelerationStructureKHR          out-of-reach:acceleration-structure
-vkCmdDispatchBase                                  wanted:indexed-and-indirect-draw
-vkCmdDispatchIndirect                              wanted:indexed-and-indirect-draw
-vkCmdDrawIndexed                                   wanted:indexed-and-indirect-draw
-vkCmdDrawIndexedIndirect                           wanted:indexed-and-indirect-draw
-vkCmdDrawIndexedIndirectCount                      wanted:indexed-and-indirect-draw
-vkCmdDrawIndirect                                  wanted:indexed-and-indirect-draw
 vkCmdDrawIndirectByteCountEXT                      wanted:transform-feedback
-vkCmdDrawIndirectCount                             wanted:indexed-and-indirect-draw
 vkCmdDrawMeshTasksEXT                              out-of-reach:mesh-shader
 vkCmdDrawMeshTasksIndirectCountEXT                 out-of-reach:mesh-shader
 vkCmdDrawMeshTasksIndirectEXT                      out-of-reach:mesh-shader

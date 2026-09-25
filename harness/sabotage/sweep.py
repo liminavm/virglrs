@@ -2122,6 +2122,24 @@ SABOTAGES = [
         """        unsafe { f(cb, enables.len().saturating_sub(1) as u32, enables.as_ptr()) };""",
         'color_write_enable_hands_the_driver_every_switch',
     ),
+    (
+        'vkCmdDrawIndirectCount swaps its draw cap and its stride',
+        'src/venus/driver.rs',
+        """        let f = self.recorder(cb)?.try_vkCmdDrawIndirectCount()?;
+        // SAFETY: as above.
+        unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };""",
+        """        let f = self.recorder(cb)?.try_vkCmdDrawIndirectCount()?;
+        // SAFETY: sabotage -- two u32s transposed.
+        unsafe { f(cb, buffer, offset, count_buffer, count_offset, stride, max_draws) };""",
+        'the_indexed_and_indirect_draws_hand_the_driver_every_argument_in_place',
+    ),
+    (
+        'vkCmdDispatchBase dispatches from its counts instead of its base',
+        'src/venus/driver.rs',
+        """        let ([bx, by, bz], [x, y, z]) = (base, groups);""",
+        """        let ([bx, by, bz], [x, y, z]) = (groups, groups);""",
+        'the_indexed_and_indirect_draws_hand_the_driver_every_argument_in_place',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
