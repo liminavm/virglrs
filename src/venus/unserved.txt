@@ -94,7 +94,6 @@ vkCmdSetDepthClampRangeEXT                         out-of-reach:shader-object
 vkCmdSetDepthClipEnableEXT                         wanted:extended-dynamic-state3
 vkCmdSetDepthClipNegativeOneToOneEXT               wanted:extended-dynamic-state3
 vkCmdSetExtraPrimitiveOverestimationSizeEXT        wanted:extended-dynamic-state3
-vkCmdSetFragmentShadingRateKHR                     wanted:fragment-shading-rate
 vkCmdSetLineRasterizationModeEXT                   wanted:extended-dynamic-state3
 vkCmdSetLineStippleEnableEXT                       wanted:extended-dynamic-state3
 vkCmdSetLogicOpEnableEXT                           wanted:extended-dynamic-state3
@@ -130,7 +129,6 @@ vkGetDeviceQueue                                   not-in-reference:device-queue
 vkGetImageOpaqueCaptureDataEXT                     out-of-reach:descriptor-heap
 vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR  out-of-reach:cooperative-matrix
 vkGetPhysicalDeviceDescriptorSizeEXT               out-of-reach:descriptor-heap
-vkGetPhysicalDeviceFragmentShadingRatesKHR         wanted:fragment-shading-rate
 vkGetPrivateData                                   not-in-reference:private-data
 vkGetRayTracingCaptureReplayShaderGroupHandlesKHR  out-of-reach:ray-tracing-pipeline
 vkGetRayTracingShaderGroupHandlesKHR               out-of-reach:ray-tracing-pipeline

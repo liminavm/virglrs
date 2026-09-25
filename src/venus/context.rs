@@ -67,10 +67,11 @@ use super::proto::types::{
     vn_command_vkCmdSetDepthBoundsTestEnable, vn_command_vkCmdSetDepthCompareOp,
     vn_command_vkCmdSetDepthTestEnable, vn_command_vkCmdSetDepthWriteEnable,
     vn_command_vkCmdSetDeviceMask, vn_command_vkCmdSetEvent, vn_command_vkCmdSetEvent2,
-    vn_command_vkCmdSetFrontFace, vn_command_vkCmdSetLineStipple, vn_command_vkCmdSetLineWidth,
-    vn_command_vkCmdSetLogicOpEXT, vn_command_vkCmdSetPatchControlPointsEXT,
-    vn_command_vkCmdSetPrimitiveRestartEnable, vn_command_vkCmdSetPrimitiveTopology,
-    vn_command_vkCmdSetRasterizerDiscardEnable, vn_command_vkCmdSetRenderingAttachmentLocations,
+    vn_command_vkCmdSetFragmentShadingRateKHR, vn_command_vkCmdSetFrontFace,
+    vn_command_vkCmdSetLineStipple, vn_command_vkCmdSetLineWidth, vn_command_vkCmdSetLogicOpEXT,
+    vn_command_vkCmdSetPatchControlPointsEXT, vn_command_vkCmdSetPrimitiveRestartEnable,
+    vn_command_vkCmdSetPrimitiveTopology, vn_command_vkCmdSetRasterizerDiscardEnable,
+    vn_command_vkCmdSetRenderingAttachmentLocations,
     vn_command_vkCmdSetRenderingInputAttachmentIndices, vn_command_vkCmdSetSampleLocationsEXT,
     vn_command_vkCmdSetScissor, vn_command_vkCmdSetScissorWithCount,
     vn_command_vkCmdSetStencilCompareMask, vn_command_vkCmdSetStencilOp,
@@ -124,6 +125,7 @@ use super::proto::types::{
     vn_command_vkGetPhysicalDeviceFeatures, vn_command_vkGetPhysicalDeviceFeatures2,
     vn_command_vkGetPhysicalDeviceFormatProperties,
     vn_command_vkGetPhysicalDeviceFormatProperties2,
+    vn_command_vkGetPhysicalDeviceFragmentShadingRatesKHR,
     vn_command_vkGetPhysicalDeviceImageFormatProperties,
     vn_command_vkGetPhysicalDeviceImageFormatProperties2,
     vn_command_vkGetPhysicalDeviceMemoryProperties,
@@ -4394,6 +4396,36 @@ impl Commands for Handlers<'_> {
         }
     }
 
+    fn vkGetPhysicalDeviceFragmentShadingRatesKHR(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceFragmentShadingRatesKHR<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        if !self.counted(args.has_pFragmentShadingRateCount()) {
+            return;
+        }
+        let out = if args.has_pFragmentShadingRates() {
+            match self.array(args.pFragmentShadingRates_mut()) {
+                Some(out) => Some(out),
+                None => return,
+            }
+        } else {
+            None
+        };
+        let asked = self
+            .driver
+            .enumerate_into(pd, out, |i| i.try_vkGetPhysicalDeviceFragmentShadingRatesKHR());
+        match asked {
+            Ok((n, ret)) => {
+                args.ret = ret;
+                if let Some(mut count) = args.pFragmentShadingRateCount_mut() {
+                    count.set(n);
+                }
+            }
+            Err(e) => args.ret = e,
+        }
+    }
+
     fn vkGetPhysicalDeviceSparseImageFormatProperties(
         &mut self,
         args: &mut vn_command_vkGetPhysicalDeviceSparseImageFormatProperties<'_>,
@@ -5483,6 +5515,19 @@ impl Commands for Handlers<'_> {
             args.pVertexBindingDescriptions(),
             args.pVertexAttributeDescriptions(),
         );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetFragmentShadingRateKHR(
+        &mut self,
+        args: &mut vn_command_vkCmdSetFragmentShadingRateKHR<'_>,
+    ) {
+        let Some(&size) = args.pFragmentSize else {
+            self.reject("set a fragment shading rate without a fragment size");
+            return;
+        };
+        let done =
+            self.driver.cmd_set_fragment_shading_rate(args.commandBuffer, size, args.combinerOps);
         self.recorded(done);
     }
 
@@ -17959,6 +18004,202 @@ mod tests {
         assert_eq!(SAW.with_borrow(Vec::len), 1, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// `vkCmdSetFragmentShadingRateKHR` hands the driver the guest's fragment size and both
+    /// combiners, in order.
+    ///
+    /// The extent and the combiner pair travel by value on the wire and by pointer to the
+    /// driver, so the pointers are rebuilt here; the values are distinct so a swapped pair or a
+    /// transposed extent reads back wrong. A command with no fragment size has nothing to set
+    /// and is refused.
+    #[test]
+    fn fragment_shading_rate_hands_the_driver_the_size_and_both_combiners() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandPool, VkDevice, VkExtent2D,
+            VkFragmentShadingRateCombinerOpKHR as Op, vn_command_vkCmdSetFragmentShadingRateKHR,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Each call: width, height, and the two combiners.
+        thread_local! {
+            static SAW: RefCell<Vec<[i64; 4]>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn set(_: VkCommandBuffer, size: *const VkExtent2D, ops: *const Op) {
+            // SAFETY: the wrapper passes a live extent and a two-element array.
+            let (size, ops) = unsafe { (*size, core::slice::from_raw_parts(ops, 2)) };
+            SAW.with_borrow_mut(|s| {
+                s.push([size.width.into(), size.height.into(), ops[0].0.into(), ops[1].0.into()])
+            });
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetFragmentShadingRateKHR(set);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        let size = VkExtent2D { width: 2, height: 4 };
+        h.vkCmdSetFragmentShadingRateKHR(&mut vn_command_vkCmdSetFragmentShadingRateKHR {
+            commandBuffer: cb,
+            pFragmentSize: Some(&size),
+            combinerOps: [Op(1), Op(3)],
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+        SAW.with_borrow(|s| {
+            assert_eq!(*s, [[2, 4, 1, 3]], "the guest's extent, and its combiners in order");
+        });
+
+        h.vkCmdSetFragmentShadingRateKHR(&mut vn_command_vkCmdSetFragmentShadingRateKHR {
+            commandBuffer: cb,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_some(), "a rate with no fragment size is refused");
+        assert_eq!(SAW.with_borrow(Vec::len), 1, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// `vkGetPhysicalDeviceFragmentShadingRatesKHR` is the two-call enumeration: a count, then
+    /// the rates.
+    ///
+    /// The guest offers room for four and the driver has three, so a count that is not written
+    /// back reads as four rates, and the fourth slot must be left as the guest sent it. A query
+    /// with no count has nowhere to put the answer and is refused.
+    #[test]
+    fn fragment_shading_rates_are_counted_then_written() {
+        use super::super::proto::types::{
+            VkExtent2D, VkPhysicalDevice, VkPhysicalDeviceFragmentShadingRateKHR as Rate,
+            VkSampleCountFlags, vn_command_vkGetPhysicalDeviceFragmentShadingRatesKHR as Cmd,
+        };
+
+        const PD: VkPhysicalDevice = VkPhysicalDevice::forged(0x711);
+        const RATES: u32 = 3;
+
+        unsafe extern "C" fn rates(
+            _pd: VkPhysicalDevice,
+            count: *mut u32,
+            out: *mut Rate,
+        ) -> VkResult {
+            // SAFETY: the caller passed a live count, and an array of that length or null.
+            let count = unsafe { &mut *count };
+            if out.is_null() {
+                *count = RATES;
+                return VkResult::VK_SUCCESS;
+            }
+            let room = (*count).min(RATES);
+            // SAFETY: `count` is the length the caller sized the array to.
+            let out = unsafe { core::slice::from_raw_parts_mut(out, room as usize) };
+            for (i, r) in (0u32..).zip(out.iter_mut()) {
+                r.sampleCounts = VkSampleCountFlags(1 << i);
+                r.fragmentSize = VkExtent2D { width: 1 << i, height: 1 };
+            }
+            *count = room;
+            if room < RATES { VkResult::VK_INCOMPLETE } else { VkResult::VK_SUCCESS }
+        }
+
+        let objects = Shared::new();
+        let mut fns = crate::vulkan::Instance::default();
+        fns.plant_vkGetPhysicalDeviceFragmentShadingRatesKHR(rates);
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_instance(fns);
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let mut n = 0u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        args.plant_pFragmentShadingRateCount(&mut n);
+        h.vkGetPhysicalDeviceFragmentShadingRatesKHR(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+        assert_eq!((args.ret, n), (VkResult::VK_SUCCESS, RATES), "the count call is answered");
+
+        let mut out = [Rate::default(); 4];
+        out[3].sampleCounts = VkSampleCountFlags(0x55);
+        let mut n = 4u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        args.plant_pFragmentShadingRateCount(&mut n);
+        args.plant_pFragmentShadingRates(&mut out);
+        h.vkGetPhysicalDeviceFragmentShadingRatesKHR(&mut args);
+        assert!(h.rejected().is_none(), "a roomy array is an answer, not a refusal");
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        assert_eq!(n, RATES, "the count is the driver's total, never the room the guest offered");
+        assert_eq!(
+            out.map(|r| (r.sampleCounts.0, r.fragmentSize.width)),
+            [(1, 1), (2, 2), (4, 4), (0x55, 0)],
+            "three rates written, and the slot past them left as the guest sent it"
+        );
+
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        h.vkGetPhysicalDeviceFragmentShadingRatesKHR(&mut args);
+        assert!(h.rejected().is_some(), "a query with no count is refused");
+
         h.driver.abandon_planted();
     }
 

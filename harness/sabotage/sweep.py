@@ -2247,6 +2247,22 @@ SABOTAGES = [
         """                bindings.len() as u32,""",
         'vertex_input_hands_the_driver_both_arrays_with_their_own_counts',
     ),
+    (
+        'fragment-shading-rate-combiners-swapped',
+        'src/venus/driver.rs',
+        """unsafe { f(cb, &size, ops.as_ptr()) };""",
+        """unsafe { f(cb, &size, [ops[1], ops[0]].as_ptr()) };""",
+        'fragment_shading_rate_hands_the_driver_the_size_and_both_combiners',
+    ),
+    (
+        'fragment-shading-rates-count-not-the-drivers',
+        'src/venus/context.rs',
+        """pFragmentShadingRateCount_mut() {
+                    count.set(n);""",
+        """pFragmentShadingRateCount_mut() {
+                    count.set(n + 1);""",
+        'fragment_shading_rates_are_counted_then_written',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

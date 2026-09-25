@@ -33,38 +33,38 @@ use super::proto::types::{
     VkCullModeFlags, VkDependencyFlags, VkDependencyInfo, VkDepthBiasInfoEXT, VkDescriptorPool,
     VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
     VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA,
-    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties,
+    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties, VkExtent2D,
     VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
     VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
     VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceCreateFlags, VkFenceCreateInfo,
-    VkFenceGetFdInfoKHR, VkFilter, VkFormat, VkFramebuffer, VkFrontFace,
-    VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlags, VkImageBlit, VkImageCopy,
-    VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties, VkImageFormatProperties2,
-    VkImageLayout, VkImageMemoryBarrier, VkImageResolve, VkImageSubresourceRange, VkImageTiling,
-    VkImageToMemoryCopy, VkImageType, VkImageUsageFlags, VkImageView,
-    VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR,
-    VkIndexType, VkInstance, VkInstanceCreateInfo, VkLogicOp, VkMemoryAllocateInfo,
-    VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags, VkMemoryPropertyFlagBits,
-    VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy,
-    VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType,
-    VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo, VkPhysicalDeviceImageFormatInfo2,
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties, VkPipeline,
-    VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
-    VkPipelineStageFlags, VkPipelineStageFlags2, VkPrimitiveTopology, VkPushConstantsInfo,
-    VkPushDescriptorSetInfo, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
-    VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
-    VkRenderPassBeginInfo, VkRenderingAttachmentLocationInfo, VkRenderingInfo,
-    VkRenderingInputAttachmentIndexInfo, VkResolveImageInfo2, VkResult, VkRingMonitorInfoMESA,
-    VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampler, VkSamplerYcbcrConversion,
-    VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
-    VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
-    VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags,
-    VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo, VkSubmitInfo2,
-    VkSubpassBeginInfo, VkSubpassContents, VkSubpassEndInfo, VkTimelineSemaphoreSubmitInfo,
-    VkVertexInputAttributeDescription2EXT, VkVertexInputBindingDescription2EXT, VkViewport,
-    VkWriteDescriptorSet,
+    VkFenceGetFdInfoKHR, VkFilter, VkFormat, VkFragmentShadingRateCombinerOpKHR, VkFramebuffer,
+    VkFrontFace, VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlags, VkImageBlit,
+    VkImageCopy, VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties,
+    VkImageFormatProperties2, VkImageLayout, VkImageMemoryBarrier, VkImageResolve,
+    VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy, VkImageType, VkImageUsageFlags,
+    VkImageView, VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA,
+    VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance, VkInstanceCreateInfo, VkLogicOp,
+    VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags,
+    VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA,
+    VkMemoryToImageCopy, VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT,
+    VkObjectType, VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo,
+    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceMemoryBudgetPropertiesEXT,
+    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
+    VkPipelineLayout, VkPipelineStageFlagBits, VkPipelineStageFlags, VkPipelineStageFlags2,
+    VkPrimitiveTopology, VkPushConstantsInfo, VkPushDescriptorSetInfo, VkQueryControlFlags,
+    VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType,
+    VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingAttachmentLocationInfo,
+    VkRenderingInfo, VkRenderingInputAttachmentIndexInfo, VkResolveImageInfo2, VkResult,
+    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampler,
+    VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR,
+    VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType,
+    VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule,
+    VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo,
+    VkSubmitInfo2, VkSubpassBeginInfo, VkSubpassContents, VkSubpassEndInfo,
+    VkTimelineSemaphoreSubmitInfo, VkVertexInputAttributeDescription2EXT,
+    VkVertexInputBindingDescription2EXT, VkViewport, VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
@@ -4883,6 +4883,24 @@ impl Driver {
                 attributes.as_ptr(),
             )
         };
+        Some(())
+    }
+
+    /// `vkCmdSetFragmentShadingRateKHR`: the pipeline's fragment size, and how it combines with
+    /// the primitive's rate and the attachment's.
+    ///
+    /// `size` is a plain extent and `ops` the two combiners by value; the driver reads both
+    /// through pointers, which are rebuilt here from what the guest sent.
+    pub fn cmd_set_fragment_shading_rate(
+        &self,
+        cb: VkCommandBuffer,
+        size: VkExtent2D,
+        ops: [VkFragmentShadingRateCombinerOpKHR; 2],
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetFragmentShadingRateKHR()?;
+        // SAFETY: as above; `size` and `ops` are locals live for the call, and `ops` is the
+        // two-element array the entry point reads.
+        unsafe { f(cb, &size, ops.as_ptr()) };
         Some(())
     }
 
