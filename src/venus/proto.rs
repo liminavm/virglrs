@@ -157,6 +157,10 @@ mod witness {
 }
 
 #[cfg(test)]
+#[path = "wire_samples.rs"]
+mod wire_samples;
+
+#[cfg(test)]
 mod tests {
     use super::serialize::*;
     use super::types::*;
@@ -260,6 +264,109 @@ mod tests {
         assert!(decode(&host).0, "a host pointer poisons the stream");
         let neither = wire(&[&2u32.to_le_bytes(), &0u64.to_le_bytes()]);
         assert!(decode(&neither).0, "a tag the union does not have poisons it");
+    }
+
+    /// `vkCmdBuildAccelerationStructuresKHR` is an array of arrays twice over: `ppBuildRangeInfos`
+    /// has a row per build, row `i` as long as `pInfos[i].geometryCount`, and a build info may
+    /// send its geometries as `ppGeometries`, rows of one. Two builds of different lengths, one
+    /// each way, have to come back out byte for byte -- the encode reads every row through the
+    /// pointers the decode stored, so a row stored in the wrong place or sized from the wrong
+    /// element changes the bytes.
+    #[test]
+    fn an_acceleration_structure_build_reproduces_the_wire_row_by_row() {
+        let args = super::wire_samples::build_args();
+
+        let temp = Bump::new();
+        let hard = AtomicBool::new(false);
+        let mut dec = Decoder::new(&args, &temp, &IdentityObjects, &hard);
+        let mut val = vn_command_vkCmdBuildAccelerationStructuresKHR::default();
+        vn_decode_vkCmdBuildAccelerationStructuresKHR_args_temp(&mut dec, &mut val);
+        assert!(!dec.fatal(), "decode poisoned the stream");
+        assert_eq!(dec.pos(), args.len(), "decode did not consume the command");
+        assert_eq!(val.ppBuildRangeInfos().len(), 2, "a row per build");
+        let counts: Vec<u32> = val.pInfos().iter().map(|i| i.get().geometryCount).collect();
+        assert_eq!(counts, [1, 2]);
+
+        let size = vn_sizeof_vkCmdBuildAccelerationStructuresKHR_args(&AllOfIt, &val);
+        let mut buf = vec![0u8; size];
+        let mut enc = Encoder::new(&mut buf, &AllOfIt);
+        vn_encode_vkCmdBuildAccelerationStructuresKHR_args(&mut enc, VkFlags(0), &val);
+        assert!(!enc.fatal(), "encode overran the buffer it sized itself");
+        // The encoder writes the command's header, which the decoder's caller consumed.
+        assert_eq!(&enc.written()[8..], &args[..]);
+    }
+
+    /// The hand-written samples `seed-corpora` feeds the fuzzer, each decoded as the dispatcher
+    /// would -- header first -- and encoded back to the same bytes. A sample that poisons, or
+    /// leaves bytes unread, seeds the fuzzer with a command that stops at the first bad word.
+    #[test]
+    fn every_wire_sample_decodes_whole_and_encodes_back_the_same() {
+        let named = [
+            VkCommandTypeEXT::VK_COMMAND_TYPE_vkCmdBuildAccelerationStructuresKHR_EXT,
+            VkCommandTypeEXT::VK_COMMAND_TYPE_vkCmdBuildAccelerationStructuresIndirectKHR_EXT,
+            VkCommandTypeEXT::VK_COMMAND_TYPE_vkGetAccelerationStructureBuildSizesKHR_EXT,
+            VkCommandTypeEXT::VK_COMMAND_TYPE_vkCmdCopyMemoryToAccelerationStructureKHR_EXT,
+        ];
+        for ((ty, args), want) in super::wire_samples::commands().into_iter().zip(named) {
+            assert_eq!(ty, want.0 as u32, "the sample's header names the command it holds");
+            let wire = [ty.to_le_bytes().to_vec(), 0u32.to_le_bytes().to_vec(), args].concat();
+            let temp = Bump::new();
+            let hard = AtomicBool::new(false);
+            let mut dec = Decoder::new(&wire, &temp, &IdentityObjects, &hard);
+            let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+            let flags = dec.decode_scalar::<VkFlags>();
+            let mut out = Vec::new();
+            let mut enc = Encoder::growing(&mut out, &AllOfIt);
+            let size = vn_round_trip_args(&mut dec, &mut enc, cmd, flags);
+            assert!(!dec.fatal(), "{want:?}: the sample poisoned the stream");
+            assert_eq!(dec.pos(), wire.len(), "{want:?}: the sample has bytes left over");
+            let written = enc.written().to_vec();
+            assert_eq!(size, Some(written.len()), "{want:?}: sizeof disagrees with the encoder");
+            assert_eq!(written, wire, "{want:?}: the sample does not come back as it went in");
+        }
+    }
+
+    /// A row the guest sized differently from the build it belongs to poisons the stream, and so
+    /// does a `pInfos` whose count disagrees with `infoCount` -- which leaves `pInfos` an empty
+    /// array whose pointer is not null, so the rows must not be sized from it at all. Without the
+    /// decode's early return on a poisoned stream, the second case reads through that pointer.
+    #[test]
+    fn a_build_whose_rows_disagree_with_its_infos_poisons_the_stream() {
+        use super::wire_samples::*;
+        let decode = |w: &[u8]| {
+            let temp = Bump::new();
+            let hard = AtomicBool::new(false);
+            let mut dec = Decoder::new(w, &temp, &IdentityObjects, &hard);
+            let mut val = vn_command_vkCmdBuildAccelerationStructuresKHR::default();
+            vn_decode_vkCmdBuildAccelerationStructuresKHR_args_temp(&mut dec, &mut val);
+            dec.fatal()
+        };
+
+        let long_row = [
+            u64(0x11),
+            u32(1),
+            u64(1),
+            info(&[aabbs(0xa000)], false),
+            u64(1),
+            u64(2), // one geometry, two ranges
+            range(10),
+            range(20),
+        ]
+        .concat();
+        assert!(decode(&long_row), "a row longer than its geometry count");
+
+        let short_infos = [
+            u64(0x11),
+            u32(2),
+            u64(1), // pInfos: one, where infoCount says two
+            u64(2), // ppBuildRangeInfos, as the rows would be read next
+            u64(1),
+            range(10),
+            u64(1),
+            range(20),
+        ]
+        .concat();
+        assert!(decode(&short_infos), "a pInfos the count disagrees with");
     }
 
     /// An array of strings is an array of pointers, and the arena element has to be one pointer

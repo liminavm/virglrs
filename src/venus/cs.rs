@@ -229,6 +229,65 @@ impl<'a, T> Decoded<'a, [T]> {
     }
 }
 
+/// An array of arrays, exactly as the decoder built it: one pointer per row, each row an arena
+/// array as long as the count the decoder held it to.
+///
+/// Vulkan spells these `const T* const*` -- `ppBuildRangeInfos`, one row per build -- and sizes each
+/// row from a member of *another* array: row `i` is `pInfos[i].geometryCount` long. So a row's
+/// length is not something this type can know, and it offers no way to read one. The decoder,
+/// which held each row to that count, is the only thing that mints one; the driver hands it to
+/// Vulkan whole through [`Rows::as_ptr`], beside the array its row lengths come from.
+///
+/// `'a` is the arena's, as for [`Decoded`].
+pub struct Rows<'a, T>(&'a [*const T]);
+
+impl<T> Clone for Rows<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Rows<'_, T> {}
+
+impl<'a, T> Rows<'a, T> {
+    /// Vouch for `rows` as an array of arrays the decoder built.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer in `rows` names an array that lives for `'a` and is as long as the count the
+    /// decoder held that row to, and every pointer inside those elements meets [`Decoded::vouch`].
+    pub(crate) unsafe fn vouch(rows: &'a [*const T]) -> Self {
+        Rows(rows)
+    }
+
+    /// Plant rows a test built, as though the decoder had.
+    #[cfg(test)]
+    pub fn planted(rows: &'a [*const T]) -> Self {
+        Rows(rows)
+    }
+
+    /// How many rows there are: one per element of the array the row lengths come from.
+    pub fn len(self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there are no rows at all.
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The array of row pointers, for the one foreign call that needs it.
+    pub fn as_ptr(self) -> *const *const T {
+        self.0.as_ptr()
+    }
+}
+
+impl<T> core::fmt::Debug for Rows<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Rows").field(&self.0).finish()
+    }
+}
+
 /// A struct with no pointer anywhere in it -- an extent, a region, a subresource. Generated.
 ///
 /// There is nothing in one for Vulkan to follow, so there is nothing to vouch for, and any
@@ -621,6 +680,16 @@ impl<'a> Decoder<'a> {
     /// [`verdict`]: Decoder::verdict
     pub fn fatal(&self) -> bool {
         self.hard.load(Ordering::Acquire) || self.ghost.get().is_some()
+    }
+
+    /// Whether the stream itself is poisoned, ghosts aside.
+    ///
+    /// For the one decode that has to stop early rather than read on: a poisoned count decodes as
+    /// zero and leaves its array an empty one whose pointer is not null, and an array of arrays
+    /// sizes its rows by reading such a sibling. A ghost must not stop it -- a ghosted command is
+    /// skipped whole and the ring carries on, so its every byte still has to be consumed.
+    pub fn poisoned(&self) -> bool {
+        self.hard.load(Ordering::Acquire)
     }
 
     /// Why the command cannot run, taking the ghost with it so it does not outlive the command.

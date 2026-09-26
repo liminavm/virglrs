@@ -341,6 +341,7 @@ class RustGen:
         kind of door -- see `scalar_rows`.
         """
         return ({f for f, _, _, _ in self._array_rows(ty)}
+                | {f for f, _, _, _ in self.nested_rows(ty)}
                 | {f for f, _, _, _ in self.scalar_rows(ty)}
                 | set(self.string_rows(ty))
                 | set(self.length_members(ty)))
@@ -354,7 +355,9 @@ class RustGen:
         them, and so the decoder is the only thing that may set them.
         """
         out = []
-        for _, _, count, _ in self._array_rows(ty):
+        counts = [c for _, _, c, _ in self._array_rows(ty)]
+        counts += [c for _, _, c, _ in self.nested_rows(ty)]
+        for count in counts:
             for name in re.findall(r'\bval\.(\w+)', count):
                 if name not in out:
                     out.append(name)
@@ -645,7 +648,7 @@ class RustGen:
                     shape = self._shape(ty, v)
                 except self.Unsupported:
                     continue
-                if shape[0] in ('dynamic', 'blob', 'string_array'):
+                if shape[0] in ('dynamic', 'blob', 'string_array', 'nested'):
                     if 'unsafe' in shape[1] or 'val.' not in shape[1]:
                         return None
                     lines.append('out.push(%s);' % shape[1].replace('val.', 'self.'))
@@ -783,6 +786,36 @@ class RustGen:
             return '(if %s.is_null() { 0 } else { unsafe { %s } }) as u64' % (guard, inner)
         return '(%s) as u64' % inner
 
+    def _row_len(self, ty, var):
+        """How long row `row` of an array of arrays is, as `(u64 expression, needs unsafe)`.
+
+        vk.xml gives an array of arrays two lengths, and the second is per row. Two forms occur and
+        each is all this accepts: a literal -- `ppGeometries`, `geometryCount` rows of one -- and
+        `S[i].field`, a member of row `i` of a sibling array -- `ppBuildRangeInfos`, whose row `i`
+        is `pInfos[i].geometryCount` long.
+
+        The sibling form reads through the sibling's pointer, so what makes it sound is checked
+        here rather than trusted: the sibling comes first, so it is decoded before the rows are,
+        and it has the same outer length, so a row index is always one of its elements. The
+        decode of the rows returns once the stream is poisoned (see `decode_member`), because a
+        poisoned count decodes as zero and leaves the sibling a dangling empty array.
+        """
+        inner = var.attrs['len_exprs'][1]
+        if inner.isdigit():
+            return ('%su64' % inner, False)
+        m = re.fullmatch(r'(\w+)\[i\]\.(\w+)', inner)
+        if not m:
+            raise self.Unsupported('%s.%s: row len %r' % (ty.name, var.name, inner))
+        names = [v.name for v in ty.variables]
+        sib = next((v for v in ty.variables if v.name == m.group(1)), None)
+        if (sib is None or names.index(sib.name) > names.index(var.name)
+                or not sib.is_dynamic_array() or sib.ty.indirection_depth() != 1
+                or sib.attrs.get('len_exprs', [None])[0] != var.attrs['len_exprs'][0]):
+            raise self.Unsupported('%s.%s: row len %r' % (ty.name, var.name, inner))
+        s = 'val.%s' % self.field_name(sib.name)
+        return ('(if %s.is_null() { 0 } else { (*%s.add(row)).%s }) as u64'
+                % (s, s, self.field_name(m.group(2))), True)
+
     def _shape(self, ty, var):
         """How a member is laid out: ('static', n) | ('dynamic', len) | ('pointer',) | ('plain',)."""
         # `stride` is the *guest's* business and never reaches the wire. vk.xml gives it to an
@@ -806,6 +839,8 @@ class RustGen:
                 raise self.Unsupported('%s.%s: string pointer depth' % (ty.name, var.name))
             return ('string_array', self._len_expr(ty, var, levels=2))
         if var.is_dynamic_array():
+            if var.ty.indirection_depth() == 2:
+                return ('nested', self._len_expr(ty, var, levels=2), self._row_len(ty, var))
             if var.ty.indirection_depth() != 1:
                 raise self.Unsupported('%s.%s: pointer depth' % (ty.name, var.name))
             return ('dynamic', self._len_expr(ty, var))
@@ -934,6 +969,38 @@ class RustGen:
                    '}',
                    '%s = a.as_ptr() as %s _;' % (m, ptr)]
             return self._present(shape[1], var, m, null, hit)
+
+        if shape[0] == 'nested':
+            if not alloc or validity == Gen_INVALID:
+                raise self.Unsupported('%s.%s: nested out array' % (ty.name, var.name))
+            count, (row_len, row_unsafe) = shape[1], shape[2]
+            if row_unsafe:
+                row = ['    // SAFETY: `row` is below the outer count, which this decode held to the',
+                       "    // sibling's, and the sibling was decoded first from the same arena; a",
+                       '    // poisoned stream returned above, before either could be left a',
+                       '    // dangling empty array.',
+                       '    let k = unsafe { %s };' % row_len]
+            else:
+                row = ['    let k = %s;' % row_len]
+            hit = ['let n = dec.decode_array_size(%s) as usize;' % count,
+                   'let Some(a) = dec.alloc_temp_array::<cs::Ptr>(n) else { return };',
+                   ('for (row, e) in a.iter_mut().enumerate() {' if row_unsafe
+                    else 'for e in a.iter_mut() {')] + row + [
+                   '    let k = dec.decode_array_size(k) as usize;',
+                   '    let Some(r) = dec.alloc_temp_array::<%s>(k) else { return };'
+                   % self.base_name(var.ty)]
+            if elem_kind == 'scalar':
+                hit.append('    dec.decode_scalar_array(r);')
+            else:
+                hit += ['    for x in r.iter_mut() {', '        %s(dec, x%s);' % (elem, tag), '    }']
+            hit += ['    *e = cs::Ptr(r.as_ptr() as *const c_void);',
+                    '}',
+                    '%s = a.as_ptr() as *const _;' % m]
+            # The rows index the sibling, and a poisoned count leaves it an empty array whose
+            # pointer is not null; see `_row_len`. A ghost is not that, and must read on: see
+            # `Decoder::poisoned`.
+            return (['if dec.poisoned() {', '    return;', '}']
+                    + self._present(count, var, m, null, hit))
 
         if shape[0] == 'pointer':
             miss = ['%s = %s;' % (m, null)]
@@ -1177,6 +1244,27 @@ class RustGen:
             lines.append('} else {')
             lines.append('    ' + ('enc.encode_array_size(0);' if kind == 'encode'
                                    else 'size += cs::sizeof_scalar::<u64>();'))
+            lines.append('}')
+            return lines
+
+        if shape[0] == 'nested':
+            count, (row_len, row_unsafe) = shape[1], shape[2]
+            rows = 'core::slice::from_raw_parts(%s as *const *const %s, (%s) as usize)' % (
+                m, self.base_name(var.ty), count)
+            lines = ['if !%s.is_null() {' % m, '    ' + array_size(count)]
+            lines.append('    // SAFETY: non-null, so the decoder allocated this many row pointers, and')
+            lines.append('    // each row as long as the row length reads; the sibling that length')
+            lines.append('    // comes from was decoded beside it.')
+            lines.append('    unsafe {')
+            lines.append(('        for (row, e) in %s.iter().enumerate() {' if row_unsafe
+                          else '        for e in %s.iter() {') % rows)
+            lines.append('            let k = %s;' % row_len)
+            lines.append('            ' + array_size('k'))
+            lines += ['            ' + l for l in many('core::slice::from_raw_parts(*e, k as usize)', 'k')]
+            lines.append('        }')
+            lines.append('    }')
+            lines.append('} else {')
+            lines.append('    ' + array_size('0'))
             lines.append('}')
             return lines
 
@@ -1813,10 +1901,13 @@ class RustGen:
                 if not plantable and not mutable:
                     missed.append('%s.%s (count is %s)' % (ty.name, f, self._count_expr(count)))
             skipped += missed
+            nested = [(f, elem, sure) for f, elem, count, sure in self.nested_rows(ty)
+                      if self.planted_count(ty, count) is not None]
+            asserted += len(nested)
             if not asserted:
                 continue
             covered += asserted
-            out += self._witness(ty, rows)
+            out += self._witness(ty, rows, nested)
 
         out = (['/// The arrays no test below plants, and why. Each is an array whose count is not',
                 '/// a plain member of its own command, so planting a slice establishes the',
@@ -1830,13 +1921,20 @@ class RustGen:
                 '']) + out
         return '\n'.join(out)
 
-    def _witness(self, ty, rows):
+    def _witness(self, ty, rows, nested=()):
         n = ty.name
         body = ["    let mut val = vn_command_%s::default();" % n]
         for f, elem, _, wr, _ in rows:
             body += ["    let %s%s: [%s; N] = core::array::from_fn(|_| %s::default());"
                      % ('mut ' if wr else '', f, elem, elem),
                      "    val.plant_%s(&%s%s);" % (f, 'mut ' if wr else '', f)]
+        # An array of arrays gets a row per element of the sibling planted above, and a default
+        # element asks for rows of none. A row is never null, even empty: the encoder makes a
+        # slice of each, and a slice of a null pointer is undefined whatever its length.
+        for f, elem, _ in nested:
+            body += ["    let %s_row: [%s; 0] = [];" % (f, elem),
+                     "    let %s: [*const %s; N] = [%s_row.as_ptr(); N];" % (f, elem, f),
+                     "    val.plant_%s(&%s);" % (f, f)]
         body += self._witness_required(ty)
         body += ["",
                  "    let mut wire = Vec::new();",
@@ -1857,6 +1955,9 @@ class RustGen:
                  "    vn_decode_%s_args_temp(&mut dec, &mut got);" % n,
                  "    assert!(!dec.fatal(), \"the decoder poisoned its own encoder's wire\");",
                  ""]
+        for f, _, sure in nested:
+            got = 'got.%s().len()' % f if sure else 'got.%s().map_or(0, |r| r.len())' % f
+            body.append('    assert_eq!(%s, N, "%s: a row per element");' % (got, f))
         for f, elem, sure, wr, ask in rows:
             if not ask:
                 continue
@@ -2231,6 +2332,22 @@ class RustGen:
                 rows.append((f, rs.split(' ', 1)[1], shape[1], mutable))
         return rows
 
+    def nested_rows(self, ty):
+        """Every array of arrays `ty` carries, as `(field, element type, outer count, sure)`.
+
+        Kept apart from `_array_rows` because none of them is a slice: a row's length lives in
+        another member, so what a handler gets is a `cs::Rows`, which only the driver opens. `sure`
+        is `infallible_arrays`' rule, for the same reason.
+        """
+        out = []
+        for var in ty.variables:
+            shape = self._shape_or_none(ty, var)
+            if shape is None or shape[0] != 'nested':
+                continue
+            sure = not var.is_optional() and var.can_validate()
+            out.append((self.field_name(var.name), self.base_name(var.ty), shape[1], sure))
+        return out
+
     def infallible_arrays(self, ty):
         """The array members whose accessor cannot hand back `None`, by field name.
 
@@ -2286,9 +2403,10 @@ class RustGen:
         `infallible_arrays`.
         """
         rows = self._array_rows(ty)
+        nested = self.nested_rows(ty)
         scalars = self.scalar_rows(ty)
         strings = self.string_rows(ty)
-        if not rows and not scalars and not strings:
+        if not rows and not nested and not scalars and not strings:
             return []
         out = ["impl<'a> vn_command_%s<'a> {" % ty.name]
         out_handles = self.out_handle_fields(ty)
@@ -2352,12 +2470,42 @@ class RustGen:
                     '    }',
                     '']
             out += self._planter(ty, f, elem, count, mutable)
+        for f, elem, count, sure in nested:
+            out += self._rows_accessor(f, elem, count, sure)
         for f, elem, mutable, field_mut in scalars:
             out += self._scalar_accessor(ty, f, elem, mutable, field_mut)
         for f in strings:
             out += self._string_accessor(f)
         out += self._length_getters(ty)
         return out[:-1] + ['}', '']
+
+    def _rows_accessor(self, f, elem, count, sure):
+        """The door onto an array of arrays: a `cs::Rows`, and a planter for tests."""
+        ret = "cs::Rows<'a, %s>" % elem if sure else "Option<cs::Rows<'a, %s>>" % elem
+        return ['    /// Whether the guest sent `%s` at all.' % f,
+                '    pub fn has_%s(&self) -> bool {' % f,
+                '        !self.%s.is_null()' % f,
+                '    }',
+                '',
+                '    /// `%s`, one row pointer per element of the array its row lengths come from.' % f,
+                '    pub fn %s(&self) -> %s {' % (f, ret),
+                '        let val = self;',
+                '        // SAFETY: the decoder allocated this many row pointers from the batch arena,',
+                "        // which the struct's `'a` borrows, and each row as long as the count it held",
+                '        // that row to; every pointer in the elements is from the same arena.',
+                '        unsafe { cs::wire_array((%s) as usize, val.%s as *const *const %s) }'
+                % (self._count_expr(count), f, elem),
+                '            // SAFETY: as above.',
+                '            .map(|a| unsafe { cs::Rows::vouch(a) })' + (self.EXPECT if sure else ''),
+                '    }',
+                '',
+                '    /// Plant `%s` as the decoder would have. The outer count is the sibling\'s,' % f,
+                '    /// planted with it.',
+                '    #[cfg(test)]',
+                "    pub fn plant_%s(&mut self, rows: &'a [*const %s]) {" % (f, elem),
+                '        self.%s = rows.as_ptr();' % f,
+                '    }',
+                '']
 
     def _length_getters(self, ty):
         """Read-only doors onto the plain members an array's length is read from.

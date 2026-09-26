@@ -2,7 +2,8 @@
 // Copyright © 2026 Gustavo Noronha Silva
 
 //! Cut the recorded corpora into fuzzer seeds: one file per venus command, from every capture
-//! under `harness/vm/captures`, and one per shader in the classic corpus's TGSI log.
+//! under `harness/vm/captures`, and one per shader in the classic corpus's TGSI log. The venus
+//! commands no capture holds are added from `src/venus/wire_samples.rs`.
 //!
 //! Run from the repository root: `cargo run --manifest-path fuzz/Cargo.toml --bin seed-corpora`.
 //! A random input almost never names a real command with plausible arguments, so starting from
@@ -11,6 +12,10 @@
 #[allow(dead_code)]
 #[path = "../../../harness/replay/rs/src/corpus.rs"]
 mod corpus;
+
+#[allow(dead_code)]
+#[path = "../../../src/venus/wire_samples.rs"]
+mod wire_samples;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -50,6 +55,14 @@ fn main() {
         }
     }
     println!("venus_command: {commands} distinct commands from {} captures", captures.len());
+
+    // The shapes no capture holds, written out by hand. With no flags, as a ring sends them.
+    let mut samples = 0;
+    for (ty, args) in wire_samples::commands() {
+        let wire = [ty.to_le_bytes().to_vec(), 0u32.to_le_bytes().to_vec(), args].concat();
+        samples += usize::from(write_seed(venus, &wire));
+    }
+    println!("venus_command: {samples} hand-written commands");
 
     let tgsi = Path::new("fuzz/corpus/tgsi_translate");
     std::fs::create_dir_all(tgsi).expect("the corpus directory can be made");

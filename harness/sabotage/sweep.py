@@ -2447,6 +2447,20 @@ SABOTAGES = [
                     '}']""",
         'a_device_or_host_address_decodes_a_device_address_and_no_host_one',
     ),
+    (
+        'an array of arrays sizes its rows from a poisoned sibling',
+        'venus-gen/rustgen.py',
+        """            return (['if dec.poisoned() {', '    return;', '}']""",
+        """            return ([]""",
+        'a_build_whose_rows_disagree_with_its_infos_poisons_the_stream',
+    ),
+    (
+        'every row of an array of arrays is sized from the first',
+        'venus-gen/rustgen.py',
+        """        return ('(if %s.is_null() { 0 } else { (*%s.add(row)).%s }) as u64'""",
+        """        return ('(if %s.is_null() { 0 } else { (*%s.add(0)).%s }) as u64'""",
+        'an_acceleration_structure_build_reproduces_the_wire_row_by_row',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

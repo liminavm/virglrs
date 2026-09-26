@@ -995,7 +995,9 @@ it survives the session it was found in.
     Random bytes almost never form a real command. So
     `cargo run --release --manifest-path fuzz/Cargo.toml --bin seed-corpora`, run from the
     repository root, seeds `venus_command` with every distinct command in
-    `harness/vm/captures/*.vkrc`, and `tgsi_translate` with every shader in the classic corpus's
+    `harness/vm/captures/*.vkrc` and with the hand-written commands in
+    `src/venus/wire_samples.rs` -- the shapes no capture holds, such as an acceleration-structure
+    build's arrays of arrays -- and `tgsi_translate` with every shader in the classic corpus's
     TGSI log. Nothing here reaches GL or Vulkan, so the vrend command stream as a whole is not
     fuzzed.
 
