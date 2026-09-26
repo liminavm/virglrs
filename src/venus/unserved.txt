@@ -75,14 +75,9 @@
 vkCmdBindResourceHeapEXT                           out-of-reach:descriptor-heap
 vkCmdBindSamplerHeapEXT                            out-of-reach:descriptor-heap
 vkCmdPushDataEXT                                   out-of-reach:descriptor-heap
-vkCmdSetRayTracingPipelineStackSizeKHR             out-of-reach:ray-tracing-pipeline
-vkCmdTraceRaysIndirect2KHR                         out-of-reach:ray-tracing-maintenance1
-vkCmdTraceRaysIndirectKHR                          out-of-reach:ray-tracing-pipeline
-vkCmdTraceRaysKHR                                  out-of-reach:ray-tracing-pipeline
 vkCopyAccelerationStructureKHR                     not-in-reference:acceleration-structure
 vkCreateDeferredOperationKHR                       not-in-reference:deferred-operation
 vkCreatePrivateDataSlot                            not-in-reference:private-data
-vkCreateRayTracingPipelinesKHR                     out-of-reach:ray-tracing-pipeline
 vkDeferredOperationJoinKHR                         not-in-reference:deferred-operation
 vkDestroyDeferredOperationKHR                      not-in-reference:deferred-operation
 vkDestroyPrivateDataSlot                           not-in-reference:private-data
@@ -94,9 +89,6 @@ vkGetDeviceQueue                                   not-in-reference:device-queue
 vkGetImageOpaqueCaptureDataEXT                     out-of-reach:descriptor-heap
 vkGetPhysicalDeviceDescriptorSizeEXT               out-of-reach:descriptor-heap
 vkGetPrivateData                                   not-in-reference:private-data
-vkGetRayTracingCaptureReplayShaderGroupHandlesKHR  out-of-reach:ray-tracing-pipeline
-vkGetRayTracingShaderGroupHandlesKHR               out-of-reach:ray-tracing-pipeline
-vkGetRayTracingShaderGroupStackSizeKHR             out-of-reach:ray-tracing-pipeline
 vkQueueBindSparse                                  no-host-feature:sparse-binding
 vkRegisterCustomBorderColorEXT                     out-of-reach:descriptor-heap
 vkSetPrivateData                                   not-in-reference:private-data

@@ -24,20 +24,21 @@ use super::driver::{
     self, Answered, Driver, DriverWait, ExportError, Exported, InFlight, Level, MemoryError,
     NoSubmit2, NoSyncFd, NotATimeline, XfbCounters,
 };
+use super::driver::{GroupHandle, ShaderBindingTables};
 use super::journal::{self, Journal, Owner, Recording, Seq};
 use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{COMMAND_TYPES, Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
     VkAccelerationStructureBuildGeometryInfoKHR, VkClearRect, VkCommandBufferLevel,
-    VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDepthClampModeEXT, VkDevice,
-    VkDeviceMemory, VkDeviceSize, VkFence, VkFlags, VkMemoryHeapFlagBits,
+    VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDeferredOperationKHR, VkDepthClampModeEXT,
+    VkDevice, VkDeviceMemory, VkDeviceSize, VkFence, VkFlags, VkMemoryHeapFlagBits,
     VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType,
     VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkResult, VkRingCreateInfoMESA,
-    VkRingMonitorInfoMESA, VkSemaphore, vn_command_vkAllocateCommandBuffers,
-    vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
-    vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
-    vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2,
+    VkRingMonitorInfoMESA, VkSemaphore, VkStridedDeviceAddressRegionKHR,
+    vn_command_vkAllocateCommandBuffers, vn_command_vkAllocateDescriptorSets,
+    vn_command_vkAllocateMemory, vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory,
+    vn_command_vkBindBufferMemory2, vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2,
     vn_command_vkCmdBeginConditionalRenderingEXT, vn_command_vkCmdBeginQuery,
     vn_command_vkCmdBeginQueryIndexedEXT, vn_command_vkCmdBeginRenderPass,
     vn_command_vkCmdBeginRenderPass2, vn_command_vkCmdBeginRendering,
@@ -92,6 +93,7 @@ use super::proto::types::{
     vn_command_vkCmdSetPrimitiveRestartEnable, vn_command_vkCmdSetPrimitiveTopology,
     vn_command_vkCmdSetProvokingVertexModeEXT, vn_command_vkCmdSetRasterizationSamplesEXT,
     vn_command_vkCmdSetRasterizationStreamEXT, vn_command_vkCmdSetRasterizerDiscardEnable,
+    vn_command_vkCmdSetRayTracingPipelineStackSizeKHR,
     vn_command_vkCmdSetRenderingAttachmentLocations,
     vn_command_vkCmdSetRenderingInputAttachmentIndices, vn_command_vkCmdSetSampleLocationsEXT,
     vn_command_vkCmdSetSampleLocationsEnableEXT, vn_command_vkCmdSetSampleMaskEXT,
@@ -100,9 +102,11 @@ use super::proto::types::{
     vn_command_vkCmdSetStencilReference, vn_command_vkCmdSetStencilTestEnable,
     vn_command_vkCmdSetStencilWriteMask, vn_command_vkCmdSetTessellationDomainOriginEXT,
     vn_command_vkCmdSetVertexInputEXT, vn_command_vkCmdSetViewport,
-    vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents,
-    vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteAccelerationStructuresPropertiesKHR,
-    vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2, vn_command_vkCopyImageToImage,
+    vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdTraceRaysIndirect2KHR,
+    vn_command_vkCmdTraceRaysIndirectKHR, vn_command_vkCmdTraceRaysKHR,
+    vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents, vn_command_vkCmdWaitEvents2,
+    vn_command_vkCmdWriteAccelerationStructuresPropertiesKHR, vn_command_vkCmdWriteTimestamp,
+    vn_command_vkCmdWriteTimestamp2, vn_command_vkCopyImageToImage,
     vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
     vn_command_vkCreateAccelerationStructureKHR, vn_command_vkCreateBuffer,
     vn_command_vkCreateBufferView, vn_command_vkCreateCommandPool,
@@ -111,7 +115,8 @@ use super::proto::types::{
     vn_command_vkCreateDevice, vn_command_vkCreateEvent, vn_command_vkCreateFence,
     vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
     vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
-    vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
+    vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool,
+    vn_command_vkCreateRayTracingPipelinesKHR, vn_command_vkCreateRenderPass,
     vn_command_vkCreateRenderPass2, vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
     vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
     vn_command_vkCreateShaderModule, vn_command_vkDestroyAccelerationStructureKHR,
@@ -166,7 +171,9 @@ use super::proto::types::{
     vn_command_vkGetPhysicalDeviceSparseImageFormatProperties,
     vn_command_vkGetPhysicalDeviceSparseImageFormatProperties2,
     vn_command_vkGetPhysicalDeviceToolProperties, vn_command_vkGetPipelineCacheData,
-    vn_command_vkGetQueryPoolResults, vn_command_vkGetRenderAreaGranularity,
+    vn_command_vkGetQueryPoolResults, vn_command_vkGetRayTracingCaptureReplayShaderGroupHandlesKHR,
+    vn_command_vkGetRayTracingShaderGroupHandlesKHR,
+    vn_command_vkGetRayTracingShaderGroupStackSizeKHR, vn_command_vkGetRenderAreaGranularity,
     vn_command_vkGetRenderingAreaGranularity, vn_command_vkGetSemaphoreCounterValue,
     vn_command_vkImportSemaphoreResourceMESA, vn_command_vkInvalidateMappedMemoryRanges,
     vn_command_vkMergePipelineCaches, vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit,
@@ -2140,6 +2147,21 @@ impl Handlers<'_> {
     /// decide: a count with no array behind it is a command that cannot be carried out, and
     /// refusing it is the only honest answer. Doing nothing and reporting success would leave the
     /// guest drawing through binds and writes that never happened.
+    /// A ray trace's four shader binding tables, in Vulkan's order. Each pointer is optional on
+    /// the wire and required by Vulkan, and the driver reads all four, so a missing one is a
+    /// refusal rather than a null handed on.
+    fn tables<'a>(
+        &mut self,
+        [raygen, miss, hit, callable]: [Option<&'a VkStridedDeviceAddressRegionKHR>; 4],
+    ) -> Option<ShaderBindingTables<'a>> {
+        let (Some(raygen), Some(miss), Some(hit), Some(callable)) = (raygen, miss, hit, callable)
+        else {
+            self.reject("traced rays without all four shader binding tables");
+            return None;
+        };
+        Some(ShaderBindingTables { raygen, miss, hit, callable })
+    }
+
     fn array<T>(&mut self, a: Option<T>) -> Option<T> {
         if a.is_none() {
             self.reject("counted an array it did not send");
@@ -2245,6 +2267,28 @@ impl Handlers<'_> {
                     Q::OutOfRoom => "asked for query results past the room it offered",
                     Q::WrongKind => "wrote a query into a pool that counts another kind",
                     Q::Unsized => "read results of a query kind this renderer cannot size",
+                });
+                None
+            }
+        }
+    }
+
+    fn rayed<R>(&mut self, r: Result<R, driver::RayTracingRefused>) -> Option<R> {
+        use driver::RayTracingRefused as T;
+        match r {
+            Ok(r) => Some(r),
+            Err(why) => {
+                self.reject(match why {
+                    T::NoDevice => "named a ray-tracing pipeline on a device with no table here",
+                    T::NotExported => {
+                        "asked a ray-tracing command of a device that does not serve it"
+                    }
+                    T::UnknownPipeline => "named a pipeline that is not a ray-tracing one",
+                    T::NotALibrary => "linked a library that is not a ray-tracing pipeline",
+                    T::ShaderOutOfStages => "grouped a shader stage its pipeline does not have",
+                    T::OutOfGroups => "named shader groups past the end of the pipeline's",
+                    T::OutOfRoom => "asked for shader group handles past the room it offered",
+                    T::UnknownShader => "asked the stack size of a shader kind Vulkan has not",
                 });
                 None
             }
@@ -4718,7 +4762,100 @@ impl Commands for Handlers<'_> {
         }
     }
 
-    simple_destroy!(vkDestroyPipeline, vn_command_vkDestroyPipeline, pipeline);
+    /// Not [`simple_destroy`]: a ray-tracing pipeline's record goes with it. See
+    /// [`Driver::forget_pipeline`].
+    fn vkDestroyPipeline(&mut self, args: &mut vn_command_vkDestroyPipeline<'_>) {
+        self.driver.destroy_object(
+            args.device,
+            |d| Some(d.vkDestroyPipeline()),
+            args.pipeline,
+            args.pAllocator,
+        );
+        self.driver.forget_pipeline(args.pipeline);
+    }
+
+    /// The graphics and compute creates' run, for ray tracing, which records each pipeline's
+    /// group count on the way through: see [`Driver::create_ray_tracing_pipelines`].
+    fn vkCreateRayTracingPipelinesKHR(
+        &mut self,
+        args: &mut vn_command_vkCreateRayTracingPipelinesKHR<'_>,
+    ) {
+        // The guest's venus driver keeps deferred operations guest-side and sends none; a guest
+        // that names one names an object this renderer never made.
+        if args.deferredOperation != VkDeferredOperationKHR::NULL {
+            self.reject("deferred a ray-tracing pipeline create to an operation it never made");
+            return;
+        }
+        let infos = args.pCreateInfos();
+        let ids = args.pPipelines();
+        // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
+        let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
+        let out = args.handle_pPipelines_mut();
+        let made = self.driver.create_ray_tracing_pipelines(device, cache, infos, alloc, out);
+        let Some(host) = self.rayed(made) else { return };
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        if host.is_err() {
+            eprintln!("[virglrs] vkCreateRayTracingPipelinesKHR refused by the driver");
+            self.ghost_ids(ids);
+        }
+    }
+
+    fn vkGetRayTracingShaderGroupHandlesKHR(
+        &mut self,
+        args: &mut vn_command_vkGetRayTracingShaderGroupHandlesKHR<'_>,
+    ) {
+        let (device, pipeline, first, count) =
+            (args.device, args.pipeline, args.firstGroup, args.groupCount);
+        let Some(out) = self.array(args.pData_mut()) else { return };
+        let r = self.driver.shader_group_handles(
+            device,
+            pipeline,
+            first,
+            count,
+            out,
+            GroupHandle::Shader,
+        );
+        if let Some(ret) = self.rayed(r) {
+            args.ret = ret;
+        }
+    }
+
+    fn vkGetRayTracingCaptureReplayShaderGroupHandlesKHR(
+        &mut self,
+        args: &mut vn_command_vkGetRayTracingCaptureReplayShaderGroupHandlesKHR<'_>,
+    ) {
+        let (device, pipeline, first, count) =
+            (args.device, args.pipeline, args.firstGroup, args.groupCount);
+        let Some(out) = self.array(args.pData_mut()) else { return };
+        let r = self.driver.shader_group_handles(
+            device,
+            pipeline,
+            first,
+            count,
+            out,
+            GroupHandle::CaptureReplay,
+        );
+        if let Some(ret) = self.rayed(r) {
+            args.ret = ret;
+        }
+    }
+
+    /// A query whose whole answer is its return value, like the address queries: a refusal has
+    /// no `VkResult` to travel in, so it stops the ring.
+    fn vkGetRayTracingShaderGroupStackSizeKHR(
+        &mut self,
+        args: &mut vn_command_vkGetRayTracingShaderGroupStackSizeKHR<'_>,
+    ) {
+        let r = self.driver.shader_group_stack_size(
+            args.device,
+            args.pipeline,
+            args.group,
+            args.groupShader,
+        );
+        if let Some(ret) = self.rayed(r) {
+            args.ret = ret;
+        }
+    }
 
     // -------------------------------------------------------------- binding and updating
     //
@@ -4985,6 +5122,58 @@ impl Commands for Handlers<'_> {
             args.maxDrawCount,
             args.stride,
         );
+        self.recorded(done);
+    }
+
+    fn vkCmdTraceRaysKHR(&mut self, args: &mut vn_command_vkCmdTraceRaysKHR<'_>) {
+        let Some(tables) = self.tables([
+            args.pRaygenShaderBindingTable,
+            args.pMissShaderBindingTable,
+            args.pHitShaderBindingTable,
+            args.pCallableShaderBindingTable,
+        ]) else {
+            return;
+        };
+        let done = self.driver.cmd_trace_rays(
+            args.commandBuffer,
+            &tables,
+            args.width,
+            args.height,
+            args.depth,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdTraceRaysIndirectKHR(&mut self, args: &mut vn_command_vkCmdTraceRaysIndirectKHR<'_>) {
+        let Some(tables) = self.tables([
+            args.pRaygenShaderBindingTable,
+            args.pMissShaderBindingTable,
+            args.pHitShaderBindingTable,
+            args.pCallableShaderBindingTable,
+        ]) else {
+            return;
+        };
+        let done = self.driver.cmd_trace_rays_indirect(
+            args.commandBuffer,
+            &tables,
+            args.indirectDeviceAddress,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdTraceRaysIndirect2KHR(&mut self, args: &mut vn_command_vkCmdTraceRaysIndirect2KHR<'_>) {
+        let done =
+            self.driver.cmd_trace_rays_indirect2(args.commandBuffer, args.indirectDeviceAddress);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetRayTracingPipelineStackSizeKHR(
+        &mut self,
+        args: &mut vn_command_vkCmdSetRayTracingPipelineStackSizeKHR<'_>,
+    ) {
+        let done = self
+            .driver
+            .cmd_set_ray_tracing_pipeline_stack_size(args.commandBuffer, args.pipelineStackSize);
         self.recorded(done);
     }
 
@@ -16007,12 +16196,12 @@ mod tests {
         for shape in [
             "vkCmdSetViewport",         // a written-out handler
             "vkCmdDrawMultiIndexedEXT", // one whose signature wraps onto later lines
-            "vkDestroyPipeline",        // a macro with its command on the same line
+            "vkDestroyEvent",           // a macro with its command on the same line
             "vkCreateBuffer",           // a macro with its command on the next
         ] {
             assert!(served.contains(shape), "the parser missed a handler that is there: {shape}");
         }
-        for absent in ["vkQueueBindSparse", "vkCmdTraceRaysKHR"] {
+        for absent in ["vkQueueBindSparse", "vkCmdPushDataEXT"] {
             assert!(!served.contains(absent), "the parser invented a handler: {absent}");
         }
 
@@ -17124,6 +17313,208 @@ mod tests {
         });
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The ray-tracing handlers, where the driver's own test cannot see: a pipeline's record goes
+    /// with the guest's destroy, a create naming a deferred operation is refused, and a trace
+    /// hands the driver the guest's four tables in order -- or is refused without one.
+    #[test]
+    fn ray_tracing_pipelines_are_created_traced_and_forgotten_through_the_handlers() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkCommandBuffer, VkCommandPool, VkDeferredOperationKHR,
+            VkDevice, VkDeviceAddress, VkPipeline, VkPipelineCache,
+            VkRayTracingPipelineCreateInfoKHR, VkStridedDeviceAddressRegionKHR,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const CB: (u64, u64) = (11, 110);
+        const HOST: VkPipeline = VkPipeline::forged(0x70);
+
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<u64>)>> = const { RefCell::new(Vec::new()) };
+        }
+        fn saw(name: &'static str, args: &[u64]) {
+            SAW.with_borrow_mut(|s| s.push((name, args.to_vec())));
+        }
+        unsafe extern "C" fn create(
+            _d: VkDevice,
+            _op: VkDeferredOperationKHR,
+            _c: VkPipelineCache,
+            n: u32,
+            _i: *const VkRayTracingPipelineCreateInfoKHR,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkPipeline,
+        ) -> VkResult {
+            saw("create", &[n.into()]);
+            // SAFETY: one slot, as the handler sized it.
+            unsafe { *out = HOST };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy(
+            _d: VkDevice,
+            p: VkPipeline,
+            _a: *const VkAllocationCallbacks,
+        ) {
+            saw("destroy", &[p.raw()]);
+        }
+        unsafe extern "C" fn handles(
+            _d: VkDevice,
+            _p: VkPipeline,
+            first: u32,
+            count: u32,
+            size: usize,
+            _data: *mut core::ffi::c_void,
+        ) -> VkResult {
+            saw("handles", &[first.into(), count.into(), size as u64]);
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn trace(
+            _cb: VkCommandBuffer,
+            raygen: *const VkStridedDeviceAddressRegionKHR,
+            miss: *const VkStridedDeviceAddressRegionKHR,
+            hit: *const VkStridedDeviceAddressRegionKHR,
+            callable: *const VkStridedDeviceAddressRegionKHR,
+            w: u32,
+            h: u32,
+            d: u32,
+        ) {
+            // SAFETY: four borrows the handler holds for the call.
+            let at = |r: *const VkStridedDeviceAddressRegionKHR| unsafe { (*r).deviceAddress.0 };
+            saw(
+                "trace",
+                &[at(raygen), at(miss), at(hit), at(callable), w.into(), h.into(), d.into()],
+            );
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateRayTracingPipelinesKHR(create);
+        fns.plant_vkDestroyPipeline(destroy);
+        fns.plant_vkGetRayTracingShaderGroupHandlesKHR(handles);
+        fns.plant_vkCmdTraceRaysKHR(trace);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_group_handle_sizes(VkDevice::forged(DEVICE), 32, 0);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(7),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        // One pipeline of no groups -- the count is what is recorded, not the shaders.
+        let infos = [VkRayTracingPipelineCreateInfoKHR::default()];
+        let mut wire = [VkPipeline::forged(40)];
+        let mut shadow = [VkPipeline::forged(0)];
+        let mut args = vn_command_vkCreateRayTracingPipelinesKHR::default();
+        args.device = VkDevice::forged(DEVICE);
+        args.plant_pCreateInfos(&infos);
+        args.plant_pPipelines(&mut wire);
+        args.plant_handle_pPipelines(&mut shadow);
+        h.vkCreateRayTracingPipelinesKHR(&mut args);
+        assert!(h.rejected().is_none());
+        assert_eq!((args.ret, shadow), (VkResult::VK_SUCCESS, [HOST]));
+
+        let mut empty = [0u8; 0];
+        let mut args = vn_command_vkGetRayTracingShaderGroupHandlesKHR::default();
+        args.device = VkDevice::forged(DEVICE);
+        args.pipeline = HOST;
+        args.plant_pData(&mut empty);
+        h.vkGetRayTracingShaderGroupHandlesKHR(&mut args);
+        assert!(h.rejected().is_none(), "no groups asked of a pipeline it has a record of");
+
+        let region = |at: u64| VkStridedDeviceAddressRegionKHR {
+            deviceAddress: VkDeviceAddress(at),
+            ..Default::default()
+        };
+        let (raygen, miss, hit, callable) =
+            (region(0x10), region(0x20), region(0x30), region(0x40));
+        let mut args = vn_command_vkCmdTraceRaysKHR {
+            commandBuffer: VkCommandBuffer::forged(CB.0),
+            pRaygenShaderBindingTable: Some(&raygen),
+            pMissShaderBindingTable: Some(&miss),
+            pHitShaderBindingTable: Some(&hit),
+            pCallableShaderBindingTable: Some(&callable),
+            width: 5,
+            height: 6,
+            depth: 7,
+            ..Default::default()
+        };
+        h.vkCmdTraceRaysKHR(&mut args);
+        assert!(h.rejected().is_none());
+
+        let mut args = vn_command_vkDestroyPipeline {
+            device: VkDevice::forged(DEVICE),
+            pipeline: HOST,
+            ..Default::default()
+        };
+        h.vkDestroyPipeline(&mut args);
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<u64>); 4] = [
+                ("create", vec![1]),
+                ("handles", vec![0, 0, 0]),
+                ("trace", vec![0x10, 0x20, 0x30, 0x40, 5, 6, 7]),
+                ("destroy", vec![HOST.raw()]),
+            ];
+            assert_eq!(*s, want, "each once, with the guest's own arguments");
+        });
+
+        // Destroyed, the pipeline is no longer one whose groups can be asked about.
+        let mut args = vn_command_vkGetRayTracingShaderGroupHandlesKHR::default();
+        args.device = VkDevice::forged(DEVICE);
+        args.pipeline = HOST;
+        args.plant_pData(&mut empty);
+        h.vkGetRayTracingShaderGroupHandlesKHR(&mut args);
+        assert_eq!(h.take_rejected(), Some("named a pipeline that is not a ray-tracing one"));
+
+        // A trace missing one of its tables, and a create deferred to an operation.
+        let mut args = vn_command_vkCmdTraceRaysKHR {
+            commandBuffer: VkCommandBuffer::forged(CB.0),
+            pRaygenShaderBindingTable: Some(&raygen),
+            pMissShaderBindingTable: Some(&miss),
+            pHitShaderBindingTable: None,
+            pCallableShaderBindingTable: Some(&callable),
+            ..Default::default()
+        };
+        h.vkCmdTraceRaysKHR(&mut args);
+        assert_eq!(h.take_rejected(), Some("traced rays without all four shader binding tables"));
+        let mut args = vn_command_vkCreateRayTracingPipelinesKHR::default();
+        args.device = VkDevice::forged(DEVICE);
+        args.deferredOperation = VkDeferredOperationKHR::forged(0x5);
+        args.plant_pCreateInfos(&infos);
+        args.plant_pPipelines(&mut wire);
+        args.plant_handle_pPipelines(&mut shadow);
+        h.vkCreateRayTracingPipelinesKHR(&mut args);
+        assert!(h.take_rejected().is_some(), "a deferred create is refused");
+        SAW.with_borrow(|s| assert_eq!(s.len(), 4, "and none of the three reached the driver"));
+
         h.driver.abandon_planted();
     }
 

@@ -331,15 +331,15 @@ SABOTAGES = [
     (
         'a failed pipeline run leaks the pipelines it did make',
         'src/venus/driver.rs',
-        "            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };\n            // The guest's reply must not carry a handle that is now gone.\n            *survivor = VkPipeline::NULL;",
+        "            unsafe { (fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };\n            // The guest's reply must not carry a handle that is now gone.\n            *survivor = VkPipeline::NULL;",
         '            *survivor = VkPipeline::NULL;',
         '',
     ),
     (
         'a failed pipeline run leaves destroyed handles in the reply',
         'src/venus/driver.rs',
-        "            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };\n            // The guest's reply must not carry a handle that is now gone.\n            *survivor = VkPipeline::NULL;",
-        '            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };',
+        "            unsafe { (fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };\n            // The guest's reply must not carry a handle that is now gone.\n            *survivor = VkPipeline::NULL;",
+        '            unsafe { (fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };',
         '',
     ),
     (
@@ -2522,6 +2522,34 @@ SABOTAGES = [
         """_KHR => facts.counts(ty)?,""",
         """_KHR => {}""",
         'every_query_index_is_held_to_the_pool',
+    ),
+    (
+        'a shader group index is not held to the pipeline',
+        'src/venus/driver.rs',
+        """            Some(end) if end <= groups => Ok(()),""",
+        """            Some(_) => Ok(()),""",
+        'ray_tracing_groups_are_held_to_the_pipeline',
+    ),
+    (
+        'shader group handles are not held to the room',
+        'src/venus/driver.rs',
+        """        if (out.len() as u64) < u64::from(count) * u64::from(size) {""",
+        """        if (out.len() as u64) < u64::from(size) {""",
+        'ray_tracing_groups_are_held_to_the_pipeline',
+    ),
+    (
+        'a destroyed pipeline keeps its ray-tracing record',
+        'src/venus/context.rs',
+        """        self.driver.forget_pipeline(args.pipeline);""",
+        """""",
+        'ray_tracing_pipelines_are_created_traced_and_forgotten_through_the_handlers',
+    ),
+    (
+        'a ray-tracing group may name any stage',
+        'src/venus/driver.rs',
+        """            let names_a_stage = |i: u32| i == SHADER_UNUSED || (i as usize) < stages;""",
+        """            let names_a_stage = |_: u32| stages < usize::MAX;""",
+        'ray_tracing_groups_are_held_to_the_pipeline',
     ),
 ]
 

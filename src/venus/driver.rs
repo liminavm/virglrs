@@ -75,6 +75,11 @@ use super::proto::types::{
     VkTimelineSemaphoreSubmitInfo, VkVertexInputAttributeDescription2EXT,
     VkVertexInputBindingDescription2EXT, VkViewport, VkWriteDescriptorSet,
 };
+use super::proto::types::{
+    VkDeferredOperationKHR, VkPhysicalDeviceProperties2,
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR, VkRayTracingPipelineCreateInfoKHR,
+    VkShaderGroupShaderKHR, VkStridedDeviceAddressRegionKHR,
+};
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
 
@@ -370,6 +375,28 @@ pub enum QueryRefused {
     Unsized,
 }
 
+/// Why a ray-tracing pipeline command was refused. None reached the driver.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RayTracingRefused {
+    /// The device named has no table here.
+    NoDevice,
+    /// The device exports no entry point for the command, or never enabled ray-tracing
+    /// pipelines, so has no handle size to hold the room to.
+    NotExported,
+    /// The pipeline is not a ray-tracing pipeline this renderer has a record of.
+    UnknownPipeline,
+    /// A library named in a create is not a ray-tracing pipeline this renderer has a record of.
+    NotALibrary,
+    /// A group names a stage its create-info does not have.
+    ShaderOutOfStages,
+    /// The groups named run past the pipeline's, or a count overflows.
+    OutOfGroups,
+    /// The handles asked for need more room than the guest offered.
+    OutOfRoom,
+    /// A group shader kind Vulkan does not define.
+    UnknownShader,
+}
+
 /// Why a run of pool objects was not freed. Neither reached the driver.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FreeRefused {
@@ -457,6 +484,12 @@ pub struct Driver {
     /// way: the record dies at both places the pool does, so a recycled handle finds no record
     /// from a previous life.
     query_pools: BTreeMap<VkQueryPool, QueryFacts>,
+    /// How many shader groups each live ray-tracing pipeline has, its libraries' included.
+    ///
+    /// The group queries name groups by index and the driver indexes its own array with it, so
+    /// the index is held to this. Keyed by host handle and kept honest as `query_pools` is: the
+    /// record dies at both places the pipeline does.
+    ray_tracing_pipelines: BTreeMap<VkPipeline, u32>,
     /// Whether each live semaphore is binary or timeline.
     ///
     /// Vulkan fixes this at create and offers no way to ask afterwards, and three entry points are
@@ -1346,7 +1379,36 @@ struct DeviceState {
     /// creation because it never changes, and because an allocation must not pay an instance
     /// round trip to learn whether it is host-visible.
     memory_types: Vec<VkMemoryPropertyFlags>,
+    /// How big a shader group handle is on this device, if it enabled ray-tracing pipelines.
+    /// Read once at creation for the reason `memory_types` is; the handle queries hold the
+    /// guest's room to it.
+    group_handles: Option<GroupHandleSizes>,
 }
+
+/// A device's shader group handle sizes, in bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct GroupHandleSizes {
+    shader: u32,
+    capture_replay: u32,
+}
+
+/// Which of the two shader group handle queries is asked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GroupHandle {
+    Shader,
+    CaptureReplay,
+}
+
+/// The four shader binding tables a ray trace reads its shaders from, all required.
+pub struct ShaderBindingTables<'a> {
+    pub raygen: &'a VkStridedDeviceAddressRegionKHR,
+    pub miss: &'a VkStridedDeviceAddressRegionKHR,
+    pub hit: &'a VkStridedDeviceAddressRegionKHR,
+    pub callable: &'a VkStridedDeviceAddressRegionKHR,
+}
+
+/// `VK_SHADER_UNUSED_KHR`: a group's shader slot that names no stage.
+const SHADER_UNUSED: u32 = !0;
 
 // Every pointer these take is one the decoder allocated in the batch arena and handed to a
 // handler; the arena outlives the whole submission, so none can dangle for the length of a call.
@@ -1505,6 +1567,7 @@ impl Driver {
             account,
             instance: None,
             devices: BTreeMap::new(),
+            ray_tracing_pipelines: BTreeMap::new(),
             physical_device_exts: BTreeMap::new(),
             withheld: ledger::withheld(),
             memory: BTreeMap::new(),
@@ -1857,7 +1920,28 @@ impl Driver {
             fns: vulkan::device(inst, out),
             instance: Some(Arc::clone(self.instance.as_ref().expect("checked above"))),
         });
-        self.devices.insert(out, DeviceState { fns, memory_types });
+        let group_handles = wanted
+            .iter()
+            .any(|n| n == "VK_KHR_ray_tracing_pipeline")
+            .then(|| {
+                let mut rt = VkPhysicalDeviceRayTracingPipelinePropertiesKHR {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR,
+                    ..Default::default()
+                };
+                let mut props = VkPhysicalDeviceProperties2 {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                    pNext: (&mut rt as *mut VkPhysicalDeviceRayTracingPipelinePropertiesKHR).cast(),
+                    ..Default::default()
+                };
+                // SAFETY: `pd` is a handle this instance returned, and the chain is two locals,
+                // the second an extension the device was just created with.
+                unsafe { (inst.vkGetPhysicalDeviceProperties2())(pd, &mut props) };
+                GroupHandleSizes {
+                    shader: rt.shaderGroupHandleSize,
+                    capture_replay: rt.shaderGroupHandleCaptureReplaySize,
+                }
+            });
+        self.devices.insert(out, DeviceState { fns, memory_types, group_handles });
         Ok(out)
     }
 
@@ -3167,6 +3251,9 @@ impl Driver {
                 VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {
                     self.forget_query_pool(VkQueryPool::from_host(handle));
                 }
+                VkObjectType::VK_OBJECT_TYPE_PIPELINE => {
+                    self.forget_pipeline(VkPipeline::from_host(handle));
+                }
                 VkObjectType::VK_OBJECT_TYPE_SEMAPHORE => {
                     self.forget_semaphore(VkSemaphore::from_host(handle));
                 }
@@ -3358,24 +3445,33 @@ impl Driver {
         let Some(d) = self.devices.get(&device) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
+        let f = proc(&d.fns);
+        Self::pipeline_run(&d.fns, device, infos.len(), alloc, out, |out| {
+            // SAFETY: `device` is a handle in this table, `alloc` is an arena allocation live for
+            // the call, and both counts Vulkan is given are the slices' own lengths.
+            unsafe {
+                f(device, cache, infos.len() as u32, infos.as_ptr(), ptr(alloc), out.as_mut_ptr())
+            }
+        })
+    }
+
+    /// The part of a pipeline create every kind shares: one handle slot per create-info, and on
+    /// failure no survivor left owned by nobody. `create` makes the one call that fills `out`.
+    fn pipeline_run(
+        fns: &DeviceFns,
+        device: VkDevice,
+        infos: usize,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+        out: &mut [VkPipeline],
+        create: impl FnOnce(&mut [VkPipeline]) -> VkResult,
+    ) -> Result<(), VkResult> {
         // One handle comes back per create-info, so the decoder sized both from the same count.
         // A mismatch is this renderer having got it wrong, not the guest -- so it asserts.
-        assert_eq!(infos.len(), out.len(), "a pipeline run needs one handle slot per create-info");
-        if infos.is_empty() {
+        assert_eq!(infos, out.len(), "a pipeline run needs one handle slot per create-info");
+        if infos == 0 {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         }
-        // SAFETY: `device` is a handle in this table, `alloc` is an arena allocation live for the
-        // call, and both counts Vulkan is given are the slices' own lengths.
-        let r = unsafe {
-            proc(&d.fns)(
-                device,
-                cache,
-                infos.len() as u32,
-                infos.as_ptr(),
-                ptr(alloc),
-                out.as_mut_ptr(),
-            )
-        };
+        let r = create(out);
         // A positive result is not a failure: `VK_PIPELINE_COMPILE_REQUIRED` says the driver
         // declined to compile early, and every handle is real.
         if r.0 >= VkResult::VK_SUCCESS.0 {
@@ -3387,11 +3483,182 @@ impl Driver {
             }
             // SAFETY: a handle this call just produced, destroyed once -- the slice is walked once
             // and the guest never learns the handle, so nothing else can name it.
-            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };
+            unsafe { (fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };
             // The guest's reply must not carry a handle that is now gone.
             *survivor = VkPipeline::NULL;
         }
         Err(r)
+    }
+
+    /// `vkCreateRayTracingPipelinesKHR`: [`Driver::create_pipelines`] for the one kind whose
+    /// pipelines are asked about afterwards by group index, so each is recorded with how many
+    /// groups it has.
+    ///
+    /// The count is the create-info's own groups and then every library's, in order, which is how
+    /// Vulkan numbers them. A library this renderer has no record of is not a ray-tracing
+    /// pipeline, and the driver would read its groups all the same -- so the run is refused before
+    /// the driver sees it, as is a group naming a stage its create-info does not have. The outer
+    /// `Result` is that refusal; the inner one is the driver's own answer. No deferred operation
+    /// is ever passed: the guest's driver keeps those to itself and sends none.
+    pub fn create_ray_tracing_pipelines(
+        &mut self,
+        device: VkDevice,
+        cache: VkPipelineCache,
+        infos: cs::Decoded<'_, [VkRayTracingPipelineCreateInfoKHR]>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+        out: &mut [VkPipeline],
+    ) -> Result<Result<(), VkResult>, RayTracingRefused> {
+        let d = self.devices.get(&device).ok_or(RayTracingRefused::NoDevice)?;
+        let f = d.fns.try_vkCreateRayTracingPipelinesKHR().ok_or(RayTracingRefused::NotExported)?;
+        let mut groups = Vec::with_capacity(infos.len());
+        for info in infos.iter() {
+            let info = info.get();
+            // SAFETY: the decoder allocated each array from the batch arena at the count beside
+            // it, which is live for this call; a split pair poisoned the decode and never
+            // reached a handler.
+            let (own, stages) = unsafe {
+                (
+                    cs::wire_array(info.groupCount as usize, info.pGroups),
+                    cs::wire_array(info.stageCount as usize, info.pStages),
+                )
+            };
+            let own = own.expect("the decoder holds pGroups to groupCount");
+            let stages = stages.expect("the decoder holds pStages to stageCount").len();
+            let names_a_stage = |i: u32| i == SHADER_UNUSED || (i as usize) < stages;
+            let in_stages = own.iter().all(|g| {
+                [g.generalShader, g.closestHitShader, g.anyHitShader, g.intersectionShader]
+                    .into_iter()
+                    .all(names_a_stage)
+            });
+            if !in_stages {
+                return Err(RayTracingRefused::ShaderOutOfStages);
+            }
+            let mut total = info.groupCount;
+            if !info.pLibraryInfo.is_null() {
+                // SAFETY: a pointer the decoder set to an arena struct of its own, and the
+                // library array inside it allocated at the count beside it.
+                let libraries = unsafe {
+                    let l = &*info.pLibraryInfo;
+                    cs::wire_array(l.libraryCount as usize, l.pLibraries)
+                }
+                .expect("the decoder holds pLibraries to libraryCount");
+                for lib in libraries {
+                    let n = self
+                        .ray_tracing_pipelines
+                        .get(lib)
+                        .ok_or(RayTracingRefused::NotALibrary)?;
+                    total = total.checked_add(*n).ok_or(RayTracingRefused::OutOfGroups)?;
+                }
+            }
+            groups.push(total);
+        }
+        let made = Self::pipeline_run(&d.fns, device, infos.len(), alloc, out, |out| {
+            // SAFETY: as `create_pipelines`, and a null deferred operation is Vulkan's "now".
+            unsafe {
+                f(
+                    device,
+                    VkDeferredOperationKHR::NULL,
+                    cache,
+                    infos.len() as u32,
+                    infos.as_ptr(),
+                    ptr(alloc),
+                    out.as_mut_ptr(),
+                )
+            }
+        });
+        if made.is_ok() {
+            for (pipeline, n) in out.iter().zip(groups) {
+                if pipeline.host().raw() != 0 {
+                    self.ray_tracing_pipelines.insert(*pipeline, n);
+                }
+            }
+        }
+        Ok(made)
+    }
+
+    /// Drop a pipeline's ray-tracing record, if it has one. Called from the two places a pipeline
+    /// dies, as [`Driver::forget_query_pool`] is.
+    pub fn forget_pipeline(&mut self, pipeline: VkPipeline) {
+        self.ray_tracing_pipelines.remove(&pipeline);
+    }
+
+    /// `vkGetRayTracingShaderGroupHandlesKHR`, or its capture-replay twin: the handles of
+    /// `count` groups from `first`, written into `out`.
+    ///
+    /// The driver indexes its own group array by `first` and writes a handle per group into the
+    /// guest's room, trusting both -- lavapipe reads `groups[first + i]` and writes
+    /// `count * handle size` bytes. So the groups are held to the pipeline's record and the room
+    /// to the handle size the device reported, and the room is handed over as the slice it is.
+    pub fn shader_group_handles(
+        &self,
+        device: VkDevice,
+        pipeline: VkPipeline,
+        first: u32,
+        count: u32,
+        out: &mut [u8],
+        kind: GroupHandle,
+    ) -> Result<VkResult, RayTracingRefused> {
+        let d = self.devices.get(&device).ok_or(RayTracingRefused::NoDevice)?;
+        let sizes = d.group_handles.ok_or(RayTracingRefused::NotExported)?;
+        self.holds_groups(pipeline, first, count)?;
+        let size = match kind {
+            GroupHandle::Shader => sizes.shader,
+            GroupHandle::CaptureReplay => sizes.capture_replay,
+        };
+        if (out.len() as u64) < u64::from(count) * u64::from(size) {
+            return Err(RayTracingRefused::OutOfRoom);
+        }
+        let f = match kind {
+            GroupHandle::Shader => d.fns.try_vkGetRayTracingShaderGroupHandlesKHR(),
+            GroupHandle::CaptureReplay => {
+                d.fns.try_vkGetRayTracingCaptureReplayShaderGroupHandlesKHR()
+            }
+        }
+        .ok_or(RayTracingRefused::NotExported)?;
+        // SAFETY: `device` and `pipeline` are live handles this context holds, the groups are the
+        // pipeline's own, and `out` is an exclusive borrow of at least the bytes they need.
+        Ok(unsafe { f(device, pipeline, first, count, out.len(), out.as_mut_ptr().cast()) })
+    }
+
+    /// `vkGetRayTracingShaderGroupStackSizeKHR`: the stack one shader of one group needs.
+    pub fn shader_group_stack_size(
+        &self,
+        device: VkDevice,
+        pipeline: VkPipeline,
+        group: u32,
+        shader: VkShaderGroupShaderKHR,
+    ) -> Result<VkDeviceSize, RayTracingRefused> {
+        use VkShaderGroupShaderKHR as S;
+        let d = self.devices.get(&device).ok_or(RayTracingRefused::NoDevice)?;
+        self.holds_groups(pipeline, group, 1)?;
+        match shader {
+            S::VK_SHADER_GROUP_SHADER_GENERAL_KHR
+            | S::VK_SHADER_GROUP_SHADER_CLOSEST_HIT_KHR
+            | S::VK_SHADER_GROUP_SHADER_ANY_HIT_KHR
+            | S::VK_SHADER_GROUP_SHADER_INTERSECTION_KHR => {}
+            _ => return Err(RayTracingRefused::UnknownShader),
+        }
+        let f = d
+            .fns
+            .try_vkGetRayTracingShaderGroupStackSizeKHR()
+            .ok_or(RayTracingRefused::NotExported)?;
+        // SAFETY: as `shader_group_handles`, for one group the pipeline has.
+        Ok(unsafe { f(device, pipeline, group, shader) })
+    }
+
+    /// Whether groups `first..first + count` are all `pipeline`'s.
+    fn holds_groups(
+        &self,
+        pipeline: VkPipeline,
+        first: u32,
+        count: u32,
+    ) -> Result<(), RayTracingRefused> {
+        let groups =
+            *self.ray_tracing_pipelines.get(&pipeline).ok_or(RayTracingRefused::UnknownPipeline)?;
+        match first.checked_add(count) {
+            Some(end) if end <= groups => Ok(()),
+            _ => Err(RayTracingRefused::OutOfGroups),
+        }
     }
 
     /// Free a run of pool children back to the pool that allocated them, handing back whatever
@@ -3440,7 +3707,21 @@ impl Driver {
         // planted table holds only the entry points its own test needed, and destroying it would
         // call through whichever was left null.
         let fns = Arc::new(LiveDevice { handle, fns, instance: None });
-        self.devices.insert(handle, DeviceState { fns, memory_types: Vec::new() });
+        self.devices
+            .insert(handle, DeviceState { fns, memory_types: Vec::new(), group_handles: None });
+    }
+
+    /// Give a planted device the shader group handle sizes `vkCreateDevice` would have read off a
+    /// driver with ray-tracing pipelines.
+    #[cfg(test)]
+    pub(super) fn plant_group_handle_sizes(
+        &mut self,
+        handle: VkDevice,
+        shader: u32,
+        capture_replay: u32,
+    ) {
+        let d = self.devices.get_mut(&handle).expect("a planted device");
+        d.group_handles = Some(GroupHandleSizes { shader, capture_replay });
     }
 
     /// Give a planted device the memory types `vkCreateDevice` would have read off the driver.
@@ -4331,6 +4612,57 @@ impl Driver {
         let f = self.recorder(cb)?.try_vkCmdCopyMemoryToAccelerationStructureKHR()?;
         // SAFETY: as above.
         unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// `vkCmdTraceRaysKHR`: a `width` by `height` by `depth` grid of rays, their shaders read on
+    /// the device from the four tables.
+    pub fn cmd_trace_rays(
+        &self,
+        cb: VkCommandBuffer,
+        tables: &ShaderBindingTables<'_>,
+        width: u32,
+        height: u32,
+        depth: u32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdTraceRaysKHR()?;
+        let t = tables;
+        // SAFETY: as above; each table is a borrow live for the call.
+        unsafe { f(cb, t.raygen, t.miss, t.hit, t.callable, width, height, depth) };
+        Some(())
+    }
+
+    /// `vkCmdTraceRaysIndirectKHR`: [`Driver::cmd_trace_rays`] with the grid read on the device.
+    pub fn cmd_trace_rays_indirect(
+        &self,
+        cb: VkCommandBuffer,
+        tables: &ShaderBindingTables<'_>,
+        grid: VkDeviceAddress,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdTraceRaysIndirectKHR()?;
+        let t = tables;
+        // SAFETY: as above.
+        unsafe { f(cb, t.raygen, t.miss, t.hit, t.callable, grid) };
+        Some(())
+    }
+
+    /// `vkCmdTraceRaysIndirect2KHR`: the tables and the grid both read on the device.
+    pub fn cmd_trace_rays_indirect2(&self, cb: VkCommandBuffer, at: VkDeviceAddress) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdTraceRaysIndirect2KHR()?;
+        // SAFETY: as above.
+        unsafe { f(cb, at) };
+        Some(())
+    }
+
+    /// `vkCmdSetRayTracingPipelineStackSizeKHR`.
+    pub fn cmd_set_ray_tracing_pipeline_stack_size(
+        &self,
+        cb: VkCommandBuffer,
+        size: u32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetRayTracingPipelineStackSizeKHR()?;
+        // SAFETY: as above.
+        unsafe { f(cb, size) };
         Some(())
     }
 
@@ -13354,6 +13686,210 @@ mod tests {
             );
         });
         d.abandon_planted();
+    }
+
+    /// A ray-tracing pipeline's groups are counted at create, its libraries' included, and every
+    /// command naming one by index is held to that count; the handle queries' room is held to the
+    /// device's handle size. The record dies with the pipeline, at both places it can.
+    #[test]
+    fn ray_tracing_groups_are_held_to_the_pipeline() {
+        use super::super::proto::types::{
+            VkPipelineLibraryCreateInfoKHR, VkPipelineShaderStageCreateInfo,
+            VkRayTracingShaderGroupCreateInfoKHR,
+        };
+        use std::cell::{Cell, RefCell};
+
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        const LIBRARY: VkPipeline = VkPipeline::forged(0x70);
+        const LINKED: VkPipeline = VkPipeline::forged(0x71);
+
+        thread_local! {
+            static NEXT: Cell<u64> = const { Cell::new(0x70) };
+            static ASKED: RefCell<Vec<(&'static str, u32, u32, usize)>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn create(
+            _d: VkDevice,
+            _op: VkDeferredOperationKHR,
+            _c: VkPipelineCache,
+            n: u32,
+            _i: *const VkRayTracingPipelineCreateInfoKHR,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkPipeline,
+        ) -> VkResult {
+            for i in 0..n as usize {
+                let h = NEXT.get();
+                NEXT.set(h + 1);
+                // SAFETY: one slot per create-info, as the driver sized it.
+                unsafe { *out.add(i) = VkPipeline::forged(h) };
+            }
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn handles(
+            _d: VkDevice,
+            _p: VkPipeline,
+            first: u32,
+            count: u32,
+            size: usize,
+            _data: *mut core::ffi::c_void,
+        ) -> VkResult {
+            ASKED.with_borrow_mut(|a| a.push(("handles", first, count, size)));
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn stack(
+            _d: VkDevice,
+            _p: VkPipeline,
+            group: u32,
+            _s: VkShaderGroupShaderKHR,
+        ) -> VkDeviceSize {
+            ASKED.with_borrow_mut(|a| a.push(("stack", group, 1, 0)));
+            VkDeviceSize(4)
+        }
+        unsafe extern "C" fn destroy(
+            _d: VkDevice,
+            _p: VkPipeline,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+        unsafe extern "C" fn wait_idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateRayTracingPipelinesKHR(create);
+        fns.plant_vkGetRayTracingShaderGroupHandlesKHR(handles);
+        fns.plant_vkGetRayTracingShaderGroupStackSizeKHR(stack);
+        fns.plant_vkDestroyPipeline(destroy);
+        fns.plant_vkDeviceWaitIdle(wait_idle);
+        fns.plant_vkDestroyDevice(destroy_device);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+
+        const UNUSED: u32 = !0;
+        let group = |general: u32| VkRayTracingShaderGroupCreateInfoKHR {
+            generalShader: general,
+            closestHitShader: UNUSED,
+            anyHitShader: UNUSED,
+            intersectionShader: UNUSED,
+            ..Default::default()
+        };
+        let stages = [VkPipelineShaderStageCreateInfo::default(); 2];
+        let two = [group(0), group(1)];
+        let one = [group(1)];
+        let info = |groups: &[VkRayTracingShaderGroupCreateInfoKHR],
+                    libs: *const VkPipelineLibraryCreateInfoKHR| {
+            VkRayTracingPipelineCreateInfoKHR {
+                stageCount: stages.len() as u32,
+                pStages: stages.as_ptr(),
+                groupCount: groups.len() as u32,
+                pGroups: groups.as_ptr(),
+                pLibraryInfo: libs,
+                ..Default::default()
+            }
+        };
+        let run = |d: &mut Driver, infos: &[VkRayTracingPipelineCreateInfoKHR]| {
+            let mut out = vec![VkPipeline::NULL; infos.len()];
+            let r = d.create_ray_tracing_pipelines(
+                DEVICE,
+                VkPipelineCache::NULL,
+                cs::Decoded::planted(infos),
+                None,
+                &mut out,
+            );
+            (r, out)
+        };
+
+        // A library of two groups, and a pipeline of one linking it: three.
+        assert_eq!(run(&mut d, &[info(&two, core::ptr::null())]), (Ok(Ok(())), vec![LIBRARY]));
+        let libraries = [LIBRARY];
+        let link = VkPipelineLibraryCreateInfoKHR {
+            libraryCount: 1,
+            pLibraries: libraries.as_ptr(),
+            ..Default::default()
+        };
+        assert_eq!(run(&mut d, &[info(&one, &link)]), (Ok(Ok(())), vec![LINKED]));
+
+        // A group naming a stage past the create-info's, and a library that is not one, are
+        // refused before the driver makes anything.
+        let past = [group(2)];
+        let unknown = [VkPipeline::forged(0x99)];
+        let stray = VkPipelineLibraryCreateInfoKHR {
+            libraryCount: 1,
+            pLibraries: unknown.as_ptr(),
+            ..Default::default()
+        };
+        assert_eq!(
+            run(&mut d, &[info(&past, core::ptr::null())]).0,
+            Err(RayTracingRefused::ShaderOutOfStages)
+        );
+        assert_eq!(run(&mut d, &[info(&one, &stray)]).0, Err(RayTracingRefused::NotALibrary));
+        assert_eq!(NEXT.get(), 0x72, "neither reached the driver");
+
+        let shader = GroupHandle::Shader;
+        let general = VkShaderGroupShaderKHR::VK_SHADER_GROUP_SHADER_GENERAL_KHR;
+        let mut room = [0u8; 64];
+        assert_eq!(
+            d.shader_group_handles(DEVICE, LINKED, 1, 2, &mut room, shader),
+            Err(RayTracingRefused::NotExported),
+            "a device that never enabled ray-tracing pipelines has no handle size"
+        );
+        d.plant_group_handle_sizes(DEVICE, 32, 0);
+
+        // The linked pipeline's last two groups, the second of them its library's: exactly the
+        // room two 32-byte handles need.
+        assert_eq!(
+            d.shader_group_handles(DEVICE, LINKED, 1, 2, &mut room, shader),
+            Ok(VkResult::VK_SUCCESS)
+        );
+        assert_eq!(d.shader_group_stack_size(DEVICE, LINKED, 2, general), Ok(VkDeviceSize(4)));
+        ASKED.with_borrow(|a| {
+            assert_eq!(
+                a.as_slice(),
+                [("handles", 1, 2, 64), ("stack", 2, 1, 0)],
+                "the guest's numbers"
+            )
+        });
+
+        // One byte short, one group past the end, a first group that wraps, a shader kind Vulkan
+        // has not, and a pipeline that is not a ray-tracing one: none reach the driver.
+        let out_of_groups = Err(RayTracingRefused::OutOfGroups);
+        assert_eq!(
+            d.shader_group_handles(DEVICE, LINKED, 1, 2, &mut room[..63], shader),
+            Err(RayTracingRefused::OutOfRoom)
+        );
+        assert_eq!(d.shader_group_handles(DEVICE, LINKED, 2, 2, &mut room, shader), out_of_groups);
+        assert_eq!(
+            d.shader_group_handles(DEVICE, LINKED, u32::MAX, 1, &mut room, shader),
+            out_of_groups
+        );
+        assert_eq!(
+            d.shader_group_stack_size(DEVICE, LINKED, 3, general),
+            Err(RayTracingRefused::OutOfGroups)
+        );
+        assert_eq!(
+            d.shader_group_stack_size(DEVICE, LINKED, 0, VkShaderGroupShaderKHR(7)),
+            Err(RayTracingRefused::UnknownShader)
+        );
+        assert_eq!(
+            d.shader_group_handles(DEVICE, VkPipeline::forged(0x99), 0, 0, &mut room, shader),
+            Err(RayTracingRefused::UnknownPipeline)
+        );
+        ASKED.with_borrow(|a| assert_eq!(a.len(), 2, "no refusal reached the driver"));
+
+        // The guest's destroy takes the record with it, and so does a device's teardown.
+        d.forget_pipeline(LINKED);
+        assert_eq!(
+            d.shader_group_handles(DEVICE, LINKED, 0, 1, &mut room, shader),
+            Err(RayTracingRefused::UnknownPipeline)
+        );
+        let doomed = [Doomed {
+            id: ObjectId(41),
+            ty: VkObjectType::VK_OBJECT_TYPE_PIPELINE,
+            handle: LIBRARY.host(),
+            device: Some(DEVICE),
+        }];
+        d.destroy_device(DEVICE, &doomed);
+        assert!(d.ray_tracing_pipelines.is_empty(), "no record outlives the pipeline it describes");
     }
 
     /// A surface handed to a venus context comes out marked lent, because the classic side reads
