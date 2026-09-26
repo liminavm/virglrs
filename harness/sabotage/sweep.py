@@ -2471,6 +2471,27 @@ SABOTAGES = [
         """                        out += ['let tag = dec.decode_scalar::<%s>();' % ty.sty.name]""",
         'a_geometry_whose_union_tag_is_not_its_type_poisons_the_stream',
     ),
+    (
+        'a build may name its geometries through both arrays',
+        'src/venus/context.rs',
+        """    info.geometryCount == 0 || info.pGeometries.is_null() != info.ppGeometries.is_null()""",
+        """    info.geometryCount == 0 || !info.pGeometries.is_null() || !info.ppGeometries.is_null()""",
+        'a_build_whose_geometries_are_in_neither_array_or_both_is_refused',
+    ),
+    (
+        'a build-size query without primitive counts reaches the driver',
+        'src/venus/context.rs',
+        """        let Some(counts) = args.pMaxPrimitiveCounts() else {""",
+        """        let Some(counts) = args.pMaxPrimitiveCounts().or(Some(&[])) else {""",
+        'a_build_whose_geometries_are_in_neither_array_or_both_is_refused',
+    ),
+    (
+        'a property write is not held to its query pool',
+        'src/venus/driver.rs',
+        """        facts.holds(first, n)?;""",
+        """        let _ = facts;""",
+        'the_acceleration_structure_commands_hand_the_driver_what_the_guest_sent',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

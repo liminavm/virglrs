@@ -23,22 +23,26 @@ use super::cs::{self, Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
 use super::ledger;
 use super::objects::Doomed;
 use super::proto::types::{
-    VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBindDescriptorSetsInfo,
-    VkBlitImageInfo2, VkBool32, VkBuffer, VkBufferCopy, VkBufferImageCopy, VkBufferMemoryBarrier,
-    VkBufferView, VkCalibratedTimestampInfoKHR, VkClearAttachment, VkClearColorValue,
-    VkClearDepthStencilValue, VkClearRect, VkColorBlendAdvancedEXT, VkColorBlendEquationEXT,
-    VkColorComponentFlags, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
-    VkCommandPool, VkCommandPoolTrimFlags, VkCompareOp, VkConditionalRenderingBeginInfoEXT,
-    VkConservativeRasterizationModeEXT, VkCopyBufferInfo2, VkCopyBufferToImageInfo2,
-    VkCopyDescriptorSet, VkCopyImageInfo2, VkCopyImageToBufferInfo2, VkCopyImageToImageInfo,
-    VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo,
-    VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags, VkDependencyInfo,
-    VkDepthBiasInfoEXT, VkDepthClampModeEXT, VkDepthClampRangeEXT, VkDescriptorPool,
-    VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
-    VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA,
-    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties, VkExtent2D,
-    VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
-    VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
+    VkAccelerationStructureBuildGeometryInfoKHR, VkAccelerationStructureBuildRangeInfoKHR,
+    VkAccelerationStructureBuildSizesInfoKHR, VkAccelerationStructureBuildTypeKHR,
+    VkAccelerationStructureKHR, VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure,
+    VkBindDescriptorSetsInfo, VkBlitImageInfo2, VkBool32, VkBuffer, VkBufferCopy,
+    VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView, VkCalibratedTimestampInfoKHR,
+    VkClearAttachment, VkClearColorValue, VkClearDepthStencilValue, VkClearRect,
+    VkColorBlendAdvancedEXT, VkColorBlendEquationEXT, VkColorComponentFlags, VkCommandBuffer,
+    VkCommandBufferBeginInfo, VkCommandBufferResetFlags, VkCommandPool, VkCommandPoolTrimFlags,
+    VkCompareOp, VkConditionalRenderingBeginInfoEXT, VkConservativeRasterizationModeEXT,
+    VkCopyAccelerationStructureInfoKHR, VkCopyAccelerationStructureToMemoryInfoKHR,
+    VkCopyBufferInfo2, VkCopyBufferToImageInfo2, VkCopyDescriptorSet, VkCopyImageInfo2,
+    VkCopyImageToBufferInfo2, VkCopyImageToImageInfo, VkCopyImageToMemoryInfo,
+    VkCopyImageToMemoryInfoMESA, VkCopyMemoryToAccelerationStructureInfoKHR,
+    VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags,
+    VkDependencyInfo, VkDepthBiasInfoEXT, VkDepthClampModeEXT, VkDepthClampRangeEXT,
+    VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
+    VkDeviceAddress, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
+    VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo,
+    VkExtensionProperties, VkExtent2D, VkExternalFenceHandleTypeFlagBits,
+    VkExternalImageFormatProperties, VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
     VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceCreateFlags, VkFenceCreateInfo,
@@ -2107,6 +2111,32 @@ impl Driver {
         Ok(unsafe { f(device, info.get()) })
     }
 
+    /// `vkGetAccelerationStructureBuildSizesKHR`: how much room a build of `info` needs, with
+    /// `max_counts` bounding the primitives of each of its geometries.
+    pub fn acceleration_structure_build_sizes(
+        &self,
+        device: VkDevice,
+        build_type: VkAccelerationStructureBuildTypeKHR,
+        info: cs::Decoded<'_, VkAccelerationStructureBuildGeometryInfoKHR>,
+        max_counts: &[u32],
+        mut out: cs::Out<'_, VkAccelerationStructureBuildSizesInfoKHR>,
+    ) -> Result<(), VkResult> {
+        assert_eq!(
+            max_counts.len(),
+            info.geometryCount as usize,
+            "one bound per geometry: the decoder sized it so, and an absent one is the handler's"
+        );
+        let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let f = d
+            .fns
+            .try_vkGetAccelerationStructureBuildSizesKHR()
+            .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        // SAFETY: as `dev_query_info`; `max_counts` is an arena array of one bound per geometry,
+        // which is how many Vulkan reads.
+        unsafe { f(device, build_type, info.get(), max_counts.as_ptr(), out.as_mut_ptr()) };
+        Ok(())
+    }
+
     /// A device query that names what it is asking about with a struct. `info` is a borrow for
     /// the reason [`Driver::pd_query_info`] gives.
     pub fn dev_query_info<I, T, R>(
@@ -3047,6 +3077,12 @@ impl Driver {
                     .vkDestroyDescriptorUpdateTemplate())(
                     device,
                     VkDescriptorUpdateTemplate::from_host(h),
+                    n,
+                ),
+                T::VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR => (fns
+                    .vkDestroyAccelerationStructureKHR())(
+                    device,
+                    VkAccelerationStructureKHR::from_host(h),
                     n,
                 ),
                 // Destroying a pool frees everything allocated from it, which is why the two kinds
@@ -4206,6 +4242,116 @@ impl Driver {
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };
         Some(())
+    }
+
+    /// `vkCmdBuildAccelerationStructuresKHR`: one build per element of `infos`, each over the row
+    /// of `ranges` beside it. The decoder held every row to its build's `geometryCount`, which is
+    /// why the two arrive as separate values and have only their row count left to agree on.
+    pub fn cmd_build_acceleration_structures(
+        &self,
+        cb: VkCommandBuffer,
+        infos: cs::Decoded<'_, [VkAccelerationStructureBuildGeometryInfoKHR]>,
+        ranges: cs::Rows<'_, VkAccelerationStructureBuildRangeInfoKHR>,
+    ) -> Option<()> {
+        assert_eq!(infos.len(), ranges.len(), "the decoder sizes the rows by the builds");
+        let f = self.recorder(cb)?.try_vkCmdBuildAccelerationStructuresKHR()?;
+        let n = u32::try_from(infos.len()).expect("the decoder sized it from a u32");
+        // SAFETY: as above; `infos`, every row of `ranges`, and every array the builds point at
+        // are arena allocations live for the call, each as long as the count Vulkan reads it by.
+        unsafe { f(cb, n, infos.get().as_ptr(), ranges.as_ptr()) };
+        Some(())
+    }
+
+    /// `vkCmdBuildAccelerationStructuresIndirectKHR`: the builds of
+    /// [`Driver::cmd_build_acceleration_structures`], with each one's ranges read on the device
+    /// from `addresses` at `strides`, bounded by the row of `max_counts` beside it.
+    pub fn cmd_build_acceleration_structures_indirect(
+        &self,
+        cb: VkCommandBuffer,
+        infos: cs::Decoded<'_, [VkAccelerationStructureBuildGeometryInfoKHR]>,
+        addresses: &[VkDeviceAddress],
+        strides: &[u32],
+        max_counts: cs::Rows<'_, u32>,
+    ) -> Option<()> {
+        let n = infos.len();
+        assert!(
+            addresses.len() == n && strides.len() == n && max_counts.len() == n,
+            "the decoder sizes all four by one count"
+        );
+        let f = self.recorder(cb)?.try_vkCmdBuildAccelerationStructuresIndirectKHR()?;
+        let n = u32::try_from(n).expect("the decoder sized it from a u32");
+        // SAFETY: as `cmd_build_acceleration_structures`; `addresses` and `strides` are arena
+        // arrays of `n`.
+        unsafe {
+            f(
+                cb,
+                n,
+                infos.get().as_ptr(),
+                addresses.as_ptr(),
+                strides.as_ptr(),
+                max_counts.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    /// `vkCmdCopyAccelerationStructureKHR`, and the two copies below it that go through memory:
+    /// each is a forward of the one struct the decoder built.
+    pub fn cmd_copy_acceleration_structure(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkCopyAccelerationStructureInfoKHR>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdCopyAccelerationStructureKHR()?;
+        // SAFETY: as above; `info` is an arena allocation live for the call.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_copy_acceleration_structure`].
+    pub fn cmd_copy_acceleration_structure_to_memory(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkCopyAccelerationStructureToMemoryInfoKHR>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdCopyAccelerationStructureToMemoryKHR()?;
+        // SAFETY: as above.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_copy_acceleration_structure`].
+    pub fn cmd_copy_memory_to_acceleration_structure(
+        &self,
+        cb: VkCommandBuffer,
+        info: cs::Decoded<'_, VkCopyMemoryToAccelerationStructureInfoKHR>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdCopyMemoryToAccelerationStructureKHR()?;
+        // SAFETY: as above.
+        unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// `vkCmdWriteAccelerationStructuresPropertiesKHR`: one query per structure, from `first` on,
+    /// so the run has to be the pool's as any other query write's does.
+    pub fn cmd_write_acceleration_structures_properties(
+        &self,
+        cb: VkCommandBuffer,
+        structures: &[VkAccelerationStructureKHR],
+        ty: VkQueryType,
+        pool: VkQueryPool,
+        first: u32,
+    ) -> Result<(), QueryRefused> {
+        let (d, facts) = self.query_recorder(cb, pool)?;
+        let n = u32::try_from(structures.len()).expect("the decoder sized it from a u32");
+        facts.holds(first, n)?;
+        let f = d
+            .try_vkCmdWriteAccelerationStructuresPropertiesKHR()
+            .ok_or(QueryRefused::NotExported)?;
+        // SAFETY: as above, a run of queries the pool holds, and `structures` an arena array of
+        // `n` handles the decoder resolved.
+        unsafe { f(cb, n, structures.as_ptr(), ty, pool, first) };
+        Ok(())
     }
 
     /// See [`Driver::cmd_draw_indirect_count`].

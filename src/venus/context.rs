@@ -29,9 +29,10 @@ use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{COMMAND_TYPES, Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkClearRect, VkCommandBufferLevel, VkCommandStreamDescriptionMESA, VkCommandTypeEXT,
-    VkDepthClampModeEXT, VkDevice, VkDeviceMemory, VkDeviceSize, VkFence, VkFlags,
-    VkMemoryHeapFlagBits, VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType,
+    VkAccelerationStructureBuildGeometryInfoKHR, VkClearRect, VkCommandBufferLevel,
+    VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDepthClampModeEXT, VkDevice,
+    VkDeviceMemory, VkDeviceSize, VkFence, VkFlags, VkMemoryHeapFlagBits,
+    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType,
     VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkResult, VkRingCreateInfoMESA,
     VkRingMonitorInfoMESA, VkSemaphore, vn_command_vkAllocateCommandBuffers,
     vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
@@ -45,20 +46,23 @@ use super::proto::types::{
     vn_command_vkCmdBindIndexBuffer2, vn_command_vkCmdBindPipeline,
     vn_command_vkCmdBindTransformFeedbackBuffersEXT, vn_command_vkCmdBindVertexBuffers,
     vn_command_vkCmdBindVertexBuffers2, vn_command_vkCmdBlitImage, vn_command_vkCmdBlitImage2,
-    vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage,
-    vn_command_vkCmdClearDepthStencilImage, vn_command_vkCmdCopyBuffer,
+    vn_command_vkCmdBuildAccelerationStructuresIndirectKHR,
+    vn_command_vkCmdBuildAccelerationStructuresKHR, vn_command_vkCmdClearAttachments,
+    vn_command_vkCmdClearColorImage, vn_command_vkCmdClearDepthStencilImage,
+    vn_command_vkCmdCopyAccelerationStructureKHR,
+    vn_command_vkCmdCopyAccelerationStructureToMemoryKHR, vn_command_vkCmdCopyBuffer,
     vn_command_vkCmdCopyBuffer2, vn_command_vkCmdCopyBufferToImage,
     vn_command_vkCmdCopyBufferToImage2, vn_command_vkCmdCopyImage, vn_command_vkCmdCopyImage2,
     vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyImageToBuffer2,
-    vn_command_vkCmdCopyQueryPoolResults, vn_command_vkCmdDispatch, vn_command_vkCmdDispatchBase,
-    vn_command_vkCmdDispatchIndirect, vn_command_vkCmdDraw, vn_command_vkCmdDrawIndexed,
-    vn_command_vkCmdDrawIndexedIndirect, vn_command_vkCmdDrawIndexedIndirectCount,
-    vn_command_vkCmdDrawIndirect, vn_command_vkCmdDrawIndirectByteCountEXT,
-    vn_command_vkCmdDrawIndirectCount, vn_command_vkCmdDrawMeshTasksEXT,
-    vn_command_vkCmdDrawMeshTasksIndirectCountEXT, vn_command_vkCmdDrawMeshTasksIndirectEXT,
-    vn_command_vkCmdDrawMultiEXT, vn_command_vkCmdDrawMultiIndexedEXT,
-    vn_command_vkCmdEndConditionalRenderingEXT, vn_command_vkCmdEndQuery,
-    vn_command_vkCmdEndQueryIndexedEXT, vn_command_vkCmdEndRenderPass,
+    vn_command_vkCmdCopyMemoryToAccelerationStructureKHR, vn_command_vkCmdCopyQueryPoolResults,
+    vn_command_vkCmdDispatch, vn_command_vkCmdDispatchBase, vn_command_vkCmdDispatchIndirect,
+    vn_command_vkCmdDraw, vn_command_vkCmdDrawIndexed, vn_command_vkCmdDrawIndexedIndirect,
+    vn_command_vkCmdDrawIndexedIndirectCount, vn_command_vkCmdDrawIndirect,
+    vn_command_vkCmdDrawIndirectByteCountEXT, vn_command_vkCmdDrawIndirectCount,
+    vn_command_vkCmdDrawMeshTasksEXT, vn_command_vkCmdDrawMeshTasksIndirectCountEXT,
+    vn_command_vkCmdDrawMeshTasksIndirectEXT, vn_command_vkCmdDrawMultiEXT,
+    vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndConditionalRenderingEXT,
+    vn_command_vkCmdEndQuery, vn_command_vkCmdEndQueryIndexedEXT, vn_command_vkCmdEndRenderPass,
     vn_command_vkCmdEndRenderPass2, vn_command_vkCmdEndRendering, vn_command_vkCmdEndRendering2KHR,
     vn_command_vkCmdEndTransformFeedbackEXT, vn_command_vkCmdExecuteCommands,
     vn_command_vkCmdFillBuffer, vn_command_vkCmdNextSubpass, vn_command_vkCmdNextSubpass2,
@@ -97,24 +101,26 @@ use super::proto::types::{
     vn_command_vkCmdSetStencilWriteMask, vn_command_vkCmdSetTessellationDomainOriginEXT,
     vn_command_vkCmdSetVertexInputEXT, vn_command_vkCmdSetViewport,
     vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdUpdateBuffer, vn_command_vkCmdWaitEvents,
-    vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2,
-    vn_command_vkCopyImageToImage, vn_command_vkCopyImageToMemoryMESA,
-    vn_command_vkCopyMemoryToImageMESA, vn_command_vkCreateBuffer, vn_command_vkCreateBufferView,
-    vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
-    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
-    vn_command_vkCreateDescriptorUpdateTemplate, vn_command_vkCreateDevice,
-    vn_command_vkCreateEvent, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
-    vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
-    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCmdWaitEvents2, vn_command_vkCmdWriteAccelerationStructuresPropertiesKHR,
+    vn_command_vkCmdWriteTimestamp, vn_command_vkCmdWriteTimestamp2, vn_command_vkCopyImageToImage,
+    vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
+    vn_command_vkCreateAccelerationStructureKHR, vn_command_vkCreateBuffer,
+    vn_command_vkCreateBufferView, vn_command_vkCreateCommandPool,
+    vn_command_vkCreateComputePipelines, vn_command_vkCreateDescriptorPool,
+    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDescriptorUpdateTemplate,
+    vn_command_vkCreateDevice, vn_command_vkCreateEvent, vn_command_vkCreateFence,
+    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
+    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
     vn_command_vkCreateRenderPass2, vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
     vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
-    vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer, vn_command_vkDestroyBufferView,
-    vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
-    vn_command_vkDestroyDescriptorSetLayout, vn_command_vkDestroyDescriptorUpdateTemplate,
-    vn_command_vkDestroyDevice, vn_command_vkDestroyEvent, vn_command_vkDestroyFence,
-    vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
-    vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
+    vn_command_vkCreateShaderModule, vn_command_vkDestroyAccelerationStructureKHR,
+    vn_command_vkDestroyBuffer, vn_command_vkDestroyBufferView, vn_command_vkDestroyCommandPool,
+    vn_command_vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorSetLayout,
+    vn_command_vkDestroyDescriptorUpdateTemplate, vn_command_vkDestroyDevice,
+    vn_command_vkDestroyEvent, vn_command_vkDestroyFence, vn_command_vkDestroyFramebuffer,
+    vn_command_vkDestroyImage, vn_command_vkDestroyImageView, vn_command_vkDestroyInstance,
+    vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyQueryPool,
     vn_command_vkDestroyRenderPass, vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler,
     vn_command_vkDestroySamplerYcbcrConversion, vn_command_vkDestroySemaphore,
@@ -124,9 +130,12 @@ use super::proto::types::{
     vn_command_vkEnumeratePhysicalDeviceGroups, vn_command_vkEnumeratePhysicalDevices,
     vn_command_vkExecuteCommandStreamsMESA, vn_command_vkFlushMappedMemoryRanges,
     vn_command_vkFreeCommandBuffers, vn_command_vkFreeDescriptorSets, vn_command_vkFreeMemory,
-    vn_command_vkGetBufferDeviceAddress, vn_command_vkGetBufferMemoryRequirements,
-    vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetBufferOpaqueCaptureAddress,
-    vn_command_vkGetCalibratedTimestampsKHR, vn_command_vkGetDescriptorSetLayoutSupport,
+    vn_command_vkGetAccelerationStructureBuildSizesKHR,
+    vn_command_vkGetAccelerationStructureDeviceAddressKHR, vn_command_vkGetBufferDeviceAddress,
+    vn_command_vkGetBufferMemoryRequirements, vn_command_vkGetBufferMemoryRequirements2,
+    vn_command_vkGetBufferOpaqueCaptureAddress, vn_command_vkGetCalibratedTimestampsKHR,
+    vn_command_vkGetDescriptorSetLayoutSupport,
+    vn_command_vkGetDeviceAccelerationStructureCompatibilityKHR,
     vn_command_vkGetDeviceBufferMemoryRequirements, vn_command_vkGetDeviceGroupPeerMemoryFeatures,
     vn_command_vkGetDeviceImageMemoryRequirements,
     vn_command_vkGetDeviceImageSparseMemoryRequirements,
@@ -2403,6 +2412,19 @@ impl Handlers<'_> {
         }
     }
 }
+
+/// Whether a build names its geometries through exactly one of its two arrays, as Vulkan
+/// requires of any build with geometries at all.
+///
+/// The wire cannot say it: each array is optional on its own, so the decoder accepts neither or
+/// both, and the driver would read a null array as one of `geometryCount` geometries. A build
+/// with none has neither, because the decoder holds either array to the count.
+fn one_geometry_array(info: &VkAccelerationStructureBuildGeometryInfoKHR) -> bool {
+    info.geometryCount == 0 || info.pGeometries.is_null() != info.ppGeometries.is_null()
+}
+
+const NOT_ONE_GEOMETRY_ARRAY: &str = "built an acceleration structure whose geometries are in \
+     neither of its two arrays, or in both";
 
 /// A create whose whole host action is one `vkCreateX(device, info, alloc, out)`.
 ///
@@ -5003,6 +5025,164 @@ impl Commands for Handlers<'_> {
             args.stride,
         );
         self.recorded(done);
+    }
+
+    /// Not [`simple_create`]: that calls the entry point a driver must export, and this one is an
+    /// extension's -- a guest that names it on a driver without it gets an answer, not an abort.
+    fn vkCreateAccelerationStructureKHR(
+        &mut self,
+        args: &mut vn_command_vkCreateAccelerationStructureKHR<'_>,
+    ) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        let host = self.driver.create_object(
+            args.device,
+            |d| d.try_vkCreateAccelerationStructureKHR(),
+            info,
+            args.pAllocator,
+        );
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant(
+            "vkCreateAccelerationStructureKHR",
+            args.pAccelerationStructure(),
+            args.handle_pAccelerationStructure_mut(),
+            host,
+        );
+    }
+
+    fn vkDestroyAccelerationStructureKHR(
+        &mut self,
+        args: &mut vn_command_vkDestroyAccelerationStructureKHR<'_>,
+    ) {
+        self.driver.destroy_object(
+            args.device,
+            |d| d.try_vkDestroyAccelerationStructureKHR(),
+            args.accelerationStructure,
+            args.pAllocator,
+        );
+    }
+
+    fn vkGetAccelerationStructureDeviceAddressKHR(
+        &mut self,
+        args: &mut vn_command_vkGetAccelerationStructureDeviceAddressKHR<'_>,
+    ) {
+        let Some(info) = self.names(args.pInfo) else { return };
+        let r = self.driver.dev_ask_info(args.device, info, |d| {
+            d.try_vkGetAccelerationStructureDeviceAddressKHR()
+        });
+        if let Some(ret) = self.asked(r) {
+            args.ret = ret;
+        }
+    }
+
+    fn vkGetDeviceAccelerationStructureCompatibilityKHR(
+        &mut self,
+        args: &mut vn_command_vkGetDeviceAccelerationStructureCompatibilityKHR<'_>,
+    ) {
+        let device = args.device;
+        let Some(info) = self.names(args.pVersionInfo) else { return };
+        let Some(out) = self.fills(args.pCompatibility_mut()) else { return };
+        let r = self.driver.dev_query_info(device, info, out.into(), |d| {
+            d.try_vkGetDeviceAccelerationStructureCompatibilityKHR()
+        });
+        self.asked(r);
+    }
+
+    /// The primitive counts are optional on the wire because the pointer is, and required by
+    /// Vulkan for every geometry the build has; the driver reads one per geometry.
+    fn vkGetAccelerationStructureBuildSizesKHR(
+        &mut self,
+        args: &mut vn_command_vkGetAccelerationStructureBuildSizesKHR<'_>,
+    ) {
+        let (device, ty) = (args.device, args.buildType);
+        let Some(info) = self.names(args.pBuildInfo()) else { return };
+        if !one_geometry_array(info.get()) {
+            self.reject(NOT_ONE_GEOMETRY_ARRAY);
+            return;
+        }
+        let Some(counts) = args.pMaxPrimitiveCounts() else {
+            self.reject("asked the size of a build with no primitive counts for its geometries");
+            return;
+        };
+        let Some(out) = self.fills(args.pSizeInfo_mut()) else { return };
+        let r = self.driver.acceleration_structure_build_sizes(device, ty, info, counts, out);
+        self.asked(r);
+    }
+
+    fn vkCmdBuildAccelerationStructuresKHR(
+        &mut self,
+        args: &mut vn_command_vkCmdBuildAccelerationStructuresKHR<'_>,
+    ) {
+        let infos = args.pInfos();
+        if !infos.iter().all(|i| one_geometry_array(i.get())) {
+            self.reject(NOT_ONE_GEOMETRY_ARRAY);
+            return;
+        }
+        let done = self.driver.cmd_build_acceleration_structures(
+            args.commandBuffer,
+            infos,
+            args.ppBuildRangeInfos(),
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdBuildAccelerationStructuresIndirectKHR(
+        &mut self,
+        args: &mut vn_command_vkCmdBuildAccelerationStructuresIndirectKHR<'_>,
+    ) {
+        let infos = args.pInfos();
+        if !infos.iter().all(|i| one_geometry_array(i.get())) {
+            self.reject(NOT_ONE_GEOMETRY_ARRAY);
+            return;
+        }
+        let done = self.driver.cmd_build_acceleration_structures_indirect(
+            args.commandBuffer,
+            infos,
+            args.pIndirectDeviceAddresses(),
+            args.pIndirectStrides(),
+            args.ppMaxPrimitiveCounts(),
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyAccelerationStructureKHR(
+        &mut self,
+        args: &mut vn_command_vkCmdCopyAccelerationStructureKHR<'_>,
+    ) {
+        let Some(info) = self.names(args.pInfo) else { return };
+        let done = self.driver.cmd_copy_acceleration_structure(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyAccelerationStructureToMemoryKHR(
+        &mut self,
+        args: &mut vn_command_vkCmdCopyAccelerationStructureToMemoryKHR<'_>,
+    ) {
+        let Some(info) = self.names(args.pInfo) else { return };
+        let done = self.driver.cmd_copy_acceleration_structure_to_memory(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyMemoryToAccelerationStructureKHR(
+        &mut self,
+        args: &mut vn_command_vkCmdCopyMemoryToAccelerationStructureKHR<'_>,
+    ) {
+        let Some(info) = self.names(args.pInfo) else { return };
+        let done = self.driver.cmd_copy_memory_to_acceleration_structure(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdWriteAccelerationStructuresPropertiesKHR(
+        &mut self,
+        args: &mut vn_command_vkCmdWriteAccelerationStructuresPropertiesKHR<'_>,
+    ) {
+        let done = self.driver.cmd_write_acceleration_structures_properties(
+            args.commandBuffer,
+            args.pAccelerationStructures(),
+            args.queryType,
+            args.queryPool,
+            args.firstQuery,
+        );
+        self.queried(done);
     }
 
     fn vkCmdDrawIndexedIndirectCount(
@@ -16897,6 +17077,328 @@ mod tests {
         });
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The acceleration-structure commands hand the driver what the decoder built, in place: the
+    /// builds and their range rows as the same arrays, the indirect form's four arrays beside
+    /// each other, the size query's bounds, and a property write's run of structures.
+    #[test]
+    fn the_acceleration_structure_commands_hand_the_driver_what_the_guest_sent() {
+        use super::super::proto::types::{
+            VkAccelerationStructureBuildRangeInfoKHR, VkAccelerationStructureBuildSizesInfoKHR,
+            VkAccelerationStructureBuildTypeKHR, VkAccelerationStructureGeometryKHR,
+            VkAccelerationStructureKHR, VkCommandBuffer, VkCommandPool, VkDevice, VkDeviceAddress,
+            VkQueryPool, VkQueryPoolCreateInfo, VkQueryType,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+        const QUERIES: u64 = 0x40;
+
+        // Every call, as the command's name and its arguments widened to one integer type.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<u64>)>> = const { RefCell::new(Vec::new()) };
+        }
+        fn saw(name: &'static str, args: &[u64]) {
+            SAW.with_borrow_mut(|s| s.push((name, args.to_vec())));
+        }
+
+        unsafe extern "C" fn build(
+            _: VkCommandBuffer,
+            n: u32,
+            infos: *const VkAccelerationStructureBuildGeometryInfoKHR,
+            ranges: *const *const VkAccelerationStructureBuildRangeInfoKHR,
+        ) {
+            saw("Build", &[n.into(), infos as u64, ranges as u64]);
+        }
+        unsafe extern "C" fn build_indirect(
+            _: VkCommandBuffer,
+            n: u32,
+            infos: *const VkAccelerationStructureBuildGeometryInfoKHR,
+            addresses: *const VkDeviceAddress,
+            strides: *const u32,
+            counts: *const *const u32,
+        ) {
+            let args = [n.into(), infos as u64, addresses as u64, strides as u64, counts as u64];
+            saw("BuildIndirect", &args);
+        }
+        unsafe extern "C" fn sizes(
+            _: VkDevice,
+            ty: VkAccelerationStructureBuildTypeKHR,
+            info: *const VkAccelerationStructureBuildGeometryInfoKHR,
+            counts: *const u32,
+            out: *mut VkAccelerationStructureBuildSizesInfoKHR,
+        ) {
+            saw("BuildSizes", &[ty.0 as u64, info as u64, counts as u64]);
+            // SAFETY: the out-struct the handler was planted with.
+            unsafe { (*out).accelerationStructureSize = VkDeviceSize(0x77) };
+        }
+        unsafe extern "C" fn write(
+            _: VkCommandBuffer,
+            n: u32,
+            structures: *const VkAccelerationStructureKHR,
+            ty: VkQueryType,
+            pool: VkQueryPool,
+            first: u32,
+        ) {
+            let args = [n.into(), structures as u64, ty.0 as u64, pool.raw(), first.into()];
+            saw("WriteProperties", &args);
+        }
+        unsafe extern "C" fn create_pool(
+            _: VkDevice,
+            _: *const VkQueryPoolCreateInfo,
+            _: *const super::super::proto::types::VkAllocationCallbacks,
+            out: *mut VkQueryPool,
+        ) -> VkResult {
+            // SAFETY: the driver's own local.
+            unsafe { *out = VkQueryPool::forged(QUERIES) };
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdBuildAccelerationStructuresKHR(build);
+        fns.plant_vkCmdBuildAccelerationStructuresIndirectKHR(build_indirect);
+        fns.plant_vkGetAccelerationStructureBuildSizesKHR(sizes);
+        fns.plant_vkCmdWriteAccelerationStructuresPropertiesKHR(write);
+        fns.plant_vkCreateQueryPool(create_pool);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+        let pool_info = VkQueryPoolCreateInfo {
+            queryType: VkQueryType::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+            queryCount: 4,
+            ..Default::default()
+        };
+        let made = driver.create_query_pool(
+            VkDevice::forged(DEVICE),
+            super::super::cs::Decoded::planted(&pool_info),
+            None,
+        );
+        assert_eq!(made, Ok(VkQueryPool::forged(QUERIES)));
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        // One build over an array, one over rows of one: both of Vulkan's spellings.
+        let one = [VkAccelerationStructureGeometryKHR::default()];
+        let two = [VkAccelerationStructureGeometryKHR::default(); 2];
+        let by_row = [&two[0] as *const _, &two[1] as *const _];
+        let infos = [
+            VkAccelerationStructureBuildGeometryInfoKHR {
+                geometryCount: 1,
+                pGeometries: one.as_ptr(),
+                ..Default::default()
+            },
+            VkAccelerationStructureBuildGeometryInfoKHR {
+                geometryCount: 2,
+                ppGeometries: by_row.as_ptr(),
+                ..Default::default()
+            },
+        ];
+        let ranges = [[VkAccelerationStructureBuildRangeInfoKHR::default(); 2]; 2];
+        let range_rows = [ranges[0].as_ptr(), ranges[1].as_ptr()];
+        let mut args = vn_command_vkCmdBuildAccelerationStructuresKHR::default();
+        args.commandBuffer = cb;
+        args.plant_pInfos(&infos);
+        args.plant_ppBuildRangeInfos(&range_rows);
+        h.vkCmdBuildAccelerationStructuresKHR(&mut args);
+
+        let addresses = [VkDeviceAddress(0xd000), VkDeviceAddress(0xe000)];
+        let strides = [16u32, 32];
+        let bounds = [[5u32, 6], [7, 8]];
+        let bound_rows = [bounds[0].as_ptr(), bounds[1].as_ptr()];
+        let mut args = vn_command_vkCmdBuildAccelerationStructuresIndirectKHR::default();
+        args.commandBuffer = cb;
+        args.plant_pInfos(&infos);
+        args.plant_pIndirectDeviceAddresses(&addresses);
+        args.plant_pIndirectStrides(&strides);
+        args.plant_ppMaxPrimitiveCounts(&bound_rows);
+        h.vkCmdBuildAccelerationStructuresIndirectKHR(&mut args);
+
+        let counts = [9u32, 10];
+        let mut size = VkAccelerationStructureBuildSizesInfoKHR::default();
+        let mut args = vn_command_vkGetAccelerationStructureBuildSizesKHR::default();
+        args.device = VkDevice::forged(DEVICE);
+        args.buildType = VkAccelerationStructureBuildTypeKHR(1);
+        args.plant_pBuildInfo(Some(super::super::cs::Decoded::planted(&infos[1])));
+        args.plant_pMaxPrimitiveCounts(&counts);
+        args.plant_pSizeInfo(&mut size);
+        h.vkGetAccelerationStructureBuildSizesKHR(&mut args);
+
+        let structures =
+            [VkAccelerationStructureKHR::forged(0x51), VkAccelerationStructureKHR::forged(0x52)];
+        let mut args = vn_command_vkCmdWriteAccelerationStructuresPropertiesKHR::default();
+        args.commandBuffer = cb;
+        args.queryType = pool_info.queryType;
+        args.queryPool = VkQueryPool::forged(QUERIES);
+        args.firstQuery = 2;
+        args.plant_pAccelerationStructures(&structures);
+        h.vkCmdWriteAccelerationStructuresPropertiesKHR(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+        assert_eq!(
+            size.accelerationStructureSize,
+            VkDeviceSize(0x77),
+            "the answer reached the guest"
+        );
+
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<u64>); 4] = [
+                ("Build", vec![2, infos.as_ptr() as u64, range_rows.as_ptr() as u64]),
+                (
+                    "BuildIndirect",
+                    vec![
+                        2,
+                        infos.as_ptr() as u64,
+                        addresses.as_ptr() as u64,
+                        strides.as_ptr() as u64,
+                        bound_rows.as_ptr() as u64,
+                    ],
+                ),
+                ("BuildSizes", vec![1, &infos[1] as *const _ as u64, counts.as_ptr() as u64]),
+                (
+                    "WriteProperties",
+                    vec![2, structures.as_ptr() as u64, pool_info.queryType.0 as u64, QUERIES, 2],
+                ),
+            ];
+            assert_eq!(*s, want, "each command once, every array the one the guest sent");
+        });
+
+        // A write past the pool's end never reaches the driver.
+        let mut args = vn_command_vkCmdWriteAccelerationStructuresPropertiesKHR::default();
+        args.commandBuffer = cb;
+        args.queryType = pool_info.queryType;
+        args.queryPool = VkQueryPool::forged(QUERIES);
+        args.firstQuery = 3;
+        args.plant_pAccelerationStructures(&structures);
+        h.vkCmdWriteAccelerationStructuresPropertiesKHR(&mut args);
+        assert_eq!(h.rejected(), Some("named queries past the end of the pool"));
+        SAW.with_borrow(|s| assert_eq!(s.len(), 4, "and the driver was not asked"));
+
+        // Nothing here came from Vulkan but the pool's record, which has no handle behind it.
+        h.driver.abandon_planted();
+    }
+
+    /// A build with geometries names them through exactly one of its two arrays. The wire allows
+    /// neither and both, and the driver would read a null array as the geometries it counts, so
+    /// each is refused before it is asked -- as is a size query with no bound per geometry.
+    #[test]
+    fn a_build_whose_geometries_are_in_neither_array_or_both_is_refused() {
+        use super::super::proto::types::{
+            VkAccelerationStructureBuildRangeInfoKHR, VkAccelerationStructureBuildSizesInfoKHR,
+            VkAccelerationStructureGeometryKHR, VkCommandBuffer, VkCommandPool, VkDevice,
+        };
+
+        const DEVICE: u64 = 3;
+        const CB: (u64, u64) = (11, 110);
+
+        // No entry point is planted: a handler that asks the driver fails as not recorded, which
+        // is a different refusal from the one each case expects.
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), crate::vulkan::Device::default());
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(7),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let geometry = [VkAccelerationStructureGeometryKHR::default()];
+        let row = [geometry.as_ptr()];
+        let neither =
+            VkAccelerationStructureBuildGeometryInfoKHR { geometryCount: 1, ..Default::default() };
+        let both = VkAccelerationStructureBuildGeometryInfoKHR {
+            geometryCount: 1,
+            pGeometries: geometry.as_ptr(),
+            ppGeometries: row.as_ptr(),
+            ..Default::default()
+        };
+        let ranges = [VkAccelerationStructureBuildRangeInfoKHR::default()];
+        let range_rows = [ranges.as_ptr()];
+        for (what, info) in [("neither array", neither), ("both arrays", both)] {
+            let infos = [info];
+            let mut args = vn_command_vkCmdBuildAccelerationStructuresKHR::default();
+            args.commandBuffer = VkCommandBuffer::forged(CB.0);
+            args.plant_pInfos(&infos);
+            args.plant_ppBuildRangeInfos(&range_rows);
+            h.vkCmdBuildAccelerationStructuresKHR(&mut args);
+            assert_eq!(h.rejected(), Some(NOT_ONE_GEOMETRY_ARRAY), "a build with {what}");
+            h.ask = None;
+        }
+
+        let fine = VkAccelerationStructureBuildGeometryInfoKHR {
+            geometryCount: 1,
+            pGeometries: geometry.as_ptr(),
+            ..Default::default()
+        };
+        let mut size = VkAccelerationStructureBuildSizesInfoKHR::default();
+        let mut args = vn_command_vkGetAccelerationStructureBuildSizesKHR::default();
+        args.device = VkDevice::forged(DEVICE);
+        args.plant_pBuildInfo(Some(super::super::cs::Decoded::planted(&fine)));
+        args.plant_pSizeInfo(&mut size);
+        h.vkGetAccelerationStructureBuildSizesKHR(&mut args);
+        assert_eq!(
+            h.rejected(),
+            Some("asked the size of a build with no primitive counts for its geometries")
+        );
+
         h.driver.abandon_planted();
     }
 
