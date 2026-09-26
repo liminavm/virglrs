@@ -2551,6 +2551,52 @@ SABOTAGES = [
         """            let names_a_stage = |_: u32| stages < usize::MAX;""",
         'ray_tracing_groups_are_held_to_the_pipeline',
     ),
+    (
+        'a derivative may name any pipeline of its run as its base',
+        'src/venus/context.rs',
+        """            base => usize::try_from(base).is_ok_and(|base| base < i),""",
+        """            base => usize::try_from(base).is_ok(),""",
+        'a_derivative_pipeline_names_only_an_earlier_pipeline_of_its_run_as_its_base',
+    ),
+    (
+        "a derivative's flags2 link is not read",
+        'src/venus/context.rs',
+        """            Some(two) => two.flags.0,""",
+        """            Some(_) => info.flags(),""",
+        'a_derivative_pipeline_names_only_an_earlier_pipeline_of_its_run_as_its_base',
+    ),
+    (
+        'a graphics pipeline run is not held to its bases',
+        'src/venus/context.rs',
+        """    fn vkCreateGraphicsPipelines(&mut self, args: &mut vn_command_vkCreateGraphicsPipelines<'_>) {
+        let infos = args.pCreateInfos();
+        if !bases_in_run(infos) {""",
+        """    fn vkCreateGraphicsPipelines(&mut self, args: &mut vn_command_vkCreateGraphicsPipelines<'_>) {
+        let infos = args.pCreateInfos();
+        if false && !bases_in_run(infos) {""",
+        'a_derivative_pipeline_names_only_an_earlier_pipeline_of_its_run_as_its_base',
+    ),
+    (
+        'a ray-tracing pipeline run is not held to its bases',
+        'src/venus/context.rs',
+        """        let infos = args.pCreateInfos();
+        if !bases_in_run(infos) {
+            self.reject(BASE_OUTSIDE_RUN);
+            return;
+        }
+        let ids = args.pPipelines();
+        // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
+        let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
+        let out = args.handle_pPipelines_mut();
+        let made = self.driver.create_ray_tracing_pipelines(""",
+        """        let infos = args.pCreateInfos();
+        let ids = args.pPipelines();
+        // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
+        let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
+        let out = args.handle_pPipelines_mut();
+        let made = self.driver.create_ray_tracing_pipelines(""",
+        'a_derivative_pipeline_names_only_an_earlier_pipeline_of_its_run_as_its_base',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

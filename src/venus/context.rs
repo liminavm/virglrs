@@ -188,6 +188,10 @@ use super::proto::types::{
     vn_command_vkWaitSemaphores, vn_command_vkWaitVirtqueueSeqnoMESA,
     vn_command_vkWriteRingExtraMESA,
 };
+use super::proto::types::{
+    VkComputePipelineCreateInfo, VkGraphicsPipelineCreateInfo, VkPipelineCreateFlagBits,
+    VkPipelineCreateFlags2CreateInfo, VkRayTracingPipelineCreateInfoKHR,
+};
 use super::ring::{
     ReplyStream, ReplyStreamError, ResourceBytes, Ring, RingControl, RingError, ShmResources,
 };
@@ -2471,6 +2475,59 @@ fn one_geometry_array(info: &VkAccelerationStructureBuildGeometryInfoKHR) -> boo
 const NOT_ONE_GEOMETRY_ARRAY: &str = "built an acceleration structure whose geometries are in \
      neither of its two arrays, or in both";
 
+/// A pipeline create-info, which may name the pipeline it derives from by its index in the same
+/// run.
+trait Derives: super::cs::Links + Sized {
+    /// The 1.0 `flags`, which a chained `VkPipelineCreateFlags2CreateInfo` replaces.
+    fn flags(&self) -> u64;
+    fn base_index(&self) -> i32;
+}
+
+macro_rules! derives {
+    ($($t:ty),*) => {$(
+        impl Derives for $t {
+            fn flags(&self) -> u64 {
+                self.flags.0.into()
+            }
+            fn base_index(&self) -> i32 {
+                self.basePipelineIndex
+            }
+        }
+    )*};
+}
+derives!(
+    VkGraphicsPipelineCreateInfo,
+    VkComputePipelineCreateInfo,
+    VkRayTracingPipelineCreateInfoKHR
+);
+
+/// Whether every derivative in a pipeline run names, by index, only a pipeline earlier in the
+/// run -- or names none, with -1, and derives from its handle instead.
+///
+/// Vulkan requires it, and nothing on the wire can enforce it: the index is a bare `i32` into
+/// the array beside it. No Mesa driver reads the index today, so this bounds a read into the
+/// guest's array that a driver following the spec would make, before one does. Only a
+/// derivative is held to it, as Vulkan holds only a derivative: an index on a create without the
+/// bit is ignored and may be anything. Which bit is read follows Vulkan too: a chained
+/// `VkPipelineCreateFlags2CreateInfo` replaces `flags` whole.
+fn bases_in_run<I: Derives>(infos: Decoded<'_, [I]>) -> bool {
+    const DERIVATIVE: u64 = VkPipelineCreateFlagBits::VK_PIPELINE_CREATE_DERIVATIVE_BIT.0 as u64;
+    infos.iter().enumerate().all(|(i, info)| {
+        let flags = match driver::chained::<VkPipelineCreateFlags2CreateInfo>(info) {
+            Some(two) => two.flags.0,
+            None => info.flags(),
+        };
+        match info.base_index() {
+            _ if flags & DERIVATIVE == 0 => true,
+            -1 => true,
+            base => usize::try_from(base).is_ok_and(|base| base < i),
+        }
+    })
+}
+
+const BASE_OUTSIDE_RUN: &str =
+    "derived a pipeline from an index that is not an earlier pipeline in the same run";
+
 /// A create whose whole host action is one `vkCreateX(device, info, alloc, out)`.
 ///
 /// Twenty Vulkan objects have exactly this shape, and writing them out forty times would be forty
@@ -4714,6 +4771,10 @@ impl Commands for Handlers<'_> {
 
     fn vkCreateGraphicsPipelines(&mut self, args: &mut vn_command_vkCreateGraphicsPipelines<'_>) {
         let infos = args.pCreateInfos();
+        if !bases_in_run(infos) {
+            self.reject(BASE_OUTSIDE_RUN);
+            return;
+        }
         let ids = args.pPipelines();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
@@ -4743,6 +4804,10 @@ impl Commands for Handlers<'_> {
     /// [`Driver::create_pipelines`] is already generic over it.
     fn vkCreateComputePipelines(&mut self, args: &mut vn_command_vkCreateComputePipelines<'_>) {
         let infos = args.pCreateInfos();
+        if !bases_in_run(infos) {
+            self.reject(BASE_OUTSIDE_RUN);
+            return;
+        }
         let ids = args.pPipelines();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
@@ -4787,6 +4852,10 @@ impl Commands for Handlers<'_> {
             return;
         }
         let infos = args.pCreateInfos();
+        if !bases_in_run(infos) {
+            self.reject(BASE_OUTSIDE_RUN);
+            return;
+        }
         let ids = args.pPipelines();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
@@ -17313,6 +17382,170 @@ mod tests {
         });
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// A derivative pipeline may name its base by index only if the base is earlier in the same
+    /// run; -1 names none, and a create without the derivative bit is not held to its index at
+    /// all. The bit is read from a chained `VkPipelineCreateFlags2CreateInfo` when there is one,
+    /// since that replaces `flags`. A run that breaks the rule never reaches the driver, whichever
+    /// of the three pipeline creates carries it.
+    #[test]
+    fn a_derivative_pipeline_names_only_an_earlier_pipeline_of_its_run_as_its_base() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkDevice, VkPipeline, VkPipelineCache, VkPipelineCreateFlagBits,
+            VkPipelineCreateFlags, VkPipelineCreateFlags2, VkPipelineCreateFlags2CreateInfo,
+            VkStructureType,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const DERIVATIVE: VkPipelineCreateFlags = VkPipelineCreateFlags(
+            VkPipelineCreateFlagBits::VK_PIPELINE_CREATE_DERIVATIVE_BIT.0 as u32,
+        );
+
+        thread_local! {
+            /// The create-info count of every run that reached the driver.
+            static ASKED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn create(
+            _d: VkDevice,
+            _c: VkPipelineCache,
+            n: u32,
+            _i: *const VkComputePipelineCreateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkPipeline,
+        ) -> VkResult {
+            ASKED.with_borrow_mut(|a| a.push(n));
+            // SAFETY: the wrapper passes its slice's own pointer and length.
+            for e in unsafe { core::slice::from_raw_parts_mut(out, n as usize) } {
+                *e = VkPipeline::forged(0x70);
+            }
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateComputePipelines(create);
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let compute = |flags: VkPipelineCreateFlags, base: i32| VkComputePipelineCreateInfo {
+            flags,
+            basePipelineIndex: base,
+            ..Default::default()
+        };
+        let plain = compute(VkPipelineCreateFlags(0), -1);
+        // The flags2 link: derivative, or not, whatever the 1.0 flags beside it say.
+        let two = |bits: u64| VkPipelineCreateFlags2CreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+            flags: VkPipelineCreateFlags2(bits),
+            ..Default::default()
+        };
+        let derivative2 = two(DERIVATIVE.0.into());
+        let not_derivative2 = two(0);
+        let chained = |link: &VkPipelineCreateFlags2CreateInfo, flags, base| {
+            let mut info = compute(flags, base);
+            info.pNext = (link as *const VkPipelineCreateFlags2CreateInfo).cast();
+            info
+        };
+
+        let run = |h: &mut Handlers<'_>, infos: &[VkComputePipelineCreateInfo]| {
+            let mut wire = vec![VkPipeline::forged(40); infos.len()];
+            let mut shadow = vec![VkPipeline::forged(0); infos.len()];
+            let mut args = vn_command_vkCreateComputePipelines::default();
+            args.device = VkDevice::forged(DEVICE);
+            args.plant_pCreateInfos(infos);
+            args.plant_pPipelines(&mut wire);
+            args.plant_handle_pPipelines(&mut shadow);
+            h.vkCreateComputePipelines(&mut args);
+            h.take_rejected()
+        };
+
+        let refused = Some(BASE_OUTSIDE_RUN);
+        let cases: [(&str, Vec<VkComputePipelineCreateInfo>, Option<&str>); 9] = [
+            ("a base earlier in the run", vec![plain, compute(DERIVATIVE, 0)], None),
+            ("a base of -1: the handle instead", vec![compute(DERIVATIVE, -1)], None),
+            (
+                "an index on a create that is not a derivative",
+                vec![compute(VkPipelineCreateFlags(0), 99)],
+                None,
+            ),
+            ("itself as its base", vec![plain, compute(DERIVATIVE, 1)], refused),
+            ("a base later in the run", vec![compute(DERIVATIVE, 1), plain], refused),
+            ("a base past the run", vec![plain, compute(DERIVATIVE, 5)], refused),
+            ("a negative base other than -1", vec![plain, compute(DERIVATIVE, -2)], refused),
+            (
+                "a derivative by its flags2 link",
+                vec![chained(&derivative2, VkPipelineCreateFlags(0), 3)],
+                refused,
+            ),
+            (
+                "flags2 saying not, over flags saying so",
+                vec![chained(&not_derivative2, DERIVATIVE, 3)],
+                None,
+            ),
+        ];
+        for (what, infos, want) in &cases {
+            assert_eq!(run(&mut h, infos), *want, "{what}");
+        }
+        ASKED.with_borrow(|a| {
+            assert_eq!(a.as_slice(), [2, 1, 1, 1], "every accepted run, and no refused one")
+        });
+
+        // The other two creates run the same check.
+        let graphics = [VkGraphicsPipelineCreateInfo {
+            flags: DERIVATIVE,
+            basePipelineIndex: 0,
+            ..Default::default()
+        }];
+        let mut wire = [VkPipeline::forged(40)];
+        let mut shadow = [VkPipeline::forged(0)];
+        let mut args = vn_command_vkCreateGraphicsPipelines::default();
+        args.device = VkDevice::forged(DEVICE);
+        args.plant_pCreateInfos(&graphics);
+        args.plant_pPipelines(&mut wire);
+        args.plant_handle_pPipelines(&mut shadow);
+        h.vkCreateGraphicsPipelines(&mut args);
+        assert_eq!(h.take_rejected(), refused, "a graphics run");
+        let ray_tracing = [VkRayTracingPipelineCreateInfoKHR {
+            flags: DERIVATIVE,
+            basePipelineIndex: 0,
+            ..Default::default()
+        }];
+        let mut args = vn_command_vkCreateRayTracingPipelinesKHR::default();
+        args.device = VkDevice::forged(DEVICE);
+        args.plant_pCreateInfos(&ray_tracing);
+        args.plant_pPipelines(&mut wire);
+        args.plant_handle_pPipelines(&mut shadow);
+        h.vkCreateRayTracingPipelinesKHR(&mut args);
+        assert_eq!(h.take_rejected(), refused, "a ray-tracing run");
+
         h.driver.abandon_planted();
     }
 

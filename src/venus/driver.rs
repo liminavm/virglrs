@@ -77,8 +77,8 @@ use super::proto::types::{
 };
 use super::proto::types::{
     VkDeferredOperationKHR, VkPhysicalDeviceProperties2,
-    VkPhysicalDeviceRayTracingPipelinePropertiesKHR, VkRayTracingPipelineCreateInfoKHR,
-    VkShaderGroupShaderKHR, VkStridedDeviceAddressRegionKHR,
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR, VkPipelineCreateFlags2CreateInfo,
+    VkRayTracingPipelineCreateInfoKHR, VkShaderGroupShaderKHR, VkStridedDeviceAddressRegionKHR,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
@@ -8945,6 +8945,13 @@ unsafe impl InStruct for VkRingMonitorInfoMESA {
 unsafe impl InStruct for VkPhysicalDeviceExternalImageFormatInfo {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkPipelineCreateFlags2CreateInfo {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO;
 }
 
 /// The struct the guest chained onto an answer, or `None` if it chained none.
