@@ -2432,6 +2432,21 @@ SABOTAGES = [
         unsafe { f(cb, buffer, count_offset, count_buffer, offset, max_draws, stride) };""",
         'the_mesh_task_draws_hand_the_driver_every_argument_in_place',
     ),
+    (
+        'a host-address union member is accepted even when present',
+        'venus-gen/rustgen.py',
+        """            return ['if dec.decode_simple_pointer() {',
+                    '    dec.set_fatal();',
+                    '} else {',
+                    '    %s = %s;' % (m, null),
+                    '}']""",
+        """            return ['if dec.decode_simple_pointer() {',
+                    '    let _ = 0;',
+                    '} else {',
+                    '    %s = %s;' % (m, null),
+                    '}']""",
+        'a_device_or_host_address_decodes_a_device_address_and_no_host_one',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

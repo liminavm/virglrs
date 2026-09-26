@@ -232,6 +232,36 @@ mod tests {
         );
     }
 
+    /// `VkDeviceOrHostAddressConstKHR` rides as a tag and its member: 0 and a device address, or
+    /// 1 and a host pointer that must be absent, since a host address means nothing on this side.
+    /// The union is inside every acceleration-structure geometry, so refusing it outright refused
+    /// every build.
+    #[test]
+    fn a_device_or_host_address_decodes_a_device_address_and_no_host_one() {
+        let device = wire(&[&0u32.to_le_bytes(), &0x1234_5678_9abc_u64.to_le_bytes()]);
+        round_trip::<VkDeviceOrHostAddressConstKHR>(
+            &device,
+            vn_decode_VkDeviceOrHostAddressConstKHR_temp,
+            vn_sizeof_VkDeviceOrHostAddressConstKHR,
+            vn_encode_VkDeviceOrHostAddressConstKHR,
+        );
+
+        let decode = |w: &[u8]| {
+            let temp = Bump::new();
+            let hard = AtomicBool::new(false);
+            let mut dec = Decoder::new(w, &temp, &IdentityObjects, &hard);
+            let mut val = VkDeviceOrHostAddressConstKHR::default();
+            vn_decode_VkDeviceOrHostAddressConstKHR_temp(&mut dec, &mut val);
+            (dec.fatal(), dec.pos())
+        };
+        let absent_host = wire(&[&1u32.to_le_bytes(), &0u64.to_le_bytes()]);
+        assert_eq!(decode(&absent_host), (false, absent_host.len()), "a null host pointer is fine");
+        let host = wire(&[&1u32.to_le_bytes(), &1u64.to_le_bytes()]);
+        assert!(decode(&host).0, "a host pointer poisons the stream");
+        let neither = wire(&[&2u32.to_le_bytes(), &0u64.to_le_bytes()]);
+        assert!(decode(&neither).0, "a tag the union does not have poisons it");
+    }
+
     /// An array of strings is an array of pointers, and the arena element has to be one pointer
     /// wide. Allocating it a character wide compiles and then truncates every pointer it stores.
     #[test]

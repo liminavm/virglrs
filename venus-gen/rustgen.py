@@ -991,7 +991,11 @@ class RustGen:
         everything after it, which is how the first corpus run found this.
         """
         m = self.member_expr(var)
-        if not var.ty.is_pointer() or not var.maybe_null():
+        # A union's member is never required to be there: the tag says which one was sent. So a
+        # pointer member of a union rides as one that must arrive null, as it does in the C --
+        # `VkDeviceOrHostAddressKHR.hostAddress`, which a device-side build never sends.
+        may_be_absent = var.maybe_null() or ty.category == VkType.UNION
+        if not var.ty.is_pointer() or not may_be_absent:
             raise self.Unsupported('%s.%s: not serializable' % (ty.name, var.name))
         ref = self.is_ref_member(ty, var)
         null = 'None' if ref else self.null_of(var)
