@@ -2400,6 +2400,20 @@ SABOTAGES = [
         """        true""",
         'no_advertised_extension_needs_a_command_this_build_does_not_serve',
     ),
+    (
+        "vkCmdEndRendering2KHR drops the guest's struct",
+        'src/venus/driver.rs',
+        """        unsafe { f(cb, ptr(info)) };""",
+        """        unsafe { f(cb, ptr(info.filter(|_| false))) };""",
+        'end_rendering2_and_depth_clamp_range_hand_the_driver_the_guests_structs',
+    ),
+    (
+        'a user-defined depth clamp with no range reaches the driver',
+        'src/venus/context.rs',
+        """        if user_defined && args.pDepthClampRange.is_none() {""",
+        """        if user_defined && args.pDepthClampRange.is_none() && false {""",
+        'end_rendering2_and_depth_clamp_range_hand_the_driver_the_guests_structs',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

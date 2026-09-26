@@ -33,11 +33,12 @@ use super::proto::types::{
     VkCopyDescriptorSet, VkCopyImageInfo2, VkCopyImageToBufferInfo2, VkCopyImageToImageInfo,
     VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo,
     VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags, VkDependencyInfo,
-    VkDepthBiasInfoEXT, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
-    VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
-    VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo,
-    VkExtensionProperties, VkExtent2D, VkExternalFenceHandleTypeFlagBits,
-    VkExternalImageFormatProperties, VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
+    VkDepthBiasInfoEXT, VkDepthClampModeEXT, VkDepthClampRangeEXT, VkDescriptorPool,
+    VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
+    VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA,
+    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties, VkExtent2D,
+    VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
+    VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
     VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceCreateFlags, VkFenceCreateInfo,
@@ -59,16 +60,16 @@ use super::proto::types::{
     VkProvokingVertexModeEXT, VkPushConstantsInfo, VkPushDescriptorSetInfo, VkQueryControlFlags,
     VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType,
     VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingAttachmentLocationInfo,
-    VkRenderingInfo, VkRenderingInputAttachmentIndexInfo, VkResolveImageInfo2, VkResult,
-    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampleMask,
-    VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo,
-    VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo,
-    VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags,
-    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
-    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassBeginInfo, VkSubpassContents,
-    VkSubpassEndInfo, VkTessellationDomainOrigin, VkTimelineSemaphoreSubmitInfo,
-    VkVertexInputAttributeDescription2EXT, VkVertexInputBindingDescription2EXT, VkViewport,
-    VkWriteDescriptorSet,
+    VkRenderingEndInfoKHR, VkRenderingInfo, VkRenderingInputAttachmentIndexInfo,
+    VkResolveImageInfo2, VkResult, VkRingMonitorInfoMESA, VkSampleCountFlagBits,
+    VkSampleLocationsInfoEXT, VkSampleMask, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
+    VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
+    VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
+    VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags,
+    VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo, VkSubmitInfo2,
+    VkSubpassBeginInfo, VkSubpassContents, VkSubpassEndInfo, VkTessellationDomainOrigin,
+    VkTimelineSemaphoreSubmitInfo, VkVertexInputAttributeDescription2EXT,
+    VkVertexInputBindingDescription2EXT, VkViewport, VkWriteDescriptorSet,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
@@ -4495,6 +4496,19 @@ impl Driver {
         Some(())
     }
 
+    /// `vkCmdEndRendering2KHR`, `VK_KHR_maintenance10`'s end of rendering, whose struct is optional
+    /// and whose chain may carry the fragment density map's offsets.
+    pub fn cmd_end_rendering2(
+        &self,
+        cb: VkCommandBuffer,
+        info: Option<cs::Decoded<'_, VkRenderingEndInfoKHR>>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdEndRendering2KHR()?;
+        // SAFETY: as above; `info` is null or a struct the decoder built, live for the call.
+        unsafe { f(cb, ptr(info)) };
+        Some(())
+    }
+
     pub fn cmd_set_cull_mode(&self, cb: VkCommandBuffer, mode: VkCullModeFlags) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdSetCullMode()?;
         // SAFETY: as above.
@@ -4997,6 +5011,20 @@ impl Driver {
         let f = self.recorder(cb)?.try_vkCmdSetDepthBias2EXT()?;
         // SAFETY: as above; `info` is a struct the decoder built, live for the call.
         unsafe { f(cb, info.get()) };
+        Some(())
+    }
+
+    /// `vkCmdSetDepthClampRangeEXT`. `range` is what a user-defined mode clamps to; the handler has
+    /// already refused that mode without one, which the driver would read through a null pointer.
+    pub fn cmd_set_depth_clamp_range(
+        &self,
+        cb: VkCommandBuffer,
+        mode: VkDepthClampModeEXT,
+        range: Option<&VkDepthClampRangeEXT>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetDepthClampRangeEXT()?;
+        // SAFETY: as above; `range` is null or addresses one struct live for the call.
+        unsafe { f(cb, mode, range.map_or(core::ptr::null(), |r| r as *const _)) };
         Some(())
     }
 

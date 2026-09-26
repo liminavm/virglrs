@@ -82,9 +82,7 @@ vkCmdCopyMemoryToAccelerationStructureKHR          out-of-reach:acceleration-str
 vkCmdDrawMeshTasksEXT                              out-of-reach:mesh-shader
 vkCmdDrawMeshTasksIndirectCountEXT                 out-of-reach:mesh-shader
 vkCmdDrawMeshTasksIndirectEXT                      out-of-reach:mesh-shader
-vkCmdEndRendering2KHR                              out-of-reach:maintenance10
 vkCmdPushDataEXT                                   out-of-reach:descriptor-heap
-vkCmdSetDepthClampRangeEXT                         out-of-reach:shader-object
 vkCmdSetRayTracingPipelineStackSizeKHR             out-of-reach:ray-tracing-pipeline
 vkCmdTraceRaysIndirect2KHR                         out-of-reach:ray-tracing-maintenance1
 vkCmdTraceRaysIndirectKHR                          out-of-reach:ray-tracing-pipeline

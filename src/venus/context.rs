@@ -29,9 +29,9 @@ use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{COMMAND_TYPES, Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkClearRect, VkCommandBufferLevel, VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDevice,
-    VkDeviceMemory, VkDeviceSize, VkFence, VkFlags, VkMemoryHeapFlagBits,
-    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType,
+    VkClearRect, VkCommandBufferLevel, VkCommandStreamDescriptionMESA, VkCommandTypeEXT,
+    VkDepthClampModeEXT, VkDevice, VkDeviceMemory, VkDeviceSize, VkFence, VkFlags,
+    VkMemoryHeapFlagBits, VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType,
     VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkResult, VkRingCreateInfoMESA,
     VkRingMonitorInfoMESA, VkSemaphore, vn_command_vkAllocateCommandBuffers,
     vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
@@ -57,7 +57,7 @@ use super::proto::types::{
     vn_command_vkCmdDrawIndirectCount, vn_command_vkCmdDrawMultiEXT,
     vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndConditionalRenderingEXT,
     vn_command_vkCmdEndQuery, vn_command_vkCmdEndQueryIndexedEXT, vn_command_vkCmdEndRenderPass,
-    vn_command_vkCmdEndRenderPass2, vn_command_vkCmdEndRendering,
+    vn_command_vkCmdEndRenderPass2, vn_command_vkCmdEndRendering, vn_command_vkCmdEndRendering2KHR,
     vn_command_vkCmdEndTransformFeedbackEXT, vn_command_vkCmdExecuteCommands,
     vn_command_vkCmdFillBuffer, vn_command_vkCmdNextSubpass, vn_command_vkCmdNextSubpass2,
     vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPipelineBarrier2,
@@ -73,10 +73,11 @@ use super::proto::types::{
     vn_command_vkCmdSetCullMode, vn_command_vkCmdSetDepthBias, vn_command_vkCmdSetDepthBias2EXT,
     vn_command_vkCmdSetDepthBiasEnable, vn_command_vkCmdSetDepthBounds,
     vn_command_vkCmdSetDepthBoundsTestEnable, vn_command_vkCmdSetDepthClampEnableEXT,
-    vn_command_vkCmdSetDepthClipEnableEXT, vn_command_vkCmdSetDepthClipNegativeOneToOneEXT,
-    vn_command_vkCmdSetDepthCompareOp, vn_command_vkCmdSetDepthTestEnable,
-    vn_command_vkCmdSetDepthWriteEnable, vn_command_vkCmdSetDeviceMask, vn_command_vkCmdSetEvent,
-    vn_command_vkCmdSetEvent2, vn_command_vkCmdSetExtraPrimitiveOverestimationSizeEXT,
+    vn_command_vkCmdSetDepthClampRangeEXT, vn_command_vkCmdSetDepthClipEnableEXT,
+    vn_command_vkCmdSetDepthClipNegativeOneToOneEXT, vn_command_vkCmdSetDepthCompareOp,
+    vn_command_vkCmdSetDepthTestEnable, vn_command_vkCmdSetDepthWriteEnable,
+    vn_command_vkCmdSetDeviceMask, vn_command_vkCmdSetEvent, vn_command_vkCmdSetEvent2,
+    vn_command_vkCmdSetExtraPrimitiveOverestimationSizeEXT,
     vn_command_vkCmdSetFragmentShadingRateKHR, vn_command_vkCmdSetFrontFace,
     vn_command_vkCmdSetLineRasterizationModeEXT, vn_command_vkCmdSetLineStipple,
     vn_command_vkCmdSetLineStippleEnableEXT, vn_command_vkCmdSetLineWidth,
@@ -5035,6 +5036,12 @@ impl Commands for Handlers<'_> {
         self.recorded(done);
     }
 
+    fn vkCmdEndRendering2KHR(&mut self, args: &mut vn_command_vkCmdEndRendering2KHR<'_>) {
+        // The struct is optional: absent, this is `vkCmdEndRendering`.
+        let done = self.driver.cmd_end_rendering2(args.commandBuffer, args.pRenderingEndInfo);
+        self.recorded(done);
+    }
+
     fn vkCmdSetCullMode(&mut self, args: &mut vn_command_vkCmdSetCullMode<'_>) {
         let done = self.driver.cmd_set_cull_mode(args.commandBuffer, args.cullMode);
         self.recorded(done);
@@ -5633,6 +5640,22 @@ impl Commands for Handlers<'_> {
     ) {
         let done =
             self.driver.cmd_set_depth_clamp_enable(args.commandBuffer, args.depthClampEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDepthClampRangeEXT(&mut self, args: &mut vn_command_vkCmdSetDepthClampRangeEXT<'_>) {
+        // The range is optional on the wire and required by a user-defined mode, and the driver
+        // reads it without looking: sent without one, it would be a host read through null.
+        let user_defined =
+            args.depthClampMode == VkDepthClampModeEXT::VK_DEPTH_CLAMP_MODE_USER_DEFINED_RANGE_EXT;
+        if user_defined && args.pDepthClampRange.is_none() {
+            return self.reject("asked for a user-defined depth clamp range and sent no range");
+        }
+        let done = self.driver.cmd_set_depth_clamp_range(
+            args.commandBuffer,
+            args.depthClampMode,
+            args.pDepthClampRange,
+        );
         self.recorded(done);
     }
 
@@ -17784,6 +17807,130 @@ mod tests {
         });
         assert!(h.rejected().is_some(), "a command with no struct is refused, not forwarded");
         assert_eq!(SAW.with_borrow(Vec::len), 1, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// `vkCmdEndRendering2KHR` and `vkCmdSetDepthClampRangeEXT` hand the driver the struct the
+    /// guest sent, or null where the guest sent none and may -- and a user-defined clamp with no
+    /// range is refused, because the driver would read that range through null.
+    #[test]
+    fn end_rendering2_and_depth_clamp_range_hand_the_driver_the_guests_structs() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandPool, VkDepthClampRangeEXT, VkDevice, VkRenderingEndInfoKHR,
+            vn_command_vkCmdEndRendering2KHR, vn_command_vkCmdSetDepthClampRangeEXT,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Each call, as its name and what it was handed: a struct's address, or the scalars.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<u64>)>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn cmd_end_rendering2(
+            _: VkCommandBuffer,
+            info: *const VkRenderingEndInfoKHR,
+        ) {
+            SAW.with_borrow_mut(|s| s.push(("CmdEndRendering2KHR", vec![info.addr() as u64])));
+        }
+        unsafe extern "C" fn cmd_set_depth_clamp_range(
+            _: VkCommandBuffer,
+            mode: VkDepthClampModeEXT,
+            range: *const VkDepthClampRangeEXT,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.push(("CmdSetDepthClampRangeEXT", vec![mode.0 as u64, range.addr() as u64]))
+            });
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdEndRendering2KHR(cmd_end_rendering2);
+        fns.plant_vkCmdSetDepthClampRangeEXT(cmd_set_depth_clamp_range);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+        let user_defined = VkDepthClampModeEXT::VK_DEPTH_CLAMP_MODE_USER_DEFINED_RANGE_EXT;
+
+        let end_info = VkRenderingEndInfoKHR::default();
+        let range = VkDepthClampRangeEXT { minDepthClamp: 0.25, maxDepthClamp: 0.75 };
+
+        h.vkCmdEndRendering2KHR(&mut vn_command_vkCmdEndRendering2KHR {
+            commandBuffer: cb,
+            pRenderingEndInfo: Some(Decoded::planted(&end_info)),
+            ..Default::default()
+        });
+        h.vkCmdEndRendering2KHR(&mut vn_command_vkCmdEndRendering2KHR {
+            commandBuffer: cb,
+            ..Default::default()
+        });
+        h.vkCmdSetDepthClampRangeEXT(&mut vn_command_vkCmdSetDepthClampRangeEXT {
+            commandBuffer: cb,
+            depthClampMode: user_defined,
+            pDepthClampRange: Some(&range),
+            ..Default::default()
+        });
+        h.vkCmdSetDepthClampRangeEXT(&mut vn_command_vkCmdSetDepthClampRangeEXT {
+            commandBuffer: cb,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<u64>); 4] = [
+                ("CmdEndRendering2KHR", vec![(&raw const end_info).addr() as u64]),
+                ("CmdEndRendering2KHR", vec![0]),
+                ("CmdSetDepthClampRangeEXT", vec![1, (&raw const range).addr() as u64]),
+                ("CmdSetDepthClampRangeEXT", vec![0, 0]),
+            ];
+            assert_eq!(*s, want, "each command once, handed what the guest sent");
+        });
+
+        // A user-defined range that names no range has nothing for the driver to clamp to.
+        h.vkCmdSetDepthClampRangeEXT(&mut vn_command_vkCmdSetDepthClampRangeEXT {
+            commandBuffer: cb,
+            depthClampMode: user_defined,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_some(), "a user-defined clamp with no range is refused");
+        assert_eq!(SAW.with_borrow(Vec::len), 4, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
