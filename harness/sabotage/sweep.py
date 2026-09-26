@@ -2461,6 +2461,16 @@ SABOTAGES = [
         """        return ('(if %s.is_null() { 0 } else { (*%s.add(0)).%s }) as u64'""",
         'an_acceleration_structure_build_reproduces_the_wire_row_by_row',
     ),
+    (
+        'a selected union is decoded by its wire tag, not its selector',
+        'venus-gen/rustgen.py',
+        """                        out += ['if dec.decode_scalar::<%s>() != tag {' % ty.sty.name,
+                                '    dec.set_fatal();',
+                                '    return;',
+                                '}']""",
+        """                        out += ['let tag = dec.decode_scalar::<%s>();' % ty.sty.name]""",
+        'a_geometry_whose_union_tag_is_not_its_type_poisons_the_stream',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

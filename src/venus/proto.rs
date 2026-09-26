@@ -369,6 +369,30 @@ mod tests {
         assert!(decode(&short_infos), "a pInfos the count disagrees with");
     }
 
+    /// A geometry says its type twice, once in `geometryType` and once as its union's wire tag,
+    /// and the union is decoded by the second while the driver reads it by the first. Let them
+    /// differ and the driver reads one geometry's data as another's.
+    #[test]
+    fn a_geometry_whose_union_tag_is_not_its_type_poisons_the_stream() {
+        use super::wire_samples::*;
+        let decode = |geometry_type: u32| {
+            let mut g = aabbs(0xa000);
+            g[12..16].copy_from_slice(&geometry_type.to_le_bytes()); // after sType and pNext
+            let w =
+                [u64(0x11), u32(1), u64(1), info(&[g], false), u64(1), u64(1), range(10)].concat();
+            let temp = Bump::new();
+            let hard = AtomicBool::new(false);
+            let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
+            let mut val = vn_command_vkCmdBuildAccelerationStructuresKHR::default();
+            vn_decode_vkCmdBuildAccelerationStructuresKHR_args_temp(&mut dec, &mut val);
+            (dec.fatal(), dec.pos() == w.len())
+        };
+
+        assert_eq!(decode(1), (false, true), "the control: AABBS both times");
+        assert!(decode(0).0, "a TRIANGLES geometry carrying AABBS data");
+        assert!(decode(7).0, "a geometry type no case names");
+    }
+
     /// An array of strings is an array of pointers, and the arena element has to be one pointer
     /// wide. Allocating it a character wide compiles and then truncates every pointer it stores.
     #[test]

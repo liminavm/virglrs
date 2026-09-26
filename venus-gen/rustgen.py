@@ -851,12 +851,21 @@ class RustGen:
         return ('plain',)
 
     def _tag_arg(self, ty, var):
-        """A tagged union's discriminant, which the owning struct carries in another member."""
+        """A tagged union's discriminant, which the owning struct carries in another member.
+
+        Decode takes it too, to hold the wire's own tag to it: the driver reads the union by the
+        selector, so a union decoded as any other member would be read as the wrong type. That
+        needs the selector decoded first, which is why it must come earlier in the struct.
+        """
         sel = var.attrs.get('selector')
         if not sel:
             return ''
         if '->' in sel or '[' in sel:
             raise self.Unsupported('%s.%s: indirect selector %r' % (ty.name, var.name, sel))
+        names = [v.name for v in ty.variables]
+        if sel not in names or names.index(sel) > names.index(var.name):
+            raise self.Unsupported('%s.%s: selector %r does not precede it'
+                                   % (ty.name, var.name, sel))
         return ', val.%s' % self.field_name(sel)
 
     def _elem_call(self, kind, ty, var, validity, alloc):
@@ -882,7 +891,7 @@ class RustGen:
                     name += '_temp'
         else:
             raise self.Unsupported('%s.%s: category %d' % (ty.name, var.name, base.category))
-        if base.category == VkType.UNION and base.is_valid_union() and kind != 'decode':
+        if base.category == VkType.UNION and base.is_valid_union():
             return ('call', name, self._tag_arg(ty, var))
         return ('call', name, '')
 
@@ -2817,8 +2826,9 @@ class RustGen:
 
         Reading a Rust union member is unsafe by definition -- nothing but the tag says which one
         is live -- so every case body is wrapped. Where the tag comes from is the whole design:
-        a selected union takes it from the owning struct, and the rest write a pinned default. Only
-        decode can read it off the wire, which is why decode alone takes no tag argument.
+        a selected union takes it from the owning struct, and the rest write a pinned default.
+        Decode reads it off the wire, and a selected union's decode is handed the struct's too:
+        the two disagreeing poisons the stream, because every later reader goes by the struct's.
         """
         n = ty.name
         valid = ty.is_valid_union()
@@ -2848,7 +2858,10 @@ class RustGen:
 
                 if valid:
                     if kind == 'decode':
-                        out.append('let tag = dec.decode_scalar::<%s>();' % ty.sty.name)
+                        out += ['if dec.decode_scalar::<%s>() != tag {' % ty.sty.name,
+                                '    dec.set_fatal();',
+                                '    return;',
+                                '}']
                     elif kind == 'encode':
                         out.append('enc.encode_scalar::<%s>(tag);' % ty.sty.name)
                     else:
@@ -2874,7 +2887,7 @@ class RustGen:
                         % (n, n, tag), body('sizeof'), gaps, n)
         out += self._fn('vn_encode_%s(enc: &mut Encoder<\'_>, val: &%s%s)' % (n, n, tag),
                         body('encode'), gaps, n)
-        out += self._fn('vn_decode_%s_temp(dec: &mut Decoder<\'_>, val: &mut %s)' % (n, n),
+        out += self._fn('vn_decode_%s_temp(dec: &mut Decoder<\'_>, val: &mut %s%s)' % (n, n, tag),
                         body('decode'), gaps, n)
         return out
 
