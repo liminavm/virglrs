@@ -54,9 +54,11 @@ use super::proto::types::{
     vn_command_vkCmdDispatchIndirect, vn_command_vkCmdDraw, vn_command_vkCmdDrawIndexed,
     vn_command_vkCmdDrawIndexedIndirect, vn_command_vkCmdDrawIndexedIndirectCount,
     vn_command_vkCmdDrawIndirect, vn_command_vkCmdDrawIndirectByteCountEXT,
-    vn_command_vkCmdDrawIndirectCount, vn_command_vkCmdDrawMultiEXT,
-    vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndConditionalRenderingEXT,
-    vn_command_vkCmdEndQuery, vn_command_vkCmdEndQueryIndexedEXT, vn_command_vkCmdEndRenderPass,
+    vn_command_vkCmdDrawIndirectCount, vn_command_vkCmdDrawMeshTasksEXT,
+    vn_command_vkCmdDrawMeshTasksIndirectCountEXT, vn_command_vkCmdDrawMeshTasksIndirectEXT,
+    vn_command_vkCmdDrawMultiEXT, vn_command_vkCmdDrawMultiIndexedEXT,
+    vn_command_vkCmdEndConditionalRenderingEXT, vn_command_vkCmdEndQuery,
+    vn_command_vkCmdEndQueryIndexedEXT, vn_command_vkCmdEndRenderPass,
     vn_command_vkCmdEndRenderPass2, vn_command_vkCmdEndRendering, vn_command_vkCmdEndRendering2KHR,
     vn_command_vkCmdEndTransformFeedbackEXT, vn_command_vkCmdExecuteCommands,
     vn_command_vkCmdFillBuffer, vn_command_vkCmdNextSubpass, vn_command_vkCmdNextSubpass2,
@@ -4952,6 +4954,46 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdDrawIndirectCount(&mut self, args: &mut vn_command_vkCmdDrawIndirectCount<'_>) {
         let done = self.driver.cmd_draw_indirect_count(
+            args.commandBuffer,
+            args.buffer,
+            args.offset,
+            args.countBuffer,
+            args.countBufferOffset,
+            args.maxDrawCount,
+            args.stride,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDrawMeshTasksEXT(&mut self, args: &mut vn_command_vkCmdDrawMeshTasksEXT<'_>) {
+        let done = self.driver.cmd_draw_mesh_tasks(
+            args.commandBuffer,
+            args.groupCountX,
+            args.groupCountY,
+            args.groupCountZ,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDrawMeshTasksIndirectEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdDrawMeshTasksIndirectEXT<'_>,
+    ) {
+        let done = self.driver.cmd_draw_mesh_tasks_indirect(
+            args.commandBuffer,
+            args.buffer,
+            args.offset,
+            args.drawCount,
+            args.stride,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDrawMeshTasksIndirectCountEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdDrawMeshTasksIndirectCountEXT<'_>,
+    ) {
+        let done = self.driver.cmd_draw_mesh_tasks_indirect_count(
             args.commandBuffer,
             args.buffer,
             args.offset,
@@ -16711,6 +16753,148 @@ mod tests {
         h.vkCmdSetColorWriteEnableEXT(&mut args);
         assert!(h.rejected().is_some(), "an unknown command buffer is refused");
         assert_eq!(SAW.with_borrow(Vec::len), 1, "and the driver never saw it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// The three mesh-shader draws hand the driver every argument in the position the guest put
+    /// it. Each is a run of same-typed scalars, where a transposition compiles, so each argument
+    /// has a value no other shares.
+    #[test]
+    fn the_mesh_task_draws_hand_the_driver_every_argument_in_place() {
+        use super::super::proto::types::{
+            VkBuffer, VkCommandBuffer, VkCommandPool, VkDevice, VkDeviceSize,
+            vn_command_vkCmdDrawMeshTasksEXT, vn_command_vkCmdDrawMeshTasksIndirectCountEXT,
+            vn_command_vkCmdDrawMeshTasksIndirectEXT,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        // Every call, as the command's name and its arguments widened to one integer type.
+        thread_local! {
+            static SAW: RefCell<Vec<(&'static str, Vec<i64>)>> = const { RefCell::new(Vec::new()) };
+        }
+        fn saw(name: &'static str, args: &[i64]) {
+            SAW.with_borrow_mut(|s| s.push((name, args.to_vec())));
+        }
+
+        unsafe extern "C" fn draw(_: VkCommandBuffer, x: u32, y: u32, z: u32) {
+            saw("DrawMeshTasks", &[x.into(), y.into(), z.into()]);
+        }
+        unsafe extern "C" fn draw_indirect(
+            _: VkCommandBuffer,
+            buf: VkBuffer,
+            off: VkDeviceSize,
+            n: u32,
+            stride: u32,
+        ) {
+            saw(
+                "DrawMeshTasksIndirect",
+                &[buf.raw() as i64, off.0 as i64, n.into(), stride.into()],
+            );
+        }
+        unsafe extern "C" fn draw_indirect_count(
+            _: VkCommandBuffer,
+            buf: VkBuffer,
+            off: VkDeviceSize,
+            count: VkBuffer,
+            count_off: VkDeviceSize,
+            max: u32,
+            stride: u32,
+        ) {
+            saw(
+                "DrawMeshTasksIndirectCount",
+                &[
+                    buf.raw() as i64,
+                    off.0 as i64,
+                    count.raw() as i64,
+                    count_off.0 as i64,
+                    max.into(),
+                    stride.into(),
+                ],
+            );
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdDrawMeshTasksEXT(draw);
+        fns.plant_vkCmdDrawMeshTasksIndirectEXT(draw_indirect);
+        fns.plant_vkCmdDrawMeshTasksIndirectCountEXT(draw_indirect_count);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        h.vkCmdDrawMeshTasksEXT(&mut vn_command_vkCmdDrawMeshTasksEXT {
+            commandBuffer: cb,
+            groupCountX: 0x11,
+            groupCountY: 0x12,
+            groupCountZ: 0x13,
+            ..Default::default()
+        });
+        h.vkCmdDrawMeshTasksIndirectEXT(&mut vn_command_vkCmdDrawMeshTasksIndirectEXT {
+            commandBuffer: cb,
+            buffer: VkBuffer::forged(0x21),
+            offset: VkDeviceSize(0x22),
+            drawCount: 0x23,
+            stride: 0x24,
+            ..Default::default()
+        });
+        h.vkCmdDrawMeshTasksIndirectCountEXT(&mut vn_command_vkCmdDrawMeshTasksIndirectCountEXT {
+            commandBuffer: cb,
+            buffer: VkBuffer::forged(0x31),
+            offset: VkDeviceSize(0x32),
+            countBuffer: VkBuffer::forged(0x33),
+            countBufferOffset: VkDeviceSize(0x34),
+            maxDrawCount: 0x35,
+            stride: 0x36,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "served now; a build that still refuses one fails here");
+
+        SAW.with_borrow(|s| {
+            let want: [(&str, Vec<i64>); 3] = [
+                ("DrawMeshTasks", vec![0x11, 0x12, 0x13]),
+                ("DrawMeshTasksIndirect", vec![0x21, 0x22, 0x23, 0x24]),
+                ("DrawMeshTasksIndirectCount", vec![0x31, 0x32, 0x33, 0x34, 0x35, 0x36]),
+            ];
+            assert_eq!(*s, want, "each draw once, every argument where the guest put it");
+        });
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();

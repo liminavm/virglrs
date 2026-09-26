@@ -2421,6 +2421,17 @@ SABOTAGES = [
         """            .enumerate_into(pd, out.filter(|_| false), |i| i.try_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR());""",
         'cooperative_matrix_properties_are_counted_then_written',
     ),
+    (
+        'vkCmdDrawMeshTasksIndirectCountEXT swaps its two offsets',
+        'src/venus/driver.rs',
+        """        let f = self.recorder(cb)?.try_vkCmdDrawMeshTasksIndirectCountEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };""",
+        """        let f = self.recorder(cb)?.try_vkCmdDrawMeshTasksIndirectCountEXT()?;
+        // SAFETY: sabotage -- the two offsets swapped.
+        unsafe { f(cb, buffer, count_offset, count_buffer, offset, max_draws, stride) };""",
+        'the_mesh_task_draws_hand_the_driver_every_argument_in_place',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

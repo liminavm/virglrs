@@ -4167,6 +4167,47 @@ impl Driver {
         Some(())
     }
 
+    /// `vkCmdDrawMeshTasksEXT`: a mesh-shader draw of `x` by `y` by `z` task groups.
+    pub fn cmd_draw_mesh_tasks(&self, cb: VkCommandBuffer, x: u32, y: u32, z: u32) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdDrawMeshTasksEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, x, y, z) };
+        Some(())
+    }
+
+    /// `vkCmdDrawMeshTasksIndirectEXT`: the group counts read from `buffer`, `draws` times.
+    pub fn cmd_draw_mesh_tasks_indirect(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        draws: u32,
+        stride: u32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdDrawMeshTasksIndirectEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, buffer, offset, draws, stride) };
+        Some(())
+    }
+
+    /// See [`Driver::cmd_draw_indirect_count`]; the mesh-shader form.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cmd_draw_mesh_tasks_indirect_count(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        count_buffer: VkBuffer,
+        count_offset: VkDeviceSize,
+        max_draws: u32,
+        stride: u32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdDrawMeshTasksIndirectCountEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };
+        Some(())
+    }
+
     /// See [`Driver::cmd_draw_indirect_count`].
     #[allow(clippy::too_many_arguments)]
     pub fn cmd_draw_indexed_indirect_count(
