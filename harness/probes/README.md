@@ -1,8 +1,8 @@
 # Command probes
 
 One program per `wanted` group of [`src/venus/unserved.txt`](../../src/venus/unserved.txt), and
-one per command served while out of reach. No guest can send those, so the positive control is the
-only run such a probe has, and the handler's unit test scores the renderer.
+one per command served while no guest can send it, whose positive control is then the only run it
+has and whose handler's unit test scores the renderer.
 
 A workload cannot enumerate that ledger. The first unserved command poisons its context, so a
 boot discovers exactly one of them and then reports the consequence in the guest driver's
@@ -92,5 +92,5 @@ On the host, for the positive control, the loader and headers are Homebrew's:
 | `local_read.c` | `dynamic-rendering-locations` | 2 | 4/4 on KosmicKrisp, Apple M1 Max, and on anv, Intel Iris Plus (ICL GT2), both Vulkan 1.4. Both commands are scored by the log only: the pipeline must carry the same map and mesa installs it at bind, so the pixels pass without them | 4/4 on anv via QEMU; 4/4 on KosmicKrisp via limina. No refusal (Fedora 44, 2026-09-25) |
 | `extended_dynamic_state3.c` | `extended-dynamic-state3` | 21 | 24/24 on anv, Intel Iris Plus (ICL GT2), which serves 19 of the 21; 6/6 on KosmicKrisp, Apple M1 Max, which serves 5; both Vulkan 1.4. Rasterization stream, sample locations enable and line rasterization mode are scored by the log only; extra overestimation size and advanced blend by no host | 24/24 on anv via QEMU; 6/6 on KosmicKrisp via limina. No refusal (Fedora 44, 2026-09-25) |
 | `maintenance10.c` | `maintenance10` | 1 | 3/3 on KosmicKrisp, Apple M1 Max, and on anv, Intel Iris Plus (ICL GT2), both Vulkan 1.4 | Not reachable: the guest's venus driver offers no guest `VK_KHR_maintenance10`. The handler is scored by `end_rendering2_and_depth_clamp_range_hand_the_driver_the_guests_structs` |
-| `depth_clamp_range.c` | `shader-object` (`vkCmdSetDepthClampRangeEXT` only) | 1 | 4/4 on anv, Intel Iris Plus (ICL GT2), Vulkan 1.4; KosmicKrisp lacks `VK_EXT_depth_clamp_control` | Not reachable: the guest's venus driver offers neither `VK_EXT_depth_clamp_control` nor `VK_EXT_shader_object`. Scored by the same handler test |
+| `depth_clamp_range.c` | `shader-object` (`vkCmdSetDepthClampRangeEXT` only) | 1 | 4/4 on anv, Intel Iris Plus (ICL GT2), Vulkan 1.4; KosmicKrisp lacks `VK_EXT_depth_clamp_control` | 4/4 on anv via QEMU, through `VK_EXT_depth_clamp_control`; the guest offers no `VK_EXT_shader_object`. No refusal (Fedora 44, 2026-09-26) |
 | (none) | `descriptor-update-template` | 2 | The guest venus driver answers both commands guest-side and never sends them; there is nothing to probe | — |
