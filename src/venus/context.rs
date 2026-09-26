@@ -2243,6 +2243,7 @@ impl Handlers<'_> {
                     Q::UnknownPool => "named a query pool this renderer has no record of",
                     Q::OutOfPool => "named queries past the end of the pool",
                     Q::OutOfRoom => "asked for query results past the room it offered",
+                    Q::WrongKind => "wrote a query into a pool that counts another kind",
                     Q::Unsized => "read results of a query kind this renderer cannot size",
                 });
                 None
@@ -14394,6 +14395,10 @@ mod tests {
         const DEVICE: u64 = 3;
         const POOL: u64 = 40;
         const HOST_POOL: VkQueryPool = VkQueryPool::forged(0x50);
+        // Begin and end bracket a kind of query a timestamp is not, so they get a pool of their
+        // own.
+        const OCCLUSION: u64 = 41;
+        const HOST_OCCLUSION: VkQueryPool = VkQueryPool::forged(0x51);
         const CB: VkCommandBuffer = VkCommandBuffer::forged(0x30);
 
         thread_local! {
@@ -14448,12 +14453,17 @@ mod tests {
         }
         unsafe extern "C" fn create(
             _d: VkDevice,
-            _i: *const VkQueryPoolCreateInfo,
+            i: *const VkQueryPoolCreateInfo,
             _a: *const VkAllocationCallbacks,
             out: *mut VkQueryPool,
         ) -> VkResult {
-            // SAFETY: the caller passes a local of its own.
-            unsafe { *out = HOST_POOL };
+            // SAFETY: the caller passes its create-info and a local of its own.
+            unsafe {
+                *out = match (*i).queryType {
+                    VkQueryType::VK_QUERY_TYPE_OCCLUSION => HOST_OCCLUSION,
+                    _ => HOST_POOL,
+                }
+            };
             VkResult::VK_SUCCESS
         }
         unsafe extern "C" fn destroy(
@@ -14564,6 +14574,21 @@ mod tests {
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         assert_eq!(shadow, HOST_POOL, "the driver's handle, in the shadow the reply reads");
         assert!(h.rejected().is_none());
+        let info = VkQueryPoolCreateInfo {
+            queryType: VkQueryType::VK_QUERY_TYPE_OCCLUSION,
+            queryCount: 2,
+            ..Default::default()
+        };
+        let mut id = VkQueryPool::forged(OCCLUSION);
+        let mut shadow = VkQueryPool::forged(0);
+        let mut args = vn_command_vkCreateQueryPool::default();
+        args.device = device;
+        args.pCreateInfo = Some(Decoded::planted(&info));
+        args.plant_pQueryPool(&mut id);
+        args.plant_handle_pQueryPool(&mut shadow);
+        h.vkCreateQueryPool(&mut args);
+        assert_eq!(shadow, HOST_OCCLUSION);
+        assert!(h.rejected().is_none());
 
         // Both, 32-bit, four apart, into eight bytes: exactly enough.
         let mut room = [0xffu8; 8];
@@ -14595,7 +14620,7 @@ mod tests {
         h.vkResetQueryPool(&mut args);
         let mut args = vn_command_vkCmdBeginQuery {
             commandBuffer: CB,
-            queryPool: HOST_POOL,
+            queryPool: HOST_OCCLUSION,
             query: 1,
             flags: VkQueryControlFlags(0x1),
             ..Default::default()
@@ -14603,7 +14628,7 @@ mod tests {
         h.vkCmdBeginQuery(&mut args);
         let mut args = vn_command_vkCmdEndQuery {
             commandBuffer: CB,
-            queryPool: HOST_POOL,
+            queryPool: HOST_OCCLUSION,
             query: 1,
             ..Default::default()
         };
@@ -14666,7 +14691,7 @@ mod tests {
         assert!(h.take_rejected().is_some(), "a host-side reset past the pool is a heap scribble");
         let mut args = vn_command_vkCmdBeginQuery {
             commandBuffer: CB,
-            queryPool: HOST_POOL,
+            queryPool: HOST_OCCLUSION,
             query: 2,
             ..Default::default()
         };
@@ -14708,6 +14733,27 @@ mod tests {
         assert!(h.take_rejected().is_some());
         SAW.with_borrow(|s| assert!(s.is_empty(), "no refusal reached the driver"));
 
+        // And each of the two in the other's pool: a timestamp is not bracketed, and an occlusion
+        // pool holds no timestamps. Both within the pool, so only the kind is wrong.
+        SAW.with_borrow_mut(Vec::clear);
+        let mut args = vn_command_vkCmdBeginQuery {
+            commandBuffer: CB,
+            queryPool: HOST_POOL,
+            query: 0,
+            ..Default::default()
+        };
+        h.vkCmdBeginQuery(&mut args);
+        assert_eq!(h.take_rejected(), Some("wrote a query into a pool that counts another kind"));
+        let mut args = vn_command_vkCmdWriteTimestamp {
+            commandBuffer: CB,
+            queryPool: HOST_OCCLUSION,
+            query: 0,
+            ..Default::default()
+        };
+        h.vkCmdWriteTimestamp(&mut args);
+        assert_eq!(h.take_rejected(), Some("wrote a query into a pool that counts another kind"));
+        SAW.with_borrow(|s| assert!(s.is_empty(), "and the driver saw neither"));
+
         // Destroyed, the pool's record goes with it, and a read of it is a refusal too.
         let mut args =
             vn_command_vkDestroyQueryPool { device, queryPool: HOST_POOL, ..Default::default() };
@@ -14726,6 +14772,7 @@ mod tests {
     /// Vulkan fills the whole array or none of it, and the generated lifecycle hook walks all of
     /// it either way -- so a refusal that decided about only one id leaves the guest holding
     /// command buffers the driver never made.
+
     #[test]
     fn a_refused_pool_allocation_ghosts_the_whole_run() {
         use super::super::cs::{Lookup, Objects};

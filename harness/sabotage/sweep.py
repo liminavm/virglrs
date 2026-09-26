@@ -151,9 +151,11 @@ SABOTAGES = [
         'src/venus/driver.rs',
         """        let (d, facts) = self.query_recorder(cb, pool)?;
         facts.holds(query, 1)?;
+        facts.is_bracketed()?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdBeginQuery())(cb, pool, query, flags) };""",
-        """        let (d, _facts) = self.query_recorder(cb, pool)?;
+        """        let (d, facts) = self.query_recorder(cb, pool)?;
+        facts.is_bracketed()?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdBeginQuery())(cb, pool, query, flags) };""",
         'query',
@@ -2267,8 +2269,10 @@ SABOTAGES = [
         'vkCmdBeginQueryIndexedEXT is not held to the pool',
         'src/venus/driver.rs',
         """facts.holds(query, 1)?;
+        facts.is_bracketed()?;
         let f = d.try_vkCmdBeginQueryIndexedEXT()""",
-        """let f = d.try_vkCmdBeginQueryIndexedEXT()""",
+        """facts.is_bracketed()?;
+        let f = d.try_vkCmdBeginQueryIndexedEXT()""",
         'every_query_index_is_held_to_the_pool',
     ),
     (
@@ -2491,6 +2495,33 @@ SABOTAGES = [
         """        facts.holds(first, n)?;""",
         """        let _ = facts;""",
         'the_acceleration_structure_commands_hand_the_driver_what_the_guest_sent',
+    ),
+    (
+        'a query of any kind may be begun',
+        'src/venus/driver.rs',
+        """        facts.is_bracketed()?;
+        // SAFETY: as above, and a query the pool holds.
+        unsafe { (d.vkCmdBeginQuery())""",
+        """        // SAFETY: as above, and a query the pool holds.
+        unsafe { (d.vkCmdBeginQuery())""",
+        'every_query_index_is_held_to_the_pool',
+    ),
+    (
+        'a timestamp may be written into any pool',
+        'src/venus/driver.rs',
+        """        facts.counts(VkQueryType::VK_QUERY_TYPE_TIMESTAMP)?;
+        // SAFETY: as above, and a query the pool holds.
+        unsafe { (d.vkCmdWriteTimestamp())""",
+        """        // SAFETY: as above, and a query the pool holds.
+        unsafe { (d.vkCmdWriteTimestamp())""",
+        'every_query_index_is_held_to_the_pool',
+    ),
+    (
+        'a property write need not match its pool',
+        'src/venus/driver.rs',
+        """_KHR => facts.counts(ty)?,""",
+        """_KHR => {}""",
+        'every_query_index_is_held_to_the_pool',
     ),
 ]
 

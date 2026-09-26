@@ -364,6 +364,8 @@ pub enum QueryRefused {
     OutOfPool,
     /// The results asked for run past the room offered.
     OutOfRoom,
+    /// The pool counts a kind of query the command does not write.
+    WrongKind,
     /// A pool whose result this renderer cannot size, so it cannot hold the read to the room.
     Unsized,
 }
@@ -4345,6 +4347,14 @@ impl Driver {
         let (d, facts) = self.query_recorder(cb, pool)?;
         let n = u32::try_from(structures.len()).expect("the decoder sized it from a u32");
         facts.holds(first, n)?;
+        use VkQueryType as Q;
+        match ty {
+            Q::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR
+            | Q::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR
+            | Q::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR
+            | Q::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR => facts.counts(ty)?,
+            _ => return Err(QueryRefused::WrongKind),
+        }
         let f = d
             .try_vkCmdWriteAccelerationStructuresPropertiesKHR()
             .ok_or(QueryRefused::NotExported)?;
@@ -5858,6 +5868,7 @@ impl Driver {
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
         facts.holds(query, 1)?;
+        facts.is_bracketed()?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdBeginQuery())(cb, pool, query, flags) };
         Ok(())
@@ -5888,6 +5899,7 @@ impl Driver {
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
         facts.holds(query, 1)?;
+        facts.is_bracketed()?;
         let f = d.try_vkCmdBeginQueryIndexedEXT().ok_or(QueryRefused::NotExported)?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { f(cb, pool, query, flags, index) };
@@ -5933,6 +5945,7 @@ impl Driver {
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
         facts.holds(query, 1)?;
+        facts.counts(VkQueryType::VK_QUERY_TYPE_TIMESTAMP)?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdWriteTimestamp())(cb, stage, pool, query) };
         Ok(())
@@ -5949,6 +5962,7 @@ impl Driver {
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
         facts.holds(query, 1)?;
+        facts.counts(VkQueryType::VK_QUERY_TYPE_TIMESTAMP)?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdWriteTimestamp2())(cb, stage, pool, query) };
         Ok(())
@@ -7533,6 +7547,10 @@ struct QueryFacts {
     /// its own. Such a pool is created and indexed like any other; only its read-back into
     /// guest-offered room is refused, since the room cannot be held to a size nobody knows.
     values: Option<u32>,
+    /// What the pool counts. A query command is only valid on the kinds it writes, and a driver
+    /// lays each kind's queries out its own way, so one written as another kind lands where the
+    /// driver never meant anything to be.
+    kind: VkQueryType,
 }
 
 impl QueryFacts {
@@ -7557,7 +7575,31 @@ impl QueryFacts {
             VkQueryType::VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR => Some(0),
             _ => None,
         };
-        QueryFacts { queries: info.queryCount, values }
+        QueryFacts { queries: info.queryCount, values, kind: info.queryType }
+    }
+
+    /// Whether the pool's queries are `kind`.
+    fn counts(&self, kind: VkQueryType) -> Result<(), QueryRefused> {
+        if self.kind == kind { Ok(()) } else { Err(QueryRefused::WrongKind) }
+    }
+
+    /// Whether the pool's queries are a kind a begin and an end bracket. Listed rather than
+    /// excluded, so a kind a later protocol adds is refused until someone has looked at it.
+    fn is_bracketed(&self) -> Result<(), QueryRefused> {
+        use VkQueryType as Q;
+        match self.kind {
+            Q::VK_QUERY_TYPE_OCCLUSION
+            | Q::VK_QUERY_TYPE_PIPELINE_STATISTICS
+            | Q::VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR
+            | Q::VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT
+            | Q::VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR
+            | Q::VK_QUERY_TYPE_TIME_ELAPSED_QCOM
+            | Q::VK_QUERY_TYPE_PERFORMANCE_QUERY_INTEL
+            | Q::VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR
+            | Q::VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT
+            | Q::VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT => Ok(()),
+            _ => Err(QueryRefused::WrongKind),
+        }
     }
 
     /// Whether queries `first..first + count` are all the pool's.
@@ -12911,6 +12953,8 @@ mod tests {
         const POOL: VkQueryPool = VkQueryPool::forged(0x50);
         const STATS: VkQueryPool = VkQueryPool::forged(0x51);
         const PERF: VkQueryPool = VkQueryPool::forged(0x52);
+        // What a begin and an end bracket, which a timestamp is not.
+        const OCCLUSION: VkQueryPool = VkQueryPool::forged(0x53);
 
         // What the driver was asked, by entry point: first (or the query) and count.
         thread_local! {
@@ -12930,6 +12974,7 @@ mod tests {
                 *out = match (*info).queryType {
                     VkQueryType::VK_QUERY_TYPE_PIPELINE_STATISTICS => STATS,
                     VkQueryType::VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR => PERF,
+                    VkQueryType::VK_QUERY_TYPE_OCCLUSION => OCCLUSION,
                     _ => POOL,
                 }
             };
@@ -13044,6 +13089,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(d.create_query_pool(DEVICE, cs::Decoded::planted(&info), None), Ok(POOL));
+        let info = VkQueryPoolCreateInfo {
+            queryType: VkQueryType::VK_QUERY_TYPE_OCCLUSION,
+            queryCount: 4,
+            ..Default::default()
+        };
+        assert_eq!(d.create_query_pool(DEVICE, cs::Decoded::planted(&info), None), Ok(OCCLUSION));
 
         const NONE: VkQueryResultFlags = VkQueryResultFlags(0);
         const WIDE: VkQueryResultFlags =
@@ -13078,11 +13129,11 @@ mod tests {
             ),
             Ok(())
         );
-        assert_eq!(d.cmd_begin_query(CB, POOL, 3, VkQueryControlFlags(0)), Ok(()));
-        assert_eq!(d.cmd_end_query(CB, POOL, 3), Ok(()));
+        assert_eq!(d.cmd_begin_query(CB, OCCLUSION, 3, VkQueryControlFlags(0)), Ok(()));
+        assert_eq!(d.cmd_end_query(CB, OCCLUSION, 3), Ok(()));
         assert_eq!(d.cmd_write_timestamp(CB, STAGE, POOL, 3), Ok(()));
-        assert_eq!(d.cmd_begin_query_indexed(CB, POOL, 3, VkQueryControlFlags(0), 2), Ok(()));
-        assert_eq!(d.cmd_end_query_indexed(CB, POOL, 3, 2), Ok(()));
+        assert_eq!(d.cmd_begin_query_indexed(CB, OCCLUSION, 3, VkQueryControlFlags(0), 2), Ok(()));
+        assert_eq!(d.cmd_end_query_indexed(CB, OCCLUSION, 3, 2), Ok(()));
         let r = d.query_pool_results(DEVICE, POOL, 0, 4, &mut buf[..16], VkDeviceSize(4), NONE);
         assert_eq!(r, Ok(VkResult::VK_NOT_READY), "the driver's answer, as it gave it");
         ASKED.with_borrow(|a| {
@@ -13127,11 +13178,14 @@ mod tests {
             ),
             out_of_pool
         );
-        assert_eq!(d.cmd_begin_query(CB, POOL, 4, VkQueryControlFlags(0)), out_of_pool);
-        assert_eq!(d.cmd_end_query(CB, POOL, u32::MAX), out_of_pool);
+        assert_eq!(d.cmd_begin_query(CB, OCCLUSION, 4, VkQueryControlFlags(0)), out_of_pool);
+        assert_eq!(d.cmd_end_query(CB, OCCLUSION, u32::MAX), out_of_pool);
         assert_eq!(d.cmd_write_timestamp(CB, STAGE, POOL, 4), out_of_pool);
-        assert_eq!(d.cmd_begin_query_indexed(CB, POOL, 4, VkQueryControlFlags(0), 0), out_of_pool);
-        assert_eq!(d.cmd_end_query_indexed(CB, POOL, u32::MAX, 0), out_of_pool);
+        assert_eq!(
+            d.cmd_begin_query_indexed(CB, OCCLUSION, 4, VkQueryControlFlags(0), 0),
+            out_of_pool
+        );
+        assert_eq!(d.cmd_end_query_indexed(CB, OCCLUSION, u32::MAX, 0), out_of_pool);
         assert_eq!(
             d.query_pool_results(DEVICE, POOL, 3, 2, &mut buf, VkDeviceSize(4), NONE),
             read_out_of_pool
@@ -13140,6 +13194,23 @@ mod tests {
             d.query_pool_results(DEVICE, POOL, u32::MAX, 1, &mut buf, VkDeviceSize(4), NONE),
             read_out_of_pool,
             "and a first query that wraps is past it too"
+        );
+        // A begin on a pool of timestamps, a timestamp in a pool of occlusion queries, and a
+        // property write whose kind is not an acceleration structure's or not the pool's: each
+        // within the pool, and each the wrong kind.
+        let wrong_kind: Result<(), QueryRefused> = Err(QueryRefused::WrongKind);
+        assert_eq!(d.cmd_begin_query(CB, POOL, 0, VkQueryControlFlags(0)), wrong_kind);
+        assert_eq!(d.cmd_begin_query_indexed(CB, POOL, 0, VkQueryControlFlags(0), 0), wrong_kind);
+        assert_eq!(d.cmd_write_timestamp(CB, STAGE, OCCLUSION, 0), wrong_kind);
+        let serial = VkQueryType::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR;
+        let stamp = VkQueryType::VK_QUERY_TYPE_TIMESTAMP;
+        assert_eq!(
+            d.cmd_write_acceleration_structures_properties(CB, &[], serial, POOL, 0),
+            wrong_kind
+        );
+        assert_eq!(
+            d.cmd_write_acceleration_structures_properties(CB, &[], stamp, POOL, 0),
+            wrong_kind
         );
         // An empty range at the very end is within the pool; one past that is not.
         assert_eq!(d.cmd_reset_query_pool(CB, POOL, 4, 0), Ok(()));
@@ -13259,6 +13330,12 @@ mod tests {
                 id: ObjectId(42),
                 ty: VkObjectType::VK_OBJECT_TYPE_QUERY_POOL,
                 handle: PERF.host(),
+                device: Some(DEVICE),
+            },
+            Doomed {
+                id: ObjectId(43),
+                ty: VkObjectType::VK_OBJECT_TYPE_QUERY_POOL,
+                handle: OCCLUSION.host(),
                 device: Some(DEVICE),
             },
         ];
