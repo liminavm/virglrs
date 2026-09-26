@@ -136,6 +136,7 @@ use super::proto::types::{
     vn_command_vkGetImageSparseMemoryRequirements2, vn_command_vkGetImageSubresourceLayout,
     vn_command_vkGetImageSubresourceLayout2, vn_command_vkGetMemoryResourcePropertiesMESA,
     vn_command_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR,
+    vn_command_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR,
     vn_command_vkGetPhysicalDeviceExternalBufferProperties,
     vn_command_vkGetPhysicalDeviceExternalFenceProperties,
     vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties,
@@ -4448,6 +4449,36 @@ impl Commands for Handlers<'_> {
             Ok((n, ret)) => {
                 args.ret = ret;
                 if let Some(mut count) = args.pFragmentShadingRateCount_mut() {
+                    count.set(n);
+                }
+            }
+            Err(e) => args.ret = e,
+        }
+    }
+
+    fn vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        if !self.counted(args.has_pPropertyCount()) {
+            return;
+        }
+        let out = if args.has_pProperties() {
+            match self.array(args.pProperties_mut()) {
+                Some(out) => Some(out),
+                None => return,
+            }
+        } else {
+            None
+        };
+        let asked = self
+            .driver
+            .enumerate_into(pd, out, |i| i.try_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR());
+        match asked {
+            Ok((n, ret)) => {
+                args.ret = ret;
+                if let Some(mut count) = args.pPropertyCount_mut() {
                     count.set(n);
                 }
             }
@@ -18655,6 +18686,104 @@ mod tests {
         let mut args = Cmd::default();
         args.physicalDevice = PD;
         h.vkGetPhysicalDeviceFragmentShadingRatesKHR(&mut args);
+        assert!(h.rejected().is_some(), "a query with no count is refused");
+
+        h.driver.abandon_planted();
+    }
+
+    /// `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` is the same two-call enumeration: a
+    /// count, then the shapes, with a slot past the driver's left as the guest sent it.
+    #[test]
+    fn cooperative_matrix_properties_are_counted_then_written() {
+        use super::super::proto::types::{
+            VkCooperativeMatrixPropertiesKHR as Shape, VkPhysicalDevice,
+            vn_command_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR as Cmd,
+        };
+
+        const PD: VkPhysicalDevice = VkPhysicalDevice::forged(0x711);
+        const SHAPES: u32 = 3;
+
+        unsafe extern "C" fn shapes(
+            _pd: VkPhysicalDevice,
+            count: *mut u32,
+            out: *mut Shape,
+        ) -> VkResult {
+            // SAFETY: the caller passed a live count, and an array of that length or null.
+            let count = unsafe { &mut *count };
+            if out.is_null() {
+                *count = SHAPES;
+                return VkResult::VK_SUCCESS;
+            }
+            let room = (*count).min(SHAPES);
+            // SAFETY: `count` is the length the caller sized the array to.
+            let out = unsafe { core::slice::from_raw_parts_mut(out, room as usize) };
+            for (i, s) in (0u32..).zip(out.iter_mut()) {
+                s.MSize = 8 << i;
+                s.KSize = 16;
+            }
+            *count = room;
+            if room < SHAPES { VkResult::VK_INCOMPLETE } else { VkResult::VK_SUCCESS }
+        }
+
+        let objects = Shared::new();
+        let mut fns = crate::vulkan::Instance::default();
+        fns.plant_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(shapes);
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_instance(fns);
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let mut n = 0u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        args.plant_pPropertyCount(&mut n);
+        h.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(&mut args);
+        assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
+        assert_eq!((args.ret, n), (VkResult::VK_SUCCESS, SHAPES), "the count call is answered");
+
+        let mut out = [Shape::default(); 4];
+        out[3].MSize = 0x55;
+        let mut n = 4u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        args.plant_pPropertyCount(&mut n);
+        args.plant_pProperties(&mut out);
+        h.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(&mut args);
+        assert!(h.rejected().is_none(), "a roomy array is an answer, not a refusal");
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        assert_eq!(n, SHAPES, "the count is the driver's total, never the room the guest offered");
+        assert_eq!(
+            out.map(|s| (s.MSize, s.KSize)),
+            [(8, 16), (16, 16), (32, 16), (0x55, 0)],
+            "three shapes written, and the slot past them left as the guest sent it"
+        );
+
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        h.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(&mut args);
         assert!(h.rejected().is_some(), "a query with no count is refused");
 
         h.driver.abandon_planted();

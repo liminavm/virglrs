@@ -106,7 +106,6 @@ vkGetDeferredOperationResultKHR                    not-in-reference:deferred-ope
 vkGetDeviceAccelerationStructureCompatibilityKHR   out-of-reach:acceleration-structure
 vkGetDeviceQueue                                   not-in-reference:device-queue
 vkGetImageOpaqueCaptureDataEXT                     out-of-reach:descriptor-heap
-vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR  out-of-reach:cooperative-matrix
 vkGetPhysicalDeviceDescriptorSizeEXT               out-of-reach:descriptor-heap
 vkGetPrivateData                                   not-in-reference:private-data
 vkGetRayTracingCaptureReplayShaderGroupHandlesKHR  out-of-reach:ray-tracing-pipeline

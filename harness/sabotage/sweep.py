@@ -2414,6 +2414,13 @@ SABOTAGES = [
         """        if user_defined && args.pDepthClampRange.is_none() && false {""",
         'end_rendering2_and_depth_clamp_range_hand_the_driver_the_guests_structs',
     ),
+    (
+        'vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR answers no shapes',
+        'src/venus/context.rs',
+        """            .enumerate_into(pd, out, |i| i.try_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR());""",
+        """            .enumerate_into(pd, out.filter(|_| false), |i| i.try_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR());""",
+        'cooperative_matrix_properties_are_counted_then_written',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
