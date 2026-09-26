@@ -76,9 +76,10 @@ use super::proto::types::{
     VkVertexInputBindingDescription2EXT, VkViewport, VkWriteDescriptorSet,
 };
 use super::proto::types::{
-    VkDeferredOperationKHR, VkPhysicalDeviceProperties2,
-    VkPhysicalDeviceRayTracingPipelinePropertiesKHR, VkPipelineCreateFlags2CreateInfo,
-    VkRayTracingPipelineCreateInfoKHR, VkShaderGroupShaderKHR, VkStridedDeviceAddressRegionKHR,
+    VkComputePipelineCreateInfo, VkDeferredOperationKHR, VkGraphicsPipelineCreateInfo,
+    VkPhysicalDeviceProperties2, VkPhysicalDeviceRayTracingPipelinePropertiesKHR,
+    VkPipelineCreateFlags2CreateInfo, VkRayTracingPipelineCreateInfoKHR, VkShaderGroupShaderKHR,
+    VkStridedDeviceAddressRegionKHR,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
@@ -180,11 +181,65 @@ pub enum Level {
     Unleveled,
 }
 
-/// One object a pool handed out: the guest id it was allocated under, and its level.
+/// One object a pool handed out: the guest id it was allocated under, its level, and -- for a
+/// command buffer -- which bind points its recording has bound a pipeline at.
+///
+/// `bound` lives here rather than in a map of its own because a command buffer's pool record is
+/// already the thing that lives exactly as long as the buffer does: a freed buffer, a destroyed
+/// pool and a destroyed device all take it, and a record kept anywhere else would need each of
+/// those to remember it. Every other pool child carries it empty, as it carries `Unleveled`.
 #[derive(Clone, Copy, Debug)]
 struct Child {
     id: ObjectId,
     level: Level,
+    bound: Bound,
+}
+
+/// Where a pipeline is bound, and so which draws, dispatches or traces it serves.
+///
+/// Vulkan's enum has more members than these, each from an extension this renderer does not
+/// serve, so a bind at any other point is refused before this type exists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BindPoint {
+    Graphics,
+    Compute,
+    RayTracing,
+}
+
+impl BindPoint {
+    fn of(point: VkPipelineBindPoint) -> Option<Self> {
+        use VkPipelineBindPoint as P;
+        match point {
+            P::VK_PIPELINE_BIND_POINT_GRAPHICS => Some(Self::Graphics),
+            P::VK_PIPELINE_BIND_POINT_COMPUTE => Some(Self::Compute),
+            P::VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR => Some(Self::RayTracing),
+            _ => None,
+        }
+    }
+}
+
+/// The bind points of one command buffer's current recording that have a pipeline bound.
+///
+/// A driver reads the bound pipeline's shaders when the draw is recorded, not when it runs:
+/// KosmicKrisp's `kk_CmdDispatch` reads `cmd->state.shaders[MESA_SHADER_COMPUTE]->info` and
+/// `kk_flush_pipeline` the vertex shader's Metal pipeline, with nothing checking either is there.
+/// A guest that draws before it binds takes the host down, so every draw, dispatch and trace is
+/// held to this.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Bound(u8);
+
+impl Bound {
+    fn bit(point: BindPoint) -> u8 {
+        1 << point as u8
+    }
+
+    fn with(self, point: BindPoint) -> Self {
+        Self(self.0 | Self::bit(point))
+    }
+
+    fn has(self, point: BindPoint) -> bool {
+        self.0 & Self::bit(point) != 0
+    }
 }
 
 /// One live pool: the device that owns it, and what has been allocated from it.
@@ -243,7 +298,8 @@ impl Pools {
             return;
         };
         for (handle, id) in children {
-            p.children.insert(TypedHandle::of(handle), Child { id, level });
+            p.children
+                .insert(TypedHandle::of(handle), Child { id, level, bound: Bound::default() });
             self.owner.insert(TypedHandle::of(handle), pool);
         }
     }
@@ -267,6 +323,35 @@ impl Pools {
                 && let Some(p) = self.open.get_mut(&pool)
             {
                 p.children.remove(&child);
+            }
+        }
+    }
+
+    /// A pool child's record, if a pool here holds it.
+    fn child_mut<T: Handle>(&mut self, handle: T) -> Option<&mut Child> {
+        let handle = TypedHandle::of(handle);
+        self.open.get_mut(self.owner.get(&handle)?)?.children.get_mut(&handle)
+    }
+
+    /// Which bind points of a command buffer have a pipeline, if a pool here holds it.
+    fn bound(&self, cb: VkCommandBuffer) -> Option<Bound> {
+        let handle = TypedHandle::of(cb);
+        Some(self.open.get(self.owner.get(&handle)?)?.children.get(&handle)?.bound)
+    }
+
+    /// Start a command buffer's bindings over, as a begin or a reset starts its recording over.
+    fn unbind(&mut self, cb: VkCommandBuffer) {
+        if let Some(c) = self.child_mut(cb) {
+            c.bound = Bound::default();
+        }
+    }
+
+    /// Start every binding of a pool's children over: a pool reset returns each buffer it handed
+    /// out to the initial state without naming any of them.
+    fn unbind_pool<P: Handle>(&mut self, pool: P) {
+        if let Some(p) = self.open.get_mut(&TypedHandle::of(pool)) {
+            for c in p.children.values_mut() {
+                c.bound = Bound::default();
             }
         }
     }
@@ -397,6 +482,30 @@ pub enum RayTracingRefused {
     UnknownShader,
 }
 
+/// Why a `vkCmdBindPipeline` was refused. None reached the driver.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BindRefused {
+    /// The command buffer has no pool record here, so no device behind it.
+    NoDevice,
+    /// A bind point this renderer serves no pipeline for.
+    UnknownBindPoint,
+    /// The pipeline has no record here, or was made by another device than the command
+    /// buffer's.
+    UnknownPipeline,
+    /// The pipeline is of another kind than the bind point.
+    WrongKind,
+}
+
+/// Why a draw, dispatch or trace was not recorded. None reached the driver.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unrecorded {
+    /// The command buffer has no pool record here, or its device does not export the command.
+    NoDevice,
+    /// The command buffer's recording has bound no pipeline at the point the command draws,
+    /// dispatches or traces with.
+    Unbound,
+}
+
 /// Why a run of pool objects was not freed. Neither reached the driver.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FreeRefused {
@@ -484,12 +593,15 @@ pub struct Driver {
     /// way: the record dies at both places the pool does, so a recycled handle finds no record
     /// from a previous life.
     query_pools: BTreeMap<VkQueryPool, QueryFacts>,
-    /// How many shader groups each live ray-tracing pipeline has, its libraries' included.
+    /// What each live pipeline is and which device made it.
     ///
-    /// The group queries name groups by index and the driver indexes its own array with it, so
-    /// the index is held to this. Keyed by host handle and kept honest as `query_pools` is: the
-    /// record dies at both places the pipeline does.
-    ray_tracing_pipelines: BTreeMap<VkPipeline, u32>,
+    /// A bind is held to it, because Vulkan's bind takes the bind point and the pipeline as two
+    /// arguments and mesa's common `vk_common_CmdBindPipeline` checks they agree only with an
+    /// assert: a compute pipeline bound at the graphics point leaves no vertex shader for the draw
+    /// that follows. The group queries read a ray-tracing pipeline's group count from it. Keyed
+    /// by host handle and kept honest as `query_pools` is: the record dies at both places the
+    /// pipeline does.
+    pipelines: BTreeMap<VkPipeline, PipelineFacts>,
     /// Whether each live semaphore is binary or timeline.
     ///
     /// Vulkan fixes this at create and offers no way to ask afterwards, and three entry points are
@@ -1567,7 +1679,7 @@ impl Driver {
             account,
             instance: None,
             devices: BTreeMap::new(),
-            ray_tracing_pipelines: BTreeMap::new(),
+            pipelines: BTreeMap::new(),
             physical_device_exts: BTreeMap::new(),
             withheld: ledger::withheld(),
             memory: BTreeMap::new(),
@@ -3424,19 +3536,9 @@ impl Driver {
     /// Which leaves the survivors owned by nobody, so they are destroyed here. The C zeroes the
     /// array and walks away, leaking them until the device goes; there is nothing to be faithful
     /// to in that.
-    pub fn create_pipelines<I>(
-        &self,
+    pub fn create_pipelines<I: PipelineInfo>(
+        &mut self,
         device: VkDevice,
-        proc: impl FnOnce(
-            &DeviceFns,
-        ) -> unsafe extern "C" fn(
-            VkDevice,
-            VkPipelineCache,
-            u32,
-            *const I,
-            *const VkAllocationCallbacks,
-            *mut VkPipeline,
-        ) -> VkResult,
         cache: VkPipelineCache,
         infos: cs::Decoded<'_, [I]>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
@@ -3445,14 +3547,20 @@ impl Driver {
         let Some(d) = self.devices.get(&device) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
-        let f = proc(&d.fns);
-        Self::pipeline_run(&d.fns, device, infos.len(), alloc, out, |out| {
+        let f = I::create(&d.fns);
+        let made = Self::pipeline_run(&d.fns, device, infos.len(), alloc, out, |out| {
             // SAFETY: `device` is a handle in this table, `alloc` is an arena allocation live for
             // the call, and both counts Vulkan is given are the slices' own lengths.
             unsafe {
                 f(device, cache, infos.len() as u32, infos.as_ptr(), ptr(alloc), out.as_mut_ptr())
             }
-        })
+        });
+        if made.is_ok() {
+            for pipeline in out.iter().filter(|p| p.host().raw() != 0) {
+                self.pipelines.insert(*pipeline, PipelineFacts { device, kind: I::KIND });
+            }
+        }
+        made
     }
 
     /// The part of a pipeline create every kind shares: one handle slot per create-info, and on
@@ -3544,10 +3652,11 @@ impl Driver {
                 .expect("the decoder holds pLibraries to libraryCount");
                 for lib in libraries {
                     let n = self
-                        .ray_tracing_pipelines
+                        .pipelines
                         .get(lib)
+                        .and_then(|p| p.kind.groups())
                         .ok_or(RayTracingRefused::NotALibrary)?;
-                    total = total.checked_add(*n).ok_or(RayTracingRefused::OutOfGroups)?;
+                    total = total.checked_add(n).ok_or(RayTracingRefused::OutOfGroups)?;
                 }
             }
             groups.push(total);
@@ -3567,19 +3676,20 @@ impl Driver {
             }
         });
         if made.is_ok() {
-            for (pipeline, n) in out.iter().zip(groups) {
+            for (pipeline, groups) in out.iter().zip(groups) {
                 if pipeline.host().raw() != 0 {
-                    self.ray_tracing_pipelines.insert(*pipeline, n);
+                    let kind = PipelineKind::RayTracing { groups };
+                    self.pipelines.insert(*pipeline, PipelineFacts { device, kind });
                 }
             }
         }
         Ok(made)
     }
 
-    /// Drop a pipeline's ray-tracing record, if it has one. Called from the two places a pipeline
-    /// dies, as [`Driver::forget_query_pool`] is.
+    /// Drop a pipeline's record. Called from the two places a pipeline dies, as
+    /// [`Driver::forget_query_pool`] is.
     pub fn forget_pipeline(&mut self, pipeline: VkPipeline) {
-        self.ray_tracing_pipelines.remove(&pipeline);
+        self.pipelines.remove(&pipeline);
     }
 
     /// `vkGetRayTracingShaderGroupHandlesKHR`, or its capture-replay twin: the handles of
@@ -3653,8 +3763,11 @@ impl Driver {
         first: u32,
         count: u32,
     ) -> Result<(), RayTracingRefused> {
-        let groups =
-            *self.ray_tracing_pipelines.get(&pipeline).ok_or(RayTracingRefused::UnknownPipeline)?;
+        let groups = self
+            .pipelines
+            .get(&pipeline)
+            .and_then(|p| p.kind.groups())
+            .ok_or(RayTracingRefused::UnknownPipeline)?;
         match first.checked_add(count) {
             Some(end) if end <= groups => Ok(()),
             _ => Err(RayTracingRefused::OutOfGroups),
@@ -3925,6 +4038,7 @@ impl Driver {
         self.physical_device_exts.clear();
         self.images.clear();
         self.query_pools.clear();
+        self.pipelines.clear();
         self.semaphores.clear();
         self.pending_fences.clear();
     }
@@ -3955,6 +4069,15 @@ impl Driver {
     ) {
         self.pools.open(device, pool);
         self.pools.adopt(pool, level, children.iter().copied());
+    }
+
+    /// Mark a planted command buffer as having a pipeline bound at `point`, as a served
+    /// `vkCmdBindPipeline` would. Test scaffolding, beside [`Driver::plant_pool`]: a test about
+    /// a draw has no pipeline to create.
+    #[cfg(test)]
+    pub(super) fn plant_bound(&mut self, cb: VkCommandBuffer, point: BindPoint) {
+        let child = self.pools.child_mut(cb).expect("a command buffer planted first");
+        child.bound = child.bound.with(point);
     }
 
     /// Whether a pool is still open, for the test that a reset keeps it so where a destroy does
@@ -4052,7 +4175,7 @@ impl Driver {
     /// one it owns: see `Pools::held_by`. What a reset does to the pool's children is the
     /// caller's, because the two resets differ exactly there.
     pub fn reset_pool<P: PoolOf, F: Copy>(
-        &self,
+        &mut self,
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, P, F) -> VkResult,
         pool: P,
@@ -4064,6 +4187,9 @@ impl Driver {
         if !self.pools.held_by(pool, device) {
             return None;
         }
+        // A command pool's reset starts every buffer's recording over. A descriptor pool's
+        // children have no bindings, so this is nothing to them.
+        self.pools.unbind_pool(pool);
         Some(self.object_flags_op(device, proc, pool, flags))
     }
 
@@ -4110,13 +4236,26 @@ impl Driver {
         self.devices.get(&self.pools.device_of(cb)?).map(|d| &d.fns.fns)
     }
 
+    /// [`Driver::recorder`] for a draw, dispatch or trace: the entry points only if the
+    /// recording has bound a pipeline at the point the command uses. See [`Bound`].
+    fn drawer(&self, cb: VkCommandBuffer, point: BindPoint) -> Result<&DeviceFns, Unrecorded> {
+        let bound = self.pools.bound(cb).ok_or(Unrecorded::NoDevice)?;
+        if !bound.has(point) {
+            return Err(Unrecorded::Unbound);
+        }
+        self.recorder(cb).ok_or(Unrecorded::NoDevice)
+    }
+
     /// `vkBeginCommandBuffer`. The one recording command with a result, because it is the one
     /// that can run the pool out of memory before anything has been recorded.
     pub fn begin_command_buffer(
-        &self,
+        &mut self,
         cb: VkCommandBuffer,
         info: cs::Decoded<'_, VkCommandBufferBeginInfo>,
     ) -> Option<VkResult> {
+        // A begin starts the recording over, bindings and all, whether the driver's answer is a
+        // success or not: a failed begin leaves nothing a draw may rely on either.
+        self.pools.unbind(cb);
         let d = self.recorder(cb)?;
         // SAFETY: a command buffer this context allocated, and `info` is an arena allocation
         // live for the call. The same holds for every call in this section.
@@ -4130,10 +4269,11 @@ impl Driver {
     }
 
     pub fn reset_command_buffer(
-        &self,
+        &mut self,
         cb: VkCommandBuffer,
         flags: VkCommandBufferResetFlags,
     ) -> Option<VkResult> {
+        self.pools.unbind(cb);
         let d = self.recorder(cb)?;
         // SAFETY: as above.
         Some(unsafe { (d.vkResetCommandBuffer())(cb, flags) })
@@ -4350,16 +4490,31 @@ impl Driver {
         Some(())
     }
 
+    /// `vkCmdBindPipeline`, held to the pipeline's record: a pipeline of this command buffer's
+    /// device, bound at the one point its kind is for. Then the point counts as bound for the
+    /// rest of the recording -- see [`Bound`].
     pub fn cmd_bind_pipeline(
-        &self,
+        &mut self,
         cb: VkCommandBuffer,
         bind_point: VkPipelineBindPoint,
         pipeline: VkPipeline,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), BindRefused> {
+        let device = self.pools.device_of(cb).ok_or(BindRefused::NoDevice)?;
+        let point = BindPoint::of(bind_point).ok_or(BindRefused::UnknownBindPoint)?;
+        let facts = self
+            .pipelines
+            .get(&pipeline)
+            .filter(|p| p.device == device)
+            .ok_or(BindRefused::UnknownPipeline)?;
+        if facts.kind.bind_point() != point {
+            return Err(BindRefused::WrongKind);
+        }
+        let d = self.recorder(cb).ok_or(BindRefused::NoDevice)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdBindPipeline())(cb, bind_point, pipeline) };
-        Some(())
+        let child = self.pools.child_mut(cb).expect("the pool record `device_of` just read");
+        child.bound = child.bound.with(point);
+        Ok(())
     }
 
     pub fn cmd_bind_descriptor_sets(
@@ -4395,18 +4550,24 @@ impl Driver {
         instances: u32,
         first_vertex: u32,
         first_instance: u32,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), Unrecorded> {
+        let d = self.drawer(cb, BindPoint::Graphics)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDraw())(cb, vertices, instances, first_vertex, first_instance) };
-        Some(())
+        Ok(())
     }
 
-    pub fn cmd_dispatch(&self, cb: VkCommandBuffer, x: u32, y: u32, z: u32) -> Option<()> {
-        let d = self.recorder(cb)?;
+    pub fn cmd_dispatch(
+        &self,
+        cb: VkCommandBuffer,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> Result<(), Unrecorded> {
+        let d = self.drawer(cb, BindPoint::Compute)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDispatch())(cb, x, y, z) };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_draw_indexed(
@@ -4417,8 +4578,8 @@ impl Driver {
         first_index: u32,
         vertex_offset: i32,
         first_instance: u32,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), Unrecorded> {
+        let d = self.drawer(cb, BindPoint::Graphics)?;
         // SAFETY: as above.
         unsafe {
             (d.vkCmdDrawIndexed())(
@@ -4430,7 +4591,7 @@ impl Driver {
                 first_instance,
             )
         };
-        Some(())
+        Ok(())
     }
 
     // The indirect draws and dispatch. Each reads its parameters from a buffer of the guest's
@@ -4446,11 +4607,11 @@ impl Driver {
         offset: VkDeviceSize,
         draws: u32,
         stride: u32,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), Unrecorded> {
+        let d = self.drawer(cb, BindPoint::Graphics)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDrawIndirect())(cb, buffer, offset, draws, stride) };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_draw_indexed_indirect(
@@ -4460,11 +4621,11 @@ impl Driver {
         offset: VkDeviceSize,
         draws: u32,
         stride: u32,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), Unrecorded> {
+        let d = self.drawer(cb, BindPoint::Graphics)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDrawIndexedIndirect())(cb, buffer, offset, draws, stride) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdDrawIndirectCount`: an indirect draw whose count is itself read from a buffer, and
@@ -4479,19 +4640,31 @@ impl Driver {
         count_offset: VkDeviceSize,
         max_draws: u32,
         stride: u32,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdDrawIndirectCount()?;
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawIndirectCount()
+            .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdDrawMeshTasksEXT`: a mesh-shader draw of `x` by `y` by `z` task groups.
-    pub fn cmd_draw_mesh_tasks(&self, cb: VkCommandBuffer, x: u32, y: u32, z: u32) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdDrawMeshTasksEXT()?;
+    pub fn cmd_draw_mesh_tasks(
+        &self,
+        cb: VkCommandBuffer,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawMeshTasksEXT()
+            .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, x, y, z) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdDrawMeshTasksIndirectEXT`: the group counts read from `buffer`, `draws` times.
@@ -4502,11 +4675,14 @@ impl Driver {
         offset: VkDeviceSize,
         draws: u32,
         stride: u32,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdDrawMeshTasksIndirectEXT()?;
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawMeshTasksIndirectEXT()
+            .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, draws, stride) };
-        Some(())
+        Ok(())
     }
 
     /// See [`Driver::cmd_draw_indirect_count`]; the mesh-shader form.
@@ -4520,11 +4696,14 @@ impl Driver {
         count_offset: VkDeviceSize,
         max_draws: u32,
         stride: u32,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdDrawMeshTasksIndirectCountEXT()?;
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawMeshTasksIndirectCountEXT()
+            .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdBuildAccelerationStructuresKHR`: one build per element of `infos`, each over the row
@@ -4624,12 +4803,15 @@ impl Driver {
         width: u32,
         height: u32,
         depth: u32,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdTraceRaysKHR()?;
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::RayTracing)?
+            .try_vkCmdTraceRaysKHR()
+            .ok_or(Unrecorded::NoDevice)?;
         let t = tables;
         // SAFETY: as above; each table is a borrow live for the call.
         unsafe { f(cb, t.raygen, t.miss, t.hit, t.callable, width, height, depth) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdTraceRaysIndirectKHR`: [`Driver::cmd_trace_rays`] with the grid read on the device.
@@ -4638,20 +4820,30 @@ impl Driver {
         cb: VkCommandBuffer,
         tables: &ShaderBindingTables<'_>,
         grid: VkDeviceAddress,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdTraceRaysIndirectKHR()?;
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::RayTracing)?
+            .try_vkCmdTraceRaysIndirectKHR()
+            .ok_or(Unrecorded::NoDevice)?;
         let t = tables;
         // SAFETY: as above.
         unsafe { f(cb, t.raygen, t.miss, t.hit, t.callable, grid) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdTraceRaysIndirect2KHR`: the tables and the grid both read on the device.
-    pub fn cmd_trace_rays_indirect2(&self, cb: VkCommandBuffer, at: VkDeviceAddress) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdTraceRaysIndirect2KHR()?;
+    pub fn cmd_trace_rays_indirect2(
+        &self,
+        cb: VkCommandBuffer,
+        at: VkDeviceAddress,
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::RayTracing)?
+            .try_vkCmdTraceRaysIndirect2KHR()
+            .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, at) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdSetRayTracingPipelineStackSizeKHR`.
@@ -4707,11 +4899,14 @@ impl Driver {
         count_offset: VkDeviceSize,
         max_draws: u32,
         stride: u32,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdDrawIndexedIndirectCount()?;
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawIndexedIndirectCount()
+            .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_dispatch_indirect(
@@ -4719,11 +4914,11 @@ impl Driver {
         cb: VkCommandBuffer,
         buffer: VkBuffer,
         offset: VkDeviceSize,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), Unrecorded> {
+        let d = self.drawer(cb, BindPoint::Compute)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDispatchIndirect())(cb, buffer, offset) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdDispatchBase`: a dispatch whose workgroup ids start at `base` rather than zero.
@@ -4732,12 +4927,15 @@ impl Driver {
         cb: VkCommandBuffer,
         base: [u32; 3],
         groups: [u32; 3],
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdDispatchBase()?;
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::Compute)?
+            .try_vkCmdDispatchBase()
+            .ok_or(Unrecorded::NoDevice)?;
         let ([bx, by, bz], [x, y, z]) = (base, groups);
         // SAFETY: as above.
         unsafe { f(cb, bx, by, bz, x, y, z) };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_set_viewport(
@@ -5225,8 +5423,11 @@ impl Driver {
         draws: Option<&[VkMultiDrawInfoEXT]>,
         instances: u32,
         first_instance: u32,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdDrawMultiEXT()?;
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawMultiEXT()
+            .ok_or(Unrecorded::NoDevice)?;
         let stride = size_of::<VkMultiDrawInfoEXT>() as u32;
         // SAFETY: as above; the count is the slice's own length and the stride is the element
         // size of the array being pointed at, so the driver's walk stays inside it.
@@ -5240,7 +5441,7 @@ impl Driver {
                 stride,
             )
         };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_draw_multi_indexed(
@@ -5250,8 +5451,11 @@ impl Driver {
         instances: u32,
         first_instance: u32,
         vertex_offset: Option<&i32>,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdDrawMultiIndexedEXT()?;
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawMultiIndexedEXT()
+            .ok_or(Unrecorded::NoDevice)?;
         let stride = size_of::<VkMultiDrawIndexedInfoEXT>() as u32;
         // SAFETY: as above; `vertex_offset` is null or addresses one `i32` live for the call.
         unsafe {
@@ -5265,7 +5469,7 @@ impl Driver {
                 vertex_offset.map_or(core::ptr::null(), |o| o as *const i32),
             )
         };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdBindVertexBuffers`, whose one count governs two arrays.
@@ -5730,11 +5934,14 @@ impl Driver {
         counter_offset: VkDeviceSize,
         vertex_offset: u32,
         stride: u32,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdDrawIndirectByteCountEXT()?;
+    ) -> Result<(), Unrecorded> {
+        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawIndirectByteCountEXT()
+            .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, instances, first_instance, counter, counter_offset, vertex_offset, stride) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdSetTessellationDomainOriginEXT` and the other scalar setters of
@@ -7864,6 +8071,74 @@ enum Planned {
     /// renderer maps and owns as [`Storage::Heap`], carrying the question the image failed at for
     /// whoever is later handed a share and finds no surface; `None` is memory it cannot.
     Deferred { charge: Charge, why: Option<NoSurface> },
+}
+
+/// What a pipeline was created as, and by which device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PipelineFacts {
+    device: VkDevice,
+    kind: PipelineKind,
+}
+
+/// A pipeline's kind: the create that made it, and so the one bind point it may be bound at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PipelineKind {
+    Graphics,
+    Compute,
+    /// With how many shader groups it has, its libraries' included. The group queries name
+    /// groups by index and the driver indexes its own array with it, so the index is held to this.
+    RayTracing {
+        groups: u32,
+    },
+}
+
+impl PipelineKind {
+    fn bind_point(self) -> BindPoint {
+        match self {
+            Self::Graphics => BindPoint::Graphics,
+            Self::Compute => BindPoint::Compute,
+            Self::RayTracing { .. } => BindPoint::RayTracing,
+        }
+    }
+
+    fn groups(self) -> Option<u32> {
+        match self {
+            Self::RayTracing { groups } => Some(groups),
+            Self::Graphics | Self::Compute => None,
+        }
+    }
+}
+
+/// The entry point a run of pipelines is created through, from the create-info it takes.
+pub type CreatePipelines<I> = unsafe extern "C" fn(
+    VkDevice,
+    VkPipelineCache,
+    u32,
+    *const I,
+    *const VkAllocationCallbacks,
+    *mut VkPipeline,
+) -> VkResult;
+
+/// A create-info [`Driver::create_pipelines`] makes a run from: which entry point takes it, and
+/// what kind of pipeline comes out. One trait, so the entry point and the kind recorded for its
+/// pipelines cannot be named apart.
+pub trait PipelineInfo: Sized {
+    const KIND: PipelineKind;
+    fn create(fns: &DeviceFns) -> CreatePipelines<Self>;
+}
+
+impl PipelineInfo for VkGraphicsPipelineCreateInfo {
+    const KIND: PipelineKind = PipelineKind::Graphics;
+    fn create(fns: &DeviceFns) -> CreatePipelines<Self> {
+        fns.vkCreateGraphicsPipelines()
+    }
+}
+
+impl PipelineInfo for VkComputePipelineCreateInfo {
+    const KIND: PipelineKind = PipelineKind::Compute;
+    fn create(fns: &DeviceFns) -> CreatePipelines<Self> {
+        fns.vkCreateComputePipelines()
+    }
 }
 
 /// What a query pool was created as, for the commands that name its queries by index and the
@@ -13896,7 +14171,7 @@ mod tests {
             device: Some(DEVICE),
         }];
         d.destroy_device(DEVICE, &doomed);
-        assert!(d.ray_tracing_pipelines.is_empty(), "no record outlives the pipeline it describes");
+        assert!(d.pipelines.is_empty(), "no record outlives the pipeline it describes");
     }
 
     /// A surface handed to a venus context comes out marked lent, because the classic side reads

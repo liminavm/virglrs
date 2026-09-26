@@ -426,17 +426,14 @@ SABOTAGES = [
     (
         "a compute pipeline run is compiled without the guest's pipeline cache",
         'src/venus/context.rs',
-        """        let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
-        let out = args.handle_pPipelines_mut();
-        let host = self.driver.create_pipelines(
-            device,
-            |d| d.vkCreateComputePipelines(),""",
-        """        let (device, _cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
-        let cache = Default::default();
-        let out = args.handle_pPipelines_mut();
-        let host = self.driver.create_pipelines(
-            device,
-            |d| d.vkCreateComputePipelines(),""",
+        """        let host = self.driver.create_pipelines(device, cache, infos, alloc, out);
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        if host.is_err() {
+            eprintln!("[virglrs] vkCreateComputePipelines refused by the driver");""",
+        """        let host = self.driver.create_pipelines(device, Default::default(), infos, alloc, out);
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        if host.is_err() {
+            eprintln!("[virglrs] vkCreateComputePipelines refused by the driver");""",
         'the_compute_pipeline_pair_reaches_the_driver_as_the_guest_sent_it',
     ),
     (
@@ -2127,10 +2124,16 @@ SABOTAGES = [
     (
         'vkCmdDrawIndirectCount swaps its draw cap and its stride',
         'src/venus/driver.rs',
-        """        let f = self.recorder(cb)?.try_vkCmdDrawIndirectCount()?;
+        """        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawIndirectCount()
+            .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };""",
-        """        let f = self.recorder(cb)?.try_vkCmdDrawIndirectCount()?;
+        """        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawIndirectCount()
+            .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: sabotage -- two u32s transposed.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, stride, max_draws) };""",
         'the_indexed_and_indirect_draws_hand_the_driver_every_argument_in_place',
@@ -2428,10 +2431,16 @@ SABOTAGES = [
     (
         'vkCmdDrawMeshTasksIndirectCountEXT swaps its two offsets',
         'src/venus/driver.rs',
-        """        let f = self.recorder(cb)?.try_vkCmdDrawMeshTasksIndirectCountEXT()?;
+        """        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawMeshTasksIndirectCountEXT()
+            .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };""",
-        """        let f = self.recorder(cb)?.try_vkCmdDrawMeshTasksIndirectCountEXT()?;
+        """        let f = self
+            .drawer(cb, BindPoint::Graphics)?
+            .try_vkCmdDrawMeshTasksIndirectCountEXT()
+            .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: sabotage -- the two offsets swapped.
         unsafe { f(cb, buffer, count_offset, count_buffer, offset, max_draws, stride) };""",
         'the_mesh_task_draws_hand_the_driver_every_argument_in_place',
@@ -2596,6 +2605,81 @@ SABOTAGES = [
         let out = args.handle_pPipelines_mut();
         let made = self.driver.create_ray_tracing_pipelines(""",
         'a_derivative_pipeline_names_only_an_earlier_pipeline_of_its_run_as_its_base',
+    ),
+    (
+        'a draw is recorded with no pipeline bound at its point',
+        'src/venus/driver.rs',
+        """        if !bound.has(point) {
+            return Err(Unrecorded::Unbound);""",
+        """        if false && !bound.has(point) {
+            return Err(Unrecorded::Unbound);""",
+        'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
+    ),
+    (
+        'a trace reaches the driver without asking what is bound',
+        'src/venus/driver.rs',
+        """            .drawer(cb, BindPoint::RayTracing)?
+            .try_vkCmdTraceRaysKHR()""",
+        """            .recorder(cb)
+            .ok_or(Unrecorded::NoDevice)?
+            .try_vkCmdTraceRaysKHR()""",
+        'venus::context::tests::ray_tracing_pipelines_are_created_traced_and_forgotten_through_the_handlers',
+    ),
+    (
+        "a pipeline may be bound at another kind's point",
+        'src/venus/driver.rs',
+        """        if facts.kind.bind_point() != point {""",
+        """        if false && facts.kind.bind_point() != point {""",
+        'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
+    ),
+    (
+        'a pipeline of another device may be bound',
+        'src/venus/driver.rs',
+        """            .filter(|p| p.device == device)
+            .ok_or(BindRefused::UnknownPipeline)?;""",
+        """            .filter(|_| true)
+            .ok_or(BindRefused::UnknownPipeline)?;""",
+        'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
+    ),
+    (
+        'a served bind marks nothing bound',
+        'src/venus/driver.rs',
+        """        let child = self.pools.child_mut(cb).expect("the pool record `device_of` just read");
+        child.bound = child.bound.with(point);
+""",
+        """        let child = self.pools.child_mut(cb).expect("the pool record `device_of` just read");
+""",
+        'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
+    ),
+    (
+        "a begin keeps the last recording's bindings",
+        'src/venus/driver.rs',
+        """        // success or not: a failed begin leaves nothing a draw may rely on either.
+        self.pools.unbind(cb);
+""",
+        """        // success or not: a failed begin leaves nothing a draw may rely on either.
+""",
+        'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
+    ),
+    (
+        'a command buffer reset keeps its bindings',
+        'src/venus/driver.rs',
+        """        self.pools.unbind(cb);
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        Some(unsafe { (d.vkResetCommandBuffer())""",
+        """        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        Some(unsafe { (d.vkResetCommandBuffer())""",
+        'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
+    ),
+    (
+        "a pool reset keeps its buffers' bindings",
+        'src/venus/driver.rs',
+        """        self.pools.unbind_pool(pool);
+""",
+        """""",
+        'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
     ),
 ]
 

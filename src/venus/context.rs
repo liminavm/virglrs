@@ -2357,6 +2357,27 @@ impl Handlers<'_> {
         self.reject("recorded into a command buffer with no device behind it");
     }
 
+    /// The verdict on a draw, dispatch or trace: see [`driver::Unrecorded`].
+    fn drawn(&mut self, done: Result<(), driver::Unrecorded>) {
+        match done {
+            Ok(()) => {}
+            Err(driver::Unrecorded::NoDevice) => self.no_recorder(),
+            Err(driver::Unrecorded::Unbound) => self.reject(UNBOUND),
+        }
+    }
+
+    /// The verdict on a `vkCmdBindPipeline`: see [`driver::BindRefused`].
+    fn bound(&mut self, done: Result<(), driver::BindRefused>) {
+        use driver::BindRefused as B;
+        match done {
+            Ok(()) => {}
+            Err(B::NoDevice) => self.no_recorder(),
+            Err(B::UnknownBindPoint) => self.reject(BIND_UNKNOWN_POINT),
+            Err(B::UnknownPipeline) => self.reject(BIND_UNKNOWN_PIPELINE),
+            Err(B::WrongKind) => self.reject(BIND_WRONG_KIND),
+        }
+    }
+
     /// Where this stream keeps the driver wait it is suspended on: its ring's entry, so that the
     /// record goes with the ring, or the context for its own stream. `None` is a ring that is not
     /// here.
@@ -2524,6 +2545,11 @@ fn bases_in_run<I: Derives>(infos: Decoded<'_, [I]>) -> bool {
         }
     })
 }
+
+const UNBOUND: &str = "drew, dispatched or traced with no pipeline bound at that point";
+const BIND_UNKNOWN_POINT: &str = "bound a pipeline at a point this renderer serves none at";
+const BIND_UNKNOWN_PIPELINE: &str = "bound a pipeline its command buffer's device never made";
+const BIND_WRONG_KIND: &str = "bound a pipeline at another kind's bind point";
 
 const BASE_OUTSIDE_RUN: &str =
     "derived a pipeline from an index that is not an earlier pipeline in the same run";
@@ -4779,14 +4805,7 @@ impl Commands for Handlers<'_> {
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
         let out = args.handle_pPipelines_mut();
-        let host = self.driver.create_pipelines(
-            device,
-            |d| d.vkCreateGraphicsPipelines(),
-            cache,
-            infos,
-            alloc,
-            out,
-        );
+        let host = self.driver.create_pipelines(device, cache, infos, alloc, out);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
             // A pipeline the host refuses is a shader the guest cannot draw with, which is worth
@@ -4812,14 +4831,7 @@ impl Commands for Handlers<'_> {
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
         let out = args.handle_pPipelines_mut();
-        let host = self.driver.create_pipelines(
-            device,
-            |d| d.vkCreateComputePipelines(),
-            cache,
-            infos,
-            alloc,
-            out,
-        );
+        let host = self.driver.create_pipelines(device, cache, infos, alloc, out);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
             eprintln!("[virglrs] vkCreateComputePipelines refused by the driver");
@@ -4827,7 +4839,7 @@ impl Commands for Handlers<'_> {
         }
     }
 
-    /// Not [`simple_destroy`]: a ray-tracing pipeline's record goes with it. See
+    /// Not [`simple_destroy`]: the pipeline's record goes with it. See
     /// [`Driver::forget_pipeline`].
     fn vkDestroyPipeline(&mut self, args: &mut vn_command_vkDestroyPipeline<'_>) {
         self.driver.destroy_object(
@@ -5106,7 +5118,7 @@ impl Commands for Handlers<'_> {
             args.pipelineBindPoint,
             args.pipeline,
         );
-        self.recorded(done);
+        self.bound(done);
     }
 
     fn vkCmdBindDescriptorSets(&mut self, args: &mut vn_command_vkCmdBindDescriptorSets<'_>) {
@@ -5134,7 +5146,7 @@ impl Commands for Handlers<'_> {
             args.firstVertex,
             args.firstInstance,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdDispatch(&mut self, args: &mut vn_command_vkCmdDispatch<'_>) {
@@ -5144,7 +5156,7 @@ impl Commands for Handlers<'_> {
             args.groupCountY,
             args.groupCountZ,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdDrawIndexed(&mut self, args: &mut vn_command_vkCmdDrawIndexed<'_>) {
@@ -5156,7 +5168,7 @@ impl Commands for Handlers<'_> {
             args.vertexOffset,
             args.firstInstance,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdDrawIndirect(&mut self, args: &mut vn_command_vkCmdDrawIndirect<'_>) {
@@ -5167,7 +5179,7 @@ impl Commands for Handlers<'_> {
             args.drawCount,
             args.stride,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdDrawIndexedIndirect(&mut self, args: &mut vn_command_vkCmdDrawIndexedIndirect<'_>) {
@@ -5178,7 +5190,7 @@ impl Commands for Handlers<'_> {
             args.drawCount,
             args.stride,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdDrawIndirectCount(&mut self, args: &mut vn_command_vkCmdDrawIndirectCount<'_>) {
@@ -5191,7 +5203,7 @@ impl Commands for Handlers<'_> {
             args.maxDrawCount,
             args.stride,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdTraceRaysKHR(&mut self, args: &mut vn_command_vkCmdTraceRaysKHR<'_>) {
@@ -5210,7 +5222,7 @@ impl Commands for Handlers<'_> {
             args.height,
             args.depth,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdTraceRaysIndirectKHR(&mut self, args: &mut vn_command_vkCmdTraceRaysIndirectKHR<'_>) {
@@ -5227,13 +5239,13 @@ impl Commands for Handlers<'_> {
             &tables,
             args.indirectDeviceAddress,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdTraceRaysIndirect2KHR(&mut self, args: &mut vn_command_vkCmdTraceRaysIndirect2KHR<'_>) {
         let done =
             self.driver.cmd_trace_rays_indirect2(args.commandBuffer, args.indirectDeviceAddress);
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdSetRayTracingPipelineStackSizeKHR(
@@ -5253,7 +5265,7 @@ impl Commands for Handlers<'_> {
             args.groupCountY,
             args.groupCountZ,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdDrawMeshTasksIndirectEXT(
@@ -5267,7 +5279,7 @@ impl Commands for Handlers<'_> {
             args.drawCount,
             args.stride,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdDrawMeshTasksIndirectCountEXT(
@@ -5283,7 +5295,7 @@ impl Commands for Handlers<'_> {
             args.maxDrawCount,
             args.stride,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     /// Not [`simple_create`]: that calls the entry point a driver must export, and this one is an
@@ -5457,12 +5469,12 @@ impl Commands for Handlers<'_> {
             args.maxDrawCount,
             args.stride,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdDispatchIndirect(&mut self, args: &mut vn_command_vkCmdDispatchIndirect<'_>) {
         let done = self.driver.cmd_dispatch_indirect(args.commandBuffer, args.buffer, args.offset);
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdDispatchBase(&mut self, args: &mut vn_command_vkCmdDispatchBase<'_>) {
@@ -5471,7 +5483,7 @@ impl Commands for Handlers<'_> {
             [args.baseGroupX, args.baseGroupY, args.baseGroupZ],
             [args.groupCountX, args.groupCountY, args.groupCountZ],
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdBindIndexBuffer2(&mut self, args: &mut vn_command_vkCmdBindIndexBuffer2<'_>) {
@@ -5771,7 +5783,7 @@ impl Commands for Handlers<'_> {
             args.instanceCount,
             args.firstInstance,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdDrawMultiIndexedEXT(&mut self, args: &mut vn_command_vkCmdDrawMultiIndexedEXT<'_>) {
@@ -5782,7 +5794,7 @@ impl Commands for Handlers<'_> {
             args.firstInstance,
             args.pVertexOffset,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdSetAttachmentFeedbackLoopEnableEXT(
@@ -6134,7 +6146,7 @@ impl Commands for Handlers<'_> {
             args.counterOffset,
             args.vertexStride,
         );
-        self.recorded(done);
+        self.drawn(done);
     }
 
     fn vkCmdSetTessellationDomainOriginEXT(
@@ -14479,6 +14491,7 @@ mod tests {
             VkCommandPool::forged(POOL),
             &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
+        driver.plant_bound(VkCommandBuffer::forged(CB.0), driver::BindPoint::Compute);
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -16343,6 +16356,7 @@ mod tests {
             VkCommandPool::forged(POOL),
             &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
+        driver.plant_bound(VkCommandBuffer::forged(CB.0), driver::BindPoint::Graphics);
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -17317,6 +17331,7 @@ mod tests {
             VkCommandPool::forged(POOL),
             &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
+        driver.plant_bound(VkCommandBuffer::forged(CB.0), driver::BindPoint::Graphics);
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -17549,6 +17564,274 @@ mod tests {
         h.driver.abandon_planted();
     }
 
+    /// A draw, dispatch or trace reaches the driver only once its recording has bound a pipeline
+    /// at the point it uses, and a bind only with a pipeline of that point's kind made by the
+    /// command buffer's own device. A begin, a buffer reset and a pool reset each start the
+    /// bindings over. KosmicKrisp reads the bound shader as the command is recorded, so each
+    /// refusal here is a host crash it prevents.
+    #[test]
+    fn a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkCommandBuffer, VkCommandBufferBeginInfo,
+            VkCommandBufferResetFlags, VkCommandPool, VkCommandPoolResetFlags, VkDevice,
+            VkPipeline, VkPipelineBindPoint, VkPipelineCache, vn_command_vkBeginCommandBuffer,
+            vn_command_vkCmdBindPipeline, vn_command_vkCmdDispatch, vn_command_vkCmdDraw,
+            vn_command_vkResetCommandBuffer, vn_command_vkResetCommandPool,
+        };
+        use std::cell::{Cell, RefCell};
+
+        const DEVICE: u64 = 3;
+        const OTHER: u64 = 4;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+        const GRAPHICS: VkPipelineBindPoint = VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_GRAPHICS;
+        const COMPUTE: VkPipelineBindPoint = VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_COMPUTE;
+
+        thread_local! {
+            /// Every recording command that reached the driver, by name.
+            static SAW: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+            /// The next pipeline handle a create hands out.
+            static NEXT: Cell<u64> = const { Cell::new(0x70) };
+        }
+        fn saw(name: &'static str) {
+            SAW.with_borrow_mut(|s| s.push(name));
+        }
+        fn made(n: u32, out: *mut VkPipeline) -> VkResult {
+            // SAFETY: the wrapper passes its slice's own pointer and length.
+            for e in unsafe { core::slice::from_raw_parts_mut(out, n as usize) } {
+                *e = VkPipeline::forged(NEXT.replace(NEXT.get() + 1));
+            }
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn create_compute(
+            _d: VkDevice,
+            _c: VkPipelineCache,
+            n: u32,
+            _i: *const VkComputePipelineCreateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkPipeline,
+        ) -> VkResult {
+            made(n, out)
+        }
+        unsafe extern "C" fn create_graphics(
+            _d: VkDevice,
+            _c: VkPipelineCache,
+            n: u32,
+            _i: *const VkGraphicsPipelineCreateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkPipeline,
+        ) -> VkResult {
+            made(n, out)
+        }
+        unsafe extern "C" fn record_bind(
+            _cb: VkCommandBuffer,
+            _p: VkPipelineBindPoint,
+            _l: VkPipeline,
+        ) {
+            saw("bind");
+        }
+        unsafe extern "C" fn record_dispatch(_cb: VkCommandBuffer, _x: u32, _y: u32, _z: u32) {
+            saw("dispatch");
+        }
+        unsafe extern "C" fn record_draw(
+            _cb: VkCommandBuffer,
+            _v: u32,
+            _i: u32,
+            _fv: u32,
+            _fi: u32,
+        ) {
+            saw("draw");
+        }
+        unsafe extern "C" fn begin(
+            _cb: VkCommandBuffer,
+            _i: *const VkCommandBufferBeginInfo,
+        ) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn reset(
+            _cb: VkCommandBuffer,
+            _f: VkCommandBufferResetFlags,
+        ) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn reset_pool(
+            _d: VkDevice,
+            _p: VkCommandPool,
+            _f: VkCommandPoolResetFlags,
+        ) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+
+        let fns = || {
+            let mut fns = crate::vulkan::Device::default();
+            fns.plant_vkCreateComputePipelines(create_compute);
+            fns.plant_vkCreateGraphicsPipelines(create_graphics);
+            fns.plant_vkCmdBindPipeline(record_bind);
+            fns.plant_vkCmdDispatch(record_dispatch);
+            fns.plant_vkCmdDraw(record_draw);
+            fns.plant_vkBeginCommandBuffer(begin);
+            fns.plant_vkResetCommandBuffer(reset);
+            fns.plant_vkResetCommandPool(reset_pool);
+            fns
+        };
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns());
+        driver.plant_device(VkDevice::forged(OTHER), fns());
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(POOL),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let compute = |h: &mut Handlers<'_>, device: u64| {
+            let infos = [VkComputePipelineCreateInfo::default()];
+            let mut wire = [VkPipeline::forged(40)];
+            let mut shadow = [VkPipeline::forged(0)];
+            let mut args = vn_command_vkCreateComputePipelines::default();
+            args.device = VkDevice::forged(device);
+            args.plant_pCreateInfos(&infos);
+            args.plant_pPipelines(&mut wire);
+            args.plant_handle_pPipelines(&mut shadow);
+            h.vkCreateComputePipelines(&mut args);
+            assert_eq!(h.take_rejected(), None, "a compute pipeline is made");
+            shadow[0]
+        };
+        let graphics = |h: &mut Handlers<'_>| {
+            let infos = [VkGraphicsPipelineCreateInfo::default()];
+            let mut wire = [VkPipeline::forged(41)];
+            let mut shadow = [VkPipeline::forged(0)];
+            let mut args = vn_command_vkCreateGraphicsPipelines::default();
+            args.device = VkDevice::forged(DEVICE);
+            args.plant_pCreateInfos(&infos);
+            args.plant_pPipelines(&mut wire);
+            args.plant_handle_pPipelines(&mut shadow);
+            h.vkCreateGraphicsPipelines(&mut args);
+            assert_eq!(h.take_rejected(), None, "a graphics pipeline is made");
+            shadow[0]
+        };
+        let cb = VkCommandBuffer::forged(CB.0);
+        let bind = |h: &mut Handlers<'_>, point: VkPipelineBindPoint, pipeline: VkPipeline| {
+            h.vkCmdBindPipeline(&mut vn_command_vkCmdBindPipeline {
+                commandBuffer: cb,
+                pipelineBindPoint: point,
+                pipeline,
+                ..Default::default()
+            });
+            h.take_rejected()
+        };
+        let dispatch = |h: &mut Handlers<'_>| {
+            h.vkCmdDispatch(&mut vn_command_vkCmdDispatch {
+                commandBuffer: cb,
+                groupCountX: 1,
+                groupCountY: 1,
+                groupCountZ: 1,
+                ..Default::default()
+            });
+            h.take_rejected()
+        };
+        let draw = |h: &mut Handlers<'_>| {
+            h.vkCmdDraw(&mut vn_command_vkCmdDraw {
+                commandBuffer: cb,
+                vertexCount: 3,
+                instanceCount: 1,
+                ..Default::default()
+            });
+            h.take_rejected()
+        };
+
+        let unbound = Some(UNBOUND);
+        assert_eq!(dispatch(&mut h), unbound, "a dispatch before any bind");
+        assert_eq!(draw(&mut h), unbound, "a draw before any bind");
+
+        let mine = compute(&mut h, DEVICE);
+        let shaded = graphics(&mut h);
+        let theirs = compute(&mut h, OTHER);
+        let refusals = [
+            ("a compute pipeline at the graphics point", GRAPHICS, mine, BIND_WRONG_KIND),
+            ("a graphics pipeline at the compute point", COMPUTE, shaded, BIND_WRONG_KIND),
+            ("another device's pipeline", COMPUTE, theirs, BIND_UNKNOWN_PIPELINE),
+            ("a pipeline never made", COMPUTE, VkPipeline::forged(0x5eed), BIND_UNKNOWN_PIPELINE),
+            (
+                "a bind point this renderer serves nothing at",
+                VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_SUBPASS_SHADING_HUAWEI,
+                mine,
+                BIND_UNKNOWN_POINT,
+            ),
+        ];
+        for (what, point, pipeline, why) in refusals {
+            assert_eq!(bind(&mut h, point, pipeline), Some(why), "{what}");
+        }
+        assert_eq!(dispatch(&mut h), unbound, "a refused bind binds nothing");
+
+        assert_eq!(bind(&mut h, COMPUTE, mine), None);
+        assert_eq!(dispatch(&mut h), None, "a dispatch with a compute pipeline bound");
+        assert_eq!(draw(&mut h), unbound, "a compute bind leaves nothing to draw with");
+        assert_eq!(bind(&mut h, GRAPHICS, shaded), None);
+        assert_eq!(draw(&mut h), None, "a draw with a graphics pipeline bound");
+
+        // Each way a recording starts over takes its bindings with it.
+        let begin_info = VkCommandBufferBeginInfo::default();
+        let mut args = vn_command_vkBeginCommandBuffer { commandBuffer: cb, ..Default::default() };
+        args.pBeginInfo = Some(Decoded::planted(&begin_info));
+        h.vkBeginCommandBuffer(&mut args);
+        assert_eq!(h.take_rejected(), None);
+        assert_eq!(dispatch(&mut h), unbound, "a dispatch after a begin");
+        assert_eq!(draw(&mut h), unbound, "a draw after a begin");
+
+        assert_eq!(bind(&mut h, COMPUTE, mine), None);
+        h.vkResetCommandBuffer(&mut vn_command_vkResetCommandBuffer {
+            commandBuffer: cb,
+            ..Default::default()
+        });
+        assert_eq!(h.take_rejected(), None);
+        assert_eq!(dispatch(&mut h), unbound, "a dispatch after a buffer reset");
+
+        assert_eq!(bind(&mut h, COMPUTE, mine), None);
+        h.vkResetCommandPool(&mut vn_command_vkResetCommandPool {
+            device: VkDevice::forged(DEVICE),
+            commandPool: VkCommandPool::forged(POOL),
+            ..Default::default()
+        });
+        assert_eq!(h.take_rejected(), None);
+        assert_eq!(dispatch(&mut h), unbound, "a dispatch after a pool reset");
+
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                s.as_slice(),
+                ["bind", "dispatch", "bind", "draw", "bind", "bind"],
+                "every served command, and no refused one"
+            );
+        });
+
+        h.driver.abandon_planted();
+    }
+
     /// The ray-tracing handlers, where the driver's own test cannot see: a pipeline's record goes
     /// with the guest's destroy, a create naming a deferred operation is refused, and a trace
     /// hands the driver the guest's four tables in order -- or is refused without one.
@@ -17556,8 +17839,9 @@ mod tests {
     fn ray_tracing_pipelines_are_created_traced_and_forgotten_through_the_handlers() {
         use super::super::proto::types::{
             VkAllocationCallbacks, VkCommandBuffer, VkCommandPool, VkDeferredOperationKHR,
-            VkDevice, VkDeviceAddress, VkPipeline, VkPipelineCache,
+            VkDevice, VkDeviceAddress, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
             VkRayTracingPipelineCreateInfoKHR, VkStridedDeviceAddressRegionKHR,
+            vn_command_vkCmdBindPipeline,
         };
         use std::cell::RefCell;
 
@@ -17620,12 +17904,16 @@ mod tests {
                 &[at(raygen), at(miss), at(hit), at(callable), w.into(), h.into(), d.into()],
             );
         }
+        unsafe extern "C" fn bind(_cb: VkCommandBuffer, _at: VkPipelineBindPoint, p: VkPipeline) {
+            saw("bind", &[p.raw()]);
+        }
 
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkCreateRayTracingPipelinesKHR(create);
         fns.plant_vkDestroyPipeline(destroy);
         fns.plant_vkGetRayTracingShaderGroupHandlesKHR(handles);
         fns.plant_vkCmdTraceRaysKHR(trace);
+        fns.plant_vkCmdBindPipeline(bind);
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
@@ -17701,6 +17989,15 @@ mod tests {
             ..Default::default()
         };
         h.vkCmdTraceRaysKHR(&mut args);
+        assert_eq!(h.take_rejected(), Some(UNBOUND), "a trace before its pipeline is bound");
+        h.vkCmdBindPipeline(&mut vn_command_vkCmdBindPipeline {
+            commandBuffer: VkCommandBuffer::forged(CB.0),
+            pipelineBindPoint: VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+            pipeline: HOST,
+            ..Default::default()
+        });
+        assert!(h.rejected().is_none(), "a ray-tracing pipeline at its own point");
+        h.vkCmdTraceRaysKHR(&mut args);
         assert!(h.rejected().is_none());
 
         let mut args = vn_command_vkDestroyPipeline {
@@ -17710,9 +18007,10 @@ mod tests {
         };
         h.vkDestroyPipeline(&mut args);
         SAW.with_borrow(|s| {
-            let want: [(&str, Vec<u64>); 4] = [
+            let want: [(&str, Vec<u64>); 5] = [
                 ("create", vec![1]),
                 ("handles", vec![0, 0, 0]),
+                ("bind", vec![HOST.raw()]),
                 ("trace", vec![0x10, 0x20, 0x30, 0x40, 5, 6, 7]),
                 ("destroy", vec![HOST.raw()]),
             ];
@@ -17746,7 +18044,7 @@ mod tests {
         args.plant_handle_pPipelines(&mut shadow);
         h.vkCreateRayTracingPipelinesKHR(&mut args);
         assert!(h.take_rejected().is_some(), "a deferred create is refused");
-        SAW.with_borrow(|s| assert_eq!(s.len(), 4, "and none of the three reached the driver"));
+        SAW.with_borrow(|s| assert_eq!(s.len(), 5, "and none of the three reached the driver"));
 
         h.driver.abandon_planted();
     }
@@ -18219,6 +18517,8 @@ mod tests {
             VkCommandPool::forged(POOL),
             &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
+        driver.plant_bound(VkCommandBuffer::forged(CB.0), driver::BindPoint::Graphics);
+        driver.plant_bound(VkCommandBuffer::forged(CB.0), driver::BindPoint::Compute);
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -20267,6 +20567,7 @@ mod tests {
             VkCommandPool::forged(POOL),
             &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
+        driver.plant_bound(VkCommandBuffer::forged(CB.0), driver::BindPoint::Graphics);
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
