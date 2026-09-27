@@ -799,9 +799,20 @@ fn die(ring: &Ring, fatal: &AtomicBool, wait_ring: &WaitRing) {
 /// acquire and both can miss, leaving a ring asleep on work that is already there with nobody left
 /// to wake it. The C's `vkr_ring_load_tail_seqcst` carries the same reasoning, and records that the
 /// 2ms poll it replaced existed only to survive this race.
+///
+/// A doorbell already rung when the ring gets here is not stale, and the ring does not park on it.
+/// The guest does not ring again for one idle timeout after it rings, so that is how long the ring
+/// must stay up after the doorbell -- and a doorbell that found the ring awake arrived after the
+/// ring last worked, possibly well after: the guest's IDLE read can catch this function's own IDLE
+/// on a pass whose tail check then found the guest's write and never slept. Parking one idle
+/// timeout after the work would leave the guest reading IDLE inside its own window, forbidden to
+/// ring, with its next write unread. Returning here instead restarts the caller's idle clock now,
+/// which is after the doorbell and so after the guest started its window.
 fn park_if_quiet(ring: &Ring, park: &Park, started: &AtomicBool, cur: &mut u32) -> bool {
     let mut state = park.state.lock().expect("the park lock is never poisoned");
-    state.notified = false;
+    if std::mem::take(&mut state.notified) {
+        return !started.load(Ordering::Acquire);
+    }
     ring.set_status_bits(STATUS_IDLE);
 
     if *cur == ring.tail_seqcst() {
@@ -1006,6 +1017,43 @@ mod tests {
 
         until("the woken ring to dispatch", || !rec.batches.lock().unwrap().is_empty());
         assert_eq!(rec.batches.lock().unwrap().as_slice(), &[b"wake up".to_vec()]);
+        t.stop();
+    }
+
+    /// A doorbell that finds the ring awake still holds it up for a whole idle timeout.
+    ///
+    /// The guest rings only when it reads IDLE, and then not again for one idle timeout from the
+    /// moment it rang (mesa's `vn_ring_submit_internal`, `next_notify`). Its read can catch the IDLE
+    /// a ring sets on the way into a park it then does not take, because its tail check found the
+    /// very write the guest is about to ring for. So the ring runs that write, and its idle clock
+    /// starts, *before* the guest stamps the ring -- and a ring that shrugs the late doorbell off
+    /// parks one idle timeout after the write, while the guest is still inside its own. The next
+    /// write lands in that gap: the guest reads IDLE, is not allowed to ring, and waits on a ring
+    /// that is asleep with work in it. That is the seated `venus_replay` stall, read live off two
+    /// wedged guests: 68 bytes unread, status IDLE, the last doorbell rung as the wait began.
+    #[test]
+    fn a_doorbell_rung_while_awake_holds_the_ring_through_the_guests_throttle() {
+        const IDLE: Duration = Duration::from_millis(200);
+        let (map, r) = ring(IDLE);
+        let rec = Arc::new(Recorder::default());
+        let (t, _, _wr) = spawn_with(Arc::clone(&rec), r);
+
+        // The ring runs the first write; its idle clock starts here.
+        guest_writes(&map, 0, b"x");
+        until("the first write to run", || head(&map) == 1);
+        let ran = Instant::now();
+
+        // The guest's doorbell for that write, rung after the ring had already taken it.
+        std::thread::sleep(IDLE / 2);
+        t.notify();
+
+        // Past the ring's idle timeout counted from the write, and inside the guest's counted from
+        // the doorbell: the guest writes, and does not ring.
+        std::thread::sleep((ran + IDLE * 5 / 4).saturating_duration_since(Instant::now()));
+        guest_writes(&map, 1, b"y");
+
+        until("the second write to run with no doorbell of its own", || head(&map) == 2);
+        assert_eq!(rec.batches.lock().unwrap().as_slice(), &[b"x".to_vec(), b"y".to_vec()]);
         t.stop();
     }
 
