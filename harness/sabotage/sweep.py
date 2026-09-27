@@ -2765,6 +2765,9 @@ def main():
     started = time.monotonic()
     baseline = run(['cargo', 'test'])
     if baseline.returncode != 0:
+        # The run's own words, since a baseline that fails only sometimes is gone by the time
+        # anyone reruns it to ask why.
+        sys.stderr.write(baseline.stdout + baseline.stderr)
         sys.exit('the tests do not pass before any sabotage; fix that first')
     # Derived from the clean run rather than fixed, so a slow machine is not called a hang and a
     # fast one still catches a wedge quickly. The floor covers a rebuild after each edit.
