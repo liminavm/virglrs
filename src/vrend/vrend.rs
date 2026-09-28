@@ -1479,6 +1479,7 @@ mod tests {
     /// feature withdrawn, probed again against the same live driver.
     #[test]
     fn without_multisample_arrays_no_multisampling_is_advertised() {
+        let _display = crate::vrend::one_display_at_a_time();
         struct Discard;
         impl crate::fence::FenceSink for Discard {
             fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
