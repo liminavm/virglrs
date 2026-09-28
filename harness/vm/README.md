@@ -122,7 +122,9 @@ boots into the overview, which composites the session's windows as scaled thumbn
 shell's own UI. They are live and the compositor keeps presenting, so what this costs is not
 motion but framing: what gets captured, or scored, is the overview rather than the client at its
 own size. Escaping puts the focused window up, which is the shape the measurement is meant to be
-taken in.
+taken in. **Never tap Esc while a browser workload is running:** Esc is also Firefox's Stop, and a
+tap that lands during a page's navigation cancels it. `client-basemark.sh` leaves the overview once,
+before the suite starts, and only if the shell reports `OverviewActive`.
 
 ## A WebGL client asking for MSAA takes the VM down
 

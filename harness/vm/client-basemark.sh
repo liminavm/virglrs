@@ -128,6 +128,31 @@ case "$probe" in
     exit 1 ;;
 esac
 
+# Framing, not motion: see tap-keys.py. The session boots into the overview, which keeps presenting
+# but composites Firefox as a thumbnail inside the shell's UI rather than at its own size. Left ONCE,
+# here, while the only page is the static probe -- never while a suite runs. Esc is also Firefox's
+# Stop: tapped during the suite, it lands, often enough to matter, while the page is navigating from
+# one test to the next, Firefox cancels that navigation, and Basemark's engine (which only acts on a
+# 200 and never retries) leaves the tab on the finished test until the wait times out. That was the
+# run-2 "stall" at Shader Pipeline (limina spikes/basemark-stall/RESULTS.md). The shell says whether
+# the overview is up, so the tap is sent only when it is needed and the outcome is checked.
+overview() {
+  gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell \
+    --method org.freedesktop.DBus.Properties.Get org.gnome.Shell OverviewActive 2>/dev/null
+}
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+case "$(overview)" in
+  *false*) echo "overview: not active, nothing to leave" ;;
+  *true*)
+    sudo python3 /tmp/tap-keys.py esc || echo "WARNING: could not tap esc" >&2
+    sleep 2
+    case "$(overview)" in
+      *false*) echo "overview: left" ;;
+      *) echo "WARNING: the overview is still up; Firefox runs as a thumbnail" >&2 ;;
+    esac ;;
+  *) echo "WARNING: the shell did not say whether the overview is up; leaving it untouched" >&2 ;;
+esac
+
 # Configuring is per RUN, not per session. A session that has finished a run has consumed the
 # state `/run/` needs: handing it that URL again lands on `/`, the suite never starts, and the wait
 # below spends its whole 900 s on a browser sitting at the site's front page. Measured: run 2
@@ -164,11 +189,6 @@ suite() {
   echo "=== launching the suite in that same session (run $1)"
   firefox --profile "$PROFILE" "$URL_RUN" > /dev/null 2>&1
   sleep 12
-
-  # Framing, not motion: see tap-keys.py. The overview keeps presenting, but it composites the
-  # window as a thumbnail inside the shell's UI rather than showing it at its own size.
-  sudo python3 /tmp/tap-keys.py esc || echo "WARNING: could not tap esc" >&2
-  sleep 2
 
   # /run/ does not auto-start; it waits behind a Start button, and there is no URL parameter that
   # skips it. Clicked in the page rather than tapped through the focus order, because a
