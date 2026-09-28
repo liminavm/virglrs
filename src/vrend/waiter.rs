@@ -38,6 +38,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use super::debug;
 use super::egl::{self, ThreadDisplay};
 use super::gl::{Fence, FenceWait, Gl};
+use super::in_flight::Ticket;
 use super::video::pending::Landing;
 use crate::fence;
 use crate::ids::{ClientFenceId, ContextId, FenceId, RingIdx};
@@ -104,6 +105,9 @@ struct Job {
     /// How this fence is answered; see [`Answer`]. An `Ordered` job still travels the queue,
     /// because leaving it out would let it overtake a fence ahead of it that is still in flight.
     fence: Answer,
+    /// This fence's place in its context's in-flight count, given back as soon as the GPU has
+    /// passed it -- see [`super::in_flight`]. `None` for a fence no context is bounded by.
+    ticket: Option<Ticket>,
     retire: Retire,
 }
 
@@ -145,21 +149,34 @@ impl Waiter {
         &self,
         pictures: Vec<Arc<Landing>>,
         fence: Answer,
+        ticket: Option<Ticket>,
         ctx: ContextId,
         ring: RingIdx,
         id: FenceId,
     ) {
-        self.push(Job { pictures, fence, retire: Retire::Context(ctx, ring, id) });
+        self.push(Job { pictures, fence, ticket, retire: Retire::Context(ctx, ring, id) });
     }
 
     /// Queue a global-ring fence to retire once its work has run and its `pictures` have landed.
-    pub fn retire_global(&self, pictures: Vec<Arc<Landing>>, fence: Answer, id: ClientFenceId) {
-        self.push(Job { pictures, fence, retire: Retire::Global(id) });
+    pub fn retire_global(
+        &self,
+        pictures: Vec<Arc<Landing>>,
+        fence: Answer,
+        ticket: Option<Ticket>,
+        id: ClientFenceId,
+    ) {
+        self.push(Job { pictures, fence, ticket, retire: Retire::Global(id) });
     }
 
     /// Queue a present fence to retire once the work behind a flushed surface has run.
-    pub fn retire_present(&self, pictures: Vec<Arc<Landing>>, fence: Answer, id: FenceId) {
-        self.push(Job { pictures, fence, retire: Retire::Present(id) });
+    pub fn retire_present(
+        &self,
+        pictures: Vec<Arc<Landing>>,
+        fence: Answer,
+        ticket: Option<Ticket>,
+        id: FenceId,
+    ) {
+        self.push(Job { pictures, fence, ticket, retire: Retire::Present(id) });
     }
 
     fn push(&self, job: Job) {
@@ -231,6 +248,10 @@ fn run(
                 gl.fence_delete(fence);
             }
         }
+        // The GPU is past this fence's work, so it no longer counts against its context. Given
+        // back before the retirement, which goes through the VMM's locks: a batch waiting on the
+        // count must not also wait on those.
+        drop(job.ticket);
         if debug.enabled(debug::Switch::Fence) {
             eprintln!("[virglrs] fence: waiter done waiting, retiring");
         }
@@ -391,7 +412,7 @@ mod tests {
             black(&gl);
             queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
             gl.flush();
-            waiter.retire_global(Vec::new(), Answer::Ordered, ClientFenceId(1));
+            waiter.retire_global(Vec::new(), Answer::Ordered, None, ClientFenceId(1));
             assert_eq!(retired.recv().expect("the sink answers"), ClientFenceId(1));
             alone = first_pixel_blue(&surface);
             if alone != 0xff {
@@ -411,16 +432,21 @@ mod tests {
         black(&gl);
         queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
         let sync = gl.fence().expect("the driver gives a sync object");
+        // With a ticket, so the same run checks that the context's in-flight count is given back
+        // once the GPU is past the sync -- and not before: nothing retires ahead of this job.
+        let gate = crate::vrend::in_flight::Gate::default();
         waiter.retire_context(
             Vec::new(),
             Answer::Syncs(vec![sync]),
+            Some(gate.ticket()),
             ContextId::new(1).expect("a context id"),
             RingIdx(0),
             FenceId(2),
         );
-        waiter.retire_global(Vec::new(), Answer::Ordered, ClientFenceId(3));
+        waiter.retire_global(Vec::new(), Answer::Ordered, None, ClientFenceId(3));
         assert_eq!(retired.recv().expect("the sink answers"), ClientFenceId(3));
         let behind = first_pixel_blue(&surface);
+        assert_eq!(gate.queued(), 0, "the fence retired but still counts as in flight");
 
         eprintln!("[ordered] {passes} passes: alone={alone:#04x} behind={behind:#04x}");
         assert_eq!(
@@ -587,7 +613,7 @@ mod tests {
         );
 
         let landing = Landing::new();
-        waiter.retire_global(vec![Arc::clone(&landing)], Answer::Ordered, ClientFenceId(1));
+        waiter.retire_global(vec![Arc::clone(&landing)], Answer::Ordered, None, ClientFenceId(1));
         assert!(
             retired.recv_timeout(Duration::from_millis(100)).is_err(),
             "the fence retired while the picture it was taken over was still decoding"

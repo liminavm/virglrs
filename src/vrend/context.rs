@@ -1367,6 +1367,9 @@ pub struct Context {
     /// Owned rather than registered, so an id the guest describes and never claims dies with the
     /// context and no destroy path has to remember it exists.
     described: crate::Map<BlobId, Resource>,
+    /// Fences of this context the waiter holds, for bounding how far it may run ahead of the GPU.
+    /// See [`super::in_flight`].
+    in_flight: super::in_flight::Gate,
 }
 
 impl Context {
@@ -1380,9 +1383,15 @@ impl Context {
             replay: None,
             seq: Seq::default(),
             described: crate::Map::default(),
+            in_flight: super::in_flight::Gate::default(),
         };
         ctx.create_sub(host, SubContextId(0))?;
         Ok(ctx)
+    }
+
+    /// This context's fences in flight. See [`super::in_flight`].
+    pub fn in_flight(&self) -> &super::in_flight::Gate {
+        &self.in_flight
     }
 
     pub fn fault(&self) -> Option<&Fault> {
@@ -4973,6 +4982,7 @@ mod tests {
             replay: None,
             seq: Seq::default(),
             described: crate::Map::default(),
+            in_flight: super::super::in_flight::Gate::default(),
         }
     }
 

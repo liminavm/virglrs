@@ -136,6 +136,82 @@ pub struct Vrend {
     /// cost of the finish was measured in the first place. Retirement still goes through the
     /// waiter's queue, so the comparison changes what a fence costs and not what it means.
     fence_finish: bool,
+    /// How many fences one context may have in the waiter's queue before its next batch waits for
+    /// the oldest to retire; 0 for no bound. See [`super::in_flight`].
+    fence_depth: usize,
+    /// What the bound has cost since it last said so.
+    throttled: Throttled,
+}
+
+/// How many fences one context may have in flight before its next batch waits, unless
+/// `VIRGLRS_CLASSIC_FENCE_DEPTH` says otherwise. A guest asks for about one fence per execbuffer,
+/// and a desktop's contexts sit at a handful; this is well above that and well below the thousands
+/// of render passes an unbounded context was measured queueing.
+const FENCE_DEPTH_DEFAULT: usize = 16;
+
+/// How long a batch waits for its context to drop below the bound before running anyway. Long
+/// enough for any real frame to retire, short enough that a sync which never signals costs the
+/// other contexts a hiccup rather than the desktop.
+const FENCE_DEPTH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `VIRGLRS_CLASSIC_FENCE_DEPTH`: the bound, `0` for none. Anything that is not a number keeps
+/// the default and says so, rather than silently switching the bound off.
+fn fence_depth_from_env() -> usize {
+    match std::env::var("VIRGLRS_CLASSIC_FENCE_DEPTH") {
+        Err(_) => FENCE_DEPTH_DEFAULT,
+        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
+            eprintln!(
+                "[virglrs] VIRGLRS_CLASSIC_FENCE_DEPTH={v:?} is not a count; keeping {FENCE_DEPTH_DEFAULT}"
+            );
+            FENCE_DEPTH_DEFAULT
+        }),
+    }
+}
+
+/// How often the bound reports what it has cost, at most.
+const THROTTLE_REPORT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Batches the in-flight bound held back since the last report. Printed at most every
+/// [`THROTTLE_REPORT`], and only when it did something: a context that never reaches the bound
+/// never prints.
+#[derive(Default)]
+struct Throttled {
+    waits: u64,
+    waited: std::time::Duration,
+    gave_up: u64,
+    last_report: Option<std::time::Instant>,
+}
+
+impl Throttled {
+    fn note(&mut self, ctx: ContextId, waited: super::in_flight::Waited, depth: usize) {
+        use super::in_flight::Waited;
+        match waited {
+            Waited::No => return,
+            Waited::For(d) => {
+                self.waits += 1;
+                self.waited += d;
+            }
+            Waited::GaveUp(d) => {
+                self.waits += 1;
+                self.waited += d;
+                self.gave_up += 1;
+                eprintln!(
+                    "[virglrs] vrend: ctx {ctx:?} still had {depth} fences in flight after {d:?}; \
+                     running its batch anyway -- a sync that does not signal?"
+                );
+            }
+        }
+        let now = std::time::Instant::now();
+        if self.last_report.is_some_and(|t| now - t < THROTTLE_REPORT) {
+            return;
+        }
+        eprintln!(
+            "[virglrs] vrend: fence depth bound ({depth}) held {} batches for {:?} in all \
+             ({} gave up) since the last report; latest ctx {ctx:?}",
+            self.waits, self.waited, self.gave_up
+        );
+        *self = Throttled { last_report: Some(now), ..Throttled::default() };
+    }
 }
 
 /// The versions tried, newest first -- the GLES rows of the C's `gl_versions` ladder.
@@ -364,6 +440,8 @@ impl Vrend {
             traces,
             debug,
             fence_finish: std::env::var("VIRGLRS_FENCE_FINISH").as_deref() == Ok("1"),
+            fence_depth: fence_depth_from_env(),
+            throttled: Throttled::default(),
         })
     }
 
@@ -432,6 +510,8 @@ impl Vrend {
             traces,
             debug,
             fence_finish: _,
+            fence_depth: _,
+            throttled: _,
         } = self;
         let host = Host {
             batch: *batch,
@@ -588,6 +668,7 @@ impl Vrend {
         guest: &dyn Guest,
     ) -> Option<Result<(), Fault>> {
         let id = ctx.id();
+        self.hold_to_fence_depth(id);
         // One tick per batch, before anything in it runs. It is what says a guest has had no
         // opportunity to rewrite its pages since a copy of them was taken -- see
         // [`resource::GuestPixels`] -- so it must move exactly when that stops being true.
@@ -599,6 +680,36 @@ impl Vrend {
         let ran = contexts.get_mut(&id).map(|c| c.submit(&mut host, words));
         self.tally.batch_ended(began, words.len());
         ran
+    }
+
+    /// Wait, before running a batch for `id`, until that context has fewer than `fence_depth`
+    /// fences in the waiter's queue. See [`super::in_flight`].
+    ///
+    /// Only with a waiter: without one every fence is answered inline and nothing is ever queued.
+    fn hold_to_fence_depth(&mut self, id: ContextId) {
+        if self.fence_depth == 0 || self.waiter.is_none() {
+            return;
+        }
+        let Some(gate) = self.contexts.get(&id).map(|c| c.in_flight().clone()) else {
+            return;
+        };
+        let waited = gate.wait_below(self.fence_depth, FENCE_DEPTH_PATIENCE);
+        self.throttled.note(id, waited, self.fence_depth);
+    }
+
+    /// The in-flight ticket a fence taken for `on` carries through the waiter: one when the fence
+    /// is answered by syncs on a context we have, since only that is GPU work still to run.
+    fn in_flight_ticket(
+        &self,
+        on: Option<ContextId>,
+        answer: &Answer,
+    ) -> Option<super::in_flight::Ticket> {
+        match answer {
+            Answer::Syncs(_) => {
+                on.and_then(|id| self.contexts.get(&id)).map(|c| c.in_flight().ticket())
+            }
+            Answer::Ordered => None,
+        }
     }
 
     // ---- resources ----
@@ -945,8 +1056,9 @@ impl Vrend {
                 answer.name()
             );
         }
+        let ticket = self.in_flight_ticket(Some(ctx), &answer);
         let w = self.waiter.as_ref().expect("checked just above");
-        w.retire_context(pictures, answer, ctx, ring, id);
+        w.retire_context(pictures, answer, ticket, ctx, ring, id);
     }
 
     /// Answer a present fence for work a classic context queued: make it true that the GL work has
@@ -970,8 +1082,9 @@ impl Vrend {
         if self.debug.enabled(super::debug::Switch::Fence) {
             eprintln!("[virglrs] fence: present ctx={ctx:?} id={} answer={}", id.0, answer.name());
         }
+        let ticket = self.in_flight_ticket(Some(ctx), &answer);
         let w = self.waiter.as_ref().expect("checked just above");
-        w.retire_present(pictures, answer, id);
+        w.retire_present(pictures, answer, ticket, id);
     }
 
     /// Answer a fence on the legacy global ring, which names its context from outside.
@@ -992,8 +1105,9 @@ impl Vrend {
         if self.debug.enabled(super::debug::Switch::Fence) {
             eprintln!("[virglrs] fence: global id={} on={on:?} answer={}", id.0, answer.name());
         }
+        let ticket = self.in_flight_ticket(on, &answer);
         let w = self.waiter.as_ref().expect("checked just above");
-        w.retire_global(pictures, answer, id);
+        w.retire_global(pictures, answer, ticket, id);
     }
 
     /// [`crate::renderer::Renderer::settle_video`]: every decode thread idle, every picture
@@ -2719,5 +2833,79 @@ mod tests {
         assert!(landing.is_landed(), "the read returned before the picture landed");
         assert!(!v.unsettled.any(), "the read left the picture pending");
         lander.join().expect("the lander finishes");
+    }
+
+    /// A batch for a context at the fence-depth bound runs only once one of its fences has
+    /// retired -- and not before, however cheap the batch.
+    ///
+    /// The waiter is held on a picture that lands on another thread, so the context's one fence
+    /// stays in flight for a known time. Without the bound the batch runs at once and finds it
+    /// still queued; with it, the batch waits for the landing.
+    #[test]
+    fn a_batch_waits_while_its_context_is_at_the_fence_depth() {
+        use super::super::video::pending::{Landing, Outcome};
+
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        assert!(v.waiter.is_some(), "without a waiter nothing is ever in flight");
+        v.fence_depth = 1;
+
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &NoGuest).expect("a context");
+
+        // Ahead of the context's fence in the waiter's FIFO: nothing behind it retires until it
+        // lands.
+        let landing = Landing::new();
+        v.waiter.as_ref().expect("checked above").retire_global(
+            vec![Arc::clone(&landing)],
+            Answer::Ordered,
+            None,
+            ClientFenceId(1),
+        );
+        v.fence_context(ctx, RingIdx(0), FenceId(2));
+        let gate = v.contexts.get(&ctx.id()).expect("the context").in_flight().clone();
+        assert_eq!(gate.queued(), 1, "a fence answered by syncs counts as in flight");
+
+        let hold = std::time::Duration::from_millis(300);
+        let lander = {
+            let landing = Arc::clone(&landing);
+            std::thread::spawn(move || {
+                std::thread::sleep(hold);
+                landing.land(Outcome::Nothing);
+            })
+        };
+        let began = std::time::Instant::now();
+        // An empty batch: whatever it costs, it is not what is being timed.
+        v.submit(ctx, &[], &NoGuest)
+            .expect("the context takes the batch")
+            .expect("an empty batch runs");
+        let took = began.elapsed();
+        assert_eq!(gate.queued(), 0, "the batch ran while its context was at the bound");
+        assert!(
+            took >= hold / 2,
+            "the batch returned after {took:?}, before the fence could retire"
+        );
+
+        lander.join().expect("the lander finishes");
+        v.context_destroy(ctx, &NoGuest);
     }
 }

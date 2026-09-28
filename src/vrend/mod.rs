@@ -30,6 +30,7 @@ pub mod features;
 pub mod formats;
 #[allow(unsafe_code)]
 pub mod gl;
+pub mod in_flight;
 pub mod journal;
 pub mod pipe;
 pub mod proto;
