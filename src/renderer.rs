@@ -2099,6 +2099,31 @@ impl Renderer {
         }
     }
 
+    /// [`Self::resource_present_fence`] for a venus scanout, copying it as part of the fence.
+    ///
+    /// The copy goes on the rendering context's queue behind the frame's own work and ahead of
+    /// whatever the guest submits after it, so a guest that is not held off its scanout -- its
+    /// flushes carry no fence -- cannot draw its next frame into the bytes before they are read.
+    /// The fence retires once the copy is done, and the surface returned is what to show. See
+    /// [`crate::venus::present_copy`].
+    ///
+    /// `None` when there is no ordered copy to take: the resource is not a venus scanout
+    /// attached to one context, the context has other than one queue, or the copy ring is full.
+    /// Nothing has been fenced then, and the caller falls back to
+    /// [`Self::resource_present_fence`].
+    #[cfg(target_os = "macos")]
+    pub fn resource_present_copy(
+        &mut self,
+        handle: ResourceHandle,
+        fence: FenceId,
+    ) -> Option<crate::ids::SurfaceId> {
+        let attached = self.with_resource(handle, |r| r.attached.clone())?;
+        let [ctx] = attached[..] else { return None };
+        let Ok(Bound::Venus(vctx)) = self.bound(ctx) else { return None };
+        let src = self.resource_storage(handle)?;
+        self.venus.as_ref()?.present_copy(vctx, fence, src)
+    }
+
     /// Where a blob resource lives in this process, for a VMM about to publish it to the guest.
     ///
     /// The one question the mapping calls ask, in one answer: an address on its own is not enough

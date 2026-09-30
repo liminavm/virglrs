@@ -18,6 +18,8 @@ pub mod journal;
 pub mod ledger;
 pub mod monitor;
 pub mod objects;
+#[cfg(target_os = "macos")]
+pub mod present_copy;
 #[allow(unsafe_code)]
 pub mod proto;
 pub mod ring;

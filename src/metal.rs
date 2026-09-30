@@ -111,6 +111,11 @@ unsafe extern "C" {
     fn IOSurfaceGetBaseAddress(surface: CfTypeRef) -> *mut c_void;
     fn IOSurfaceGetAllocSize(surface: CfTypeRef) -> usize;
     fn IOSurfaceGetBytesPerRow(surface: CfTypeRef) -> usize;
+    fn IOSurfaceGetWidth(surface: CfTypeRef) -> usize;
+    fn IOSurfaceGetHeight(surface: CfTypeRef) -> usize;
+    fn IOSurfaceGetBytesPerElement(surface: CfTypeRef) -> usize;
+    fn IOSurfaceGetPixelFormat(surface: CfTypeRef) -> u32;
+    fn IOSurfaceIsInUse(surface: CfTypeRef) -> u8;
     fn IOSurfaceGetPlaneCount(surface: CfTypeRef) -> usize;
     fn IOSurfaceGetWidthOfPlane(surface: CfTypeRef, plane: usize) -> usize;
     fn IOSurfaceGetHeightOfPlane(surface: CfTypeRef, plane: usize) -> usize;
@@ -356,6 +361,33 @@ impl Surface {
         format: PixelFormat,
         bytes_per_row: u32,
     ) -> Result<Surface, SurfaceError> {
+        Self::linear(width, height, format.bytes_per_element(), bytes_per_row, format.fourcc())
+    }
+
+    /// Mint a surface laid out exactly like `like`: same size, pixel format and row pitch, so its
+    /// bytes can be copied from `like`'s as one block. What a presented frame is copied into.
+    pub fn scanout_like(like: &Surface) -> Result<Surface, SurfaceError> {
+        // SAFETY: we hold a reference to `like`; these read immutable creation-time properties.
+        let (bytes_per_element, fourcc) = unsafe {
+            (IOSurfaceGetBytesPerElement(like.as_ref()), IOSurfaceGetPixelFormat(like.as_ref()))
+        };
+        Self::linear(
+            like.width(),
+            like.height(),
+            u32::try_from(bytes_per_element).map_err(|_| SurfaceError::Refused)?,
+            like.bytes_per_row(),
+            fourcc,
+        )
+    }
+
+    /// One plane, `width` x `height`, rows `bytes_per_row` apart.
+    fn linear(
+        width: u32,
+        height: u32,
+        bytes_per_element: u32,
+        bytes_per_row: u32,
+        fourcc: u32,
+    ) -> Result<Surface, SurfaceError> {
         // A surface with no pixels has no storage, and IOSurface's own refusal of one arrives as
         // a null with no reason attached. Name it here instead.
         if width == 0 || height == 0 {
@@ -376,9 +408,9 @@ impl Surface {
             let numbers = [
                 Number::new(width),
                 Number::new(height),
-                Number::new(format.bytes_per_element()),
+                Number::new(bytes_per_element),
                 Number::new(bytes_per_row),
-                Number::new(format.fourcc()),
+                Number::new(fourcc),
             ];
             if numbers.iter().any(|n| n.0.is_null()) {
                 return Err(SurfaceError::Refused);
@@ -855,6 +887,25 @@ impl Surface {
         // SAFETY: as above. A row pitch is bounded by the surface's own allocation.
         let bytes = unsafe { IOSurfaceGetBytesPerRow(self.as_ref()) };
         u32::try_from(bytes).expect("an IOSurface row pitch does not exceed a u32")
+    }
+
+    pub fn width(&self) -> u32 {
+        // SAFETY: as above.
+        let w = unsafe { IOSurfaceGetWidth(self.as_ref()) };
+        u32::try_from(w).expect("an IOSurface width fits a u32")
+    }
+
+    pub fn height(&self) -> u32 {
+        // SAFETY: as above.
+        let h = unsafe { IOSurfaceGetHeight(self.as_ref()) };
+        u32::try_from(h).expect("an IOSurface height fits a u32")
+    }
+
+    /// Whether any process is using the surface: the window server holds a use count on one it is
+    /// compositing, so a surface in use may be on screen and must not be written.
+    pub fn in_use(&self) -> bool {
+        // SAFETY: as above.
+        unsafe { IOSurfaceIsInUse(self.as_ref()) != 0 }
     }
 
     /// How many bytes of storage it has, which is what bounds any read of it.

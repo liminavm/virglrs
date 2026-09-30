@@ -752,6 +752,8 @@ pub struct HostQueue {
     handle: VkQueue,
     /// The device that handed this queue out, for the per-device sweeps.
     device: VkDevice,
+    /// The queue family it belongs to, which a command pool for it must name.
+    family: u32,
     fns: Arc<LiveDevice>,
     vk: Mutex<()>,
     /// Fences to reuse, rather than one `vkCreateFence`/`vkDestroyFence` per guest fence. The
@@ -760,8 +762,8 @@ pub struct HostQueue {
 }
 
 impl HostQueue {
-    fn new(handle: VkQueue, device: VkDevice, fns: Arc<LiveDevice>) -> HostQueue {
-        HostQueue { handle, device, fns, vk: Mutex::new(()), spare: Mutex::new(Vec::new()) }
+    fn new(handle: VkQueue, device: VkDevice, family: u32, fns: Arc<LiveDevice>) -> HostQueue {
+        HostQueue { handle, device, family, fns, vk: Mutex::new(()), spare: Mutex::new(Vec::new()) }
     }
 
     /// The queue, held for one operation on it.
@@ -858,6 +860,16 @@ struct RingQueuesInner {
     /// fences that ring is still waiting out. Nothing observes a present's order against a guest
     /// fence -- the guest cannot see it at all -- so it needs a queue of its own and no more.
     present: Mutex<Option<PresentSync>>,
+    /// Where presented frames are copied to, handed out on the VMM's virtio-gpu thread. See
+    /// [`super::present_copy`].
+    #[cfg(target_os = "macos")]
+    copies: Mutex<super::present_copy::Ring>,
+    /// The Vulkan side of those copies, used on the present thread and dropped with the device.
+    #[cfg(target_os = "macos")]
+    copier: Mutex<Option<copier::Copier>>,
+    /// `LIMINA_TEST_PRESENT_COPY_DELAY_MS`, read with the other knob when the context was made.
+    #[cfg(target_os = "macos")]
+    copies_delay: Option<std::time::Duration>,
 }
 
 /// The thread that answers present fences, and the channel feeding it.
@@ -871,6 +883,9 @@ struct PresentSync {
 struct PresentJob {
     id: FenceId,
     waiters: Vec<BarrierWaiter>,
+    /// A copy of the scanout to take in phase two, in place of an empty fence on its queue.
+    #[cfg(target_os = "macos")]
+    copy: Option<super::present_copy::Job>,
 }
 
 impl Drop for PresentSync {
@@ -926,6 +941,8 @@ impl Drop for RingSync {
 
 impl RingQueues {
     pub fn new(ctx: ContextId, retire: crate::fence::Handle) -> RingQueues {
+        #[cfg(target_os = "macos")]
+        let knobs = super::present_copy::Knobs::from_env();
         RingQueues {
             inner: Arc::new(RingQueuesInner {
                 ctx,
@@ -933,6 +950,12 @@ impl RingQueues {
                 bound: Mutex::new(BTreeMap::new()),
                 ordered: AtomicU64::new(0),
                 present: Mutex::new(None),
+                #[cfg(target_os = "macos")]
+                copies: Mutex::new(super::present_copy::Ring::new(knobs)),
+                #[cfg(target_os = "macos")]
+                copier: Mutex::new(None),
+                #[cfg(target_os = "macos")]
+                copies_delay: knobs.delay,
             }),
         }
     }
@@ -944,6 +967,8 @@ impl RingQueues {
     /// caller retires the fence itself -- which is exactly what a test standing a driver up on
     /// its own wants, and is what every venus fence got before this existed.
     pub fn detached() -> RingQueues {
+        #[cfg(target_os = "macos")]
+        let knobs = super::present_copy::Knobs::default();
         RingQueues {
             inner: Arc::new(RingQueuesInner {
                 ctx: ContextId::new(1).expect("1 is not zero"),
@@ -951,6 +976,12 @@ impl RingQueues {
                 bound: Mutex::new(BTreeMap::new()),
                 ordered: AtomicU64::new(0),
                 present: Mutex::new(None),
+                #[cfg(target_os = "macos")]
+                copies: Mutex::new(super::present_copy::Ring::new(knobs)),
+                #[cfg(target_os = "macos")]
+                copier: Mutex::new(None),
+                #[cfg(target_os = "macos")]
+                copies_delay: knobs.delay,
             }),
         }
     }
@@ -995,8 +1026,19 @@ impl RingQueues {
     /// on a device being destroyed is undefined behaviour, and the fences it holds are the
     /// device's too.
     fn forget_device(&self, device: VkDevice) {
-        let mut bound = self.inner.bound.lock().expect("the ring-queue lock is never poisoned");
-        bound.retain(|_, s| s.queue.device != device);
+        {
+            let mut bound = self.inner.bound.lock().expect("the ring-queue lock is never poisoned");
+            bound.retain(|_, s| s.queue.device != device);
+        }
+        // After the rings, and without their lock held: the present thread holds this one across
+        // a copy's wait, and a copy in flight must finish before its objects go.
+        #[cfg(target_os = "macos")]
+        {
+            let mut copier = self.inner.copier.lock().expect("the copier lock is never poisoned");
+            if copier.as_ref().is_some_and(|c| c.queue().device == device) {
+                *copier = None;
+            }
+        }
     }
 
     /// Order a ring's fence behind the work the guest has submitted on that ring's queue.
@@ -1071,6 +1113,49 @@ impl RingQueues {
     /// its rings, so there is nothing to fence -- and the caller shows the frame the old way
     /// instead of waiting for a fence that would never come.
     pub fn present_fence(&self, waiters: Vec<BarrierWaiter>, id: FenceId) -> bool {
+        self.send_present(PresentJob {
+            id,
+            waiters,
+            #[cfg(target_os = "macos")]
+            copy: None,
+        })
+    }
+
+    /// [`Self::present_fence`], and copy the scanout `src` as part of it: the copy goes on the
+    /// context's queue behind the frame's work and ahead of what the guest submits after it. The
+    /// surface to present is returned, and the fence retires once the copy is done.
+    ///
+    /// `None` when the copy cannot be ordered -- the context has other than exactly one queue --
+    /// or has nowhere to land, and the caller fences the present without one.
+    #[cfg(target_os = "macos")]
+    pub fn present_copy(
+        &self,
+        waiters: Vec<BarrierWaiter>,
+        id: FenceId,
+        src: Storage,
+    ) -> Option<crate::ids::SurfaceId> {
+        if self.queues().len() != 1 {
+            return None;
+        }
+        let job =
+            self.inner.copies.lock().expect("the copy ring lock is never poisoned").job(src)?;
+        let target = job.target();
+        self.send_present(PresentJob { id, waiters, copy: Some(job) }).then_some(target)
+    }
+
+    /// Every distinct queue bound to one of this context's rings.
+    fn queues(&self) -> Vec<Arc<HostQueue>> {
+        let bound = self.inner.bound.lock().expect("the ring-queue lock is never poisoned");
+        let mut seen: Vec<Arc<HostQueue>> = Vec::new();
+        for s in bound.values() {
+            if !seen.iter().any(|q| q.handle.raw() == s.queue.handle.raw()) {
+                seen.push(Arc::clone(&s.queue));
+            }
+        }
+        seen
+    }
+
+    fn send_present(&self, job: PresentJob) -> bool {
         let Some(retire) = self.inner.retire.clone() else {
             return false;
         };
@@ -1097,7 +1182,7 @@ impl RingQueues {
         let Some(jobs) = sync.jobs.as_ref() else {
             return false;
         };
-        jobs.send(PresentJob { id, waiters }).is_ok()
+        jobs.send(job).is_ok()
     }
 }
 
@@ -1119,10 +1204,10 @@ fn present_thread(
     jobs: &std::sync::mpsc::Receiver<PresentJob>,
     going: &AtomicBool,
 ) {
-    while let Ok(job) = jobs.recv() {
+    while let Ok(mut job) = jobs.recv() {
         // Phase one. A poisoned context answers `false` and stops the wait; the present still
         // retires below, because a frame parked on a fence that never comes is a wedged scanout.
-        for w in job.waiters {
+        for w in std::mem::take(&mut job.waiters) {
             if !going.load(Ordering::Acquire) {
                 break;
             }
@@ -1130,16 +1215,19 @@ fn present_thread(
         }
         // Phase two. The set is snapshotted rather than held, so a queue bound or forgotten while
         // this runs does not keep the lock waiting on the GPU.
-        let queues: Vec<Arc<HostQueue>> = {
-            let bound = inner.bound.lock().expect("the ring-queue lock is never poisoned");
-            let mut seen = Vec::new();
-            for s in bound.values() {
-                if !seen.iter().any(|q: &Arc<HostQueue>| q.handle.raw() == s.queue.handle.raw()) {
-                    seen.push(Arc::clone(&s.queue));
-                }
+        let queues = RingQueues { inner: Arc::clone(inner) }.queues();
+        // A copy takes the place of the empty fence on the one queue it is ordered on.
+        #[cfg(target_os = "macos")]
+        if let Some(copy) = job.copy.take() {
+            if !(queues.len() == 1
+                && going.load(Ordering::Acquire)
+                && copy_on(inner, &queues[0], &copy, job.id, going))
+            {
+                super::present_copy::copy_on_cpu(&copy);
             }
-            seen
-        };
+            retire.retire_present(job.id);
+            continue;
+        }
         for queue in &queues {
             if !going.load(Ordering::Acquire) {
                 break;
@@ -1170,6 +1258,360 @@ fn present_thread(
         // until it retires, so losing one costs a scanout that never updates again.
         retire.retire_present(job.id);
     }
+}
+
+/// The Vulkan half of [`super::present_copy`]: a pool, one command buffer, and buffers over the
+/// copy ring's surfaces, on the one queue a context's copies are ordered on.
+#[cfg(target_os = "macos")]
+mod copier {
+    use super::super::present_copy::Job;
+    use super::super::proto::types::{
+        VkAccessFlags, VkBufferCreateFlags, VkBufferCreateInfo, VkBufferUsageFlags,
+        VkCommandBufferAllocateInfo, VkCommandBufferLevel, VkCommandBufferUsageFlags,
+        VkCommandPoolCreateFlags, VkCommandPoolCreateInfo, VkExternalMemoryBufferCreateInfo,
+        VkMemoryRequirements, VkSharingMode,
+    };
+    use super::*;
+    use crate::metal::Surface;
+    use std::collections::HashMap;
+
+    // Bits from vulkan_core.h.
+    const STAGE_TRANSFER: u32 = 0x1000;
+    const STAGE_ALL_COMMANDS: u32 = 0x1_0000;
+    const ACCESS_TRANSFER_READ: u32 = 0x800;
+    const ACCESS_TRANSFER_WRITE: u32 = 0x1000;
+    const ACCESS_MEMORY_READ: u32 = 0x8000;
+    const ACCESS_MEMORY_WRITE: u32 = 0x1_0000;
+    const USAGE_TRANSFER_SRC: u32 = 0x1;
+    const USAGE_TRANSFER_DST: u32 = 0x2;
+    const POOL_RESET_COMMAND_BUFFER: u32 = 0x2;
+    const BEGIN_ONE_TIME_SUBMIT: u32 = 0x1;
+
+    /// A buffer over a surface's bytes, on one device.
+    pub struct Import {
+        buffer: VkBuffer,
+        memory: VkDeviceMemory,
+    }
+
+    /// The Vulkan side of the copies for one queue: a pool, one command buffer, and the imports of
+    /// the ring's surfaces. Lives on the present thread's side, and goes before the device does.
+    pub struct Copier {
+        queue: Arc<HostQueue>,
+        pool: VkCommandPool,
+        cb: VkCommandBuffer,
+        /// Keyed by surface id. A slot's surface outlives its import only after the copier is gone.
+        dst: HashMap<u32, (Arc<Surface>, Import)>,
+    }
+
+    impl Copier {
+        pub fn new(queue: &Arc<HostQueue>) -> Option<Copier> {
+            let fns = &*queue.fns;
+            let info = VkCommandPoolCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                pNext: core::ptr::null(),
+                flags: VkCommandPoolCreateFlags(POOL_RESET_COMMAND_BUFFER),
+                queueFamilyIndex: queue.family,
+            };
+            let mut pool = VkCommandPool::NULL;
+            // SAFETY: a live device, a local info and a local out-handle.
+            let r = unsafe {
+                (fns.vkCreateCommandPool())(queue.device, &info, core::ptr::null(), &mut pool)
+            };
+            if r != VkResult::VK_SUCCESS || pool.is_null() {
+                eprintln!("[virglrs] present copy: no command pool ({r:?})");
+                return None;
+            }
+            let alloc = VkCommandBufferAllocateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                pNext: core::ptr::null(),
+                commandPool: pool,
+                level: VkCommandBufferLevel::VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                commandBufferCount: 1,
+            };
+            let mut cb = VkCommandBuffer::NULL;
+            // SAFETY: as above; one command buffer into one local.
+            let r = unsafe { (fns.vkAllocateCommandBuffers())(queue.device, &alloc, &mut cb) };
+            if r != VkResult::VK_SUCCESS || cb.is_null() {
+                eprintln!("[virglrs] present copy: no command buffer ({r:?})");
+                // SAFETY: the pool made above, on its own device.
+                unsafe { (fns.vkDestroyCommandPool())(queue.device, pool, core::ptr::null()) };
+                return None;
+            }
+            eprintln!(
+                "[virglrs] present copies are ordered on queue {:#x} (family {})",
+                queue.handle.raw(),
+                queue.family
+            );
+            Some(Copier { queue: Arc::clone(queue), pool, cb, dst: HashMap::new() })
+        }
+
+        /// The queue this records on.
+        pub fn queue(&self) -> &Arc<HostQueue> {
+            &self.queue
+        }
+
+        /// A transfer buffer over `surface`'s bytes, sharing its pages.
+        fn import(&self, surface: &Surface) -> Option<Import> {
+            let fns = &*self.queue.fns;
+            let device = self.queue.device;
+            let size = surface.alloc_size();
+            let addr = surface.as_host_allocation()?;
+            let host = VkExternalMemoryHandleTypeFlags(
+                VkExternalMemoryHandleTypeFlagBits::VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT
+                    .0 as u32,
+            );
+            let external = VkExternalMemoryBufferCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                pNext: core::ptr::null(),
+                handleTypes: host,
+            };
+            let info = VkBufferCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                pNext: (&raw const external).cast(),
+                flags: VkBufferCreateFlags(0),
+                size: VkDeviceSize(size),
+                usage: VkBufferUsageFlags(USAGE_TRANSFER_SRC | USAGE_TRANSFER_DST),
+                sharingMode: VkSharingMode::VK_SHARING_MODE_EXCLUSIVE,
+                queueFamilyIndexCount: 0,
+                pQueueFamilyIndices: core::ptr::null(),
+            };
+            let mut buffer = VkBuffer::NULL;
+            // SAFETY: a live device; the info and its chain are locals that outlive the call.
+            let r =
+                unsafe { (fns.vkCreateBuffer())(device, &info, core::ptr::null(), &mut buffer) };
+            if r != VkResult::VK_SUCCESS || buffer.is_null() {
+                eprintln!(
+                    "[virglrs] present copy: no buffer over surface {} ({r:?})",
+                    surface.id().0
+                );
+                return None;
+            }
+            let mut req = VkMemoryRequirements::default();
+            // SAFETY: the buffer just made, on its own device.
+            unsafe { (fns.vkGetBufferMemoryRequirements())(device, buffer, &mut req) };
+            let destroy_buffer = || {
+                // SAFETY: the buffer made above, never bound.
+                unsafe { (fns.vkDestroyBuffer())(device, buffer, core::ptr::null()) };
+            };
+            let Some(type_index) = (0..32).find(|i| req.memoryTypeBits & (1 << i) != 0) else {
+                destroy_buffer();
+                return None;
+            };
+            let pointer = VkImportMemoryHostPointerInfoEXT {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+                pNext: core::ptr::null(),
+                handleType:
+                    VkExternalMemoryHandleTypeFlagBits::VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                pHostPointer: addr as *mut core::ffi::c_void,
+            };
+            let alloc = VkMemoryAllocateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                pNext: (&raw const pointer).cast(),
+                allocationSize: VkDeviceSize(size),
+                memoryTypeIndex: type_index,
+            };
+            let mut memory = VkDeviceMemory::NULL;
+            // SAFETY: as above. The pages are the surface's, which the caller keeps alive for as
+            // long as this import stands.
+            let r =
+                unsafe { (fns.vkAllocateMemory())(device, &alloc, core::ptr::null(), &mut memory) };
+            if r != VkResult::VK_SUCCESS || memory.is_null() {
+                eprintln!(
+                    "[virglrs] present copy: surface {} would not import ({r:?})",
+                    surface.id().0
+                );
+                destroy_buffer();
+                return None;
+            }
+            // SAFETY: both made above, on this device, the memory sized for the buffer.
+            let r = unsafe { (fns.vkBindBufferMemory())(device, buffer, memory, VkDeviceSize(0)) };
+            if r != VkResult::VK_SUCCESS {
+                // SAFETY: as above.
+                unsafe { (fns.vkFreeMemory())(device, memory, core::ptr::null()) };
+                destroy_buffer();
+                return None;
+            }
+            Some(Import { buffer, memory })
+        }
+
+        fn release(&self, import: Import) {
+            let (fns, device) = (&*self.queue.fns, self.queue.device);
+            // SAFETY: made by `import` on this device, and no submit that uses it is outstanding --
+            // every caller releases after the copy's fence, or never submitted it.
+            unsafe {
+                (fns.vkDestroyBuffer())(device, import.buffer, core::ptr::null());
+                (fns.vkFreeMemory())(device, import.memory, core::ptr::null());
+            }
+        }
+
+        /// Record `job`'s copy and submit it with `fence`. `false` when nothing was submitted, and
+        /// the fence is still unsignalled and unused.
+        ///
+        /// The source import is made per copy and handed back through `used`, for the caller to
+        /// release once the fence has signalled: the guest may free its scanout at any time after,
+        /// and an import kept past that would alias pages the host has given back.
+        pub fn submit(
+            &mut self,
+            job: &Job,
+            fence: VkFence,
+            delay: Option<std::time::Duration>,
+            used: &mut Option<Import>,
+        ) -> bool {
+            let Ok(src) = job.src.surface() else { return false };
+            let dst_id = job.dst.id().0;
+            if !self.dst.contains_key(&dst_id) {
+                let Some(import) = self.import(&job.dst) else { return false };
+                self.dst.insert(dst_id, (Arc::clone(&job.dst), import));
+            }
+            let Some(from) = self.import(src) else { return false };
+            let to = self.dst[&dst_id].1.buffer;
+            let size = src.alloc_size().min(job.dst.alloc_size());
+            let region = VkBufferCopy {
+                srcOffset: VkDeviceSize(0),
+                dstOffset: VkDeviceSize(0),
+                size: VkDeviceSize(size),
+            };
+            let (fns, cb) = (&*self.queue.fns, self.cb);
+            let before = VkMemoryBarrier {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                pNext: core::ptr::null(),
+                srcAccessMask: VkAccessFlags(ACCESS_MEMORY_WRITE),
+                dstAccessMask: VkAccessFlags(ACCESS_TRANSFER_READ | ACCESS_TRANSFER_WRITE),
+            };
+            let after = VkMemoryBarrier {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                pNext: core::ptr::null(),
+                srcAccessMask: VkAccessFlags(ACCESS_TRANSFER_READ | ACCESS_TRANSFER_WRITE),
+                dstAccessMask: VkAccessFlags(ACCESS_MEMORY_READ | ACCESS_MEMORY_WRITE),
+            };
+            let begin = VkCommandBufferBeginInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                pNext: core::ptr::null(),
+                flags: VkCommandBufferUsageFlags(BEGIN_ONE_TIME_SUBMIT),
+                pInheritanceInfo: core::ptr::null(),
+            };
+            // SAFETY: the command buffer is this copier's own and not in flight -- the caller waits
+            // out each copy's fence before submitting the next -- and every pointer is a local.
+            let recorded = unsafe {
+                (fns.vkResetCommandBuffer())(cb, VkCommandBufferResetFlags(0))
+                    == VkResult::VK_SUCCESS
+                    && (fns.vkBeginCommandBuffer())(cb, &begin) == VkResult::VK_SUCCESS
+                    && {
+                        // The frame's own writes, whatever wrote them, before the copy reads.
+                        (fns.vkCmdPipelineBarrier())(
+                            cb,
+                            VkPipelineStageFlags(STAGE_ALL_COMMANDS),
+                            VkPipelineStageFlags(STAGE_TRANSFER),
+                            VkDependencyFlags(0),
+                            1,
+                            &before,
+                            0,
+                            core::ptr::null(),
+                            0,
+                            core::ptr::null(),
+                        );
+                        (fns.vkCmdCopyBuffer())(cb, from.buffer, to, 1, &region);
+                        // And the copy's reads before anything submitted after it writes.
+                        (fns.vkCmdPipelineBarrier())(
+                            cb,
+                            VkPipelineStageFlags(STAGE_TRANSFER),
+                            VkPipelineStageFlags(STAGE_ALL_COMMANDS),
+                            VkDependencyFlags(0),
+                            1,
+                            &after,
+                            0,
+                            core::ptr::null(),
+                            0,
+                            core::ptr::null(),
+                        );
+                        (fns.vkEndCommandBuffer())(cb) == VkResult::VK_SUCCESS
+                    }
+            };
+            if !recorded {
+                eprintln!("[virglrs] present copy: the command buffer would not record");
+                self.release(from);
+                return false;
+            }
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
+            let submit = VkSubmitInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                pNext: core::ptr::null(),
+                waitSemaphoreCount: 0,
+                pWaitSemaphores: core::ptr::null(),
+                pWaitDstStageMask: core::ptr::null(),
+                commandBufferCount: 1,
+                pCommandBuffers: &cb,
+                signalSemaphoreCount: 0,
+                pSignalSemaphores: core::ptr::null(),
+            };
+            let r = {
+                let _vk = self.queue.held();
+                // SAFETY: the queue's own lock is held; the command buffer was recorded above.
+                unsafe { (fns.vkQueueSubmit())(self.queue.handle, 1, &submit, fence) }
+            };
+            if r != VkResult::VK_SUCCESS {
+                eprintln!("[virglrs] present copy: the queue refused the copy ({r:?})");
+                self.release(from);
+                return false;
+            }
+            *used = Some(from);
+            true
+        }
+
+        /// Once a copy's fence has signalled: let go of its source import, and say what it copied.
+        pub fn finish(&self, job: &Job, used: Option<Import>) {
+            if let Some(import) = used {
+                self.release(import);
+            }
+            super::super::present_copy::trace(job);
+        }
+    }
+
+    impl Drop for Copier {
+        fn drop(&mut self) {
+            let (fns, device) = (&*self.queue.fns, self.queue.device);
+            for (_, (_, import)) in std::mem::take(&mut self.dst) {
+                self.release(import);
+            }
+            // SAFETY: the pool this copier made, with nothing of it in flight: every submit's fence
+            // was waited out before the next, and this runs after the last.
+            unsafe { (fns.vkDestroyCommandPool())(device, self.pool, core::ptr::null()) };
+        }
+    }
+}
+
+/// Take `copy` on `queue` and wait it out. `false` when it was not submitted, and nothing was
+/// copied.
+#[cfg(target_os = "macos")]
+fn copy_on(
+    inner: &Arc<RingQueuesInner>,
+    queue: &Arc<HostQueue>,
+    copy: &super::present_copy::Job,
+    id: FenceId,
+    going: &AtomicBool,
+) -> bool {
+    let mut copier = inner.copier.lock().expect("the copier lock is never poisoned");
+    if copier.as_ref().is_none_or(|c| c.queue().handle != queue.handle) {
+        *copier = copier::Copier::new(queue);
+    }
+    let Some(c) = copier.as_mut() else { return false };
+    let Some(fence) = queue.take_fence() else { return false };
+    let mut used = None;
+    if !c.submit(copy, fence, inner.copies_delay, &mut used) {
+        queue.put_fence(fence);
+        return false;
+    }
+    if wait_out(queue, "present copy", id, fence, going) {
+        queue.put_fence(fence);
+        c.finish(copy, used);
+    } else {
+        // Still outstanding when the thread was stopped: the import is left to the device's
+        // teardown rather than freed under a copy that may yet run.
+        let _outstanding = used;
+    }
+    true
 }
 
 /// Wait each of a ring's fences out, in the order they were submitted, and retire the guest's.
@@ -3176,11 +3618,9 @@ impl Driver {
         // the same handle each time, and the answer recorded here is the same both times -- so
         // the slot is kept rather than replaced, or the second ask would hand out a second lock
         // for one queue and the two would guard nothing.
-        let slot = Arc::clone(
-            self.queues
-                .entry(out)
-                .or_insert_with(|| Arc::new(HostQueue::new(out, device, Arc::clone(&d.fns)))),
-        );
+        let slot = Arc::clone(self.queues.entry(out).or_insert_with(|| {
+            Arc::new(HostQueue::new(out, device, info.get().queueFamilyIndex, Arc::clone(&d.fns)))
+        }));
         // `VkDeviceQueueTimelineInfoMESA` in the chain names the ring whose fences this queue
         // orders. Without it a ring has no queue to fence against and its fences retire as soon
         // as they are asked for, which is what left a compositor sampling a client's image
@@ -4113,7 +4553,7 @@ impl Driver {
     #[cfg(test)]
     pub(super) fn plant_queue(&mut self, device: VkDevice, queue: VkQueue) {
         let fns = Arc::clone(&self.devices.get(&device).expect("a planted device").fns);
-        self.queues.insert(queue, Arc::new(HostQueue::new(queue, device, fns)));
+        self.queues.insert(queue, Arc::new(HostQueue::new(queue, device, 0, fns)));
     }
 
     /// Create a pool, and start tracking what will be allocated from it.
