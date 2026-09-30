@@ -1038,6 +1038,12 @@ impl RingQueues {
             if copier.as_ref().is_some_and(|c| c.queue().device == device) {
                 *copier = None;
             }
+            // The slots' imports too, with the copier's lock still held so no copy makes one
+            // meanwhile. The slots and their surfaces stay; the next copy into one on another
+            // device imports it again.
+            let mut copies =
+                self.inner.copies.lock().expect("the copy ring lock is never poisoned");
+            copies.drop_imports(|i| i.on(device));
         }
     }
 
@@ -1132,14 +1138,19 @@ impl RingQueues {
         &self,
         waiters: Vec<BarrierWaiter>,
         id: FenceId,
+        scanout: crate::ids::ScanoutId,
         src: Storage,
     ) -> Result<crate::ids::SurfaceId, super::present_copy::CopyRefused> {
         use super::present_copy::CopyRefused;
         if self.queues().len() != 1 {
             return Err(CopyRefused::NotOrderable);
         }
-        let job =
-            self.inner.copies.lock().expect("the copy ring lock is never poisoned").job(src)?;
+        let job = self
+            .inner
+            .copies
+            .lock()
+            .expect("the copy ring lock is never poisoned")
+            .job(scanout, src)?;
         let target = job.target();
         if self.send_present(PresentJob { id, waiters, copy: Some(job) }) {
             Ok(target)
@@ -1265,10 +1276,10 @@ fn present_thread(
     }
 }
 
-/// The Vulkan half of [`super::present_copy`]: a pool, one command buffer, and buffers over the
-/// copy ring's surfaces, on the one queue a context's copies are ordered on.
+/// The Vulkan half of [`super::present_copy`]: a pool and one command buffer on the one queue a
+/// context's copies are ordered on, and the buffers over the surfaces it copies between.
 #[cfg(target_os = "macos")]
-mod copier {
+pub(super) mod copier {
     use super::super::present_copy::Job;
     use super::super::proto::types::{
         VkAccessFlags, VkBufferCreateFlags, VkBufferCreateInfo, VkBufferUsageFlags,
@@ -1278,7 +1289,6 @@ mod copier {
     };
     use super::*;
     use crate::metal::Surface;
-    use std::collections::HashMap;
 
     // Bits from vulkan_core.h.
     const STAGE_TRANSFER: u32 = 0x1000;
@@ -1292,20 +1302,44 @@ mod copier {
     const POOL_RESET_COMMAND_BUFFER: u32 = 0x2;
     const BEGIN_ONE_TIME_SUBMIT: u32 = 0x1;
 
-    /// A buffer over a surface's bytes, on one device.
+    /// A buffer over a surface's bytes, on one device, destroyed when dropped.
+    ///
+    /// Whoever holds one also holds the surface, and drops this first: a copy-ring slot keeps
+    /// its own beside its surface, and a copy's source import is dropped once its fence has
+    /// signalled, while the job still holds the guest's scanout.
     pub struct Import {
+        fns: Arc<LiveDevice>,
+        device: VkDevice,
         buffer: VkBuffer,
         memory: VkDeviceMemory,
     }
 
-    /// The Vulkan side of the copies for one queue: a pool, one command buffer, and the imports of
-    /// the ring's surfaces. Lives on the present thread's side, and goes before the device does.
+    impl Import {
+        /// Whether this was made on `device`.
+        pub fn on(&self, device: VkDevice) -> bool {
+            self.device == device
+        }
+    }
+
+    impl Drop for Import {
+        fn drop(&mut self) {
+            // SAFETY: made by `Copier::import` on this device, which is still alive --
+            // `RingQueues::forget_device` drops every import of a device before it goes -- and no
+            // submit that uses it is outstanding: a copy's imports are dropped after its fence,
+            // and one still in flight when its thread was stopped is forgotten, not dropped.
+            unsafe {
+                (self.fns.vkDestroyBuffer())(self.device, self.buffer, core::ptr::null());
+                (self.fns.vkFreeMemory())(self.device, self.memory, core::ptr::null());
+            }
+        }
+    }
+
+    /// The Vulkan side of the copies for one queue: a pool and one command buffer. Lives on the
+    /// present thread's side, and goes before the device does.
     pub struct Copier {
         queue: Arc<HostQueue>,
         pool: VkCommandPool,
         cb: VkCommandBuffer,
-        /// Keyed by surface id. A slot's surface outlives its import only after the copier is gone.
-        dst: HashMap<u32, (Arc<Surface>, Import)>,
     }
 
     impl Copier {
@@ -1347,7 +1381,7 @@ mod copier {
                 queue.handle.raw(),
                 queue.family
             );
-            Some(Copier { queue: Arc::clone(queue), pool, cb, dst: HashMap::new() })
+            Some(Copier { queue: Arc::clone(queue), pool, cb })
         }
 
         /// The queue this records on.
@@ -1436,25 +1470,16 @@ mod copier {
                 destroy_buffer();
                 return None;
             }
-            Some(Import { buffer, memory })
-        }
-
-        fn release(&self, import: Import) {
-            let (fns, device) = (&*self.queue.fns, self.queue.device);
-            // SAFETY: made by `import` on this device, and no submit that uses it is outstanding --
-            // every caller releases after the copy's fence, or never submitted it.
-            unsafe {
-                (fns.vkDestroyBuffer())(device, import.buffer, core::ptr::null());
-                (fns.vkFreeMemory())(device, import.memory, core::ptr::null());
-            }
+            Some(Import { fns: Arc::clone(&self.queue.fns), device, buffer, memory })
         }
 
         /// Record `job`'s copy and submit it with `fence`. `false` when nothing was submitted, and
         /// the fence is still unsignalled and unused.
         ///
-        /// The source import is made per copy and handed back through `used`, for the caller to
-        /// release once the fence has signalled: the guest may free its scanout at any time after,
-        /// and an import kept past that would alias pages the host has given back.
+        /// The destination's import is the slot's own, made on the first copy into it. The source
+        /// import is made per copy and handed back through `used`, for the caller to drop once
+        /// the fence has signalled: the guest may free its scanout at any time after, and an
+        /// import kept past that would alias pages the host has given back.
         pub fn submit(
             &mut self,
             job: &Job,
@@ -1463,14 +1488,20 @@ mod copier {
             used: &mut Option<Import>,
         ) -> bool {
             let Ok(src) = job.src.surface() else { return false };
-            let dst_id = job.dst.id().0;
-            if !self.dst.contains_key(&dst_id) {
-                let Some(import) = self.import(&job.dst) else { return false };
-                self.dst.insert(dst_id, (Arc::clone(&job.dst), import));
-            }
+            let dst = &job.dst.surface;
+            let to = {
+                let mut import = job.dst.import.lock().expect("an import lock is never poisoned");
+                // One made on a device since forgotten is gone already; one on another live
+                // device is replaced, since this copier's queue cannot use it.
+                if import.as_ref().is_none_or(|i| !i.on(self.queue.device)) {
+                    *import = None;
+                    *import = self.import(dst);
+                }
+                let Some(to) = import.as_ref() else { return false };
+                to.buffer
+            };
             let Some(from) = self.import(src) else { return false };
-            let to = self.dst[&dst_id].1.buffer;
-            let size = src.alloc_size().min(job.dst.alloc_size());
+            let size = src.alloc_size().min(dst.alloc_size());
             let region = VkBufferCopy {
                 srcOffset: VkDeviceSize(0),
                 dstOffset: VkDeviceSize(0),
@@ -1534,7 +1565,6 @@ mod copier {
             };
             if !recorded {
                 eprintln!("[virglrs] present copy: the command buffer would not record");
-                self.release(from);
                 return false;
             }
             if let Some(delay) = delay {
@@ -1558,7 +1588,6 @@ mod copier {
             };
             if r != VkResult::VK_SUCCESS {
                 eprintln!("[virglrs] present copy: the queue refused the copy ({r:?})");
-                self.release(from);
                 return false;
             }
             *used = Some(from);
@@ -1567,9 +1596,7 @@ mod copier {
 
         /// Once a copy's fence has signalled: let go of its source import, and say what it copied.
         pub fn finish(&self, job: &Job, used: Option<Import>) {
-            if let Some(import) = used {
-                self.release(import);
-            }
+            drop(used);
             super::super::present_copy::trace(job);
         }
     }
@@ -1577,9 +1604,6 @@ mod copier {
     impl Drop for Copier {
         fn drop(&mut self) {
             let (fns, device) = (&*self.queue.fns, self.queue.device);
-            for (_, (_, import)) in std::mem::take(&mut self.dst) {
-                self.release(import);
-            }
             // SAFETY: the pool this copier made, with nothing of it in flight: every submit's fence
             // was waited out before the next, and this runs after the last.
             unsafe { (fns.vkDestroyCommandPool())(device, self.pool, core::ptr::null()) };
@@ -1614,7 +1638,7 @@ fn copy_on(
     } else {
         // Still outstanding when the thread was stopped: the import is left to the device's
         // teardown rather than freed under a copy that may yet run.
-        let _outstanding = used;
+        std::mem::forget(used);
     }
     true
 }

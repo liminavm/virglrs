@@ -2104,17 +2104,18 @@ impl Renderer {
     /// The copy goes on the rendering context's queue behind the frame's own work and ahead of
     /// whatever the guest submits after it, so a guest that is not held off its scanout -- its
     /// flushes carry no fence -- cannot draw its next frame into the bytes before they are read.
-    /// The fence retires once the copy is done, and the surface returned is what to show. See
-    /// [`crate::venus::present_copy`].
+    /// The fence retires once the copy is done, and the surface returned is what to show. The
+    /// copy lands in `scanout`'s own ring of surfaces. See [`crate::venus::present_copy`].
     ///
     /// Refused -- nothing fenced -- when there is no ordered copy to take: `Busy` when every
-    /// surface of the copy ring is still pending or on glass, which passes, and `NotOrderable`
+    /// surface of that scanout's ring is still pending or on glass, which passes, and `NotOrderable`
     /// when the resource is not a venus scanout attached to one context or its context has other
     /// than one queue, where the caller should fall back to [`Self::resource_present_fence`].
     #[cfg(target_os = "macos")]
     pub fn resource_present_copy(
         &mut self,
         handle: ResourceHandle,
+        scanout: crate::ids::ScanoutId,
         fence: FenceId,
     ) -> Result<crate::ids::SurfaceId, crate::venus::present_copy::CopyRefused> {
         use crate::venus::present_copy::CopyRefused;
@@ -2125,7 +2126,10 @@ impl Renderer {
             return Err(CopyRefused::NotOrderable);
         };
         let src = self.resource_storage(handle).ok_or(CopyRefused::NotOrderable)?;
-        self.venus.as_ref().ok_or(CopyRefused::NotOrderable)?.present_copy(vctx, fence, src)
+        self.venus
+            .as_ref()
+            .ok_or(CopyRefused::NotOrderable)?
+            .present_copy(vctx, fence, scanout, src)
     }
 
     /// Where a blob resource lives in this process, for a VMM about to publish it to the guest.

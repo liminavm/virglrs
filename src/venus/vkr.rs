@@ -338,7 +338,8 @@ impl Vkr {
         slot.fences().present_fence(waiters, fence)
     }
 
-    /// [`Self::present_fence`], copying the scanout `src` on the context's queue as part of it.
+    /// [`Self::present_fence`], copying `src`, presented on `scanout`, on the context's queue as
+    /// part of it.
     /// The surface to present instead of the scanout, or why this context cannot take the copy;
     /// nothing has been fenced then.
     #[cfg(target_os = "macos")]
@@ -346,6 +347,7 @@ impl Vkr {
         &self,
         ctx: VenusCtx,
         fence: FenceId,
+        scanout: crate::ids::ScanoutId,
         src: crate::venus::driver::Storage,
     ) -> Result<crate::ids::SurfaceId, super::present_copy::CopyRefused> {
         let slot =
@@ -354,7 +356,7 @@ impl Vkr {
             let c = slot.lock().expect("a context lock is never poisoned");
             c.decode_barrier()
         };
-        slot.fences().present_copy(waiters, fence, src)
+        slot.fences().present_copy(waiters, fence, scanout, src)
     }
 
     /// Tear a context down. Every host handle it still holds dies with it -- a guest that leaks is

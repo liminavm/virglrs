@@ -86,6 +86,11 @@ id!(
     SurfaceId(u32)
 );
 id!(
+    /// A display output, numbered as the VMM numbers its scanouts. Carried so that state kept
+    /// per output -- the surfaces a present is copied into -- stays per output.
+    ScanoutId(u32)
+);
+id!(
     /// Identifies the host-side object a blob resource exports. Meaningful only to the renderer
     /// that minted it.
     BlobId(u64)
