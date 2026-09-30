@@ -1125,22 +1125,27 @@ impl RingQueues {
     /// context's queue behind the frame's work and ahead of what the guest submits after it. The
     /// surface to present is returned, and the fence retires once the copy is done.
     ///
-    /// `None` when the copy cannot be ordered -- the context has other than exactly one queue --
-    /// or has nowhere to land, and the caller fences the present without one.
+    /// Refused when the copy cannot be ordered -- the context has other than exactly one queue --
+    /// or has nowhere to land; nothing has been fenced then.
     #[cfg(target_os = "macos")]
     pub fn present_copy(
         &self,
         waiters: Vec<BarrierWaiter>,
         id: FenceId,
         src: Storage,
-    ) -> Option<crate::ids::SurfaceId> {
+    ) -> Result<crate::ids::SurfaceId, super::present_copy::CopyRefused> {
+        use super::present_copy::CopyRefused;
         if self.queues().len() != 1 {
-            return None;
+            return Err(CopyRefused::NotOrderable);
         }
         let job =
             self.inner.copies.lock().expect("the copy ring lock is never poisoned").job(src)?;
         let target = job.target();
-        self.send_present(PresentJob { id, waiters, copy: Some(job) }).then_some(target)
+        if self.send_present(PresentJob { id, waiters, copy: Some(job) }) {
+            Ok(target)
+        } else {
+            Err(CopyRefused::NotOrderable)
+        }
     }
 
     /// Every distinct queue bound to one of this context's rings.

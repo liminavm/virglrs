@@ -2107,21 +2107,25 @@ impl Renderer {
     /// The fence retires once the copy is done, and the surface returned is what to show. See
     /// [`crate::venus::present_copy`].
     ///
-    /// `None` when there is no ordered copy to take: the resource is not a venus scanout
-    /// attached to one context, the context has other than one queue, or the copy ring is full.
-    /// Nothing has been fenced then, and the caller falls back to
-    /// [`Self::resource_present_fence`].
+    /// Refused -- nothing fenced -- when there is no ordered copy to take: `Busy` when every
+    /// surface of the copy ring is still pending or on glass, which passes, and `NotOrderable`
+    /// when the resource is not a venus scanout attached to one context or its context has other
+    /// than one queue, where the caller should fall back to [`Self::resource_present_fence`].
     #[cfg(target_os = "macos")]
     pub fn resource_present_copy(
         &mut self,
         handle: ResourceHandle,
         fence: FenceId,
-    ) -> Option<crate::ids::SurfaceId> {
-        let attached = self.with_resource(handle, |r| r.attached.clone())?;
-        let [ctx] = attached[..] else { return None };
-        let Ok(Bound::Venus(vctx)) = self.bound(ctx) else { return None };
-        let src = self.resource_storage(handle)?;
-        self.venus.as_ref()?.present_copy(vctx, fence, src)
+    ) -> Result<crate::ids::SurfaceId, crate::venus::present_copy::CopyRefused> {
+        use crate::venus::present_copy::CopyRefused;
+        let attached =
+            self.with_resource(handle, |r| r.attached.clone()).ok_or(CopyRefused::NotOrderable)?;
+        let [ctx] = attached[..] else { return Err(CopyRefused::NotOrderable) };
+        let Ok(Bound::Venus(vctx)) = self.bound(ctx) else {
+            return Err(CopyRefused::NotOrderable);
+        };
+        let src = self.resource_storage(handle).ok_or(CopyRefused::NotOrderable)?;
+        self.venus.as_ref().ok_or(CopyRefused::NotOrderable)?.present_copy(vctx, fence, src)
     }
 
     /// Where a blob resource lives in this process, for a VMM about to publish it to the guest.

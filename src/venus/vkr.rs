@@ -339,16 +339,17 @@ impl Vkr {
     }
 
     /// [`Self::present_fence`], copying the scanout `src` on the context's queue as part of it.
-    /// The surface to present instead of the scanout, or `None` when this context cannot take
-    /// an ordered copy and the caller should fence the present without one.
+    /// The surface to present instead of the scanout, or why this context cannot take the copy;
+    /// nothing has been fenced then.
     #[cfg(target_os = "macos")]
     pub fn present_copy(
         &self,
         ctx: VenusCtx,
         fence: FenceId,
         src: crate::venus::driver::Storage,
-    ) -> Option<crate::ids::SurfaceId> {
-        let slot = self.contexts.get(&ctx.id())?;
+    ) -> Result<crate::ids::SurfaceId, super::present_copy::CopyRefused> {
+        let slot =
+            self.contexts.get(&ctx.id()).ok_or(super::present_copy::CopyRefused::NotOrderable)?;
         let waiters = {
             let c = slot.lock().expect("a context lock is never poisoned");
             c.decode_barrier()

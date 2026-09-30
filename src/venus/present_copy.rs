@@ -62,6 +62,16 @@ impl Knobs {
     }
 }
 
+/// Why a present got no copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CopyRefused {
+    /// Every slot is still pending or on glass. Passing: the host is behind, and the frame is
+    /// better dropped than shown some other way.
+    Busy,
+    /// No copy can be ordered here at all: not a surface, not one queue, or nowhere to mint.
+    NotOrderable,
+}
+
 /// A surface's first pixel, as its four bytes in memory order.
 fn first_pixel(surface: &Surface) -> u32 {
     let mut px = [0u8; 4];
@@ -84,6 +94,9 @@ pub struct Job {
     pending: Arc<AtomicBool>,
     /// The scanout's first pixel as the flush arrived, when tracing.
     arrived: Option<u32>,
+    /// How many of the ring's slots were in use by some process when this one was picked, for
+    /// the trace: the window server holds one it is compositing, and this is how to see it does.
+    in_use: usize,
 }
 
 impl Job {
@@ -114,10 +127,9 @@ impl Ring {
         Ring { knobs, ..Ring::default() }
     }
 
-    /// A job copying `src` into a free slot, or `None` when there is none to give -- every slot
-    /// still busy -- or the scanout has no surface to copy.
-    pub fn job(&mut self, src: Storage) -> Option<Job> {
-        let from = src.surface().ok()?;
+    /// A job copying `src` into a free slot, or why there is none.
+    pub fn job(&mut self, src: Storage) -> Result<Job, CopyRefused> {
+        let from = src.surface().map_err(|_| CopyRefused::NotOrderable)?;
         let shape = (from.width(), from.height(), from.bytes_per_row());
         // A mode change leaves slots of the old shape; drop the ones nothing is using.
         self.slots.retain(|s| {
@@ -135,7 +147,7 @@ impl Ring {
             None if self.slots.len() < MAX_SLOTS => {
                 let surface = match Surface::scanout_like(from) {
                     Ok(s) if s.bytes_per_row() == shape.2 => s,
-                    Ok(_) | Err(_) => return None,
+                    Ok(_) | Err(_) => return Err(CopyRefused::NotOrderable),
                 };
                 self.slots.push(Slot {
                     surface: Arc::new(surface),
@@ -143,7 +155,7 @@ impl Ring {
                 });
                 self.slots.len() - 1
             }
-            None => return None,
+            None => return Err(CopyRefused::Busy),
         };
         let slot = &self.slots[at];
         slot.pending.store(true, Ordering::Release);
@@ -153,11 +165,17 @@ impl Ring {
             self.recent.remove(0);
         }
         let arrived = self.knobs.trace.then(|| first_pixel(from));
-        Some(Job {
-            dst: Arc::clone(&slot.surface),
-            pending: Arc::clone(&slot.pending),
+        let in_use = if self.knobs.trace {
+            self.slots.iter().filter(|s| s.surface.in_use()).count()
+        } else {
+            0
+        };
+        Ok(Job {
+            dst: Arc::clone(&self.slots[at].surface),
+            pending: Arc::clone(&self.slots[at].pending),
             src,
             arrived,
+            in_use,
         })
     }
 }
@@ -166,9 +184,11 @@ impl Ring {
 pub fn trace(job: &Job) {
     if let Some(arrived) = job.arrived {
         eprintln!(
-            "[virglrs] copy trace: frame {} arrived bgra={arrived:08x} shown bgra={:08x}",
+            "[virglrs] copy trace: frame {} arrived bgra={arrived:08x} shown bgra={:08x} \
+             in_use={}",
             job.dst.id().0,
-            first_pixel(&job.dst)
+            first_pixel(&job.dst),
+            job.in_use
         );
     }
 }
