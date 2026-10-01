@@ -47,8 +47,8 @@ generated = "harness/replay/make-sampled-corpus.py"
 
 [[corpus]]
 name = "sampler.bin"
-sha256 = "41a7fad521d677be66be9c9e6b6cfcbed4fac10fb94e815c74f29cb2bbdcc8a6"
-size = 19152
+sha256 = "ed76f52d25a9083616f644141f4ad525411dbf521b912c101e197f1725d8e2a9"
+size = 19536
 generated = "harness/replay/make-sampler-corpus.py"
 
 [[corpus]]

@@ -99,7 +99,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 - `make-teardown-corpus.py` — writes a synthetic classic corpus that destroys a program and a
   sub-context while the renderer still holds them (see `fixtures/teardown.score` below).
 - `make-sampler-corpus.py` — writes a synthetic classic corpus that changes only the sampler
-  state between two draws through one view (see `fixtures/sampler.score` below).
+  state between draws through one view, by a bind and then by a destroy (see
+  `fixtures/sampler.score` below).
   `--no-destroy` writes the arming control.
 - `make-flatshade-corpus.py` — writes a synthetic classic corpus that changes only the
   rasterizer between two draws into one target (see `fixtures/flatshade.score` below).
@@ -708,8 +709,13 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `vm/captures/sampler.bin`: one view, one program, one vertex buffer, and two draws between which
   the stream carries only the second destination's framebuffer and a `BIND_SAMPLER_STATES` from
   clamp-to-edge to repeat, with texture coordinates running to 2.0 so the wrap mode decides three
-  quarters of the pixels. The three lines are the source, as the control that the pattern landed,
-  and the two destinations, which must differ from each other. The corpus is deliberately narrow:
+  quarters of the pixels. A third draw scores a destroy the same way: the second bind puts clamp
+  at slot 1 beside repeat at slot 0, and destroying the repeat state moves clamp down, as
+  `vrend_destroy_sampler_state_object` does, with no bind in the stream. The four lines are the
+  source, as the control that the pattern landed, and the three destinations: the first two must
+  differ, and the third must hash like the first. A renderer that fails to mark the moved slot, or
+  to move into it, samples with the texture's own wrap, GL's default repeat, and its third read
+  hashes like the second. The pin is the same on KK and iris. The corpus is deliberately narrow:
   anything else between the draws would re-bind the unit on its own and the fixture would be
   measuring that instead.
 

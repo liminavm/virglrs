@@ -20,12 +20,20 @@
 # So the stream between the draws carries only what the second destination needs -- its
 # framebuffer -- and the sampler bind. A second view bind, a shader bind or a fresh vertex buffer
 # would dirty the unit on its own, and the corpus would then measure that instead.
+#
+# A third draw does the same for a destroy. The second bind puts repeat at slot 0 and clamp at
+# slot 1; destroying the repeat state then closes the gap, as `vrend_destroy_sampler_state_object`
+# does, moving clamp down to slot 0 -- a different sampler for the unit, under the same view, with
+# no bind in the stream. The C marks every slot that moved, so the third read is a clamped one and
+# hashes like the first. A renderer that does not mark, or that empties the slot instead of moving
+# clamp into it, leaves the unit on no sampler object, so it samples with the texture's own wrap,
+# GL's default repeat: measured on both sabotages, the third read hashes like the second.
 import struct, sys, zlib
 
 from corpus import (Corpus, BIND_RENDER_TARGET, BIND_SAMPLER_VIEW, BIND_VERTEX_BUFFER,
                     B8G8R8A8_UNORM, R32G32B32A32_FLOAT,
-                    OBJ_BLEND, OBJ_DSA, OBJ_RASTERIZER, OBJ_SAMPLER_VIEW, OBJ_SURFACE,
-                    OBJ_VERTEX_ELEMENTS,
+                    OBJ_BLEND, OBJ_DSA, OBJ_RASTERIZER, OBJ_SAMPLER_STATE, OBJ_SAMPLER_VIEW,
+                    OBJ_SURFACE, OBJ_VERTEX_ELEMENTS,
                     STAGE_VERTEX, STAGE_FRAGMENT, TARGET_2D)
 
 SIDE = 64
@@ -75,19 +83,21 @@ def build():
     SRC = 30
     READ_CLAMP, READ_REPEAT = 31, 32
     VBO = 33
+    READ_COMPACTED = 34
 
     # Handle numbering is by kind so a refused object names itself in a log.
     VS_H, FS_H = 100, 101
     RAST_H, BLEND_H, DSA_H, VE_H = 110, 111, 112, 113
     SAMP_CLAMP_H, SAMP_REPEAT_H = 114, 115
     VIEW_H = 200
-    SURF_CLAMP_H, SURF_REPEAT_H = 201, 202
+    SURF_CLAMP_H, SURF_REPEAT_H, SURF_COMPACTED_H = 201, 202, 203
 
     c.submit()
     c.create(SRC, B8G8R8A8_UNORM, tex, SIDE)
     c.create(READ_CLAMP, B8G8R8A8_UNORM, tex, SIDE)
     c.create(READ_REPEAT, B8G8R8A8_UNORM, tex, SIDE)
     c.create(VBO, R8_UNORM, BIND_VERTEX_BUFFER, 128, 1, target=0)
+    c.create(READ_COMPACTED, B8G8R8A8_UNORM, tex, SIDE)
 
     c.shader(VS_H, STAGE_VERTEX, VS)
     c.shader(FS_H, STAGE_FRAGMENT, FS)
@@ -112,6 +122,7 @@ def build():
     c.sampler_view(VIEW_H, SRC, B8G8R8A8_UNORM, TARGET_2D)
     c.surface(SURF_CLAMP_H, READ_CLAMP, B8G8R8A8_UNORM)
     c.surface(SURF_REPEAT_H, READ_REPEAT, B8G8R8A8_UNORM)
+    c.surface(SURF_COMPACTED_H, READ_COMPACTED, B8G8R8A8_UNORM)
 
     # Everything both draws share, bound once.
     c.set_viewport(SIDE, SIDE)
@@ -122,9 +133,15 @@ def build():
     c.bind_sampler_states(STAGE_FRAGMENT, [SAMP_CLAMP_H])
     c.draw(4)
 
-    # The change under test, and the destination to see it in. Nothing else.
+    # The change under test, and the destination to see it in. Nothing else. Clamp rides at slot
+    # 1, unsampled, for the destroy below to move down.
     c.set_framebuffer([SURF_REPEAT_H])
-    c.bind_sampler_states(STAGE_FRAGMENT, [SAMP_REPEAT_H])
+    c.bind_sampler_states(STAGE_FRAGMENT, [SAMP_REPEAT_H, SAMP_CLAMP_H])
+    c.draw(4)
+
+    # The destroy under test: slot 0's state goes, and slot 1's takes its place.
+    c.set_framebuffer([SURF_COMPACTED_H])
+    c.destroy_object(OBJ_SAMPLER_STATE, SAMP_REPEAT_H)
     c.draw(4)
 
     # Unbind and destroy the per-draw objects, the way a guest releases them: a view or a surface
@@ -133,12 +150,13 @@ def build():
     c.set_sampler_views(STAGE_FRAGMENT, [])
     c.destroy_object(OBJ_SURFACE, SURF_CLAMP_H)
     c.destroy_object(OBJ_SURFACE, SURF_REPEAT_H)
+    c.destroy_object(OBJ_SURFACE, SURF_COMPACTED_H)
     c.destroy_object(OBJ_SAMPLER_VIEW, VIEW_H)
     c.submit()
 
     # The sweep reads each scored offscreen AT its unref. The source is scored too, as the
     # control that the pattern landed as written.
-    for h in (SRC, READ_CLAMP, READ_REPEAT):
+    for h in (SRC, READ_CLAMP, READ_REPEAT, READ_COMPACTED):
         c.unref(h)
     c.submit()
     return c
