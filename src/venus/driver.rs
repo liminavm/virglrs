@@ -753,6 +753,10 @@ pub struct HostQueue {
     /// The device that handed this queue out, for the per-device sweeps.
     device: VkDevice,
     /// The queue family it belongs to, which a command pool for it must name.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "only the present copier makes a pool, and it is macOS-only")
+    )]
     family: u32,
     fns: Arc<LiveDevice>,
     vk: Mutex<()>,
