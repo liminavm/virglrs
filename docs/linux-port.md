@@ -478,8 +478,11 @@ C's `VIRGL_GBM_LAYOUT_ENABLE`, read under that name by `ffi.rs`, and only with v
 every shared buffer as a linear GBM buffer and answers `GET_PIPE_RESOURCE_LAYOUT`; without it,
 shared storage is GL's own and tiled, the guest assumes linear, and a venus import of it is
 refused by the layout check rather than read wrong. It is off by default for the C's reason:
-linear storage costs every compositor buffer its tiling. Whether it should become the default
-on Linux is open.
+linear storage costs every shared buffer its tiling, and the cost is real -- measured on goiaba
+(iris, Ice Lake) on 2026-10-01, glmark2-wayland in a GNOME session on the venus rig scored 2473
+with it off and 2191 with it on, 11.4% lower, over four alternating boots per arm whose ranges do
+not overlap (2461-2487 against 2187-2194). So it stays a request: a guest that runs a Vulkan
+compositor asks for it and pays for it.
 
 **A classic export holds a descriptor per resource, for the resource's lifetime, uncharged.**
 `export_surface` takes a dma-buf from the driver for every SHARED or SCANOUT classic resource and
