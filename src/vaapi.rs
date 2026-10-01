@@ -6,18 +6,22 @@
 //! The decode itself is `vrend::video`'s VA-API backend, which keeps a display, a context and a
 //! surface per decode target on each codec's decode thread. This module is the part the rest of
 //! the renderer sees whatever the backend: the probe the capset is built from, and a [`Picture`]
-//! the delivery path reads planes out of.
+//! the delivery path copies planes out of.
 //!
 //! The bindings are `cros-libva`'s, which are safe: nothing here needs `unsafe`, and the module is
 //! not on CLAUDE.md's list for that reason. Its types are `Rc`, not `Send`, so a VA object never
 //! leaves the thread that made it: the probe opens and drops its own display, and a [`Picture`] is
-//! a copy of a surface's pixels in memory of ours, not a mapping of the driver's.
+//! EGL images over a surface, or a copy of its pixels, never the driver's surface itself.
 //!
 //! **Any driver, not only one.** The C refuses every VA driver that is not Mesa's, because it
 //! leaves slice parameters uninitialised and only Mesa ignores them. Nothing here does that, so
 //! the probe asks the driver what it decodes and believes the answer.
 
+use std::sync::Arc;
+
 use cros_libva as va;
+
+use crate::vrend::egl::Image;
 
 /// A codec a stream can be in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,16 +112,35 @@ pub enum PixelFormat {
     Planar420,
 }
 
-/// A decoded picture, in memory of ours.
+/// A decoded picture, on its way from the decode thread to a target's planes.
 ///
-/// Copied out of the surface on the decode thread, because the surface cannot leave it: it is a
-/// reference picture for the frames after this one, and the driver's types are not `Send`. A copy
-/// is what the delivery path would have made of a mapping anyway -- it uploads each plane into
-/// the target's texture from bytes.
+/// The surface itself cannot leave the decode thread -- it is a reference picture for the frames
+/// after this one, and the driver's types are not `Send` -- so what travels is one of two things
+/// that can: EGL images over the surface's planes, which delivery copies from on the GPU, or a
+/// copy of its pixels in memory of ours, which delivery uploads. The images are the usual case;
+/// the copy is for a target whose planes the GPU copy cannot fill.
 pub struct Picture {
     width: u32,
     height: u32,
-    planes: Vec<OwnedPlane>,
+    pixels: Pixels,
+}
+
+enum Pixels {
+    Copied(Vec<OwnedPlane>),
+    Imaged(Arc<Imaged>),
+}
+
+/// EGL images over a surface's two NV12 planes, made once per surface on the decode thread.
+pub struct Imaged {
+    pub luma: Image,
+    pub chroma: Image,
+}
+
+/// One plane of an imaged picture: the image, and the extent of it the picture fills.
+pub struct ImagedPlane<'a> {
+    pub image: &'a Image,
+    pub width: u32,
+    pub height: u32,
 }
 
 struct OwnedPlane {
@@ -187,7 +210,26 @@ impl Picture {
                 }
             }
         }
-        Some(Picture { width, height, planes })
+        Some(Picture { width, height, pixels: Pixels::Copied(planes) })
+    }
+
+    /// A picture that is the surface `planes` images, `width` by `height` of it.
+    pub(crate) fn imaged(planes: Arc<Imaged>, width: u32, height: u32) -> Picture {
+        Picture { width, height, pixels: Pixels::Imaged(planes) }
+    }
+
+    /// Plane `index` as an image, for a picture delivered on the GPU; `None` for one copied
+    /// through memory, or past the second plane.
+    pub fn image(&self, index: usize) -> Option<ImagedPlane<'_>> {
+        let Pixels::Imaged(planes) = &self.pixels else {
+            return None;
+        };
+        let (image, width, height) = match index {
+            0 => (&planes.luma, self.width, self.height),
+            1 => (&planes.chroma, self.width.div_ceil(2), self.height.div_ceil(2)),
+            _ => return None,
+        };
+        Some(ImagedPlane { image, width, height })
     }
 
     pub fn width(&self) -> u32 {
@@ -198,24 +240,27 @@ impl Picture {
         self.height
     }
 
-    /// The planes, for reading. Never `None`: they are already in memory of ours.
+    /// The planes, for reading. `None` for an imaged picture, whose pixels are only on the GPU.
     pub fn lock(&self) -> Option<Locked<'_>> {
-        Some(Locked(self))
+        match &self.pixels {
+            Pixels::Copied(planes) => Some(Locked(planes)),
+            Pixels::Imaged(_) => None,
+        }
     }
 }
 
 /// A picture whose planes are readable, for as long as this value lives.
-pub struct Locked<'a>(&'a Picture);
+pub struct Locked<'a>(&'a [OwnedPlane]);
 
 impl Locked<'_> {
     /// How many planes the picture has: two for NV12, three for I420.
     pub fn plane_count(&self) -> usize {
-        self.0.planes.len()
+        self.0.len()
     }
 
     /// One plane, or `None` past the end.
     pub fn plane(&self, index: usize) -> Option<Plane<'_>> {
-        self.0.planes.get(index).map(|plane| Plane {
+        self.0.get(index).map(|plane| Plane {
             width: plane.width,
             height: plane.height,
             pitch: plane.pitch,

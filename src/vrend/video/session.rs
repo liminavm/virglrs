@@ -8,7 +8,7 @@
 //! declare for it, so everything here is in those terms: the unit is the re-framed access unit,
 //! and the session is keyed on the parameter sets the descriptors were turned back into.
 
-use super::{Backend, Buffers, Delivery, Shape, pending};
+use super::{Backend, Delivery, Lookup, Shape, pending};
 use crate::decode::{Configuration, Picture, PixelFormat, Session, SessionKey};
 use crate::vrend::proto::VideoCodecHandle;
 
@@ -62,16 +62,15 @@ impl Backend for Host {
     type Unit = Unit;
 
     fn unit(
-        name: &'static str,
+        lookup: &Lookup<'_>,
         shape: &Shape,
         bytes: &[u8],
         delivery: Delivery<'_>,
         pixels: Option<PixelFormat>,
-        _buffers: &Buffers,
     ) -> Unit {
         let (width, height) = shape.extent();
         Unit {
-            name,
+            name: lookup.name,
             width,
             height,
             config: shape.configuration(),

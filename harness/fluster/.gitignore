@@ -4,5 +4,6 @@
 !.gitignore
 !README.md
 !*.sh
+!*.py
 !fixtures/
 !fixtures/*

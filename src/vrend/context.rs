@@ -2203,8 +2203,15 @@ impl Context {
             Command::EndFrame { codec, target } => {
                 self.make_current(host);
                 let began = host.tally.mark();
-                let ended =
-                    self.video.end_frame(host.gl, host.features, host.unsettled, codec, target);
+                let importer = video::gpu_importer(host.winsys, host.features);
+                let ended = self.video.end_frame(
+                    host.gl,
+                    host.features,
+                    host.unsettled,
+                    importer.as_ref(),
+                    codec,
+                    target,
+                );
                 host.tally.video(began, true);
                 video_result(kind, ended)
             }
@@ -4808,7 +4815,13 @@ impl Context {
             false,
         )?;
         let bitstream = self.read_guest_bytes(host, cmd, buffer, buffer_size, true)?;
-        let env = video::Env { gl: host.gl, unsettled: host.unsettled, budget: host.budget };
+        let importer = video::gpu_importer(host.winsys, host.features);
+        let env = video::Env {
+            gl: host.gl,
+            importer: importer.as_ref(),
+            unsettled: host.unsettled,
+            budget: host.budget,
+        };
         let out = self.video.decode_bitstream(&env, codec, target, &descriptor, &bitstream);
         video_result(cmd, out)
     }

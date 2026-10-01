@@ -88,6 +88,15 @@ VECTORS=${FLUSTER_VECTORS:-}
 TV=
 [ -n "$VECTORS" ] && TV="-tv $VECTORS"
 
+# FLUSTER_NV12=1 pins the VA decoder's output to NV12 for every vector whose reference is I420
+# (nv12.py), which is what puts a VA-API host's pictures on the GPU copy: left to itself the
+# guest's decoder picks I420, and three-plane targets are read back through memory instead. The
+# md5 is still taken after the convert to I420, so the scores compare. Linux only, and like
+# FLUSTER_VECTORS it is not the pinned run.
+NV12=${FLUSTER_NV12:-}
+RUNNER=upstream/fluster.py
+[ -n "$NV12" ] && RUNNER=nv12.py
+
 # The guest's login. limina's stock disk has `claude`; a QEMU guest is whatever its image was
 # provisioned with.
 GUEST_USER="${FLUSTER_GUEST_USER:-claude}"
@@ -240,7 +249,7 @@ run_leg() {
         set -e
         sudo mkdir -p /media/fluster
         mountpoint -q /media/fluster || sudo mount -t virtiofs limina-fluster /media/fluster
-        python3 /media/fluster/upstream/fluster.py \
+        python3 /media/fluster/$RUNNER \
             -r /media/fluster/resources -o /tmp/fluster-out -ne \
             run -ts ${SUITES[*]} -d ${DECODERS[*]} $TV -j 1 -q -t 120 \
                 -so /tmp/summary.json -f json
@@ -271,6 +280,17 @@ for suite, data in sorted(report["test_suites"].items()):
         for vector, v in sorted(d["vectors"].items()):
             print(f"{suite} {decoder} {vector} {v['result']}")
 REDUCE_PY
+
+    # Which way the pictures reached their targets, as the VA backend says whenever it changes.
+    # A forced NV12 run that never took the GPU copy is a run of the readback under another name,
+    # and scores the same -- so it fails here rather than reporting that number.
+    if [ "$(uname -s)" != Darwin ] && [ "$leg" = rs ]; then
+        grep -o 'VA pictures reach their targets .*' "$log" | sort | uniq -c
+        if [ -n "$NV12" ] && ! grep -q 'VA pictures reach their targets Gpu' "$log"; then
+            echo "rs: FLUSTER_NV12 is set and no picture took the GPU copy, see $log" >&2
+            return 1
+        fi
+    fi
 
     local total pass
     total=$(wc -l < "$OUT/$leg.txt" | tr -d ' ')
@@ -303,6 +323,7 @@ case "${1:-diff}" in
 
     if [ "${2:-}" = "--record" ]; then
         [ -z "$VECTORS" ] || { echo "refusing to record a pin from a FLUSTER_VECTORS subset" >&2; exit 1; }
+        [ -z "$NV12" ] || { echo "refusing to record a pin from a FLUSTER_NV12 run" >&2; exit 1; }
         mkdir -p "$(dirname "$PIN")"
         cp "$OUT/c.txt" "$PIN"
         echo "recorded $PIN"

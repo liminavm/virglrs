@@ -25,8 +25,12 @@ use std::sync::{Arc, Weak};
 
 use cros_libva as va;
 
-use super::{Backend, Buffers, Delivery, Identity, Shape, pending, vp9};
-use crate::decode::{Picture, PixelFormat};
+use super::{Backend, Delivery, Destination, Identity, Layout, Lookup, Shape, TargetFormat};
+use super::{pending, vp9};
+use crate::decode::{Imaged, Picture, PixelFormat};
+use crate::surface::{Held, PlaneLayout, PlaneLayouts};
+use crate::vrend::egl::{Importer, Plane};
+use crate::vrend::gl::gles::{GL_R8, GL_RG8};
 use crate::vrend::proto::{VideoBufferHandle, VideoCodecHandle};
 
 /// `VA_INVALID_SURFACE`: an empty reference slot.
@@ -40,6 +44,45 @@ pub struct Unit {
     target: Option<Target>,
     pixels: PixelFormat,
     bytes: Vec<u8>,
+    /// How the picture reaches the target. On the GPU the decode thread images the surface and
+    /// delivery copies from the images; on any other route it is read back into memory.
+    route: Route<Importer>,
+}
+
+/// How a picture reaches its target, and why when it is not on the GPU. Said by the decode
+/// thread whenever it changes, which is the positive control that the GPU copy is in use: a
+/// silent fallback reads back the same pixels and scores the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Route<T> {
+    Gpu(T),
+    /// The host has no dma-buf import, no EGL-image textures or no copy-image.
+    NoImporter,
+    NoTarget,
+    /// A composite target, whose surface is not a pair of textures.
+    Composite,
+    /// A layout other than NV12, which a surface's two planes are not.
+    Layout(Layout),
+    /// Plane textures in formats a plane import cannot be copied into.
+    PlaneFormats {
+        luma: u32,
+        chroma: u32,
+        count: usize,
+    },
+}
+
+impl<T> Route<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Route<U> {
+        match self {
+            Route::Gpu(t) => Route::Gpu(f(t)),
+            Route::NoImporter => Route::NoImporter,
+            Route::NoTarget => Route::NoTarget,
+            Route::Composite => Route::Composite,
+            Route::Layout(layout) => Route::Layout(layout),
+            Route::PlaneFormats { luma, chroma, count } => {
+                Route::PlaneFormats { luma, chroma, count }
+            }
+        }
+    }
 }
 
 /// What the descriptor says, per codec.
@@ -66,6 +109,8 @@ pub struct Host {
     /// once and leaves every frame undecoded.
     va: Option<Va>,
     unavailable: bool,
+    /// The route the last picture took, so a change is said once rather than every frame.
+    route: Option<Route<()>>,
 }
 
 struct Va {
@@ -90,22 +135,31 @@ struct Decoder {
 struct Stored {
     identity: Weak<Identity>,
     surface: va::Surface<()>,
+    /// The surface's planes as EGL images, made the first time a picture in it goes out on the
+    /// GPU. A surface is decoded into in place, so one export serves every frame it holds.
+    imaging: Imaging,
+}
+
+enum Imaging {
+    Untried,
+    Ready(Arc<Imaged>),
+    /// The export or the import was refused, which was said; the surface is read back instead.
+    Refused,
 }
 
 impl Backend for Host {
     type Unit = Unit;
 
     fn unit(
-        _name: &'static str,
+        lookup: &Lookup<'_>,
         shape: &Shape,
         bytes: &[u8],
         delivery: Delivery<'_>,
         pixels: Option<PixelFormat>,
-        buffers: &Buffers,
     ) -> Unit {
         let resolve = |handle: u32| {
             (handle != 0)
-                .then(|| buffers.get(&VideoBufferHandle(handle)))
+                .then(|| lookup.buffers.get(&VideoBufferHandle(handle)))
                 .flatten()
                 .map(|buffer| Arc::clone(&buffer.identity))
         };
@@ -127,6 +181,12 @@ impl Backend for Host {
             }),
             pixels: pixels.unwrap_or(PixelFormat::BiPlanar420),
             bytes: bytes.to_vec(),
+            route: match (delivery.target().map(route_of), lookup.importer) {
+                (Some(Route::Gpu(())), Some(importer)) => Route::Gpu(importer.clone()),
+                (Some(Route::Gpu(())), None) => Route::NoImporter,
+                (Some(other), _) => other.map(|()| unreachable!()),
+                (None, _) => Route::NoTarget,
+            },
         }
     }
 
@@ -157,8 +217,12 @@ impl Backend for Host {
         va.surfaces.retain(|stored| stored.identity.strong_count() > 0);
 
         let began = std::time::Instant::now();
-        let Params::Vp9 { frame, refs } = &unit.picture;
-        let made = va.decoder_for(va::VAProfile::VAProfileVP9Profile0, frame.width, frame.height);
+        let (profile, width, height) = match &unit.picture {
+            Params::Vp9 { frame, .. } => {
+                (va::VAProfile::VAProfileVP9Profile0, frame.width, frame.height)
+            }
+        };
+        let made = va.decoder_for(profile, width, height);
         let Some(target_at) = va.surface_for(target) else {
             eprintln!("[virglrs] video codec {handle}: no VA surface for the decode target");
             return None;
@@ -167,16 +231,19 @@ impl Backend for Host {
             phases.create = Some(began.elapsed());
         }
         let Some(decoder) = &va.decoder else {
-            eprintln!("[virglrs] video codec {handle}: no VA decode context for VP9");
+            eprintln!("[virglrs] video codec {handle}: no VA decode context");
             return None;
         };
-        let reference_frames = refs.each_ref().map(|slot| {
-            slot.as_ref().and_then(|identity| va.surface_id(identity)).unwrap_or(NO_SURFACE)
-        });
+        let id = |slot: &Option<Arc<Identity>>| slot.as_ref().and_then(|i| va.surface_id(i));
 
         let began = std::time::Instant::now();
         let surface = &va.surfaces[target_at].surface;
-        let decoded = decode_vp9(decoder, surface, frame, reference_frames, &unit.bytes);
+        let decoded = match &unit.picture {
+            Params::Vp9 { frame, refs } => {
+                let reference_frames = refs.each_ref().map(|slot| id(slot).unwrap_or(NO_SURFACE));
+                decode_vp9(decoder, surface, frame, reference_frames, &unit.bytes)
+            }
+        };
         phases.session = Some(began.elapsed());
         if let Err(why) = decoded {
             eprintln!("[virglrs] video codec {handle}: the VA driver decoded no picture ({why})");
@@ -184,7 +251,21 @@ impl Backend for Host {
         }
 
         let began = std::time::Instant::now();
-        let picture = read_back(surface, va.nv12, frame.width, frame.height, unit.pixels);
+        let route = unit.route.clone().map(|_| ());
+        if self.route.as_ref() != Some(&route) {
+            eprintln!("[virglrs] video codec {handle}: VA pictures reach their targets {route:?}");
+            self.route = Some(route);
+        }
+        let importer = match &unit.route {
+            Route::Gpu(importer) => Some(importer),
+            _ => None,
+        };
+        let imaged = importer.and_then(|importer| va.imaged(target_at, importer));
+        let surface = &va.surfaces[target_at].surface;
+        let picture = match imaged {
+            Some(planes) => Some(Picture::imaged(planes, width, height)),
+            None => read_back(surface, va.nv12, width, height, unit.pixels),
+        };
         phases.write = Some(began.elapsed());
         if picture.is_none() {
             eprintln!("[virglrs] video codec {handle}: the decoded VA surface could not be read");
@@ -252,8 +333,30 @@ impl Va {
             .map_err(|why| eprintln!("[virglrs] video: VA surface: {why}"))
             .ok()?
             .pop()?;
-        self.surfaces.push(Stored { identity: Arc::downgrade(&target.identity), surface });
+        let identity = Arc::downgrade(&target.identity);
+        self.surfaces.push(Stored { identity, surface, imaging: Imaging::Untried });
         Some(self.surfaces.len() - 1)
+    }
+
+    /// The images over the surface at `at`, made the first time they are asked for.
+    fn imaged(&mut self, at: usize, importer: &Importer) -> Option<Arc<Imaged>> {
+        let stored = &mut self.surfaces[at];
+        if let Imaging::Untried = stored.imaging {
+            stored.imaging = match image(&stored.surface, importer) {
+                Ok(planes) => Imaging::Ready(Arc::new(planes)),
+                Err(why) => {
+                    eprintln!(
+                        "[virglrs] video: a VA surface could not be imaged ({why}); its pictures \
+                         are read back through memory instead"
+                    );
+                    Imaging::Refused
+                }
+            };
+        }
+        match &stored.imaging {
+            Imaging::Ready(planes) => Some(Arc::clone(planes)),
+            Imaging::Untried | Imaging::Refused => None,
+        }
     }
 
     /// The surface a reference names, if its target has ever been decoded into here.
@@ -382,18 +485,30 @@ fn decode_vp9(
     });
     let slice = va::SliceParameterBufferVP9::new(size, offset, frame.slice_data_flag, segments);
 
+    render(
+        decoder,
+        surface,
+        vec![
+            va::BufferType::PictureParameter(va::PictureParameter::VP9(picture)),
+            va::BufferType::SliceParameter(va::SliceParameter::VP9(slice)),
+            va::BufferType::SliceData(bytes.to_vec()),
+        ],
+    )
+}
+
+/// Hand the driver a picture's buffers, and wait for the picture.
+fn render(
+    decoder: &Decoder,
+    surface: &va::Surface<()>,
+    buffers: Vec<va::BufferType>,
+) -> Result<(), Failure> {
     let context = &decoder.context;
-    let buffer = |what, kind| context.create_buffer(kind).map_err(|why| Failure::Va(what, why));
     let mut pending = va::Picture::new(0, Rc::clone(context), surface);
-    pending.add_buffer(buffer(
-        "picture parameters",
-        va::BufferType::PictureParameter(va::PictureParameter::VP9(picture)),
-    )?);
-    pending.add_buffer(buffer(
-        "slice parameters",
-        va::BufferType::SliceParameter(va::SliceParameter::VP9(slice)),
-    )?);
-    pending.add_buffer(buffer("slice data", va::BufferType::SliceData(bytes.to_vec()))?);
+    for kind in buffers {
+        let buffer =
+            context.create_buffer(kind).map_err(|why| Failure::Va("vaCreateBuffer", why))?;
+        pending.add_buffer(buffer);
+    }
     pending
         .begin::<()>()
         .map_err(|why| Failure::Va("vaBeginPicture", why))?
@@ -404,6 +519,60 @@ fn decode_vp9(
         .sync::<()>()
         .map_err(|(why, _)| Failure::Va("vaSyncSurface", why))?;
     Ok(())
+}
+
+/// Whether a target's planes take a GPU copy from a surface's: two per-plane textures, NV12, in
+/// the formats a plane import produces -- `R8` for luma and `RG8` for the interleaved chroma --
+/// since `glCopyImageSubData` copies only between compatible formats and reports a mismatch as a
+/// GL error nothing would read.
+fn route_of(buffer: &Arc<super::Buffer>) -> Route<()> {
+    let Destination::PerPlane(planes) = &buffer.destination else {
+        return Route::Composite;
+    };
+    if !matches!(buffer.format, Layout::Served(TargetFormat::Nv12)) {
+        return Route::Layout(buffer.format);
+    }
+    let format = |i: usize| planes.get(i).map_or(0, |p: &super::Plane| p.gl.internalformat);
+    if planes.len() == 2 && format(0) == GL_R8 && format(1) == GL_RG8 {
+        Route::Gpu(())
+    } else {
+        Route::PlaneFormats { luma: format(0), chroma: format(1), count: planes.len() }
+    }
+}
+
+/// Export a surface and image its two planes.
+///
+/// The export is the composed form cros-libva asks for, which on every driver measured is one
+/// object with both planes in it -- what the per-plane import is written for. Anything else is
+/// refused here rather than imported as a guess.
+fn image(surface: &va::Surface<()>, importer: &Importer) -> Result<Imaged, String> {
+    let mut exported = surface.export_prime().map_err(|why| format!("export: {why}"))?;
+    let [layer] = exported.layers.as_slice() else {
+        return Err(format!("{} layers", exported.layers.len()));
+    };
+    if exported.objects.len() != 1 || layer.num_planes != 2 {
+        let objects = exported.objects.len();
+        return Err(format!("{objects} objects, {} planes", layer.num_planes));
+    }
+    let planes: Vec<PlaneLayout> = (0..2)
+        .map(|i| PlaneLayout { offset: u64::from(layer.offset[i]), pitch: layer.pitch[i] })
+        .collect();
+    let object = exported.objects.remove(0);
+    let layout = crate::surface::Layout {
+        width: exported.width,
+        height: exported.height,
+        fourcc: exported.fourcc,
+        modifier: object.drm_format_modifier,
+        planes: PlaneLayouts::new(&planes).map_err(|why| format!("{why:?}"))?,
+        alloc_size: u64::from(object.size),
+    };
+    let held: Arc<dyn Held> = Arc::new(crate::dmabuf::Surface::exported(object.fd, layout));
+    let import = |plane| {
+        importer
+            .image_from_surface_plane(Arc::clone(&held), plane)
+            .map_err(|why| format!("import of {plane:?}: {why:?}"))
+    };
+    Ok(Imaged { luma: import(Plane::Luma)?, chroma: import(Plane::ChromaPair)? })
 }
 
 /// Copy the decoded picture out of its surface, at the frame's extent.

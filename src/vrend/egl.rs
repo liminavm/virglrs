@@ -428,6 +428,176 @@ impl Drop for Image {
     }
 }
 
+/// The dma-buf importer, apart from the [`Winsys`] it came from, for a thread with no context of
+/// its own: a video decode thread imaging the surfaces it decodes into, so that the render thread
+/// only has to copy from them.
+///
+/// An image is made against no context -- it belongs to the display -- and EGL is callable from
+/// any thread, so nothing about this needs the render thread. It holds the display, as every
+/// [`Image`] does, and cannot outlive it.
+#[derive(Clone)]
+pub struct Importer {
+    shared: Arc<Shared>,
+}
+
+impl Importer {
+    /// An EGL image over one plane of an exported surface. See
+    /// [`Winsys::image_from_surface_plane`].
+    pub fn image_from_surface_plane(
+        &self,
+        held: Arc<dyn Held>,
+        plane: Plane,
+    ) -> Result<Image, EglError> {
+        self.shared.image_of_surface(held, Some(plane))
+    }
+}
+
+impl Shared {
+    /// Import an exported dma-buf as an EGL image, through `EGL_EXT_image_dma_buf_import`.
+    ///
+    /// The mirror of the IOSurface path below and the same contract: the image holds a share of
+    /// the surface, so the descriptor stays open for as long as the driver can reach it. EGL dups
+    /// what it needs at import time, but that is the driver's business and not something to rely
+    /// on -- the share is what makes the lifetime a property of the types.
+    ///
+    /// **A plane import is a different image of the same descriptor.** Asked for one plane, this
+    /// imports a single-plane image at that plane's offset, pitch and own FourCC (`R8` or `GR88`),
+    /// exactly as the Limina path does -- so a composite decode target's planes are separate
+    /// textures over one allocation on both hosts.
+    ///
+    /// The modifier is sent only when the driver named one. `DRM_FORMAT_MOD_INVALID` means "no
+    /// claim", and passing it as if it were a modifier tells the importer the buffer is laid out
+    /// in a way it is not -- a driver may then read a tiled buffer as linear, which displays and
+    /// displays wrong. Omitting the attributes instead asks EGL to work it out, which is the
+    /// honest form of not knowing.
+    #[cfg(not(target_os = "macos"))]
+    fn image_of_surface(
+        self: &Arc<Self>,
+        held: Arc<dyn Held>,
+        plane: Option<Plane>,
+    ) -> Result<Image, EglError> {
+        use crate::dmabuf::DRM_FORMAT_MOD_INVALID;
+
+        let egl = &self.egl;
+        let layout = *held.surface().layout();
+        let fd = {
+            use std::os::fd::AsRawFd;
+            held.surface().fd().as_raw_fd()
+        };
+
+        // One plane asked for, or every plane the allocation has.
+        let (first, count, fourcc, width, height) = match plane {
+            Some(p) => {
+                let idx = p.index() as usize;
+                let Some((shape, _)) = held.surface().plane(p.index() as u32) else {
+                    return Err(self.error("a plane the exported layout does not have"));
+                };
+                (idx, 1, p.fourcc(), shape.width, shape.height)
+            }
+            None => (0, layout.planes.len(), layout.fourcc as EGLint, layout.width, layout.height),
+        };
+        if count == 0 || first + count > crate::dmabuf::MAX_PLANES {
+            return Err(self.error("an exported layout with no planes to import"));
+        }
+
+        let mut attribs: Vec<EGLint> = vec![
+            EGL_WIDTH,
+            width as EGLint,
+            EGL_HEIGHT,
+            height as EGLint,
+            EGL_LINUX_DRM_FOURCC_EXT,
+            fourcc,
+        ];
+        // A single-plane import of plane N still describes it as *plane 0* of the image it is
+        // making: the attribute index is a position in the image being built, not in the
+        // allocation being read. The offset is what carries which plane of the allocation it is.
+        //
+        // Every plane names the same descriptor because every plane *is* the same allocation --
+        // checked where the export happens (`Winsys::export_image`), not assumed here.
+        //
+        // Measured against iris on this host: this list, built for a two-plane
+        // `I915_FORMAT_MOD_Y_TILED_CCS` buffer with one descriptor named twice, is accepted. The
+        // same buffer declared as one plane under that modifier is refused with `EGL_BAD_MATCH`,
+        // which is what makes a wrong plane count an importer's refusal rather than wrong pixels.
+        for (at, &(fd_a, off_a, pitch_a, mod_lo, mod_hi)) in
+            DMA_BUF_PLANE_ATTRS.iter().enumerate().take(count)
+        {
+            let src = layout.planes[first + at];
+            attribs.extend_from_slice(&[
+                fd_a,
+                fd,
+                off_a,
+                src.offset as EGLint,
+                pitch_a,
+                src.pitch as EGLint,
+            ]);
+            if layout.modifier != DRM_FORMAT_MOD_INVALID {
+                attribs.extend_from_slice(&[
+                    mod_lo,
+                    (layout.modifier & 0xffff_ffff) as EGLint,
+                    mod_hi,
+                    (layout.modifier >> 32) as EGLint,
+                ]);
+            }
+        }
+        attribs.push(proc::EGL_NONE as EGLint);
+
+        // SAFETY: the display is initialised; the target is the registry's dma-buf target and
+        // takes a null client buffer, the attribute list is a live local this call outlives and
+        // is `EGL_NONE`-terminated, and the descriptor it names is kept open by the share the
+        // `Image` holds for as long as the image exists.
+        let image = unsafe {
+            egl.eglCreateImageKHR()(
+                self.display,
+                proc::EGL_NO_CONTEXT,
+                EGL_LINUX_DMA_BUF_EXT,
+                core::ptr::null_mut(),
+                attribs.as_ptr(),
+            )
+        };
+        if image.is_null() {
+            return Err(self.error("eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)"));
+        }
+        Ok(Image { shared: Arc::clone(self), image, held })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_of_surface(
+        self: &Arc<Self>,
+        held: Arc<dyn Held>,
+        plane: Option<Plane>,
+    ) -> Result<Image, EglError> {
+        let egl = &self.egl;
+        let attribs = plane.map(|plane| {
+            [
+                EGL_IOSURFACE_PLANE_LIMINA,
+                plane.index(),
+                EGL_IOSURFACE_FOURCC_LIMINA,
+                plane.fourcc(),
+                proc::EGL_NONE as EGLint,
+            ]
+        });
+        // SAFETY: the display is initialised; the target is the one limina's Mesa defines for an
+        // `IOSurfaceRef` client buffer, and `surface` is held by the `Image` for as long as the
+        // image exists, so the reference passed here outlives every use the driver makes of it.
+        // The attribute list, when there is one, is a live local this call outlives and is
+        // `EGL_NONE`-terminated; `NULL` is the documented empty list when there is not.
+        let image = unsafe {
+            egl.eglCreateImageKHR()(
+                self.display,
+                proc::EGL_NO_CONTEXT,
+                EGL_IOSURFACE_LIMINA,
+                held.surface().client_buffer(),
+                attribs.as_ref().map_or(core::ptr::null(), |a| a.as_ptr()),
+            )
+        };
+        if image.is_null() {
+            return Err(self.error("eglCreateImageKHR"));
+        }
+        Ok(Image { shared: Arc::clone(self), image, held })
+    }
+}
+
 fn c_str_to_string(p: *const c_char) -> String {
     if p.is_null() {
         return String::new();
@@ -1022,7 +1192,14 @@ impl Winsys {
     /// bind it. Fails, naming the call, when the driver will not import the surface -- the
     /// resource then keeps ordinary GL storage, and the caller says so.
     pub fn image_from_surface(&self, held: Arc<dyn Held>) -> Result<Image, EglError> {
-        self.image_of_surface(held, None)
+        self.shared.image_of_surface(held, None)
+    }
+
+    /// An importer another thread can image dma-bufs through, or `None` where the display has no
+    /// dma-buf import -- which is every macOS host, whose surfaces are IOSurfaces.
+    pub fn importer(&self) -> Option<Importer> {
+        (!cfg!(target_os = "macos") && self.has_extension("EGL_EXT_image_dma_buf_import"))
+            .then(|| Importer { shared: Arc::clone(&self.shared) })
     }
 
     /// An EGL image over *one plane* of a planar surface, in that plane's own layout.
@@ -1036,151 +1213,7 @@ impl Winsys {
         held: Arc<dyn Held>,
         plane: Plane,
     ) -> Result<Image, EglError> {
-        self.image_of_surface(held, Some(plane))
-    }
-
-    /// Import an exported dma-buf as an EGL image, through `EGL_EXT_image_dma_buf_import`.
-    ///
-    /// The mirror of the IOSurface path below and the same contract: the image holds a share of
-    /// the surface, so the descriptor stays open for as long as the driver can reach it. EGL dups
-    /// what it needs at import time, but that is the driver's business and not something to rely
-    /// on -- the share is what makes the lifetime a property of the types.
-    ///
-    /// **A plane import is a different image of the same descriptor.** Asked for one plane, this
-    /// imports a single-plane image at that plane's offset, pitch and own FourCC (`R8` or `GR88`),
-    /// exactly as the Limina path does -- so a composite decode target's planes are separate
-    /// textures over one allocation on both hosts.
-    ///
-    /// The modifier is sent only when the driver named one. `DRM_FORMAT_MOD_INVALID` means "no
-    /// claim", and passing it as if it were a modifier tells the importer the buffer is laid out
-    /// in a way it is not -- a driver may then read a tiled buffer as linear, which displays and
-    /// displays wrong. Omitting the attributes instead asks EGL to work it out, which is the
-    /// honest form of not knowing.
-    #[cfg(not(target_os = "macos"))]
-    fn image_of_surface(
-        &self,
-        held: Arc<dyn Held>,
-        plane: Option<Plane>,
-    ) -> Result<Image, EglError> {
-        use crate::dmabuf::DRM_FORMAT_MOD_INVALID;
-
-        let egl = &self.shared.egl;
-        let layout = *held.surface().layout();
-        let fd = {
-            use std::os::fd::AsRawFd;
-            held.surface().fd().as_raw_fd()
-        };
-
-        // One plane asked for, or every plane the allocation has.
-        let (first, count, fourcc, width, height) = match plane {
-            Some(p) => {
-                let idx = p.index() as usize;
-                let Some((shape, _)) = held.surface().plane(p.index() as u32) else {
-                    return Err(self.shared.error("a plane the exported layout does not have"));
-                };
-                (idx, 1, p.fourcc(), shape.width, shape.height)
-            }
-            None => (0, layout.planes.len(), layout.fourcc as EGLint, layout.width, layout.height),
-        };
-        if count == 0 || first + count > crate::dmabuf::MAX_PLANES {
-            return Err(self.shared.error("an exported layout with no planes to import"));
-        }
-
-        let mut attribs: Vec<EGLint> = vec![
-            EGL_WIDTH,
-            width as EGLint,
-            EGL_HEIGHT,
-            height as EGLint,
-            EGL_LINUX_DRM_FOURCC_EXT,
-            fourcc,
-        ];
-        // A single-plane import of plane N still describes it as *plane 0* of the image it is
-        // making: the attribute index is a position in the image being built, not in the
-        // allocation being read. The offset is what carries which plane of the allocation it is.
-        //
-        // Every plane names the same descriptor because every plane *is* the same allocation --
-        // checked where the export happens (`Winsys::export_image`), not assumed here.
-        //
-        // Measured against iris on this host: this list, built for a two-plane
-        // `I915_FORMAT_MOD_Y_TILED_CCS` buffer with one descriptor named twice, is accepted. The
-        // same buffer declared as one plane under that modifier is refused with `EGL_BAD_MATCH`,
-        // which is what makes a wrong plane count an importer's refusal rather than wrong pixels.
-        for (at, &(fd_a, off_a, pitch_a, mod_lo, mod_hi)) in
-            DMA_BUF_PLANE_ATTRS.iter().enumerate().take(count)
-        {
-            let src = layout.planes[first + at];
-            attribs.extend_from_slice(&[
-                fd_a,
-                fd,
-                off_a,
-                src.offset as EGLint,
-                pitch_a,
-                src.pitch as EGLint,
-            ]);
-            if layout.modifier != DRM_FORMAT_MOD_INVALID {
-                attribs.extend_from_slice(&[
-                    mod_lo,
-                    (layout.modifier & 0xffff_ffff) as EGLint,
-                    mod_hi,
-                    (layout.modifier >> 32) as EGLint,
-                ]);
-            }
-        }
-        attribs.push(proc::EGL_NONE as EGLint);
-
-        // SAFETY: the display is initialised; the target is the registry's dma-buf target and
-        // takes a null client buffer, the attribute list is a live local this call outlives and
-        // is `EGL_NONE`-terminated, and the descriptor it names is kept open by the share the
-        // `Image` holds for as long as the image exists.
-        let image = unsafe {
-            egl.eglCreateImageKHR()(
-                self.shared.display,
-                proc::EGL_NO_CONTEXT,
-                EGL_LINUX_DMA_BUF_EXT,
-                core::ptr::null_mut(),
-                attribs.as_ptr(),
-            )
-        };
-        if image.is_null() {
-            return Err(self.shared.error("eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)"));
-        }
-        Ok(Image { shared: Arc::clone(&self.shared), image, held })
-    }
-
-    #[cfg(target_os = "macos")]
-    fn image_of_surface(
-        &self,
-        held: Arc<dyn Held>,
-        plane: Option<Plane>,
-    ) -> Result<Image, EglError> {
-        let egl = &self.shared.egl;
-        let attribs = plane.map(|plane| {
-            [
-                EGL_IOSURFACE_PLANE_LIMINA,
-                plane.index(),
-                EGL_IOSURFACE_FOURCC_LIMINA,
-                plane.fourcc(),
-                proc::EGL_NONE as EGLint,
-            ]
-        });
-        // SAFETY: the display is initialised; the target is the one limina's Mesa defines for an
-        // `IOSurfaceRef` client buffer, and `surface` is held by the `Image` for as long as the
-        // image exists, so the reference passed here outlives every use the driver makes of it.
-        // The attribute list, when there is one, is a live local this call outlives and is
-        // `EGL_NONE`-terminated; `NULL` is the documented empty list when there is not.
-        let image = unsafe {
-            egl.eglCreateImageKHR()(
-                self.shared.display,
-                proc::EGL_NO_CONTEXT,
-                EGL_IOSURFACE_LIMINA,
-                held.surface().client_buffer(),
-                attribs.as_ref().map_or(core::ptr::null(), |a| a.as_ptr()),
-            )
-        };
-        if image.is_null() {
-            return Err(self.shared.error("eglCreateImageKHR"));
-        }
-        Ok(Image { shared: Arc::clone(&self.shared), image, held })
+        self.shared.image_of_surface(held, Some(plane))
     }
 
     /// The GLES entry points. Resolved through `eglGetProcAddress`, which for Mesa answers the

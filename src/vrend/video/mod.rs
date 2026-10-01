@@ -36,6 +36,7 @@ use std::collections::btree_map::Entry as MapEntry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use super::egl::{Importer, Winsys};
 use super::features::{Feature, Features};
 use super::formats::GlFormat;
 use super::gl::gles::GL_TEXTURE_2D;
@@ -249,6 +250,7 @@ impl Plane {
 ///
 /// The two live in one value rather than as a `TargetFormat` beside the number it came from:
 /// a target has one layout, and a pair could be handed on disagreeing about what it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layout {
     /// A layout CoreVideo can produce.
     Served(TargetFormat),
@@ -515,6 +517,8 @@ impl Frame {
 /// What DECODE_BITSTREAM needs of the renderer around it.
 pub struct Env<'a> {
     pub gl: &'a Gl,
+    /// See [`gpu_importer`].
+    pub importer: Option<&'a Importer>,
     /// Where a picture that goes out now -- a held AV1 frame -- is counted until it is settled.
     pub unsettled: &'a pending::Unsettled,
     /// Where the accumulated bitstream is charged.
@@ -728,16 +732,13 @@ trait Backend: Default {
     type Unit: Send + 'static;
 
     /// The unit for one submission. `pixels` is the layout the target wants, or `None` for a
-    /// unit with no target. `buffers` is the context's targets, which a backend that is handed
-    /// the reference list resolves the descriptor's handles against -- here, on the render
-    /// thread, where the one table of them is.
+    /// unit with no target.
     fn unit(
-        name: &'static str,
+        lookup: &Lookup<'_>,
         shape: &Shape,
         bytes: &[u8],
         delivery: Delivery<'_>,
         pixels: Option<PixelFormat>,
-        buffers: &Buffers,
     ) -> Self::Unit;
 
     /// Decode one unit, on the decode thread. `None` is a frame with no picture to deliver:
@@ -749,6 +750,33 @@ trait Backend: Default {
         unit: &Self::Unit,
         phases: &mut pending::Phases,
     ) -> Option<Picture>;
+}
+
+/// What building a unit may look up on the render thread.
+struct Lookup<'a> {
+    /// Which codec the host was asked for, for a message about the host.
+    #[cfg_attr(va, expect(dead_code, reason = "only the session backend names the codec"))]
+    name: &'static str,
+    /// The context's targets, which a backend that is handed the reference list resolves the
+    /// descriptor's handles against -- here, on the render thread, where the one table of them
+    /// is.
+    #[cfg_attr(not(va), expect(dead_code, reason = "only VA-API is handed the reference list"))]
+    buffers: &'a Buffers,
+    /// See [`gpu_importer`].
+    #[cfg_attr(not(va), expect(dead_code, reason = "only VA-API pictures are imported"))]
+    importer: Option<&'a Importer>,
+}
+
+/// How a decoded picture can reach a target's planes on the GPU, or `None` where it cannot and
+/// is copied through memory instead.
+///
+/// The decode thread images its surfaces through the importer, and delivery copies each plane
+/// with `glCopyImageSubData` from a texture over the image. So all three have to be there: dma-buf
+/// import on the display, EGL images as texture storage, and the copy.
+pub fn gpu_importer(winsys: &Winsys, features: &Features) -> Option<Importer> {
+    (features.has(Feature::copy_image) && features.has(Feature::egl_image))
+        .then(|| winsys.importer())
+        .flatten()
 }
 
 /// How many decodes a codec may have queued ahead of the render thread.
@@ -946,6 +974,7 @@ struct Around<'a> {
     gl: &'a Gl,
     unsettled: &'a pending::Unsettled,
     buffers: &'a Buffers,
+    importer: Option<&'a Importer>,
 }
 
 /// The host's decoder, as the render thread sees it: a codec's decode thread, and what a job
@@ -954,6 +983,7 @@ struct HostDecoder<'a> {
     gl: &'a Gl,
     /// The context's targets, for a backend that resolves the descriptor's reference handles.
     buffers: &'a Buffers,
+    importer: Option<&'a Importer>,
     decoder: &'a mut Decoder,
     /// Which codec the host was asked for, for a message about the host.
     codec: &'static str,
@@ -992,7 +1022,13 @@ impl Submit for HostDecoder<'_> {
         self.decoder.send(
             Job {
                 codec: handle,
-                unit: backend::Host::unit(self.codec, shape, unit, delivery, pixels, self.buffers),
+                unit: backend::Host::unit(
+                    &Lookup { name: self.codec, buffers: self.buffers, importer: self.importer },
+                    shape,
+                    unit,
+                    delivery,
+                    pixels,
+                ),
                 write,
                 landing,
                 sent: std::time::Instant::now(),
@@ -1145,8 +1181,9 @@ impl Av1 {
 impl Codec {
     /// The host's decoder for this codec's frames.
     fn host<'a>(&'a mut self, around: Around<'a>) -> HostDecoder<'a> {
-        let Around { gl, unsettled, buffers } = around;
-        HostDecoder { gl, buffers, decoder: &mut self.decoder, codec: self.kind.name(), unsettled }
+        let Around { gl, unsettled, buffers, importer } = around;
+        let codec = self.kind.name();
+        HostDecoder { gl, buffers, importer, decoder: &mut self.decoder, codec, unsettled }
     }
 
     /// DECODE_BITSTREAM for AV1. See [`Av1::advance`].
@@ -1162,8 +1199,14 @@ impl Codec {
         let Codec { kind: Kind::Av1(av1), decoder, frame, width, height, .. } = self else {
             unreachable!("only an AV1 codec decodes an AV1 frame");
         };
-        let mut host =
-            HostDecoder { gl: env.gl, buffers, decoder, codec: "AV1", unsettled: env.unsettled };
+        let mut host = HostDecoder {
+            gl: env.gl,
+            buffers,
+            importer: env.importer,
+            decoder,
+            codec: "AV1",
+            unsettled: env.unsettled,
+        };
         let next = av1.advance(&mut host, handle, descriptor, (*width, *height))?;
         let (accumulated, shape) = frame.open_on(target)?;
         accumulated.append(bitstream, env.budget)?;
@@ -1183,8 +1226,8 @@ impl Codec {
         let Codec { kind: Kind::Av1(av1), decoder, .. } = self else {
             unreachable!("only an AV1 codec ends an AV1 frame");
         };
-        let Around { gl, unsettled, buffers } = around;
-        let mut host = HostDecoder { gl, buffers, decoder, codec: "AV1", unsettled };
+        let Around { gl, unsettled, buffers, importer } = around;
+        let mut host = HostDecoder { gl, buffers, importer, decoder, codec: "AV1", unsettled };
         av1.end(&mut host, handle, shape, tiles, buffer)
     }
 }
@@ -1670,6 +1713,7 @@ impl Video {
         gl: &Gl,
         features: &Features,
         unsettled: &pending::Unsettled,
+        importer: Option<&Importer>,
         handle: VideoCodecHandle,
         target: VideoBufferHandle,
     ) -> Result<(), Refusal> {
@@ -1714,14 +1758,14 @@ impl Video {
         // AV1's unit is synthesized from the descriptor rather than re-framed from what the
         // guest sent, and may be held rather than submitted at all.
         if let Shape::Av1 { .. } = shape {
-            let around = Around { gl, unsettled, buffers };
+            let around = Around { gl, unsettled, buffers, importer };
             return codec.end_av1_frame(around, handle, &shape, &bitstream, buffer);
         }
         let Some(unit) = shape.access_unit(bitstream.into_bytes()) else {
             eprintln!("[virglrs] video codec {handle}: the access unit is not Annex-B framed");
             return Err(Refusal::HostRefusedFrame);
         };
-        let around = Around { gl, unsettled, buffers };
+        let around = Around { gl, unsettled, buffers, importer };
         codec.host(around).submit(handle, &shape, &unit, Some(&buffer))
     }
 }

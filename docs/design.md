@@ -706,8 +706,14 @@ buildable throughout as the A-side reference.
   descriptor to the driver field for field, so there it *is* translated: each `ref[i]` is
   resolved on the render thread, against the one buffer table, to the target's `Identity`, and
   the decode thread keeps one surface per identity, holding only a `Weak` so that a destroyed
-  target's surface goes with it. Pictures are copied out of the surface into memory of ours and
-  delivered by the per-plane upload; a GPU copy through dma-buf import is the next step. VP9 is
+  target's surface goes with it. A picture reaches an NV12 per-plane target on the GPU: the
+  decode thread exports the surface as a dma-buf and images its two planes once per surface
+  (`egl::Importer`, the one `Send` piece of the winsys), and delivery copies each plane from a
+  texture over its image with `glCopyImageSubData`, then flushes, so the driver's implicit sync
+  orders the copy before the surface's next decode. Any other target -- three-plane layouts,
+  composite targets, a host without dma-buf import -- is read back through memory and uploaded.
+  The decode thread logs the route each time it changes, because a silent fallback produces the
+  same pixels and the same score. VP9 is
   served first because its parameters come wholly from the descriptor. H.264 and HEVC need their
   slice headers parsed, since the C leaves those parameters uninitialised and only Mesa's driver
   tolerates that, and this backend serves any driver.

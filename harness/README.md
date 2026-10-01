@@ -1242,6 +1242,18 @@ out at 120 too, so they are reliably too slow rather than borderline, and *that*
 `FLUSTER_VECTORS` narrows a run to named vectors, for reading one stream's renderer log instead of
 a whole suite's. A score over a subset is not the fixture, so `--record` refuses while it is set.
 
+`FLUSTER_NV12=1` is how a Linux run reaches the VA backend's GPU copy. Left to itself, the guest's
+GStreamer VA decoder outputs whatever fluster's `videoconvert ! video/x-raw,format=I420` will take,
+which is I420. Stock Mesa then allocates three-plane targets, and three-plane targets are read back
+through memory. `nv12.py` runs fluster with the decoder's output pinned to NV12 for every vector
+whose reference is I420. The md5 is still taken after the convert, so the score compares. It also
+pins Python's start method to `fork`: fluster builds each pipeline in a pool worker, and a worker
+that is not forked re-imports the decoder module without the pin. The rs leg prints the routes
+the VA backend logged, and with `FLUSTER_NV12` set it fails a run in which no picture took the
+GPU copy -- that run would score the readback under this name. On goiaba every codec takes the
+GPU route under it, and the verdicts match the readback's vector for vector. Armed: returning before
+the plane copy takes it to 0.
+
 Unlike `ctests.sh` there is no cascade — each vector is its own process — so the pin is the whole
 result list, not its first entry.
 

@@ -31,6 +31,11 @@ use super::TargetFormat;
 use crate::decode::Picture;
 use crate::vrend::formats::GlFormat;
 use crate::vrend::gl::gles::{GL_TEXTURE_2D, GL_TEXTURE_BINDING_2D};
+#[cfg(va)]
+use crate::vrend::gl::{
+    GLint,
+    gles::{GL_NEAREST, GL_TEXTURE_MIN_FILTER},
+};
 use crate::vrend::gl::{Gl, TextureName};
 use crate::vrend::resource::Planes;
 
@@ -449,6 +454,11 @@ fn deliver(pending: Pending, gl: &Gl, name: TextureName, planes: Option<&Planes>
 /// The arithmetic is the synchronous path's, unchanged: clamp to what the source plane holds, and
 /// stride by the decoder's pitch. See the notes on [`super::Buffer`]'s per-plane delivery.
 fn upload_plane(gl: &Gl, name: TextureName, upload: &PlaneUpload, picture: &Picture) {
+    #[cfg(va)]
+    if let Some(source) = picture.image(upload.index) {
+        copy_plane(gl, name, upload, &source);
+        return;
+    }
     let Some(locked) = picture.lock() else {
         eprintln!(
             "[virglrs] video: a decoded picture could not be mapped; the plane keeps what it held"
@@ -491,6 +501,52 @@ fn upload_plane(gl: &Gl, name: TextureName, upload: &PlaneUpload, picture: &Pict
     // the formats where the two disagree. So a refusal here is this arithmetic being wrong: a
     // host bug, and one that would otherwise show as a target holding the previous frame.
     assert!(ok, "a decoded plane clamped to its own extent does not fit it");
+}
+
+/// Copy one plane of an imaged picture into its texture, on the GPU.
+///
+/// The image becomes the storage of a scratch texture for as long as the copy takes. Only a target
+/// whose planes are the formats the import produces is sent here -- the VA backend checks that
+/// before it images anything -- and only on a host with copy-image, so the copy has nothing to
+/// refuse.
+///
+/// **The flush is what keeps the surface's next picture out of this one.** The decoder writes the
+/// next frame into the same surface once the guest decodes into this target again, and the kernel
+/// orders that write after this read only if the read has been submitted: a copy still sitting in
+/// the context's command buffer has no fence on the buffer yet for the decoder to wait for.
+#[cfg(va)]
+fn copy_plane(
+    gl: &Gl,
+    name: TextureName,
+    upload: &PlaneUpload,
+    source: &crate::decode::ImagedPlane<'_>,
+) {
+    let w = upload.width.min(source.width);
+    let h = upload.height.min(source.height);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let previous = gl.get_integer(GL_TEXTURE_BINDING_2D) as u32;
+    let scratch = gl.gen_texture();
+    gl.bind_texture(GL_TEXTURE_2D, Some(scratch));
+    gl.egl_image_target_texture_2d(GL_TEXTURE_2D, source.image);
+    // A copy refuses an incomplete source with INVALID_OPERATION, and a texture whose min filter
+    // still asks for mipmaps it does not have is incomplete -- the default filter does.
+    gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST as GLint);
+    gl.bind_texture_name(GL_TEXTURE_2D, previous);
+    gl.copy_image_sub_data(
+        scratch,
+        GL_TEXTURE_2D,
+        0,
+        [0, 0, 0],
+        name,
+        GL_TEXTURE_2D,
+        0,
+        [0, 0, 0],
+        [w as i32, h as i32, 1],
+    );
+    gl.delete_texture(scratch);
+    gl.flush();
 }
 
 #[cfg(all(test, target_os = "macos"))]
