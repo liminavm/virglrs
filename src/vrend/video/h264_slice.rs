@@ -213,8 +213,9 @@ pub struct SliceHeader {
     pub disable_deblocking_filter_idc: u8,
     pub slice_alpha_c0_offset_div2: i8,
     pub slice_beta_offset_div2: i8,
-    /// Where `slice_data()` begins, in bits from the start of the NAL as sent: header byte and
-    /// emulation-prevention bytes included.
+    /// Where `slice_data()` begins, in RBSP bits from the start of the NAL, its header byte
+    /// included: emulation-prevention bytes are not counted, as VA-API's
+    /// `slice_data_bit_offset` says.
     pub data_bit_offset: u32,
 }
 
@@ -403,7 +404,7 @@ fn read_header(nal: &[u8], desc: &PictureDesc) -> Result<SliceHeader, Refused> {
         disable_deblocking_filter_idc: idc,
         slice_alpha_c0_offset_div2: alpha,
         slice_beta_offset_div2: beta,
-        data_bit_offset: u32::try_from(r.raw_bits())
+        data_bit_offset: u32::try_from(r.rbsp_bits())
             .map_err(|_| Refused::OutOfRange("the slice header's length"))?,
     })
 }
@@ -689,8 +690,7 @@ mod tests {
         assert_eq!(ref_lists(&h, &decoding(0, dpb), &desc()), Err(Refused::NoSuchReference));
     }
 
-    /// The header reader stops where slice data starts, and says where in the bytes as sent --
-    /// emulation-prevention bytes included.
+    /// The header reader stops where slice data starts, and says where in RBSP bits.
     #[test]
     fn a_p_slice_header_reads_back_with_its_data_offset() {
         let mut d = desc();
@@ -726,5 +726,36 @@ mod tests {
         assert_eq!((h.slice_alpha_c0_offset_div2, h.slice_beta_offset_div2), (1, -1));
         // 8 header bits, then 1+5+1+4 +1+3 +1+1+3+5 +1 +5 +1+3+3 for the fields above.
         assert_eq!(h.data_bit_offset, 46);
+    }
+
+    /// A header that holds an emulation-prevention byte reports the same offset as its RBSP:
+    /// VA-API counts the slice data's position without the escapes.
+    #[test]
+    fn an_escaped_header_reports_its_offset_in_rbsp_bits() {
+        let mut d = desc();
+        d.frame_mbs_only = true;
+        d.pic_order_cnt_type = 2;
+        // A 16-bit frame_num of 0 puts two zero bytes in the header, and the next byte is small
+        // enough that an encoder must escape it.
+        d.log2_max_frame_num_minus4 = 12;
+        let header = |escape| {
+            let mut w = Writer::new(escape);
+            w.u(8, 0x41);
+            w.ue(0);
+            w.ue(5);
+            w.ue(0);
+            w.u(16, 0);
+            w.u(1, 0); // num_ref_idx_active_override_flag
+            w.u(1, 0); // ref_pic_list_modification_flag_l0
+            w.u(1, 0); // adaptive_ref_pic_marking_mode_flag
+            w.se(-8); // slice_qp_delta: 000010001, which leaves 0x02 after the zero bytes
+            w.align();
+            w.finish()
+        };
+        let (escaped, rbsp) = (header(Escape::Rbsp), header(Escape::Raw));
+        assert_eq!(escaped.len(), rbsp.len() + 1, "the escaped header carries one 0x03");
+        let offset = |nal: &[u8]| read_header(nal, &d).unwrap().data_bit_offset;
+        assert_eq!(offset(&escaped), offset(&rbsp));
+        assert_eq!(offset(&rbsp), 8 + 1 + 5 + 1 + 16 + 1 + 1 + 1 + 9);
     }
 }

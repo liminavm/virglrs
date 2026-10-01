@@ -174,11 +174,13 @@ pub struct Reader<'a> {
     pos: usize,
     bit: u32,
     zeros: u32,
+    /// Emulation-prevention bytes stepped over so far.
+    escapes: u32,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0, bit: 0, zeros: 0 }
+        Self { buf, pos: 0, bit: 0, zeros: 0, escapes: 0 }
     }
 
     pub fn bit(&mut self) -> Option<u32> {
@@ -190,6 +192,7 @@ impl<'a> Reader<'a> {
         if self.bit == 0 && self.zeros >= 2 && self.buf[self.pos] == 0x03 {
             self.pos += 1;
             self.zeros = 0;
+            self.escapes += 1;
             if self.pos >= self.buf.len() {
                 return None;
             }
@@ -206,11 +209,16 @@ impl<'a> Reader<'a> {
         Some(v)
     }
 
-    /// How many bits of the *buffer* have been read, emulation-prevention bytes included: where
-    /// the next syntax element starts in the bytes as they were sent. A decoder handed the raw
-    /// NAL is told the slice data's position in these terms, not in RBSP bits.
-    pub fn raw_bits(&self) -> usize {
-        self.pos * 8 + self.bit as usize
+    /// How many RBSP bits have been read: the bytes as sent, less the emulation-prevention bytes
+    /// stepped over. VA-API states a slice's data offset in these terms, and hands the escape
+    /// count across separately ([`Reader::escapes`]) for a driver that wants the other.
+    pub fn rbsp_bits(&self) -> usize {
+        (self.pos - self.escapes as usize) * 8 + self.bit as usize
+    }
+
+    /// How many emulation-prevention bytes have been stepped over.
+    pub fn escapes(&self) -> u32 {
+        self.escapes
     }
 
     /// `u(n)`: `n` bits, most significant first.
