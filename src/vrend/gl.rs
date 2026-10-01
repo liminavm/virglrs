@@ -2319,6 +2319,17 @@ impl Gl {
         unsafe { f(mode, count, ty, offset_ptr(offset), instances, base_vertex, base_instance) };
     }
 
+    pub fn dispatch_compute(&self, groups: [GLuint; 3]) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glDispatchCompute()(groups[0], groups[1], groups[2]) };
+    }
+
+    /// `glDispatchComputeIndirect` with the command at `offset` into the bound dispatch buffer.
+    pub fn dispatch_compute_indirect(&self, offset: u32) {
+        // SAFETY: an offset into the bound dispatch buffer, which the driver bounds.
+        unsafe { self.t.glDispatchComputeIndirect()(offset as GLintptr) };
+    }
+
     /// `glDrawArraysIndirect` with the command at `offset` into the bound indirect buffer.
     pub fn draw_arrays_indirect(&self, mode: GLenum, offset: u32) {
         // SAFETY: an offset into the bound indirect buffer, which the driver bounds.

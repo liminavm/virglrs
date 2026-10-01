@@ -59,7 +59,7 @@ mod select;
 #[path = "context/units.rs"]
 mod units;
 
-pub use draw::{HwBlend, LinkedProgram, ProgramSerial, ProgramSlot, Sysval, Tracked, Xfb};
+pub use draw::{HwBlend, Linkage, LinkedProgram, ProgramSerial, ProgramSlot, Sysval, Tracked, Xfb};
 pub use select::{Bound, Program, Variant, VariantId};
 use units::Units;
 

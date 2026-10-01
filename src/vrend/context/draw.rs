@@ -176,16 +176,47 @@ pub enum Xfb {
     Paused,
 }
 
+/// What a program links, which is also what a selection looks it up by.
+///
+/// The C keeps graphics and compute programs on two lists and tells them apart by which list it
+/// searched. Here they share one list, so the kind is part of the key: a compute program can never
+/// answer a graphics lookup, nor be walked as a draw's stages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Linkage {
+    Graphics {
+        /// The variant of each graphics stage, in stage order.
+        stages: [Option<VariantId>; 5],
+        dual_src: bool,
+    },
+    Compute(VariantId),
+}
+
+impl Linkage {
+    /// The last stage a draw walks: the last before the rasterizer, or the fragment stage.
+    ///
+    /// Only a draw asks, and a draw runs only a program it selected, so a compute program here is
+    /// a host invariant broken, not a guest's doing.
+    fn last_stage(&self) -> ShaderStage {
+        let Linkage::Graphics { stages, .. } = self else {
+            panic!("a draw is running a compute program");
+        };
+        if stages[ShaderStage::TessEval.index()].is_some() {
+            ShaderStage::TessEval
+        } else if stages[ShaderStage::Geometry.index()].is_some() {
+            ShaderStage::Geometry
+        } else {
+            ShaderStage::Fragment
+        }
+    }
+}
+
 /// `vrend_linked_shader_program`: the variants of the bound stages linked into one GL program,
 /// and every location the draw path writes through.
 pub struct LinkedProgram {
     /// Names this program in the sub-context's list; stable while the program lives.
     pub serial: ProgramSerial,
     pub id: ProgramName,
-    /// The variant of each stage, in stage order, compute excluded.
-    pub stages: [Option<VariantId>; 5],
-    pub dual_src_linked: bool,
-    pub last_stage: ShaderStage,
+    pub linkage: Linkage,
     pub ubo_used_mask: [u32; ShaderStage::COUNT],
     pub samplers_used_mask: [u32; ShaderStage::COUNT],
     pub shadow_samp_mask: [u32; ShaderStage::COUNT],
@@ -213,9 +244,137 @@ pub struct LinkedProgram {
 }
 
 impl LinkedProgram {
+    /// A program with nothing looked up yet.
+    fn new(serial: ProgramSerial, id: ProgramName, linkage: Linkage) -> LinkedProgram {
+        LinkedProgram {
+            serial,
+            id,
+            linkage,
+            ubo_used_mask: [0; ShaderStage::COUNT],
+            samplers_used_mask: [0; ShaderStage::COUNT],
+            shadow_samp_mask: [0; ShaderStage::COUNT],
+            sampler_locs: Default::default(),
+            shadow_samp_mask_locs: Default::default(),
+            shadow_samp_add_locs: Default::default(),
+            const_location: [None; ShaderStage::COUNT],
+            num_consts: [0; ShaderStage::COUNT],
+            ssbo_used_mask: [0; ShaderStage::COUNT],
+            ssbo_binding_offset: [0; ShaderStage::COUNT],
+            images_used_mask: [0; ShaderStage::COUNT],
+            img_locs: Default::default(),
+            image_binding_offset: [0; ShaderStage::COUNT],
+            tex_levels_uniform_id: [None; ShaderStage::COUNT],
+            virgl_block_bind: None,
+            sysval_buffer: None,
+            sysval_uploaded: None,
+            reads_drawid: false,
+            fs_blend_equation_advanced: 0,
+        }
+    }
+
     /// Whether this program links `variant`.
     pub fn links(&self, variant: VariantId) -> bool {
-        self.stages.contains(&Some(variant))
+        match self.linkage {
+            Linkage::Graphics { stages, .. } => stages.contains(&Some(variant)),
+            Linkage::Compute(v) => v == variant,
+        }
+    }
+
+    /// `bind_const_locs`, `bind_image_locs` and `bind_ssbo_locs` for one stage.
+    fn bind_resource_locs(&mut self, gl: &Gl, features: &Features, l: &Linked<'_>) {
+        let s = l.stage.index();
+        let id = self.id;
+        let prefix = stage_prefix(l.stage);
+        if l.info.num_consts > 0 {
+            self.const_location[s] = gl.get_uniform_location(id, &format!("{prefix}const0"));
+            self.num_consts[s] = l.info.num_consts as usize;
+        }
+        let mask = l.info.images_used_mask;
+        if (mask != 0 || !l.info.image_arrays.is_empty()) && features.has(Feature::images) {
+            let nsamp = (32 - mask.leading_zeros()) as usize;
+            let mut locs = vec![None; nsamp];
+            if !l.info.image_arrays.is_empty() {
+                for arr in &l.info.image_arrays {
+                    for j in 0..arr.array_size {
+                        let name = format!("{prefix}img{}[{j}]", arr.first);
+                        // An image the compiler dropped has no location; the draw skips it.
+                        let loc = gl.get_uniform_location(id, &name);
+                        let slot = (arr.first + j) as usize;
+                        if slot >= locs.len() {
+                            locs.resize(slot + 1, None);
+                        }
+                        locs[slot] = loc;
+                    }
+                }
+            } else {
+                for (i, loc) in locs.iter_mut().enumerate() {
+                    if mask & (1 << i) != 0 {
+                        let name = format!("{prefix}img{i}");
+                        *loc = gl.get_uniform_location(id, &name);
+                    }
+                }
+            }
+            self.img_locs[s] = locs;
+            self.images_used_mask[s] = mask;
+            self.image_binding_offset[s] = l.info.image_binding_offset;
+        }
+        if features.has(Feature::ssbo) {
+            self.ssbo_used_mask[s] = l.info.ssbo_used_mask;
+            self.ssbo_binding_offset[s] = l.info.ssbo_binding_offset;
+        }
+    }
+
+    /// `bind_sampler_locs` and `bind_ubo_locs` for one stage, its uniform blocks bound from
+    /// `next_ubo_id` on. Answers the first binding after them.
+    fn bind_sampler_and_ubo_locs(
+        &mut self,
+        gl: &Gl,
+        l: &Linked<'_>,
+        mut next_ubo_id: BindingPoint,
+    ) -> BindingPoint {
+        let s = l.stage.index();
+        let id = self.id;
+        let prefix = stage_prefix(l.stage);
+        let mut mask = l.info.samplers_used_mask;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as i32;
+            mask &= mask - 1;
+            let name = if !l.info.sampler_arrays.is_empty() {
+                let first = l.info.lookup_sampler_array(i);
+                format!("{prefix}samp{first}[{}]", i - first)
+            } else {
+                format!("{prefix}samp{i}")
+            };
+            self.sampler_locs[s].push(gl.get_uniform_location(id, &name));
+            let (mask_loc, add_loc) = if l.info.shadow_samp_mask & (1 << i) != 0 {
+                (
+                    gl.get_uniform_location(id, &format!("{prefix}shadmask{i}")),
+                    gl.get_uniform_location(id, &format!("{prefix}shadadd{i}")),
+                )
+            } else {
+                (None, None)
+            };
+            self.shadow_samp_mask_locs[s].push(mask_loc);
+            self.shadow_samp_add_locs[s].push(add_loc);
+        }
+        self.samplers_used_mask[s] = l.info.samplers_used_mask;
+        self.shadow_samp_mask[s] = l.info.shadow_samp_mask;
+        let mut mask = l.info.ubo_used_mask;
+        while mask != 0 {
+            let i = mask.trailing_zeros();
+            mask &= mask - 1;
+            let name = if l.info.ubo_indirect {
+                format!("{prefix}ubo[{}]", i.wrapping_sub(1) as i32)
+            } else {
+                format!("{prefix}ubo{i}")
+            };
+            if let Some(block) = gl.get_uniform_block_index(id, &name) {
+                gl.uniform_block_binding(id, block, next_ubo_id);
+            }
+            next_ubo_id = next_ubo_id.next();
+        }
+        self.ubo_used_mask[s] = l.info.ubo_used_mask;
+        next_ubo_id
     }
 }
 
@@ -479,18 +638,17 @@ impl SubContext {
             if self.shaders[stage.index()].is_none() {
                 continue;
             }
-            let Some(program) = self.bound_program(stage) else {
-                return Err(stage);
-            };
-            let Some(variant) = program.variants.first() else {
-                return Err(stage);
-            };
-            let Some(gl) = variant.gl else {
-                return Err(stage);
-            };
-            out.push(Linked { stage, info: &program.info, variant, gl });
+            out.push(self.linked_stage(stage).ok_or(stage)?);
         }
         Ok(out)
+    }
+
+    /// The current variant of the stage bound at `stage`, compiled, or `None` when there is no
+    /// such variant.
+    fn linked_stage(&self, stage: ShaderStage) -> Option<Linked<'_>> {
+        let program = self.bound_program(stage)?;
+        let variant = program.variants.first()?;
+        Some(Linked { stage, info: &program.info, variant, gl: variant.gl? })
     }
 
     /// `vrend_destroy_program` for every program linking `variant`, as the C destroys them
@@ -590,39 +748,10 @@ fn add_shader_program(
         return Err(Fault::Shader { cmd, what: "a program the driver refused to link" });
     }
 
-    let last_stage = if tes.is_some() {
-        ShaderStage::TessEval
-    } else if gs.is_some() {
-        ShaderStage::Geometry
-    } else {
-        ShaderStage::Fragment
-    };
-    let mut prog = LinkedProgram {
-        serial,
-        id,
-        stages,
-        dual_src_linked,
-        last_stage,
-        ubo_used_mask: [0; ShaderStage::COUNT],
-        samplers_used_mask: [0; ShaderStage::COUNT],
-        shadow_samp_mask: [0; ShaderStage::COUNT],
-        sampler_locs: Default::default(),
-        shadow_samp_mask_locs: Default::default(),
-        shadow_samp_add_locs: Default::default(),
-        const_location: [None; ShaderStage::COUNT],
-        num_consts: [0; ShaderStage::COUNT],
-        ssbo_used_mask: [0; ShaderStage::COUNT],
-        ssbo_binding_offset: [0; ShaderStage::COUNT],
-        images_used_mask: [0; ShaderStage::COUNT],
-        img_locs: Default::default(),
-        image_binding_offset: [0; ShaderStage::COUNT],
-        tex_levels_uniform_id: [None; ShaderStage::COUNT],
-        virgl_block_bind: None,
-        sysval_buffer: None,
-        sysval_uploaded: None,
-        reads_drawid: false,
-        fs_blend_equation_advanced: fs.info.fs_blend_equation_advanced,
-    };
+    let linkage = Linkage::Graphics { stages, dual_src: dual_src_linked };
+    let last_stage = linkage.last_stage();
+    let mut prog = LinkedProgram::new(serial, id, linkage);
+    prog.fs_blend_equation_advanced = fs.info.fs_blend_equation_advanced;
 
     gl.use_program(host.current.program(), Some(id));
 
@@ -633,48 +762,7 @@ fn add_shader_program(
         .filter_map(|s| by_stage(*s))
         .collect();
     for l in &walk {
-        let s = l.stage.index();
-        let prefix = stage_prefix(l.stage);
-        // bind_const_locs
-        if l.info.num_consts > 0 {
-            prog.const_location[s] = gl.get_uniform_location(id, &format!("{prefix}const0"));
-            prog.num_consts[s] = l.info.num_consts as usize;
-        }
-        // bind_image_locs
-        let mask = l.info.images_used_mask;
-        if (mask != 0 || !l.info.image_arrays.is_empty()) && features.has(Feature::images) {
-            let nsamp = (32 - mask.leading_zeros()) as usize;
-            let mut locs = vec![None; nsamp];
-            if !l.info.image_arrays.is_empty() {
-                for arr in &l.info.image_arrays {
-                    for j in 0..arr.array_size {
-                        let name = format!("{prefix}img{}[{j}]", arr.first);
-                        // An image the compiler dropped has no location; the draw skips it.
-                        let loc = gl.get_uniform_location(id, &name);
-                        let slot = (arr.first + j) as usize;
-                        if slot >= locs.len() {
-                            locs.resize(slot + 1, None);
-                        }
-                        locs[slot] = loc;
-                    }
-                }
-            } else {
-                for (i, loc) in locs.iter_mut().enumerate() {
-                    if mask & (1 << i) != 0 {
-                        let name = format!("{prefix}img{i}");
-                        *loc = gl.get_uniform_location(id, &name);
-                    }
-                }
-            }
-            prog.img_locs[s] = locs;
-            prog.images_used_mask[s] = mask;
-            prog.image_binding_offset[s] = l.info.image_binding_offset;
-        }
-        // bind_ssbo_locs
-        if features.has(Feature::ssbo) {
-            prog.ssbo_used_mask[s] = l.info.ssbo_used_mask;
-            prog.ssbo_binding_offset[s] = l.info.ssbo_binding_offset;
-        }
+        prog.bind_resource_locs(gl, features, l);
         if l.info.reads_drawid {
             prog.reads_drawid = true;
         }
@@ -683,49 +771,7 @@ fn add_shader_program(
     // rebind_ubo_and_sampler_locs
     let mut next_ubo_id = BindingPoint::FIRST;
     for l in &walk {
-        let s = l.stage.index();
-        let prefix = stage_prefix(l.stage);
-        // bind_sampler_locs
-        let mut mask = l.info.samplers_used_mask;
-        while mask != 0 {
-            let i = mask.trailing_zeros() as i32;
-            mask &= mask - 1;
-            let name = if !l.info.sampler_arrays.is_empty() {
-                let first = l.info.lookup_sampler_array(i);
-                format!("{prefix}samp{first}[{}]", i - first)
-            } else {
-                format!("{prefix}samp{i}")
-            };
-            prog.sampler_locs[s].push(gl.get_uniform_location(id, &name));
-            let (mask_loc, add_loc) = if l.info.shadow_samp_mask & (1 << i) != 0 {
-                (
-                    gl.get_uniform_location(id, &format!("{prefix}shadmask{i}")),
-                    gl.get_uniform_location(id, &format!("{prefix}shadadd{i}")),
-                )
-            } else {
-                (None, None)
-            };
-            prog.shadow_samp_mask_locs[s].push(mask_loc);
-            prog.shadow_samp_add_locs[s].push(add_loc);
-        }
-        prog.samplers_used_mask[s] = l.info.samplers_used_mask;
-        prog.shadow_samp_mask[s] = l.info.shadow_samp_mask;
-        // bind_ubo_locs
-        let mut mask = l.info.ubo_used_mask;
-        while mask != 0 {
-            let i = mask.trailing_zeros();
-            mask &= mask - 1;
-            let name = if l.info.ubo_indirect {
-                format!("{prefix}ubo[{}]", i.wrapping_sub(1) as i32)
-            } else {
-                format!("{prefix}ubo{i}")
-            };
-            if let Some(block) = gl.get_uniform_block_index(id, &name) {
-                gl.uniform_block_binding(id, block, next_ubo_id);
-            }
-            next_ubo_id = next_ubo_id.next();
-        }
-        prog.ubo_used_mask[s] = l.info.ubo_used_mask;
+        next_ubo_id = prog.bind_sampler_and_ubo_locs(gl, l, next_ubo_id);
     }
     // bind_virgl_block_loc: the block binds after the last UBO.
     for _ in &walk {
@@ -797,11 +843,12 @@ impl Context {
             .find(|l| l.stage == ShaderStage::Fragment)
             .expect("select_program required a fragment stage");
         let dual_src = dual_src && fs.info.num_outputs > 1;
-        let mut ids = [None; 5];
+        let mut stages = [None; 5];
         for l in &linked {
-            ids[l.stage.index()] = Some(l.variant.id);
+            stages[l.stage.index()] = Some(l.variant.id);
         }
-        let same = sub.program().is_some_and(|p| p.stages == ids && p.dual_src_linked == dual_src);
+        let want = Linkage::Graphics { stages, dual_src };
+        let same = sub.program().is_some_and(|p| p.linkage == want);
         if same {
             // The selection is settled either way; a flag left standing here would run the
             // nine key passes again on every draw of this program.
@@ -811,7 +858,7 @@ impl Context {
         let found = sub
             .programs
             .iter()
-            .position(|p| p.stages == ids && p.dual_src_linked == dual_src)
+            .position(|p| p.linkage == want)
             .map(|at| ProgramSlot { at, serial: sub.programs[at].serial });
         let slot = match found {
             Some(s) => s,
@@ -1378,7 +1425,7 @@ impl Context {
         // The pass's other question -- which sub-context -- is answered once here too. Each binder
         // used to ask both again, per stage.
         let sub = self.sub_mut();
-        let last = sub.program_at(at).last_stage;
+        let last = sub.program_at(at).linkage.last_stage();
         let mut next_ubo_id = BindingPoint::FIRST;
         let mut next_sampler_id = TextureUnit::FIRST;
         for stage in C_STAGE_ORDER {
