@@ -94,4 +94,29 @@ mod tests {
         let (got, total) = g.loaded();
         assert_eq!(got, total, "the loader must answer for every global command");
     }
+
+    /// A promoted command is found under its extension name when the core name is null. The
+    /// loader answers that way for a device under an instance older than the promotion -- wlroots'
+    /// Vulkan renderer creates a 1.1 instance and enables `VK_KHR_synchronization2` -- and a table
+    /// that asked only for `vkQueueSubmit2` refused every submit such a guest made.
+    #[test]
+    fn a_promoted_command_is_found_under_its_extension_name() {
+        unsafe extern "C" fn stand_in() {}
+        let mut asked = Vec::new();
+        // SAFETY: the table is only asked whether the field is set; the stand-in is never called.
+        let table = unsafe {
+            Device::load(&mut |name| {
+                asked.push(name.to_owned());
+                (name == c"vkQueueSubmit2KHR").then_some(stand_in as ProcAddr)
+            })
+        };
+        assert!(table.has_vkQueueSubmit2(), "the KHR name must fill the core command's field");
+        let core = asked.iter().position(|n| n.as_c_str() == c"vkQueueSubmit2");
+        let alias = asked.iter().position(|n| n.as_c_str() == c"vkQueueSubmit2KHR");
+        assert!(
+            core.is_some() && core < alias,
+            "the core name is asked first, the alias only after it is null"
+        );
+        assert!(!table.has_vkQueueWaitIdle(), "a command with no answer stays absent");
+    }
 }

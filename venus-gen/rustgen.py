@@ -2185,12 +2185,20 @@ class RustGen:
                     '    /// `get` must answer each name with null or with the address of the',
                     '    /// Vulkan command of exactly that name. That is the loader\'s contract',
                     '    /// for `%s`, and nothing else may be passed here: the returned' % loader,
-                    '    /// pointer is transmuted to the signature generated from vk.xml.',
+                    '    /// pointer is transmuted to the signature generated from vk.xml, which',
+                    '    /// a command and every alias vk.xml gives it share.',
                     '    pub unsafe fn load(get: &mut dyn FnMut(&CStr) -> Option<ProcAddr>) -> %s {' % name,
                     '        %s {' % name]
+            # A promoted command is asked for under its core name first and then under each
+            # extension name vk.xml aliases to it. The loader answers the core name only when the
+            # instance's apiVersion reaches the version that promoted it, so a guest on a 1.1
+            # instance that enabled `VK_KHR_synchronization2` gets null for `vkQueueSubmit2` and
+            # the driver's entry point for `vkQueueSubmit2KHR`. An alias is the same command with
+            # the same signature, so either answer is the one this field is typed for.
             for ty in tys:
-                out.append('            fp_%s: get(c"%s").map(|p| unsafe { transmute(p) }),'
-                           % (ty.name, ty.name))
+                names = ''.join('.or_else(|| get(c"%s"))' % a for a in ty.aliases)
+                out.append('            fp_%s: get(c"%s")%s.map(|p| unsafe { transmute(p) }),'
+                           % (ty.name, ty.name, names))
             out += ['        }', '    }', '']
             for ty in tys:
                 out += [
