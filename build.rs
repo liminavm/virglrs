@@ -58,6 +58,7 @@ fn main() {
     gl_bindings(&manifest);
     vrend_formats(&manifest);
     link_vulkan_loader();
+    video_backend();
     link_egl();
 
     #[cfg(feature = "reply-oracle")]
@@ -152,6 +153,17 @@ enum EglSearch {
     /// pkg-config knows the package and named no `-L`: the library sits where the linker already
     /// looks. Naming a directory here would be inventing one.
     LinkerDefault,
+}
+
+/// `cfg(va)`: video decodes through VA-API. The `vaapi` feature asks for it, and only a Linux
+/// target can have it -- one name for the pair, so no `cfg` in the tree has to spell both and
+/// none can spell only one.
+fn video_backend() {
+    println!("cargo::rustc-check-cfg=cfg(va)");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if std::env::var_os("CARGO_FEATURE_VAAPI").is_some() && os == "linux" {
+        println!("cargo::rustc-cfg=va");
+    }
 }
 
 /// The link-time filename of libEGL for the *target*, which is not necessarily this host.

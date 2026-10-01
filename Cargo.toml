@@ -44,11 +44,21 @@ reply-oracle = ["dep:cc"]
 # conformance vector for a synthesized parameter set -- so agreeing with it is the whole standard.
 video-oracle = ["dep:cc"]
 
+# Decode video through VA-API on Linux, with any driver that has the codec. On by default: off,
+# a Linux host decodes nothing and advertises no video. It needs libva's headers to build; no
+# effect on macOS, which decodes through VideoToolbox.
+vaapi = ["dep:cros-libva"]
+default = ["vaapi"]
+
 [dependencies]
 bumpalo = "3.20"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 libc = "0.2"
 rustc-hash = "2.1"
+
+# Pinned to a rev: the latest release (0.0.13) does not build against libva 1.23.
+[target.'cfg(target_os = "linux")'.dependencies]
+cros-libva = { git = "https://github.com/chromeos/cros-libva", rev = "59384456ac2ae78c0c3e5515f41ef1efd9b802cf", optional = true }
 
 [build-dependencies]
 cc = { version = "1.4", optional = true }

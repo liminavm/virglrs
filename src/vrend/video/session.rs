@@ -8,7 +8,7 @@
 //! declare for it, so everything here is in those terms: the unit is the re-framed access unit,
 //! and the session is keyed on the parameter sets the descriptors were turned back into.
 
-use super::{Backend, Delivery, Shape, pending};
+use super::{Backend, Buffers, Delivery, Shape, pending};
 use crate::decode::{Configuration, Picture, PixelFormat, Session, SessionKey};
 use crate::vrend::proto::VideoCodecHandle;
 
@@ -32,6 +32,22 @@ pub struct Unit {
     withheld: bool,
 }
 
+impl Shape {
+    /// The codec configuration record a session for this frame is built around.
+    pub(super) fn configuration(&self) -> Configuration {
+        match self {
+            Shape::Vp9(frame) => {
+                Configuration::vp9(frame.profile, frame.bit_depth, frame.subsampling())
+            }
+            Shape::H264 { sets, .. } => Configuration::h264(sets.sps.clone(), sets.pps.clone()),
+            Shape::Hevc { sets, .. } => {
+                Configuration::hevc(sets.vps.clone(), sets.sps.clone(), sets.pps.clone())
+            }
+            Shape::Av1 { config, .. } => Configuration::av1c(config.clone()),
+        }
+    }
+}
+
 /// What a codec's decode thread keeps between units: the decompression session.
 ///
 /// Built on the first unit, not at creation: it is keyed on the shape of the frame it will
@@ -51,6 +67,7 @@ impl Backend for Host {
         bytes: &[u8],
         delivery: Delivery<'_>,
         pixels: Option<PixelFormat>,
+        _buffers: &Buffers,
     ) -> Unit {
         let (width, height) = shape.extent();
         Unit {

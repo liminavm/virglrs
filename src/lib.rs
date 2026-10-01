@@ -58,7 +58,10 @@ pub mod config;
 #[path = "videotoolbox.rs"]
 #[allow(unsafe_code)]
 pub mod decode;
-#[cfg(not(target_os = "macos"))]
+#[cfg(va)]
+#[path = "vaapi.rs"]
+pub mod decode;
+#[cfg(not(any(target_os = "macos", va)))]
 #[path = "decode_unbacked.rs"]
 pub mod decode;
 #[cfg(not(target_os = "macos"))]

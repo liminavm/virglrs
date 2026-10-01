@@ -698,6 +698,20 @@ buildable throughout as the A-side reference.
   before a bitstream can be handed over, out of a fixed prefix, and carries no translation step
   and no host-side buffer ids at all.
 
+  **On Linux the decoder is VA-API, behind the same frame.** `vrend::video` keeps the protocol
+  -- the frame, the key-frame gate, the queue, the delivery -- and a `Backend` trait is the
+  half that differs by host: what a unit carries to the codec's decode thread, and what that
+  thread keeps. The session backend (`video/session.rs`) is VideoToolbox's whole-bitstream
+  path. The VA backend (`video/vaapi.rs`, through `cros-libva`, which is safe) hands the
+  descriptor to the driver field for field, so there it *is* translated: each `ref[i]` is
+  resolved on the render thread, against the one buffer table, to the target's `Identity`, and
+  the decode thread keeps one surface per identity, holding only a `Weak` so that a destroyed
+  target's surface goes with it. Pictures are copied out of the surface into memory of ours and
+  delivered by the per-plane upload; a GPU copy through dma-buf import is the next step. VP9 is
+  served first because its parameters come wholly from the descriptor. H.264 and HEVC need their
+  slice headers parsed, since the C leaves those parameters uninitialised and only Mesa's driver
+  tolerates that, and this backend serves any driver.
+
   **Decode only.** `virgl_video_encode_bitstream` is a stub returning -1 and `fill_caps`
   advertises no encode entrypoint, so the guest cannot reach it. `EncodeBitstream` is refused
   and counted, like any other command this build does not serve, and the encode callbacks are

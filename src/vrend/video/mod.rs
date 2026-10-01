@@ -4,9 +4,10 @@
 //! Hardware video decode: the codecs and decode targets a context owns, and the frames they
 //! decode.
 //!
-//! Safe throughout. The VideoToolbox calls live in [`crate::decode`]; what is here is the
-//! protocol's own vocabulary -- profiles, targets, the accumulate-then-decode frame -- and the
-//! copy of a decoded picture into the textures the guest samples.
+//! Safe throughout. The host decoder's calls live in [`crate::decode`] and in the [`Backend`]
+//! for it -- VideoToolbox's session on macOS, VA-API on Linux; what is here is the protocol's own
+//! vocabulary -- profiles, targets, the accumulate-then-decode frame -- and the copy of a decoded
+//! picture into the textures the guest samples.
 //!
 //! **Everything a frame needs is resolved when it is named, not when it is used.** A decode
 //! target holds a share of each plane's texture, taken at CREATE_VIDEO_BUFFER; a codec holds a
@@ -20,9 +21,16 @@ pub mod bitstream;
 pub mod h264;
 pub mod h265;
 pub mod pending;
+#[cfg(not(va))]
 mod session;
+#[cfg(va)]
+mod vaapi;
+pub mod vp9;
 
+#[cfg(not(va))]
 use session as backend;
+#[cfg(va)]
+use vaapi as backend;
 
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,7 +44,7 @@ use super::journal::Retained;
 use super::proto::{Format, VideoBuffer, VideoBufferHandle, VideoCodec, VideoCodecHandle};
 use super::resource::{self, Texture};
 use crate::budget::{Charge, Classic};
-use crate::decode::{self, Configuration, Picture, PixelFormat};
+use crate::decode::{self, Picture, PixelFormat};
 use crate::surface::Held;
 
 /// `enum pipe_video_profile`, as virglrenderer numbers it.
@@ -188,89 +196,6 @@ impl TargetFormat {
     }
 }
 
-/// What a VP9 picture descriptor says about the frame, as far as this backend reads it.
-///
-/// Six fields out of a 528-byte descriptor. VideoToolbox keeps its own reference-picture buffer
-/// and parses the real bitstream, so the reference list, the segmentation probabilities and the
-/// loop-filter deltas are all decoded by the hardware from the bytes the guest also sent -- the
-/// descriptor is consulted only for what the *container* has to declare before the bitstream can
-/// be handed over.
-///
-/// That is also why nothing here rewrites the descriptor. The C translates every `ref[i]` from a
-/// guest buffer handle into a host buffer id before passing it on, and then the VideoToolbox
-/// backend reads none of them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Vp9Frame {
-    /// `frame_type == 0`: a key frame, which re-seeds every reference slot. An intra-only frame
-    /// is not one -- it does not refresh them all.
-    pub key: bool,
-    pub profile: u8,
-    pub bit_depth: u8,
-    /// The vpcC encoding, not the stream's two flags: 1 is 4:2:0, 3 is 4:4:4.
-    pub subsampling: u8,
-    pub width: u32,
-    pub height: u32,
-}
-
-impl Vp9Frame {
-    /// Where each field sits in `struct virgl_vp9_picture_desc`, measured with `offsetof` rather
-    /// than counted by hand.
-    const FRAME_WIDTH: usize = 328;
-    const FRAME_HEIGHT: usize = 330;
-    const PIC_FIELDS: usize = 332;
-    const PROFILE: usize = 354;
-    const BIT_DEPTH: usize = 355;
-
-    /// How much of a VP9 picture descriptor is read: through `bit_depth`, the last field this
-    /// backend consults.
-    const DESCRIPTOR_BYTES: usize = Vp9Frame::BIT_DEPTH + 1;
-
-    /// `pic_fields` bit positions, measured the same way.
-    const SUBSAMPLING_X: u32 = 1 << 0;
-    const SUBSAMPLING_Y: u32 = 1 << 1;
-    const FRAME_TYPE: u32 = 1 << 2;
-
-    /// Read a descriptor the guest wrote.
-    ///
-    /// Total on purpose: a short descriptor reads as zeros rather than failing, which is what the
-    /// C does and what the protocol allows -- the resource carries whatever the guest's driver
-    /// wrote and its size is the guest's choice. A field that reads zero falls back to the
-    /// codec's own creation arguments, which is the only place a missing extent can come from.
-    pub fn read(blob: &[u8], codec_width: u32, codec_height: u32) -> Vp9Frame {
-        let byte = |at: usize| blob.get(at).copied().unwrap_or(0);
-        let short = |at: usize| u16::from_le_bytes([byte(at), byte(at + 1)]) as u32;
-        let word =
-            |at: usize| u32::from_le_bytes([byte(at), byte(at + 1), byte(at + 2), byte(at + 3)]);
-
-        let fields = word(Vp9Frame::PIC_FIELDS);
-        let width = short(Vp9Frame::FRAME_WIDTH);
-        let height = short(Vp9Frame::FRAME_HEIGHT);
-        Vp9Frame {
-            key: fields & Vp9Frame::FRAME_TYPE == 0,
-            profile: byte(Vp9Frame::PROFILE),
-            // A descriptor that declares no depth means the only one profile 0 has.
-            bit_depth: match byte(Vp9Frame::BIT_DEPTH) {
-                0 => 8,
-                depth => depth,
-            },
-            subsampling: if fields & Vp9Frame::SUBSAMPLING_X != 0
-                && fields & Vp9Frame::SUBSAMPLING_Y != 0
-            {
-                1
-            } else {
-                3
-            },
-            width: if width == 0 { codec_width } else { width },
-            height: if height == 0 { codec_height } else { height },
-        }
-    }
-
-    /// The codec configuration record a session for this frame is built around.
-    fn configuration(&self) -> Configuration {
-        Configuration::vp9(self.profile, self.bit_depth, self.subsampling)
-    }
-}
-
 /// One plane of a decode target: where the decoded plane is copied to.
 ///
 /// Everything needed to make that copy is captured when the target is created, so delivery never
@@ -349,10 +274,23 @@ pub enum Destination {
     Composite(Arc<Texture>),
 }
 
+/// What a decode target is to a backend that keeps storage of its own for each one.
+///
+/// VA-API decodes into surfaces it allocates, and a reference picture is a surface: the decode
+/// thread keeps one per target and finds it by this. Not the guest's handle -- a handle is
+/// re-created over a live target (see [`Video::create_buffer`]), and two targets under one name
+/// would share one surface. The thread holds only a `Weak`, so a target the guest destroyed
+/// shows there as an entry that no longer upgrades, and nothing on this side has to go and tell
+/// it.
+#[derive(Debug)]
+pub struct Identity(());
+
 /// A decode target: the picture the guest handed us to decode into.
 pub struct Buffer {
     /// The create that made this target, kept so a rebuild can make it again. See [`Codec`].
     retained: Retained,
+    #[cfg_attr(not(va), expect(dead_code, reason = "only VA-API keeps storage per target"))]
+    identity: Arc<Identity>,
     pub format: Layout,
     pub width: u32,
     pub height: u32,
@@ -451,48 +389,37 @@ impl Gate {
 /// bitstream and takes its extent from the codec -- and the three answers the rest of the frame
 /// needs are asked for by name rather than each caller knowing which codec it has.
 #[derive(Clone)]
+#[cfg_attr(
+    va,
+    expect(dead_code, reason = "VA-API serves VP9 alone so far; these feed the session backend")
+)]
 enum Shape {
-    Vp9(Vp9Frame),
+    /// Boxed: the descriptor is read whole, for a backend that hands every field to the driver.
+    Vp9(Box<vp9::Frame>),
     /// H.264: the parameter sets the last descriptor was written into, and whether an IDR slice
     /// has turned up in the access unit so far.
     ///
     /// The sets are kept rather than the descriptor they came from because they *are* the
     /// session's configuration -- keeping the descriptor would leave two places holding one
     /// fact, and the one the session was built from would be the derived copy.
-    H264 {
-        sets: h264::ParameterSets,
-        key: bool,
-        width: u32,
-        height: u32,
-    },
+    H264 { sets: h264::ParameterSets, key: bool, width: u32, height: u32 },
     /// HEVC: the same, with three sets. Key-ness comes from the descriptor here rather than
     /// from the bitstream -- `IDRPicFlag` and `RAPPicFlag` are on the wire, and H.264 has no
     /// equivalent.
-    Hevc {
-        sets: h265::ParameterSets,
-        key: bool,
-        width: u32,
-        height: u32,
-    },
+    Hevc { sets: h265::ParameterSets, key: bool, width: u32, height: u32 },
     /// AV1: the frame's own descriptor, because the serializer writes the whole bitstream out of
     /// it, and the `av1C` box the session is configured by.
     ///
     /// Boxed: the descriptor is a kilobyte, and every open frame would otherwise carry that much
     /// whatever its codec.
-    Av1 {
-        desc: Box<av1::FrameDesc>,
-        config: Vec<u8>,
-        key: bool,
-        width: u32,
-        height: u32,
-    },
+    Av1 { desc: Box<av1::FrameDesc>, config: Vec<u8>, key: bool, width: u32, height: u32 },
 }
 
 impl Shape {
     /// Whether this frame re-seeds the reference pictures.
     fn key(&self) -> bool {
         match self {
-            Shape::Vp9(frame) => frame.key,
+            Shape::Vp9(frame) => frame.key(),
             Shape::H264 { key, .. } | Shape::Hevc { key, .. } | Shape::Av1 { key, .. } => *key,
         }
     }
@@ -509,24 +436,16 @@ impl Shape {
     }
 
     /// The extent the decoded picture is expected to come back at.
+    #[cfg_attr(
+        all(va, not(test)),
+        expect(dead_code, reason = "VA-API reads the extent from the VP9 frame")
+    )]
     fn extent(&self) -> (u32, u32) {
         match self {
             Shape::Vp9(frame) => (frame.width, frame.height),
             Shape::H264 { width, height, .. }
             | Shape::Hevc { width, height, .. }
             | Shape::Av1 { width, height, .. } => (*width, *height),
-        }
-    }
-
-    /// The codec configuration record a session for this frame is built around.
-    fn configuration(&self) -> Configuration {
-        match self {
-            Shape::Vp9(frame) => frame.configuration(),
-            Shape::H264 { sets, .. } => Configuration::h264(sets.sps.clone(), sets.pps.clone()),
-            Shape::Hevc { sets, .. } => {
-                Configuration::hevc(sets.vps.clone(), sets.sps.clone(), sets.pps.clone())
-            }
-            Shape::Av1 { config, .. } => Configuration::av1c(config.clone()),
         }
     }
 
@@ -809,13 +728,16 @@ trait Backend: Default {
     type Unit: Send + 'static;
 
     /// The unit for one submission. `pixels` is the layout the target wants, or `None` for a
-    /// unit with no target.
+    /// unit with no target. `buffers` is the context's targets, which a backend that is handed
+    /// the reference list resolves the descriptor's handles against -- here, on the render
+    /// thread, where the one table of them is.
     fn unit(
         name: &'static str,
         shape: &Shape,
         bytes: &[u8],
         delivery: Delivery<'_>,
         pixels: Option<PixelFormat>,
+        buffers: &Buffers,
     ) -> Self::Unit;
 
     /// Decode one unit, on the decode thread. `None` is a frame with no picture to deliver:
@@ -1017,10 +939,21 @@ fn write_planes(
     written
 }
 
+/// What a submission at END_FRAME needs from around the codec: the renderer's GL and its count of
+/// unsettled pictures, and the context's targets.
+#[derive(Clone, Copy)]
+struct Around<'a> {
+    gl: &'a Gl,
+    unsettled: &'a pending::Unsettled,
+    buffers: &'a Buffers,
+}
+
 /// The host's decoder, as the render thread sees it: a codec's decode thread, and what a job
 /// needs from this side before it can go.
 struct HostDecoder<'a> {
     gl: &'a Gl,
+    /// The context's targets, for a backend that resolves the descriptor's reference handles.
+    buffers: &'a Buffers,
     decoder: &'a mut Decoder,
     /// Which codec the host was asked for, for a message about the host.
     codec: &'static str,
@@ -1059,7 +992,7 @@ impl Submit for HostDecoder<'_> {
         self.decoder.send(
             Job {
                 codec: handle,
-                unit: backend::Host::unit(self.codec, shape, unit, delivery, pixels),
+                unit: backend::Host::unit(self.codec, shape, unit, delivery, pixels, self.buffers),
                 write,
                 landing,
                 sent: std::time::Instant::now(),
@@ -1211,14 +1144,16 @@ impl Av1 {
 
 impl Codec {
     /// The host's decoder for this codec's frames.
-    fn host<'a>(&'a mut self, gl: &'a Gl, unsettled: &'a pending::Unsettled) -> HostDecoder<'a> {
-        HostDecoder { gl, decoder: &mut self.decoder, codec: self.kind.name(), unsettled }
+    fn host<'a>(&'a mut self, around: Around<'a>) -> HostDecoder<'a> {
+        let Around { gl, unsettled, buffers } = around;
+        HostDecoder { gl, buffers, decoder: &mut self.decoder, codec: self.kind.name(), unsettled }
     }
 
     /// DECODE_BITSTREAM for AV1. See [`Av1::advance`].
     fn decode_av1(
         &mut self,
         env: &Env<'_>,
+        buffers: &Buffers,
         handle: VideoCodecHandle,
         target: VideoBufferHandle,
         descriptor: &[u8],
@@ -1227,7 +1162,8 @@ impl Codec {
         let Codec { kind: Kind::Av1(av1), decoder, frame, width, height, .. } = self else {
             unreachable!("only an AV1 codec decodes an AV1 frame");
         };
-        let mut host = HostDecoder { gl: env.gl, decoder, codec: "AV1", unsettled: env.unsettled };
+        let mut host =
+            HostDecoder { gl: env.gl, buffers, decoder, codec: "AV1", unsettled: env.unsettled };
         let next = av1.advance(&mut host, handle, descriptor, (*width, *height))?;
         let (accumulated, shape) = frame.open_on(target)?;
         accumulated.append(bitstream, env.budget)?;
@@ -1238,8 +1174,7 @@ impl Codec {
     /// END_FRAME for AV1. See [`Av1::end`].
     fn end_av1_frame(
         &mut self,
-        gl: &Gl,
-        unsettled: &pending::Unsettled,
+        around: Around<'_>,
         handle: VideoCodecHandle,
         shape: &Shape,
         tiles: &[u8],
@@ -1248,7 +1183,8 @@ impl Codec {
         let Codec { kind: Kind::Av1(av1), decoder, .. } = self else {
             unreachable!("only an AV1 codec ends an AV1 frame");
         };
-        let mut host = HostDecoder { gl, decoder, codec: "AV1", unsettled };
+        let Around { gl, unsettled, buffers } = around;
+        let mut host = HostDecoder { gl, buffers, decoder, codec: "AV1", unsettled };
         av1.end(&mut host, handle, shape, tiles, buffer)
     }
 }
@@ -1306,7 +1242,7 @@ impl core::fmt::Display for Refusal {
 /// The prefixes are short because the hardware parses the real bitstream: what the descriptor is
 /// consulted for is only what the *container* has to declare before the bytes can be handed over.
 pub const DESCRIPTOR_BYTES: usize = {
-    let mut most = Vp9Frame::DESCRIPTOR_BYTES;
+    let mut most = vp9::DESCRIPTOR_BYTES;
     if h264::DESCRIPTOR_BYTES > most {
         most = h264::DESCRIPTOR_BYTES;
     }
@@ -1322,7 +1258,7 @@ pub const DESCRIPTOR_BYTES: usize = {
 // A leg that forgets to widen the read gets a short descriptor and reads its own fields as
 // zeros -- so the build fails instead.
 const _: () = {
-    assert!(DESCRIPTOR_BYTES >= Vp9Frame::DESCRIPTOR_BYTES);
+    assert!(DESCRIPTOR_BYTES >= vp9::DESCRIPTOR_BYTES);
     assert!(DESCRIPTOR_BYTES >= h264::DESCRIPTOR_BYTES);
     assert!(DESCRIPTOR_BYTES >= h265::DESCRIPTOR_BYTES);
     assert!(DESCRIPTOR_BYTES >= av1::DESCRIPTOR_BYTES);
@@ -1396,13 +1332,19 @@ pub fn advertised(support: Option<&decode::Support>) -> Vec<Profile> {
     .collect()
 }
 
+/// A codec handle this context never created, or has destroyed.
+const NO_SUCH_CODEC: Refusal = Refusal::NoSuchObject("no such video codec");
+
+/// A context's decode targets, by the guest's handle.
+type Buffers = BTreeMap<VideoBufferHandle, Arc<Buffer>>;
+
 /// The codecs and decode targets one context owns.
 #[derive(Default)]
 pub struct Video {
     codecs: BTreeMap<VideoCodecHandle, Codec>,
     /// Shared because a codec mid-frame holds the target it is decoding into, and a frozen
     /// target outlives the guest's own reference to it.
-    buffers: BTreeMap<VideoBufferHandle, Arc<Buffer>>,
+    buffers: Buffers,
     /// Formats already named in an unserved-layout message.
     ///
     /// The message is about the format, not the buffer, so it is worth saying once however many
@@ -1522,7 +1464,14 @@ impl Video {
         }
         self.buffers.insert(
             handle,
-            Arc::new(Buffer { retained: at, format: layout, width, height, destination }),
+            Arc::new(Buffer {
+                retained: at,
+                identity: Arc::new(Identity(())),
+                format: layout,
+                width,
+                height,
+                destination,
+            }),
         );
         Ok(())
     }
@@ -1608,14 +1557,15 @@ impl Video {
         bitstream: &[u8],
     ) -> Result<(), Refusal> {
         let handle = codec;
-        let codec = self.codec_mut(codec)?;
+        let Video { codecs, buffers, .. } = self;
+        let codec = codecs.get_mut(&handle).ok_or(NO_SUCH_CODEC)?;
         let (width, height) = (codec.width, codec.height);
         // AV1 is the odd one and takes the whole call: its descriptor settles the *previous*
         // frame's reference slot, so a frame the serializer is holding goes out here rather than
         // at END_FRAME -- and a stream may display a hidden frame just one decode later, which
         // leaves no margin.
         if matches!(codec.kind, Kind::Av1(_)) {
-            return codec.decode_av1(env, handle, target, descriptor, bitstream);
+            return codec.decode_av1(env, buffers, handle, target, descriptor, bitstream);
         }
 
         let (accumulated, shape) = codec.frame.open_on(target)?;
@@ -1624,7 +1574,9 @@ impl Video {
         accumulated.append(bitstream, env.budget)?;
 
         match &mut codec.kind {
-            Kind::Vp9 => *shape = Some(Shape::Vp9(Vp9Frame::read(descriptor, width, height))),
+            Kind::Vp9 => {
+                *shape = Some(Shape::Vp9(Box::new(vp9::Frame::read(descriptor, width, height))));
+            }
             Kind::H264(h264_profile) => {
                 let h264_profile = *h264_profile;
                 // Nothing on the wire says which `pic_parameter_set_id` the guest's slices
@@ -1705,7 +1657,7 @@ impl Video {
     }
 
     fn codec_mut(&mut self, handle: VideoCodecHandle) -> Result<&mut Codec, Refusal> {
-        self.codecs.get_mut(&handle).ok_or(Refusal::NoSuchObject("no such video codec"))
+        self.codecs.get_mut(&handle).ok_or(NO_SUCH_CODEC)
     }
 }
 
@@ -1722,7 +1674,8 @@ impl Video {
         target: VideoBufferHandle,
     ) -> Result<(), Refusal> {
         self.deliver_landed(gl);
-        let codec = self.codec_mut(handle)?;
+        let Video { codecs, buffers, .. } = self;
+        let codec = codecs.get_mut(&handle).ok_or(NO_SUCH_CODEC)?;
         let Frame::Open { handle: began_on, target: buffer, bitstream, shape } =
             std::mem::replace(&mut codec.frame, Frame::Idle)
         else {
@@ -1761,13 +1714,15 @@ impl Video {
         // AV1's unit is synthesized from the descriptor rather than re-framed from what the
         // guest sent, and may be held rather than submitted at all.
         if let Shape::Av1 { .. } = shape {
-            return codec.end_av1_frame(gl, unsettled, handle, &shape, &bitstream, buffer);
+            let around = Around { gl, unsettled, buffers };
+            return codec.end_av1_frame(around, handle, &shape, &bitstream, buffer);
         }
         let Some(unit) = shape.access_unit(bitstream.into_bytes()) else {
             eprintln!("[virglrs] video codec {handle}: the access unit is not Annex-B framed");
             return Err(Refusal::HostRefusedFrame);
         };
-        codec.host(gl, unsettled).submit(handle, &shape, &unit, Some(&buffer))
+        let around = Around { gl, unsettled, buffers };
+        codec.host(around).submit(handle, &shape, &unit, Some(&buffer))
     }
 }
 
@@ -1950,51 +1905,6 @@ mod tests {
         assert!(agreed > 50 && refused > 50, "{agreed} agreed, {refused} refused");
     }
 
-    /// The descriptor offsets are the load-bearing numbers in this file: read one wrong and the
-    /// session is built for a frame nobody sent. They were measured with `offsetof` against
-    /// `struct virgl_vp9_picture_desc`, so the test builds a descriptor the same way -- by
-    /// planting each field at its offset -- and checks it reads back.
-    #[test]
-    fn the_descriptor_fields_are_where_offsetof_put_them() {
-        let mut blob = vec![0u8; DESCRIPTOR_BYTES];
-        blob[Vp9Frame::FRAME_WIDTH..][..2].copy_from_slice(&640u16.to_le_bytes());
-        blob[Vp9Frame::FRAME_HEIGHT..][..2].copy_from_slice(&480u16.to_le_bytes());
-        // subsampling_x and subsampling_y set, frame_type clear: a 4:2:0 key frame.
-        blob[Vp9Frame::PIC_FIELDS..][..4].copy_from_slice(&0b011u32.to_le_bytes());
-        blob[Vp9Frame::PROFILE] = 2;
-        blob[Vp9Frame::BIT_DEPTH] = 10;
-
-        let frame = Vp9Frame::read(&blob, 1, 1);
-        assert_eq!(
-            frame,
-            Vp9Frame {
-                key: true,
-                profile: 2,
-                bit_depth: 10,
-                subsampling: 1,
-                width: 640,
-                height: 480
-            }
-        );
-
-        // frame_type set is an inter frame, and it is the bit the keyframe gate turns on.
-        blob[Vp9Frame::PIC_FIELDS] = 0b111;
-        assert!(!Vp9Frame::read(&blob, 1, 1).key);
-    }
-
-    /// A guest need not fill the prefix, and a descriptor shorter than the fields we read must
-    /// not panic -- it reads as zeros, and zero means "take it from the codec".
-    #[test]
-    fn a_short_descriptor_falls_back_to_the_codec() {
-        for len in [0, 1, Vp9Frame::PIC_FIELDS, DESCRIPTOR_BYTES - 1] {
-            let frame = Vp9Frame::read(&vec![0u8; len], 352, 240);
-            assert_eq!(frame.width, 352, "len {len}");
-            assert_eq!(frame.height, 240, "len {len}");
-            assert_eq!(frame.bit_depth, 8, "len {len}: profile 0 has only one depth");
-            assert!(frame.key, "len {len}: frame_type zero is a key frame");
-        }
-    }
-
     /// The two halves of the composite-target promise have to move together. A format that
     /// reports more than one plane is one the capset offers only if this build can back it, so
     /// making one backable without the path behind it is what this test is here to catch.
@@ -2062,14 +1972,7 @@ mod tests {
     /// re-framed, and each reports its own extent and key-ness.
     #[test]
     fn a_shape_answers_for_its_own_codec() {
-        let vp9 = Shape::Vp9(Vp9Frame {
-            key: true,
-            profile: 0,
-            bit_depth: 8,
-            subsampling: 1,
-            width: 320,
-            height: 240,
-        });
+        let vp9 = Shape::Vp9(Box::new(vp9::test_frame(true, 320, 240)));
         assert!(vp9.key());
         assert_eq!(vp9.extent(), (320, 240));
         assert_eq!(vp9.access_unit(vec![1, 2, 3]), Some(vec![1, 2, 3]));
@@ -2123,7 +2026,7 @@ mod tests {
         // variant, and a host with no decoder has nothing to name -- so only the naming is gated.
         // Everything above is the reshaping, which is every host's.
         #[cfg(target_os = "macos")]
-        assert!(matches!(av1.configuration(), Configuration::Av1c(_)));
+        assert!(matches!(av1.configuration(), crate::decode::Configuration::Av1c(_)));
     }
 
     /// Where a fake decoder was told a unit's picture goes.
@@ -2164,6 +2067,7 @@ mod tests {
     fn av1_target() -> Arc<Buffer> {
         Arc::new(Buffer {
             retained: Retained::new(crate::vrend::journal::Seq::default(), &[]),
+            identity: Arc::new(Identity(())),
             format: Layout::Unserved(0),
             width: 640,
             height: 360,

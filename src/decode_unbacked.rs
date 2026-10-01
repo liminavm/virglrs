@@ -17,8 +17,9 @@
 //! somebody has to keep correct. The methods are `match *self {}`: total, because there is no
 //! value to answer for.
 //!
-//! Linux decodes through VA-API, and that is what replaces this module -- not a stub inside it.
-//! Until then this is the honest description of the host: it decodes nothing.
+//! A Linux build with the `vaapi` feature decodes through VA-API (`vaapi.rs`), which replaces
+//! this module rather than living in it. Without the feature this is the honest description of
+//! the host: it decodes nothing.
 //!
 //! No unsafe here, and no foreign calls: there is no library to call.
 
