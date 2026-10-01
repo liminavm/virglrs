@@ -25,6 +25,7 @@
 # only the first divergence: the whole result list is the fixture.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 RIG="$HERE/../vm"
 UPSTREAM="$HERE/upstream"
 RESOURCES="$HERE/resources"
@@ -87,17 +88,17 @@ VECTORS=${FLUSTER_VECTORS:-}
 TV=
 [ -n "$VECTORS" ] && TV="-tv $VECTORS"
 
-# Boot the stock guest -- the tier the video path lives on, and the one the three video corpora
-# were recorded from -- run every complete suite in it, and bring it down.
-#
-# The vectors are shared read-only rather than copied in: several GB against a 13 GB image, and
-# both legs must read the same bytes for the diff to mean anything.
-run_leg() {
-    local leg="$1" app disk log
+# The guest's login. limina's stock disk has `claude`; a QEMU guest is whatever its image was
+# provisioned with.
+GUEST_USER="${FLUSTER_GUEST_USER:-claude}"
+
+# Boot the stock guest under limina: macOS, where the video path is VideoToolbox. Sets `vm` to
+# the process to bring down.
+boot_limina() {
+    local leg="$1" log="$2" app disk
     case "$leg" in
         c)     app="$RIG/Limina.app" ;;
         rs)    app="$RIG/Limina-rust.app" ;;
-        *) echo "unknown leg: $leg (c|rs)" >&2; return 2 ;;
     esac
     [ -x "$app/Contents/MacOS/limina" ] || {
         echo "no rig -- run harness/vm/make-rig.sh --renderer $([ "$leg" = c ] && echo c || echo rust)" >&2
@@ -105,7 +106,6 @@ run_leg() {
     }
     disk="$RIG/disks/Fedora-Workstation-44.stock.test.raw"
     [ -f "$disk" ] || { echo "missing disk: $disk -- run harness/vm/make-rig.sh" >&2; return 1; }
-    log="$OUT/$leg-boot.log"
 
     # --display-capture and not --window: it attaches the virtio-gpu a headless boot otherwise
     # gets none of, and the guest with no GPU has no render node and so no VA driver at all.
@@ -114,23 +114,111 @@ run_leg() {
         --share "fluster=$HERE:ro" \
         --display-capture "$OUT/$leg-frame.png" --display-size 1280x800 \
         --firmware "$app/Contents/Resources/KRUN_EFI.gop.fd" > "$log" 2>&1 &
-    local vm=$!
-    # Bring the VM down however this returns -- including a failed run. A limina left holding the
+    vm=$!
+}
+
+# Boot a guest under stock QEMU: Linux, where the video path is VA-API. Sets `vm` and `vfs`.
+#
+# The renderer is chosen the way the goiaba rig chooses it, by putting a directory holding a
+# `libvirglrenderer.so.1` in front of the system's: QEMU's virtio-gpu-gl module links it by that
+# name with unversioned symbols. A directory and not a file -- a file path resolves nothing, and
+# the boot then succeeds on the system renderer and scores it in silence.
+#
+# The disk is a guest image the caller provisions (FLUSTER_GUEST_DISK, with FLUSTER_GUEST_SEED
+# for a cloud-init seed), booted with -snapshot: a run writes nothing back to an image other rigs
+# share. It needs a VA driver for virgl that decodes the suites -- Fedora's Mesa is built without
+# H.264 and HEVC, so a Fedora guest wants RPM Fusion's mesa-va-drivers-freeworld -- and GStreamer's
+# va plugin.
+boot_qemu() {
+    local leg="$1" log="$2" lib disk seed
+    case "$leg" in
+        c)  lib="$ROOT/third_party/virgl-prefix/lib64"
+            [ -d "$lib" ] || lib="$ROOT/third_party/virgl-prefix/lib" ;;
+        rs) "$ROOT/install.sh" >/dev/null || return 1
+            lib="$ROOT/prefix/lib" ;;
+    esac
+    [ -e "$lib/libvirglrenderer.so.1" ] || { echo "no libvirglrenderer.so.1 in $lib" >&2; return 1; }
+    disk="${FLUSTER_GUEST_DISK:-}"
+    [ -f "$disk" ] || { echo "set FLUSTER_GUEST_DISK to a provisioned guest image" >&2; return 1; }
+    seed="${FLUSTER_GUEST_SEED:-}"
+
+    # virtiofs needs guest RAM QEMU can share with the daemon, so it is a memfd; the size is
+    # written once and used twice, or the guest boots with a different amount than it was given.
+    local mem=4G sock="$OUT/$leg-vfs.sock"
+    rm -f "$sock"
+    /usr/libexec/virtiofsd --socket-path="$sock" --shared-dir="$HERE" --readonly \
+        --sandbox=none > "$OUT/$leg-virtiofsd.log" 2>&1 &
+    vfs=$!
+    local waited=0
+    until [ -S "$sock" ]; do
+        sleep 0.2
+        waited=$((waited + 1))
+        [ "$waited" -lt 50 ] || { echo "virtiofsd never listened, see $OUT/$leg-virtiofsd.log" >&2; return 1; }
+    done
+
+    env LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" qemu-system-x86_64 \
+        -enable-kvm -cpu host -m "$mem" -smp 4 \
+        -object memory-backend-memfd,id=mem0,size="$mem",share=on \
+        -machine memory-backend=mem0 \
+        -snapshot \
+        -drive file="$disk",if=virtio \
+        ${seed:+-drive file="$seed",if=virtio,format=raw,readonly=on} \
+        -vga none \
+        -device virtio-gpu-gl-pci \
+        -display egl-headless,rendernode="${FLUSTER_RENDER_NODE:-/dev/dri/renderD128}" \
+        -chardev socket,id=vfs,path="$sock" \
+        -device vhost-user-fs-pci,chardev=vfs,tag=limina-fluster \
+        -netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$PORT"-:22 \
+        -device virtio-net-pci,netdev=n0 \
+        -serial file:"$OUT/$leg-serial.log" > "$log" 2>&1 &
+    vm=$!
+}
+
+# Boot the stock guest -- the tier the video path lives on, and the one the three video corpora
+# were recorded from -- run every complete suite in it, and bring it down.
+#
+# The vectors are shared read-only rather than copied in: several GB against a 13 GB image, and
+# both legs must read the same bytes for the diff to mean anything.
+run_leg() {
+    local leg="$1" log vm= vfs=
+    case "$leg" in
+        c|rs) ;;
+        *) echo "unknown leg: $leg (c|rs)" >&2; return 2 ;;
+    esac
+    log="$OUT/$leg-boot.log"
+    # Bring the VM down however this returns -- including a failed run. A VM left holding the
     # disk makes the NEXT leg fail to boot, which reads like a renderer that cannot start.
-    trap 'kill "$vm" 2>/dev/null; wait "$vm" 2>/dev/null' RETURN
+    trap 'kill $vm $vfs 2>/dev/null; wait $vm $vfs 2>/dev/null' RETURN
+    if [ "$(uname -s)" = Darwin ]; then
+        boot_limina "$leg" "$log" || return 1
+    else
+        boot_qemu "$leg" "$log" || return 1
+    fi
 
     echo "==> $leg: booting (log: $log)"
     local waited=0
-    until ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 -o BatchMode=yes claude@127.0.0.1 true 2>/dev/null; do
+    until ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 -o BatchMode=yes "$GUEST_USER"@127.0.0.1 true 2>/dev/null; do
         sleep 3
         waited=$((waited + 3))
         [ "$waited" -lt 180 ] || { echo "$leg: no ssh after ${waited}s, see $log" >&2; return 1; }
         kill -0 "$vm" 2>/dev/null || { echo "$leg: the VM exited, see $log" >&2; return 1; }
     done
 
+    # Which renderer QEMU actually loaded, from its own log: virglrs announces itself at init and
+    # the C does not. A library path that resolved nothing still boots, on the system renderer,
+    # and every number after that would be about the wrong leg.
+    if [ "$(uname -s)" != Darwin ]; then
+        local said
+        said=$(grep -c '\[virglrs\]' "$log")
+        case "$leg" in
+            rs) [ "$said" -gt 0 ] || { echo "rs: QEMU did not load virglrs, see $log" >&2; return 1; } ;;
+            c)  [ "$said" -eq 0 ] || { echo "c: QEMU loaded virglrs, see $log" >&2; return 1; } ;;
+        esac
+    fi
+
     echo "==> $leg: running ${SUITES[*]}"
     # The guest has no limina agent, so the share is mounted by hand rather than at /media.
-    ssh "${SSH_OPTS[@]}" claude@127.0.0.1 "
+    ssh "${SSH_OPTS[@]}" "$GUEST_USER"@127.0.0.1 "
         set -e
         sudo mkdir -p /media/fluster
         mountpoint -q /media/fluster || sudo mount -t virtiofs limina-fluster /media/fluster
@@ -141,11 +229,18 @@ run_leg() {
     " > "$OUT/$leg-run.log" 2>&1
     local rc=$?
 
-    scp "${SCP_OPTS[@]}" claude@127.0.0.1:/tmp/summary.json "$OUT/$leg.json" 2>/dev/null || {
-        echo "$leg: no summary came back (fluster rc=$rc), see $OUT/$leg-run.log" >&2
+    scp "${SCP_OPTS[@]}" "$GUEST_USER"@127.0.0.1:/tmp/summary.json "$OUT/$leg.json" 2>/dev/null || {
+        # fluster skips a decoder whose GStreamer element does not exist, and the guest's VA
+        # plugin registers a decoder element only for a profile the host advertises. Every one
+        # skipped is a host that serves no video, which is not the same finding as a failed run.
+        if [ "$(grep -c 'because it cannot be run' "$OUT/$leg-run.log")" -eq "${#DECODERS[@]}" ]; then
+            echo "$leg: the guest has no VA decoder for any suite -- the host advertises no video" >&2
+        else
+            echo "$leg: no summary came back (fluster rc=$rc), see $OUT/$leg-run.log" >&2
+        fi
         return 1
     }
-    ssh "${SSH_OPTS[@]}" claude@127.0.0.1 'sudo systemctl poweroff' 2>/dev/null || true
+    ssh "${SSH_OPTS[@]}" "$GUEST_USER"@127.0.0.1 'sudo systemctl poweroff' 2>/dev/null || true
 
     # The fixture is the verdicts alone. Times, the machine's own description and the per-profile
     # tallies all vary run to run and would make a pin that never matches twice.

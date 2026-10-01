@@ -1209,6 +1209,17 @@ not moved (the host's).
 makes a single divergence worth reading as a defect rather than as noise. On the current build they
 agree on all 587, which is one run against the pin rather than a repeated measurement.
 
+**On Linux the guest runs under stock QEMU**, not limina, and each leg is a renderer library put
+in front of the system's: `third_party/virgl-prefix` for the C, `prefix/` for virglrs. The guest
+image is the caller's, named by `FLUSTER_GUEST_DISK` (with `FLUSTER_GUEST_SEED` for a cloud-init
+seed and `FLUSTER_GUEST_USER` for its login), and is booted with `-snapshot` so a run writes
+nothing back. The vectors reach it over virtiofs, which does not follow a symlink out of the
+shared directory, so `resources/` and `upstream/` must be real directories. The script refuses a
+boot whose QEMU log does not name the renderer the leg asked for. A Fedora guest needs RPM Fusion's
+`mesa-va-drivers-freeworld`, because Fedora's Mesa is built without H.264 and HEVC; and upstream
+virglrenderer serves VA decode only on a Mesa driver, so on an Intel host the C leg decodes
+nothing and the gate is the published md5 alone.
+
 `-t 120` rather than fluster's default 30 seconds, because a `Timeout` is a verdict about the
 clock and a verdict about the clock cannot be pinned. `MR4_TANDBERG_C` and `MR5_TANDBERG_C` time
 out at 120 too, so they are reliably too slow rather than borderline, and *that* is stable.
