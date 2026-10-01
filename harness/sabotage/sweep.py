@@ -2630,10 +2630,31 @@ SABOTAGES = [
     (
         'a draw is recorded with no pipeline bound at its point',
         'src/venus/driver.rs',
-        """        if !bound.has(point) {
-            return Err(Unrecorded::Unbound);""",
-        """        if false && !bound.has(point) {
-            return Err(Unrecorded::Unbound);""",
+        """        let binding = bound.at(point).ok_or(Unrecorded::Unbound)?;
+        self.pipelines
+            .get(&binding.pipeline)
+            .filter(|facts| facts.serial == binding.serial)
+            .ok_or(Unrecorded::Destroyed)?;""",
+        """        let _ = bound;""",
+        'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
+    ),
+    (
+        'a draw is recorded with the pipeline bound at its point destroyed',
+        'src/venus/driver.rs',
+        """        let binding = bound.at(point).ok_or(Unrecorded::Unbound)?;
+        self.pipelines
+            .get(&binding.pipeline)
+            .filter(|facts| facts.serial == binding.serial)
+            .ok_or(Unrecorded::Destroyed)?;""",
+        """        let _binding = bound.at(point).ok_or(Unrecorded::Unbound)?;""",
+        'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
+    ),
+    (
+        "a draw takes a reused pipeline handle for the pipeline that was bound",
+        'src/venus/driver.rs',
+        """            .filter(|facts| facts.serial == binding.serial)
+            .ok_or(Unrecorded::Destroyed)?;""",
+        """            .ok_or(Unrecorded::Destroyed)?;""",
         'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
     ),
     (
@@ -2666,7 +2687,7 @@ SABOTAGES = [
         'a served bind marks nothing bound',
         'src/venus/driver.rs',
         """        let child = self.pools.child_mut(cb).expect("the pool record `device_of` just read");
-        child.bound = child.bound.with(point);
+        child.bound = child.bound.with(point, Binding { pipeline, serial: facts.serial });
 """,
         """        let child = self.pools.child_mut(cb).expect("the pool record `device_of` just read");
 """,

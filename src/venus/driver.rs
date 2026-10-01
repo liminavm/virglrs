@@ -219,29 +219,47 @@ impl BindPoint {
     }
 }
 
-/// The bind points of one command buffer's current recording that have a pipeline bound.
+/// Which pipeline each bind point of one command buffer's current recording has bound.
 ///
 /// A driver reads the bound pipeline's shaders when the draw is recorded, not when it runs:
 /// KosmicKrisp's `kk_CmdDispatch` reads `cmd->state.shaders[MESA_SHADER_COMPUTE]->info` and
 /// `kk_flush_pipeline` the vertex shader's Metal pipeline, with nothing checking either is there.
-/// A guest that draws before it binds takes the host down, so every draw, dispatch and trace is
-/// held to this.
+/// A guest that draws before it binds takes the host down, and so does one that destroys the
+/// pipeline it bound and then draws -- the driver's state still points at the freed shaders. So
+/// every draw, dispatch and trace is held to this, and through it to the pipeline table.
+///
+/// A point records a [`Binding`], a key into that table, and never a fact copied out of it: a
+/// destroyed pipeline then fails the lookup on its own, with nothing to purge here when it dies.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-struct Bound(u8);
+struct Bound([Option<Binding>; 3]);
 
 impl Bound {
-    fn bit(point: BindPoint) -> u8 {
-        1 << point as u8
+    fn with(mut self, point: BindPoint, binding: Binding) -> Self {
+        self.0[point as usize] = Some(binding);
+        self
     }
 
-    fn with(self, point: BindPoint) -> Self {
-        Self(self.0 | Self::bit(point))
-    }
-
-    fn has(self, point: BindPoint) -> bool {
-        self.0 & Self::bit(point) != 0
+    fn at(self, point: BindPoint) -> Option<Binding> {
+        self.0[point as usize]
     }
 }
+
+/// One pipeline, as a command buffer remembers binding it: its host handle and the serial its
+/// record was created with.
+///
+/// The handle alone is not a name. A driver may hand a freed pipeline's handle to the next one it
+/// makes -- KosmicKrisp's is the address of its `kk_pipeline` -- so a bind of a destroyed pipeline
+/// would read as a bind of its successor, whose shaders the recording never saw. The serial is
+/// what a reused handle cannot carry over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Binding {
+    pipeline: VkPipeline,
+    serial: PipelineSerial,
+}
+
+/// The order a pipeline's record was made in, unique for the life of a [`Driver`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PipelineSerial(u64);
 
 /// One live pool: the device that owns it, and what has been allocated from it.
 struct Pool {
@@ -505,6 +523,9 @@ pub enum Unrecorded {
     /// The command buffer's recording has bound no pipeline at the point the command draws,
     /// dispatches or traces with.
     Unbound,
+    /// The pipeline bound at that point has been destroyed since. Vulkan leaves the command
+    /// buffer invalid; the driver would read the freed pipeline's shaders.
+    Destroyed,
 }
 
 /// Why a run of pool objects was not freed. Neither reached the driver.
@@ -603,6 +624,8 @@ pub struct Driver {
     /// by host handle and kept honest as `query_pools` is: the record dies at both places the
     /// pipeline does.
     pipelines: BTreeMap<VkPipeline, PipelineFacts>,
+    /// The serial the next pipeline record takes. See [`Binding`].
+    next_pipeline: u64,
     /// Whether each live semaphore is binary or timeline.
     ///
     /// Vulkan fixes this at create and offers no way to ask afterwards, and three entry points are
@@ -2156,6 +2179,7 @@ impl Driver {
             instance: None,
             devices: BTreeMap::new(),
             pipelines: BTreeMap::new(),
+            next_pipeline: 0,
             physical_device_exts: BTreeMap::new(),
             withheld: ledger::withheld(),
             memory: BTreeMap::new(),
@@ -4031,7 +4055,7 @@ impl Driver {
         });
         if made.is_ok() {
             for pipeline in out.iter().filter(|p| p.host().raw() != 0) {
-                self.pipelines.insert(*pipeline, PipelineFacts { device, kind: I::KIND });
+                self.record_pipeline(*pipeline, device, I::KIND);
             }
         }
         made
@@ -4152,12 +4176,18 @@ impl Driver {
         if made.is_ok() {
             for (pipeline, groups) in out.iter().zip(groups) {
                 if pipeline.host().raw() != 0 {
-                    let kind = PipelineKind::RayTracing { groups };
-                    self.pipelines.insert(*pipeline, PipelineFacts { device, kind });
+                    self.record_pipeline(*pipeline, device, PipelineKind::RayTracing { groups });
                 }
             }
         }
         Ok(made)
+    }
+
+    /// Record a pipeline the driver just made, under a serial no earlier record had.
+    fn record_pipeline(&mut self, pipeline: VkPipeline, device: VkDevice, kind: PipelineKind) {
+        let serial = PipelineSerial(self.next_pipeline);
+        self.next_pipeline += 1;
+        self.pipelines.insert(pipeline, PipelineFacts { device, kind, serial });
     }
 
     /// Drop a pipeline's record. Called from the two places a pipeline dies, as
@@ -4545,13 +4575,23 @@ impl Driver {
         self.pools.adopt(pool, level, children.iter().copied());
     }
 
-    /// Mark a planted command buffer as having a pipeline bound at `point`, as a served
-    /// `vkCmdBindPipeline` would. Test scaffolding, beside [`Driver::plant_pool`]: a test about
-    /// a draw has no pipeline to create.
+    /// Bind a planted command buffer to a pipeline of `point`'s kind, as a served
+    /// `vkCmdBindPipeline` would, recording the pipeline too. Test scaffolding, beside
+    /// [`Driver::plant_pool`]: a test about a draw has no pipeline to create.
     #[cfg(test)]
     pub(super) fn plant_bound(&mut self, cb: VkCommandBuffer, point: BindPoint) {
+        let device = self.pools.device_of(cb).expect("a command buffer planted first");
+        let kind = match point {
+            BindPoint::Graphics => PipelineKind::Graphics,
+            BindPoint::Compute => PipelineKind::Compute,
+            BindPoint::RayTracing => PipelineKind::RayTracing { groups: 0 },
+        };
+        // Out of the way of any handle a planted driver hands out.
+        let pipeline = VkPipeline::forged(0xb0d0_0000 + self.next_pipeline);
+        self.record_pipeline(pipeline, device, kind);
+        let serial = self.pipelines[&pipeline].serial;
         let child = self.pools.child_mut(cb).expect("a command buffer planted first");
-        child.bound = child.bound.with(point);
+        child.bound = child.bound.with(point, Binding { pipeline, serial });
     }
 
     /// Whether a pool is still open, for the test that a reset keeps it so where a destroy does
@@ -4714,9 +4754,11 @@ impl Driver {
     /// recording has bound a pipeline at the point the command uses. See [`Bound`].
     fn drawer(&self, cb: VkCommandBuffer, point: BindPoint) -> Result<&DeviceFns, Unrecorded> {
         let bound = self.pools.bound(cb).ok_or(Unrecorded::NoDevice)?;
-        if !bound.has(point) {
-            return Err(Unrecorded::Unbound);
-        }
+        let binding = bound.at(point).ok_or(Unrecorded::Unbound)?;
+        self.pipelines
+            .get(&binding.pipeline)
+            .filter(|facts| facts.serial == binding.serial)
+            .ok_or(Unrecorded::Destroyed)?;
         self.recorder(cb).ok_or(Unrecorded::NoDevice)
     }
 
@@ -4975,7 +5017,7 @@ impl Driver {
     ) -> Result<(), BindRefused> {
         let device = self.pools.device_of(cb).ok_or(BindRefused::NoDevice)?;
         let point = BindPoint::of(bind_point).ok_or(BindRefused::UnknownBindPoint)?;
-        let facts = self
+        let facts = *self
             .pipelines
             .get(&pipeline)
             .filter(|p| p.device == device)
@@ -4987,7 +5029,7 @@ impl Driver {
         // SAFETY: as above.
         unsafe { (d.vkCmdBindPipeline())(cb, bind_point, pipeline) };
         let child = self.pools.child_mut(cb).expect("the pool record `device_of` just read");
-        child.bound = child.bound.with(point);
+        child.bound = child.bound.with(point, Binding { pipeline, serial: facts.serial });
         Ok(())
     }
 
@@ -8648,6 +8690,8 @@ enum Planned {
 struct PipelineFacts {
     device: VkDevice,
     kind: PipelineKind,
+    /// Which record this is, for a bind to name it by. See [`Binding`].
+    serial: PipelineSerial,
 }
 
 /// A pipeline's kind: the create that made it, and so the one bind point it may be bound at.

@@ -2361,6 +2361,7 @@ impl Handlers<'_> {
             Ok(()) => {}
             Err(driver::Unrecorded::NoDevice) => self.no_recorder(),
             Err(driver::Unrecorded::Unbound) => self.reject(UNBOUND),
+            Err(driver::Unrecorded::Destroyed) => self.reject(UNBOUND_DESTROYED),
         }
     }
 
@@ -2545,6 +2546,8 @@ fn bases_in_run<I: Derives>(infos: Decoded<'_, [I]>) -> bool {
 }
 
 const UNBOUND: &str = "drew, dispatched or traced with no pipeline bound at that point";
+const UNBOUND_DESTROYED: &str =
+    "drew, dispatched or traced with a pipeline destroyed since it was bound at that point";
 const BIND_UNKNOWN_POINT: &str = "bound a pipeline at a point this renderer serves none at";
 const BIND_UNKNOWN_PIPELINE: &str = "bound a pipeline its command buffer's device never made";
 const BIND_WRONG_KIND: &str = "bound a pipeline at another kind's bind point";
@@ -17590,7 +17593,8 @@ mod tests {
             VkCommandBufferResetFlags, VkCommandPool, VkCommandPoolResetFlags, VkDevice,
             VkPipeline, VkPipelineBindPoint, VkPipelineCache, vn_command_vkBeginCommandBuffer,
             vn_command_vkCmdBindPipeline, vn_command_vkCmdDispatch, vn_command_vkCmdDraw,
-            vn_command_vkResetCommandBuffer, vn_command_vkResetCommandPool,
+            vn_command_vkDestroyPipeline, vn_command_vkResetCommandBuffer,
+            vn_command_vkResetCommandPool,
         };
         use std::cell::{Cell, RefCell};
 
@@ -17656,6 +17660,13 @@ mod tests {
         ) {
             saw("draw");
         }
+        unsafe extern "C" fn destroy_pipeline(
+            _d: VkDevice,
+            _p: VkPipeline,
+            _a: *const VkAllocationCallbacks,
+        ) {
+            saw("destroy");
+        }
         unsafe extern "C" fn begin(
             _cb: VkCommandBuffer,
             _i: *const VkCommandBufferBeginInfo,
@@ -17683,6 +17694,7 @@ mod tests {
             fns.plant_vkCmdBindPipeline(record_bind);
             fns.plant_vkCmdDispatch(record_dispatch);
             fns.plant_vkCmdDraw(record_draw);
+            fns.plant_vkDestroyPipeline(destroy_pipeline);
             fns.plant_vkBeginCommandBuffer(begin);
             fns.plant_vkResetCommandBuffer(reset);
             fns.plant_vkResetCommandPool(reset_pool);
@@ -17736,9 +17748,9 @@ mod tests {
             assert_eq!(h.take_rejected(), None, "a compute pipeline is made");
             shadow[0]
         };
-        let graphics = |h: &mut Handlers<'_>| {
+        let graphics = |h: &mut Handlers<'_>, id: u64| {
             let infos = [VkGraphicsPipelineCreateInfo::default()];
-            let mut wire = [VkPipeline::forged(41)];
+            let mut wire = [VkPipeline::forged(id)];
             let mut shadow = [VkPipeline::forged(0)];
             let mut args = vn_command_vkCreateGraphicsPipelines::default();
             args.device = VkDevice::forged(DEVICE);
@@ -17784,7 +17796,7 @@ mod tests {
         assert_eq!(draw(&mut h), unbound, "a draw before any bind");
 
         let mine = compute(&mut h, DEVICE);
-        let shaded = graphics(&mut h);
+        let shaded = graphics(&mut h, 41);
         let theirs = compute(&mut h, OTHER);
         let refusals = [
             ("a compute pipeline at the graphics point", GRAPHICS, mine, BIND_WRONG_KIND),
@@ -17835,10 +17847,32 @@ mod tests {
         assert_eq!(h.take_rejected(), None);
         assert_eq!(dispatch(&mut h), unbound, "a dispatch after a pool reset");
 
+        // A destroyed pipeline leaves its bind point with nothing to draw with -- including when
+        // the driver hands its handle to the next pipeline it makes, which the recording never
+        // bound. Binding that one is a bind like any other.
+        assert_eq!(bind(&mut h, GRAPHICS, shaded), None);
+        h.vkDestroyPipeline(&mut vn_command_vkDestroyPipeline {
+            device: VkDevice::forged(DEVICE),
+            pipeline: shaded,
+            ..Default::default()
+        });
+        assert_eq!(h.take_rejected(), None);
+        let destroyed = Some(UNBOUND_DESTROYED);
+        assert_eq!(draw(&mut h), destroyed, "a draw with the bound pipeline destroyed");
+        NEXT.set(shaded.host().raw());
+        let reborn = graphics(&mut h, 42);
+        assert_eq!(reborn, shaded, "the stand-in driver reused the freed handle");
+        assert_eq!(draw(&mut h), destroyed, "a reused handle is not the pipeline that was bound");
+        assert_eq!(bind(&mut h, GRAPHICS, reborn), None);
+        assert_eq!(draw(&mut h), None, "a draw with the new pipeline bound");
+
         SAW.with_borrow(|s| {
             assert_eq!(
                 s.as_slice(),
-                ["bind", "dispatch", "bind", "draw", "bind", "bind"],
+                [
+                    "bind", "dispatch", "bind", "draw", "bind", "bind", "bind", "destroy", "bind",
+                    "draw"
+                ],
                 "every served command, and no refused one"
             );
         });
