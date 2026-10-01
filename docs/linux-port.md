@@ -311,14 +311,17 @@ Linux was adopted by nothing and composited as a blank texture.
 choice, and a tiled buffer's bytes are not pixels even if it does. Measured on this host: scanouts
 export with modifier `0x0100000000000001` (`I915_FORMAT_MOD_X_TILED`). So `Surface::readable()` is
 the question every
-CPU path asks first, a share with no host address is refused at the venus import rather than passed
-to a driver as a null pointer, and the harness read goes through the GPU instead.
+CPU path asks first, a share with no host address goes to a venus import as its descriptor rather
+than as a pointer, and the harness read goes through the GPU instead.
 
-**What is not written yet: a venus client importing a classic resource.** The share it resolves
-to is now a descriptor rather than nothing, and importing one means a dma-buf handle type at
-`vkAllocateMemory` instead of a host pointer. Until that is written the import is refused by name.
-Measured against a live guest: vkmark runs its whole scene set through venus and scores, hitting
-this refusal four times without failing.
+**A venus client imports a classic resource as its dma-buf.** `Storage::importable` says how a
+second device takes a storage's bytes -- host memory as a host pointer, the driver's export as its
+descriptor -- and both `vkGetMemoryResourcePropertiesMESA` and `vkAllocateMemory` answer from it,
+the second with `VkImportMemoryFdInfoKHR`. A descriptor carries no layout, so the image the memory
+is dedicated to must claim the one the bytes have: its explicit DRM-modifier layout is held to the
+export's, or to linear rows where the export has none, and a mismatch is refused before the driver
+sees it. That check is what makes linear shared buffers (below) load-bearing for a Vulkan
+compositor: the guest claims the layout `GET_PIPE_RESOURCE_LAYOUT` told it.
 
 **Gate.** The census turning non-zero is *not* a control: it hashes an allocation's pages, and with
 force-LINEAR dropped a tiled image's pages are non-zero driver-specific noise. The control is a
@@ -486,28 +489,6 @@ The cost is real, and it is the price of the default. Measured on goiaba (iris, 
 with it on, 11.4% lower, over four alternating boots per arm whose ranges do not overlap
 (2461-2487 against 2187-2194). That is the ceiling: glmark2 draws every frame into a shared
 window buffer, where an ordinary desktop mostly does not.
-
-**An exported blob is not exportable onward.** A venus allocation that came back as
-`Storage::Exported` -- Mesa's WSI buffer, and every declared export with no shape -- has a real
-dma-buf descriptor and still answers `NotExportable` to `resource_export`, `export_blob` and the
-`EXPORT_QUERY` structure. The descriptor is right there; what is missing is the code to hand it
-onward with the guest's layout, which only arrives at `PIPE_RESOURCE_SET_TYPE`. Nothing on this
-host asks yet -- rutabaga calls `export_blob` per blob create and takes the refusal -- so this is
-a VMM that wants to pass a client's window buffer to a compositor outside the guest, and it will
-be an unexplained blank window when it does.
-
-**Shared buffers are linear only on request.** A guest that presents through virtio-gpu KMS can
-scan out `LINEAR` and nothing else, and a venus context importing a classic buffer must be told
-its true layout -- so a Vulkan compositor in the guest needs both. `Config::linear_shared` (the
-C's `VIRGL_GBM_LAYOUT_ENABLE`, read under that name by `ffi.rs`, and only with venus) allocates
-every shared buffer as a linear GBM buffer and answers `GET_PIPE_RESOURCE_LAYOUT`; without it,
-shared storage is GL's own and tiled, the guest assumes linear, and a venus import of it is
-refused by the layout check rather than read wrong. It is off by default for the C's reason:
-linear storage costs every shared buffer its tiling, and the cost is real -- measured on goiaba
-(iris, Ice Lake) on 2026-10-01, glmark2-wayland in a GNOME session on the venus rig scored 2473
-with it off and 2191 with it on, 11.4% lower, over four alternating boots per arm whose ranges do
-not overlap (2461-2487 against 2187-2194). So it stays a request: a guest that runs a Vulkan
-compositor asks for it and pays for it.
 
 **A classic export holds a descriptor per resource, for the resource's lifetime, uncharged.**
 `export_surface` takes a dma-buf from the driver for every SHARED or SCANOUT classic resource and
