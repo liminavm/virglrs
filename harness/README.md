@@ -979,11 +979,13 @@ their acceptance lines alone (see `--expect-lines` above, and the venus bullet b
 does and does not carry). The rest are not failing; they are
 measuring nothing, and the difference matters because a corpus of zeros agrees with itself:
 
-- **The video corpora** (`vrend-vp9stock`, `vrend-h264`, `vrend-hevc`, both `vrend-composite`
-  scores) need hardware decode this host has none of, so every decode target reads back zero on
-  both legs. `vrend-h264` and `vrend-hevc` then report `0 differing lines` between the two
-  renderers, which is agreement about nothing — the exact weak oracle the blob fixture's `ink=0`
-  warning is about. Do not read those as passes and do not pin them here.
+- **The video corpora** (`vrend-vp9stock`, `vrend-h264`, `vrend-hevc`) decode through VA-API
+  on a host that has it, and then they *are* scored: the three codecs are normatively exact, so
+  goiaba's iHD reproduces the macOS VideoToolbox pins byte for byte, plane lines and all. A host
+  without hardware decode reads every target back as zero on both legs, and `0 differing lines`
+  there is agreement about nothing -- the weak oracle the blob fixture's `ink=0` warning is
+  about. The C leg decodes nothing on a non-Mesa VA driver. The composite scores remain
+  macOS-only: a composite planar target cannot be backed here.
 - **`vrend-overview`** replays 116 creates of a `Y8_U8V8_420_UNORM` composite planar target. The
   Linux capset correctly does not advertise that (`capability_bits_v2` has bit 20 clear, against
   macOS's set, and `num_video_caps` is 0), so the renderer refuses all 116 — the right answer to a
