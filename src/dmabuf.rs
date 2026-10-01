@@ -237,6 +237,12 @@ impl Surface {
         Some((self.fd.try_clone().ok()?, self.layout))
     }
 
+    /// The layout an [`Self::export`] carries, without taking a descriptor to learn it -- what a
+    /// guest is told when it asks how a shared texture is laid out.
+    pub fn exported_layout(&self) -> Option<Layout> {
+        Some(self.layout)
+    }
+
     /// What the driver said the allocation is.
     pub fn layout(&self) -> &Layout {
         &self.layout

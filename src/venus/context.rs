@@ -192,9 +192,7 @@ use super::proto::types::{
     VkComputePipelineCreateInfo, VkGraphicsPipelineCreateInfo, VkPipelineCreateFlagBits,
     VkPipelineCreateFlags2CreateInfo, VkRayTracingPipelineCreateInfoKHR,
 };
-use super::ring::{
-    ReplyStream, ReplyStreamError, ResourceBytes, Ring, RingControl, RingError, ShmResources,
-};
+use super::ring::{ReplyStream, ReplyStreamError, Ring, RingControl, RingError, ShmResources};
 use super::ring_thread::{BarrierWaiter, RingThread, RingWaiter, WaitRing, seqno_ge};
 use super::sync;
 use super::vkr::ContextKey;
@@ -4431,28 +4429,44 @@ impl Commands for Handlers<'_> {
             args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
             return;
         };
-        let span = self.driver.span(&bytes);
-
+        // The answer has to agree with what the allocation path will do with the same resource,
+        // so both read `Driver::importable`: memory a host pointer can reach is answered with the
+        // host-visible types, and a dma-buf with the types the driver says it imports into. A
+        // guest reads this, intersects it with the image's own requirements, and hands the result
+        // straight back as a `memoryTypeIndex`.
+        //
+        // Storage that is neither is answered as host memory, as it always was; the allocation
+        // refuses it by name, which is the diagnostic that says which storage it was.
+        //
         // A device this renderer has no table for is the other kind of failure: not the guest's
         // state, ours. It goes back through the query family's own refusal rather than a second
         // copy of its wording -- there is one policy here, so there is one place that states it.
-        let asked = self.driver.host_visible_memory_types(device);
-        let Some(bits) = self.asked(asked) else { return };
-
-        // The answer has to agree with what the allocation path will do with the same resource --
-        // see `Driver::host_visible_memory_types`. A guest reads this, intersects it with the
-        // image's own requirements, and hands the result straight back as a `memoryTypeIndex`.
+        let (asked, allocation) = match driver::Driver::importable(&bytes) {
+            Some(driver::Importable::DmaBuf { fd, size, .. }) => {
+                (self.driver.dma_buf_memory_types(device, fd), size)
+            }
+            // The span the import will alias, reported as the size the guest may allocate over
+            // it -- literally the same number, so the query cannot promise an extent the
+            // allocation then clamps away.
+            Some(driver::Importable::HostPointer { len, .. }) => {
+                (self.driver.host_visible_memory_types(device).map(Ok), len)
+            }
+            None => {
+                (self.driver.host_visible_memory_types(device).map(Ok), self.driver.span(&bytes).1)
+            }
+        };
+        let Some(answer) = self.asked(asked) else { return };
+        let bits = match answer {
+            Ok(bits) => bits,
+            Err(driver_said) => {
+                args.ret = driver_said;
+                return;
+            }
+        };
         out.edit(|o| o.memoryTypeBits = bits);
         if let Some(mut size) =
             driver::chained_mut::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut out)
         {
-            let allocation = match &bytes {
-                ResourceBytes::Host(map) => map.len() as u64,
-                // The span the import will alias, reported as the size the guest may allocate
-                // over it -- literally the same number, so the query cannot promise an extent
-                // the allocation then clamps away.
-                ResourceBytes::Shared(_) => span.1,
-            };
             size.edit(|s| s.allocationSize = allocation);
         }
         args.ret = VkResult::VK_SUCCESS;

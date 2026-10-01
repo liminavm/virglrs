@@ -87,6 +87,7 @@ use std::sync::{Arc, Weak};
 #[cfg(target_os = "macos")]
 use super::proto::types::VkImageUsageFlagBits;
 use super::proto::types::{VkImageAspectFlagBits, VkImageSubresource, VkSubresourceLayout};
+use super::proto::types::{VkImageDrmFormatModifierExplicitCreateInfoEXT, VkMemoryFdPropertiesKHR};
 #[cfg(not(target_os = "macos"))]
 use super::proto::types::{VkImageDrmFormatModifierPropertiesEXT, VkMemoryGetFdInfoKHR};
 use super::ring::ResourceBytes;
@@ -7660,24 +7661,55 @@ impl Driver {
             );
             return Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE));
         }
-        // What the import may act on, which is not the same question as where the bytes are.
-        // The chain built below hands the driver a `pHostPointer`, and that handle type means
-        // memory the *host* allocated: pages this renderer minted, or a mapping it made of memory
-        // the VMM shared with it. Storage that is only named by a descriptor has no such address
-        // -- and storage whose descriptor this renderer has mapped has an address that is still
-        // not one, because the pages belong to the exporting driver. Both are refused by name
-        // here rather than attempted: importing them properly means a dma-buf handle type at
-        // `vkAllocateMemory` instead of a host pointer, which is a different call and not yet
-        // made.
-        let alias_span = alias.as_ref().and_then(|b| self.as_host_allocation(b));
-        if alias.is_some() && alias_span.is_none() {
-            eprintln!(
-                "[virglrs] {id:?}: cannot import this share as host memory -- its storage is the \
-                 exporting driver's, named by a descriptor, and a mapping of one is not a host \
-                 allocation"
-            );
-            return Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE));
-        }
+        // What the import may act on, which is not the same question as where the bytes are --
+        // see `Driver::importable`, which the resource-properties query answered from too. Memory
+        // the host allocated is handed over as a `pHostPointer`. Storage the exporting driver
+        // allocated is handed over as the dma-buf it is, and only once the image it backs has
+        // been checked against it: a descriptor carries no layout, so an image that described
+        // the bytes differently would be read in a layout they were never written in.
+        let route = match alias.as_ref() {
+            None => None,
+            Some(bytes) => Some(match Driver::importable(bytes) {
+                Some(Importable::HostPointer { addr, len }) => ImportRoute::HostPointer(addr, len),
+                Some(Importable::DmaBuf { fd, size, layout }) => {
+                    let refuse = |why: &dyn core::fmt::Display| {
+                        eprintln!("[virglrs] {id:?}: cannot import this dma-buf -- {why}");
+                        NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE)
+                    };
+                    // The one bound the driver may take on trust, so it is checked here: an
+                    // allocation larger than the buffer would let it address past the end.
+                    if info.allocationSize.0 > size {
+                        return Err(refuse(&format_args!(
+                            "{} bytes asked of a {size}-byte buffer",
+                            info.allocationSize.0
+                        )));
+                    }
+                    // A dedicated image is the one whose layout these bytes must already be. An
+                    // allocation dedicated to nothing is bound later, to whatever the guest
+                    // names, and the bound above is all that can be held of it here.
+                    if let Some(image) = dedicated_image(info.pNext) {
+                        let facts = self
+                            .images
+                            .get(&image)
+                            .ok_or_else(|| refuse(&"it is dedicated to an image never created"))?;
+                        claim_fits(facts, layout.as_ref(), size).map_err(|why| refuse(&why))?;
+                    }
+                    let dup = fd.try_clone_to_owned().map_err(|e| refuse(&e))?;
+                    ImportRoute::DmaBuf(dup)
+                }
+                None => {
+                    eprintln!(
+                        "[virglrs] {id:?}: cannot import this share -- its storage is neither \
+                         host memory nor a descriptor this side can hand on"
+                    );
+                    return Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE));
+                }
+            }),
+        };
+        let alias_span = match &route {
+            Some(ImportRoute::HostPointer(addr, len)) => Some((*addr, *len)),
+            _ => None,
+        };
         let surface = if import.is_some() {
             Err(NoSurface::NotExported)
         } else {
@@ -7808,15 +7840,38 @@ impl Driver {
             info.pNext = (&raw const host_pointer).cast();
             info.allocationSize = VkDeviceSize(info.allocationSize.0.min(span.1));
         }
+        // The dma-buf route, prepended the same way. One import struct or the other, never both:
+        // a host pointer is only set for the host-pointer route, and this only for its own.
+        let dma_buf = match route {
+            Some(ImportRoute::DmaBuf(fd)) => Some(fd),
+            _ => None,
+        };
+        let fd_import = dma_buf.as_ref().map(|fd| VkImportMemoryFdInfoKHR {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+            pNext: info.pNext,
+            handleType:
+                VkExternalMemoryHandleTypeFlagBits::VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+            fd: std::os::fd::AsRawFd::as_raw_fd(fd),
+        });
+        if let Some(fd_import) = &fd_import {
+            info.pNext = (fd_import as *const VkImportMemoryFdInfoKHR).cast();
+        }
 
         // `d` was borrowed before the surface was minted, which needed `&mut self`.
         let d = self.devices.get(&device).expect("the device was here a moment ago");
         let mut out = VkDeviceMemory::NULL;
         // SAFETY: `info` is a local whose chain the decoder owns for the batch, extended with a
         // local that outlives this call, `alloc` is another arena allocation, and `out` is a local.
+        // A descriptor in the chain is a dup this call owns, open for the call.
         let r = unsafe { (d.fns.vkAllocateMemory())(device, &info, ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
+            // A refused import does not take the descriptor; the dup closes as it drops.
             return Err(NoMemory::Driver(r));
+        }
+        // A successful one does: Vulkan owns the descriptor from here and closes it when the
+        // memory is freed, so this side must not.
+        if let Some(fd) = dma_buf {
+            let _vulkans_now: std::os::fd::RawFd = std::os::fd::IntoRawFd::into_raw_fd(fd);
         }
         assert!(!out.is_null(), "vkAllocateMemory succeeded and returned a null handle");
         // Owned before anything else can fail, and for every backing: what the driver handed
@@ -8023,17 +8078,58 @@ impl Driver {
         }
     }
 
-    /// These bytes as a host allocation a second device may import, if they are one.
+    /// How a second device may import these bytes, if it may.
     ///
     /// What an import may act on, as against [`Self::span`], which is what a mapping covers. See
-    /// [`Storage::as_host_allocation`].
-    pub fn as_host_allocation(&self, bytes: &ResourceBytes) -> Option<(usize, u64)> {
+    /// [`Storage::importable`]. The resource-properties query and the allocation both answer
+    /// from here, so the query cannot call importable what the allocation then refuses.
+    pub fn importable(bytes: &ResourceBytes) -> Option<Importable<'_>> {
         match bytes {
             // A mapping this renderer made of memory the VMM shared with it, which is the one
             // thing a host-pointer import was for before any of the rest existed.
-            ResourceBytes::Host(map) => Some((map.host_addr(), map.len() as u64)),
-            ResourceBytes::Shared(storage) => storage.as_host_allocation(),
+            ResourceBytes::Host(map) => {
+                Some(Importable::HostPointer { addr: map.host_addr(), len: map.len() as u64 })
+            }
+            ResourceBytes::Shared(storage) => storage.importable(),
         }
+    }
+
+    /// The memory types a dma-buf can be imported into on `device`, as Vulkan's own bitmask:
+    /// `vkGetMemoryFdPropertiesKHR`, the dma-buf counterpart of
+    /// [`Self::host_visible_memory_types`].
+    ///
+    /// Asked per descriptor rather than read off a list, because the answer is about the buffer
+    /// -- which heap the exporting driver put it in -- and not only about the device. `Err` is
+    /// this renderer unable to ask, as for every query; the driver's own answer is inside.
+    pub fn dma_buf_memory_types(
+        &self,
+        device: VkDevice,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<Result<u32, VkResult>, VkResult> {
+        use std::os::fd::AsRawFd;
+        let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let f = d
+            .fns
+            .try_vkGetMemoryFdPropertiesKHR()
+            .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        let mut props = VkMemoryFdPropertiesKHR {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+            pNext: core::ptr::null_mut(),
+            memoryTypeBits: 0,
+        };
+        // SAFETY: `device` is a handle in this table, the descriptor is borrowed for the call and
+        // a properties query takes no ownership of it, and `props` is a local.
+        let r = unsafe {
+            f(
+                device,
+                VkExternalMemoryHandleTypeFlagBits::VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                fd.as_raw_fd(),
+                &mut props,
+            )
+        };
+        // The outer `Ok` is that the driver was asked; what it said is the inner one, and a
+        // descriptor it will not import is its answer to give back, not a reason to refuse.
+        Ok(if r == VkResult::VK_SUCCESS { Ok(props.memoryTypeBits) } else { Err(r) })
     }
 
     /// Mint the IOSurface a scanout allocation lives in, if this allocation is one.
@@ -8177,6 +8273,7 @@ impl Driver {
                 height: info.extent.height,
                 format: info.format,
                 tiling: info.tiling,
+                claim: claim_of(info),
             },
         );
     }
@@ -8741,6 +8838,25 @@ struct ImageFacts {
     format: VkFormat,
     /// As the driver was told to lay it out -- after [`external_images_are_linear`], not before.
     tiling: VkImageTiling,
+    /// What the guest said the image's memory looks like, which an import of storage someone
+    /// else laid out has to agree with.
+    claim: Claim,
+}
+
+/// What a guest said an image's memory looks like.
+///
+/// Read once, at create, where the plane count and the plane array arrive together: a claim is
+/// the reconciled [`PlaneLayouts`], never a count beside an array.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Claim {
+    /// An explicit modifier and plane layout -- the only claim an import can be checked against.
+    Explicit { modifier: u64, planes: crate::surface::PlaneLayouts },
+    /// No explicit layout: the driver is asked to choose, by tiling or from a modifier list, and
+    /// what it chose is not something storage that already exists can be made to match.
+    DriversChoice,
+    /// An explicit layout this side could not read: more planes than a layout holds, or a
+    /// count with no array behind it.
+    Unreadable,
 }
 
 impl Allocated {
@@ -8934,6 +9050,44 @@ pub enum Storage {
     /// through. It is what an allocation the guest did *not* declare for export gets, which is
     /// most host-visible memory and every image whose texels a snapshot has to carry.
     Heap(Arc<Charged<Heap>>),
+}
+
+/// `VkImportMemoryFdInfoKHR`, laid out as vk.xml gives it.
+///
+/// The one struct here the protocol's types do not have: a venus guest names a resource, never a
+/// descriptor, so the wire has no reason to carry it. It exists only on this side, built around
+/// a descriptor this side dup'd, for the one call that hands it to the driver.
+#[repr(C)]
+#[allow(non_snake_case, reason = "vk.xml's member names, as every generated struct keeps them")]
+struct VkImportMemoryFdInfoKHR {
+    sType: VkStructureType,
+    pNext: *const core::ffi::c_void,
+    handleType: VkExternalMemoryHandleTypeFlagBits,
+    fd: core::ffi::c_int,
+}
+
+/// What an import hands the driver, settled before anything is charged or asked: the address of
+/// host memory, or a dup of the exporting driver's descriptor that the allocation passes on.
+enum ImportRoute {
+    HostPointer(usize, u64),
+    DmaBuf(std::os::fd::OwnedFd),
+}
+
+/// How a second device may take a storage's bytes: the one answer the resource-properties query
+/// and the allocation that imports the resource both read.
+///
+/// Two answers because there are two kinds of owner. Pages this renderer allocated -- or a mapping
+/// it made of memory the VMM shared -- are a host allocation, and the driver is handed their
+/// address. Storage the exporting driver allocated is not, whatever address a mapping of it has;
+/// it is handed on as the dma-buf it is, with the driver's layout when the driver gave one.
+pub enum Importable<'a> {
+    /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT` over these bytes.
+    HostPointer { addr: usize, len: u64 },
+    /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT` over this descriptor, which the import
+    /// dups: the storage keeps owning it. `size` is the kernel's figure, the one bound a guest
+    /// cannot choose. `layout` is the exporting driver's answer about a texture it laid out, and
+    /// `None` for a buffer only the guest can describe.
+    DmaBuf { fd: std::os::fd::BorrowedFd<'a>, size: u64, layout: Option<crate::surface::Layout> },
 }
 
 /// Whether anything still holds a share of an exported allocation's storage.
@@ -9300,27 +9454,45 @@ impl Storage {
         }
     }
 
-    /// This storage as a host allocation another device may import, if it is one.
+    /// How a second device may import this storage, if it may.
     ///
     /// The counterpart to [`Storage::span`], and deliberately not derived from it. `span` answers
     /// "where are these bytes in this process", which is the question the VMM's mapping asks;
-    /// this one answers "are these pages this renderer's to lend to a second driver", which is
-    /// the question `VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT` asks. An exporting
-    /// host makes them different answers: a dma-buf's mapping has an address and is still not a
-    /// host allocation, so a caller reading `span().0 != 0` as permission would hand another
-    /// driver a view of the exporting driver's pages.
-    pub fn as_host_allocation(&self) -> Option<(usize, u64)> {
+    /// this one answers "what may a second driver be handed for them". An exporting host makes
+    /// them different answers: a dma-buf's mapping has an address and is still not a host
+    /// allocation, so a caller reading `span().0 != 0` as permission would hand another driver a
+    /// view of the exporting driver's pages. Such storage is handed on as the descriptor it is.
+    pub fn importable(&self) -> Option<Importable<'_>> {
         match self {
             Storage::Texture(m) => {
-                m.surface().as_host_allocation().map(|addr| (addr, m.surface().alloc_size()))
+                let surface = m.surface();
+                if let Some(addr) = surface.as_host_allocation() {
+                    return Some(Importable::HostPointer { addr, len: surface.alloc_size() });
+                }
+                // The exporting driver's texture: the descriptor, and the driver's own answer
+                // about how it is laid out.
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let layout = surface.exported_layout()?;
+                    let fd = surface.fd();
+                    let size = crate::dmabuf::buffer_size(fd)?;
+                    Some(Importable::DmaBuf { fd, size, layout: Some(layout) })
+                }
+                #[cfg(target_os = "macos")]
+                None
             }
-            // A descriptor names the driver's memory. There is no address to lend even when there
-            // is an address to publish.
+            // A descriptor of the driver's allocation that nothing has described: handed on as
+            // a descriptor, and the guest's description of it checked against its size.
             #[cfg(not(target_os = "macos"))]
-            Storage::Exported(_) => None,
+            Storage::Exported(d) => {
+                Some(Importable::DmaBuf { fd: d.it().fd(), size: d.it().size(), layout: None })
+            }
             // Pages this renderer minted for exactly this, which is why the declared export mints
             // rather than letting the driver allocate.
-            Storage::Linear(p) => Some((p.it().map.host_addr(), p.it().map.len() as u64)),
+            Storage::Linear(p) => Some(Importable::HostPointer {
+                addr: p.it().map.host_addr(),
+                len: p.it().map.len() as u64,
+            }),
             // The driver's own allocation, mapped by us. Not lent onward -- refused by name and
             // out loud at the import, because a guest reaching it is telling us the
             // declared-export gate is in the wrong place.
@@ -9818,6 +9990,10 @@ impl Chained for VkMemoryDedicatedAllocateInfo {
     const S_TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
 }
+impl Chained for VkImageDrmFormatModifierExplicitCreateInfoEXT {
+    const S_TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+}
 impl Chained for VkImportMemoryResourceInfoMESA {
     const S_TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA;
@@ -9859,6 +10035,132 @@ fn has_external_handle_types(node: *const core::ffi::c_void) -> bool {
 /// Whether an allocation's `pNext` chain says the memory is for the world outside this guest.
 fn exports_memory(node: *const core::ffi::c_void) -> bool {
     chain_find::<VkExportMemoryAllocateInfo>(node).is_some()
+}
+
+/// What an image's create info claims about its memory. See [`Claim`].
+///
+/// Only `DRM_FORMAT_MODIFIER` tiling with an explicit layout claims anything; every other
+/// tiling leaves the layout to the driver.
+fn claim_of(info: &VkImageCreateInfo) -> Claim {
+    if info.tiling != VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT {
+        return Claim::DriversChoice;
+    }
+    let Some(e) = chain_find::<VkImageDrmFormatModifierExplicitCreateInfoEXT>(info.pNext) else {
+        return Claim::DriversChoice;
+    };
+    let count = e.drmFormatModifierPlaneCount as usize;
+    if e.pPlaneLayouts.is_null() {
+        return if count == 0 { Claim::DriversChoice } else { Claim::Unreadable };
+    }
+    // SAFETY: the chain is the decoder's, which decoded exactly `drmFormatModifierPlaneCount`
+    // entries into the arena behind a non-null `pPlaneLayouts` and keeps them for the batch.
+    let wire = unsafe { core::slice::from_raw_parts(e.pPlaneLayouts, count) };
+    let planes: Vec<crate::surface::PlaneLayout> = wire
+        .iter()
+        .map(|l| crate::surface::PlaneLayout {
+            offset: l.offset.0,
+            pitch: u32::try_from(l.rowPitch.0).unwrap_or(u32::MAX),
+        })
+        .collect();
+    match crate::surface::PlaneLayouts::new(&planes) {
+        Ok(planes) => Claim::Explicit { modifier: e.drmFormatModifier, planes },
+        Err(_) => Claim::Unreadable,
+    }
+}
+
+/// Why storage someone else laid out cannot back the image a guest dedicated it to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mismatch {
+    /// The image states no layout, so nothing says the driver would read these bytes the way
+    /// they were written.
+    NoClaim,
+    /// A layout the guest stated and this side could not read.
+    Unreadable,
+    /// The exporting driver laid the storage out under another modifier.
+    Modifier { claimed: u64, actual: u64 },
+    /// The planes are not where, or not as wide as, the exporting driver put them.
+    Planes,
+    /// The image is larger than the storage's own extent.
+    Extent { claimed: (u32, u32), actual: (u32, u32) },
+    /// A buffer only the guest can describe, described as tiled: there is no layout on this
+    /// side to check a tiling against.
+    TiledWithoutLayout { modifier: u64 },
+    /// A plane runs past the end of the buffer.
+    PastEnd { plane: usize },
+}
+
+impl core::fmt::Display for Mismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Mismatch::NoClaim => f.write_str("the image states no explicit layout"),
+            Mismatch::Unreadable => f.write_str("the image's explicit layout could not be read"),
+            Mismatch::Modifier { claimed, actual } => {
+                write!(f, "the image claims modifier {claimed:#x} and the storage is {actual:#x}")
+            }
+            Mismatch::Planes => f.write_str("the image's planes are not the storage's"),
+            Mismatch::Extent { claimed, actual } => write!(
+                f,
+                "the image is {}x{} and the storage {}x{}",
+                claimed.0, claimed.1, actual.0, actual.1
+            ),
+            Mismatch::TiledWithoutLayout { modifier } => {
+                write!(f, "modifier {modifier:#x} over a buffer with no layout to check it against")
+            }
+            Mismatch::PastEnd { plane } => write!(f, "plane {plane} runs past the buffer"),
+        }
+    }
+}
+
+/// Whether an image's claim describes storage that already exists.
+///
+/// With the exporting driver's `layout` the claim must be that layout exactly -- the same
+/// modifier, the same planes -- for an image no larger than it. Without one, the bytes are a
+/// buffer only the guest can describe, so the claim is held to what can be checked: linear rows,
+/// every plane inside the buffer's `size`.
+fn claim_fits(
+    facts: &ImageFacts,
+    layout: Option<&crate::surface::Layout>,
+    size: u64,
+) -> Result<(), Mismatch> {
+    let (modifier, planes) = match facts.claim {
+        Claim::Explicit { modifier, planes } => (modifier, planes),
+        Claim::DriversChoice => return Err(Mismatch::NoClaim),
+        Claim::Unreadable => return Err(Mismatch::Unreadable),
+    };
+    match layout {
+        Some(l) => {
+            if modifier != l.modifier {
+                return Err(Mismatch::Modifier { claimed: modifier, actual: l.modifier });
+            }
+            if planes != l.planes {
+                return Err(Mismatch::Planes);
+            }
+            if facts.width > l.width || facts.height > l.height {
+                return Err(Mismatch::Extent {
+                    claimed: (facts.width, facts.height),
+                    actual: (l.width, l.height),
+                });
+            }
+            Ok(())
+        }
+        None => {
+            if modifier != crate::surface::DRM_FORMAT_MOD_LINEAR {
+                return Err(Mismatch::TiledWithoutLayout { modifier });
+            }
+            // The first plane holds the image's full height of rows. A later plane's height is
+            // the format's to say, so it is held to one row -- the bound that can be checked
+            // without knowing the format, and the one a plane past the end certainly fails.
+            for (i, p) in planes.iter().enumerate() {
+                let rows = if i == 0 { u64::from(facts.height) } else { 1 };
+                let end =
+                    u64::from(p.pitch).checked_mul(rows).and_then(|n| n.checked_add(p.offset));
+                if end.is_none_or(|end| end > size) {
+                    return Err(Mismatch::PastEnd { plane: i });
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// The image an allocation is dedicated to, if it is dedicated to one.
@@ -11094,187 +11396,272 @@ mod tests {
         d.abandon_planted();
     }
 
-    /// An import keeps what it resolved alive for as long as the driver may reach it.
+    /// Storage the exporting driver laid out is imported as the dma-buf it is.
     ///
-    /// The driver is handed an address, and keeps it for the life of the importer's memory. The
-    /// storage behind that address is the exporter's record's, or the resource's -- and a guest
-    /// process can drop its handle to the resource while another still has the memory bound. A
-    /// client exiting is the ordinary case: the compositor's next submit still reads the buffer.
-    /// So the importer's record holds the share, and the pages go only when the last holder does.
-    /// A share the CPU has no address for is refused, not imported at a null pointer.
-    ///
-    /// The exporting host lends descriptors: a classic scanout's storage is a dma-buf the driver
-    /// laid out, and on this host it is tiled, so nothing maps it. `Storage::span` answers zero
-    /// for such a share -- correctly, there is no address -- and the allocate path would have put
-    /// that zero straight into `VkImportMemoryHostPointerInfoEXT.pHostPointer` and called the
-    /// driver with it. Not a guest error and not a Vulkan failure: a null pointer handed to a
-    /// driver that was told it was memory.
+    /// A classic scanout's storage is a descriptor of the driver's texture. It may have a mapping
+    /// and it never has host memory: handed over as `HOST_ALLOCATION_BIT_EXT` it would claim
+    /// pages the importing driver knows nothing about, and with no mapping it would be a null
+    /// pointer. So it goes as `VkImportMemoryFdInfoKHR` -- a dup of the descriptor, which the
+    /// driver owns once it accepts -- and only for an image whose claimed layout is the one the
+    /// exporting driver reported. A claim that differs is refused before the driver is asked,
+    /// because the driver would take it and read the bytes in the wrong layout.
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn a_share_with_no_host_address_is_refused_rather_than_imported_at_null() {
-        use super::super::proto::types::VkImportMemoryResourceInfoMESA;
-        use crate::surface::{DRM_FORMAT_MOD_INVALID, Layout, PlaneLayout, PlaneLayouts, Surface};
+    fn a_driver_laid_out_share_is_imported_as_its_dma_buf() {
+        use super::super::proto::types::{
+            VkExtent3D, VkImageCreateInfo, VkImageType, VkImportMemoryResourceInfoMESA,
+            VkMemoryDedicatedAllocateInfo, VkSampleCountFlagBits,
+        };
+        use crate::surface::{DRM_FORMAT_MOD_LINEAR, Layout, PlaneLayout, PlaneLayouts, Surface};
+        use std::os::fd::AsRawFd;
 
         const DEVICE: VkDevice = VkDevice::forged(3);
+        const MATCHING: VkImage = VkImage::forged(0x51);
+        const LINEAR_CLAIM: VkImage = VkImage::forged(0x52);
+        const X_TILED: u64 = 0x0100_0000_0000_0001;
+        const PITCH: u32 = 256;
         const LEN: u64 = 16384;
 
+        thread_local! {
+            static CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            static HANDED: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+        }
         unsafe extern "C" fn allocate(
             _d: VkDevice,
-            _info: *const VkMemoryAllocateInfo,
+            info: *const VkMemoryAllocateInfo,
             _a: *const VkAllocationCallbacks,
-            _out: *mut VkDeviceMemory,
+            out: *mut VkDeviceMemory,
         ) -> VkResult {
-            unreachable!("the refusal comes before the driver is asked for anything");
+            CALLS.with(|c| c.set(c.get() + 1));
+            // SAFETY: the caller's struct and the chain it built, live for the call.
+            let first = unsafe { (*info).pNext };
+            assert!(!first.is_null(), "an import has a chain");
+            // SAFETY: as above; every link starts with the base header.
+            let base = unsafe { &*first.cast::<VkBaseInStructure>() };
+            assert_eq!(
+                base.sType,
+                VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+                "the descriptor goes first, as a dma-buf import"
+            );
+            // SAFETY: the tag says what the link is.
+            let fd_info = unsafe { &*first.cast::<VkImportMemoryFdInfoKHR>() };
+            assert_eq!(
+                fd_info.handleType,
+                VkExternalMemoryHandleTypeFlagBits::VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+            );
+            let mut node = first;
+            while !node.is_null() {
+                // SAFETY: as above.
+                let link = unsafe { &*node.cast::<VkBaseInStructure>() };
+                assert_ne!(
+                    link.sType,
+                    VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+                    "one import struct, never both"
+                );
+                node = link.pNext.cast();
+            }
+            // Kept, as a driver keeps it: the test closes it once it has looked.
+            HANDED.with(|h| h.set(fd_info.fd));
+            // SAFETY: the caller's local.
+            unsafe { *out = VkDeviceMemory::forged(0x9300) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            _m: VkDeviceMemory,
+            _a: *const VkAllocationCallbacks,
+        ) {
         }
 
         let mut d = Driver::new(Account::for_test(None));
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkAllocateMemory(allocate);
+        fns.plant_vkFreeMemory(free);
         d.plant_device(DEVICE, fns);
-        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(HOST_VISIBLE_BIT as _)]);
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(0)]);
+        CALLS.with(|c| c.set(0));
 
-        // A descriptor of storage that is not ours: tiled, so no CPU path opens it, and the fd
-        // is never mapped -- which is the whole point, and why any fd will do here.
-        let fd = std::fs::File::open("/dev/null").expect("every host has one").into();
-        let planes =
-            PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch: 256 }]).expect("one plane");
-        let tiled = Surface::exported(
-            fd,
-            Layout {
-                width: 64,
-                height: 64,
-                fourcc: crate::surface::PixelFormat::Bgra.fourcc(),
-                // Anything but LINEAR: the modifier is what says the bytes are not rows.
-                modifier: 0x0100_0000_0000_0001,
-                planes,
-                alloc_size: LEN,
-            },
-        );
-        assert_ne!(tiled.layout().modifier, DRM_FORMAT_MOD_INVALID, "a real descriptor");
-        let lent = Storage::lent(std::sync::Arc::new(tiled));
-        assert_eq!(lent.span().0, 0, "the premise: this share names no host address");
-
-        let import = VkImportMemoryResourceInfoMESA {
-            sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
-            pNext: core::ptr::null(),
-            resourceId: 7,
-        };
-        let info = VkMemoryAllocateInfo {
-            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            pNext: (&raw const import).cast(),
-            allocationSize: VkDeviceSize(LEN),
-            memoryTypeIndex: 0,
-        };
-        let resolve = |_| Some(ResourceBytes::Shared(lent.clone()));
-        assert!(
-            d.allocate_memory(DEVICE, ObjectId(80), cs::Decoded::planted(&info), None, &resolve)
-                .is_err(),
-            "the guest is told the handle is not importable"
-        );
-        assert!(!d.memory.contains_key(&ObjectId(80)), "and nothing is left behind for it");
-
-        d.abandon_planted();
-    }
-
-    /// A LINEAR descriptor *does* have a host address, and it is still not one to lend.
-    ///
-    /// The tiled case above is refused because there is nothing to hand over. This one is the
-    /// case a test of that shape cannot reach: the descriptor is linear, so the mapping is taken
-    /// and the address is real -- and the pages behind it are the exporting driver's, reached
-    /// through a GEM mmap. Handed to a second driver as
-    /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT` it claims to be memory the host
-    /// allocated, which aliases storage that driver knows nothing about.
-    ///
-    /// So "is there an address" was the wrong question, and asking it let the answer depend on
-    /// whether a mapping had happened to be taken. The premise below asserts the address is
-    /// there, or the refusal would be the tiled one over again under a new name.
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn a_linear_descriptor_has_an_address_and_is_still_not_a_host_allocation() {
-        use super::super::proto::types::VkImportMemoryResourceInfoMESA;
-        use crate::surface::{DRM_FORMAT_MOD_LINEAR, Layout, PlaneLayout, PlaneLayouts, Surface};
-
-        const DEVICE: VkDevice = VkDevice::forged(3);
-        const WIDTH: u32 = 64;
-        const HEIGHT: u32 = 64;
-        const PITCH: u32 = WIDTH * 4;
-        const LEN: u64 = (PITCH * HEIGHT) as u64;
-
-        unsafe extern "C" fn allocate(
-            _d: VkDevice,
-            _info: *const VkMemoryAllocateInfo,
-            _a: *const VkAllocationCallbacks,
-            _out: *mut VkDeviceMemory,
-        ) -> VkResult {
-            unreachable!("the refusal comes before the driver is asked for anything");
-        }
-
-        let mut d = Driver::new(Account::for_test(None));
-        let mut fns = crate::vulkan::Device::default();
-        fns.plant_vkAllocateMemory(allocate);
-        d.plant_device(DEVICE, fns);
-        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(HOST_VISIBLE_BIT as _)]);
-
-        // A memfd stands in for the dma-buf: `mmap` is what this path asks of it, and what the
-        // premise below needs to succeed.
+        // A memfd stands in for the dma-buf: the kernel's size is what the import is bounded by,
+        // and a memfd answers `lseek` the way a dma-buf does.
         // SAFETY: a NUL-terminated literal and no flags; the descriptor is fresh.
-        let raw = unsafe { libc::memfd_create(c"virglrs-test-lend".as_ptr(), 0) };
+        let raw = unsafe { libc::memfd_create(c"virglrs-test-import".as_ptr(), 0) };
         assert!(raw >= 0, "memfd_create: {}", std::io::Error::last_os_error());
         // SAFETY: sizing a fresh memfd nothing has mapped.
         let rc = unsafe { libc::ftruncate(raw, LEN as libc::off_t) };
         assert_eq!(rc, 0, "ftruncate: {}", std::io::Error::last_os_error());
         // SAFETY: a descriptor this scope owns and hands over exactly once.
         let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
-
         let planes =
             PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch: PITCH }]).expect("one plane");
-        let linear = Surface::exported(
-            fd,
-            Layout {
-                width: WIDTH,
-                height: HEIGHT,
-                fourcc: crate::surface::PixelFormat::Bgra.fourcc(),
-                modifier: DRM_FORMAT_MOD_LINEAR,
-                planes,
-                alloc_size: LEN,
-            },
-        );
-        let lent = Storage::lent(std::sync::Arc::new(linear));
-        assert_ne!(lent.span().0, 0, "the premise: this one really does map");
-        assert!(
-            lent.as_host_allocation().is_none(),
-            "and the address it has is the exporting driver's, not this renderer's to lend"
-        );
-
-        let import = VkImportMemoryResourceInfoMESA {
-            sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
-            pNext: core::ptr::null(),
-            resourceId: 9,
+        let layout = Layout {
+            width: 64,
+            height: 64,
+            fourcc: crate::surface::PixelFormat::Bgra.fourcc(),
+            modifier: X_TILED,
+            planes,
+            alloc_size: LEN,
         };
-        let info = VkMemoryAllocateInfo {
-            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            pNext: (&raw const import).cast(),
-            allocationSize: VkDeviceSize(LEN),
-            memoryTypeIndex: 0,
-        };
-        let resolve = |_| Some(ResourceBytes::Shared(lent.clone()));
-        assert!(
-            d.allocate_memory(DEVICE, ObjectId(81), cs::Decoded::planted(&info), None, &resolve)
-                .is_err(),
-            "the guest is told the handle is not importable, rather than given an alias"
-        );
-        assert!(!d.memory.contains_key(&ObjectId(81)), "and nothing is left behind for it");
-
-        // The control, on the predicate itself: pages this renderer minted are exactly what the
-        // handle type is for, and they still answer with an address. Without this the assertion
-        // above would pass just as well if nothing were lendable any more.
+        let lent = Storage::lent(std::sync::Arc::new(Surface::exported(fd, layout)));
+        match lent.importable() {
+            Some(Importable::DmaBuf { size, layout: Some(l), .. }) => {
+                assert_eq!(
+                    (size, l.modifier),
+                    (LEN, X_TILED),
+                    "the kernel's size, the driver's layout"
+                );
+            }
+            _ => panic!("a driver's texture is handed on as its descriptor, never as host memory"),
+        }
+        // The control: pages this renderer minted are host memory, and stay a host pointer.
         let minted = Storage::pages_for_test(4096, &Account::for_test(None));
+        assert!(matches!(minted.importable(), Some(Importable::HostPointer { .. })));
+
+        let image = |explicit: &VkImageDrmFormatModifierExplicitCreateInfoEXT| VkImageCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            pNext: (explicit as *const VkImageDrmFormatModifierExplicitCreateInfoEXT).cast(),
+            flags: VkImageCreateFlags(0),
+            imageType: VkImageType::VK_IMAGE_TYPE_2D,
+            format: VkFormat::VK_FORMAT_B8G8R8A8_UNORM,
+            extent: VkExtent3D { width: 64, height: 64, depth: 1 },
+            mipLevels: 1,
+            arrayLayers: 1,
+            samples: VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT,
+            tiling: VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+            usage: VkImageUsageFlags(0),
+            sharingMode: Default::default(),
+            queueFamilyIndexCount: 0,
+            pQueueFamilyIndices: core::ptr::null(),
+            initialLayout: VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        let plane = [VkSubresourceLayout {
+            offset: VkDeviceSize(0),
+            size: VkDeviceSize(0),
+            rowPitch: VkDeviceSize(u64::from(PITCH)),
+            arrayPitch: VkDeviceSize(0),
+            depthPitch: VkDeviceSize(0),
+        }];
+        let explicit = |modifier| {
+            VkImageDrmFormatModifierExplicitCreateInfoEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+            pNext: core::ptr::null(),
+            drmFormatModifier: modifier,
+            drmFormatModifierPlaneCount: 1,
+            pPlaneLayouts: plane.as_ptr(),
+        }
+        };
+        let (tiled, linear) = (explicit(X_TILED), explicit(DRM_FORMAT_MOD_LINEAR));
+        d.note_image(MATCHING, &image(&tiled));
+        d.note_image(LINEAR_CLAIM, &image(&linear));
+
+        let allocate_for = |d: &mut Driver, id, image, size| {
+            let import = VkImportMemoryResourceInfoMESA {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+                pNext: core::ptr::null(),
+                resourceId: 7,
+            };
+            let dedicated = VkMemoryDedicatedAllocateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+                pNext: (&raw const import).cast(),
+                image,
+                buffer: VkBuffer::forged(0),
+            };
+            let info = VkMemoryAllocateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                pNext: (&raw const dedicated).cast(),
+                allocationSize: VkDeviceSize(size),
+                memoryTypeIndex: 0,
+            };
+            let resolve = |_| Some(ResourceBytes::Shared(lent.clone()));
+            d.allocate_memory(DEVICE, id, cs::Decoded::planted(&info), None, &resolve).is_ok()
+        };
+
         assert!(
-            minted.as_host_allocation().is_some(),
-            "minted pages are host memory, and lending them is what the declared mint is for"
+            !allocate_for(&mut d, ObjectId(82), LINEAR_CLAIM, LEN),
+            "an image claiming LINEAR over a tiled texture is refused"
         );
+        assert!(
+            !allocate_for(&mut d, ObjectId(83), MATCHING, LEN + 1),
+            "and so is an allocation larger than the buffer"
+        );
+        assert_eq!(CALLS.with(|c| c.get()), 0, "both before the driver is asked");
+
+        assert!(allocate_for(&mut d, ObjectId(84), MATCHING, LEN), "the agreeing claim imports");
+        assert!(d.memory.contains_key(&ObjectId(84)));
+        let handed = HANDED.with(|h| h.get());
+        let original = match lent.importable() {
+            Some(Importable::DmaBuf { fd, .. }) => fd.as_raw_fd(),
+            _ => unreachable!(),
+        };
+        assert_ne!(handed, original, "a dup, so the storage keeps its own descriptor");
+        let inode = |fd: i32| {
+            let mut st = core::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: an open descriptor and a `stat` this call fills.
+            assert_eq!(unsafe { libc::fstat(fd, st.as_mut_ptr()) }, 0);
+            // SAFETY: filled by the successful `fstat` above.
+            unsafe { st.assume_init() }.st_ino
+        };
+        assert_eq!(inode(handed), inode(original), "of the same buffer");
+        // SAFETY: the dup the stand-in driver kept, closed once, as the driver would at free.
+        unsafe { libc::close(handed) };
 
         d.abandon_planted();
+    }
+
+    /// An image's claim is held to the storage it would be bound to.
+    ///
+    /// With the exporting driver's layout, exactly that layout; with only a buffer's size, linear
+    /// rows inside it. Each refusal is a picture read in a layout its bytes were never written in,
+    /// so each is a case here.
+    #[test]
+    fn a_claim_fits_only_the_storage_it_describes() {
+        use crate::surface::{DRM_FORMAT_MOD_LINEAR, Layout, PlaneLayout, PlaneLayouts};
+        const X_TILED: u64 = 0x0100_0000_0000_0001;
+        let planes = |pitch| PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch }]).unwrap();
+        let facts = |claim| ImageFacts {
+            width: 64,
+            height: 64,
+            format: VkFormat::VK_FORMAT_B8G8R8A8_UNORM,
+            tiling: VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+            claim,
+        };
+        let claim = |modifier, pitch| facts(Claim::Explicit { modifier, planes: planes(pitch) });
+        let layout = Layout {
+            width: 64,
+            height: 64,
+            fourcc: 0,
+            modifier: X_TILED,
+            planes: planes(512),
+            alloc_size: 32768,
+        };
+
+        assert_eq!(claim_fits(&claim(X_TILED, 512), Some(&layout), 32768), Ok(()));
+        assert_eq!(
+            claim_fits(&claim(DRM_FORMAT_MOD_LINEAR, 512), Some(&layout), 32768),
+            Err(Mismatch::Modifier { claimed: DRM_FORMAT_MOD_LINEAR, actual: X_TILED })
+        );
+        assert_eq!(claim_fits(&claim(X_TILED, 256), Some(&layout), 32768), Err(Mismatch::Planes));
+        let mut wide = claim(X_TILED, 512);
+        wide.width = 65;
+        assert!(matches!(claim_fits(&wide, Some(&layout), 32768), Err(Mismatch::Extent { .. })));
+        assert_eq!(
+            claim_fits(&facts(Claim::DriversChoice), Some(&layout), 32768),
+            Err(Mismatch::NoClaim)
+        );
+        assert_eq!(
+            claim_fits(&facts(Claim::Unreadable), Some(&layout), 32768),
+            Err(Mismatch::Unreadable)
+        );
+
+        // No layout: linear rows inside the buffer, and nothing else.
+        assert_eq!(claim_fits(&claim(DRM_FORMAT_MOD_LINEAR, 256), None, 16384), Ok(()));
+        assert_eq!(
+            claim_fits(&claim(DRM_FORMAT_MOD_LINEAR, 256), None, 16383),
+            Err(Mismatch::PastEnd { plane: 0 })
+        );
+        assert_eq!(
+            claim_fits(&claim(X_TILED, 256), None, 16384),
+            Err(Mismatch::TiledWithoutLayout { modifier: X_TILED })
+        );
     }
 
     #[test]
