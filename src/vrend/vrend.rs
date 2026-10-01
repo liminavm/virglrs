@@ -366,9 +366,9 @@ impl Vrend {
         }
         let mut caps = caps::CapsV2::probe(&gl, &features, &limits, &formats, video.as_ref());
         // The C's gbm-layout feature: shared buffers allocated linear, and the guest told every
-        // shared buffer's layout. Asked for by `Config::linear_shared` and only with venus, as the
-        // C ties it to `VIRGL_RENDERER_VENUS` -- the layout matters to a venus import, and linear
-        // storage costs every compositor buffer its tiling.
+        // shared buffer's layout. On by default (`Config::linear_shared`, where the C has it off)
+        // and only with venus, as the C ties it to `VIRGL_RENDERER_VENUS`: the layout matters to a
+        // venus import, and without venus there is nothing to pay the tiling for.
         #[cfg(not(target_os = "macos"))]
         let mut winsys = winsys;
         #[cfg(not(target_os = "macos"))]
@@ -379,7 +379,7 @@ impl Vrend {
                     node.display()
                 ),
                 Err(why) => eprintln!(
-                    "[virglrs] vrend: linear shared buffers were asked for and are not available \
+                    "[virglrs] vrend: linear shared buffers are not available \
                      ({why}); shared buffers keep the driver's tiling"
                 ),
             }

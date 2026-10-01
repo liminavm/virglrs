@@ -9,7 +9,7 @@
 /// mean anything here; the rest select a winsys this build does not use. So the Rust API asks for
 /// the four, by name, and the shim does the decoding -- a caller should not have to know which
 /// bit is which, nor that one of them is spelled inside out.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Config {
     /// Serve venus.
     pub venus: bool,
@@ -23,11 +23,24 @@ pub struct Config {
     /// not a thing to do to a caller who never asked for video.
     pub video: bool,
     /// Allocate every shared classic buffer linear, and tell the guest each shared buffer's
-    /// layout. Off by default, because linear storage costs every compositor buffer its tiling;
-    /// what it buys is a guest that can scan a shared buffer out through virtio-gpu KMS, which
-    /// takes `LINEAR` only, and a venus context that can import one. Has an effect only with
-    /// `venus`, and only on a host that exports rather than mints its storage.
+    /// layout. What it buys is a guest that can scan a shared buffer out through virtio-gpu KMS,
+    /// which takes `LINEAR` only, and a venus context that can import one -- which together are
+    /// what a Vulkan compositor in the guest needs. Has an effect only with `venus`, and only on a
+    /// host that exports rather than mints its storage.
+    ///
+    /// On by default, where the C has it off: Vulkan compositors are common enough that a guest
+    /// which cannot run one is the worse default. The cost is every shared buffer's tiling --
+    /// 11.4% of glmark2 under GNOME, measured in `docs/linux-port.md` -- and a caller that would
+    /// rather have that back turns this off.
     pub linear_shared: bool,
+}
+
+impl Default for Config {
+    /// Nothing served, nothing optional asked for -- except linear shared buffers, which are on
+    /// by default; see [`Config::linear_shared`].
+    fn default() -> Config {
+        Config { venus: false, vrend: false, guest_vram: false, video: false, linear_shared: true }
+    }
 }
 
 /// The renderer a context bound when it was created.

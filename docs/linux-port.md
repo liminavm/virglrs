@@ -471,6 +471,31 @@ host asks yet -- rutabaga calls `export_blob` per blob create and takes the refu
 a VMM that wants to pass a client's window buffer to a compositor outside the guest, and it will
 be an unexplained blank window when it does.
 
+**Shared buffers are linear by default.** A guest that presents through virtio-gpu KMS can scan
+out `LINEAR` and nothing else, and a venus context importing a classic buffer must be told its
+true layout -- so a Vulkan compositor in the guest needs both. `Config::linear_shared`, with
+venus, allocates every shared buffer as a linear GBM buffer and answers
+`GET_PIPE_RESOURCE_LAYOUT`. The C has the same feature off unless `VIRGL_GBM_LAYOUT_ENABLE=1`;
+here it is on, because a guest that cannot run a Vulkan compositor is the worse default, and
+`ffi.rs` reads the same variable to turn it off (`=0`). Off, shared storage is GL's own and
+tiled, the guest assumes linear, and a venus import of it is refused by the layout check rather
+than read wrong.
+
+The cost is real, and it is the price of the default. Measured on goiaba (iris, Ice Lake) on
+2026-10-01, glmark2-wayland in a GNOME session on the venus rig scored 2473 with it off and 2191
+with it on, 11.4% lower, over four alternating boots per arm whose ranges do not overlap
+(2461-2487 against 2187-2194). That is the ceiling: glmark2 draws every frame into a shared
+window buffer, where an ordinary desktop mostly does not.
+
+**An exported blob is not exportable onward.** A venus allocation that came back as
+`Storage::Exported` -- Mesa's WSI buffer, and every declared export with no shape -- has a real
+dma-buf descriptor and still answers `NotExportable` to `resource_export`, `export_blob` and the
+`EXPORT_QUERY` structure. The descriptor is right there; what is missing is the code to hand it
+onward with the guest's layout, which only arrives at `PIPE_RESOURCE_SET_TYPE`. Nothing on this
+host asks yet -- rutabaga calls `export_blob` per blob create and takes the refusal -- so this is
+a VMM that wants to pass a client's window buffer to a compositor outside the guest, and it will
+be an unexplained blank window when it does.
+
 **Shared buffers are linear only on request.** A guest that presents through virtio-gpu KMS can
 scan out `LINEAR` and nothing else, and a venus context importing a classic buffer must be told
 its true layout -- so a Vulkan compositor in the guest needs both. `Config::linear_shared` (the

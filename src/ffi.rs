@@ -65,8 +65,9 @@ fn config_of(flags: c_int) -> Config {
         vrend: flags & abi::NO_VIRGL == 0,
         guest_vram: flags & abi::USE_GUEST_VRAM != 0,
         video: flags & abi::USE_VIDEO != 0,
-        // No flag carries it; `virgl_renderer_init` reads it from the environment instead.
-        linear_shared: false,
+        // No flag carries it, so it takes the Rust default and `virgl_renderer_init` lets the
+        // environment override it.
+        linear_shared: Config::default().linear_shared,
     }
 }
 
@@ -450,8 +451,11 @@ pub extern "C" fn virgl_renderer_init(
     let forced = !config.video && std::env::var("VIRGLRS_VIDEO").as_deref() == Ok("1");
     config.video |= forced;
     // The C reads the same switch from the environment (`VIRGL_GBM_LAYOUT_ENABLE`), and no VMM
-    // has a flag for it, so it is read here under the C's name.
-    config.linear_shared = std::env::var("VIRGL_GBM_LAYOUT_ENABLE").as_deref() == Ok("1");
+    // has a flag for it, so it is read here under the C's name -- with the C's default inverted:
+    // on unless set to `0`. See `Config::linear_shared`.
+    if let Ok(v) = std::env::var("VIRGL_GBM_LAYOUT_ENABLE") {
+        config.linear_shared = v != "0";
+    }
     eprintln!(
         "[virglrs] init flags={flags:#x} cb v{version} -- {}, GL {}{}",
         crate::renderer::unsupported_renderers(config),
@@ -3072,7 +3076,7 @@ mod tests {
                 vrend: true,
                 guest_vram: false,
                 video: false,
-                linear_shared: false
+                linear_shared: true
             }
         );
 
@@ -3085,7 +3089,7 @@ mod tests {
                 vrend: false,
                 guest_vram: true,
                 video: true,
-                linear_shared: false
+                linear_shared: true
             }
         );
 
