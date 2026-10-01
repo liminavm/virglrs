@@ -441,12 +441,19 @@ pub extern "C" fn virgl_renderer_init(
             _ => None,
         }
     };
+    let mut config = config_of(flags);
+    // `VIRGLRS_VIDEO=1` asks for video where the VMM cannot: QEMU has no option that sets
+    // `USE_VIDEO`, so without this a QEMU guest -- the Linux video harness's -- never sees a
+    // decoder on either renderer.
+    let forced = !config.video && std::env::var("VIRGLRS_VIDEO").as_deref() == Ok("1");
+    config.video |= forced;
     eprintln!(
-        "[virglrs] init flags={flags:#x} cb v{version} -- {}, GL {}",
-        crate::renderer::unsupported_renderers(config_of(flags)),
+        "[virglrs] init flags={flags:#x} cb v{version} -- {}, GL {}{}",
+        crate::renderer::unsupported_renderers(config),
         if contexts.is_some() { "minted by the VMM" } else { "of our own" },
+        if forced { ", video by VIRGLRS_VIDEO" } else { "" },
     );
-    match Renderer::new(Box::new(VmmFences(Arc::clone(&shared))), config_of(flags), contexts) {
+    match Renderer::new(Box::new(VmmFences(Arc::clone(&shared))), config, contexts) {
         Ok(renderer) => {
             shared.debug.set(renderer.debug()).expect("a sink is initialised once");
             *g = Some(Client { renderer, init: InitArgs::new(cookie, flags, cb) });
