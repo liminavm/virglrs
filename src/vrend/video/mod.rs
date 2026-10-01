@@ -19,6 +19,7 @@
 pub mod av1;
 pub mod bitstream;
 pub mod h264;
+pub mod h264_slice;
 pub mod h265;
 pub mod pending;
 #[cfg(not(va))]
@@ -393,7 +394,14 @@ impl Gate {
 #[derive(Clone)]
 #[cfg_attr(
     va,
-    expect(dead_code, reason = "VA-API serves VP9 alone so far; these feed the session backend")
+    expect(
+        dead_code,
+        reason = "VA-API is not handed parameter sets; they feed the session backend"
+    )
+)]
+#[cfg_attr(
+    not(va),
+    expect(dead_code, reason = "the parsed picture is VA-API's; the session backend takes sets")
 )]
 enum Shape {
     /// Boxed: the descriptor is read whole, for a backend that hands every field to the driver.
@@ -404,7 +412,17 @@ enum Shape {
     /// The sets are kept rather than the descriptor they came from because they *are* the
     /// session's configuration -- keeping the descriptor would leave two places holding one
     /// fact, and the one the session was built from would be the derived copy.
-    H264 { sets: h264::ParameterSets, key: bool, width: u32, height: u32 },
+    ///
+    /// `picture` is the descriptor itself, read whole, for a backend that is handed it field by
+    /// field rather than a bitstream. The sets are still written on every host: a stream they
+    /// cannot be written for is one outside the profiles advertised, and is refused alike.
+    H264 {
+        sets: h264::ParameterSets,
+        picture: Arc<h264_slice::Picture>,
+        key: bool,
+        width: u32,
+        height: u32,
+    },
     /// HEVC: the same, with three sets. Key-ness comes from the descriptor here rather than
     /// from the bitstream -- `IDRPicFlag` and `RAPPicFlag` are on the wire, and H.264 has no
     /// equivalent.
@@ -451,19 +469,16 @@ impl Shape {
         }
     }
 
-    /// Re-frame the accumulated access unit into what VideoToolbox takes.
+    /// Re-frame the accumulated access unit into what the host decoder takes.
     ///
     /// VP9 is handed over as it arrives. H.264 and HEVC arrive Annex-B -- mesa's frontend
-    /// prepends a start code per slice -- and VideoToolbox accepts only length-prefixed NALs,
-    /// so the framing is rewritten and nothing else: the emulation-prevention bytes inside each
-    /// NAL stay exactly as the encoder wrote them.
-    ///
-    /// One rewrite for both, because NAL framing is the one thing the two codecs did not change
-    /// between them -- which is why the C reaches for its H.264 function here too.
+    /// prepends a start code per slice -- and the backend says what becomes of that framing
+    /// (`reframe`): VideoToolbox takes only length-prefixed NALs, VA-API takes the slices as
+    /// sent. `None` is an access unit that is not Annex-B at all.
     fn access_unit(&self, bitstream: Vec<u8>) -> Option<Vec<u8>> {
         match self {
             Shape::Vp9(_) => Some(bitstream),
-            Shape::H264 { .. } | Shape::Hevc { .. } => h264::annexb_to_avcc(&bitstream),
+            Shape::H264 { .. } | Shape::Hevc { .. } => backend::reframe(bitstream),
             // AV1 never arrives here: what the guest sends is tile data, and the temporal unit
             // around it is synthesized rather than re-framed.
             Shape::Av1 { .. } => unreachable!("an AV1 unit is built by the serializer"),
@@ -1645,7 +1660,9 @@ impl Video {
                 // Sticky across the calls that make up one access unit: an IDR seen in an earlier
                 // fragment is still an IDR in this frame.
                 let key = shape.as_ref().is_some_and(Shape::key) || h264::has_idr(accumulated);
-                *shape = Some(Shape::H264 { sets, key, width, height });
+                let decoding = h264_slice::Decoding::read(descriptor);
+                let picture = Arc::new(h264_slice::Picture { desc, decoding });
+                *shape = Some(Shape::H264 { sets, picture, key, width, height });
             }
             Kind::Hevc { profile: hevc_profile, ref_pic_sets } => {
                 let hevc_profile = *hevc_profile;
@@ -2023,17 +2040,21 @@ mod tests {
 
         let h264 = Shape::H264 {
             sets: h264::ParameterSets { sps: vec![0x67, 0x42], pps: vec![0x68, 0xce] },
+            picture: Arc::new(h264_slice::Picture {
+                desc: h264::PictureDesc::read(&[]),
+                decoding: h264_slice::Decoding::read(&[]),
+            }),
             key: false,
             width: 176,
             height: 144,
         };
         assert!(!h264.key());
         assert_eq!(h264.extent(), (176, 144));
-        // Annex-B in, AVCC out: one four-byte length in place of the start code.
-        assert_eq!(
-            h264.access_unit(vec![0, 0, 0, 1, 0x65, 0xaa]),
-            Some(vec![0, 0, 0, 2, 0x65, 0xaa])
-        );
+        // Annex-B in, AVCC out for VideoToolbox: one four-byte length in place of the start
+        // code. VA-API takes the slices as they were sent.
+        let reframed =
+            if cfg!(va) { vec![0, 0, 0, 1, 0x65, 0xaa] } else { vec![0, 0, 0, 2, 0x65, 0xaa] };
+        assert_eq!(h264.access_unit(vec![0, 0, 0, 1, 0x65, 0xaa]), Some(reframed));
         // Not Annex-B at all: nothing to guess at, and the caller refuses the frame.
         assert_eq!(h264.access_unit(vec![0x65, 0xaa]), None);
 
@@ -2046,10 +2067,12 @@ mod tests {
         };
         assert!(hevc.key());
         assert_eq!(hevc.extent(), (1280, 720));
-        assert_eq!(
-            hevc.access_unit(vec![0, 0, 1, 0x26, 0x01, 0xaf]),
-            Some(vec![0, 0, 0, 3, 0x26, 0x01, 0xaf])
-        );
+        let reframed = if cfg!(va) {
+            vec![0, 0, 1, 0x26, 0x01, 0xaf]
+        } else {
+            vec![0, 0, 0, 3, 0x26, 0x01, 0xaf]
+        };
+        assert_eq!(hevc.access_unit(vec![0, 0, 1, 0x26, 0x01, 0xaf]), Some(reframed));
 
         // AV1's configuration is an av1C box, and its extent comes from the descriptor the
         // serializer writes the whole unit out of.

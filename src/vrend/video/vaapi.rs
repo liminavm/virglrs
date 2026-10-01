@@ -26,7 +26,7 @@ use std::sync::{Arc, Weak};
 use cros_libva as va;
 
 use super::{Backend, Delivery, Destination, Identity, Layout, Lookup, Shape, TargetFormat};
-use super::{pending, vp9};
+use super::{h264_slice, pending, vp9};
 use crate::decode::{Imaged, Picture, PixelFormat};
 use crate::surface::{Held, PlaneLayout, PlaneLayouts};
 use crate::vrend::egl::{Importer, Plane};
@@ -93,6 +93,21 @@ enum Params {
         /// empty slot, or a handle naming no target.
         refs: [Option<Arc<Identity>>; 8],
     },
+    H264 {
+        picture: Arc<h264_slice::Picture>,
+        /// The DPB's targets, resolved the same way, one per DPB entry.
+        dpb: Vec<Option<Arc<Identity>>>,
+        /// The codec's extent: the wire has no `pic_width_in_mbs`.
+        width: u32,
+        height: u32,
+    },
+}
+
+/// VA-API takes the slices as they were sent, start codes and all: each NAL goes to the driver in
+/// a slice-data buffer of its own. Only the framing is checked -- an access unit that is not
+/// Annex-B has no slices to find.
+pub(super) fn reframe(bitstream: Vec<u8>) -> Option<Vec<u8>> {
+    super::bitstream::NalUnits::new(&bitstream).is_some().then_some(bitstream)
 }
 
 /// A decode target, as the decode thread needs it.
@@ -168,8 +183,14 @@ impl Backend for Host {
                 frame: frame.clone(),
                 refs: std::array::from_fn(|slot| resolve(frame.refs[slot])),
             },
-            Shape::H264 { .. } | Shape::Hevc { .. } | Shape::Av1 { .. } => {
-                unreachable!("VA-API advertises VP9 only, so no other codec is created")
+            Shape::H264 { picture, width, height, .. } => Params::H264 {
+                picture: Arc::clone(picture),
+                dpb: picture.decoding.dpb.iter().map(|r| resolve(r.buffer)).collect(),
+                width: *width,
+                height: *height,
+            },
+            Shape::Hevc { .. } | Shape::Av1 { .. } => {
+                unreachable!("VA-API advertises neither HEVC nor AV1, so no such codec is created")
             }
         };
         Unit {
@@ -221,6 +242,9 @@ impl Backend for Host {
             Params::Vp9 { frame, .. } => {
                 (va::VAProfile::VAProfileVP9Profile0, frame.width, frame.height)
             }
+            Params::H264 { width, height, .. } => {
+                (va::VAProfile::VAProfileH264High, *width, *height)
+            }
         };
         let made = va.decoder_for(profile, width, height);
         let Some(target_at) = va.surface_for(target) else {
@@ -242,6 +266,11 @@ impl Backend for Host {
             Params::Vp9 { frame, refs } => {
                 let reference_frames = refs.each_ref().map(|slot| id(slot).unwrap_or(NO_SURFACE));
                 decode_vp9(decoder, surface, frame, reference_frames, &unit.bytes)
+            }
+            Params::H264 { picture, dpb, width, height } => {
+                let dpb: Vec<Option<va::VASurfaceID>> = dpb.iter().map(id).collect();
+                let extent = (*width, *height);
+                decode_h264(decoder, surface, picture, &dpb, extent, &unit.bytes)
             }
         };
         phases.session = Some(began.elapsed());
@@ -384,6 +413,8 @@ enum Failure {
         width: u32,
         height: u32,
     },
+    /// An H.264 slice that could not be described to the driver.
+    H264(h264_slice::Refused),
     Va(&'static str, va::VaError),
 }
 
@@ -398,6 +429,7 @@ impl std::fmt::Display for Failure {
             Failure::Extent { width, height } => {
                 write!(f, "a {width}x{height} frame is outside what VP9 can declare")
             }
+            Failure::H264(why) => write!(f, "H.264: {why}"),
             Failure::Va(step, why) => write!(f, "{step}: {why}"),
         }
     }
@@ -519,6 +551,183 @@ fn render(
         .sync::<()>()
         .map_err(|(why, _)| Failure::Va("vaSyncSurface", why))?;
     Ok(())
+}
+
+/// Decode one H.264 frame into `surface`, and wait for it.
+///
+/// The picture parameters and the scaling lists are the descriptor's, field for field, as the C's
+/// `h264_fill_picture_param` writes them. The slice parameters are not on the wire, and the C sends
+/// them empty; they are rebuilt here from each slice's own header and the descriptor's DPB, which is
+/// what lets a driver other than Mesa's decode the stream (see [`h264_slice`]).
+fn decode_h264(
+    decoder: &Decoder,
+    surface: &va::Surface<()>,
+    picture: &h264_slice::Picture,
+    dpb_surfaces: &[Option<va::VASurfaceID>],
+    (width, height): (u32, u32),
+    bytes: &[u8],
+) -> Result<(), Failure> {
+    use va::{
+        VA_PICTURE_H264_BOTTOM_FIELD as BOTTOM, VA_PICTURE_H264_INVALID as INVALID,
+        VA_PICTURE_H264_LONG_TERM_REFERENCE as LONG, VA_PICTURE_H264_SHORT_TERM_REFERENCE as SHORT,
+        VA_PICTURE_H264_TOP_FIELD as TOP,
+    };
+    let desc = &picture.desc;
+    let dec = &picture.decoding;
+    let slices = h264_slice::slices(bytes, desc).map_err(Failure::H264)?;
+    if slices.is_empty() {
+        return Err(Failure::H264(h264_slice::Refused::Unsupported(
+            "an access unit with no slice",
+        )));
+    }
+
+    let invalid = || va::PictureH264::new(NO_SURFACE, 0, INVALID, 0, 0);
+    // A DPB entry as VA-API names it, or `None` for one that is not a reference: an entry
+    // neither of whose fields is marked -- the guest zero-fills the slots up to `num_ref_frames`,
+    // and handle 0 of a zeroed slot can name a live target -- or one whose target has no surface
+    // here, a picture this codec never decoded, which no list may point at.
+    let reference = |i: usize| {
+        let r = &dec.dpb[i];
+        let mut flags = if r.long_term { LONG } else { SHORT };
+        match (r.top, r.bottom) {
+            (true, true) => {}
+            (true, false) => flags |= TOP,
+            (false, true) => flags |= BOTTOM,
+            (false, false) => return None,
+        }
+        let id = dpb_surfaces.get(i).copied().flatten()?;
+        Some(va::PictureH264::new(
+            id,
+            r.frame_idx,
+            flags,
+            r.field_order_cnt[0],
+            r.field_order_cnt[1],
+        ))
+    };
+    let reference_frames: [va::PictureH264; 16] = std::array::from_fn(|i| {
+        if i < dec.dpb.len() { reference(i) } else { None }.unwrap_or_else(invalid)
+    });
+    let current = va::PictureH264::new(
+        surface.id(),
+        dec.frame_num,
+        if dec.is_reference { SHORT } else { 0 },
+        dec.field_order_cnt[0],
+        dec.field_order_cnt[1],
+    );
+
+    let mbs = |n: u32| n.div_ceil(16);
+    let mut height_mbs = mbs(height);
+    if !desc.frame_mbs_only {
+        // A field-capable stream counts its height in pairs of macroblock rows.
+        height_mbs = height_mbs.next_multiple_of(2);
+    }
+    let seq = va::H264SeqFields::new(
+        u32::from(desc.chroma_format_idc),
+        0,
+        0,
+        u32::from(desc.frame_mbs_only),
+        u32::from(dec.mb_adaptive_frame_field),
+        u32::from(desc.direct_8x8_inference),
+        u32::from(dec.min_luma_bi_pred_8x8),
+        u32::from(desc.log2_max_frame_num_minus4),
+        u32::from(desc.pic_order_cnt_type),
+        u32::from(desc.log2_max_pic_order_cnt_lsb_minus4),
+        u32::from(desc.delta_pic_order_always_zero),
+    );
+    let fields = va::H264PicFields::new(
+        u32::from(desc.entropy_coding_mode),
+        u32::from(desc.weighted_pred),
+        u32::from(desc.weighted_bipred_idc),
+        u32::from(desc.transform_8x8_mode),
+        u32::from(desc.field_pic),
+        u32::from(desc.constrained_intra_pred),
+        u32::from(desc.bottom_field_pic_order_in_frame_present),
+        u32::from(desc.deblocking_filter_control_present),
+        u32::from(desc.redundant_pic_cnt_present),
+        u32::from(dec.is_reference),
+    );
+    let too_big = || Failure::H264(h264_slice::Refused::OutOfRange("the picture's extent"));
+    let parameters = va::PictureParameterBufferH264::new(
+        current,
+        reference_frames,
+        u16::try_from(mbs(width).saturating_sub(1)).map_err(|_| too_big())?,
+        u16::try_from(height_mbs.saturating_sub(1)).map_err(|_| too_big())?,
+        desc.bit_depth_luma_minus8,
+        desc.bit_depth_chroma_minus8,
+        desc.num_ref_frames,
+        &seq,
+        desc.num_slice_groups_minus1,
+        dec.slice_group_map_type,
+        u16::from(dec.slice_group_change_rate_minus1),
+        desc.pic_init_qp_minus26,
+        desc.pic_init_qs_minus26,
+        desc.chroma_qp_index_offset,
+        desc.second_chroma_qp_index_offset,
+        &fields,
+        dec.frame_num as u16,
+    );
+    let mut buffers = vec![
+        va::BufferType::PictureParameter(va::PictureParameter::H264(parameters)),
+        va::BufferType::IQMatrix(va::IQMatrix::H264(va::IQMatrixBufferH264::new(
+            dec.scaling_4x4,
+            dec.scaling_8x8,
+        ))),
+    ];
+
+    for slice in &slices {
+        let h = &slice.header;
+        let lists = h264_slice::ref_lists(h, dec, desc).map_err(Failure::H264)?;
+        let list =
+            |l: usize| lists[l].map(|entry| entry.and_then(reference).unwrap_or_else(invalid));
+        let blank = h264_slice::ListWeights {
+            luma_flag: false,
+            luma_weight: [0; 32],
+            luma_offset: [0; 32],
+            chroma_flag: false,
+            chroma_weight: [[0; 2]; 32],
+            chroma_offset: [[0; 2]; 32],
+        };
+        let (luma_denom, chroma_denom, [w0, w1]) = match &h.weights {
+            Some(w) => (w.luma_log2_denom, w.chroma_log2_denom, w.lists.clone()),
+            None => (0, 0, [blank.clone(), blank]),
+        };
+        let too_long = || Failure::H264(h264_slice::Refused::OutOfRange("a slice's length"));
+        let params = va::SliceParameterBufferH264::new(
+            u32::try_from(slice.nal.len()).map_err(|_| too_long())?,
+            0,
+            va::VA_SLICE_DATA_FLAG_ALL,
+            u16::try_from(h.data_bit_offset).map_err(|_| too_long())?,
+            u16::try_from(h.first_mb_in_slice).map_err(|_| too_long())?,
+            h.slice_type as u8,
+            u8::from(h.direct_spatial_mv_pred),
+            h.num_ref_idx_active_minus1[0],
+            h.num_ref_idx_active_minus1[1],
+            h.cabac_init_idc,
+            h.slice_qp_delta,
+            h.disable_deblocking_filter_idc,
+            h.slice_alpha_c0_offset_div2,
+            h.slice_beta_offset_div2,
+            list(0),
+            list(1),
+            luma_denom,
+            chroma_denom,
+            u8::from(w0.luma_flag),
+            w0.luma_weight,
+            w0.luma_offset,
+            u8::from(w0.chroma_flag),
+            w0.chroma_weight,
+            w0.chroma_offset,
+            u8::from(w1.luma_flag),
+            w1.luma_weight,
+            w1.luma_offset,
+            u8::from(w1.chroma_flag),
+            w1.chroma_weight,
+            w1.chroma_offset,
+        );
+        buffers.push(va::BufferType::SliceParameter(va::SliceParameter::H264(params)));
+        buffers.push(va::BufferType::SliceData(slice.nal.to_vec()));
+    }
+    render(decoder, surface, buffers)
 }
 
 /// Whether a target's planes take a GPU copy from a surface's: two per-plane textures, NV12, in

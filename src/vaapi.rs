@@ -55,7 +55,10 @@ impl Codec {
     pub fn va_profile(self) -> Option<va::VAProfile::Type> {
         match self {
             Codec::Vp9 => Some(va::VAProfile::VAProfileVP9Profile0),
-            Codec::H264 | Codec::Hevc | Codec::Av1 => None,
+            // High decodes the Main and Constrained Baseline streams too, which is every H.264
+            // profile advertised.
+            Codec::H264 => Some(va::VAProfile::VAProfileH264High),
+            Codec::Hevc | Codec::Av1 => None,
         }
     }
 }

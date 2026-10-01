@@ -32,6 +32,14 @@ pub struct Unit {
     withheld: bool,
 }
 
+/// VideoToolbox takes length-prefixed NALs only, so an Annex-B access unit's framing is rewritten
+/// and nothing else: the emulation-prevention bytes inside each NAL stay exactly as the encoder
+/// wrote them. One rewrite for H.264 and HEVC, because NAL framing is the one thing the two did not
+/// change between them -- which is why the C reaches for its H.264 function here too.
+pub(super) fn reframe(bitstream: Vec<u8>) -> Option<Vec<u8>> {
+    super::h264::annexb_to_avcc(&bitstream)
+}
+
 impl Shape {
     /// The codec configuration record a session for this frame is built around.
     pub(super) fn configuration(&self) -> Configuration {

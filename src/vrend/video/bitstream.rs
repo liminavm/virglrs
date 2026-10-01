@@ -206,6 +206,13 @@ impl<'a> Reader<'a> {
         Some(v)
     }
 
+    /// How many bits of the *buffer* have been read, emulation-prevention bytes included: where
+    /// the next syntax element starts in the bytes as they were sent. A decoder handed the raw
+    /// NAL is told the slice data's position in these terms, not in RBSP bits.
+    pub fn raw_bits(&self) -> usize {
+        self.pos * 8 + self.bit as usize
+    }
+
     /// `u(n)`: `n` bits, most significant first.
     pub fn u(&mut self, n: u32) -> Option<u32> {
         let mut v = 0u32;

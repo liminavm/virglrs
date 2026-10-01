@@ -713,10 +713,13 @@ buildable throughout as the A-side reference.
   orders the copy before the surface's next decode. Any other target -- three-plane layouts,
   composite targets, a host without dma-buf import -- is read back through memory and uploaded.
   The decode thread logs the route each time it changes, because a silent fallback produces the
-  same pixels and the same score. VP9 is
-  served first because its parameters come wholly from the descriptor. H.264 and HEVC need their
-  slice headers parsed, since the C leaves those parameters uninitialised and only Mesa's driver
-  tolerates that, and this backend serves any driver.
+  same pixels and the same score. VP9's parameters come wholly from the descriptor. H.264's
+  picture parameters and scaling lists do too, but its slice parameters are not on the wire: the
+  C sends them uninitialised, which only Mesa's driver tolerates, because Mesa parses the slices
+  itself. This backend serves any driver, so `video/h264_slice.rs` reads each slice header and
+  builds that slice's final reference lists (8.2.4: initialised from the descriptor's DPB, then
+  modified) to fill them. Frame pictures only: field pictures and field-capable streams are
+  refused, as they are on VideoToolbox. HEVC needs the same, with a larger header to parse.
 
   **Decode only.** `virgl_video_encode_bitstream` is a stub returning -1 and `fill_caps`
   advertises no encode entrypoint, so the guest cannot reach it. `EncodeBitstream` is refused

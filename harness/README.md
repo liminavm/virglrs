@@ -1228,8 +1228,17 @@ as a host with no video silicon. So the script asserts virglrs's own `hardware v
 rather than only that it loaded, and refuses a boot where QEMU says it could not initialise the
 renderer.
 
-**Measured on goiaba (Intel Ice Lake, RPM Fusion's iHD), rs leg: 275 of 305 VP9 vectors** match
-the published md5 -- VP9 is the one codec the VA backend serves so far. Every failure also fails on
+**Measured on goiaba (Intel Ice Lake, RPM Fusion's iHD), rs leg: 352 of 440**, which is 275 of
+305 VP9 vectors and 77 of 135 H.264 vectors (VideoToolbox passes 71); HEVC is not served yet.
+
+H.264's failures are the field-coded and MBAFF streams, which are refused, as they are on
+macOS; the PAFF streams' frame pictures, whose references were refused field pictures; and the
+SP-slice and FMO streams, which the guest refuses before they reach the renderer. One failure is
+VA's alone: `BASQP1_Sony_C`, whose first (IDR) picture the driver rejects with an internal
+decoding error while every later picture decodes. Armed: emptying every slice's reference lists
+takes H.264 to 21, the intra-only streams.
+
+VP9's every failure also fails on
 macOS's VideoToolbox: the `resize` vectors, `vp90-2-16-intra-only`, `vp90-2-22-svc_1280x720_3`, and
 the profile-1 4:2:2 and 4:4:4 streams nobody advertises. The 8- to 66-pixel `vp90-2-02-size-*`
 family and the odd `vp90-2-11-size-*` that VideoToolbox fails decode here. Armed: handing the
