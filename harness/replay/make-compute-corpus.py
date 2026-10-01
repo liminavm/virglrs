@@ -17,7 +17,8 @@
 # - C, a second compute shader, the gradient reversed, dispatched after the reads of A and B have
 #   drawn. Graphics and compute share the program the sub-context runs, so this is the switch in
 #   both directions: the dispatch must leave the draw's program, and the draw after it must come
-#   back to its own.
+#   back to its own. Then the dispatch and the read again with nothing set between them, so the
+#   draw has no state change to reselect its program for.
 #
 # No recorded session dispatches compute: a desktop does not. The textures are read back through
 # a draw because the sweep reads only plain 2D colour targets.
@@ -154,6 +155,12 @@ def build():
     launch_grid(c, [SIDE // BLOCK, SIDE // BLOCK, 1])
     c.memory_barrier()
     read("c")
+    # The same dispatch and the same draw again, with no state set between them. Every other
+    # draw here follows a framebuffer bind, which reselects the draw's program for a reason of
+    # its own; this one has only the dispatch to say its program is no longer bound.
+    launch_grid(c, [SIDE // BLOCK, SIDE // BLOCK, 1])
+    c.memory_barrier()
+    c.draw(4)
 
     c.set_shader_images(STAGE_COMPUTE, [None])
     c.set_framebuffer([])

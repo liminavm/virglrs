@@ -23,8 +23,8 @@ generated = "harness/replay/make-blit-corpus.py"
 
 [[corpus]]
 name = "compute.bin"
-sha256 = "e6311e1fe1c1ac151f1e51ab49bde2f2fcab4a2f446a5ab054db17ac2cfcead4"
-size = 5544
+sha256 = "e4b492090628e276c20c67ffd7ff8b708749ec08e0f2bc4d78d4d751344b9430"
+size = 5736
 generated = "harness/replay/make-compute-corpus.py"
 
 [[corpus]]

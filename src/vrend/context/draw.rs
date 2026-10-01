@@ -1591,7 +1591,11 @@ impl Context {
         // passes per draw on any BGRA target, which is every desktop draw here, for a program
         // that comes back the same. Every other key input marks dirt where it changes, and
         // the flatshade and sampler fixtures are what say so.
-        if sub.shader_dirty || sub.vbo_dirty {
+        //
+        // A dispatch leaves its compute program bound, and nothing about that is a dirty flag:
+        // the program itself says it is not one a draw can run, so the draw selects its own.
+        let compute_bound = sub.program().is_some_and(|p| matches!(p.linkage, Linkage::Compute(_)));
+        if sub.shader_dirty || sub.vbo_dirty || compute_bound {
             selected = host.tally.mark();
             let s = self.select_linked_program(host, cmd)?;
             new_program = s.changed;
@@ -1836,8 +1840,9 @@ impl Context {
     /// it found or made. Answers whether the sub-context's program changed.
     ///
     /// Graphics and compute share the one program a sub-context runs, as they do in the C, so a
-    /// change here leaves the draw's program behind: the shader is marked dirty, and the next draw
-    /// selects its own again.
+    /// change here leaves the draw's program behind. The C marks the shader dirty for the next
+    /// draw; here the draw sees a compute program bound and selects its own, so there is no flag
+    /// for a later change to forget.
     fn select_compute_program(&mut self, host: &mut Host<'_>, cmd: Cmd) -> Result<bool, Fault> {
         self.select_compute(host, cmd)?;
         let sub = self.sub();
@@ -1865,7 +1870,6 @@ impl Context {
         };
         let sub = self.sub_mut();
         sub.prog = Some(slot);
-        sub.shader_dirty = true;
         // A program's sampler uniforms are written only for a dirty unit, so a new one starts
         // with every unit and block of its stage to bind.
         let s = ShaderStage::Compute.index();
