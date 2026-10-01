@@ -492,11 +492,14 @@ window buffer, where an ordinary desktop mostly does not.
 
 **A classic export holds a descriptor per resource, for the resource's lifetime, uncharged.**
 `export_surface` takes a dma-buf from the driver for every SHARED or SCANOUT classic resource and
-keeps it until the resource dies. A desktop's resources are many and `RLIMIT_NOFILE` defaults to
-1024 under QEMU, so a busy session can run the host out of descriptors -- and the budget will not
-see it coming, because a file descriptor is not bytes and the ledger counts bytes. Two things to
-decide: whether the descriptor can be taken on demand rather than held, and whether descriptors
-want a count of their own beside the memory cap.
+keeps it until the resource dies, and the budget does not see it, because a descriptor is not
+bytes. It is bookkeeping, not a risk: measured on goiaba on 2026-10-01, a GNOME session on the
+venus rig with 13 windows open (vkcube among them) held 80 dma-buf descriptors and 308 in all,
+the same 80 with linear shared buffers off -- a linear buffer's GBM descriptor *is* its export.
+QEMU raises its own soft `RLIMIT_NOFILE` to the hard cap (524288 there, against the shell's
+1024), and limina raises its worker to 10240; on macOS classic storage is an IOSurface and holds
+no descriptor at all. A VMM that leaves the soft limit at 1024 would meet it: about 15
+descriptors a window over a 106-descriptor desktop puts the ceiling near 60 windows.
 
 **A host with no `EGL_EXT_image_dma_buf_import` composites a blank window and says nothing.**
 `Untyped::set_type` drops storage it cannot adopt and falls through to an ordinary texture, which
