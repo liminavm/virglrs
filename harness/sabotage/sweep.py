@@ -1884,6 +1884,27 @@ SABOTAGES = [
         'an_image_reads_its_layers_as_the_c_does',
     ),
     (
+        'a compute dispatch is refused as unimplemented again',
+        'src/vrend/context.rs',
+        """                self.launch_grid(host, grid, indirect, indirect_offset)""",
+        """                Err(Fault::Unimplemented { cmd: kind, what: "compute dispatch" })""",
+        'a_dispatch_runs_its_grid_from_the_wire_or_its_buffer',
+    ),
+    (
+        'an indirect dispatch runs the grid on the wire instead of its buffer\'s',
+        'src/vrend/context/draw.rs',
+        """            Some(_) => gl.dispatch_compute_indirect(indirect_offset),""",
+        """            Some(_) => gl.dispatch_compute(grid),""",
+        'a_dispatch_runs_its_grid_from_the_wire_or_its_buffer',
+    ),
+    (
+        'an indirect dispatch reads its grid from the start of its buffer',
+        'src/vrend/context/draw.rs',
+        """            Some(_) => gl.dispatch_compute_indirect(indirect_offset),""",
+        """            Some(_) => gl.dispatch_compute_indirect(0),""",
+        'a_dispatch_runs_its_grid_from_the_wire_or_its_buffer',
+    ),
+    (
         'a query result the pages refused is marked as delivered',
         'src/vrend/context.rs',
         """        let delivered = guest.pages(ctx, resource).is_some_and(|pages| pages.copy_in(0, &state));""",
