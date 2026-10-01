@@ -10,10 +10,13 @@
 //!
 //! `cargo run --example first-session -- vp9 h264:t.h264 hevc:t.hevc vp9`
 
+#[cfg(target_os = "macos")]
 use std::time::Instant;
+#[cfg(target_os = "macos")]
 use virglrenderer::decode::{Configuration, PixelFormat, Session, SessionKey, Support};
 
 /// The NAL units of an Annex B stream, without their start codes.
+#[cfg(target_os = "macos")]
 fn nals(stream: &[u8]) -> Vec<&[u8]> {
     let mut starts = Vec::new();
     let mut i = 0;
@@ -37,6 +40,7 @@ fn nals(stream: &[u8]) -> Vec<&[u8]> {
 }
 
 /// The first NAL unit of a type, by the codec's own reading of the header.
+#[cfg(target_os = "macos")]
 fn first(units: &[&[u8]], kind: impl Fn(u8) -> u8, want: u8) -> Vec<u8> {
     units
         .iter()
@@ -45,6 +49,7 @@ fn first(units: &[&[u8]], kind: impl Fn(u8) -> u8, want: u8) -> Vec<u8> {
         .to_vec()
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     // Registers the supplemental decoders, without which there is no VP9 session to build.
     let _support = Support::probe();
@@ -82,4 +87,11 @@ fn main() {
             began.duration_since(started).as_secs_f64() * 1e3,
         );
     }
+}
+
+/// VideoToolbox is Apple's, so there is no session to time anywhere else.
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("first-session times VideoToolbox sessions, which exist only on macOS");
+    std::process::exit(2);
 }
