@@ -156,7 +156,11 @@ boot_qemu() {
         [ "$waited" -lt 50 ] || { echo "virtiofsd never listened, see $OUT/$leg-virtiofsd.log" >&2; return 1; }
     done
 
-    env LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" qemu-system-x86_64 \
+    # VIRGLRS_VIDEO because QEMU has no option that sets USE_VIDEO: without it virglrs serves no
+    # video to a QEMU guest at all. The C has no such override, and no VA leg on a non-Mesa
+    # driver either.
+    env LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" VIRGLRS_VIDEO=1 \
+        qemu-system-x86_64 \
         -enable-kvm -cpu host -m "$mem" -smp 4 \
         -object memory-backend-memfd,id=mem0,size="$mem",share=on \
         -machine memory-backend=mem0 \
@@ -165,7 +169,7 @@ boot_qemu() {
         ${seed:+-drive file="$seed",if=virtio,format=raw,readonly=on} \
         -vga none \
         -device virtio-gpu-gl-pci \
-        -display egl-headless,rendernode="${FLUSTER_RENDER_NODE:-/dev/dri/renderD128}" \
+        -display egl-headless,gl=es,rendernode="${FLUSTER_RENDER_NODE:-/dev/dri/renderD128}" \
         -chardev socket,id=vfs,path="$sock" \
         -device vhost-user-fs-pci,chardev=vfs,tag=limina-fluster \
         -netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$PORT"-:22 \
@@ -207,13 +211,27 @@ run_leg() {
     # Which renderer QEMU actually loaded, from its own log: virglrs announces itself at init and
     # the C does not. A library path that resolved nothing still boots, on the system renderer,
     # and every number after that would be about the wrong leg.
+    #
+    # Loading it is not enough: virglrs prints its init line before it decides whether it can
+    # serve the GL context QEMU minted, and a refusal leaves a guest that boots without 3D and
+    # reads, three steps later, like a host advertising no video. So the rs leg asserts the line
+    # the renderer prints only once it is up and has probed the video it will advertise.
     if [ "$(uname -s)" != Darwin ]; then
         local said
         said=$(grep -c '\[virglrs\]' "$log")
         case "$leg" in
-            rs) [ "$said" -gt 0 ] || { echo "rs: QEMU did not load virglrs, see $log" >&2; return 1; } ;;
+            rs) [ "$said" -gt 0 ] || { echo "rs: QEMU did not load virglrs, see $log" >&2; return 1; }
+                grep -q '\[virglrs\] vrend: hardware video decode' "$log" || {
+                    echo "rs: virglrs did not come up with video, see $log" >&2
+                    return 1
+                }
+                grep '\[virglrs\] vrend: hardware video decode' "$log" ;;
             c)  [ "$said" -eq 0 ] || { echo "c: QEMU loaded virglrs, see $log" >&2; return 1; } ;;
         esac
+        ! grep -q 'virgl could not be initialized' "$log" || {
+            echo "$leg: QEMU could not initialise the renderer, see $log" >&2
+            return 1
+        }
     fi
 
     echo "==> $leg: running ${SUITES[*]}"

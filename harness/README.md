@@ -1214,11 +1214,26 @@ in front of the system's: `third_party/virgl-prefix` for the C, `prefix/` for vi
 image is the caller's, named by `FLUSTER_GUEST_DISK` (with `FLUSTER_GUEST_SEED` for a cloud-init
 seed and `FLUSTER_GUEST_USER` for its login), and is booted with `-snapshot` so a run writes
 nothing back. The vectors reach it over virtiofs, which does not follow a symlink out of the
-shared directory, so `resources/` and `upstream/` must be real directories. The script refuses a
-boot whose QEMU log does not name the renderer the leg asked for. A Fedora guest needs RPM Fusion's
-`mesa-va-drivers-freeworld`, because Fedora's Mesa is built without H.264 and HEVC; and upstream
-virglrenderer serves VA decode only on a Mesa driver, so on an Intel host the C leg decodes
-nothing and the gate is the published md5 alone.
+shared directory, so `resources/` and `upstream/` must be real directories. A Fedora guest needs
+RPM Fusion's `mesa-va-drivers-freeworld`, because Fedora's Mesa is built without H.264 and HEVC;
+and upstream virglrenderer serves VA decode only on a Mesa driver, so on an Intel host the C leg
+decodes nothing and the gate is the published md5 alone.
+
+Two things a QEMU boot does not do by itself. Its `egl-headless` display mints a desktop-GL
+context unless asked for `gl=es`, and virglrs translates for GLES only, so it refuses the context
+and the guest boots with no 3D at all. And QEMU has no option that sets `USE_VIDEO`, so the rs
+leg is run with `VIRGLRS_VIDEO=1`, which the C ABI shim reads in its place. Either one missing
+reads, three steps later, as fluster skipping every decoder for want of a VA element -- the same
+as a host with no video silicon. So the script asserts virglrs's own `hardware video decode` line
+rather than only that it loaded, and refuses a boot where QEMU says it could not initialise the
+renderer.
+
+**Measured on goiaba (Intel Ice Lake, RPM Fusion's iHD), rs leg: 275 of 305 VP9 vectors** match
+the published md5 -- VP9 is the one codec the VA backend serves so far. Every failure also fails on
+macOS's VideoToolbox: the `resize` vectors, `vp90-2-16-intra-only`, `vp90-2-22-svc_1280x720_3`, and
+the profile-1 4:2:2 and 4:4:4 streams nobody advertises. The 8- to 66-pixel `vp90-2-02-size-*`
+family and the odd `vp90-2-11-size-*` that VideoToolbox fails decode here. Armed: handing the
+driver an empty slot for every reference takes it to 1/305.
 
 `-t 120` rather than fluster's default 30 seconds, because a `Timeout` is a verdict about the
 clock and a verdict about the clock cannot be pinned. `MR4_TANDBERG_C` and `MR5_TANDBERG_C` time
