@@ -501,13 +501,6 @@ QEMU raises its own soft `RLIMIT_NOFILE` to the hard cap (524288 there, against 
 no descriptor at all. A VMM that leaves the soft limit at 1024 would meet it: about 15
 descriptors a window over a 106-descriptor desktop puts the ceiling near 60 windows.
 
-**A host with no `EGL_EXT_image_dma_buf_import` composites a blank window and says nothing.**
-`Untyped::set_type` drops storage it cannot adopt and falls through to an ordinary texture, which
-is right on a host whose storage has pixels to read and wrong for a descriptor, whose bytes the
-host has no address for at all. `Descriptor::first_refusal` exists to say so once and is not
-called from there. The gate itself is also quieter than its own documentation claims: it says it
-reports at startup, and it is asked per `SET_TYPE` and prints nothing.
-
 ## Missing infrastructure
 
 **There is no CI** (no `.github`, no `.gitlab-ci.yml`). Two hosts and no CI means macOS regresses

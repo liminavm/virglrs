@@ -835,16 +835,26 @@ impl Winsys {
     /// Both halves are needed and neither implies the other: the GL entry point that makes an
     /// EGLImage into texture storage, and the EGL extension that makes a descriptor into an
     /// EGLImage. Asked here rather than at the import, so the answer is a property of the host
-    /// and not of the window being adopted. It is silent: a host that cannot adopt composites a
-    /// blank window with nothing said, which `docs/linux-port.md` books.
+    /// and not of the window being adopted -- and said once, in the renderer's init line, from
+    /// [`Winsys::shared_storage_refusal`].
     pub fn adopts_shared_storage(&self, features: &super::features::Features) -> bool {
-        if !features.binds_egl_images() {
-            return false;
-        }
-        // An IOSurface is imported through a Limina-specific target that needs no EGL extension
-        // to advertise it; a dma-buf is imported through `EGL_EXT_image_dma_buf_import`, and a
-        // display without it would refuse every descriptor.
-        cfg!(target_os = "macos") || self.has_extension("EGL_EXT_image_dma_buf_import")
+        self.shared_storage_refusal(features).is_none()
+    }
+
+    /// Why this host adopts no shared storage, or `None` where it does. See
+    /// [`Winsys::adopts_shared_storage`].
+    pub fn shared_storage_refusal(
+        &self,
+        features: &super::features::Features,
+    ) -> Option<&'static str> {
+        adoption_refusal(
+            features.binds_egl_images(),
+            // An IOSurface is imported through a Limina-specific target that needs no EGL
+            // extension to advertise it; a dma-buf is imported through
+            // `EGL_EXT_image_dma_buf_import`, and a display without it would refuse every
+            // descriptor.
+            cfg!(target_os = "macos") || self.has_extension("EGL_EXT_image_dma_buf_import"),
+        )
     }
 
     /// Whether an sRGB drawable can be asked for -- `vrend_winsys_has_gl_colorspace`.
@@ -1357,6 +1367,17 @@ fn parse_egl_version(s: &str) -> Version {
     let major = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
     let minor = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
     Version { major, minor }
+}
+
+/// The reason a host with these two halves adopts no shared storage, naming the half it lacks.
+fn adoption_refusal(binds_egl_images: bool, imports_descriptors: bool) -> Option<&'static str> {
+    if !binds_egl_images {
+        Some("the GL driver cannot make an EGLImage a texture's storage")
+    } else if !imports_descriptors {
+        Some("the EGL display has no EGL_EXT_image_dma_buf_import")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -2010,5 +2031,16 @@ mod tests {
             "the rows are not the clear colour, so the bytes are not laid out as rows: {:?}",
             &rows[..16]
         );
+    }
+
+    /// A host lacking either half of adoption says which, so the init line can name it; one with
+    /// both says nothing.
+    #[test]
+    fn adoption_names_the_half_the_host_lacks() {
+        assert_eq!(adoption_refusal(true, true), None);
+        let no_import = adoption_refusal(true, false).expect("no import is a refusal");
+        assert!(no_import.contains("EGL_EXT_image_dma_buf_import"), "{no_import}");
+        let no_bind = adoption_refusal(false, true).expect("no bind is a refusal");
+        assert!(no_bind.contains("EGLImage"), "{no_bind}");
     }
 }

@@ -387,9 +387,19 @@ impl Vrend {
         if winsys.reports_layouts() {
             caps.capability_bits_v2 |= caps::cap2::RESOURCE_LAYOUT;
         }
+        // Adopting is the one storage question both hosts answer, and the one that fails silently
+        // per window when the answer is no: a compositor samples a client's buffer as a blank
+        // texture. So it is said here, once, as the property of the host it is.
+        let adoption = match winsys.shared_storage_refusal(&features) {
+            None => String::new(),
+            Some(why) => format!(
+                "; NO SHARED STORAGE CAN BE ADOPTED ({why}) -- every client window a compositor \
+                 samples will be blank"
+            ),
+        };
         eprintln!(
             "[virglrs] vrend: {version_string} (gles {gles_version}), {} formats, {} features, \
-             {}",
+             {}{adoption}",
             formats.entries().count(),
             features.present().count(),
             if !cfg!(target_os = "macos") {

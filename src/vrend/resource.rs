@@ -641,9 +641,9 @@ impl Untyped {
         // is exactly what the two shapes of storage record -- so they are handled apart rather
         // than joined into one call with a flag beside it saying whom to blame.
         let image = match &self.storage {
-            // Either there is no storage here, or this host adopts none -- said once at init.
-            // Neither is news, and neither means there are no pixels: the fill below reads them
-            // where they are.
+            // Either there is no storage here, or this host adopts none -- said once in the init
+            // line. Neither is news, and neither means there are no pixels: the fill below reads
+            // them where they are.
             None => None,
             Some(_) if !winsys.adopts_shared_storage(features) => None,
             // Minted here, to a layout chosen here, on a host that says it adopts what it
