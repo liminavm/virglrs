@@ -813,6 +813,33 @@ fn add_shader_program(
     Ok(prog)
 }
 
+/// `add_cs_shader_program`: the compute stage's variant linked alone, with every location a
+/// dispatch will write through looked up once. A compute program has no stream output, no
+/// fragment outputs and no `VirglBlock`, so none of the graphics builder's fixtures apply.
+fn add_cs_shader_program(
+    host: &mut Host<'_>,
+    cmd: Cmd,
+    serial: ProgramSerial,
+    cs: &Linked<'_>,
+) -> Result<LinkedProgram, Fault> {
+    let gl = host.gl;
+    let Some(id) = gl.create_program() else {
+        return Err(Fault::Shader { cmd, what: "the driver refused a program object" });
+    };
+    gl.attach_shader(id, cs.gl);
+    if let Err(log) = gl.link_program(id) {
+        gl.delete_program(host.current.program(), id);
+        eprintln!("[virglrs] vrend: error linking program:\n{log}");
+        eprintln!("cs: GLSL:\n{}", cs.variant.strings.source());
+        return Err(Fault::Shader { cmd, what: "a program the driver refused to link" });
+    }
+    let mut prog = LinkedProgram::new(serial, id, Linkage::Compute(cs.variant.id));
+    gl.use_program(host.current.program(), Some(id));
+    prog.bind_sampler_and_ubo_locs(gl, cs, BindingPoint::FIRST);
+    prog.bind_resource_locs(gl, host.features, cs);
+    Ok(prog)
+}
+
 /// What a program selection did, for the draw that asked and the tally that prices it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Selected {
@@ -1799,6 +1826,111 @@ impl Context {
         {
             gl.pause_transform_feedback();
             sub.streamouts[i].xfb = Xfb::Paused;
+        }
+        Ok(())
+    }
+}
+
+impl Context {
+    /// `vrend_launch_grid`'s program: the compute variant selected, then the program that links
+    /// it found or made. Answers whether the sub-context's program changed.
+    ///
+    /// Graphics and compute share the one program a sub-context runs, as they do in the C, so a
+    /// change here leaves the draw's program behind: the shader is marked dirty, and the next draw
+    /// selects its own again.
+    fn select_compute_program(&mut self, host: &mut Host<'_>, cmd: Cmd) -> Result<bool, Fault> {
+        self.select_compute(host, cmd)?;
+        let sub = self.sub();
+        let Some(cs) = sub.linked_stage(ShaderStage::Compute) else {
+            return Err(Fault::Shader { cmd, what: "a stage with no compiled variant" });
+        };
+        let want = Linkage::Compute(cs.variant.id);
+        if sub.program().is_some_and(|p| p.linkage == want) {
+            return Ok(false);
+        }
+        let found = sub
+            .programs
+            .iter()
+            .position(|p| p.linkage == want)
+            .map(|at| ProgramSlot { at, serial: sub.programs[at].serial });
+        let slot = match found {
+            Some(s) => s,
+            None => {
+                let serial = sub.mint_program_serial();
+                let prog = add_cs_shader_program(host, cmd, serial, &cs)?;
+                let sub = self.sub_mut();
+                sub.programs.push(prog);
+                ProgramSlot { at: sub.programs.len() - 1, serial }
+            }
+        };
+        let sub = self.sub_mut();
+        sub.prog = Some(slot);
+        sub.shader_dirty = true;
+        // A program's sampler uniforms are written only for a dirty unit, so a new one starts
+        // with every unit and block of its stage to bind.
+        let s = ShaderStage::Compute.index();
+        sub.ubos_dirty[s] = Dirty::all();
+        sub.units[s].mark_all();
+        Ok(true)
+    }
+
+    /// `vrend_launch_grid`: the compute program, its stage's bindings, and the dispatch -- its
+    /// grid from the wire, or from three words of `indirect` at `indirect_offset`.
+    ///
+    /// The C returns quietly from a dispatch on a host without compute and from one with no
+    /// compute shader bound. Neither is a dispatch a guest told the truth about: the caps
+    /// advertise compute only where the host has it, and a guest that dispatches nothing has sent
+    /// a command it cannot mean. Both are refused here, as a draw with no program is.
+    pub(super) fn launch_grid(
+        &mut self,
+        host: &mut Host<'_>,
+        grid: [u32; 3],
+        indirect: Option<ResourceHandle>,
+        indirect_offset: u32,
+    ) -> Result<(), Fault> {
+        let cmd = Cmd::LaunchGrid;
+        let gl = host.gl;
+        if !host.has(Feature::compute_shader) {
+            return Err(Fault::NoFeature { cmd, feature: Feature::compute_shader });
+        }
+        // Three words, aligned, inside the buffer: GL refuses anything else with an error the
+        // batch would report at its end, and saying so here names the dispatch that asked.
+        let indirect_buffer = match indirect {
+            Some(handle) => {
+                let res = host.resource(cmd, handle)?;
+                let Storage::Buffer { name, .. } = res.storage else {
+                    return Err(Fault::IllegalResource { cmd, handle });
+                };
+                let end = u64::from(indirect_offset) + 3 * size_of::<u32>() as u64;
+                if !indirect_offset.is_multiple_of(4) || end > u64::from(res.args.width) {
+                    return Err(Fault::OutOfRange { cmd, what: "an indirect dispatch's grid" });
+                }
+                Some(name)
+            }
+            None => None,
+        };
+
+        let new_program = self.select_compute_program(host, cmd)?;
+        let stage = ShaderStage::Compute;
+        let sub = self.sub_mut();
+        let at = sub.program_slot().expect("a compute program was selected a moment ago");
+        gl.use_program(host.current.program(), Some(sub.program_at(at).id));
+        Self::draw_bind_ubo(sub, host, at, stage, BindingPoint::FIRST);
+        Self::draw_bind_const(sub, host, at, stage, new_program);
+        Self::draw_bind_samplers(sub, host, at, stage, TextureUnit::FIRST);
+        Self::draw_bind_images(sub, host, at, stage);
+        Self::draw_bind_ssbo(sub, host, at, stage);
+        // Not in the C's dispatch, which leaves a GLES compute shader's `textureQueryLevels`
+        // reading whatever the uniform last held. The draw writes it; so does the dispatch.
+        if let Some(loc) = sub.program_at(at).tex_levels_uniform_id[stage.index()] {
+            gl.uniform_1iv(loc, &sub.texture_levels[stage.index()]);
+        }
+        Self::draw_bind_abo(sub, host);
+
+        gl.bind_buffer(GL_DISPATCH_INDIRECT_BUFFER, indirect_buffer);
+        match indirect_buffer {
+            Some(_) => gl.dispatch_compute_indirect(indirect_offset),
+            None => gl.dispatch_compute(grid),
         }
         Ok(())
     }

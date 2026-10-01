@@ -1986,6 +1986,180 @@ mod tests {
         v.context_destroy(ctx, &AllAttached);
     }
 
+    /// A compute dispatch runs, from the wire's grid and from an indirect buffer's.
+    ///
+    /// The shader numbers every texel it reaches, so a grid read wrongly -- or an indirect
+    /// dispatch that took the wire's zeros, or the buffer's words from the wrong offset -- leaves
+    /// texels the reads below disagree about. Then a dispatch whose grid would run past its
+    /// buffer is refused by name rather than handed to GL.
+    #[test]
+    fn a_dispatch_runs_its_grid_from_the_wire_or_its_buffer() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::pipe::ImageAccess;
+        use crate::vrend::proto::{
+            Box3, Command, Object, ShaderChunk, ShaderCreate, ShaderImage, ShaderKind, Transfer,
+        };
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        assert!(v.features.has(Feature::compute_shader), "the premise: this driver has compute");
+
+        const SIDE: u32 = 16;
+        let r32f = super::super::proto::Format::from_wire(28).expect("R32_FLOAT");
+        let handle = |n: u32| ResourceHandle::new(n).expect("a resource handle is non-zero");
+        let (whole, top, args) = (handle(1), handle(2), handle(3));
+        let tex = resource::Args {
+            target: TextureTarget::Texture2d,
+            format: r32f,
+            bind: resource::Bind(1 << 3),
+            width: SIDE,
+            height: SIDE,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags(0),
+        };
+        v.resource_create(whole, tex).expect("a texture");
+        v.resource_create(top, tex).expect("a texture");
+        let buffer = resource::Args {
+            target: TextureTarget::Buffer,
+            format: super::super::proto::Format::from_wire(64).expect("R8_UNORM"),
+            bind: resource::Bind(1 << 8),
+            width: 32,
+            height: 1,
+            ..tex
+        };
+        v.resource_create(args, buffer).expect("a command-args buffer");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &AllAttached).expect("a context");
+
+        let cs = tgsi_words(
+            "COMP\nPROPERTY CS_FIXED_BLOCK_WIDTH 8\nPROPERTY CS_FIXED_BLOCK_HEIGHT 8\n\
+             PROPERTY CS_FIXED_BLOCK_DEPTH 1\nDCL SV[0], THREAD_ID\nDCL SV[1], BLOCK_ID\n\
+             DCL IMAGE[0], 2D, PIPE_FORMAT_R32_FLOAT, WR\nDCL TEMP[0..1]\n\
+             IMM[0] UINT32 { 8, 16, 1, 0 }\n\
+             0: UMAD TEMP[0].xy, SV[1].xyyy, IMM[0].xxxx, SV[0].xyyy\n\
+             1: UMAD TEMP[1].x, TEMP[0].yyyy, IMM[0].yyyy, TEMP[0].xxxx\n\
+             2: UADD TEMP[1].x, TEMP[1].xxxx, IMM[0].zzzz\n\
+             3: U2F TEMP[1].x, TEMP[1].xxxx\n\
+             4: STORE IMAGE[0], TEMP[0], TEMP[1].xxxx, 2D, PIPE_FORMAT_R32_FLOAT\n\
+             5: END\n",
+        );
+        let shader = ObjectHandle::new(1).expect("non-zero");
+        let image = |resource| Command::SetShaderImages {
+            stage: ShaderStage::Compute,
+            start_slot: 0,
+            images: vec![Some(ShaderImage {
+                format: r32f,
+                access: ImageAccess::Write,
+                layer_offset: 0,
+                level_size: 0,
+                resource,
+            })],
+        };
+        // The grid at word one, so the dispatch has to honour the offset to read it.
+        let grid = [0xdead, 2, 1, 1];
+        let region = Box3 { x: 0, y: 0, z: 0, width: 16, height: 1, depth: 1 };
+        let transfer =
+            Transfer { resource: args, level: 0, usage: 0, stride: 0, layer_stride: 0, region };
+        let mut wire = Vec::new();
+        for cmd in [
+            Command::CreateObject {
+                handle: shader,
+                object: Object::Shader(ShaderCreate {
+                    stage: ShaderStage::Compute,
+                    chunk: ShaderChunk::New { total_bytes: cs.len() as u32 * 4 },
+                    num_tokens: 300,
+                    kind: ShaderKind::Compute { req_local_mem: 0 },
+                    text: &cs,
+                }),
+            },
+            Command::BindShader { stage: ShaderStage::Compute, handle: Some(shader) },
+            Command::ResourceInlineWrite { transfer, data: &grid },
+            image(whole),
+            Command::LaunchGrid {
+                block: [8, 8, 1],
+                grid: [2, 2, 1],
+                indirect: None,
+                indirect_offset: 0,
+            },
+            image(top),
+            Command::LaunchGrid {
+                block: [8, 8, 1],
+                grid: [0; 3],
+                indirect: Some(args),
+                indirect_offset: 4,
+            },
+            Command::MemoryBarrier((1 << 14) - 1),
+        ] {
+            encode(&cmd, &mut wire);
+        }
+        v.submit(ctx, &wire, &AllAttached).expect("the context is here").expect("both dispatch");
+
+        let texels = |v: &mut Vrend, res| -> Vec<f32> {
+            let read = v.cursor_contents(res).expect("a small 2D texture reads back");
+            read.pixels.chunks(4).map(|b| f32::from_ne_bytes(b.try_into().expect("4"))).collect()
+        };
+        let number = |x: u32, y: u32| (x + SIDE * y + 1) as f32;
+        let read = texels(&mut v, whole);
+        for (y, x) in (0..SIDE).flat_map(|y| (0..SIDE).map(move |x| (y, x))) {
+            assert_eq!(read[(y * SIDE + x) as usize], number(x, y), "texel ({x}, {y})");
+        }
+        let read = texels(&mut v, top);
+        for (y, x) in (0..SIDE).flat_map(|y| (0..SIDE).map(move |x| (y, x))) {
+            let want = if y < 8 { number(x, y) } else { 0.0 };
+            assert_eq!(read[(y * SIDE + x) as usize], want, "texel ({x}, {y}) of the 2x1 grid");
+        }
+
+        // Words 6 to 8 of an eight-word buffer: the last two are not there.
+        let mut wire = Vec::new();
+        let past = Command::LaunchGrid {
+            block: [8, 8, 1],
+            grid: [0; 3],
+            indirect: Some(args),
+            indirect_offset: 24,
+        };
+        encode(&past, &mut wire);
+        assert!(
+            v.submit(ctx, &wire, &AllAttached).expect("the context is here").is_err(),
+            "a grid past its buffer is refused"
+        );
+
+        v.context_destroy(ctx, &AllAttached);
+    }
+
     /// A query result the guest's pages are too short to take stays owed to them: the shadow
     /// holds it, and the next attach of pages that can hold it writes it there. Marked as
     /// delivered instead, it is lost -- the attach writes nothing to pages it believes agree.

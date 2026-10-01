@@ -44,6 +44,7 @@ BASE="${CORPORA_BASE:-https://github.com/liminavm/virglrs/releases/download}"
 generator_for() {
     case "$1" in
         blit.bin)    echo "harness/replay/make-blit-corpus.py" ;;
+        compute.bin) echo "harness/replay/make-compute-corpus.py" ;;
         sampled.bin) echo "harness/replay/make-sampled-corpus.py" ;;
         sampler.bin) echo "harness/replay/make-sampler-corpus.py" ;;
         flatshade.bin) echo "harness/replay/make-flatshade-corpus.py" ;;

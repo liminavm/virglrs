@@ -2082,9 +2082,10 @@ impl Context {
                 self.memory_barrier(host, flags);
                 Ok(())
             }
-            Command::LaunchGrid { .. } => {
-                host.todo.note("LAUNCH_GRID");
-                Err(Fault::Unimplemented { cmd: kind, what: "compute dispatch" })
+            Command::LaunchGrid { block: _, grid, indirect, indirect_offset } => {
+                // The block size is the shader's own: TGSI fixes it in the program's properties,
+                // and GLSL in its layout, so the wire's copy is read by neither leg.
+                self.launch_grid(host, grid, indirect, indirect_offset)
             }
             Command::SetFramebufferStateNoAttach { width, height, layers, samples } => {
                 if host.has(Feature::fb_no_attach) {

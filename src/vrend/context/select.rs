@@ -580,27 +580,52 @@ impl Context {
         built |= self.select_bound(host, cmd, Vertex)?;
 
         for stage in [Vertex, Fragment, Geometry, TessCtrl, TessEval] {
-            let gl = host.gl;
-            let Some(shader) = self.sub_mut().bound_shader_mut(stage) else {
-                continue;
-            };
-            let ShaderText::Whole(program) = &mut shader.text else {
-                continue;
-            };
-            let Some(current) = program.variants.first_mut() else {
-                return Err(Fault::Shader { cmd, what: "a stage with no variant to compile" });
-            };
-            if current.gl.is_none() {
-                built = true;
-                if !compile(gl, stage, current) {
-                    return Err(Fault::Shader {
-                        cmd,
-                        what: "a shader the driver refused to compile",
-                    });
-                }
-            }
+            built |= self.compile_bound(host, cmd, stage)?;
         }
         Ok(built)
+    }
+
+    /// `vrend_compile_shader` on the current variant of the shader bound at `stage`, when it has
+    /// no GL shader yet. Answers whether it compiled one.
+    fn compile_bound(
+        &mut self,
+        host: &Host<'_>,
+        cmd: Cmd,
+        stage: ShaderStage,
+    ) -> Result<bool, Fault> {
+        let gl = host.gl;
+        let Some(shader) = self.sub_mut().bound_shader_mut(stage) else {
+            return Ok(false);
+        };
+        let ShaderText::Whole(program) = &mut shader.text else {
+            return Ok(false);
+        };
+        let Some(current) = program.variants.first_mut() else {
+            return Err(Fault::Shader { cmd, what: "a stage with no variant to compile" });
+        };
+        if current.gl.is_some() {
+            return Ok(false);
+        }
+        if !compile(gl, stage, current) {
+            return Err(Fault::Shader { cmd, what: "a shader the driver refused to compile" });
+        }
+        Ok(true)
+    }
+
+    /// `vrend_launch_grid`'s selection, as far as the variant: the compute shader selected under
+    /// the state of the moment and compiled. Answers whether it was translated or compiled.
+    ///
+    /// The C selects only when a bind marked the stage dirty (`cs_shader_dirty`), so a dispatch
+    /// after a change to what the compute key reads -- the views bound to the stage -- runs the
+    /// variant selected before it. A dispatch is rare beside a draw, so this one fills the key
+    /// every time and keeps no flag that could be left standing or forgotten.
+    pub(super) fn select_compute(&mut self, host: &mut Host<'_>, cmd: Cmd) -> Result<bool, Fault> {
+        if self.sub().shaders[ShaderStage::Compute.index()].is_none() {
+            return Err(Fault::Shader { cmd, what: "a dispatch with no compute shader" });
+        }
+        let translated = self.select_bound(host, cmd, ShaderStage::Compute)?;
+        let compiled = self.compile_bound(host, cmd, ShaderStage::Compute)?;
+        Ok(translated || compiled)
     }
 
     /// `vrend_link_program_hook`: the program the handles name, assembled now rather than at

@@ -855,6 +855,18 @@ to have it, each because reproducing the C would mean reproducing a defect.
   neither. virglrs hands the ceiling to the probe, which already skips every count above what it
   is given, so the counts advertised and the positions published come from one pass and there is
   nothing to repair. Unobservable at limina's setting of 1, where nothing survives either way.
+- **A dispatch selects its compute variant every time.** The C reselects only when
+  `cs_shader_dirty` is set, and only a compute shader bind sets it, so a dispatch after a change
+  to what the compute key reads (the views bound to the stage) runs the variant selected before
+  it. A dispatch is rare beside a draw, so `launch_grid` fills the key on every dispatch and keeps
+  no flag. It also writes the GLES `textureQueryLevels` uniform, which the C's dispatch never
+  writes, and marks the compute stage's units and uniform blocks for rebinding when its program
+  changes, which the C does only for the vertex and fragment stages.
+- **A dispatch the guest cannot mean is refused, not dropped.** The C returns quietly from a
+  `LAUNCH_GRID` on a host without compute or with no compute shader bound, and hands GL an
+  indirect grid that runs past its buffer, where GL raises an error the batch reports later.
+  virglrs refuses all three by name: the caps advertise compute only where the host has it, and
+  the other two are the guest's claims about its own state.
 - **A blit leaves nothing on its source that a later draw can read.** `vrend_set_tex_param` writes
   the base and max level, the filters, the wrap modes and the format swizzle onto the *source
   texture object*, and the sampler-view bind skips its work when the same view handle is set into

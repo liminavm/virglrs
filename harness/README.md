@@ -105,6 +105,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   rasterizer between two draws into one target (see `fixtures/flatshade.score` below).
 - `make-image-corpus.py` — writes a synthetic classic corpus that stores through a shader image
   of some of an array texture's layers (see `fixtures/image.score` below).
+- `make-compute-corpus.py` — writes a synthetic classic corpus that dispatches compute, directly
+  and from an indirect buffer (see `fixtures/compute.score` below).
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
   then the whole stream in execution order through the limina replay ABI, and scores the result.
@@ -735,6 +737,16 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   The C reads layer 1 back red at full strength, layer 2 at half, and layers 0 and 3 black; the
   store's own target is scored as the control that its draw ran. Run it as
   `./vrend-replay.sh ../vm/captures/image.bin --renderer rs --expect fixtures/image.score`.
+
+  `compute.score` gates `LAUNCH_GRID`. No desktop dispatches compute, so no recorded session
+  reaches it, and `make-compute-corpus.py` writes `vm/captures/compute.bin`: three `R32_FLOAT`
+  textures, each stored into through an image by a compute shader that numbers every texel it
+  reaches, then sampled by a draw into a 2D offscreen. The first is a direct dispatch of the whole
+  texture; the second the same shader dispatched from three words at an offset into an indirect
+  buffer that asks for the top half only, so it reads back with ink on 128 texels of 256; the
+  third a second compute shader dispatched after the first two reads have drawn, which is the
+  switch between the draw's program and the dispatch's in both directions. Run it as
+  `./vrend-replay.sh ../vm/captures/compute.bin --renderer rs --expect fixtures/compute.score`.
 
   `teardown.score` gates two lifetimes a real guest reaches constantly and no oracle here was
   watching: a program destroyed out from under the one that is bound, and a sub-context destroyed
