@@ -21,6 +21,7 @@ pub mod bitstream;
 pub mod h264;
 pub mod h264_slice;
 pub mod h265;
+pub mod h265_slice;
 pub mod pending;
 #[cfg(not(va))]
 mod session;
@@ -423,10 +424,11 @@ enum Shape {
         width: u32,
         height: u32,
     },
-    /// HEVC: the same, with three sets. Key-ness comes from the descriptor here rather than
-    /// from the bitstream -- `IDRPicFlag` and `RAPPicFlag` are on the wire, and H.264 has no
-    /// equivalent.
-    Hevc { sets: h265::ParameterSets, key: bool, width: u32, height: u32 },
+    /// HEVC: what the backend decodes the frame from (`backend::HevcInput`) -- the three
+    /// parameter sets for a session, the descriptor read whole for VA-API. Key-ness comes from
+    /// the descriptor rather than from the bitstream: `IDRPicFlag` and `RAPPicFlag` are on the
+    /// wire, and H.264 has no equivalent.
+    Hevc { input: backend::HevcInput, key: bool, width: u32, height: u32 },
     /// AV1: the frame's own descriptor, because the serializer writes the whole bitstream out of
     /// it, and the `av1C` box the session is configured by.
     ///
@@ -765,6 +767,23 @@ trait Backend: Default {
         unit: &Self::Unit,
         phases: &mut pending::Phases,
     ) -> Option<Picture>;
+}
+
+/// What an HEVC frame's backend input is built from: the descriptor, raw and read, and the
+/// frame's slices so far.
+struct HevcSource<'a> {
+    #[cfg_attr(not(va), expect(dead_code, reason = "only VA-API reads the descriptor whole"))]
+    descriptor: &'a [u8],
+    desc: h265::PictureDesc,
+    #[cfg_attr(va, expect(dead_code, reason = "VA-API reads the slices when it decodes"))]
+    accumulated: &'a [u8],
+    /// See [`h265::RefPicSets`].
+    #[cfg_attr(va, expect(dead_code, reason = "VA-API is handed the resolved sets"))]
+    ref_pic_sets: &'a mut h265::RefPicSets,
+    #[cfg_attr(va, expect(dead_code, reason = "VA-API is handed the descriptor's extent"))]
+    extent: (u32, u32),
+    #[cfg_attr(va, expect(dead_code, reason = "VA-API serves the one profile advertised"))]
+    profile: h265::HevcProfile,
 }
 
 /// What building a unit may look up on the render thread.
@@ -1665,30 +1684,26 @@ impl Video {
                 *shape = Some(Shape::H264 { sets, picture, key, width, height });
             }
             Kind::Hevc { profile: hevc_profile, ref_pic_sets } => {
-                let hevc_profile = *hevc_profile;
                 let desc = h265::PictureDesc::read(descriptor);
-                // The inspection is not only for the id: it establishes that no slice predicts from
-                // a reference picture set declared in the SPS, whose contents are absent from the
-                // wire and are therefore written empty. A slice that does is refused here rather
-                // than decoded into quietly wrong pixels.
-                match desc.slice_inspect(accumulated, ref_pic_sets) {
-                    // No slice header yet: this call carried only a fragment.
+                let key = shape.as_ref().is_some_and(Shape::key) || desc.key;
+                let source = HevcSource {
+                    descriptor,
+                    desc,
+                    accumulated,
+                    ref_pic_sets,
+                    extent: (width, height),
+                    profile: *hevc_profile,
+                };
+                let input = match backend::hevc_input(source) {
+                    Ok(Some(input)) => input,
+                    // Nothing to describe the frame with yet: this call carried only a fragment.
                     Ok(None) => return Ok(()),
-                    Ok(Some(_id)) => {}
                     Err(why) => {
-                        eprintln!("[virglrs] video codec {handle}: HEVC slice refused ({why})");
-                        return Err(Refusal::HostRefusedFrame);
-                    }
-                }
-                let sets = match desc.parameter_sets(width, height, hevc_profile) {
-                    Ok(sets) => sets,
-                    Err(why) => {
-                        eprintln!("[virglrs] video codec {handle}: no HEVC parameter set ({why})");
+                        eprintln!("[virglrs] video codec {handle}: HEVC frame refused ({why})");
                         return Err(Refusal::HostRefusedFrame);
                     }
                 };
-                let key = shape.as_ref().is_some_and(Shape::key) || desc.key;
-                *shape = Some(Shape::Hevc { sets, key, width, height });
+                *shape = Some(Shape::Hevc { input, key, width, height });
             }
             // Returned above, before the frame was even reached: an AV1 descriptor settles the
             // previous frame, so it cannot wait for the accumulation this match feeds.
@@ -2059,12 +2074,14 @@ mod tests {
         assert_eq!(h264.access_unit(vec![0x65, 0xaa]), None);
 
         // HEVC re-frames the same way, and reports key-ness the descriptor gave it.
-        let hevc = Shape::Hevc {
-            sets: h265::ParameterSets { vps: vec![0x40], sps: vec![0x42], pps: vec![0x44] },
-            key: true,
-            width: 1280,
-            height: 720,
-        };
+        #[cfg(not(va))]
+        let input = h265::ParameterSets { vps: vec![0x40], sps: vec![0x42], pps: vec![0x44] };
+        #[cfg(va)]
+        let input = Arc::new(h265_slice::Picture {
+            desc: h265::PictureDesc::read(&[]),
+            decoding: h265_slice::Decoding::read(&[], &h265::PictureDesc::read(&[])),
+        });
+        let hevc = Shape::Hevc { input, key: true, width: 1280, height: 720 };
         assert!(hevc.key());
         assert_eq!(hevc.extent(), (1280, 720));
         let reframed = if cfg!(va) {

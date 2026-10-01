@@ -719,7 +719,13 @@ buildable throughout as the A-side reference.
   itself. This backend serves any driver, so `video/h264_slice.rs` reads each slice header and
   builds that slice's final reference lists (8.2.4: initialised from the descriptor's DPB, then
   modified) to fill them. Frame pictures only: field pictures and field-capable streams are
-  refused, as they are on VideoToolbox. HEVC needs the same, with a larger header to parse.
+  refused, as they are on VideoToolbox. HEVC is the same in `video/h265_slice.rs`, with one
+  difference that matters: the descriptor already holds the resolved reference picture set, so
+  the short-term set in a slice header is skipped by the length the descriptor gives, and the
+  limits that VideoToolbox's rebuilt parameter sets impose (sets declared in the SPS, custom
+  scaling lists) do not apply. Which of the two an HEVC frame becomes is the backend's choice
+  (`hevc_input`). Mesa's VA frontend reorders HEVC scaling lists into diagonal scan as it
+  copies them, so they are put back before they go to the driver.
 
   **Decode only.** `virgl_video_encode_bitstream` is a stub returning -1 and `fill_caps`
   advertises no encode entrypoint, so the guest cannot reach it. `EncodeBitstream` is refused

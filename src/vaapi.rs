@@ -58,7 +58,9 @@ impl Codec {
             // High decodes the Main and Constrained Baseline streams too, which is every H.264
             // profile advertised.
             Codec::H264 => Some(va::VAProfile::VAProfileH264High),
-            Codec::Hevc | Codec::Av1 => None,
+            // Main, which is the one HEVC profile advertised.
+            Codec::Hevc => Some(va::VAProfile::VAProfileHEVCMain),
+            Codec::Av1 => None,
         }
     }
 }

@@ -1228,8 +1228,14 @@ as a host with no video silicon. So the script asserts virglrs's own `hardware v
 rather than only that it loaded, and refuses a boot where QEMU says it could not initialise the
 renderer.
 
-**Measured on goiaba (Intel Ice Lake, RPM Fusion's iHD), rs leg: 353 of 440**, which is 275 of
-305 VP9 vectors and 78 of 135 H.264 vectors (VideoToolbox passes 71); HEVC is not served yet.
+**Measured on goiaba (Intel Ice Lake, RPM Fusion's iHD), rs leg: 485 of 587**: 275 of 305 VP9
+vectors, 78 of 135 H.264 (VideoToolbox passes 71) and 132 of 147 HEVC (VideoToolbox passes 12).
+
+HEVC's 15 failures are the 11 Main10 streams and the four `PICSIZE` streams, all of which the
+guest refuses before they reach the renderer: only Main is advertised. Armed: emptying every
+slice's reference lists takes HEVC to 27. The four `SLIST` vectors and `VPSSPSPPS_A` are the
+ones that catch the scaling lists going to the driver in the order mesa's frontend stored
+them.
 
 H.264's failures are the field-coded and MBAFF streams, which are refused, as they are on
 macOS; the PAFF streams' frame pictures, whose references were refused field pictures; and the

@@ -26,7 +26,7 @@ use std::sync::{Arc, Weak};
 use cros_libva as va;
 
 use super::{Backend, Delivery, Destination, Identity, Layout, Lookup, Shape, TargetFormat};
-use super::{h264_slice, pending, vp9};
+use super::{HevcSource, h264_slice, h265_slice, pending, vp9};
 use crate::decode::{Imaged, Picture, PixelFormat};
 use crate::surface::{Held, PlaneLayout, PlaneLayouts};
 use crate::vrend::egl::{Importer, Plane};
@@ -101,6 +101,23 @@ enum Params {
         width: u32,
         height: u32,
     },
+    Hevc {
+        picture: HevcInput,
+        /// The DPB's targets, slot for slot, resolved the same way.
+        refs: [Option<Arc<Identity>>; 16],
+        width: u32,
+        height: u32,
+    },
+}
+
+/// What an HEVC frame is decoded from here: the descriptor, read whole.
+pub(super) type HevcInput = Arc<h265_slice::Picture>;
+
+/// Read the descriptor. Never `None`: the slices are read when the frame is decoded, so there is
+/// nothing to wait for, and nothing a session needs that the wire leaves out.
+pub(super) fn hevc_input(source: HevcSource<'_>) -> Result<Option<HevcInput>, String> {
+    let decoding = h265_slice::Decoding::read(source.descriptor, &source.desc);
+    Ok(Some(Arc::new(h265_slice::Picture { desc: source.desc, decoding })))
 }
 
 /// VA-API takes the slices as they were sent, start codes and all: each NAL goes to the driver in
@@ -189,8 +206,14 @@ impl Backend for Host {
                 width: *width,
                 height: *height,
             },
-            Shape::Hevc { .. } | Shape::Av1 { .. } => {
-                unreachable!("VA-API advertises neither HEVC nor AV1, so no such codec is created")
+            Shape::Hevc { input, width, height, .. } => Params::Hevc {
+                picture: Arc::clone(input),
+                refs: input.decoding.refs.map(|r| r.and_then(|r| resolve(r.buffer))),
+                width: *width,
+                height: *height,
+            },
+            Shape::Av1 { .. } => {
+                unreachable!("VA-API does not advertise AV1, so no such codec is created")
             }
         };
         Unit {
@@ -245,6 +268,9 @@ impl Backend for Host {
             Params::H264 { width, height, .. } => {
                 (va::VAProfile::VAProfileH264High, *width, *height)
             }
+            Params::Hevc { width, height, .. } => {
+                (va::VAProfile::VAProfileHEVCMain, *width, *height)
+            }
         };
         let made = va.decoder_for(profile, width, height);
         let Some(target_at) = va.surface_for(target) else {
@@ -271,6 +297,10 @@ impl Backend for Host {
                 let dpb: Vec<Option<va::VASurfaceID>> = dpb.iter().map(id).collect();
                 let extent = (*width, *height);
                 decode_h264(decoder, surface, picture, &dpb, extent, &unit.bytes)
+            }
+            Params::Hevc { picture, refs, .. } => {
+                let refs = refs.each_ref().map(id);
+                decode_hevc(decoder, surface, picture, &refs, &unit.bytes)
             }
         };
         phases.session = Some(began.elapsed());
@@ -415,6 +445,8 @@ enum Failure {
     },
     /// An H.264 slice that could not be described to the driver.
     H264(h264_slice::Refused),
+    /// An HEVC slice segment that could not be described to the driver.
+    Hevc(h265_slice::Refused),
     Va(&'static str, va::VaError),
 }
 
@@ -430,6 +462,7 @@ impl std::fmt::Display for Failure {
                 write!(f, "a {width}x{height} frame is outside what VP9 can declare")
             }
             Failure::H264(why) => write!(f, "H.264: {why}"),
+            Failure::Hevc(why) => write!(f, "HEVC: {why}"),
             Failure::Va(step, why) => write!(f, "{step}: {why}"),
         }
     }
@@ -725,6 +758,217 @@ fn decode_h264(
             w1.chroma_offset,
         );
         buffers.push(va::BufferType::SliceParameter(va::SliceParameter::H264(params)));
+        buffers.push(va::BufferType::SliceData(slice.nal.to_vec()));
+    }
+    render(decoder, surface, buffers)
+}
+
+/// Decode one HEVC frame into `surface`, and wait for it.
+///
+/// The picture parameters and scaling lists are the descriptor's, as the C's
+/// `h265_fill_picture_param` writes them, with the DPB's slots marked by which part of the current
+/// reference picture set they are in. The slice parameters are rebuilt from each slice segment's
+/// own header (see [`h265_slice`]), as H.264's are.
+fn decode_hevc(
+    decoder: &Decoder,
+    surface: &va::Surface<()>,
+    picture: &h265_slice::Picture,
+    ref_surfaces: &[Option<va::VASurfaceID>; 16],
+    bytes: &[u8],
+) -> Result<(), Failure> {
+    use va::{
+        VA_PICTURE_HEVC_INVALID as INVALID, VA_PICTURE_HEVC_LONG_TERM_REFERENCE as LONG,
+        VA_PICTURE_HEVC_RPS_LT_CURR as LT_CURR, VA_PICTURE_HEVC_RPS_ST_CURR_AFTER as AFTER,
+        VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE as BEFORE,
+    };
+    let desc = &picture.desc;
+    let dec = &picture.decoding;
+    let refused = |why| Failure::Hevc(why);
+    let slices = h265_slice::slices(bytes, picture).map_err(refused)?;
+    let Some(last) = slices.len().checked_sub(1) else {
+        return Err(refused(h265_slice::Refused::Unsupported("an access unit with no slice")));
+    };
+    // VA-API's DPB has fifteen slots, the descriptor's sixteen: a set naming the last one has no
+    // index to be given.
+    let sets = [&dec.st_curr_before, &dec.st_curr_after, &dec.lt_curr];
+    if sets.iter().any(|set| set.iter().any(|&slot| slot >= 15)) {
+        return Err(refused(h265_slice::Refused::OutOfRange("a reference picture set slot")));
+    }
+
+    let invalid = va::PictureHEVC::new(NO_SURFACE, 0, INVALID);
+    let reference_frames: [va::PictureHEVC; 15] = std::array::from_fn(|i| {
+        let (Some(r), Some(id)) = (dec.refs[i], ref_surfaces[i]) else {
+            return invalid;
+        };
+        let mut flags = if r.long_term { LONG } else { 0 };
+        if dec.st_curr_before.contains(&i) {
+            flags |= BEFORE;
+        }
+        if dec.st_curr_after.contains(&i) {
+            flags |= AFTER;
+        }
+        if dec.lt_curr.contains(&i) {
+            flags |= LT_CURR;
+        }
+        va::PictureHEVC::new(id, r.poc, flags)
+    });
+    // A set slot whose target this codec never decoded into would point the driver at nothing.
+    if sets
+        .iter()
+        .any(|set| set.iter().any(|&slot| reference_frames[slot].picture_id() == NO_SURFACE))
+    {
+        return Err(refused(h265_slice::Refused::NoSuchReference));
+    }
+
+    let flag = u32::from;
+    let pic_fields = va::HevcPicFields::new(
+        u32::from(desc.chroma_format_idc),
+        flag(desc.separate_colour_plane),
+        flag(desc.pcm_enabled),
+        flag(desc.scaling_list_enabled),
+        flag(desc.transform_skip_enabled),
+        flag(desc.amp_enabled),
+        flag(desc.strong_intra_smoothing_enabled),
+        flag(desc.sign_data_hiding_enabled),
+        flag(desc.constrained_intra_pred),
+        flag(desc.cu_qp_delta_enabled),
+        flag(desc.weighted_pred),
+        flag(desc.weighted_bipred),
+        flag(desc.transquant_bypass_enabled),
+        flag(desc.tiles.is_some()),
+        flag(desc.entropy_coding_sync_enabled),
+        flag(desc.pps_loop_filter_across_slices_enabled),
+        flag(desc.loop_filter_across_tiles_enabled),
+        flag(desc.pcm_loop_filter_disabled),
+        0,
+        0,
+    );
+    let intra = slices.iter().all(|s| s.header.slice_type == h265_slice::SliceType::I);
+    let parsing = va::HevcSliceParsingFields::new(
+        flag(desc.lists_modification_present),
+        flag(desc.long_term_ref_pics_present),
+        flag(desc.sps_temporal_mvp_enabled),
+        flag(desc.cabac_init_present),
+        flag(desc.output_flag_present),
+        flag(desc.dependent_slice_segments_enabled),
+        flag(desc.pps_slice_chroma_qp_offsets_present),
+        flag(desc.sample_adaptive_offset_enabled),
+        flag(desc.deblocking_filter_override_enabled),
+        flag(desc.pps_deblocking_filter_disabled),
+        flag(desc.slice_segment_header_extension_present),
+        flag(dec.rap),
+        flag(dec.idr),
+        flag(intra),
+    );
+    let too_big = || refused(h265_slice::Refused::OutOfRange("the picture's extent"));
+    let tiles = &dec.tiles;
+    let parameters = va::PictureParameterBufferHEVC::new(
+        va::PictureHEVC::new(surface.id(), dec.curr_poc, 0),
+        reference_frames,
+        u16::try_from(desc.pic_width_in_luma_samples).map_err(|_| too_big())?,
+        u16::try_from(desc.pic_height_in_luma_samples).map_err(|_| too_big())?,
+        &pic_fields,
+        desc.sps_max_dec_pic_buffering_minus1,
+        desc.bit_depth_luma_minus8,
+        desc.bit_depth_chroma_minus8,
+        desc.pcm_sample_bit_depth_luma_minus1,
+        desc.pcm_sample_bit_depth_chroma_minus1,
+        desc.log2_min_luma_coding_block_size_minus3,
+        desc.log2_diff_max_min_luma_coding_block_size,
+        desc.log2_min_transform_block_size_minus2,
+        desc.log2_diff_max_min_transform_block_size,
+        desc.log2_min_pcm_luma_coding_block_size_minus3,
+        desc.log2_diff_max_min_pcm_luma_coding_block_size,
+        desc.max_transform_hierarchy_depth_intra,
+        desc.max_transform_hierarchy_depth_inter,
+        desc.init_qp_minus26,
+        desc.diff_cu_qp_delta_depth,
+        desc.pps_cb_qp_offset,
+        desc.pps_cr_qp_offset,
+        desc.log2_parallel_merge_level_minus2,
+        tiles.columns_minus1,
+        tiles.rows_minus1,
+        tiles.column_widths_minus1,
+        tiles.row_heights_minus1,
+        &parsing,
+        desc.log2_max_pic_order_cnt_lsb_minus4,
+        desc.num_short_term_ref_pic_sets,
+        desc.num_long_term_ref_pics_sps,
+        desc.num_ref_idx_l0_default_active_minus1,
+        desc.num_ref_idx_l1_default_active_minus1,
+        desc.pps_beta_offset_div2,
+        desc.pps_tc_offset_div2,
+        desc.num_extra_slice_header_bits,
+        dec.st_rps_bits,
+    );
+    let mut buffers =
+        vec![va::BufferType::PictureParameter(va::PictureParameter::HEVC(parameters))];
+    if desc.scaling_list_enabled {
+        let lists = &dec.scaling;
+        buffers.push(va::BufferType::IQMatrix(va::IQMatrix::HEVC(va::IQMatrixBufferHEVC::new(
+            lists.list_4x4,
+            lists.list_8x8,
+            lists.list_16x16,
+            lists.list_32x32,
+            lists.dc_16x16,
+            lists.dc_32x32,
+        ))));
+    }
+
+    for (n, slice) in slices.iter().enumerate() {
+        let h = &slice.header;
+        let lists = h265_slice::ref_lists(h, dec).map_err(refused)?;
+        // Indices into ReferenceFrames, which holds the DPB slot for slot; 0xff is no entry.
+        let ref_pic_list = lists.map(|list| list.map(|slot| slot.map_or(0xff, |s| s as u8)));
+        let flags = va::HevcLongSliceFlags::new(
+            u32::from(n == last),
+            flag(slice.dependent),
+            h.slice_type as u32,
+            u32::from(h.colour_plane_id),
+            flag(h.sao_luma),
+            flag(h.sao_chroma),
+            flag(h.mvd_l1_zero),
+            flag(h.cabac_init),
+            flag(h.temporal_mvp),
+            flag(h.deblocking_filter_disabled),
+            flag(h.collocated_from_l0),
+            flag(h.loop_filter_across_slices),
+        );
+        let weights = h.weights.clone().unwrap_or_default();
+        let [w0, w1] = &weights.lists;
+        let too_long = || refused(h265_slice::Refused::OutOfRange("a slice's length"));
+        let params = va::SliceParameterBufferHEVC::new(
+            u32::try_from(slice.nal.len()).map_err(|_| too_long())?,
+            0,
+            va::VA_SLICE_DATA_FLAG_ALL,
+            slice.data_byte_offset,
+            slice.segment_address,
+            ref_pic_list,
+            &flags,
+            if h.temporal_mvp { h.collocated_ref_idx } else { 0xff },
+            h.num_ref_idx_active_minus1[0],
+            h.num_ref_idx_active_minus1[1],
+            h.slice_qp_delta,
+            h.cb_qp_offset,
+            h.cr_qp_offset,
+            h.beta_offset_div2,
+            h.tc_offset_div2,
+            weights.luma_log2_denom,
+            weights.delta_chroma_log2_denom,
+            w0.delta_luma_weight,
+            w0.luma_offset,
+            w0.delta_chroma_weight,
+            w0.chroma_offset,
+            w1.delta_luma_weight,
+            w1.luma_offset,
+            w1.delta_chroma_weight,
+            w1.chroma_offset,
+            h.five_minus_max_num_merge_cand,
+            slice.num_entry_point_offsets,
+            0,
+            slice.header_escapes,
+        );
+        buffers.push(va::BufferType::SliceParameter(va::SliceParameter::HEVC(params)));
         buffers.push(va::BufferType::SliceData(slice.nal.to_vec()));
     }
     render(decoder, surface, buffers)

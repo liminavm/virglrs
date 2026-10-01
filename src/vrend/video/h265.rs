@@ -317,9 +317,9 @@ mod at {
     pub const RAP_PIC_FLAG: usize = 1585;
 }
 
-/// How much of an HEVC picture descriptor is read: through `RAPPicFlag`, the last field this
-/// backend consults, which is one byte.
-pub const DESCRIPTOR_BYTES: usize = at::RAP_PIC_FLAG + 1;
+/// How much of an HEVC picture descriptor is read: through `RefPicSetLtCurr`, the last field a
+/// backend consults (see [`super::h265_slice`]), which is eight bytes at 1608.
+pub const DESCRIPTOR_BYTES: usize = 1616;
 
 /// The parts of `struct virgl_h265_picture_desc` the three sets are written out of.
 ///
@@ -773,19 +773,25 @@ impl PictureDesc {
     /// Every term is on the wire, which is why a non-first slice segment can be parsed here at all.
     /// Zero for a picture that is a single CTB -- the field is then absent, and so is any second
     /// segment to carry it.
-    fn segment_address_bits(&self) -> u32 {
-        let ctb_log2 = u32::from(self.log2_min_luma_coding_block_size_minus3)
-            + 3
-            + u32::from(self.log2_diff_max_min_luma_coding_block_size);
-        let ctb = 1u32 << ctb_log2.min(31);
-        let in_ctbs = |px: u32| px.div_ceil(ctb.max(1));
-        let size = in_ctbs(self.pic_width_in_luma_samples)
-            .saturating_mul(in_ctbs(self.pic_height_in_luma_samples));
+    pub(super) fn segment_address_bits(&self) -> u32 {
+        let (width, height) = self.size_in_ctbs();
+        let size = width.saturating_mul(height);
         // Ceil(Log2(n)): the position of the highest set bit, rounded up for a non-power-of-two.
         match size {
             0 | 1 => 0,
             n => u32::BITS - (n - 1).leading_zeros(),
         }
+    }
+
+    /// The picture's width and height in coding tree blocks (`PicWidthInCtbsY`,
+    /// `PicHeightInCtbsY`).
+    pub(super) fn size_in_ctbs(&self) -> (u32, u32) {
+        let ctb_log2 = u32::from(self.log2_min_luma_coding_block_size_minus3)
+            + 3
+            + u32::from(self.log2_diff_max_min_luma_coding_block_size);
+        let ctb = 1u32 << ctb_log2.min(31);
+        let in_ctbs = |px: u32| px.div_ceil(ctb.max(1));
+        (in_ctbs(self.pic_width_in_luma_samples), in_ctbs(self.pic_height_in_luma_samples))
     }
 
     /// Parse every independent slice segment header far enough to learn the picture's
