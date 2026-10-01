@@ -20,6 +20,9 @@ pub mod bitstream;
 pub mod h264;
 pub mod h265;
 pub mod pending;
+mod session;
+
+use session as backend;
 
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,7 +36,7 @@ use super::journal::Retained;
 use super::proto::{Format, VideoBuffer, VideoBufferHandle, VideoCodec, VideoCodecHandle};
 use super::resource::{self, Texture};
 use crate::budget::{Charge, Classic};
-use crate::decode::{self, Configuration, PixelFormat, Session, SessionKey};
+use crate::decode::{self, Configuration, Picture, PixelFormat};
 use crate::surface::Held;
 
 /// `enum pipe_video_profile`, as virglrenderer numbers it.
@@ -721,11 +724,8 @@ pub struct Codec {
     /// snapshot's half-frame and many is a stream decoding nothing at all.
     nothing_to_decode: u32,
     frame: Frame,
-    /// The thread the frames are decoded on, which owns the decompression session.
-    ///
-    /// The session is built on the first frame, not at creation: it is keyed on the shape of
-    /// the frame it will decode, and that arrives with the descriptor rather than with the
-    /// creation arguments -- a VP9 stream may change resolution or bit depth at a key frame.
+    /// The thread the frames are decoded on, which owns whatever the host decoder keeps between
+    /// them (see [`Backend`]).
     decoder: Decoder,
 }
 
@@ -798,6 +798,37 @@ trait Submit {
     }
 }
 
+/// The half of a decode that differs by host decoder: what one unit carries to the decode
+/// thread, and what that thread keeps between units to turn it into a picture.
+///
+/// Everything else -- the frame, the gate, the queue, the delivery into the guest's targets -- is
+/// the protocol's and is shared. One backend is compiled per build, so this is a contract the
+/// build is checked against rather than a choice made at run time.
+trait Backend: Default {
+    /// One submission, built on the render thread and decoded on the codec's own thread.
+    type Unit: Send + 'static;
+
+    /// The unit for one submission. `pixels` is the layout the target wants, or `None` for a
+    /// unit with no target.
+    fn unit(
+        name: &'static str,
+        shape: &Shape,
+        bytes: &[u8],
+        delivery: Delivery<'_>,
+        pixels: Option<PixelFormat>,
+    ) -> Self::Unit;
+
+    /// Decode one unit, on the decode thread. `None` is a frame with no picture to deliver:
+    /// refused, failed, or decoded only for what later frames predict from. Whichever it was has
+    /// been said by the time this returns.
+    fn decode(
+        &mut self,
+        handle: VideoCodecHandle,
+        unit: &Self::Unit,
+        phases: &mut pending::Phases,
+    ) -> Option<Picture>;
+}
+
 /// How many decodes a codec may have queued ahead of the render thread.
 ///
 /// Enough that a burst -- AV1's held frame going out beside the next one, a player that submits a
@@ -808,8 +839,9 @@ const QUEUE_DEPTH: usize = 4;
 
 /// A codec's decode thread and the queue into it.
 ///
-/// The thread owns the codec's VideoToolbox session. `Session` is `Send` and not `Sync`, and the
-/// thread is its only user, so the reference pictures inside it are never contended and every
+/// The thread owns the backend's decoder state -- a VideoToolbox session, or a VA-API context
+/// and its surfaces -- and is its only user, so the reference pictures inside it are never
+/// contended and every
 /// frame reaches it in the order the guest submitted them -- which is what the reference
 /// pictures need. What stays on the render thread is everything that evolves in submit order and
 /// that the guest's own commands read: parsing, the frame-drop gate, the AV1 serializer.
@@ -866,22 +898,8 @@ impl Drop for Decoder {
 /// One unit for the decode thread.
 struct Job {
     codec: VideoCodecHandle,
-    /// Which codec the host was asked for, for a message about the host.
-    name: &'static str,
-    /// The extent the picture must come back at, and the configuration record the session is
-    /// keyed on.
-    width: u32,
-    height: u32,
-    config: Configuration,
-    /// The layout the target wants, or `None` for a unit with no target: that expresses no
-    /// opinion about the layout, so the session keeps the one it has. Rebuilding it around a
-    /// default would tear a live session down mid-stream on any layout but NV12.
-    pixels: Option<PixelFormat>,
-    unit: Vec<u8>,
-    /// The frame's picture is known to come back wrong on this host; see [`Shape::misreturned`].
-    misreturned: bool,
-    /// Whether that picture was meant for a target, which is the only case worth saying so.
-    withheld: bool,
+    /// What the host's decoder is handed, in the backend's own terms.
+    unit: <backend::Host as Backend>::Unit,
     write: Write,
     landing: Arc<pending::Landing>,
     /// When the render thread sent it, for the time it spent queued.
@@ -905,10 +923,10 @@ enum Write {
 }
 
 fn decode_thread(queue: std::sync::mpsc::Receiver<Job>, times: &pending::Unsettled) {
-    let mut session = None;
+    let mut host = backend::Host::default();
     for job in queue {
         let mut phases = pending::Phases { queued: job.sent.elapsed(), ..Default::default() };
-        let outcome = decode_one(&mut session, &job, &mut phases);
+        let outcome = decode_one(&mut host, &job, &mut phases);
         job.landing.land(outcome);
         times.record_decode(phases);
     }
@@ -926,79 +944,14 @@ impl Drop for Timed<'_> {
 /// Decode one unit on the decode thread. Every failure is the frame's and not the stream's: it
 /// is logged, the target keeps what it held, and the next frame decodes as usual.
 fn decode_one(
-    session: &mut Option<Session>,
+    host: &mut backend::Host,
     job: &Job,
     phases: &mut pending::Phases,
 ) -> pending::Outcome {
     let handle = job.codec;
-    let pixels = job
-        .pixels
-        .unwrap_or_else(|| session.as_ref().map_or(PixelFormat::BiPlanar420, Session::pixels));
-    let key =
-        SessionKey { width: job.width, height: job.height, pixels, config: job.config.clone() };
-    // Rebuilt only when the frame's shape actually changes: a rebuild takes the reference
-    // pictures with it, and every frame after one that did not need it then predicts from an
-    // empty buffer -- which decodes "successfully" and looks like slightly wrong colour.
-    let began = std::time::Instant::now();
-    let rebuilt = !session.as_ref().is_some_and(|s| s.serves(&key));
-    if rebuilt && !adopt(session, &key, handle) {
-        match Session::create(key) {
-            Ok(created) => *session = Some(created),
-            Err(status) => {
-                // The probe advertised this codec, so a host that now says it has no such
-                // decoder is contradicting itself and every later frame will fail the same way.
-                assert!(
-                    !status.is_no_such_decoder(),
-                    "VideoToolbox advertised {} and then had no decoder for it",
-                    job.name,
-                );
-                eprintln!("[virglrs] video codec {handle}: no decode session ({status:?})");
-                return pending::Outcome::Nothing;
-            }
-        }
-    }
-    if rebuilt {
-        phases.create = Some(began.elapsed());
-    }
-    let live = session.as_mut().expect("a session was just built or kept");
-
-    let began = std::time::Instant::now();
-    let decoded = live.decode(&job.unit);
-    phases.session = Some(began.elapsed());
-    let picture = match decoded {
-        Ok(picture) => picture,
-        Err(why) => {
-            eprintln!("[virglrs] video codec {handle}: the host decoded no picture ({why:?})");
-            return pending::Outcome::Nothing;
-        }
+    let Some(picture) = host.decode(handle, &job.unit, phases) else {
+        return pending::Outcome::Nothing;
     };
-    // Decoded, which is all a frame the host returns wrong was submitted for. Ahead of the width
-    // check: such a frame comes back at some other width, and whatever it comes back at, it is not
-    // refused -- the decoder has it, and later frames predict from it.
-    if job.misreturned {
-        // Only a withheld delivery is news. A re-emission claiming its slot never had a picture
-        // to deliver, and its first emission already said this.
-        if job.withheld {
-            eprintln!(
-                "[virglrs] video codec {handle}: this host does not return AV1 super-resolution \
-                 frames correctly; the frame is decoded for later frames to predict from, but its \
-                 picture is withheld and the target keeps what it held"
-            );
-        }
-        return pending::Outcome::Nothing;
-    }
-    // The picture comes back at its coded width. A host returning some other width has returned
-    // something that is not this frame, and delivering it puts visibly wrong content on screen
-    // with nothing anywhere reporting a problem.
-    if picture.width() != job.width {
-        eprintln!(
-            "[virglrs] video codec {handle}: the host returned a {}-wide picture for a frame that \
-             declares {}; refusing it",
-            picture.width(),
-            job.width,
-        );
-        return pending::Outcome::Nothing;
-    }
     match &job.write {
         Write::Nothing => pending::Outcome::Nothing,
         Write::Keep => pending::Outcome::Picture(picture),
@@ -1064,34 +1017,6 @@ fn write_planes(
     written
 }
 
-/// Try to carry the live session across a change in the frame's shape.
-///
-/// **H.264's parameter sets are not constant across a stream, and tearing the session down when
-/// they change is not survivable.** `num_ref_idx_lX_active_minus1` reaches us as the effective
-/// *per-slice* count, so a slice that overrides the PPS default changes the PPS written for it by
-/// a byte or two mid-GOP. Keying the session on those bytes rebuilds the decompression session
-/// there and takes the reference pictures with it: every frame after the first override predicts
-/// from an empty buffer, which decodes "successfully" and puts quietly wrong pixels on screen.
-///
-/// So the parameter sets drive the format description, and the session is asked whether it will
-/// take the new one. Falling through to a rebuild stays correct, just lossy -- and says so,
-/// because a stream that does it every frame is worth knowing about.
-fn adopt(session: &mut Option<Session>, key: &SessionKey, handle: VideoCodecHandle) -> bool {
-    let Some(live) = session.as_mut() else {
-        return false;
-    };
-    if live.adopt(key) {
-        return true;
-    }
-    if key.config.is_parameter_sets() {
-        eprintln!(
-            "[virglrs] video codec {handle}: the parameter sets changed in a way the live session \
-             would not take; its reference pictures are lost across the rebuild"
-        );
-    }
-    false
-}
-
 /// The host's decoder, as the render thread sees it: a codec's decode thread, and what a job
 /// needs from this side before it can go.
 struct HostDecoder<'a> {
@@ -1130,18 +1055,11 @@ impl Submit for HostDecoder<'_> {
             }
             _ => (Write::Nothing, None),
         };
-        let (width, height) = shape.extent();
+        let pixels = destination.map(|(_, pixels)| pixels);
         self.decoder.send(
             Job {
                 codec: handle,
-                name: self.codec,
-                width,
-                height,
-                config: shape.configuration(),
-                pixels: destination.map(|(_, pixels)| pixels),
-                unit: unit.to_vec(),
-                misreturned: shape.misreturned(),
-                withheld: matches!(delivery, Delivery::Withheld(_)),
+                unit: backend::Host::unit(self.codec, shape, unit, delivery, pixels),
                 write,
                 landing,
                 sent: std::time::Instant::now(),
