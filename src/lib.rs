@@ -70,6 +70,9 @@ pub mod dmabuf;
 pub mod fence;
 #[allow(unsafe_code)]
 pub mod ffi;
+#[cfg(not(target_os = "macos"))]
+#[allow(unsafe_code)]
+pub mod gbm;
 #[allow(unsafe_code)]
 pub mod guest_mem;
 pub mod ids;

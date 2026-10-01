@@ -232,6 +232,13 @@ pub struct Winsys {
     extensions: BTreeSet<String>,
     /// Which of [`Winsys::export_texture`]'s two answers has been reported.
     pub said: Said,
+    /// The allocator shared buffers are made linear by, once [`Winsys::linear_shared`] has
+    /// opened it on this display's render node. Locked because a GBM device takes one caller at a
+    /// time and the winsys is reached from more than one thread.
+    #[cfg(not(target_os = "macos"))]
+    linear: Option<std::sync::Mutex<crate::gbm::Allocator>>,
+    /// Which of [`Winsys::linear_surface`]'s two answers has been reported.
+    pub linear_said: Said,
 }
 
 /// Whether a driver's answer to a question it answers the same way every time has been reported
@@ -714,6 +721,9 @@ impl Winsys {
             version: Version { major: major as u32, minor: minor as u32 },
             extensions,
             said: Said::default(),
+            #[cfg(not(target_os = "macos"))]
+            linear: None,
+            linear_said: Said::default(),
         })
     }
 
@@ -778,7 +788,16 @@ impl Winsys {
         let shared = Arc::new(Shared { egl, display, backing: Backing::Embedder(contexts) });
         let ctx0 = Context { shared: Arc::clone(&shared), ctx };
         Ok((
-            Winsys { shared, flavour, version, extensions, said: Said::default() },
+            Winsys {
+                shared,
+                flavour,
+                version,
+                extensions,
+                said: Said::default(),
+                #[cfg(not(target_os = "macos"))]
+                linear: None,
+                linear_said: Said::default(),
+            },
             ctx0,
             version_made,
         ))
@@ -917,6 +936,110 @@ impl Winsys {
         );
         // `EGL_NO_CONTEXT` with no surfaces is the documented way to release.
         self.shared.make_current(proc::EGL_NO_CONTEXT)
+    }
+
+    /// Make every shared buffer linear from here on, by opening a GBM allocator on the render
+    /// node this display renders with. `vrend_use_gbm_layout_feature`, as the C spells it.
+    ///
+    /// Why it is wanted: a guest that presents a shared buffer through virtio-gpu KMS can only
+    /// scan out `LINEAR`, and a venus context that imports one must be told its true layout --
+    /// which with this in place it is, because the layout query then has an answer worth giving.
+    /// Without it, shared storage is GL's own and tiled as the driver likes.
+    ///
+    /// `Err` names why it could not be had: no device behind the display, a driver that does not
+    /// import dma-bufs, or a node GBM would not open. The renderer then carries on without it,
+    /// exactly as the C does when `gbm` is missing.
+    #[cfg(not(target_os = "macos"))]
+    pub fn linear_shared(&mut self) -> Result<std::path::PathBuf, String> {
+        if !self.has_extension("EGL_EXT_image_dma_buf_import") {
+            return Err("this display imports no dma-bufs".into());
+        }
+        let node = self.render_node().ok_or("this display names no DRM device")?;
+        let allocator = crate::gbm::Allocator::open(&node).map_err(|e| e.to_string())?;
+        self.linear = Some(std::sync::Mutex::new(allocator));
+        Ok(node)
+    }
+
+    /// Whether shared buffers are being made linear, and so whether the guest is told layouts.
+    pub fn reports_layouts(&self) -> bool {
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.linear.is_some()
+        }
+        #[cfg(target_os = "macos")]
+        false
+    }
+
+    /// A linear buffer for a shared resource, or `None` where shared buffers are not made linear.
+    #[cfg(not(target_os = "macos"))]
+    pub fn linear_surface(
+        &self,
+        width: u32,
+        height: u32,
+        format: crate::surface::PixelFormat,
+    ) -> Option<Result<crate::dmabuf::Surface, crate::gbm::NoBuffer>> {
+        let allocator = self.linear.as_ref()?;
+        let allocator = allocator.lock().expect("the allocator is never held across a panic");
+        Some(allocator.linear(width, height, format))
+    }
+
+    /// The DRM node this display renders on: its render node where the driver names one, else
+    /// its primary node. `EGL_EXT_device_query` asked of the display's own device, so a GBM
+    /// device opened on the answer allocates on the GPU this display draws with.
+    ///
+    /// Mesa answers the display's device as null, and reports success, once a surfaceless display
+    /// has been terminated and initialised again -- which a renderer reset does. The node is then
+    /// taken from the device list, but only where that list holds a single GPU: with two, nothing
+    /// says which one this display chose, and a buffer allocated on the other is one the driver
+    /// would at best copy.
+    #[cfg(not(target_os = "macos"))]
+    fn render_node(&self) -> Option<std::path::PathBuf> {
+        let egl = &self.shared.egl;
+        let query_display = egl.try_eglQueryDisplayAttribEXT()?;
+        let mut device: EGLAttrib = 0;
+        // SAFETY: the display is initialised and `device` is a local the call writes.
+        let ok = unsafe {
+            query_display(self.shared.display, proc::EGL_DEVICE_EXT as EGLint, &mut device)
+        };
+        if ok != proc::EGL_FALSE && device != 0 {
+            return self.device_node(device as EGLDeviceEXT);
+        }
+        let query_devices = egl.try_eglQueryDevicesEXT()?;
+        let mut devices = [core::ptr::null_mut(); 8];
+        let mut count: EGLint = 0;
+        // SAFETY: an array of eight the call fills up to its length, and a local count.
+        let ok =
+            unsafe { query_devices(devices.len() as EGLint, devices.as_mut_ptr(), &mut count) };
+        if ok == proc::EGL_FALSE {
+            return None;
+        }
+        let found = usize::try_from(count).unwrap_or(0).min(devices.len());
+        let mut nodes = devices[..found].iter().filter_map(|d| self.render_node_of(*d));
+        let only = nodes.next()?;
+        nodes.next().is_none().then_some(only)
+    }
+
+    /// A device's render node, else its primary node.
+    #[cfg(not(target_os = "macos"))]
+    fn device_node(&self, device: EGLDeviceEXT) -> Option<std::path::PathBuf> {
+        const EGL_DRM_DEVICE_FILE_EXT: EGLint = 0x3233;
+        self.render_node_of(device).or_else(|| self.device_string(device, EGL_DRM_DEVICE_FILE_EXT))
+    }
+
+    /// A device's render node, which a software device -- llvmpipe in the list -- has none of.
+    #[cfg(not(target_os = "macos"))]
+    fn render_node_of(&self, device: EGLDeviceEXT) -> Option<std::path::PathBuf> {
+        // `EGL_EXT_device_drm_render_node`, newer than the registry's generated set.
+        const EGL_DRM_RENDER_NODE_FILE_EXT: EGLint = 0x3377;
+        self.device_string(device, EGL_DRM_RENDER_NODE_FILE_EXT)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn device_string(&self, device: EGLDeviceEXT, name: EGLint) -> Option<std::path::PathBuf> {
+        let query_string = self.shared.egl.try_eglQueryDeviceStringEXT()?;
+        // SAFETY: a device EGL named; an attribute it does not have answers null.
+        let p = unsafe { query_string(device, name) };
+        (!p.is_null()).then(|| std::path::PathBuf::from(c_str_to_string(p)))
     }
 
     /// Export a texture this renderer made as a dma-buf, so it can be presented without a copy.
@@ -1820,6 +1943,72 @@ mod tests {
              {LUMA_BYTE:#04x} means the plane index was dropped between EGL and Metal and both \
              images are plane 0.",
             &chroma[..8]
+        );
+    }
+
+    /// A shared buffer made linear is linear: the allocator answers `LINEAR`, the driver images
+    /// it as a render target, and what GL draws lands in the descriptor's bytes as plain rows.
+    ///
+    /// That last half is what the layout query promises the guest. A buffer GBM called linear
+    /// and GL then rendered tiled into would pass every check on the descriptor and still hand a
+    /// KMS scanout or a venus import a sheared picture, so the rows are read back and compared.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_linear_shared_buffer_is_rendered_into_as_rows() {
+        use crate::dmabuf::PixelFormat;
+        use crate::surface::DRM_FORMAT_MOD_LINEAR;
+        use crate::vrend::gl::Gl;
+        use crate::vrend::gl::gles::{
+            GL_COLOR_ATTACHMENT0, GL_COLOR_BUFFER_BIT, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE,
+            GL_TEXTURE_2D,
+        };
+
+        let _display = crate::vrend::one_display_at_a_time();
+        const W: u32 = 64;
+        const H: u32 = 48;
+
+        let mut winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
+        let ctx =
+            winsys.create_context(Version { major: 3, minor: 1 }, None).expect("a 3.1 context");
+        winsys.make_current(&ctx).expect("current");
+        assert!(winsys.linear_surface(W, H, PixelFormat::Bgra).is_none(), "off until asked for");
+        assert!(!winsys.reports_layouts(), "and no layouts are reported while it is");
+        let node = winsys.linear_shared().expect("this host has a render node GBM opens");
+        assert!(winsys.reports_layouts());
+
+        let surface = winsys
+            .linear_surface(W, H, PixelFormat::Bgra)
+            .expect("asked for")
+            .expect("GBM makes a linear BGRA render target");
+        let layout = *surface.layout();
+        assert_eq!(layout.modifier, DRM_FORMAT_MOD_LINEAR, "from {}", node.display());
+        assert!(layout.bytes_per_row() >= W * 4, "a pitch that holds a row");
+        let surface = Arc::new(surface);
+
+        let gl = Gl::new(winsys.gles());
+        let image = winsys
+            .image_from_surface(Arc::clone(&surface) as Arc<dyn Held>)
+            .expect("the driver images its own allocator's buffer");
+        let texture = gl.gen_texture();
+        gl.bind_texture(GL_TEXTURE_2D, Some(texture));
+        gl.egl_image_target_texture_2d(GL_TEXTURE_2D, &image);
+        let fb = gl.gen_framebuffer();
+        gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
+        gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(texture), 0);
+        assert_eq!(gl.check_framebuffer_status(), GL_FRAMEBUFFER_COMPLETE, "renderable");
+        gl.viewport(0, 0, W as i32, H as i32);
+        // Blue, so the byte order is checked too: ARGB8888 is B, G, R, A in memory.
+        gl.clear_color([0.0, 0.0, 1.0, 1.0]);
+        gl.clear(GL_COLOR_BUFFER_BIT);
+        gl.finish();
+
+        let mut rows = vec![0u8; (W * 4 * H) as usize];
+        assert_eq!(surface.read_rows(&mut rows, (W * 4) as usize, H), H, "every row maps");
+        let blue = [0xff, 0x00, 0x00, 0xff];
+        assert!(
+            rows.as_chunks::<4>().0.iter().all(|px| *px == blue),
+            "the rows are not the clear colour, so the bytes are not laid out as rows: {:?}",
+            &rows[..16]
         );
     }
 }

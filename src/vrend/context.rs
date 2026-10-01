@@ -2174,7 +2174,10 @@ impl Context {
                 },
                 wire,
             ),
-            Command::GetMemoryInfo(_) | Command::GetPipeResourceLayout { .. } => {
+            Command::GetPipeResourceLayout { out, target } => {
+                self.get_pipe_resource_layout(host, out, target)
+            }
+            Command::GetMemoryInfo(_) => {
                 host.todo.note(kind.name());
                 Err(Fault::Unimplemented { cmd: kind, what: "blob resources" })
             }
@@ -4554,6 +4557,77 @@ impl Context {
         }
         Ok(())
     }
+
+    /// `vrend_renderer_pipe_resource_get_layout`: write `virgl_resource_layout` for `target`
+    /// into `out`.
+    ///
+    /// What lets the guest describe a shared texture truthfully. Without an answer its virgl
+    /// driver assumes `LINEAR` at a stride of its own computing, and an importer handed that
+    /// description of a texture the driver tiled samples the wrong bytes -- or, where the
+    /// importer checks, refuses it. The answer is the exported surface's layout, which is the
+    /// driver's own; a resource with no surface answers zeros, which the guest reads as "keep
+    /// your own guess", and that guess is right for storage no descriptor of ever leaves the host.
+    ///
+    /// `out` is a staging buffer the guest reads back, so the reply goes where a query result
+    /// does: into the shadow and into the guest's pages, with the two marked as agreeing or not.
+    fn get_pipe_resource_layout(
+        &mut self,
+        host: &mut Host<'_>,
+        out: ResourceHandle,
+        target: ResourceHandle,
+    ) -> Result<(), Fault> {
+        let cmd = Cmd::GetPipeResourceLayout;
+        let layout = host.resource(cmd, target)?.surface().and_then(|s| s.exported_layout());
+        let reply = resource_layout_reply(layout.as_ref());
+        let ctx = host.ctx;
+        let guest = host.guest;
+        let res = host.resource_mut(cmd, out)?;
+        let mut wrote_shadow = false;
+        if let Storage::Host(shadow) = &mut res.storage
+            && shadow.bytes().len() >= reply.len()
+        {
+            shadow.bytes_mut()[..reply.len()].copy_from_slice(&reply);
+            wrote_shadow = true;
+        }
+        let delivered = guest.pages(ctx, out).is_some_and(|pages| pages.copy_in(0, &reply));
+        if let Storage::Host(shadow) = &mut res.storage {
+            if delivered {
+                shadow.mirrored();
+            } else if wrote_shadow {
+                shadow.unmirrored();
+            }
+        }
+        // A buffer the reply fits in neither copy of is the guest's mistake, and the C's answer
+        // to it: the resource is illegal for this command.
+        if !delivered && !wrote_shadow {
+            return Err(Fault::IllegalResource { cmd, handle: out });
+        }
+        Ok(())
+    }
+}
+
+/// `struct virgl_resource_layout`, as the guest's virgl driver reads it back.
+///
+/// Eighty bytes: the modifier, a plane count and a reserved word, then four planes of offset,
+/// stride and size. Zeros for no layout, which is the C's reply for a resource with no GBM buffer.
+/// A plane's size is the distance to the next plane's offset, and the last plane's runs to the end
+/// of the allocation -- the guest reads only the modifier and the first stride, and the sizes are
+/// filled so the struct says nothing the layout does not.
+fn resource_layout_reply(layout: Option<&crate::surface::Layout>) -> [u8; 80] {
+    let mut out = [0u8; 80];
+    let Some(l) = layout else { return out };
+    let planes: &[crate::surface::PlaneLayout] = &l.planes;
+    out[0..8].copy_from_slice(&l.modifier.to_le_bytes());
+    out[8..12].copy_from_slice(&(planes.len() as u32).to_le_bytes());
+    for (i, p) in planes.iter().enumerate() {
+        let end = planes.get(i + 1).map_or(l.alloc_size, |next| next.offset);
+        let size = u32::try_from(end.saturating_sub(p.offset)).unwrap_or(u32::MAX);
+        let at = 16 + i * 16;
+        out[at..at + 8].copy_from_slice(&p.offset.to_le_bytes());
+        out[at + 8..at + 12].copy_from_slice(&p.pitch.to_le_bytes());
+        out[at + 12..at + 16].copy_from_slice(&size.to_le_bytes());
+    }
+    out
 }
 
 // ---- transfers ----
@@ -4875,6 +4949,41 @@ fn video_result(cmd: Cmd, result: Result<(), video::Refusal>) -> Result<(), Faul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The layout reply is the C's struct, byte for byte, and says nothing for storage with none.
+    ///
+    /// The guest reads the modifier at 0 and the first plane's stride at 24, and takes a zero
+    /// stride as "no answer" -- so a reply that put either anywhere else would leave every shared
+    /// texture described as `LINEAR`, which is exactly what this command exists to correct.
+    #[test]
+    fn a_resource_layout_reply_is_the_guests_struct() {
+        use crate::surface::{Layout, PlaneLayout, PlaneLayouts};
+
+        assert_eq!(resource_layout_reply(None), [0u8; 80], "no layout is all zeros");
+
+        let x_tiled = 0x0100_0000_0000_0001u64;
+        let layout = Layout {
+            width: 1280,
+            height: 656,
+            fourcc: 0x3432_5258,
+            modifier: x_tiled,
+            planes: PlaneLayouts::new(&[
+                PlaneLayout { offset: 0, pitch: 5120 },
+                PlaneLayout { offset: 3_440_640, pitch: 2560 },
+            ])
+            .expect("two planes fit"),
+            alloc_size: 4_194_304,
+        };
+        let r = resource_layout_reply(Some(&layout));
+        let u64_at = |at: usize| u64::from_le_bytes(r[at..at + 8].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(r[at..at + 4].try_into().unwrap());
+        assert_eq!(u64_at(0), x_tiled, "modifier");
+        assert_eq!(u32_at(8), 2, "plane count");
+        assert_eq!(u32_at(12), 0, "reserved");
+        assert_eq!((u64_at(16), u32_at(24), u32_at(28)), (0, 5120, 3_440_640), "plane 0");
+        assert_eq!((u64_at(32), u32_at(40), u32_at(44)), (3_440_640, 2560, 753_664), "plane 1");
+        assert!(r[48..].iter().all(|b| *b == 0), "planes past the count stay zero");
+    }
 
     /// The immutable texture every route test is about.
     const VIEWABLE: Immutable = Immutable::unbacked(TextureName::unbacked(7));

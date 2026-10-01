@@ -22,6 +22,12 @@ pub struct Config {
     /// asked for: bringing VideoToolbox up registers supplemental decoders process-wide, which is
     /// not a thing to do to a caller who never asked for video.
     pub video: bool,
+    /// Allocate every shared classic buffer linear, and tell the guest each shared buffer's
+    /// layout. Off by default, because linear storage costs every compositor buffer its tiling;
+    /// what it buys is a guest that can scan a shared buffer out through virtio-gpu KMS, which
+    /// takes `LINEAR` only, and a venus context that can import one. Has an effect only with
+    /// `venus`, and only on a host that exports rather than mints its storage.
+    pub linear_shared: bool,
 }
 
 /// The renderer a context bound when it was created.

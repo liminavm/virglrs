@@ -20,7 +20,6 @@ use super::gl::{
 use super::pipe::TextureTarget;
 use super::proto::{Format, Plane};
 use super::video;
-#[cfg(target_os = "macos")]
 use crate::budget::Charged;
 use crate::budget::{Charge, Classic};
 use crate::guest_mem::{Iov, PixelSource};
@@ -2147,21 +2146,59 @@ fn mint_planes(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args)
     Some(Planes { luma, chroma, planar, conversion: Mutex::default(), textures: Mutex::default() })
 }
 
-/// Nothing, on a host that mints nothing.
+/// A linear buffer for a shared resource, where shared buffers are made linear.
 ///
-/// The storage a scanout is presented from belongs to the driver here, and what this renderer
-/// gets is a descriptor of it -- see [`export_surface`], which is the same question answered the
-/// other way round. A resource therefore takes ordinary GL storage and may also carry an export
-/// of it; those are not alternatives, and `Texture` holds them in separate fields for that
-/// reason.
+/// `vrend_resource_gbm_init` with `VIRGL_BIND_SHARED`, which is the only case the C forces
+/// linear: a guest scans a shared buffer out through virtio-gpu KMS, whose kernel driver takes
+/// `LINEAR` and nothing else, and a venus context importing it is told this layout and must find
+/// it true. A scanout that is not shared keeps the driver's tiling, and the export taken of its
+/// texture afterwards reports that tiling instead -- see [`export_surface`].
+///
+/// Anywhere this does not apply -- shared buffers not asked to be linear, a format GBM will not
+/// make, an image the driver will not take -- the resource keeps ordinary GL storage, as it does
+/// in the C. Each outcome is said once: the success is the positive control a boot reads to know
+/// the path ran at all.
 #[cfg(not(target_os = "macos"))]
 fn mint_surface(
-    _winsys: &Winsys,
+    winsys: &Winsys,
     _features: &Features,
-    _budget: &Classic,
-    _a: &Args,
+    budget: &Classic,
+    a: &Args,
 ) -> Option<Image> {
-    None
+    if !a.bind.has(Bind::SHARED) {
+        return None;
+    }
+    let format = presentable_format(a)?;
+    let made = winsys.linear_surface(a.width, a.height, format)?;
+    let imaged = made.map_err(|e| e.to_string()).and_then(|surface| {
+        let size = surface.alloc_size();
+        let charge = budget.charge("linear buffer", size);
+        winsys
+            .image_from_surface(Arc::new(Charged::new(surface, charge)))
+            .map_err(|e| e.to_string())
+    });
+    if winsys.linear_said.first(imaged.is_ok()) {
+        match &imaged {
+            Ok(image) => {
+                let l = *image.surface().layout();
+                eprintln!(
+                    "[virglrs] vrend: shared {}x{} {} is a linear GBM buffer, pitch {}",
+                    a.width,
+                    a.height,
+                    a.format.name(),
+                    l.bytes_per_row()
+                );
+            }
+            Err(why) => eprintln!(
+                "[virglrs] vrend: no linear buffer for a shared {}x{} {} ({why}); it keeps the \
+                 driver's tiling",
+                a.width,
+                a.height,
+                a.format.name()
+            ),
+        }
+    }
+    imaged.ok()
 }
 
 /// The pixel format a resource's presentable storage takes, or `None` for a resource that gets
@@ -2481,7 +2518,7 @@ fn alloc_texture(
         assert_eq!(
             err,
             GL_NO_ERROR,
-            "the driver imported a {}x{} {} IOSurface and then would not bind it",
+            "the driver imported a {}x{} {} surface and then would not bind it",
             a.width,
             a.height,
             a.format.name()

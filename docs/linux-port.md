@@ -471,14 +471,15 @@ host asks yet -- rutabaga calls `export_blob` per blob create and takes the refu
 a VMM that wants to pass a client's window buffer to a compositor outside the guest, and it will
 be an unexplained blank window when it does.
 
-**A venus context cannot import a venus client's buffer.** The other side of the same gap. A
-compositor running in a venus context, handed a share of a client's exported storage, is refused
-at `vkAllocateMemory` because there is nothing to import it *as*: a descriptor is not a host
-allocation, and the dma-buf handle type that would take one is not passed. That is the shape a
-seated Vulkan compositor takes -- it works on the minting host, where the share is an IOSurface's
-pages -- so it is the next thing a Wayland compositor written against Vulkan will hit here. Both
-halves want the same piece of work: `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT` at
-`vkAllocateMemory`, and a layout to go with it.
+**Shared buffers are linear only on request.** A guest that presents through virtio-gpu KMS can
+scan out `LINEAR` and nothing else, and a venus context importing a classic buffer must be told
+its true layout -- so a Vulkan compositor in the guest needs both. `Config::linear_shared` (the
+C's `VIRGL_GBM_LAYOUT_ENABLE`, read under that name by `ffi.rs`, and only with venus) allocates
+every shared buffer as a linear GBM buffer and answers `GET_PIPE_RESOURCE_LAYOUT`; without it,
+shared storage is GL's own and tiled, the guest assumes linear, and a venus import of it is
+refused by the layout check rather than read wrong. It is off by default for the C's reason:
+linear storage costs every compositor buffer its tiling. Whether it should become the default
+on Linux is open.
 
 **A classic export holds a descriptor per resource, for the resource's lifetime, uncharged.**
 `export_surface` takes a dma-buf from the driver for every SHARED or SCANOUT classic resource and

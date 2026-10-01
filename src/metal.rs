@@ -851,6 +851,13 @@ impl Surface {
         None
     }
 
+    /// The layout an [`Self::export`] would carry, without taking a descriptor: none, for the
+    /// same reason. No guest importer is ever handed these pages as a dma-buf, so there is no
+    /// layout the guest has to be told.
+    pub fn exported_layout(&self) -> Option<crate::surface::Layout> {
+        None
+    }
+
     /// Note that this surface was lent to a venus context, which reads it on a Vulkan queue with
     /// nothing on this side in between. Latched: a lent share can be imported again at any time.
     ///

@@ -22,6 +22,8 @@ Metal bindings (`metal.rs`), which are the only Objective-C in the tree; the dma
 (`dmabuf.rs`), `metal.rs`'s counterpart on a host that exports storage rather than minting it,
 whose unsafe is the `mmap`/`munmap` of an exported descriptor, the `lseek` that asks the kernel
 how big it is, the copies in and out of that mapping, and the `Send`/`Sync` the mapping asserts;
+the GBM bindings (`gbm.rs`), which make the linear shared buffers a Linux guest's KMS can scan
+out and hand them on as `dmabuf.rs` surfaces;
 the VideoToolbox
 bindings (`videotoolbox.rs`), which are C APIs and so add no Objective-C; the guest-memory
 mapping (`guest_mem.rs`); the C shim (`ffi.rs`, `abi.rs`); and the venus wire decoder
