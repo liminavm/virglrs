@@ -1742,7 +1742,7 @@ fn releases_a_create(cmd: VkCommandTypeEXT) -> bool {
 /// closed enum, so this match needs a catch-all and a command that belongs here can be added to
 /// the protocol without anything saying so. The count below is what says so instead.
 const _: () = assert!(
-    COMMAND_TYPES == 326,
+    COMMAND_TYPES == 329,
     "the venus protocol's command set changed. Re-read `mutates` against the new commands -- one \
      that writes into an object it does not own belongs in it, and a missing entry is a journal \
      entry that outlives what it described -- then update this number."

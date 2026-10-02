@@ -520,7 +520,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   a decode path for. On a host with the silicon that is now the C's own six, byte for byte; a
   machine missing a codec's hardware reports fewer on both legs and still matches.
 
-  `capability_bits_v2` is short `VIDEO_GUEST_PLANES` (1<<19), which the C sets on there being a
+  `capability_bits_v2` is short `VIDEO_GUEST_PLANES`, which the C sets on there being a
   decoder at all. That is right for the C, which writes the decoded frame back into the guest's
   own pages; the bit tells the guest that backing a decode target's planes with its memory is
   worthwhile, and a guest that took the offer here would export an honest-looking dmabuf fd
@@ -993,7 +993,7 @@ measuring nothing, and the difference matters because a corpus of zeros agrees w
   about. The C leg decodes nothing on a non-Mesa VA driver. The composite scores remain
   macOS-only: a composite planar target cannot be backed here.
 - **`vrend-overview`** replays 116 creates of a `Y8_U8V8_420_UNORM` composite planar target. The
-  Linux capset correctly does not advertise that (`capability_bits_v2` has bit 20 clear, against
+  Linux capset correctly does not advertise that (`capability_bits_v2` has `VIDEO_PLANAR_TARGET` clear, against
   macOS's set, and `num_video_caps` is 0), so the renderer refuses all 116 — the right answer to a
   question this host never invited. It is a recording of a guest that asked a *different* host, so
   the corpus does not mean the same thing here. Gateable once a planar target can be backed.

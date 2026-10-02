@@ -3,7 +3,7 @@
 # Copyright © 2026 Gustavo Noronha Silva
 """Generate the Rust venus protocol from venus-protocol's model.
 
-    gen.py --outdir <dir> [--protocol <venus-protocol checkout>]
+    gen.py --outdir <dir> --protocol <venus-protocol checkout>
 
 The model (`vkxml.py`) and the type selection (`vn_protocol.py`'s `Gen`) are imported from the
 venus-protocol subproject over `sys.path`. Nothing is edited there: it is wrap-managed, and the
@@ -16,7 +16,6 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).parent.resolve()
-DEFAULT_PROTOCOL = HERE.parent.parent / 'subprojects' / 'venus-protocol-1.0'
 
 
 def api_constants(vk_xml):
@@ -160,7 +159,7 @@ def check_template_engine(Template):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--outdir', required=True, help='Where to write the .rs files.')
-    parser.add_argument('--protocol', default=str(DEFAULT_PROTOCOL),
+    parser.add_argument('--protocol', required=True,
                         help='The venus-protocol checkout to take the model from.')
     args = parser.parse_args()
 
@@ -175,15 +174,13 @@ def main():
 
     from rustgen import RustGen
 
-    reg = VkRegistry.parse(vn_protocol.VN_PROTOCOL_VK_XML, vn_protocol.VN_PROTOCOL_PRIVATE_XMLS)
+    vk_xml, private_xmls = vn_protocol.get_vk_xmls(protocol)
+    reg = VkRegistry.parse(vk_xml, private_xmls)
     gen = vn_protocol.Gen(False, reg)
-    vk_xml = protocol / 'xmls' / 'vk.xml'
     rust = RustGen(gen, api_constants(vk_xml), bitfield_types(vk_xml),
-                   member_order([vn_protocol.VN_PROTOCOL_VK_XML]
-                                + list(vn_protocol.VN_PROTOCOL_PRIVATE_XMLS)),
+                   member_order([vk_xml] + private_xmls),
                    handle_parents(vk_xml),
-                   extension_requirements([vn_protocol.VN_PROTOCOL_VK_XML]
-                                          + list(vn_protocol.VN_PROTOCOL_PRIVATE_XMLS)))
+                   extension_requirements([vk_xml] + private_xmls))
 
     check_template_engine(Template)
 

@@ -78,7 +78,7 @@ set 2: max_ver=2 max_size=1408
   host_feature_check_version = 23
   supported_readback_formats = b0372386 09090000 58002c0b 50000130 11102040 77760001 aaaaab77 20007de8 00000000 00900000 00000000 00000000 00000000 00000000 00000000 00000000
   scanout = ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff ffffffff 00000003
-  capability_bits_v2 = 001902d2
+  capability_bits_v2 = c00102d2
   max_video_memory = 0
   renderer = zink Vulkan 1.4(Apple M1 Max (MESA_KOSMICKRISP))
   max_anisotropy = 16

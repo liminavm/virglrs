@@ -74,7 +74,10 @@
 # the next four checks still passed. `[virglrs] refused:` is the oracle. The program is not.
 vkCmdBindResourceHeapEXT                           out-of-reach:descriptor-heap
 vkCmdBindSamplerHeapEXT                            out-of-reach:descriptor-heap
+vkCmdCopyMemoryIndirectKHR                         out-of-reach:copy-memory-indirect
+vkCmdCopyMemoryToImageIndirectKHR                  out-of-reach:copy-memory-indirect
 vkCmdPushDataEXT                                   out-of-reach:descriptor-heap
+vkCmdSetPrimitiveRestartIndexEXT                   out-of-reach:primitive-restart-index
 vkCopyAccelerationStructureKHR                     not-in-reference:acceleration-structure
 vkCreateDeferredOperationKHR                       not-in-reference:deferred-operation
 vkCreatePrivateDataSlot                            not-in-reference:private-data

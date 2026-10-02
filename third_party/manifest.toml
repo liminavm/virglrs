@@ -14,7 +14,7 @@
 repo = "https://github.com/liminavm/virglrenderer.git"
 upstream = "https://gitlab.freedesktop.org/virgl/virglrenderer.git"
 branch = "limina"
-rev = "017b7e159a651a2597daacaef6d13695cfd12c6b"
+rev = "ad8e1b752aea3fb108cd70715b2ee6e72c47674c"
 
 # The reference leg on Linux, and only there.
 #
