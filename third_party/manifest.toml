@@ -38,3 +38,15 @@ rev = "ad8e1b752aea3fb108cd70715b2ee6e72c47674c"
 [virglrenderer-upstream]
 repo = "https://gitlab.freedesktop.org/virgl/virglrenderer.git"
 rev = "cf6c62da2a1384b194f463e6221371962fe99575"
+
+# libva's headers, for type-checking the Linux build on macOS, and only for that.
+#
+# The VA-API backend's bindings are generated from them by cros-libva's build script, which a Mac
+# has no libva to feed. `scripts/cross-check-linux.sh` materializes this into third_party/libva and
+# lays the headers out the way an install does. Nothing is linked against it and nothing runs.
+#
+# The rev is the libva goiaba builds against (Fedora 44's 2.23.0, VA-API 1.23): cros-libva gates
+# parts of its API on the version it reads, so a different one would type-check a different crate.
+[libva]
+repo = "https://github.com/intel/libva.git"
+rev = "dbf83dc3b1ce6bad46e1628aaf2da5ef731157b8"
