@@ -2,8 +2,8 @@
 
 The Rust backend for venus-protocol's generator.
 
-`vkxml.py` in `subprojects/venus-protocol-1.0` is a language-neutral model of `vk.xml`.
-`vn_protocol.py`'s `Gen` is a *C* backend on top of it — it selects which types and commands venus
+`vkxml.py` in the venus-protocol subproject (the directory its wrap names) is a language-neutral
+model of `vk.xml`. `vn_protocol.py`'s `Gen` is a *C* backend on top of it — it selects which types and commands venus
 serializes, and it emits C statements — and this directory is the Rust one. Only the selection is
 reused; none of the emission is.
 

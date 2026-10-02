@@ -26,16 +26,36 @@ fn c_tree(manifest: &std::path::Path) -> PathBuf {
     tree
 }
 
+/// The venus-protocol checkout inside the C tree, wherever its wrap says meson puts it.
+///
+/// The directory carries the protocol's version, so it moves with every bump. The wrap is the one
+/// record of it; spelling the name here as well would be a second, and the stale one would win.
+fn venus_protocol(tree: &std::path::Path) -> PathBuf {
+    let wrap = tree.join("subprojects/venus-protocol.wrap");
+    println!("cargo::rerun-if-changed={}", wrap.display());
+    let text = std::fs::read_to_string(&wrap).expect("read subprojects/venus-protocol.wrap");
+    let directory = text
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "directory").then(|| value.trim())
+        })
+        .expect("venus-protocol.wrap names no directory");
+    let protocol = tree.join("subprojects").join(directory);
+    assert!(
+        protocol.join("vkxml.py").is_file(),
+        "venus-protocol is not materialized at {}: run `meson subprojects download` in \
+         third_party/virglrenderer",
+        protocol.display()
+    );
+    protocol
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let generator = manifest.join("venus-gen");
     let tree = c_tree(&manifest);
-    let protocol = tree.join("subprojects/venus-protocol-1.0");
-    assert!(
-        protocol.join("vkxml.py").is_file(),
-        "venus-protocol is not materialized: run `meson subprojects download` in \
-         third_party/virglrenderer"
-    );
+    let protocol = venus_protocol(&tree);
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("venus");
 
     for dep in ["gen.py", "rustgen.py", "templates"] {

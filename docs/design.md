@@ -177,7 +177,7 @@ of bug this rewrite exists to delete. The C already does the right thing: decode
 struct pointer straight to the ICD through a resolved proc pointer. We generate that
 table from the same vk.xml, which also covers the private MESA commands ash has never
 seen. Layout parity gets pinned the way the capset is, with `cc` and `offsetof`
-against `subprojects/venus-protocol-1.0/include/vulkan/vulkan.h` — the header matching
+against the venus-protocol subproject's `include/vulkan/vulkan.h` — the header matching
 the pinned vk.xml. Skew is bounded: Vulkan extends through `pNext` and never adds
 fields to an existing struct.
 
