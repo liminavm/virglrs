@@ -293,18 +293,79 @@ mod tests {
 
     const W: u32 = 1024;
     const H: u32 = 1024;
-    /// Big enough that the driver cannot have finished by the time the CPU looks, and cheap enough
-    /// that the test is not a benchmark. Raised until the control arms.
-    const FIRST_PASSES: u32 = 400;
+    /// The render's cost, in iterations of the fragment loop: measured 2026-10-02 on an M1 Max at
+    /// about 15 ms of GPU for well under a millisecond of CPU. Raised until the control arms.
+    const FIRST_ITERATIONS: i32 = 1024;
+    /// Where raising stops. Four times 16384 measured *faster* than 16384 on KosmicKrisp
+    /// (2026-10-02) -- the GPU gives up on a fragment that long -- so a ladder past it would
+    /// measure nothing.
+    const LAST_ITERATIONS: i32 = 16384;
 
-    /// Queue `passes` full-surface clears, the last one `last`, and flush without waiting.
-    fn queue(gl: &Gl, passes: u32, last: [f32; 4]) {
-        for i in 0..passes {
-            // Every pass writes the whole surface, so only the last one can be what a reader sees
-            // if the work ran to completion -- and an earlier colour is what it sees if it did not.
-            let c = if i + 1 == passes { last } else { [1.0, 0.0, 1.0, 1.0] };
-            gl.clear_color(c);
-            gl.clear(GL_COLOR_BUFFER_BIT);
+    /// A render whose cost is all on the GPU: one full-surface draw whose every fragment loops,
+    /// then one that adds blue.
+    ///
+    /// The cost has to be GPU time the CPU does not share. Full-surface clears were tried and are
+    /// not that: the driver collapses or overlaps them, so growing their count grew the CPU's
+    /// recording as fast as the GPU's work, and a reader slowed by a loaded CPU found the work
+    /// done at every size -- the control failed under load and passed idle. Here the CPU records
+    /// two draws whatever the size, and only the fragment loop grows.
+    ///
+    /// Both draws blend additively, onto a surface the caller has cleared to black. The loop's
+    /// draw adds zero -- through a test the compiler cannot prove, so the loop is not folded away
+    /// -- and blending keeps the tiler from discarding it under the draw that follows. So the
+    /// surface stays black until the second draw lands, and is exactly blue once it has.
+    struct Load {
+        iterations: crate::vrend::gl::UniformLocation,
+        colour: crate::vrend::gl::UniformLocation,
+    }
+
+    impl Load {
+        fn new(gl: &Gl) -> Load {
+            const VS: &str = "#version 310 es
+                void main() {
+                    // One triangle that covers the surface, from the vertex index alone.
+                    vec2 p = vec2(float((gl_VertexID & 1) << 2) - 1.0,
+                                  float((gl_VertexID & 2) << 1) - 1.0);
+                    gl_Position = vec4(p, 0.0, 1.0);
+                }";
+            const FS: &str = "#version 310 es
+                precision highp float;
+                uniform int iterations;
+                uniform vec4 colour;
+                out vec4 c;
+                void main() {
+                    float x = gl_FragCoord.x * 0.001;
+                    for (int i = 0; i < iterations; i++)
+                        x = fract(sin(x) * 43758.5453 + 0.1);
+                    // Always true, since fract() is below 1 -- but not to the compiler.
+                    c = colour * (x < 2.0 ? 1.0 : 0.5);
+                }";
+            let program = gl.create_program().expect("a program");
+            for (kind, source) in [(GL_VERTEX_SHADER, VS), (GL_FRAGMENT_SHADER, FS)] {
+                let shader = gl.create_shader(kind).expect("a shader");
+                gl.compile_shader(shader, source).expect("the load's shader compiles");
+                gl.attach_shader(program, shader);
+                gl.delete_shader(shader);
+            }
+            gl.link_program(program).expect("the load's program links");
+            let mut bound = crate::vrend::gl::BoundProgram::default();
+            gl.use_program(&mut bound, Some(program));
+            gl.bind_vertex_array(Some(gl.gen_vertex_array()));
+            gl.blend_func_separate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
+            gl.enable(GL_BLEND);
+            let uniform = |name| gl.get_uniform_location(program, name).expect("a live uniform");
+            Load { iterations: uniform("iterations"), colour: uniform("colour") }
+        }
+
+        /// Queue the render, `iterations` long, and flush without waiting.
+        fn queue(&self, gl: &Gl, iterations: i32) {
+            gl.uniform_1i(self.iterations, iterations);
+            gl.uniform_4f(self.colour, [0.0, 0.0, 0.0, 0.0]);
+            gl.draw_arrays(GL_TRIANGLES, 0, 3);
+            gl.uniform_1i(self.iterations, 0);
+            gl.uniform_4f(self.colour, [0.0, 0.0, 1.0, 0.0]);
+            gl.draw_arrays(GL_TRIANGLES, 0, 3);
+            gl.flush();
         }
     }
 
@@ -406,20 +467,20 @@ mod tests {
 
         // The control: an Ordered fence with an EMPTY queue ahead of it. It must retire while the
         // render is still in flight, or nothing below distinguishes ordering from luck.
-        let mut passes = FIRST_PASSES;
-        let mut alone = 0xff;
-        for _ in 0..6 {
+        let load = Load::new(&gl);
+        let mut iterations = FIRST_ITERATIONS;
+        let mut alone;
+        loop {
             black(&gl);
-            queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
-            gl.flush();
+            load.queue(&gl, iterations);
             waiter.retire_global(Vec::new(), Answer::Ordered, None, ClientFenceId(1));
             assert_eq!(retired.recv().expect("the sink answers"), ClientFenceId(1));
             alone = first_pixel_blue(&surface);
-            if alone != 0xff {
+            if alone != 0xff || iterations == LAST_ITERATIONS {
                 break;
             }
             gl.finish();
-            passes *= 4;
+            iterations *= 4;
         }
         assert_ne!(
             alone, 0xff,
@@ -430,7 +491,7 @@ mod tests {
         // The same Ordered fence, this time behind a Sync for that render. FIFO is what makes it
         // wait, and the reader must now see the finished colour.
         black(&gl);
-        queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
+        load.queue(&gl, iterations);
         let sync = gl.fence().expect("the driver gives a sync object");
         // With a ticket, so the same run checks that the context's in-flight count is given back
         // once the GPU is past the sync -- and not before: nothing retires ahead of this job.
@@ -448,7 +509,7 @@ mod tests {
         let behind = first_pixel_blue(&surface);
         assert_eq!(gate.queued(), 0, "the fence retired but still counts as in flight");
 
-        eprintln!("[ordered] {passes} passes: alone={alone:#04x} behind={behind:#04x}");
+        eprintln!("[ordered] {iterations} iterations: alone={alone:#04x} behind={behind:#04x}");
         assert_eq!(
             behind, 0xff,
             "an Ordered fence retired before the render a Sync queued ahead of it had run"
@@ -532,19 +593,20 @@ mod tests {
         // Arm the control at the same point the assertion is made: the reader is told not to
         // wait, and must come back stale. If it does not, the render is finishing before the
         // channel round trip and this test cannot tell a wait from no wait -- so grow it.
-        let mut passes = FIRST_PASSES;
-        let mut unwaited = 0xff;
-        for _ in 0..6 {
+        let load = Load::new(&gl);
+        let mut iterations = FIRST_ITERATIONS;
+        let mut unwaited;
+        loop {
             black(&gl);
-            queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
+            load.queue(&gl, iterations);
             let fence = gl.fence().expect("the driver gives a sync object");
             ask.send((fence, false)).expect("the reader is listening");
             unwaited = answer.recv().expect("the reader answers");
-            if unwaited != 0xff {
+            if unwaited != 0xff || iterations == LAST_ITERATIONS {
                 break;
             }
             gl.finish();
-            passes *= 4;
+            iterations *= 4;
         }
         assert_ne!(
             unwaited, 0xff,
@@ -554,7 +616,7 @@ mod tests {
 
         // Now the same thing, waited. Same thread, same context, same round trip.
         black(&gl);
-        queue(&gl, passes, [0.0, 0.0, 1.0, 1.0]);
+        load.queue(&gl, iterations);
         let fence = gl.fence().expect("the driver gives a sync object");
         ask.send((fence, true)).expect("the reader is listening");
         let waited = answer.recv().expect("the reader answers");
@@ -565,7 +627,7 @@ mod tests {
         // Printed, not judged: what the control cost to arm, so a later reader can see whether it
         // armed easily or barely, and on what size of render.
         eprintln!(
-            "[leg] passes={passes} unwaited=0x{unwaited:02x} waited=0x{waited:02x} \
+            "[leg] iterations={iterations} unwaited=0x{unwaited:02x} waited=0x{waited:02x} \
              (0xff is the render this fence stands for)"
         );
         assert_eq!(

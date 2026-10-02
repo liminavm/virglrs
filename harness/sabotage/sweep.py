@@ -1780,6 +1780,15 @@ SABOTAGES = [
         'a_fence_waits_for_the_pictures_decoding_ahead_of_it',
     ),
     (
+        'a fence wait returns before the GPU is past the fence',
+        'src/vrend/waiter.rs',
+        """        match gl.fence_wait(fence, SLICE_NS) {
+            FenceWait::Signalled => return,""",
+        """        match FenceWait::Signalled {
+            FenceWait::Signalled => return,""",
+        'vrend::waiter::tests::a',
+    ),
+    (
         'a second decode into a target drops the first picture instead of delivering it',
         'src/vrend/video/pending.rs',
         """            deliver(replaced, gl, name, planes);
