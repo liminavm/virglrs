@@ -1386,9 +1386,9 @@ iosurface res=1592 1280x800 sync=-22 read-failed=-22
 iosurface res=1612 1x1 sync=-22 read-failed=-22
 iosurface res=1613 640x400 sync=0 hash=e5a2e83410abd258 ink=256000/256000
 iosurface res=1617 640x400 sync=0 hash=13eb3bd45cce5ffe ink=256000/256000
-iosurface res=1618 640x400 sync=0 hash=d851d11a77301910 ink=256000/256000
+iosurface res=1618 640x400 sync=0 hash=86ad12cfdcaceb85 ink=256000/256000
 iosurface res=1620 640x400 sync=0 hash=d1d99411e5c2760a ink=256000/256000
 iosurface res=1684 1280x800 sync=-22 read-failed=-22
-iosurface res=1685 1280x800 sync=0 hash=cce10c40aec01ae0 ink=1024000/1024000
+iosurface res=1685 1280x800 sync=0 hash=20b2eea578f38ea3 ink=1024000/1024000
 iosurface res=1686 1280x800 sync=0 hash=836bca6abfde0a71 ink=1024000/1024000
 blobs 2 untyped 2
