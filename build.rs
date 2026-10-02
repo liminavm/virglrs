@@ -83,11 +83,11 @@ fn gl_bindings(manifest: &std::path::Path) {
     assert!(status.success(), "gl-gen failed");
 }
 
-/// Run the classic renderer's format generator into `OUT_DIR/vrend`.
+/// Run the classic renderer's format and capability generator into `OUT_DIR/vrend`.
 ///
-/// The wire numbering is read from `src/virgl_hw.h`, the header the guest's copy is a copy of,
-/// and the format descriptions from the gallium `u_format.yaml` the C's own table is generated
-/// from -- one copy of each (`vrend-gen/README.md`).
+/// The wire numbering -- formats and capability bits both -- is read from `src/virgl_hw.h`, the
+/// header the guest's copy is a copy of, and the format descriptions from the gallium
+/// `u_format.yaml` the C's own table is generated from -- one copy of each (`vrend-gen/README.md`).
 fn vrend_formats(manifest: &std::path::Path) {
     let generator = manifest.join("vrend-gen");
     let tree = c_tree(manifest);

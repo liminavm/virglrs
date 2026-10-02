@@ -85,70 +85,10 @@ pub mod bset {
     pub const TRANSFORM_FEEDBACK_OVERFLOW_QUERY: u32 = 1 << 31;
 }
 
-/// `VIRGL_CAP_*`: `capability_bits`.
-pub mod cap {
-    pub const TGSI_INVARIANT: u32 = 1 << 0;
-    pub const TEXTURE_VIEW: u32 = 1 << 1;
-    pub const SET_MIN_SAMPLES: u32 = 1 << 2;
-    pub const COPY_IMAGE: u32 = 1 << 3;
-    pub const TGSI_PRECISE: u32 = 1 << 4;
-    pub const TXQS: u32 = 1 << 5;
-    pub const MEMORY_BARRIER: u32 = 1 << 6;
-    pub const COMPUTE_SHADER: u32 = 1 << 7;
-    pub const FB_NO_ATTACH: u32 = 1 << 8;
-    pub const ROBUST_BUFFER_ACCESS: u32 = 1 << 9;
-    pub const TGSI_FBFETCH: u32 = 1 << 10;
-    pub const SHADER_CLOCK: u32 = 1 << 11;
-    pub const TEXTURE_BARRIER: u32 = 1 << 12;
-    pub const TGSI_COMPONENTS: u32 = 1 << 13;
-    pub const GUEST_MAY_INIT_LOG: u32 = 1 << 14;
-    pub const SRGB_WRITE_CONTROL: u32 = 1 << 15;
-    pub const QBO: u32 = 1 << 16;
-    pub const TRANSFER: u32 = 1 << 17;
-    pub const FBO_MIXED_COLOR_FORMATS: u32 = 1 << 18;
-    pub const HOST_IS_GLES: u32 = 1 << 19;
-    pub const BIND_COMMAND_ARGS: u32 = 1 << 20;
-    pub const MULTI_DRAW_INDIRECT: u32 = 1 << 21;
-    pub const INDIRECT_PARAMS: u32 = 1 << 22;
-    pub const TRANSFORM_FEEDBACK3: u32 = 1 << 23;
-    pub const ASTC_3D: u32 = 1 << 24;
-    pub const INDIRECT_INPUT_ADDR: u32 = 1 << 25;
-    pub const COPY_TRANSFER: u32 = 1 << 26;
-    pub const CLIP_HALFZ: u32 = 1 << 27;
-    pub const APP_TWEAK_SUPPORT: u32 = 1 << 28;
-    pub const BGRA_SRGB_IS_EMULATED: u32 = 1 << 29;
-    pub const CLEAR_TEXTURE: u32 = 1 << 30;
-    pub const ARB_BUFFER_STORAGE: u32 = 1 << 31;
-}
-
-/// `VIRGL_CAP_V2_*`: `capability_bits_v2`.
-pub mod cap2 {
-    pub const BLEND_EQUATION: u32 = 1 << 0;
-    pub const UNTYPED_RESOURCE: u32 = 1 << 1;
-    pub const VIDEO_MEMORY: u32 = 1 << 2;
-    pub const MEMINFO: u32 = 1 << 3;
-    pub const STRING_MARKER: u32 = 1 << 4;
-    pub const DIFFERENT_GPU: u32 = 1 << 5;
-    pub const IMPLICIT_MSAA: u32 = 1 << 6;
-    pub const COPY_TRANSFER_BOTH_DIRECTIONS: u32 = 1 << 7;
-    pub const SCANOUT_USES_GBM: u32 = 1 << 8;
-    pub const SSO: u32 = 1 << 9;
-    pub const TEXTURE_SHADOW_LOD: u32 = 1 << 10;
-    pub const VS_VERTEX_LAYER: u32 = 1 << 11;
-    pub const VS_VIEWPORT_INDEX: u32 = 1 << 12;
-    pub const PIPELINE_STATISTICS_QUERY: u32 = 1 << 13;
-    pub const DRAW_PARAMETERS: u32 = 1 << 14;
-    pub const GROUP_VOTE: u32 = 1 << 15;
-    pub const MIRROR_CLAMP_TO_EDGE: u32 = 1 << 16;
-    pub const MIRROR_CLAMP: u32 = 1 << 17;
-    pub const RESOURCE_LAYOUT: u32 = 1 << 18;
-    /// The guest may back a decode target's planes with its own memory, which is what lets it
-    /// export the decoded frame as a dmabuf rather than only sample it.
-    pub const VIDEO_GUEST_PLANES: u32 = 1 << 19;
-    /// The guest may hand over one composite planar resource as a decode target, instead of one
-    /// resource per plane.
-    pub const VIDEO_PLANAR_TARGET: u32 = 1 << 20;
-}
+// `cap` and `cap2`, the two capability words, numbered by `virgl_hw.h` -- the header the guest's
+// copy is a copy of. Spelled out here as well, a bit the header moves would go on meaning the old
+// thing on this side only, which no build would notice and every guest would.
+include!(concat!(env!("OUT_DIR"), "/vrend/caps.rs"));
 
 /// `virgl_caps_v1`.
 #[repr(C)]
