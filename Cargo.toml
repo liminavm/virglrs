@@ -53,6 +53,7 @@ default = ["vaapi"]
 [dependencies]
 bumpalo = "3.20"
 bytemuck = { version = "1.25.2", features = ["derive"] }
+dav1d = "0.11.1"
 libc = "0.2"
 rustc-hash = "2.1"
 

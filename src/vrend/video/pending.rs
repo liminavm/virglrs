@@ -27,8 +27,8 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use super::Picture;
 use super::TargetFormat;
-use crate::decode::Picture;
 use crate::vrend::formats::GlFormat;
 use crate::vrend::gl::gles::{GL_TEXTURE_2D, GL_TEXTURE_BINDING_2D};
 #[cfg(va)]
@@ -89,6 +89,12 @@ impl Landing {
     /// place, and consumes nothing.
     pub fn wait(&self) {
         drop(self.landed_guard());
+    }
+
+    /// Whether the job landed a picture that passes `test`.
+    #[cfg(test)]
+    pub fn picture_landed(&self, test: impl FnOnce(&Picture) -> bool) -> bool {
+        matches!(&*self.lock(), Stage::Landed(Outcome::Picture(picture)) if test(picture))
     }
 
     fn landed_guard(&self) -> MutexGuard<'_, Stage> {

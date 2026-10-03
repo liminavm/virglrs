@@ -15,6 +15,9 @@
 #   matches what goiaba builds against, because cros-libva gates API on the version it reads.
 # - a libEGL, which `build.rs` only checks for. An empty file is enough.
 #
+# dav1d is not even that: its build script would ask pkg-config for a Linux libdav1d, and is told
+# instead to link one by name, which nothing does.
+#
 # bindgen is told the target is glibc and freestanding. There is no Linux sysroot here, and clang's
 # own headers send a musl target to the system's `stddef.h`; libva needs nothing beyond what a
 # freestanding compiler ships.
@@ -59,4 +62,6 @@ exec env \
     CROS_LIBVA_H_PATH="$OUT/include" \
     BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl="--target=aarch64-unknown-linux-gnu -ffreestanding" \
     EGL_LIB_DIR="$OUT/egl" \
+    SYSTEM_DEPS_DAV1D_NO_PKG_CONFIG=1 \
+    SYSTEM_DEPS_DAV1D_LIB=dav1d \
     cargo clippy --lib --tests --target "$TARGET" "$@" -- -D warnings

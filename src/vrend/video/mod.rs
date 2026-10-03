@@ -25,6 +25,7 @@ pub mod h265_slice;
 pub mod pending;
 #[cfg(not(va))]
 mod session;
+mod software;
 #[cfg(va)]
 mod vaapi;
 pub mod vp9;
@@ -47,7 +48,7 @@ use super::journal::Retained;
 use super::proto::{Format, VideoBuffer, VideoBufferHandle, VideoCodec, VideoCodecHandle};
 use super::resource::{self, Texture};
 use crate::budget::{Charge, Classic};
-use crate::decode::{self, Picture, PixelFormat};
+use crate::decode::{self, PixelFormat};
 use crate::surface::Held;
 
 /// Told about the host decoder's work, for an embedder that wants to know when the guest is
@@ -614,6 +615,123 @@ impl std::ops::Deref for Bitstream {
 /// session.
 struct Av1 {
     obu: av1::ObuState<Owed>,
+    route: Route,
+}
+
+impl Av1 {
+    /// An AV1 codec on a host with or without AV1 silicon.
+    fn new(hardware: bool) -> Av1 {
+        let route = if hardware { Route::Hardware(History::default()) } else { Route::Software };
+        Av1 { obu: av1::ObuState::new(), route }
+    }
+}
+
+/// Which decoder an AV1 codec's units go to.
+///
+/// Every unit goes through [`Route::engine`], in submission order, so the history and the choice
+/// are decided in one place. Neither way out of the hardware is recoverable: a host with no AV1
+/// silicon never gains any, and a stream that used super-resolution once will use it again.
+enum Route {
+    /// No AV1 silicon: dav1d decodes the whole stream, from the codec's first unit.
+    Software,
+    /// The host's decoder, with the units since the last shown key frame kept for a switch.
+    Hardware(History),
+    /// Switched to dav1d at a super-resolution frame.
+    Switched,
+}
+
+/// How much history is kept before a switch is given up on. A stream that runs this long between
+/// shown key frames is decoded on, with its super-resolution pictures withheld.
+const HISTORY_BYTES: usize = 64 << 20;
+
+/// The units since the last shown key frame.
+///
+/// A shown key frame refreshes every reference slot, so a decoder fed from it reaches the
+/// reference state the hardware one did. A decoder started anywhere else -- mid-GOP, or on a gap
+/// -- produces subtly wrong pictures while every header parses.
+#[derive(Default)]
+struct History {
+    units: Vec<Vec<u8>>,
+    bytes: usize,
+    /// The cap was hit since the last shown key frame, so the history no longer reaches it.
+    lost: bool,
+    /// Nothing on the wire bounds a GOP, so the bytes are counted while held.
+    charge: Option<Charge>,
+}
+
+impl History {
+    fn record(&mut self, shape: &Shape, unit: &[u8], budget: &Classic) {
+        if shape.key() {
+            *self = History::default();
+        }
+        if self.lost {
+            return;
+        }
+        if self.bytes + unit.len() > HISTORY_BYTES || self.units.try_reserve(1).is_err() {
+            *self = History { lost: true, ..History::default() };
+            return;
+        }
+        let mut kept = Vec::new();
+        if kept.try_reserve_exact(unit.len()).is_err() {
+            *self = History { lost: true, ..History::default() };
+            return;
+        }
+        kept.extend_from_slice(unit);
+        self.units.push(kept);
+        self.bytes += unit.len();
+        self.charge = Some(budget.charge("AV1 replay history", self.bytes as u64));
+    }
+}
+
+impl Route {
+    /// The engine for the next unit, which is `unit`.
+    fn engine(
+        &mut self,
+        handle: VideoCodecHandle,
+        shape: &Shape,
+        unit: &[u8],
+        budget: &Classic,
+    ) -> Engine {
+        let history = match self {
+            Route::Software | Route::Switched => return Engine::Software { replay: None },
+            Route::Hardware(history) => history,
+        };
+        history.record(shape, unit, budget);
+        if !shape.misreturned() {
+            return Engine::Host;
+        }
+        let Shape::Av1 { desc, .. } = shape else {
+            unreachable!("only an AV1 frame is misreturned");
+        };
+        // The refusals leave the codec on the hardware, which withholds the picture rather than
+        // showing it wrong.
+        let refused = if desc.seq.bit_depth != 8 {
+            Some(format!("the stream is {}-bit and the targets are 8-bit", desc.seq.bit_depth))
+        } else if history.lost || history.units.is_empty() {
+            Some("no history reaches back to a shown key frame".to_owned())
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            eprintln!(
+                "[virglrs] video codec {handle}: this host does not return AV1 super-resolution \
+                 frames correctly, and dav1d cannot take the stream over ({why})"
+            );
+            return Engine::Host;
+        }
+        let Route::Hardware(History { mut units, .. }) = std::mem::replace(self, Route::Switched)
+        else {
+            unreachable!("the history was borrowed from the hardware route");
+        };
+        // The unit that switches is the last one recorded, and is decoded as itself.
+        units.pop();
+        eprintln!(
+            "[virglrs] video codec {handle}: this host does not return AV1 super-resolution frames \
+             correctly; decoding the stream in software from here, replaying {} unit(s)",
+            units.len(),
+        );
+        Engine::Software { replay: Some(units) }
+    }
 }
 
 /// What a held AV1 frame still owes the guest, kept by the model alongside the frame itself.
@@ -719,10 +837,13 @@ enum Delivery<'a> {
 }
 
 impl<'a> Delivery<'a> {
-    fn of(shape: &Shape, target: Option<&'a Arc<Buffer>>) -> Delivery<'a> {
+    /// Only the host's decoder returns a picture wrongly: dav1d's is the frame.
+    fn of(shape: &Shape, target: Option<&'a Arc<Buffer>>, engine: &Engine) -> Delivery<'a> {
         match target {
             None => Delivery::Nowhere,
-            Some(buffer) if shape.misreturned() => Delivery::Withheld(buffer),
+            Some(buffer) if shape.misreturned() && matches!(engine, Engine::Host) => {
+                Delivery::Withheld(buffer)
+            }
             Some(buffer) => Delivery::To(buffer),
         }
     }
@@ -749,9 +870,10 @@ trait Submit {
         shape: &Shape,
         unit: &[u8],
         delivery: Delivery<'_>,
+        engine: Engine,
     ) -> Result<(), Refusal>;
 
-    /// Decode one unit and put the picture it produced where it belongs.
+    /// Decode one unit on `engine` and put the picture it produced where it belongs.
     ///
     /// `target` is `None` for a unit decoded for its reference value alone.
     fn submit(
@@ -760,9 +882,26 @@ trait Submit {
         shape: &Shape,
         unit: &[u8],
         target: Option<&Arc<Buffer>>,
+        engine: Engine,
     ) -> Result<(), Refusal> {
-        self.decode(handle, shape, unit, Delivery::of(shape, target))
+        let delivery = Delivery::of(shape, target, &engine);
+        self.decode(handle, shape, unit, delivery, engine)
     }
+}
+
+/// Which decoder a unit goes to.
+///
+/// Chosen on the render thread, by [`Route`], because what the target is told depends on it: a
+/// picture the host's decoder returns wrongly is withheld, and the same frame from dav1d is
+/// delivered.
+#[derive(Debug, PartialEq)]
+enum Engine {
+    Host,
+    /// dav1d. `replay` is `Some` on the unit that switches a codec to it mid-stream, carrying the
+    /// units it has to be brought up to date with.
+    Software {
+        replay: Option<Vec<Vec<u8>>>,
+    },
 }
 
 /// The half of a decode that differs by host decoder: what one unit carries to the decode
@@ -793,7 +932,55 @@ trait Backend: Default {
         handle: VideoCodecHandle,
         unit: &Self::Unit,
         phases: &mut pending::Phases,
-    ) -> Option<Picture>;
+    ) -> Option<decode::Picture>;
+}
+
+/// A decoded picture, from the host's decoder or from dav1d.
+pub enum Picture {
+    Host(decode::Picture),
+    Software(software::Picture),
+}
+
+impl Picture {
+    /// Map the picture's planes for reading. `None` if the host's decoder refuses the lock.
+    pub fn lock(&self) -> Option<Locked<'_>> {
+        match self {
+            Picture::Host(picture) => picture.lock().map(Locked::Host),
+            Picture::Software(picture) => Some(Locked::Software(picture)),
+        }
+    }
+
+    /// Plane `index` as an image the GPU can copy from, for a host picture that has one.
+    #[cfg(va)]
+    pub fn image(&self, index: usize) -> Option<decode::ImagedPlane<'_>> {
+        match self {
+            Picture::Host(picture) => picture.image(index),
+            Picture::Software(_) => None,
+        }
+    }
+}
+
+/// A picture whose planes are readable for as long as this value lives.
+pub enum Locked<'a> {
+    Host(decode::Locked<'a>),
+    Software(&'a software::Picture),
+}
+
+impl Locked<'_> {
+    pub fn plane_count(&self) -> usize {
+        match self {
+            Locked::Host(locked) => locked.plane_count(),
+            Locked::Software(picture) => picture.plane_count(),
+        }
+    }
+
+    /// One plane, or `None` past the end.
+    pub fn plane(&self, index: usize) -> Option<decode::Plane<'_>> {
+        match self {
+            Locked::Host(locked) => locked.plane(index),
+            Locked::Software(picture) => picture.plane(index),
+        }
+    }
 }
 
 /// What an HEVC frame's backend input is built from: the descriptor, raw and read, and the
@@ -911,12 +1098,95 @@ impl Drop for Decoder {
 /// with a backend of its own.
 struct Job<U = <backend::Host as Backend>::Unit> {
     codec: VideoCodecHandle,
-    /// What the host's decoder is handed, in the backend's own terms.
-    unit: U,
+    /// What the decoder is handed.
+    unit: Work<U>,
     write: Write,
     landing: Arc<pending::Landing>,
     /// When the render thread sent it, for the time it spent queued.
     sent: std::time::Instant,
+}
+
+/// Which decoder a unit is for, and what it is handed.
+enum Work<U> {
+    /// The host's decoder, in the backend's own terms.
+    Host(U),
+    /// dav1d. See [`Engine::Software`].
+    Software(SoftwareUnit),
+}
+
+/// An AV1 temporal unit for dav1d.
+struct SoftwareUnit {
+    bytes: Vec<u8>,
+    /// The units since the last shown key frame, which bring a decoder started mid-stream up to
+    /// the reference state the hardware one reached. `Some` only on the unit that switches.
+    replay: Option<Vec<Vec<u8>>>,
+    /// The layout the target wants, or `None` for a unit with no target.
+    pixels: Option<PixelFormat>,
+}
+
+/// What a codec's decode thread keeps for dav1d.
+#[derive(Default)]
+enum Software {
+    /// No unit has asked for it.
+    #[default]
+    Idle,
+    Running(software::Decoder),
+    /// It could not be started. A stream that needs it decodes nothing from here: starting it
+    /// later, mid-stream, would decode subtly wrong pictures while every header parses.
+    Failed,
+}
+
+impl Software {
+    fn decode(&mut self, handle: VideoCodecHandle, unit: &SoftwareUnit) -> Option<Picture> {
+        if matches!(self, Software::Idle) || unit.replay.is_some() {
+            *self = Software::start(handle, unit.replay.as_deref().unwrap_or_default());
+        }
+        let Software::Running(decoder) = self else {
+            return None;
+        };
+        let decoded = match decoder.decode(&unit.bytes) {
+            Ok(Some(decoded)) => decoded,
+            // A unit with no picture to show for it: decoded for later frames to predict from.
+            Ok(None) => return None,
+            Err(why) => {
+                eprintln!("[virglrs] video codec {handle}: dav1d decoded no picture ({why})");
+                return None;
+            }
+        };
+        let pixels = unit.pixels?;
+        match software::Picture::new(&decoded, pixels) {
+            Ok(picture) => Some(Picture::Software(picture)),
+            Err(why) => {
+                eprintln!(
+                    "[virglrs] video codec {handle}: dav1d decoded {why}, which no decode target \
+                     takes; the target keeps what it held"
+                );
+                None
+            }
+        }
+    }
+
+    /// Open dav1d and feed it `replay`, whose pictures were delivered already.
+    fn start(handle: VideoCodecHandle, replay: &[Vec<u8>]) -> Software {
+        let mut decoder = match software::Decoder::open() {
+            Ok(decoder) => decoder,
+            Err(why) => {
+                eprintln!("[virglrs] video codec {handle}: dav1d would not open ({why})");
+                return Software::Failed;
+            }
+        };
+        for (index, unit) in replay.iter().enumerate() {
+            if let Err(why) = decoder.decode(unit) {
+                eprintln!(
+                    "[virglrs] video codec {handle}: dav1d could not replay unit {index} of {} \
+                     ({why}); the stream decodes nothing from here",
+                    replay.len(),
+                );
+                return Software::Failed;
+            }
+        }
+        Software::Running(decoder)
+    }
 }
 
 /// What the decode thread does with the picture.
@@ -941,9 +1211,10 @@ fn decode_thread<B: Backend>(
     observer: Option<&dyn DecodeObserver>,
 ) {
     let mut host = B::default();
+    let mut software = Software::default();
     for job in queue {
         let mut phases = pending::Phases { queued: job.sent.elapsed(), ..Default::default() };
-        let outcome = decode_one(&mut host, &job, &mut phases);
+        let outcome = decode_one(&mut host, &mut software, &job, &mut phases);
         job.landing.land(outcome);
         times.record_decode(phases);
         if let Some(observer) = observer {
@@ -965,11 +1236,19 @@ impl Drop for Timed<'_> {
 /// is logged, the target keeps what it held, and the next frame decodes as usual.
 fn decode_one<B: Backend>(
     host: &mut B,
+    software: &mut Software,
     job: &Job<B::Unit>,
     phases: &mut pending::Phases,
 ) -> pending::Outcome {
     let handle = job.codec;
-    let Some(picture) = host.decode(handle, &job.unit, phases) else {
+    let picture = match &job.unit {
+        Work::Host(unit) => host.decode(handle, unit, phases).map(Picture::Host),
+        Work::Software(unit) => {
+            let _timed = Timed(std::time::Instant::now(), &mut phases.session);
+            software.decode(handle, unit)
+        }
+    };
+    let Some(picture) = picture else {
         return pending::Outcome::Nothing;
     };
     match &job.write {
@@ -1007,7 +1286,7 @@ fn write_planes(
     surface: &crate::surface::Surface,
     geometry: &[Option<resource::PlaneGeometry>],
     layout: TargetFormat,
-    picture: &decode::Locked<'_>,
+    picture: &Locked<'_>,
 ) -> usize {
     let count = picture.plane_count().min(geometry.len());
     let mut written = 0;
@@ -1045,6 +1324,8 @@ struct Around<'a> {
     unsettled: &'a pending::Unsettled,
     buffers: &'a Buffers,
     importer: Option<&'a Importer>,
+    /// Where an AV1 codec's replay history is charged.
+    budget: &'a Classic,
 }
 
 /// The host's decoder, as the render thread sees it: a codec's decode thread, and what a job
@@ -1067,6 +1348,7 @@ impl Submit for HostDecoder<'_> {
         shape: &Shape,
         unit: &[u8],
         delivery: Delivery<'_>,
+        engine: Engine,
     ) -> Result<(), Refusal> {
         let unserved = || Refusal::Unsupported("no CoreVideo layout for that decode target");
         let destination = match delivery.target() {
@@ -1089,20 +1371,20 @@ impl Submit for HostDecoder<'_> {
             _ => (Write::Nothing, None),
         };
         let pixels = destination.map(|(_, pixels)| pixels);
+        let work = match engine {
+            Engine::Host => Work::Host(backend::Host::unit(
+                &Lookup { name: self.codec, buffers: self.buffers, importer: self.importer },
+                shape,
+                unit,
+                delivery,
+                pixels,
+            )),
+            Engine::Software { replay } => {
+                Work::Software(SoftwareUnit { bytes: unit.to_vec(), replay, pixels })
+            }
+        };
         self.decoder.send(
-            Job {
-                codec: handle,
-                unit: backend::Host::unit(
-                    &Lookup { name: self.codec, buffers: self.buffers, importer: self.importer },
-                    shape,
-                    unit,
-                    delivery,
-                    pixels,
-                ),
-                write,
-                landing,
-                sent: std::time::Instant::now(),
-            },
+            Job { codec: handle, unit: work, write, landing, sent: std::time::Instant::now() },
             self.unsettled,
         );
         if let Some(buffer) = synchronous {
@@ -1185,6 +1467,7 @@ impl Av1 {
         handle: VideoCodecHandle,
         descriptor: &[u8],
         fallback: (u32, u32),
+        budget: &Classic,
     ) -> Result<Shape, Refusal> {
         let desc = match av1::FrameDesc::read(descriptor) {
             Ok(desc) => desc,
@@ -1208,7 +1491,8 @@ impl Av1 {
         // The held frame first, under its own shape: decode order is preserved, and it is this
         // descriptor's reference map that makes its refresh exact.
         if let Some((unit, owed)) = self.obu.flush_held(&desc) {
-            host.submit(handle, &owed.shape, &unit.bytes, owed.target.as_ref())?;
+            let engine = self.route.engine(handle, &owed.shape, &unit.bytes, budget);
+            host.submit(handle, &owed.shape, &unit.bytes, owed.target.as_ref(), engine)?;
         }
 
         let (fallback_width, fallback_height) = fallback;
@@ -1226,6 +1510,7 @@ impl Av1 {
         shape: &Shape,
         tiles: &[u8],
         buffer: Arc<Buffer>,
+        budget: &Classic,
     ) -> Result<(), Refusal> {
         let Shape::Av1 { desc, .. } = shape else {
             unreachable!("an AV1 codec's frames carry an AV1 shape");
@@ -1235,7 +1520,10 @@ impl Av1 {
             // Nothing emitted: the serializer is holding this frame until the next descriptor
             // says which slot the guest stored it in. Its target is held with it.
             Ok(None) => Ok(()),
-            Ok(Some(bytes)) => host.submit(handle, shape, &bytes, Some(&buffer)),
+            Ok(Some(bytes)) => {
+                let engine = self.route.engine(handle, shape, &bytes, budget);
+                host.submit(handle, shape, &bytes, Some(&buffer), engine)
+            }
             // A frame was built while one was still held: two temporal units would reach the
             // decoder as one sample and lose a picture, which is what the hold exists to
             // prevent. It cannot happen -- every descriptor flushes first -- but a broken model
@@ -1251,7 +1539,7 @@ impl Av1 {
 impl Codec {
     /// The host's decoder for this codec's frames.
     fn host<'a>(&'a mut self, around: Around<'a>) -> HostDecoder<'a> {
-        let Around { gl, unsettled, buffers, importer } = around;
+        let Around { gl, unsettled, buffers, importer, .. } = around;
         let codec = self.kind.name();
         HostDecoder { gl, buffers, importer, decoder: &mut self.decoder, codec, unsettled }
     }
@@ -1277,7 +1565,7 @@ impl Codec {
             codec: "AV1",
             unsettled: env.unsettled,
         };
-        let next = av1.advance(&mut host, handle, descriptor, (*width, *height))?;
+        let next = av1.advance(&mut host, handle, descriptor, (*width, *height), env.budget)?;
         let (accumulated, shape) = frame.open_on(target)?;
         accumulated.append(bitstream, env.budget)?;
         *shape = Some(next);
@@ -1296,9 +1584,9 @@ impl Codec {
         let Codec { kind: Kind::Av1(av1), decoder, .. } = self else {
             unreachable!("only an AV1 codec ends an AV1 frame");
         };
-        let Around { gl, unsettled, buffers, importer } = around;
+        let Around { gl, unsettled, buffers, importer, budget } = around;
         let mut host = HostDecoder { gl, buffers, importer, decoder, codec: "AV1", unsettled };
-        av1.end(&mut host, handle, shape, tiles, buffer)
+        av1.end(&mut host, handle, shape, tiles, buffer, budget)
     }
 }
 
@@ -1416,11 +1704,15 @@ pub fn composite_target_backable(features: &Features, format: Format) -> bool {
 
 /// The profiles this host advertises decode for, in the order the capset lists them.
 ///
-/// Two conditions, and both are necessary. The host must have the silicon, and this build must
+/// Two conditions, and both are necessary. The host must have a decoder, and this build must
 /// have the leg: a profile advertised without a decode path is a guest choosing hardware decode
 /// and having its context poisoned by the first frame, which is strictly worse for it than never
 /// having been offered the choice. So the list grows as the legs land, and the capset and the
 /// handler read it from here rather than each keeping their own idea of what is served.
+///
+/// AV1 is always offered: a host without the silicon decodes it with dav1d. That is slower than
+/// the guest's own dav1d by nothing but the copy into its target, and it keeps the stream on the
+/// host, where an embedder can see that a guest is playing video.
 pub fn advertised(support: Option<&decode::Support>) -> Vec<Profile> {
     let Some(support) = support else {
         return Vec::new();
@@ -1441,7 +1733,7 @@ pub fn advertised(support: Option<&decode::Support>) -> Vec<Profile> {
         Profile::HevcMain,
     ]
     .into_iter()
-    .filter(|profile| support.decodes(profile.codec()))
+    .filter(|profile| *profile == Profile::Av1Main || support.decodes(profile.codec()))
     .collect()
 }
 
@@ -1501,7 +1793,16 @@ impl Video {
         }
         let kind = match profile {
             Profile::Vp9Profile0 => Kind::Vp9,
-            Profile::Av1Main => Kind::Av1(Box::new(Av1 { obu: av1::ObuState::new() })),
+            Profile::Av1Main => {
+                let hardware = support.is_some_and(|support| support.decodes(decode::Codec::Av1));
+                if !hardware {
+                    eprintln!(
+                        "[virglrs] video codec {handle}: no AV1 silicon on this host; decoding \
+                         in software"
+                    );
+                }
+                Kind::Av1(Box::new(Av1::new(hardware)))
+            }
             _ => match (h264::H264Profile::of(profile), h265::HevcProfile::of(profile)) {
                 (Some(h264), _) => Kind::H264(h264),
                 (_, Some(hevc)) => {
@@ -1776,12 +2077,14 @@ impl Video {
     /// END_FRAME: decode the accumulated picture and copy it into the target.
     ///
     /// This is where the frame happens. Everything before it only accumulated.
+    #[expect(clippy::too_many_arguments, reason = "END_FRAME reaches most of the renderer")]
     pub fn end_frame(
         &mut self,
         gl: &Gl,
         features: &Features,
         unsettled: &pending::Unsettled,
         importer: Option<&Importer>,
+        budget: &Classic,
         handle: VideoCodecHandle,
         target: VideoBufferHandle,
     ) -> Result<(), Refusal> {
@@ -1826,15 +2129,15 @@ impl Video {
         // AV1's unit is synthesized from the descriptor rather than re-framed from what the
         // guest sent, and may be held rather than submitted at all.
         if let Shape::Av1 { .. } = shape {
-            let around = Around { gl, unsettled, buffers, importer };
+            let around = Around { gl, unsettled, buffers, importer, budget };
             return codec.end_av1_frame(around, handle, &shape, &bitstream, buffer);
         }
         let Some(unit) = shape.access_unit(bitstream.into_bytes()) else {
             eprintln!("[virglrs] video codec {handle}: the access unit is not Annex-B framed");
             return Err(Refusal::HostRefusedFrame);
         };
-        let around = Around { gl, unsettled, buffers, importer };
-        codec.host(around).submit(handle, &shape, &unit, Some(&buffer))
+        let around = Around { gl, unsettled, buffers, importer, budget };
+        codec.host(around).submit(handle, &shape, &unit, Some(&buffer), Engine::Host)
     }
 }
 
@@ -2061,8 +2364,9 @@ mod tests {
         }
     }
 
-    /// A profile is advertised only where the silicon and the leg agree, and a host that was
-    /// never asked for video advertises nothing at all.
+    /// A profile is advertised only where the silicon and the leg agree -- AV1 always, since
+    /// dav1d decodes it where the silicon does not -- and a host that was never asked for video
+    /// advertises nothing at all.
     ///
     /// Written against the rule rather than against a list, because the list is a function of
     /// the silicon under the test and a machine without VP9 or H.264 is not a failing build.
@@ -2072,12 +2376,10 @@ mod tests {
         let support = crate::decode::Support::probe();
         let list = advertised(Some(&support));
 
-        assert!(list.iter().all(|profile| support.decodes(profile.codec())));
-        for profile in
-            [Profile::Vp9Profile0, Profile::H264Main, Profile::HevcMain, Profile::Av1Main]
-        {
+        for profile in [Profile::Vp9Profile0, Profile::H264Main, Profile::HevcMain] {
             assert_eq!(list.contains(&profile), support.decodes(profile.codec()));
         }
+        assert!(list.contains(&Profile::Av1Main));
     }
 
     /// A frame's shape answers for its own codec: VP9 is handed on as it arrived, H.264 is
@@ -2170,7 +2472,7 @@ mod tests {
             _handle: VideoCodecHandle,
             _unit: &(),
             _phases: &mut pending::Phases,
-        ) -> Option<Picture> {
+        ) -> Option<decode::Picture> {
             None
         }
     }
@@ -2194,7 +2496,7 @@ mod tests {
         for landing in &landings {
             jobs.send(Job {
                 codec: VideoCodecHandle(1),
-                unit: (),
+                unit: Work::Host(()),
                 write: Write::Nothing,
                 landing: Arc::clone(landing),
                 sent: std::time::Instant::now(),
@@ -2216,7 +2518,7 @@ mod tests {
         let landing = pending::Landing::new();
         jobs.send(Job {
             codec: VideoCodecHandle(1),
-            unit: (),
+            unit: Work::Host(()),
             write: Write::Nothing,
             landing: Arc::clone(&landing),
             sent: std::time::Instant::now(),
@@ -2238,7 +2540,7 @@ mod tests {
     /// A decoder that decodes nothing and records what it was handed, in order.
     #[derive(Default)]
     struct Recorder {
-        units: Vec<(Vec<u8>, Went)>,
+        units: Vec<(Vec<u8>, Went, Engine)>,
     }
 
     impl Submit for Recorder {
@@ -2248,18 +2550,23 @@ mod tests {
             _shape: &Shape,
             unit: &[u8],
             delivery: Delivery<'_>,
+            engine: Engine,
         ) -> Result<(), Refusal> {
             let went = match delivery {
                 Delivery::To(buffer) => Went::To(Arc::as_ptr(buffer)),
                 Delivery::Withheld(buffer) => Went::Withheld(Arc::as_ptr(buffer)),
                 Delivery::Nowhere => Went::Nowhere,
             };
-            self.units.push((unit.to_vec(), went));
+            self.units.push((unit.to_vec(), went, engine));
             Ok(())
         }
     }
 
     const AV1_CODEC: VideoCodecHandle = VideoCodecHandle(3);
+
+    fn test_budget() -> Classic {
+        Classic::open(&crate::budget::Budget::with_cap(None, false))
+    }
 
     /// A decode target nothing is ever delivered into: the recorder only compares identities.
     fn av1_target() -> Arc<Buffer> {
@@ -2280,37 +2587,55 @@ mod tests {
         descriptor: &[u8],
         into: &Arc<Buffer>,
     ) -> Result<(), Refusal> {
-        let shape = av1.advance(host, AV1_CODEC, descriptor, (640, 360))?;
-        av1.end(host, AV1_CODEC, &shape, &[0xa5; 16], Arc::clone(into))
+        let budget = test_budget();
+        let shape = av1.advance(host, AV1_CODEC, descriptor, (640, 360), &budget)?;
+        av1.end(host, AV1_CODEC, &shape, &[0xa5; 16], Arc::clone(into), &budget)
+    }
+
+    /// A test frame's descriptor, in an 8-bit stream or a 10-bit one.
+    fn av1_desc(key: bool, show: bool, superres: bool, map: [u32; 8], ten_bit: bool) -> Vec<u8> {
+        let mut blob = av1::test_frame(key, show, superres, map);
+        if ten_bit {
+            av1::test_ten_bit(&mut blob);
+        }
+        blob
     }
 
     /// Fill all eight reference slots with live, distinct pictures -- a shown key frame and seven
     /// shown inter frames, each stored by the guest in a slot of its own -- so that the next frame
     /// meets the wall and is held. Returns the guest's reference map as that frame sees it.
-    fn av1_to_the_wall(av1: &mut Av1, host: &mut Recorder) -> [u32; 8] {
+    fn av1_to_the_wall(av1: &mut Av1, host: &mut Recorder, ten_bit: bool) -> [u32; 8] {
         let into = av1_target();
-        av1_frame(av1, host, &av1::test_frame(true, true, false, [0; 8]), &into)
+        av1_frame(av1, host, &av1_desc(true, true, false, [0; 8], ten_bit), &into)
             .expect("a key frame");
         for k in 1..8u32 {
             let map = std::array::from_fn(|i| (i as u32 + 1).min(k));
-            av1_frame(av1, host, &av1::test_frame(false, true, false, map), &into)
+            av1_frame(av1, host, &av1_desc(false, true, false, map, ten_bit), &into)
                 .expect("an inter frame");
         }
         assert_eq!(host.units.len(), 8, "every frame so far went out at once");
         std::array::from_fn(|i| i as u32 + 1)
     }
 
-    /// A super-resolution frame is submitted like any other, and only its picture is withheld.
+    /// The units a recorder saw, from `from` on, as dav1d would be handed them to catch up.
+    fn replay_of(host: &Recorder, from: usize, to: usize) -> Engine {
+        Engine::Software {
+            replay: Some(host.units[from..to].iter().map(|u| u.0.clone()).collect()),
+        }
+    }
+
+    /// A super-resolution frame on a host with AV1 silicon switches the stream to dav1d, which
+    /// is first fed every unit since the shown key frame, and its picture is delivered.
     ///
-    /// The host reconstructs such a frame correctly and returns its picture wrong, so skipping
-    /// the submit corrupts every later frame predicting from it. And the frame the serializer is
-    /// holding is flushed by the *next* descriptor whatever that frame is: refusing there drops a
-    /// frame that was never super-resolution at all.
+    /// The host's reconstruction of such a frame is right and its picture wrong, so only dav1d
+    /// can deliver it; and a dav1d started on the frame itself, without the units before it,
+    /// would predict from nothing.
     #[test]
-    fn a_superres_frame_is_decoded_and_only_its_delivery_withheld() {
-        let mut av1 = Av1 { obu: av1::ObuState::new() };
+    fn a_superres_frame_switches_the_stream_to_software() {
+        let mut av1 = Av1::new(true);
         let mut host = Recorder::default();
-        let map = av1_to_the_wall(&mut av1, &mut host);
+        let map = av1_to_the_wall(&mut av1, &mut host, false);
+        assert!(host.units.iter().all(|u| u.2 == Engine::Host), "the hardware decodes until then");
 
         // A hidden frame at the wall is held for the next descriptor to settle its slot.
         let held = av1_target();
@@ -2318,36 +2643,33 @@ mod tests {
             .expect("a hidden inter frame");
         assert_eq!(host.units.len(), 8, "the hidden frame is held, not submitted");
 
-        // The guest stored it over its oldest picture; the next frame is super-resolution.
+        // The guest stored it over its oldest picture; the next frame is super-resolution. The
+        // held frame goes out ahead of it, on the hardware.
         let mut map = map;
         map[0] = 9;
         let sr = av1_target();
-        let shape = av1
-            .advance(&mut host, AV1_CODEC, &av1::test_frame(false, true, true, map), (640, 360))
-            .expect("a super-resolution descriptor is accepted");
-        assert_eq!(host.units.len(), 9, "the held frame went out ahead of it");
-        assert_eq!(host.units[8].1, Went::To(Arc::as_ptr(&held)), "and was delivered");
+        av1_frame(&mut av1, &mut host, &av1::test_frame(false, true, true, map), &sr)
+            .expect("a super-resolution frame");
+        assert_eq!(host.units.len(), 10);
+        assert_eq!(host.units[8].1, Went::To(Arc::as_ptr(&held)), "the held frame delivers");
+        assert_eq!(host.units[8].2, Engine::Host, "from the hardware");
+        assert_eq!(host.units[9].1, Went::To(Arc::as_ptr(&sr)), "and so does this one");
+        assert_eq!(host.units[9].2, replay_of(&host, 0, 9), "from dav1d, caught up from the key");
 
-        av1.end(&mut host, AV1_CODEC, &shape, &[0xa5; 16], Arc::clone(&sr))
-            .expect("the super-resolution frame ends");
-        assert_eq!(host.units.len(), 10, "the super-resolution frame is submitted");
-        assert_eq!(host.units[9].1, Went::Withheld(Arc::as_ptr(&sr)), "and its picture withheld");
-
-        // It went out at the wall, shown, so a copy claiming its slot follows once the guest
-        // stores it. That copy is decoded for its reference alone, super-resolution or not.
+        // Everything after it stays in software, slot claims included.
         map[1] = 10;
         av1_frame(&mut av1, &mut host, &av1::test_frame(false, true, false, map), &av1_target())
             .expect("the frame after it");
         assert_eq!(host.units[10].1, Went::Nowhere, "the slot claim delivers nothing");
+        assert!(host.units[10..].iter().all(|u| u.2 == Engine::Software { replay: None }));
     }
 
-    /// A super-resolution frame the serializer held is still withheld when it finally goes out,
-    /// a descriptor later and under a frame that is not super-resolution.
+    /// A held super-resolution frame switches the stream when it goes out, a descriptor later.
     #[test]
-    fn a_held_superres_frame_is_withheld_when_it_goes_out() {
-        let mut av1 = Av1 { obu: av1::ObuState::new() };
+    fn a_held_superres_frame_switches_when_it_goes_out() {
+        let mut av1 = Av1::new(true);
         let mut host = Recorder::default();
-        let mut map = av1_to_the_wall(&mut av1, &mut host);
+        let mut map = av1_to_the_wall(&mut av1, &mut host, false);
 
         let held = av1_target();
         av1_frame(&mut av1, &mut host, &av1::test_frame(false, false, true, map), &held)
@@ -2359,8 +2681,148 @@ mod tests {
         av1_frame(&mut av1, &mut host, &av1::test_frame(false, true, false, map), &next)
             .expect("the frame after it");
         assert_eq!(host.units.len(), 10);
-        assert_eq!(host.units[8].1, Went::Withheld(Arc::as_ptr(&held)), "held, then withheld");
+        assert_eq!(host.units[8].1, Went::To(Arc::as_ptr(&held)), "held, then delivered");
+        assert_eq!(host.units[8].2, replay_of(&host, 0, 8));
         assert_eq!(host.units[9].1, Went::To(Arc::as_ptr(&next)), "the next frame delivers");
+        assert_eq!(host.units[9].2, Engine::Software { replay: None });
+    }
+
+    /// Where dav1d cannot take the stream over, a super-resolution frame is still decoded on the
+    /// hardware, and only its picture is withheld.
+    ///
+    /// The host reconstructs such a frame correctly and returns its picture wrong, so skipping
+    /// the submit corrupts every later frame predicting from it. And the frame the serializer is
+    /// holding is flushed by the *next* descriptor whatever that frame is: refusing there drops a
+    /// frame that was never super-resolution at all.
+    #[test]
+    fn a_superres_frame_dav1d_cannot_take_is_decoded_and_only_its_delivery_withheld() {
+        // A 10-bit stream, which no target takes from dav1d.
+        let mut av1 = Av1::new(true);
+        let mut host = Recorder::default();
+        let map = av1_to_the_wall(&mut av1, &mut host, true);
+
+        let held = av1_target();
+        av1_frame(&mut av1, &mut host, &av1_desc(false, false, false, map, true), &held)
+            .expect("a hidden inter frame");
+        let mut map = map;
+        map[0] = 9;
+        let sr = av1_target();
+        av1_frame(&mut av1, &mut host, &av1_desc(false, true, true, map, true), &sr)
+            .expect("a super-resolution frame");
+        assert_eq!(host.units.len(), 10, "the super-resolution frame is submitted");
+        assert_eq!(host.units[8].1, Went::To(Arc::as_ptr(&held)), "the held frame delivers");
+        assert_eq!(host.units[9].1, Went::Withheld(Arc::as_ptr(&sr)), "and its picture withheld");
+
+        // It went out at the wall, shown, so a copy claiming its slot follows once the guest
+        // stores it. That copy is decoded for its reference alone, super-resolution or not.
+        map[1] = 10;
+        av1_frame(&mut av1, &mut host, &av1_desc(false, true, false, map, true), &av1_target())
+            .expect("the frame after it");
+        assert_eq!(host.units[10].1, Went::Nowhere, "the slot claim delivers nothing");
+        assert!(host.units.iter().all(|u| u.2 == Engine::Host), "and nothing left the hardware");
+    }
+
+    /// A history that no longer reaches a shown key frame cannot start dav1d either.
+    #[test]
+    fn a_superres_frame_past_a_lost_history_is_withheld() {
+        let mut av1 = Av1::new(true);
+        let mut host = Recorder::default();
+        let mut map = av1_to_the_wall(&mut av1, &mut host, false);
+        let Route::Hardware(history) = &mut av1.route else {
+            panic!("a host with the silicon starts on it");
+        };
+        *history = History { lost: true, ..History::default() };
+
+        map[0] = 9;
+        let sr = av1_target();
+        av1_frame(&mut av1, &mut host, &av1::test_frame(false, true, true, map), &sr)
+            .expect("a super-resolution frame");
+        assert_eq!(host.units[8].1, Went::Withheld(Arc::as_ptr(&sr)));
+        assert_eq!(host.units[8].2, Engine::Host);
+    }
+
+    /// The history drops itself at the cap, and a shown key frame starts it again.
+    #[test]
+    fn the_replay_history_is_lost_at_its_cap_and_found_at_a_key_frame() {
+        let budget = test_budget();
+        let key = av1_shape(true);
+        let inter = av1_shape(false);
+        let mut history = History::default();
+        history.record(&key, &[1; 16], &budget);
+        history.record(&inter, &vec![2; HISTORY_BYTES], &budget);
+        assert!(history.lost && history.units.is_empty(), "over the cap, nothing is kept");
+        history.record(&inter, &[3; 16], &budget);
+        assert!(history.lost, "and an inter frame cannot bring it back");
+        history.record(&key, &[4; 16], &budget);
+        assert!(!history.lost && history.units == [vec![4; 16]], "a shown key frame does");
+    }
+
+    /// The shape of a shown frame, key or inter.
+    fn av1_shape(key: bool) -> Shape {
+        let blob = av1::test_frame(key, true, false, [0; 8]);
+        let desc = av1::FrameDesc::read(&blob).expect("a Main frame");
+        Shape::Av1 {
+            key: desc.starts_dpb(),
+            desc: Box::new(desc),
+            config: Vec::new(),
+            width: 640,
+            height: 360,
+        }
+    }
+
+    /// On a host with no AV1 silicon every unit goes to dav1d from the first, with nothing to
+    /// replay, and a super-resolution picture is delivered like any other.
+    #[test]
+    fn without_av1_silicon_every_unit_is_decoded_in_software() {
+        let mut av1 = Av1::new(false);
+        let mut host = Recorder::default();
+        let mut map = av1_to_the_wall(&mut av1, &mut host, false);
+        map[0] = 9;
+        let sr = av1_target();
+        av1_frame(&mut av1, &mut host, &av1::test_frame(false, true, true, map), &sr)
+            .expect("a super-resolution frame");
+        assert_eq!(host.units[8].1, Went::To(Arc::as_ptr(&sr)));
+        assert!(host.units.iter().all(|u| u.2 == Engine::Software { replay: None }));
+    }
+
+    /// The decode thread runs a software unit through dav1d, lands its picture for the target,
+    /// and reports it like any other -- which is what lets an embedder see AV1 playing on a host
+    /// with no AV1 silicon.
+    #[test]
+    fn the_decode_thread_decodes_and_reports_software_units() {
+        let stream = include_bytes!("testdata/testsrc-64x48.ivf");
+        let mut rest = &stream[32..];
+        let mut units = Vec::new();
+        while rest.len() >= 12 {
+            let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            units.push(rest[12..12 + len].to_vec());
+            rest = &rest[12 + len..];
+        }
+        let (jobs, queue) = std::sync::mpsc::sync_channel(units.len());
+        let landings: Vec<_> = units.iter().map(|_| pending::Landing::new()).collect();
+        for (bytes, landing) in units.into_iter().zip(&landings) {
+            let unit = SoftwareUnit { bytes, replay: None, pixels: Some(PixelFormat::Planar420) };
+            jobs.send(Job {
+                codec: VideoCodecHandle(1),
+                unit: Work::Software(unit),
+                write: Write::Keep,
+                landing: Arc::clone(landing),
+                sent: std::time::Instant::now(),
+            })
+            .expect("the queue has room for every unit");
+        }
+        drop(jobs);
+
+        let tally = Tally::default();
+        decode_thread::<Refuses>(queue, &pending::Unsettled::default(), Some(&tally));
+        assert_eq!(tally.0.load(std::sync::atomic::Ordering::Relaxed), 4, "one report per unit");
+        for landing in &landings {
+            assert!(
+                landing.picture_landed(|picture| matches!(picture, Picture::Software(p)
+                    if p.plane(0).is_some_and(|y| (y.width, y.height) == (64, 48)))),
+                "every unit lands a 64x48 picture from dav1d"
+            );
+        }
     }
 
     /// A codec the guest created has to survive into the journal, and stop existing when it is

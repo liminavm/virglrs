@@ -2212,6 +2212,7 @@ impl Context {
                     host.features,
                     host.unsettled,
                     importer.as_ref(),
+                    host.budget,
                     codec,
                     target,
                 );

@@ -795,6 +795,12 @@ pub fn test_frame(
     blob
 }
 
+/// Make a test descriptor's stream 10-bit.
+#[cfg(test)]
+pub fn test_ten_bit(blob: &mut [u8]) {
+    blob[at::BIT_DEPTH_IDX] = 1;
+}
+
 impl FrameDesc {
     /// Whether this frame re-seeds every reference slot.
     ///
