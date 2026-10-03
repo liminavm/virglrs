@@ -485,9 +485,6 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   it cannot phrase is not a result about the renderer, and recording its refusal as `failed=22`
   reported the renderer's answer to a question the harness had asked wrong.
 
-  **`vrend-av1.score` predates this and is stale.** It cannot be re-recorded here -- alface has no
-  AV1 silicon -- so it must be re-recorded on couve before it means anything again.
-
   `vrend-shm.score` is the workload with **no GPU client in it at all**: a GTK4 terminal run with
   `GSK_RENDERER=cairo`, `GDK_DEBUG=gl-disable` and `LIBGL_ALWAYS_SOFTWARE=1`, so its surface
   reaches the compositor as a `wl_shm` buffer. The client issues no GL, and the corpus is
@@ -581,26 +578,31 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   ./dump.sh vrend-h264
   ```
 
-  `vrend-av1.score` is 400 pictures across six clips, and it is **not scored on this host**: AV1
-  decode needs M3-or-later silicon, so a machine without it advertises no AV1 and the corpus
-  measures nothing on either leg. A change to what the sweep records therefore reaches it only
-  when someone re-records it on that machine: a bulk re-record here cannot include it, and it lags
-  the others until then. It is recorded and scored on the AV1 machine, against a rig
-  copied there rather than rebuilt: the bundles are self-contained after `make-rig.sh`, the two
-  renderer prefixes and the KosmicKrisp/epoxy prefixes are a few tens of MB, and only the guest
-  disk is large. What the copy does need is the prefixes' own dependencies present at the paths
-  they were linked against -- `install_name_tool -id` onto the new path so the replayer links
-  what is there, Homebrew's `vulkan-loader`, `dav1d` and `spirv-tools`, and the *same* `libLLVM`
-  the mesa prefix was built against, dropped beside it so `DYLD_LIBRARY_PATH` finds it ahead of
-  the other machine's.
+  `vrend-av1.score` is 400 pictures across six clips. **Which decoder scores it depends on the
+  host.** Without AV1 silicon both legs decode every unit with dav1d, so on alface the corpus is
+  scored like any other and the pins are dav1d's; both legs agree on every line. With the silicon
+  (M3 or later) both legs decode in VideoToolbox, and 8-bit AV1 is normatively exact, so the
+  hardware owes the same bytes: replaying these pins on couve is what checks it.
+
+  ```sh
+  ./vrend-replay.sh ../vm/captures/vrend-av1.bin --renderer rs --ctx 8 --expect fixtures/vrend-av1.score
+  ```
+
+  Couve runs a rig copied there rather than rebuilt: the bundles are self-contained after
+  `make-rig.sh`, the two renderer prefixes and the KosmicKrisp/epoxy prefixes are a few tens of
+  MB, and only the guest disk is large. What the copy does need is the prefixes' own dependencies
+  present at the paths they were linked against -- `install_name_tool -id` onto the new path so
+  the replayer links what is there, Homebrew's `vulkan-loader`, `dav1d` and `spirv-tools`, and the
+  *same* `libLLVM` the mesa prefix was built against, dropped beside it so `DYLD_LIBRARY_PATH`
+  finds it ahead of the other machine's.
 
   The clips are limina's own AV1 spike set (`spikes/av1-obu-serializer/clips`), which is what the
   serializer was developed against: baseline, global motion, tiles, low delay, aom pyramid, pan.
-  Two of the eight are deliberately left out. `superres` because **this build withholds
-  super-resolution pictures** -- it decodes the frames, but the hardware returns their pictures
-  wrongly and there is no software decoder here -- so it would diverge by design. `filmgrain` because its hardware decode **is not
-  reproducible run to run**: three consecutive decodes of the same file give three different
-  md5s, which is a golden that grades the weather.
+  Two of the eight are left out. `superres` was captured when its pictures were withheld; a host
+  with the silicon now switches that stream to dav1d at its first super-resolution frame, and a
+  corpus holding it, replayed on couve, is what would score the switch end to end. `filmgrain`
+  because its hardware decode **is not reproducible run to run**: three consecutive decodes of the
+  same file give three different md5s, which is a golden that grades the weather.
 
   **The reference decoder for AV1 is libaom, not dav1d.** `dav1ddec` tags its output
   `chroma-site=jpeg, colorimetry=bt709` where the VA path tags nothing, so `videoconvert` does
@@ -1296,8 +1298,8 @@ it does not distinguish them. Two attempts giving two *different* checksums for 
 header or User-Agent gets past it; it clears itself in minutes, and `-j 1` stays under it.
 VP9-TEST-VECTORS is on `storage.googleapis.com` and has none of this.
 
-**AV1 is not scored here**, for the reason `vrend-av1.score` is not: without M3-or-later silicon
-`vaav1dec` is not even an element. It belongs on the AV1 machine.
+**No AV1 suite has been run.** A host without AV1 silicon advertises AV1 and decodes it with
+dav1d, so `vaav1dec` exists in a guest on alface too, and either machine can run one.
 
 A leg is a whole boot — stock guest, all three suites, poweroff. Measured: about **6 minutes of
 decode** (VP9 55 s, HEVC 37 s, H.264 277 s — H.264 dominates, and 240 s of it is the two
@@ -1513,9 +1515,6 @@ average and 4096 the worst case. The score does not move with it, on either leg,
 `--expect` asserts. Pair timing runs on `--no-rebuild` too: the rebuild leg replays the API-door
 blob feed and the readbacks a second time, so its `n api` count on the transfers line is about
 double, and a pair that differs on the flag compares two different corpora.
-
-**`vrend-av1.score` is stale.** It predates scoring at the format's own bytes per texel and cannot
-be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
 
 **The census reads the memory, so an image's texels can escape it.** It hashes the allocation's
 pages, which is the whole of the truth for a buffer and for a LINEAR image, and none of it for an
