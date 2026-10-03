@@ -50,6 +50,33 @@ use crate::budget::{Charge, Classic};
 use crate::decode::{self, Picture, PixelFormat};
 use crate::surface::Held;
 
+/// Told about the host decoder's work, for an embedder that wants to know when the guest is
+/// decoding video at all -- limina keeps the host display awake while a guest plays one.
+///
+/// Installed by the embedder, like [`crate::metal::set_publisher`] and for the same reason: who
+/// wants to know is the embedder's business, and the crate only knows when a frame went through.
+pub trait DecodeObserver: Send + Sync {
+    /// The host decoder was handed one unit and is done with it, whatever came of it. A refused
+    /// or failed unit still counts: the guest is decoding either way. Called on the codec's
+    /// decode thread, once per unit, so it must be cheap and must not block.
+    fn decoded(&self);
+}
+
+static DECODE_OBSERVER: std::sync::RwLock<Option<Arc<dyn DecodeObserver>>> =
+    std::sync::RwLock::new(None);
+
+/// Install the observer every codec created from now on reports its decodes to, or take it out.
+///
+/// A codec keeps the observer it was created under, as a minted surface keeps its publisher, so
+/// the decode thread reads no global.
+pub fn set_decode_observer(observer: Option<Arc<dyn DecodeObserver>>) {
+    *DECODE_OBSERVER.write().unwrap_or_else(|e| e.into_inner()) = observer;
+}
+
+fn decode_observer() -> Option<Arc<dyn DecodeObserver>> {
+    DECODE_OBSERVER.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// `enum pipe_video_profile`, as virglrenderer numbers it.
 ///
 /// The numbers are written out because virglrenderer carries its own copy of mesa's enum and the
@@ -851,9 +878,10 @@ impl Decoder {
         let worker = self.worker.get_or_insert_with(|| {
             let (jobs, queue) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
             let times = unsettled.clone();
+            let observer = decode_observer();
             let thread = std::thread::Builder::new()
                 .name("virglrs-decode".into())
-                .spawn(move || decode_thread(queue, &times))
+                .spawn(move || decode_thread::<backend::Host>(queue, &times, observer.as_deref()))
                 .expect("spawning a codec's decode thread");
             Worker { jobs, thread }
         });
@@ -879,11 +907,12 @@ impl Drop for Decoder {
     }
 }
 
-/// One unit for the decode thread.
-struct Job {
+/// One unit for the decode thread. Generic over the unit only so a test can drive the thread
+/// with a backend of its own.
+struct Job<U = <backend::Host as Backend>::Unit> {
     codec: VideoCodecHandle,
     /// What the host's decoder is handed, in the backend's own terms.
-    unit: <backend::Host as Backend>::Unit,
+    unit: U,
     write: Write,
     landing: Arc<pending::Landing>,
     /// When the render thread sent it, for the time it spent queued.
@@ -906,13 +935,20 @@ enum Write {
     },
 }
 
-fn decode_thread(queue: std::sync::mpsc::Receiver<Job>, times: &pending::Unsettled) {
-    let mut host = backend::Host::default();
+fn decode_thread<B: Backend>(
+    queue: std::sync::mpsc::Receiver<Job<B::Unit>>,
+    times: &pending::Unsettled,
+    observer: Option<&dyn DecodeObserver>,
+) {
+    let mut host = B::default();
     for job in queue {
         let mut phases = pending::Phases { queued: job.sent.elapsed(), ..Default::default() };
         let outcome = decode_one(&mut host, &job, &mut phases);
         job.landing.land(outcome);
         times.record_decode(phases);
+        if let Some(observer) = observer {
+            observer.decoded();
+        }
     }
 }
 
@@ -927,9 +963,9 @@ impl Drop for Timed<'_> {
 
 /// Decode one unit on the decode thread. Every failure is the frame's and not the stream's: it
 /// is logged, the target keeps what it held, and the next frame decodes as usual.
-fn decode_one(
-    host: &mut backend::Host,
-    job: &Job,
+fn decode_one<B: Backend>(
+    host: &mut B,
+    job: &Job<B::Unit>,
     phases: &mut pending::Phases,
 ) -> pending::Outcome {
     let handle = job.codec;
@@ -2111,6 +2147,84 @@ mod tests {
         // Everything above is the reshaping, which is every host's.
         #[cfg(target_os = "macos")]
         assert!(matches!(av1.configuration(), crate::decode::Configuration::Av1c(_)));
+    }
+
+    /// A host decoder that refuses every unit, for driving the decode thread without one.
+    #[derive(Default)]
+    struct Refuses;
+
+    impl Backend for Refuses {
+        type Unit = ();
+
+        fn unit(
+            _lookup: &Lookup<'_>,
+            _shape: &Shape,
+            _bytes: &[u8],
+            _delivery: Delivery<'_>,
+            _pixels: Option<PixelFormat>,
+        ) {
+        }
+
+        fn decode(
+            &mut self,
+            _handle: VideoCodecHandle,
+            _unit: &(),
+            _phases: &mut pending::Phases,
+        ) -> Option<Picture> {
+            None
+        }
+    }
+
+    /// Counts what it is told.
+    #[derive(Default)]
+    struct Tally(std::sync::atomic::AtomicUsize);
+
+    impl DecodeObserver for Tally {
+        fn decoded(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Every unit the decode thread runs is reported, refused ones included -- a guest whose
+    /// frames the host cannot decode is still a guest playing video -- and each one still lands.
+    #[test]
+    fn the_decode_thread_reports_every_unit_it_runs() {
+        let (jobs, queue) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
+        let landings: Vec<_> = (0..3).map(|_| pending::Landing::new()).collect();
+        for landing in &landings {
+            jobs.send(Job {
+                codec: VideoCodecHandle(1),
+                unit: (),
+                write: Write::Nothing,
+                landing: Arc::clone(landing),
+                sent: std::time::Instant::now(),
+            })
+            .expect("the queue has room for three");
+        }
+        drop(jobs);
+
+        let tally = Tally::default();
+        decode_thread::<Refuses>(queue, &pending::Unsettled::default(), Some(&tally));
+        assert_eq!(tally.0.load(std::sync::atomic::Ordering::Relaxed), 3, "one report per unit");
+        assert!(landings.iter().all(|l| l.is_landed()), "and every unit still landed");
+    }
+
+    /// With no observer installed the thread runs as before.
+    #[test]
+    fn the_decode_thread_runs_without_an_observer() {
+        let (jobs, queue) = std::sync::mpsc::sync_channel(QUEUE_DEPTH);
+        let landing = pending::Landing::new();
+        jobs.send(Job {
+            codec: VideoCodecHandle(1),
+            unit: (),
+            write: Write::Nothing,
+            landing: Arc::clone(&landing),
+            sent: std::time::Instant::now(),
+        })
+        .expect("the queue has room");
+        drop(jobs);
+        decode_thread::<Refuses>(queue, &pending::Unsettled::default(), None);
+        assert!(landing.is_landed());
     }
 
     /// Where a fake decoder was told a unit's picture goes.
