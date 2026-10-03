@@ -12,6 +12,10 @@
 
 use crate::decode::{PixelFormat, Plane};
 
+/// How many times in a row dav1d may answer Again to both sending and taking before the unit is
+/// given up on.
+const STALLS: u32 = 64;
+
 /// A dav1d decoder, configured for one unit in and one picture out.
 pub struct Decoder(dav1d::Decoder);
 
@@ -46,13 +50,23 @@ impl Decoder {
         // dav1d keeps a reference to what it is given, so it gets its own copy.
         let mut sent = self.0.send_data(unit.to_vec(), None, None, None);
         // Again means a picture must be taken before the rest of the unit fits. Sending anything
-        // else before the pending data has gone is a panic in the binding, so it is drained here
-        // and nowhere else.
+        // else before the pending data has gone is a panic in the binding -- an abort, here -- so
+        // it is drained in this loop and nowhere else, and no way out of the loop leaves any
+        // behind. A stream that makes no progress is dropped rather than spun on.
+        let mut stalls = 0;
         while matches!(sent, Err(dav1d::Error::Again)) {
             match self.0.get_picture() {
-                Ok(taken) => picture = Some(taken),
-                Err(dav1d::Error::Again) => {}
-                Err(why) => return Err(why),
+                Ok(taken) => {
+                    picture = Some(taken);
+                    stalls = 0;
+                }
+                Err(dav1d::Error::Again) if stalls < STALLS => stalls += 1,
+                Err(why) => {
+                    // Drops the pending data, and the references with it: the stream is already
+                    // broken, and a later unit then fails until a key frame rather than aborting.
+                    self.0.flush();
+                    return Err(why);
+                }
             }
             sent = self.0.send_pending_data();
         }
@@ -381,6 +395,40 @@ mod tests {
             Some(expected),
             "no history, no picture"
         );
+    }
+
+    /// A unit broken partway through leaves the decoder able to take the next stream it is
+    /// given. The unit is the alt-ref one, four frames long.
+    #[test]
+    fn a_unit_that_fails_partway_does_not_poison_the_next() {
+        let units_of = units;
+        let units = units(HIDDEN);
+        let (busy, _) = units
+            .iter()
+            .enumerate()
+            .find(|(_, unit)| unit.len() > 200)
+            .expect("the alt-ref unit, four frames long");
+        let mut decoder = Decoder::open().expect("dav1d opens");
+        decoder.decode(units[0]).expect("the key frame decodes");
+        let whole = decoder.decode(units[busy]).expect("four frames in one unit decode");
+        assert!(whole.is_some(), "and give the last of their pictures");
+
+        // Corrupt the unit at every seventh byte, each time on a decoder that is mid-stream, then
+        // hand that decoder a fresh stream.
+        for at in (40..units[busy].len()).step_by(7) {
+            let mut decoder = Decoder::open().expect("dav1d opens");
+            decoder.decode(units[0]).expect("the key frame decodes");
+            let mut broken = units[busy].to_vec();
+            broken[at] ^= 0xff;
+            // Decoded or refused: either is an answer about the broken unit.
+            let _ = decoder.decode(&broken);
+            for (unit, expected) in units_of(STREAM).into_iter().zip(LIBAOM) {
+                let decoded = decoder.decode(unit).expect("a fresh stream decodes").unwrap();
+                let picture = Picture::new(&decoded, PixelFormat::Planar420).unwrap();
+                let planes: Vec<_> = (0..3).map(|i| picture.plane(i).unwrap()).collect();
+                assert_eq!(fnv(&planes), expected, "after a unit broken at byte {at}");
+            }
+        }
     }
 
     /// Bytes that are not AV1 are an error from the decoder, not a panic and not a picture.
