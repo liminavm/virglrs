@@ -162,8 +162,8 @@ invariants a port owes, none of which the C encodes as a type:
    the venus harness drives, so they are P2 infrastructure, not P5 work.
 6. **The VideoToolbox backend + AV1/H.264 bitstream synthesis (4.1k).** Ours
    already, well understood, and it maps cleanly onto `objc2` +
-   `objc2-video-toolbox` + `objc2-io-surface`. The C's dav1d fallback is not ported:
-   see P4.
+   `objc2-video-toolbox` + `objc2-io-surface`. The C's dav1d fallback is ported with
+   it: see P4.
 
 Crates that carry weight: `objc2` family (IOSurface, Metal, VideoToolbox, Mach
 ports). `u_format`'s table is already generated from Mesa's XML — port that
@@ -742,15 +742,28 @@ buildable throughout as the A-side reference.
   VideoToolbox decoders, without which every session create fails and the targets score empty
   while everything else looks clean.
 
-  **There is one decoder, and it is VideoToolbox.** The C carries a dav1d fallback entered
-  mid-stream for AV1 frames the hardware returns wrongly (super-resolution) and for a host with
-  no AV1 silicon at all. Neither is ported. A superres frame is decoded and its picture withheld:
-  the host's reconstruction is right and later frames predict from it, so only the delivery is
-  suppressed, and the target keeps what it held -- a stale picture is a lost frame, while a
-  delivered one is a wrong picture nothing reports. A host without the silicon advertises no
-  AV1, which leaves the stream on the guest's own dav1d -- better tested than ours, and the same place the C's stock tier leaves it. That also removes the one
-  thing that could break the two legs' equivalence for a reason that is not a bug: a switch to
-  a different decoder at a different unit.
+  **AV1 has a second decoder, dav1d, and no other codec does.** A host with no AV1 silicon
+  still advertises AV1 and decodes every unit with dav1d. The guest's own dav1d would do the
+  same work, but then the host never sees the stream, and an embedder that keeps the display
+  awake while a guest plays video needs to. A host with the silicon decodes in VideoToolbox
+  until the first super-resolution frame, whose picture the hardware returns wrongly, and then
+  switches the codec to dav1d for good.
+
+  The switch is the delicate part, and its rules are the C's. dav1d is first fed every unit
+  since the last *shown* key frame, because a decoder started mid-GOP produces subtly wrong
+  pictures while every header parses. Both decoders get the serializer's own temporal units, so
+  the serializer stays the one source of frame headers. dav1d outputs invisible frames, since a
+  hidden frame's target is otherwise never written and one picture per unit breaks. Where it
+  cannot take over -- a 10-bit stream, whose pictures no target takes, or a history past its
+  cap -- the frame is decoded on the hardware and only its picture withheld: the reconstruction
+  is right and later frames predict from it, and a stale picture is a lost frame where a
+  delivered one is a wrong picture nothing reports.
+
+  Which decoder runs is decided per unit on the render thread (`Route` in
+  `src/vrend/video/mod.rs`), because what the target is told depends on it, and dav1d itself
+  lives on the codec's decode thread beside the hardware session. Both legs make the same
+  choice at the same unit, so the switch does not break their equivalence: on a host with no
+  AV1 silicon the AV1 corpus is dav1d's on both legs, line for line.
 
   **VP9 is the only codec a stock guest can drive, and so it goes first.** Stock Fedora's
   mesa is built `-Dvideo-codecs=all_free` and its VA frontend enforces that
