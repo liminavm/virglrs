@@ -28,7 +28,7 @@ use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::shader;
 use super::tally;
 use super::transfer::{self, Info};
-use super::waiter::{self, Answer};
+use super::waiter::{self, Answer, Owed};
 use crate::config::Config;
 use crate::decode;
 use crate::guest_mem::{Iov, PixelSource};
@@ -1068,7 +1068,13 @@ impl Vrend {
     /// Retirement is queued behind the work rather than taken here, so this returns as soon as the
     /// fence is *taken* -- the caller is holding the renderer, and waiting under it is what made
     /// one heavy client slow down every other context.
-    pub fn fence_context(&mut self, ctx: ClassicCtx, ring: RingIdx, id: FenceId) {
+    pub fn fence_context(
+        &mut self,
+        ctx: ClassicCtx,
+        ring: RingIdx,
+        id: FenceId,
+        guest: &dyn Guest,
+    ) {
         let ctx = ctx.id();
         // With no waiter there is no queue to retire behind, so the fence is answered inline --
         // the way this renderer did before there was one. Taking a sync and dropping it unwaited
@@ -1077,9 +1083,11 @@ impl Vrend {
         if self.waiter.is_none() {
             pictures.iter().for_each(|p| p.wait());
             self.finish_contexts(&[ctx]);
+            self.answer_parked(guest);
             self.fences.retire_context(ctx, ring, id);
             return;
         }
+        let queries = self.queries_before_fence(Some(ctx), guest);
         let answer = self.take_fence(Some(ctx));
         if self.debug.enabled(super::debug::Switch::Fence) {
             eprintln!(
@@ -1090,7 +1098,7 @@ impl Vrend {
         }
         let ticket = self.in_flight_ticket(Some(ctx), &answer);
         let w = self.waiter.as_ref().expect("checked just above");
-        w.retire_context(pictures, answer, ticket, ctx, ring, id);
+        w.retire_context(Owed { pictures, fence: answer, ticket, queries }, ctx, ring, id);
     }
 
     /// Answer a present fence for work a classic context queued: make it true that the GL work has
@@ -1099,7 +1107,7 @@ impl Vrend {
     /// [`Self::fence_context`] with the ring taken away. The work waited for is the same -- one
     /// sync per GL queue that context could have drawn on -- and only who is told differs, because
     /// a present fence answers the VMM about a resource rather than the guest about a stream.
-    pub fn present_fence(&mut self, ctx: ClassicCtx, id: FenceId) {
+    pub fn present_fence(&mut self, ctx: ClassicCtx, id: FenceId, guest: &dyn Guest) {
         let ctx = ctx.id();
         // Same reasoning as `fence_context`: with no waiter there is no queue to retire behind, so
         // the work is finished inline rather than the fence being retired unwaited.
@@ -1107,16 +1115,18 @@ impl Vrend {
         if self.waiter.is_none() {
             pictures.iter().for_each(|p| p.wait());
             self.finish_contexts(&[ctx]);
+            self.answer_parked(guest);
             self.fences.retire_present(id);
             return;
         }
+        let queries = self.queries_before_fence(Some(ctx), guest);
         let answer = self.take_fence(Some(ctx));
         if self.debug.enabled(super::debug::Switch::Fence) {
             eprintln!("[virglrs] fence: present ctx={ctx:?} id={} answer={}", id.0, answer.name());
         }
         let ticket = self.in_flight_ticket(Some(ctx), &answer);
         let w = self.waiter.as_ref().expect("checked just above");
-        w.retire_present(pictures, answer, ticket, id);
+        w.retire_present(Owed { pictures, fence: answer, ticket, queries }, id);
     }
 
     /// Answer a fence on the legacy global ring, which names its context from outside.
@@ -1124,22 +1134,87 @@ impl Vrend {
     /// `on` is the context whose work the fence is for. `None` -- or a context this renderer does
     /// not have -- means it cannot be attributed to one, and the fence is answered by its place in
     /// the waiter's queue instead; see [`Self::take_fence`].
-    pub fn fence_global(&mut self, on: Option<ClassicCtx>, id: ClientFenceId) {
+    pub fn fence_global(&mut self, on: Option<ClassicCtx>, id: ClientFenceId, guest: &dyn Guest) {
         let on = on.map(ClassicCtx::id);
         let pictures = self.decodes_in_flight(on);
         if self.waiter.is_none() {
             pictures.iter().for_each(|p| p.wait());
             self.finish_all();
+            self.answer_parked(guest);
             self.fences.retire_global(id);
             return;
         }
+        let queries = self.queries_before_fence(on, guest);
         let answer = self.take_fence(on);
         if self.debug.enabled(super::debug::Switch::Fence) {
             eprintln!("[virglrs] fence: global id={} on={on:?} answer={}", id.0, answer.name());
         }
         let ticket = self.in_flight_ticket(on, &answer);
         let w = self.waiter.as_ref().expect("checked just above");
-        w.retire_global(pictures, answer, ticket, id);
+        w.retire_global(Owed { pictures, fence: answer, ticket, queries }, id);
+    }
+
+    /// Whether a fence about to be taken for `on` covers a query whose result is not written yet,
+    /// and so must hold until the render thread has answered it; see [`waiter::Pump`].
+    ///
+    /// Where nobody has promised to serve the pump, holding would hang the fence, so the work is
+    /// finished here and the queries answered now instead. That is correct but costs this thread
+    /// a GPU wait, which is what the waiter exists to avoid.
+    ///
+    /// A fence that names no context -- or one this renderer does not have -- covers everyone's
+    /// queries, as it covers everyone's work, and is always answered here: nothing it waits on
+    /// says the work has run.
+    fn queries_before_fence(&mut self, on: Option<ContextId>, guest: &dyn Guest) -> bool {
+        let unanswered = match on.and_then(|ctx| self.contexts.get(&ctx)) {
+            Some(ctx) => ctx.has_unanswered_queries(),
+            None => self.contexts.values().any(Context::has_unanswered_queries),
+        };
+        if !unanswered {
+            return false;
+        }
+        // Only a fence on a context we have is answered by syncs on its work; any other is
+        // `Ordered` (see `decide_fence`), and a poll after it could find the work still running.
+        let on = on.filter(|ctx| self.contexts.contains_key(ctx));
+        if on.is_some() && self.waiter.as_ref().is_some_and(|w| w.pump().subscribed()) {
+            return true;
+        }
+        match on {
+            Some(ctx) => self.finish_contexts(&[ctx]),
+            None => self.finish_all(),
+        }
+        self.answer_parked(guest);
+        false
+    }
+
+    /// Answer every parked query whose result is ready: `vrend_renderer_check_queries`.
+    fn answer_parked(&mut self, guest: &dyn Guest) {
+        let waiting: Vec<ContextId> = self
+            .contexts
+            .iter()
+            .filter(|(_, ctx)| ctx.has_unanswered_queries())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in waiting {
+            let (mut host, contexts) = self.split(id, guest);
+            if let Some(ctx) = contexts.get_mut(&id) {
+                ctx.answer_parked(&mut host);
+            }
+        }
+    }
+
+    /// [`crate::renderer::Renderer::poll`]: answer the parked queries the waiter is holding
+    /// fences for, and let those fences go.
+    pub fn poll(&mut self, guest: &dyn Guest) {
+        let Some(pump) = self.waiter.as_ref().map(|w| Arc::clone(w.pump())) else {
+            return;
+        };
+        pump.serve(|| self.answer_parked(guest));
+    }
+
+    /// [`crate::renderer::Renderer::poll_descriptor`]. `None` with no waiter: every fence is then
+    /// answered inline, and there is never anything to poll for.
+    pub fn poll_descriptor(&self) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+        self.waiter.as_ref().map(|w| w.pump().descriptor()).transpose()
     }
 
     /// [`crate::renderer::Renderer::settle_video`]: every decode thread idle, every picture
@@ -1735,6 +1810,185 @@ mod tests {
         assert!(v.cursor_contents(handle(3)).is_none(), "nothing holds this handle");
     }
 
+    /// A context with one timestamp query, whose result goes to sixteen bytes of guest pages, and
+    /// a recorder of the context fences that retire.
+    struct QueryRig {
+        // Before `retire`: the waiter retires through it as it drains, so it must go first.
+        v: Vrend,
+        retire: crate::fence::Retirement,
+        retired: std::sync::mpsc::Receiver<u64>,
+        guest: WholePages,
+        page: Box<[u8; 16]>,
+        ctx: ClassicCtx,
+        query: ObjectHandle,
+    }
+
+    /// Every resource attached, over the same sixteen bytes of pages: one whole query result.
+    struct WholePages([crate::abi::GuestIov; 1]);
+
+    impl Guest for WholePages {
+        fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+            true
+        }
+        fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+            Some(Iov::new(&self.0))
+        }
+        fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+            None
+        }
+    }
+
+    impl QueryRig {
+        fn new() -> QueryRig {
+            struct Recorder(std::sync::mpsc::Sender<u64>);
+            impl crate::fence::FenceSink for Recorder {
+                fn context_fence(&mut self, _: ContextId, _: RingIdx, f: FenceId) {
+                    let _ = self.0.send(f.0);
+                }
+                fn present_fence(&mut self, _: FenceId) {}
+                fn global_fence(&mut self, _: ClientFenceId) {}
+            }
+            let (tx, retired) = std::sync::mpsc::channel();
+            let retire = crate::fence::Retirement::start(
+                Box::new(Recorder(tx)),
+                crate::vrend::debug::Switches::default(),
+            );
+            let mut v = Vrend::new(
+                Config::default(),
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            assert!(v.waiter.is_some(), "the premise: fences go through the waiter");
+            assert!(v.features.has(Feature::timer_query), "the premise: timer queries");
+            let mut page = Box::new([0u8; 16]);
+            let guest = WholePages([crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(page.as_mut_ptr().cast()),
+                len: page.len(),
+            }]);
+            let res = ResourceHandle::new(1).expect("a resource handle is non-zero");
+            v.resource_create(
+                res,
+                resource::Args {
+                    target: TextureTarget::Buffer,
+                    format: super::super::proto::Format::from_wire(64).expect("R8_UNORM"),
+                    bind: resource::Bind::CUSTOM,
+                    width: 16,
+                    height: 1,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )
+            .expect("a host-memory buffer");
+            let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+            v.context_create(ctx, &guest).expect("a context");
+            let query = ObjectHandle::new(1).expect("non-zero");
+            QueryRig { v, retire, retired, guest, page, ctx, query }
+        }
+
+        /// What mesa sends at end-query: the end, and the one request for the result, in one
+        /// batch with nothing flushed between them -- so the result is not ready when asked.
+        fn end_and_ask(&mut self) {
+            use crate::vrend::encode::encode;
+            use crate::vrend::pipe::QueryType;
+            use crate::vrend::proto::{Command, Object, QueryCreate};
+            let resource = ResourceHandle::new(1).expect("non-zero");
+            let create = QueryCreate { kind: QueryType::Timestamp, index: 0, offset: 0, resource };
+            let mut wire = Vec::new();
+            let handle = self.query;
+            encode(&Command::CreateObject { handle, object: Object::Query(create) }, &mut wire);
+            encode(&Command::EndQuery(handle), &mut wire);
+            encode(&Command::GetQueryResult { query: handle, wait: false }, &mut wire);
+            self.v.submit(self.ctx, &wire, &self.guest).expect("the context").expect("recorded");
+            assert!(
+                self.v.contexts[&self.ctx.id()].has_unanswered_queries(),
+                "the premise: the driver had the result at once, so nothing was parked and this \
+                 test cannot tell a parked query from one answered on the spot"
+            );
+            assert_eq!(self.state(), 0, "nothing is written for a result not ready");
+        }
+
+        /// The `virgl_host_query_state` word in the guest's pages: 1 is DONE.
+        fn state(&self) -> u32 {
+            u32::from_le_bytes(self.page[..4].try_into().expect("four bytes"))
+        }
+
+        fn finish(mut self) {
+            self.v.context_destroy(self.ctx, &self.guest);
+            drop(self.v);
+            drop(self.retire);
+        }
+    }
+
+    /// A query whose result was not ready when the guest asked is answered before the fence behind
+    /// the ask retires, by a poll the waiter holds that fence for.
+    ///
+    /// The guest asks once, at end-query, then waits for the fence and reads the buffer straight
+    /// from its pages. A fence that retires first hands it a result that is not there, and a
+    /// guest that waited (KWin's render-time query) re-reads forever.
+    #[test]
+    fn a_parked_query_is_answered_by_a_poll_before_its_fence_retires() {
+        use std::io::Read;
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut rig = QueryRig::new();
+        let bell = rig.v.poll_descriptor().expect("a dup").expect("a waiter, so a descriptor");
+        let bell = std::os::unix::net::UnixStream::from(bell);
+        bell.set_nonblocking(true).expect("nonblocking");
+        rig.end_and_ask();
+        rig.v.fence_context(rig.ctx, RingIdx(0), FenceId(7), &rig.guest);
+
+        // Held, however long the GPU takes: only the render thread can read the result.
+        let early = rig.retired.recv_timeout(std::time::Duration::from_millis(500));
+        assert!(early.is_err(), "the fence retired with the query still unanswered");
+        assert_eq!(rig.state(), 0, "and nothing answered it behind the poll's back");
+        // Read rather than peeked, which is unstable: the poll serves what was asked whether or
+        // not the byte is still there to drain.
+        assert!(matches!((&bell).read(&mut [0u8; 1]), Ok(1)), "the descriptor asks for a poll");
+
+        rig.v.poll(&rig.guest);
+        let retired = rig.retired.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(retired, Ok(7), "the poll lets the fence go");
+        assert_eq!(rig.state(), 1, "VIRGL_QUERY_STATE_DONE is in the pages");
+        let after = (&bell).read(&mut [0u8; 1]).map_err(|e| e.kind());
+        assert_eq!(after, Err(std::io::ErrorKind::WouldBlock), "and nothing asks for another");
+        rig.finish();
+    }
+
+    /// A fence that names no context is answered by its place in the queue, not by syncs on the
+    /// query's work, so a poll behind it could find the result still unready: the work is finished
+    /// and the query answered when that fence is taken, even with a poll on offer.
+    #[test]
+    fn a_fence_naming_no_context_answers_a_parked_query_when_it_is_taken() {
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut rig = QueryRig::new();
+        let _bell = rig.v.poll_descriptor().expect("a dup").expect("a waiter, so a descriptor");
+        rig.end_and_ask();
+        rig.v.fence_global(None, ClientFenceId(7), &rig.guest);
+        assert_eq!(rig.state(), 1, "VIRGL_QUERY_STATE_DONE is in the pages before the fence goes");
+        rig.finish();
+    }
+
+    /// With nobody to poll, the same query is answered when the fence is taken, by finishing the
+    /// work there: slower, but a fence that waited for a poll nobody makes would never retire.
+    #[test]
+    fn without_a_poll_a_parked_query_is_answered_when_its_fence_is_taken() {
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut rig = QueryRig::new();
+        rig.end_and_ask();
+        rig.v.fence_context(rig.ctx, RingIdx(0), FenceId(7), &rig.guest);
+        assert_eq!(rig.state(), 1, "VIRGL_QUERY_STATE_DONE is in the pages before the fence goes");
+        let retired = rig.retired.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(retired, Ok(7), "and the fence retires without a poll");
+        rig.finish();
+    }
+
     /// Both classic fence entry points, driven end to end against a live driver and a live waiter.
     ///
     /// What this is for is the half of the fence path no unit test of [`Answer`] can reach: a
@@ -1781,9 +2035,9 @@ mod tests {
 
         // Each of the three shapes a classic fence comes in: named by a context, named by the
         // global ring, and naming nothing at all.
-        v.fence_context(ctx, RingIdx(0), FenceId(11));
-        v.fence_global(Some(ctx), ClientFenceId(22));
-        v.fence_global(None, ClientFenceId(33));
+        v.fence_context(ctx, RingIdx(0), FenceId(11), &NoGuest);
+        v.fence_global(Some(ctx), ClientFenceId(22), &NoGuest);
+        v.fence_global(None, ClientFenceId(33), &NoGuest);
 
         // Dropped before the assertions: the waiter drains on the way out, so this is what makes
         // every fence above have been retired by the time they are read.
@@ -3082,12 +3336,15 @@ mod tests {
         // lands.
         let landing = Landing::new();
         v.waiter.as_ref().expect("checked above").retire_global(
-            vec![Arc::clone(&landing)],
-            Answer::Ordered,
-            None,
+            Owed {
+                pictures: vec![Arc::clone(&landing)],
+                fence: Answer::Ordered,
+                ticket: None,
+                queries: false,
+            },
             ClientFenceId(1),
         );
-        v.fence_context(ctx, RingIdx(0), FenceId(2));
+        v.fence_context(ctx, RingIdx(0), FenceId(2), &NoGuest);
         let gate = v.contexts.get(&ctx.id()).expect("the context").in_flight().clone();
         assert_eq!(gate.queued(), 1, "a fence answered by syncs counts as in flight");
 

@@ -968,6 +968,10 @@ pub struct SubContext {
     streamouts: Vec<Streamout>,
     current_so: Option<usize>,
     render_condition: Option<(ObjectHandle, bool, RenderCondMode)>,
+    /// Queries the guest asked for whose result was not ready yet: `vrend_state.waiting_query_list`,
+    /// per sub-context because a query object belongs to the GL context that made it. Names only,
+    /// so a query destroyed while parked simply fails to resolve and drops out.
+    unanswered: Vec<ObjectHandle>,
 }
 
 impl SubContext {
@@ -987,6 +991,7 @@ impl SubContext {
             created_at: Seq::default(),
             state: crate::Map::default(),
             long_shader: [None; ShaderStage::COUNT],
+            unanswered: Vec::new(),
             blend: None,
             hw_blend: HwBlend::default(),
             blend_dirty: false,
@@ -1287,6 +1292,13 @@ impl Subs {
             .iter()
             .map(|(id, sub)| (*id, sub))
             .chain(self.parked.iter().map(|(id, sub)| (*id, sub)))
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (SubContextId, &mut SubContext)> {
+        self.current
+            .iter_mut()
+            .map(|(id, sub)| (*id, sub))
+            .chain(self.parked.iter_mut().map(|(id, sub)| (*id, sub)))
     }
 
     /// Take a newly created sub-context. It parks: creating one does not select it, which is what
@@ -3369,6 +3381,57 @@ fn create_sampler_state(host: &mut Host<'_>, s: SamplerState) -> Result<Sampler,
     Ok(Sampler { state: s, ids: Some(ids) })
 }
 
+/// Write query `h`'s result into its buffer if it is ready. `Ok(false)` is a result not ready
+/// yet; nothing is written then.
+///
+/// `sub` must own the query and its GL context must be current.
+fn answer_query(host: &mut Host<'_>, sub: &SubContext, h: ObjectHandle) -> Result<bool, Fault> {
+    let cmd = Cmd::GetQueryResult;
+    let (id, resource, fake, timer) = match sub.objects.get(&h) {
+        Some(Object::Query(q)) => (q.id, q.resource, q.fake_samples_passed, q.is_timer()),
+        _ => return Err(Fault::IllegalHandle { cmd, handle: h }),
+    };
+    let gl = host.gl;
+    if gl.get_query_object_uiv(id, GL_QUERY_RESULT_AVAILABLE) == 0 {
+        return Ok(false);
+    }
+    // A timer's nanoseconds pass 2^32 in about four seconds, so it is read and reported in all 64
+    // bits; every other result is a count the 32-bit read holds.
+    let (mut result, size) = if timer {
+        (gl.get_query_object_ui64v(id, GL_QUERY_RESULT), 8u32)
+    } else {
+        (u64::from(gl.get_query_object_uiv(id, GL_QUERY_RESULT)), 4)
+    };
+    if fake {
+        result *= 1024;
+    }
+    let mut state = [0u8; 16];
+    state[0..4].copy_from_slice(&1u32.to_le_bytes()); // VIRGL_QUERY_STATE_DONE
+    state[4..8].copy_from_slice(&size.to_le_bytes());
+    state[8..16].copy_from_slice(&result.to_le_bytes());
+    let ctx = host.ctx;
+    let guest = host.guest;
+    let res = host.resource_mut(cmd, resource)?;
+    let mut wrote_shadow = false;
+    if let Storage::Host(shadow) = &mut res.storage
+        && shadow.bytes().len() >= 16
+    {
+        shadow.bytes_mut()[..16].copy_from_slice(&state);
+        wrote_shadow = true;
+    }
+    // The result goes to both sides, so they agree afterwards -- unless the pages did not take it,
+    // being absent or too short, in which case the shadow is ahead and says so.
+    let delivered = guest.pages(ctx, resource).is_some_and(|pages| pages.copy_in(0, &state));
+    if let Storage::Host(shadow) = &mut res.storage {
+        if delivered {
+            shadow.mirrored();
+        } else if wrote_shadow {
+            shadow.unmirrored();
+        }
+    }
+    Ok(true)
+}
+
 /// `vrend_create_query`, the GLES leg.
 fn create_query(host: &mut Host<'_>, q: QueryCreate) -> Result<Query, Fault> {
     let cmd = Cmd::CreateObject;
@@ -4505,58 +4568,49 @@ impl Context {
     }
 
     /// `vrend_get_query_result`: when the result is ready, write `virgl_host_query_state`
-    /// into the query's buffer. A result that is not ready is left for a later poll, which the
-    /// guest makes by asking again.
+    /// into the query's buffer, and otherwise park the query until it is.
+    ///
+    /// The guest sends this once, at end-query, and is never going to ask again: it waits for
+    /// the fence behind the request and then reads the buffer. So a parked query is answered by
+    /// [`Context::answer_parked`], which the renderer runs before any fence covering it retires.
     fn get_query_result(
         &mut self,
         host: &mut Host<'_>,
         h: ObjectHandle,
         _wait: bool,
     ) -> Result<(), Fault> {
-        let cmd = Cmd::GetQueryResult;
-        let (id, resource, fake, timer) = {
-            let q = self.query(cmd, h)?;
-            (q.id, q.resource, q.fake_samples_passed, q.is_timer())
-        };
-        let gl = host.gl;
-        if gl.get_query_object_uiv(id, GL_QUERY_RESULT_AVAILABLE) == 0 {
-            return Ok(());
-        }
-        // A timer's nanoseconds pass 2^32 in about four seconds, so it is read and reported in
-        // all 64 bits; every other result is a count the 32-bit read holds.
-        let (mut result, size) = if timer {
-            (gl.get_query_object_ui64v(id, GL_QUERY_RESULT), 8u32)
-        } else {
-            (u64::from(gl.get_query_object_uiv(id, GL_QUERY_RESULT)), 4)
-        };
-        if fake {
-            result *= 1024;
-        }
-        let mut state = [0u8; 16];
-        state[0..4].copy_from_slice(&1u32.to_le_bytes()); // VIRGL_QUERY_STATE_DONE
-        state[4..8].copy_from_slice(&size.to_le_bytes());
-        state[8..16].copy_from_slice(&result.to_le_bytes());
-        let ctx = host.ctx;
-        let guest = host.guest;
-        let res = host.resource_mut(cmd, resource)?;
-        let mut wrote_shadow = false;
-        if let Storage::Host(shadow) = &mut res.storage
-            && shadow.bytes().len() >= 16
-        {
-            shadow.bytes_mut()[..16].copy_from_slice(&state);
-            wrote_shadow = true;
-        }
-        // The result goes to both sides, so they agree afterwards -- unless the pages did not take
-        // it, being absent or too short, in which case the shadow is ahead and says so.
-        let delivered = guest.pages(ctx, resource).is_some_and(|pages| pages.copy_in(0, &state));
-        if let Storage::Host(shadow) = &mut res.storage {
-            if delivered {
-                shadow.mirrored();
-            } else if wrote_shadow {
-                shadow.unmirrored();
-            }
+        let answered = answer_query(host, self.sub(), h)?;
+        let parked = &mut self.sub_mut().unanswered;
+        if answered {
+            parked.retain(|p| *p != h);
+        } else if !parked.contains(&h) {
+            parked.push(h);
         }
         Ok(())
+    }
+
+    /// Whether any sub-context holds a query whose result has not been written yet.
+    pub fn has_unanswered_queries(&self) -> bool {
+        self.subs.iter().any(|(_, sub)| !sub.unanswered.is_empty())
+    }
+
+    /// `vrend_renderer_check_queries` for this context: answer every parked query whose result
+    /// is ready now, each in the GL context that owns it, and keep the rest.
+    ///
+    /// A query that no longer resolves -- destroyed, or its buffer gone -- is dropped rather than
+    /// faulted: nothing the guest sent just now was wrong, and there is no one left to answer.
+    pub fn answer_parked(&mut self, host: &mut Host<'_>) {
+        for (id, sub) in self.subs.iter_mut() {
+            if sub.unanswered.is_empty() {
+                continue;
+            }
+            host.make_current(id, &sub.gl_ctx);
+            let parked = std::mem::take(&mut sub.unanswered);
+            sub.unanswered = parked
+                .into_iter()
+                .filter(|h| matches!(answer_query(host, sub, *h), Ok(false)))
+                .collect();
+        }
     }
 
     /// `vrend_renderer_pipe_resource_get_layout`: write `virgl_resource_layout` for `target`

@@ -33,6 +33,9 @@
 //! cannot delay a compositor's Vulkan fence.
 
 use std::collections::VecDeque;
+use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex};
 
 use super::debug;
@@ -96,19 +99,128 @@ impl Answer {
     }
 }
 
-struct Job {
+/// Everything a fence waits on before it retires, in the order the waiter waits for it.
+pub struct Owed {
     /// Decoded pictures the fence covers that may not have landed yet: a hardware decode runs on
     /// its codec's own thread, so a fence created after an END_FRAME has to wait for the picture
     /// as well as for the GL work. Waited out before the syncs, and empty for every fence on a
     /// context with no decode in flight. See [`super::video::pending`].
-    pictures: Vec<Arc<Landing>>,
+    pub pictures: Vec<Arc<Landing>>,
     /// How this fence is answered; see [`Answer`]. An `Ordered` job still travels the queue,
     /// because leaving it out would let it overtake a fence ahead of it that is still in flight.
-    fence: Answer,
+    pub fence: Answer,
     /// This fence's place in its context's in-flight count, given back as soon as the GPU has
     /// passed it -- see [`super::in_flight`]. `None` for a fence no context is bounded by.
-    ticket: Option<Ticket>,
+    pub ticket: Option<Ticket>,
+    /// Whether a query result this fence covers was still unanswered when the fence was taken.
+    /// If so, the render thread must look at it again once the work has run and before the fence
+    /// retires; see [`Pump`].
+    pub queries: bool,
+}
+
+struct Job {
+    owed: Owed,
     retire: Retire,
+}
+
+/// How the waiter gets parked queries answered before a fence that covers them retires.
+///
+/// The guest asks for a query result once, at end-query, and then waits for the fence behind
+/// that request. When that fence retires it reads the buffer directly and expects the result to
+/// be there. A query object belongs to the GL context that made it, and only the render thread
+/// has that context current, so this thread cannot read the result itself. Instead it rings the
+/// VMM through [`Pump::descriptor`] and holds the fence until the render thread has run
+/// [`Pump::serve`]. This is the C's poll eventfd and `vrend_renderer_check_queries`.
+pub struct Pump {
+    state: Mutex<PumpState>,
+    served: Condvar,
+    /// This thread's end: one byte means "poll me", and a full buffer already means that.
+    ring: UnixStream,
+    /// The VMM's end, readable while a ring is unanswered. A socket rather than an eventfd,
+    /// so it is the same on both hosts.
+    bell: UnixStream,
+}
+
+#[derive(Default)]
+struct PumpState {
+    /// Rings made, counted so that a serve answers exactly the rings made before it looked.
+    asked: u64,
+    served: u64,
+    /// Whether the VMM took [`Pump::descriptor`], which is its promise to call
+    /// [`Pump::serve`] when it is readable. Until then nothing would answer a ring.
+    subscribed: bool,
+    /// Set when the waiter stops. A ring nobody will answer must not hold the join.
+    stopped: bool,
+}
+
+impl Pump {
+    fn new() -> std::io::Result<Pump> {
+        let (bell, ring) = UnixStream::pair()?;
+        bell.set_nonblocking(true)?;
+        ring.set_nonblocking(true)?;
+        Ok(Pump { state: Mutex::default(), served: Condvar::new(), ring, bell })
+    }
+
+    /// A descriptor that is readable while the waiter needs [`Pump::serve`] to run. Taking it is
+    /// the caller's promise to serve whenever it is: from then on fences wait for the serve.
+    pub fn descriptor(&self) -> std::io::Result<OwnedFd> {
+        let fd = self.bell.as_fd().try_clone_to_owned()?;
+        self.state.lock().expect("the pump lock is never held across a panic").subscribed = true;
+        Ok(fd)
+    }
+
+    /// Whether anyone has promised to serve; see [`Pump::descriptor`].
+    pub fn subscribed(&self) -> bool {
+        self.state.lock().expect("the pump lock is never held across a panic").subscribed
+    }
+
+    /// The waiter's half: ring, then wait until a serve that started after the ring has finished.
+    fn ask(&self) {
+        let mut g = self.state.lock().expect("the pump lock is never held across a panic");
+        g.asked += 1;
+        let mine = g.asked;
+        loop {
+            match (&self.ring).write(&[1]) {
+                // A full buffer is a bell that is already ringing.
+                Ok(_) => break,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => panic!("ringing the renderer's poll descriptor failed: {e}"),
+            }
+        }
+        while g.served < mine && !g.stopped {
+            g = self.served.wait(g).expect("the pump lock is never held across a panic");
+        }
+    }
+
+    /// The render thread's half: silence the bell, run `check`, and release every ring made
+    /// before it.
+    ///
+    /// The bell is drained before `asked` is read, so a ring that lands after the drain either
+    /// counts towards this serve or leaves a byte for the next one. A serve with nothing asked
+    /// just runs `check`.
+    pub fn serve(&self, check: impl FnOnce()) {
+        let mut sink = [0u8; 64];
+        loop {
+            match (&self.bell).read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => panic!("draining the renderer's poll descriptor failed: {e}"),
+            }
+        }
+        let target = self.state.lock().expect("the pump lock is never held across a panic").asked;
+        check();
+        let mut g = self.state.lock().expect("the pump lock is never held across a panic");
+        g.served = g.served.max(target);
+        self.served.notify_all();
+    }
+
+    fn stop(&self) {
+        self.state.lock().expect("the pump lock is never held across a panic").stopped = true;
+        self.served.notify_all();
+    }
 }
 
 struct Queue {
@@ -119,6 +231,7 @@ struct Queue {
 /// The classic fence waiter: a thread, and the GL context it waits on.
 pub struct Waiter {
     q: Arc<(Mutex<Queue>, Condvar)>,
+    pump: Arc<Pump>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -137,46 +250,34 @@ impl Waiter {
         let q =
             Arc::new((Mutex::new(Queue { jobs: VecDeque::new(), stopped: false }), Condvar::new()));
         let qt = Arc::clone(&q);
+        let pump = Arc::new(Pump::new().expect("a socket pair for the renderer's poll descriptor"));
+        let pt = Arc::clone(&pump);
         let thread = std::thread::Builder::new()
             .name("virglrs-glwait".into())
-            .spawn(move || run(display, ctx, gl, sink, qt, debug))
+            .spawn(move || run(display, ctx, gl, sink, qt, &pt, debug))
             .expect("spawning the classic fence waiter");
-        Waiter { q, thread: Some(thread) }
+        Waiter { q, pump, thread: Some(thread) }
     }
 
-    /// Queue a fence to retire once its work has run, and the `pictures` it covers have landed.
-    pub fn retire_context(
-        &self,
-        pictures: Vec<Arc<Landing>>,
-        fence: Answer,
-        ticket: Option<Ticket>,
-        ctx: ContextId,
-        ring: RingIdx,
-        id: FenceId,
-    ) {
-        self.push(Job { pictures, fence, ticket, retire: Retire::Context(ctx, ring, id) });
+    /// What the render thread serves when the VMM polls. See [`Pump`].
+    pub fn pump(&self) -> &Arc<Pump> {
+        &self.pump
     }
 
-    /// Queue a global-ring fence to retire once its work has run and its `pictures` have landed.
-    pub fn retire_global(
-        &self,
-        pictures: Vec<Arc<Landing>>,
-        fence: Answer,
-        ticket: Option<Ticket>,
-        id: ClientFenceId,
-    ) {
-        self.push(Job { pictures, fence, ticket, retire: Retire::Global(id) });
+    /// Queue a fence to retire once everything it is [`Owed`] has happened.
+    pub fn retire_context(&self, owed: Owed, ctx: ContextId, ring: RingIdx, id: FenceId) {
+        self.push(Job { owed, retire: Retire::Context(ctx, ring, id) });
     }
 
-    /// Queue a present fence to retire once the work behind a flushed surface has run.
-    pub fn retire_present(
-        &self,
-        pictures: Vec<Arc<Landing>>,
-        fence: Answer,
-        ticket: Option<Ticket>,
-        id: FenceId,
-    ) {
-        self.push(Job { pictures, fence, ticket, retire: Retire::Present(id) });
+    /// Queue a global-ring fence to retire once everything it is [`Owed`] has happened.
+    pub fn retire_global(&self, owed: Owed, id: ClientFenceId) {
+        self.push(Job { owed, retire: Retire::Global(id) });
+    }
+
+    /// Queue a present fence to retire once the work behind a flushed surface has run, and the
+    /// rest of what it is [`Owed`] has happened.
+    pub fn retire_present(&self, owed: Owed, id: FenceId) {
+        self.push(Job { owed, retire: Retire::Present(id) });
     }
 
     fn push(&self, job: Job) {
@@ -196,6 +297,9 @@ impl Drop for Waiter {
             g.stopped = true;
             cv.notify_one();
         }
+        // A fence held for a poll that will not come is released unanswered: the guest reads a
+        // query that is not done, which its own fallback re-reads, rather than never waking.
+        self.pump.stop();
         if let Some(t) = self.thread.take() {
             // Every queued fence is waited for and retired before this returns. A guest blocked on
             // one of them is not woken by anything else, and the retirement it goes to must still
@@ -211,6 +315,7 @@ fn run(
     gl: Gl,
     sink: fence::Handle,
     q: Arc<(Mutex<Queue>, Condvar)>,
+    pump: &Pump,
     debug: debug::Switches,
 ) {
     display.make_current(&ctx).expect("the fence waiter's own context is made current");
@@ -232,14 +337,14 @@ fn run(
             }
         };
         if debug.enabled(debug::Switch::Fence) {
-            eprintln!("[virglrs] fence: waiter woke, answer={}", job.fence.name());
+            eprintln!("[virglrs] fence: waiter woke, answer={}", job.owed.fence.name());
         }
         // The pictures first. A decode thread needs nothing from this one, so waiting here cannot
         // stall anything but the fences behind this one -- which is the order they owe anyway.
-        for picture in &job.pictures {
+        for picture in &job.owed.pictures {
             picture.wait();
         }
-        if let Answer::Syncs(fences) = job.fence {
+        if let Answer::Syncs(fences) = job.owed.fence {
             // Every one, and each spent as it is waited out: they are independent queues, so the
             // last to signal is what the fence is waiting for and the order they are waited in
             // does not matter.
@@ -251,7 +356,13 @@ fn run(
         // The GPU is past this fence's work, so it no longer counts against its context. Given
         // back before the retirement, which goes through the VMM's locks: a batch waiting on the
         // count must not also wait on those.
-        drop(job.ticket);
+        drop(job.owed.ticket);
+        // The work has run, so a parked query it covers is ready; the render thread writes it
+        // before the guest is told it may read. After the ticket, because a batch held at the
+        // fence depth would otherwise hold the render thread away from the poll.
+        if job.owed.queries {
+            pump.ask();
+        }
         if debug.enabled(debug::Switch::Fence) {
             eprintln!("[virglrs] fence: waiter done waiting, retiring");
         }
@@ -407,6 +518,11 @@ mod tests {
         surface
     }
 
+    /// What an `Ordered` fence with nothing else to wait for is owed: the `pictures`, if any.
+    fn ordered(pictures: Vec<Arc<Landing>>) -> Owed {
+        Owed { pictures, fence: Answer::Ordered, ticket: None, queries: false }
+    }
+
     /// A sink that says which fences were retired, in order.
     struct Recorder(std::sync::mpsc::Sender<ClientFenceId>);
 
@@ -473,7 +589,7 @@ mod tests {
         loop {
             black(&gl);
             load.queue(&gl, iterations);
-            waiter.retire_global(Vec::new(), Answer::Ordered, None, ClientFenceId(1));
+            waiter.retire_global(ordered(Vec::new()), ClientFenceId(1));
             assert_eq!(retired.recv().expect("the sink answers"), ClientFenceId(1));
             alone = first_pixel_blue(&surface);
             if alone != 0xff || iterations == LAST_ITERATIONS {
@@ -497,14 +613,17 @@ mod tests {
         // once the GPU is past the sync -- and not before: nothing retires ahead of this job.
         let gate = crate::vrend::in_flight::Gate::default();
         waiter.retire_context(
-            Vec::new(),
-            Answer::Syncs(vec![sync]),
-            Some(gate.ticket()),
+            Owed {
+                pictures: Vec::new(),
+                fence: Answer::Syncs(vec![sync]),
+                ticket: Some(gate.ticket()),
+                queries: false,
+            },
             ContextId::new(1).expect("a context id"),
             RingIdx(0),
             FenceId(2),
         );
-        waiter.retire_global(Vec::new(), Answer::Ordered, None, ClientFenceId(3));
+        waiter.retire_global(ordered(Vec::new()), ClientFenceId(3));
         assert_eq!(retired.recv().expect("the sink answers"), ClientFenceId(3));
         let behind = first_pixel_blue(&surface);
         assert_eq!(gate.queued(), 0, "the fence retired but still counts as in flight");
@@ -675,7 +794,7 @@ mod tests {
         );
 
         let landing = Landing::new();
-        waiter.retire_global(vec![Arc::clone(&landing)], Answer::Ordered, None, ClientFenceId(1));
+        waiter.retire_global(ordered(vec![Arc::clone(&landing)]), ClientFenceId(1));
         assert!(
             retired.recv_timeout(Duration::from_millis(100)).is_err(),
             "the fence retired while the picture it was taken over was still decoding"

@@ -1310,9 +1310,10 @@ impl Renderer {
         // queue to -- ring 0, which is the context's own stream and retires on the CPU timeline
         // as the C does, and the VMM's own present ring. Those retire here.
         let bound = self.bound(ctx).expect("found just above");
+        let table = self.resources.read().expect("the resource lock is never poisoned");
         let ordered = match (bound, self.vrend.as_mut()) {
             (Bound::Classic(classic), Some(v)) => {
-                v.fence_context(classic, ring, fence);
+                v.fence_context(classic, ring, fence, &*table);
                 true
             }
             (Bound::Venus(vctx), _) => {
@@ -1324,6 +1325,30 @@ impl Renderer {
             self.fences.retire_context(ctx, ring, fence);
         }
         Ok(())
+    }
+
+    /// The descriptor to watch for [`Renderer::poll`], or `None` when nothing will ever need it.
+    ///
+    /// Taking it is a promise: from then on, call [`Renderer::poll`] whenever it is readable. A
+    /// classic fence covering a GL query whose result was not ready when the guest asked for it
+    /// is held until a poll has written that result, because the guest reads the result the
+    /// moment the fence retires and never asks again. A VMM that never takes the descriptor is
+    /// still served correctly, by finishing the GL work inline when such a fence is taken -- at
+    /// the cost of a GPU wait on the calling thread. Take it once, before the first context.
+    pub fn poll_descriptor(&self) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+        match &self.vrend {
+            Some(v) => v.poll_descriptor(),
+            None => Ok(None),
+        }
+    }
+
+    /// Do the work [`Renderer::poll_descriptor`] asked for, on the thread that submits, and
+    /// silence the descriptor. A poll with nothing to do is cheap and harmless.
+    pub fn poll(&mut self) {
+        let table = self.resources.read().expect("the resource lock is never poisoned");
+        if let Some(v) = self.vrend.as_mut() {
+            v.poll(&*table);
+        }
     }
 
     /// A fence on the legacy global ring, which names the context it is for from outside.
@@ -1339,8 +1364,9 @@ impl Renderer {
             Ok(Bound::Classic(classic)) => Some(classic),
             _ => None,
         });
+        let table = self.resources.read().expect("the resource lock is never poisoned");
         match self.vrend.as_mut() {
-            Some(v) => v.fence_global(on, fence),
+            Some(v) => v.fence_global(on, fence, &*table),
             None => self.fences.retire_global(fence),
         }
     }
@@ -2087,9 +2113,10 @@ impl Renderer {
         let Ok(bound) = self.bound(ctx) else {
             return false;
         };
+        let table = self.resources.read().expect("the resource lock is never poisoned");
         match (bound, self.vrend.as_mut()) {
             (Bound::Classic(classic), Some(v)) => {
-                v.present_fence(classic, fence);
+                v.present_fence(classic, fence, &*table);
                 true
             }
             (Bound::Venus(vctx), _) => {

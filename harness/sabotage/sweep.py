@@ -1824,10 +1824,10 @@ SABOTAGES = [
     (
         'a fence retires without waiting for the pictures decoding ahead of it',
         'src/vrend/waiter.rs',
-        """        for picture in &job.pictures {
+        """        for picture in &job.owed.pictures {
             picture.wait();
         }""",
-        """        let _ = &job.pictures;""",
+        """        let _ = &job.owed.pictures;""",
         'a_fence_waits_for_the_pictures_decoding_ahead_of_it',
     ),
     (
@@ -1872,8 +1872,8 @@ SABOTAGES = [
     (
         "a timer query's result is reported in four bytes",
         'src/vrend/context.rs',
-        """            (gl.get_query_object_ui64v(id, GL_QUERY_RESULT), 8u32)""",
-        """            (gl.get_query_object_ui64v(id, GL_QUERY_RESULT), 4u32)""",
+        """        (gl.get_query_object_ui64v(id, GL_QUERY_RESULT), 8u32)""",
+        """        (gl.get_query_object_ui64v(id, GL_QUERY_RESULT), 4u32)""",
         'a_timestamp_query_is_recorded_and_read_back_in_eight_bytes',
     ),
     (
@@ -1967,8 +1967,8 @@ SABOTAGES = [
     (
         'a query result the pages refused is marked as delivered',
         'src/vrend/context.rs',
-        """        let delivered = guest.pages(ctx, resource).is_some_and(|pages| pages.copy_in(0, &state));""",
-        """        let delivered = guest.pages(ctx, resource).is_some_and(|pages| pages.copy_in(0, &state) || true);""",
+        """    let delivered = guest.pages(ctx, resource).is_some_and(|pages| pages.copy_in(0, &state));""",
+        """    let delivered = guest.pages(ctx, resource).is_some_and(|pages| pages.copy_in(0, &state) || true);""",
         'a_query_result_the_pages_cannot_take_stays_owed',
     ),
     (
@@ -2782,6 +2782,41 @@ SABOTAGES = [
 """,
         """""",
         'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
+    ),
+    (
+        'a query not ready when asked is dropped, and the guest waits forever for its result',
+        'src/vrend/context.rs',
+        '        } else if !parked.contains(&h) {\n            parked.push(h);\n        }\n',
+        '        }\n',
+        'parked_query',
+    ),
+    (
+        'a fence covering a parked query retires before the render thread has answered it',
+        'src/vrend/waiter.rs',
+        '        if job.owed.queries {\n',
+        '        if false {\n',
+        'parked_query',
+    ),
+    (
+        'a poll lets the held fences go without answering the queries they wait for',
+        'src/vrend/vrend.rs',
+        '        pump.serve(|| self.answer_parked(guest));\n',
+        '        pump.serve(|| ());\n',
+        'parked_query',
+    ),
+    (
+        'a fence naming no context leaves a parked query to a poll that may come before its work',
+        'src/vrend/vrend.rs',
+        '        if on.is_some() && self.waiter.as_ref().is_some_and(|w| w.pump().subscribed()) {\n',
+        '        if self.waiter.as_ref().is_some_and(|w| w.pump().subscribed()) {\n',
+        'parked_query',
+    ),
+    (
+        'with nobody to poll, a fence covering a parked query retires with it unanswered',
+        'src/vrend/vrend.rs',
+        '        self.answer_parked(guest);\n        false\n    }\n',
+        '        false\n    }\n',
+        'parked_query',
     ),
 ]
 
