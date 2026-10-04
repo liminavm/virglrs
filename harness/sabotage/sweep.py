@@ -1907,6 +1907,23 @@ SABOTAGES = [
         'a_replay_that_poisons_its_context_stops_and_says_so',
     ),
     (
+        'a command a replay drops leaves its GL error for the guest\'s first live batch',
+        'src/vrend/context.rs',
+        """                host.gl.drain_errors();
+                continue;""",
+        """                continue;""",
+        'a_command_a_replay_drops_does_not_refuse_the_next_live_submit',
+    ),
+    (
+        'a command a replay drops leaves its fault stuck on the context',
+        'src/vrend/context.rs',
+        """                host.gl.drain_errors();
+                continue;""",
+        """                self.fault = Some(f);
+                continue;""",
+        'a_command_a_replay_drops_does_not_refuse_the_next_live_submit',
+    ),
+    (
         'a sampler view binds whatever kind of resource its handle names now',
         'src/vrend/context.rs',
         """                (Storage::Texture(_), Span::Levels { .. }) => {}""",

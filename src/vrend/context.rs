@@ -1532,6 +1532,10 @@ impl Context {
                 if !self.dropped_in_replay(host.ctx, kind, &f) {
                     return self.poison(host.ctx, f);
                 }
+                // Any GL error a dropped command left is still its own. Left in the queue, the
+                // next command would answer for it -- and after the last retained command, that
+                // is the guest's first batch after the restore, which it would refuse.
+                host.gl.drain_errors();
                 continue;
             }
             if let Some(slot) = slot {

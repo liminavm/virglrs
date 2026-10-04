@@ -2803,6 +2803,85 @@ mod tests {
         v.context_destroy(ctx, &NoGuest);
     }
 
+    /// A command a rebuild drops leaves nothing behind for the guest's first live submit to
+    /// answer for: not the fault, and not a GL error it left in the context's GL queue. Either
+    /// would refuse every batch the guest sends after the restore.
+    #[test]
+    fn a_command_a_replay_drops_does_not_refuse_the_next_live_submit() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::journal::{Entry, Step, serialize};
+        use crate::vrend::pipe::Swizzle;
+        use crate::vrend::proto::{Command, Object, ObjectType, SamplerView};
+        use std::borrow::Cow;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &NoGuest).expect("a context");
+
+        let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
+        let wire = |c: Command<'_>| {
+            let mut w = Vec::new();
+            encode(&c, &mut w);
+            vec![w]
+        };
+        // Destroying a handle nothing holds runs, and touches nothing.
+        let harmless = || Command::DestroyObject { kind: ObjectType::SamplerView, handle: o(9) };
+        // A view of a resource that is gone, as a journal entry whose referent died is.
+        let stale = Command::CreateObject {
+            handle: o(5),
+            object: Object::SamplerView(SamplerView {
+                resource: ResourceHandle::new(28).expect("non-zero"),
+                format: super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM"),
+                target: TextureTarget::Texture2d,
+                first_element_or_layers: 0,
+                last_element_or_levels: 0,
+                swizzle: [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+            }),
+        };
+        let (first, second) = (wire(harmless()), wire(stale));
+        let journal = serialize(&[
+            Entry { seq: Seq(1), step: Step::Feed { sub: 0, chunks: Cow::Borrowed(&first) } },
+            Entry { seq: Seq(2), step: Step::Feed { sub: 0, chunks: Cow::Borrowed(&second) } },
+        ]);
+        v.replay_begin(ctx).expect("the context is here");
+        assert_eq!(v.journal_restore(ctx, &journal), Ok(2));
+        v.replay_upto(ctx, &NoGuest, Seq(1)).expect("the first entry is fed");
+        // What the stale command would leave had it got as far as GL before its fault: an error in
+        // the queue of the GL context it ran in, which the first entry left current.
+        v.gl.bind_texture(0xDEAD, None);
+        v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)).expect("a dropped command does not poison");
+        let dropped = v.contexts.get_mut(&ctx.id()).expect("the context").replay_end();
+        assert_eq!(dropped, 1, "the stale view is dropped");
+
+        let live = wire(harmless()).concat();
+        assert_eq!(
+            v.submit(ctx, &live, &NoGuest).expect("the context is here"),
+            Ok(()),
+            "the guest's first batch after the restore is accepted"
+        );
+        v.context_destroy(ctx, &NoGuest);
+    }
+
     /// A second `replay_begin` keeps the span open with the journal the first was handed,
     /// rather than starting over with an empty one.
     #[test]
