@@ -60,6 +60,13 @@ Retired on arrival it says the work is done when it has only been submitted, and
 hands another context a buffer on the strength of it is handing over a render still in flight.
 The capsets advertised are exactly the ones `Config` asks to serve.
 
+A VMM that takes `Renderer::poll_descriptor` has to call `Renderer::poll` on the submitting
+thread whenever that descriptor is readable. A classic guest asks for a GL query's result once,
+at end-query, and reads it from the buffer when the fence behind the request retires. If the
+result was not ready when asked, the fence waiter holds that fence until a poll has written the
+result. A VMM that never takes the descriptor gets the same guarantee, but more slowly: the
+query's work is finished on the submitting thread when the fence is taken.
+
 ## What we delete rather than port
 
 Not compiled today, or not needed once the C fork is gone:
