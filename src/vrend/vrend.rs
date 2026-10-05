@@ -2927,6 +2927,89 @@ mod tests {
         }
     }
 
+    /// A cursor no framebuffer can read reads back on desktop GL, as the C reads every cursor
+    /// there: through `glGetTexImage`, whose compressed form hands the blocks back as stored.
+    /// GLES has only the framebuffer, and answers nothing -- the control that says the desktop
+    /// answer took the other road.
+    #[test]
+    fn a_cursor_no_framebuffer_reads_reads_back_on_desktop_gl() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let rgtc1 = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == "RGTC1_UNORM")
+            .expect("RGTC1_UNORM is a wire format");
+        let read_back = |host_gl| {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let mut v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            let desc = rgtc1.describe().expect("described");
+            // Two blocks by two, so the rows of blocks have an order to keep.
+            let (w, h) = (8u32, 8u32);
+            let stride = desc.stride(w);
+            let layer = stride * desc.blocks_high(h);
+            let res = ResourceHandle::new(1).expect("non-zero");
+            v.resource_create(
+                res,
+                resource::Args {
+                    target: TextureTarget::Texture2d,
+                    format: rgtc1,
+                    bind: resource::Bind::SAMPLER_VIEW,
+                    width: w,
+                    height: h,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )
+            .expect("a texture");
+            let info = transfer::Info {
+                level: 0,
+                stride,
+                layer_stride: layer,
+                offset: 0,
+                region: crate::vrend::proto::Box3 {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    width: w as i32,
+                    height: h as i32,
+                    depth: 1,
+                },
+                synchronized: false,
+            };
+            let mut written: Vec<u8> = (0..layer).map(|b| (b as u8).wrapping_mul(37)).collect();
+            let from = [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(written.as_mut_ptr().cast()),
+                len: written.len(),
+            }];
+            let from = Iov::new(&from);
+            v.transfer(None, res, Some(&from), transfer::Through::ToHost(from.source()), &info)
+                .expect("the upload");
+            v.cursor_contents(res).map(|c| c.pixels == written)
+        };
+        assert_eq!(read_back(HostGl::Gles), None, "GLES cannot read an RGTC1 cursor");
+        assert_eq!(read_back(HostGl::Desktop), Some(true), "desktop GL reads its blocks back");
+    }
+
     /// Desktop GL stores a 1D texture as one, and a 1D array as a 2D texture whose rows are its
     /// layers; GLES has no 1D textures and stores both as 2D. Either way a box written to every
     /// layer reads back as written -- a layer uploaded as the wrong row, or as a 2D image of a

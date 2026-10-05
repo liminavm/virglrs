@@ -1958,6 +1958,15 @@ SABOTAGES = [
         'a_desktop_context_is_taken_only_when_asked_for',
     ),
     (
+        'a desktop host reads a cursor only through a framebuffer',
+        'src/vrend/transfer.rs',
+        """    if features.api().is_gles() {
+        read_layer(gl, features, formats, res, 0, 0, 0, 0,""",
+        """    if !features.api().is_gles() || features.api().is_gles() {
+        read_layer(gl, features, formats, res, 0, 0, 0, 0,""",
+        'a_cursor_no_framebuffer_reads_reads_back_on_desktop_gl',
+    ),
+    (
         'a framebuffer read runs at whatever pack state the context was left in',
         'src/vrend/gl.rs',
         """        self.pack_tight();

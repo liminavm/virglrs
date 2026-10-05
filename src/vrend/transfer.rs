@@ -779,7 +779,9 @@ fn read_layer(
 ///
 /// The readback half of `vrend_renderer_get_cursor_contents`. It differs from [`read`] in having
 /// no guest pages and no box: the caller wants the image, so there is no region to validate and
-/// nothing to scatter into an iov.
+/// nothing to scatter into an iov. Desktop GL reads the level with `glGetTexImage`, as the C
+/// does, so a format no framebuffer can read is read too -- a compressed one as its blocks; GLES
+/// reads through a framebuffer or not at all.
 ///
 /// The flip belongs here rather than at the call site because the convention does: GL hands rows
 /// back bottom-up, and a `y_0_top` resource stores them the other way up. A caller that had to
@@ -803,7 +805,24 @@ pub fn read_whole_2d(
     if (dst.len() as u64) < desc.blocks_high(h) as u64 * stride as u64 {
         return Err(Error::Unsupported);
     }
-    read_layer(gl, features, formats, res, 0, 0, 0, 0, w as GLsizei, h as GLsizei, dst)?;
+    if features.api().is_gles() {
+        read_layer(gl, features, formats, res, 0, 0, 0, 0, w as GLsizei, h as GLsizei, dst)?;
+    } else {
+        let entry = res.entry(formats).ok_or(Error::Unsupported)?;
+        let whole = Box3 { x: 0, y: 0, z: 0, width: w as i32, height: h as i32, depth: 1 };
+        let blocks_high = desc.blocks_high(h) as u64;
+        let l = Layout {
+            block: desc.block_bytes() as u64,
+            blocks_wide: desc.blocks_wide(w) as u64,
+            blocks_high,
+            depth: 1,
+            stride: stride as u64,
+            layer_stride: blocks_high * stride as u64,
+            compressed: desc.is_compressed(),
+        }
+        .as_gl(entry, w as u64, h as u64);
+        read_box_whole_level(gl, entry, res, 0, &whole, 0, &l, dst)?;
+    }
     if res.y_0_top() {
         reverse_rows(dst, stride, desc.blocks_high(h) as usize);
     }
