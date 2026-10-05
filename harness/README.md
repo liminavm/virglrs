@@ -535,11 +535,9 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 
   `vrend.iris.caps` and `vrend-desktop.iris.caps` are the same capsets from the C on goiaba
   (iris), on GLES (`--flags 0x819`) and on desktop GL (`--flags 0x809`), which select the
-  same flavour on the Rust leg. Both differ from the Rust leg's in three Linux
+  same flavour on the Rust leg. Both differ from the Rust leg's in two Linux
   lines that have nothing to do with the flavour: `num_video_caps`/`video_caps` (the C leg there
-  reports no decoder), `capability_bits_v2`'s `SCANOUT_USES_GBM`, and
-  `supported_multisample_formats`, where the Rust leg also offers the four 4:2:0 YUV formats
-  163, 165, 166 and 167. That last one advertises more than the C and is open. GLES also differs
+  reports no decoder) and `capability_bits_v2`'s `SCANOUT_USES_GBM`. GLES also differs
   in `sampler`'s ASTC sRGB formats, as above; desktop GL never registers ASTC, on either leg. A
   line the two flavours do not share is a desktop regression.
   `vrend-vp9stock.score` is VP9 hardware decode, 963 pictures through VideoToolbox, scored the
