@@ -33,13 +33,33 @@ pub struct Config {
     /// 11.4% of glmark2 under GNOME, measured in `docs/linux-port.md` -- and a caller that would
     /// rather have that back turns this off.
     pub linear_shared: bool,
+    /// The GL vrend may run on. On a display of its own it is the API vrend's contexts are made
+    /// in; under an embedder the embedder makes them, and this is whether a desktop context it
+    /// hands over is taken or refused.
+    pub host_gl: HostGl,
+}
+
+/// Which GL vrend runs on. See [`Config::host_gl`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HostGl {
+    Gles,
+    /// A core-profile desktop context. Still being ported: until vrend serves it whole, only a
+    /// caller that asks for it by name gets it.
+    Desktop,
 }
 
 impl Default for Config {
     /// Nothing served, nothing optional asked for -- except linear shared buffers, which are on
     /// by default; see [`Config::linear_shared`].
     fn default() -> Config {
-        Config { venus: false, vrend: false, guest_vram: false, video: false, linear_shared: true }
+        Config {
+            venus: false,
+            vrend: false,
+            guest_vram: false,
+            video: false,
+            linear_shared: true,
+            host_gl: HostGl::Gles,
+        }
     }
 }
 

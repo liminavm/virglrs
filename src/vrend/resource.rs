@@ -2964,7 +2964,7 @@ mod tests {
     }
 
     fn features() -> Features {
-        Features::probe(31, Vec::new())
+        Features::probe(crate::vrend::features::Api::Gles(31), Vec::new())
     }
 
     fn table() -> Table {

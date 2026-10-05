@@ -2328,7 +2328,7 @@ mod tests {
         // A host that adopts no surfaces backs nothing, whatever the format -- the capset asks
         // one question and this is the half that is not about the layout. Where nothing can mint
         // storage every host is this one, so it is the half that carries the test there.
-        let bare = Features::probe(300, []);
+        let bare = Features::probe(crate::vrend::features::Api::Gles(300), []);
         for raw in [163, 165, 166, 167] {
             let format = Format::from_wire(raw).expect("a planar format is on the wire");
             assert!(guest_planes(format) > 1, "format {raw} is planar");
@@ -2339,7 +2339,10 @@ mod tests {
         // adopt -- `adopts_iosurfaces` answers no elsewhere before any extension is consulted.
         #[cfg(target_os = "macos")]
         {
-            let host = Features::probe(300, ["GL_OES_EGL_image".to_string()]);
+            let host = Features::probe(
+                crate::vrend::features::Api::Gles(300),
+                ["GL_OES_EGL_image".to_string()],
+            );
             assert!(host.adopts_iosurfaces(), "the surface entry point is what backing needs");
             for raw in [163, 165, 166, 167] {
                 let format = Format::from_wire(raw).expect("a planar format is on the wire");

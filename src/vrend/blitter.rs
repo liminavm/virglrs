@@ -1027,7 +1027,7 @@ mod tests {
         let ctx = winsys.create_context(version, None).expect("a 3.1 context");
         winsys.make_current(&ctx).expect("current");
         let gl = Gl::new(winsys.gles());
-        let features = Features::probe(31, gl.extensions());
+        let features = Features::probe(crate::vrend::features::Api::Gles(31), gl.extensions());
 
         let texture = |levels: GLsizei| {
             let name = gl.gen_texture();

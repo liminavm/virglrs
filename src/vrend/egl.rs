@@ -92,11 +92,23 @@ impl fmt::Display for EglError {
 
 impl std::error::Error for EglError {}
 
-/// Which client API the winsys binds. Only GLES today; a desktop-GL flavour is a later,
-/// separately gated change (`docs/design.md`, P3).
+/// Which client API a display of our own makes its contexts in. An embedder's contexts are of
+/// whichever API it chose, which is read back from ctx0 rather than asked for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Flavour {
     Gles,
+    /// Desktop GL, core profile.
+    Gl,
+}
+
+impl Flavour {
+    /// The EGL client API, and the config bit that renders it.
+    fn api(self) -> (EGLenum, EGLenum) {
+        match self {
+            Flavour::Gles => (proc::EGL_OPENGL_ES_API, proc::EGL_OPENGL_ES2_BIT),
+            Flavour::Gl => (proc::EGL_OPENGL_API, proc::EGL_OPENGL_BIT),
+        }
+    }
 }
 
 /// The GL contexts the renderer runs on, when something else mints them.
@@ -157,7 +169,7 @@ struct Shared {
 /// the embedder and must not be terminated here, and its context tokens are its own -- under GTK a
 /// `GdkGLContext *`, which is not an `EGLContext` and must never be passed to EGL.
 enum Backing {
-    Own { config: EGLConfig },
+    Own { config: EGLConfig, flavour: Flavour },
     Embedder(Box<dyn GlContexts>),
 }
 
@@ -227,7 +239,6 @@ impl Drop for Shared {
 /// The surfaceless EGL display, initialised, with the client API bound and a config chosen.
 pub struct Winsys {
     shared: Arc<Shared>,
-    flavour: Flavour,
     version: Version,
     extensions: BTreeSet<String>,
     /// Which of [`Winsys::export_texture`]'s two answers has been reported.
@@ -665,7 +676,7 @@ impl Winsys {
         let shared = Arc::new(Shared {
             egl,
             display,
-            backing: Backing::Own { config: core::ptr::null_mut() },
+            backing: Backing::Own { config: core::ptr::null_mut(), flavour },
         });
         let egl = &shared.egl;
 
@@ -675,9 +686,7 @@ impl Winsys {
             c_str_to_string(p).split(' ').filter(|s| !s.is_empty()).map(str::to_string).collect()
         };
 
-        let (api, renderable) = match flavour {
-            Flavour::Gles => (proc::EGL_OPENGL_ES_API, proc::EGL_OPENGL_ES2_BIT),
-        };
+        let (api, renderable) = flavour.api();
         // SAFETY: `eglBindAPI` takes an enum and nothing else.
         if unsafe { egl.eglBindAPI()(api) } == proc::EGL_FALSE {
             return Err(shared.error("eglBindAPI"));
@@ -711,13 +720,12 @@ impl Winsys {
         // nothing else has cloned the `Arc` yet.
         let mut shared = shared;
         match &mut Arc::get_mut(&mut shared).expect("no context exists yet").backing {
-            Backing::Own { config: slot } => *slot = config,
+            Backing::Own { config: slot, .. } => *slot = config,
             Backing::Embedder(_) => unreachable!("this constructor built an owned backing"),
         }
 
         Ok(Winsys {
             shared,
-            flavour,
             version: Version { major: major as u32, minor: minor as u32 },
             extensions,
             said: Said::default(),
@@ -733,11 +741,9 @@ impl Winsys {
     /// context is made with is its business, not ours. What is read from it is what a display can
     /// be asked without owning it -- its version and its extensions.
     ///
-    /// The flavour is the embedder's choice too, and is not knowable until a context exists and is
-    /// current, so this records what was asked for; [`Winsys::gles`]'s caller is what finds out
-    /// what arrived.
+    /// The client API is the embedder's choice too, and is not knowable until a context exists
+    /// and is current; [`Winsys::gles`]'s caller is what finds out what arrived.
     pub fn embedded(
-        flavour: Flavour,
         contexts: Box<dyn GlContexts>,
         versions: &[Version],
     ) -> Result<(Winsys, Context, Version), EglError> {
@@ -790,7 +796,6 @@ impl Winsys {
         Ok((
             Winsys {
                 shared,
-                flavour,
                 version,
                 extensions,
                 said: Said::default(),
@@ -801,10 +806,6 @@ impl Winsys {
             ctx0,
             version_made,
         ))
-    }
-
-    pub fn flavour(&self) -> Flavour {
-        self.flavour
     }
 
     /// The EGL version the display reports.
@@ -879,12 +880,11 @@ impl Winsys {
         version: Version,
         shared: Option<&Context>,
     ) -> Result<Context, EglError> {
-        let attribs: [EGLint; 5] = [
+        let mut attribs = vec![
             proc::EGL_CONTEXT_MAJOR_VERSION as EGLint,
             version.major as EGLint,
             proc::EGL_CONTEXT_MINOR_VERSION as EGLint,
             version.minor as EGLint,
-            proc::EGL_NONE as EGLint,
         ];
         let share = shared.map_or(proc::EGL_NO_CONTEXT, |c| {
             assert!(Arc::ptr_eq(&c.shared, &self.shared), "a share context from another display");
@@ -900,11 +900,26 @@ impl Winsys {
             })?;
             return Ok(Context { shared: Arc::clone(&self.shared), ctx });
         }
-        let config = match &self.shared.backing {
-            Backing::Own { config } => *config,
+        let (config, flavour) = match &self.shared.backing {
+            Backing::Own { config, flavour } => (*config, *flavour),
             Backing::Embedder(_) => unreachable!("returned just above"),
         };
         let egl = &self.shared.egl;
+        // The API a context is made in is the calling thread's bound one, so it is bound here
+        // rather than trusted to still be what `open` bound on whichever thread that was.
+        let (api, _) = flavour.api();
+        // SAFETY: `eglBindAPI` takes an enum and nothing else.
+        if unsafe { egl.eglBindAPI()(api) } == proc::EGL_FALSE {
+            return Err(self.shared.error("eglBindAPI"));
+        }
+        // Core is the only desktop profile vrend serves; a GLES context takes no profile.
+        if flavour == Flavour::Gl {
+            attribs.extend([
+                proc::EGL_CONTEXT_OPENGL_PROFILE_MASK as EGLint,
+                proc::EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT as EGLint,
+            ]);
+        }
+        attribs.push(proc::EGL_NONE as EGLint);
         // SAFETY: the display is initialised and the config chosen on it; `attribs` is
         // NONE-terminated; `share` is either no context or one alive on this display.
         let ctx =
@@ -1455,12 +1470,9 @@ mod tests {
     /// [`Winsys::export_image`], which touches the display only by passing it to the two stubs.
     #[cfg(not(target_os = "macos"))]
     fn stub_winsys() -> Winsys {
-        let (winsys, _ctx0, _made) = Winsys::embedded(
-            Flavour::Gles,
-            Box::new(FakeEmbedder::default()),
-            &[Version { major: 3, minor: 2 }],
-        )
-        .expect("a display the embedder vouched for");
+        let (winsys, _ctx0, _made) =
+            Winsys::embedded(Box::new(FakeEmbedder::default()), &[Version { major: 3, minor: 2 }])
+                .expect("a display the embedder vouched for");
         winsys
     }
 
@@ -1690,7 +1702,7 @@ mod tests {
         }
 
         let v = Version { major: 3, minor: 2 };
-        let (winsys, ctx0, _) = Winsys::embedded(Flavour::Gles, Box::new(Lent(fake)), &[v])
+        let (winsys, ctx0, _) = Winsys::embedded(Box::new(Lent(fake)), &[v])
             .expect("a display the embedder vouched for");
         let sub_ctx = winsys.create_context(v, Some(&ctx0)).expect("a second context");
         let sub = GlContext::Sub(crate::ids::ContextId::new(1).expect("non-zero"), SubContextId(0));
@@ -1736,7 +1748,7 @@ mod tests {
         let v = Version { major: 3, minor: 2 };
         // ctx0 comes back with the winsys: it is minted and bound to find the display, so it
         // cannot be left for the caller to remember.
-        let (winsys, ctx0, made) = Winsys::embedded(Flavour::Gles, Box::new(Lent(fake)), &[v])
+        let (winsys, ctx0, made) = Winsys::embedded(Box::new(Lent(fake)), &[v])
             .expect("a display the embedder vouched for");
         assert_eq!(made, v);
 
@@ -1790,7 +1802,7 @@ mod tests {
         }
 
         let v = Version { major: 3, minor: 2 };
-        let (winsys, ctx0, _) = Winsys::embedded(Flavour::Gles, Box::new(Lent(fake)), &[v])
+        let (winsys, ctx0, _) = Winsys::embedded(Box::new(Lent(fake)), &[v])
             .expect("an embedder with no display to name is still an embedder");
 
         assert!(winsys.has_gl_colorspace(), "the C says yes with no winsys, and so must this");

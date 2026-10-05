@@ -557,7 +557,7 @@ fn probe_row(gl: &Gl, features: &Features, row: &GlFormat) -> Option<Entry> {
 fn color_can_readback(gl: &Gl, features: &Features, row: &GlFormat) -> bool {
     match row.format.name() {
         "R8G8B8A8_UNORM" => true,
-        "R32G32B32A32_SINT" | "R32G32B32A32_UINT" if features.gles_version >= 30 => true,
+        "R32G32B32A32_SINT" | "R32G32B32A32_UINT" if features.api().gles_at_least(30) => true,
         "R32G32B32A32_FLOAT" if features.has(Feature::color_buffer_float) => true,
         "B10G10R10A2_UNORM" | "B10G10R10X2_UNORM" => false,
         _ => {

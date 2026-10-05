@@ -254,14 +254,14 @@ impl CapsV2 {
         let has = |f: Feature| features.has(f);
         let get = |name: GLenum| gl.get_integer(name);
         let getu = |name: GLenum| gl.get_integer(name).max(0) as u32;
-        let gles = features.gles_version;
+        let api = features.api();
         let mut c = CapsV2::zeroed();
         c.v1.max_version = VIRGL2_VERSION;
 
         // vrend_fill_caps_glsl_version
-        c.v1.glsl_level = if gles >= 31 {
+        c.v1.glsl_level = if api.gles_at_least(31) {
             310
-        } else if gles >= 30 {
+        } else if api.gles_at_least(30) {
             130
         } else {
             120
@@ -323,7 +323,7 @@ impl CapsV2 {
             bset::FRAGMENT_COORD_CONVENTIONS,
         );
         bit(
-            features.has_extension("GL_ARB_seamless_cube_map") || gles >= 30,
+            features.has_extension("GL_ARB_seamless_cube_map") || api.gles_at_least(30),
             bset::SEAMLESS_CUBE_MAP,
         );
         bit(has(Feature::seamless_cubemap_per_texture), bset::SEAMLESS_CUBE_MAP_PER_TEXTURE);
@@ -430,7 +430,7 @@ impl CapsV2 {
         c.max_texture_lod_bias = gl.get_float(GL_MAX_TEXTURE_LOD_BIAS);
         c.max_vertex_attribs = limits.max_vertex_attributes;
         // The GL minimum where the query does not exist.
-        let outputs = if gles >= 30 { get(GL_MAX_VERTEX_OUTPUT_COMPONENTS) } else { 64 };
+        let outputs = if api.gles_at_least(30) { get(GL_MAX_VERTEX_OUTPUT_COMPONENTS) } else { 64 };
         c.max_vertex_outputs = (outputs / 4).max(0) as u32;
         c.min_texel_offset = get(GL_MIN_PROGRAM_TEXEL_OFFSET);
         c.max_texel_offset = get(GL_MAX_PROGRAM_TEXEL_OFFSET);
@@ -506,7 +506,7 @@ impl CapsV2 {
             cap::TGSI_INVARIANT | cap::SET_MIN_SAMPLES | cap::TGSI_PRECISE | cap::APP_TWEAK_SUPPORT;
         // Without the query, the specification's minimum.
         c.max_vertex_attrib_stride =
-            if gles >= 31 { getu(GL_MAX_VERTEX_ATTRIB_STRIDE) } else { 2048 };
+            if api.gles_at_least(31) { getu(GL_MAX_VERTEX_ATTRIB_STRIDE) } else { 2048 };
         if has(Feature::compute_shader) {
             c.max_compute_work_group_invocations = getu(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS);
             c.max_compute_shared_memory_size = getu(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE);

@@ -10,6 +10,38 @@
 
 use std::collections::BTreeSet;
 
+/// Which GL the host's contexts speak, and at which version, as `major * 10 + minor`.
+///
+/// Decided once, from the context ctx0 turned out to be, and never asked of a call site: what
+/// differs between the two is answered inside the `Gl` wrapper, the tables and the translator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Api {
+    Gles(u32),
+    /// A core-profile desktop context. The C's compatibility-profile leg is not served.
+    Gl(u32),
+}
+
+impl Api {
+    /// Whether this is GLES at `version` or later: the C's `gles_ver >= version`, which reads
+    /// zero on a desktop context and so answers no there.
+    pub fn gles_at_least(self, version: u32) -> bool {
+        matches!(self, Api::Gles(v) if v >= version)
+    }
+
+    pub fn is_gles(self) -> bool {
+        matches!(self, Api::Gles(_))
+    }
+}
+
+impl std::fmt::Display for Api {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Api::Gles(v) => write!(f, "gles {v}"),
+            Api::Gl(v) => write!(f, "gl {v} core"),
+        }
+    }
+}
+
 /// The GLES version a feature became core at, or never.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Core {
@@ -218,8 +250,7 @@ impl FeatureSet {
 /// The features this host has.
 pub struct Features {
     have: FeatureSet,
-    /// The context's GLES version as `major * 10 + minor`, the C's spelling.
-    pub gles_version: u32,
+    api: Api,
     extensions: BTreeSet<String>,
 }
 
@@ -264,19 +295,23 @@ impl Features {
     }
 
     /// Decide every feature from a context's version and the extensions it advertises.
-    pub fn probe(gles_version: u32, extensions: impl IntoIterator<Item = String>) -> Features {
+    pub fn probe(api: Api, extensions: impl IntoIterator<Item = String>) -> Features {
         let extensions: BTreeSet<String> = extensions.into_iter().collect();
         let mut have = FeatureSet::default();
         for f in Feature::ALL.iter().copied() {
             let core = match f.core() {
-                Gles(v) => gles_version >= v,
+                Gles(v) => api.gles_at_least(v),
                 Unavail => false,
             };
             if core || f.extensions().iter().any(|e| extensions.contains(*e)) {
                 have.insert(f);
             }
         }
-        Features { have, gles_version, extensions }
+        Features { have, api, extensions }
+    }
+
+    pub fn api(&self) -> Api {
+        self.api
     }
 
     #[inline]
@@ -321,7 +356,8 @@ mod tests {
     /// or a format without texture storage, binds through the OES entry point and it has none.
     #[test]
     fn only_the_oes_entry_point_makes_a_host_bind_egl_images() {
-        let ext = |names: &[&str]| Features::probe(300, names.iter().map(|n| n.to_string()));
+        let ext =
+            |names: &[&str]| Features::probe(Api::Gles(300), names.iter().map(|n| n.to_string()));
         assert!(ext(&["GL_OES_EGL_image"]).binds_egl_images());
         assert!(ext(&["GL_OES_EGL_image", "GL_EXT_EGL_image_storage"]).binds_egl_images());
         assert!(!ext(&["GL_EXT_EGL_image_storage"]).binds_egl_images(), "an upgrade on nothing");
@@ -350,7 +386,7 @@ mod tests {
     /// the startup line that prints it reads the same.
     #[test]
     fn present_is_in_table_order() {
-        let f = Features::probe(32, ["GL_EXT_buffer_storage".to_string()]);
+        let f = Features::probe(Api::Gles(32), ["GL_EXT_buffer_storage".to_string()]);
         let got: Vec<Feature> = f.present().collect();
         let mut want = got.clone();
         want.sort_unstable();
@@ -360,13 +396,13 @@ mod tests {
 
     #[test]
     fn a_feature_is_core_by_version_or_provided_by_an_extension() {
-        let f = Features::probe(31, ["GL_KHR_robustness".to_string()]);
+        let f = Features::probe(Api::Gles(31), ["GL_KHR_robustness".to_string()]);
         assert!(f.has(Feature::texture_storage));
         assert!(f.has(Feature::compute_shader));
         assert!(!f.has(Feature::geometry_shader));
         assert!(f.has(Feature::gles_khr_robustness));
         assert!(!f.has(Feature::qbo));
-        let g = Features::probe(32, ["GL_EXT_buffer_storage".to_string()]);
+        let g = Features::probe(Api::Gles(32), ["GL_EXT_buffer_storage".to_string()]);
         assert!(g.has(Feature::geometry_shader));
         assert!(g.has(Feature::arb_buffer_storage));
         assert!(!g.has(Feature::gles_khr_robustness));
@@ -376,10 +412,19 @@ mod tests {
     /// has the 2D form and not the array form, so without the OES extension it has none.
     #[test]
     fn multisample_textures_need_the_array_form_too() {
-        assert!(!Features::probe(31, []).multisample_textures(), "3.1 has no array form");
+        assert!(
+            !Features::probe(Api::Gles(31), []).multisample_textures(),
+            "3.1 has no array form"
+        );
         let ext = ["GL_OES_texture_storage_multisample_2d_array".to_string()];
-        assert!(Features::probe(31, ext).multisample_textures(), "the extension supplies it");
-        assert!(Features::probe(32, []).multisample_textures(), "3.2 has it in core");
-        assert!(!Features::probe(30, []).multisample_textures(), "3.0 has no storage at all");
+        assert!(
+            Features::probe(Api::Gles(31), ext).multisample_textures(),
+            "the extension supplies it"
+        );
+        assert!(Features::probe(Api::Gles(32), []).multisample_textures(), "3.2 has it in core");
+        assert!(
+            !Features::probe(Api::Gles(30), []).multisample_textures(),
+            "3.0 has no storage at all"
+        );
     }
 }

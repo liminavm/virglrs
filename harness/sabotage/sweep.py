@@ -1949,6 +1949,22 @@ SABOTAGES = [
         'an_evaluation_shader_without_a_control_shader_draws_its_patches',
     ),
     (
+        'a desktop context the caller did not ask for is taken anyway',
+        'src/vrend/vrend.rs',
+        """    if asked != HostGl::Desktop {
+        return Err(UnservedGl::NotAskedFor);""",
+        """    if asked != HostGl::Desktop && asked == HostGl::Desktop {
+        return Err(UnservedGl::NotAskedFor);""",
+        'a_desktop_context_is_taken_only_when_asked_for',
+    ),
+    (
+        'a display of ours makes GLES contexts when desktop GL is asked for',
+        'src/vrend/vrend.rs',
+        """                    HostGl::Desktop => (Flavour::Gl, DESKTOP_VERSIONS),""",
+        """                    HostGl::Desktop => (Flavour::Gles, GLES_VERSIONS),""",
+        'the_host_gl_is_the_one_asked_for',
+    ),
+    (
         'a sampler view binds whatever kind of resource its handle names now',
         'src/vrend/context.rs',
         """                (Storage::Texture(_), Span::Levels { .. }) => {}""",

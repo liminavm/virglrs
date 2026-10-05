@@ -18,10 +18,10 @@ use super::caps;
 use super::context::{Context, Fault, Guest, Host, Todo, Unfed};
 use super::current::{Current, GlContext};
 use super::egl::{self, EglError, Flavour, GlContexts, Version, Winsys};
-use super::features::{Feature, Features};
+use super::features::{Api, Feature, Features};
 use super::formats::Table;
-use super::gl::gles::GL_VERSION;
-use super::gl::{self, Gl};
+use super::gl::gles::{GL_CONTEXT_CORE_PROFILE_BIT, GL_CONTEXT_PROFILE_MASK, GL_VERSION};
+use super::gl::{self, GLenum, Gl};
 use super::journal::{Census, Seq};
 use super::pipe::TextureTarget;
 use super::resource::{self, Args, Limits, Refusal, Resource};
@@ -29,7 +29,7 @@ use super::shader;
 use super::tally;
 use super::transfer::{self, Info};
 use super::waiter::{self, Answer, Owed};
-use crate::config::Config;
+use crate::config::{Config, HostGl};
 use crate::decode;
 use crate::guest_mem::{Iov, PixelSource};
 use crate::ids::{BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, RingIdx};
@@ -42,23 +42,43 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub enum InitError {
     Egl(EglError),
-    /// No GLES 3.x context could be made.
+    /// No context of the GL asked for could be made.
     NoContext,
-    /// The context that was made is not GLES, carrying its `GL_VERSION`. Only reachable when
-    /// something else minted it: this renderer asks its own display for GLES and gets it or
-    /// nothing.
-    NotGles(String),
+    /// The context that was made speaks a GL vrend does not run on, carrying its `GL_VERSION`.
+    /// Reachable when something else minted it: a display of ours is asked for the GL this
+    /// renderer runs on, and gives it or nothing.
+    UnservedGl {
+        version: String,
+        why: UnservedGl,
+    },
+}
+
+/// Why a context's GL is not one vrend runs on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnservedGl {
+    /// Desktop GL, which the caller did not ask for: see `Config::host_gl`.
+    NotAskedFor,
+    /// A compatibility-profile context. The C has a leg for one; this renderer does not.
+    Compatibility,
+    /// Desktop GL older than 3.3, the oldest core profile with what vrend's translation needs.
+    TooOld,
 }
 
 impl fmt::Display for InitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InitError::Egl(e) => write!(f, "{e}"),
-            InitError::NoContext => f.write_str("no GLES 3.x context could be created"),
-            InitError::NotGles(v) => write!(
-                f,
-                "the embedder's GL context is {v}, and this renderer translates for GLES only"
-            ),
+            InitError::NoContext => f.write_str("no context of the GL asked for could be created"),
+            InitError::UnservedGl { version, why } => {
+                let why = match why {
+                    UnservedGl::NotAskedFor => {
+                        "desktop GL, which was not asked for (VIRGLRS_DESKTOP_GL=1 asks for it)"
+                    }
+                    UnservedGl::Compatibility => "a compatibility profile, which is not served",
+                    UnservedGl::TooOld => "older than the 3.3 core profile vrend needs",
+                };
+                write!(f, "the GL context is {version}: {why}")
+            }
         }
     }
 }
@@ -214,12 +234,25 @@ impl Throttled {
     }
 }
 
-/// The versions tried, newest first -- the GLES rows of the C's `gl_versions` ladder.
-const VERSIONS: [Version; 3] = [
+/// The versions tried, newest first: the C's `gl_versions` ladder, whose desktop rows stop at the
+/// oldest core profile vrend serves. On a display of ours the flavour picks its half; under an
+/// embedder that may hand back either API, the whole ladder is walked when desktop GL was asked
+/// for, as the C walks it.
+const VERSIONS: [Version; 11] = [
+    Version { major: 4, minor: 6 },
+    Version { major: 4, minor: 5 },
+    Version { major: 4, minor: 4 },
+    Version { major: 4, minor: 3 },
+    Version { major: 4, minor: 2 },
+    Version { major: 4, minor: 1 },
+    Version { major: 4, minor: 0 },
+    Version { major: 3, minor: 3 },
     Version { major: 3, minor: 2 },
     Version { major: 3, minor: 1 },
     Version { major: 3, minor: 0 },
 ];
+const DESKTOP_VERSIONS: &[Version] = VERSIONS.split_at(8).0;
+const GLES_VERSIONS: &[Version] = VERSIONS.split_at(8).1;
 
 /// Why a `RESOURCE_CREATE_BLOB` naming a classic context's blob id was refused.
 ///
@@ -312,11 +345,21 @@ impl Vrend {
         // An embedder's winsys arrives with ctx0 already made and current, because its display is
         // discovered through that context; ours is opened first and asked for one.
         let (winsys, ctx0, version) = match contexts {
-            Some(contexts) => Winsys::embedded(Flavour::Gles, contexts, &VERSIONS)?,
+            Some(contexts) => Winsys::embedded(
+                contexts,
+                match config.host_gl {
+                    HostGl::Gles => GLES_VERSIONS,
+                    HostGl::Desktop => &VERSIONS,
+                },
+            )?,
             None => {
-                let winsys = Winsys::open(Flavour::Gles)?;
+                let (flavour, versions) = match config.host_gl {
+                    HostGl::Gles => (Flavour::Gles, GLES_VERSIONS),
+                    HostGl::Desktop => (Flavour::Gl, DESKTOP_VERSIONS),
+                };
+                let winsys = Winsys::open(flavour)?;
                 let mut made = None;
-                for v in VERSIONS {
+                for &v in versions {
                     if let Ok(c) = winsys.create_context(v, None) {
                         made = Some((c, v));
                         break;
@@ -330,14 +373,11 @@ impl Vrend {
         let gl = Gl::new(winsys.gles());
         let version_string = gl.get_string(GL_VERSION);
         // Whose choice the client API was depends on who minted the context, so it is read back
-        // rather than assumed. A desktop-GL context parses as a plausible GLES number and serves
-        // nothing: `4.6 (Core Profile)` would be read as "GLES 4.6", and every probe below it
-        // would answer about an API this renderer does not translate for.
-        if !version_string.starts_with("OpenGL ES ") {
-            return Err(InitError::NotGles(version_string));
-        }
-        let gles_version = parse_gles_version(&version_string);
-        let mut features = Features::probe(gles_version, gl.extensions());
+        // rather than assumed.
+        let profile = || gl.get_integer(GL_CONTEXT_PROFILE_MASK) as GLenum;
+        let api = host_api(&version_string, profile, config.host_gl)
+            .map_err(|why| InitError::UnservedGl { version: version_string.clone(), why })?;
+        let mut features = Features::probe(api, gl.extensions());
         if !winsys.has_gl_colorspace() {
             features.clear(Feature::srgb_write_control);
         }
@@ -398,7 +438,7 @@ impl Vrend {
             ),
         };
         eprintln!(
-            "[virglrs] vrend: {version_string} (gles {gles_version}), {} formats, {} features, \
+            "[virglrs] vrend: {version_string} ({api}), {} formats, {} features, \
              {}{adoption}",
             formats.entries().count(),
             features.present().count(),
@@ -1622,8 +1662,36 @@ impl Guest for NoGuest {
     }
 }
 
-/// `epoxy_gl_version` for a GLES version string: "OpenGL ES 3.1 Mesa ..." is 31.
-fn parse_gles_version(s: &str) -> u32 {
+/// The GL a context speaks, read back from it -- `epoxy_is_desktop_gl` and `epoxy_gl_version` --
+/// or why vrend will not run on it. A desktop context must not be read as GLES: `4.6 (Core
+/// Profile)` parses as a plausible "GLES 4.6", and every probe after it would answer about an API
+/// the renderer is not translating for.
+///
+/// `profile` is the context's `GL_CONTEXT_PROFILE_MASK`, asked only of a desktop context.
+fn host_api(
+    version_string: &str,
+    profile: impl FnOnce() -> GLenum,
+    asked: HostGl,
+) -> Result<Api, UnservedGl> {
+    let version = parse_version(version_string);
+    if version_string.starts_with("OpenGL ES ") {
+        return Ok(Api::Gles(version));
+    }
+    if asked != HostGl::Desktop {
+        return Err(UnservedGl::NotAskedFor);
+    }
+    if version < 33 {
+        return Err(UnservedGl::TooOld);
+    }
+    // Asked of the context rather than read off the string, which only some vendors spell out.
+    if profile() & GL_CONTEXT_CORE_PROFILE_BIT == 0 {
+        return Err(UnservedGl::Compatibility);
+    }
+    Ok(Api::Gl(version))
+}
+
+/// `epoxy_gl_version` for a version string: "OpenGL ES 3.1 Mesa ..." and "3.1 Mesa ..." are 31.
+fn parse_version(s: &str) -> u32 {
     let rest = s.strip_prefix("OpenGL ES ").unwrap_or(s);
     let mut it = rest.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty());
     let major: u32 = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
@@ -1736,7 +1804,7 @@ mod tests {
         assert!(multisampled(&v.caps) > 0, "and at least one multisampling format");
 
         // Probed again from the same driver, as `Vrend::new` probes it, and then withdrawn.
-        let mut without = Features::probe(v.features.gles_version, v.gl.extensions());
+        let mut without = Features::probe(v.features.api(), v.gl.extensions());
         without.reconcile(&v.gl);
         assert!(without.multisample_textures(), "the re-probe sees what the first probe saw");
         without.clear(Feature::storage_multisample_2d_array);
@@ -2677,11 +2745,30 @@ mod tests {
         v.context_destroy(ctx, &AllAttached);
     }
 
+    /// A desktop context is refused unless desktop GL was asked for, and then only a core profile
+    /// at 3.3 or later. QEMU hands one over by default, and until the desktop leg is whole that
+    /// must stay a refusal it can report, not a renderer running GLES code on desktop GL.
+    #[test]
+    fn a_desktop_context_is_taken_only_when_asked_for() {
+        let core = || GL_CONTEXT_CORE_PROFILE_BIT;
+        let compat = || 0;
+        let es = "OpenGL ES 3.2 Mesa 26.0.0";
+        let desk = "4.6 (Core Profile) Mesa 26.0.0";
+        assert_eq!(host_api(es, core, HostGl::Gles), Ok(Api::Gles(32)));
+        assert_eq!(host_api(es, core, HostGl::Desktop), Ok(Api::Gles(32)), "what arrived rules");
+        assert_eq!(host_api(desk, core, HostGl::Gles), Err(UnservedGl::NotAskedFor));
+        assert_eq!(host_api(desk, core, HostGl::Desktop), Ok(Api::Gl(46)));
+        assert_eq!(host_api(desk, compat, HostGl::Desktop), Err(UnservedGl::Compatibility));
+        assert_eq!(host_api("3.2 Mesa", core, HostGl::Desktop), Err(UnservedGl::TooOld));
+    }
+
     #[test]
     fn the_version_string_parses_the_way_epoxy_reads_it() {
-        assert_eq!(parse_gles_version("OpenGL ES 3.1 Mesa 26.0.0"), 31);
-        assert_eq!(parse_gles_version("OpenGL ES 3.2 Mesa 26.0.0-devel (git-abc)"), 32);
-        assert_eq!(parse_gles_version(""), 0);
+        assert_eq!(parse_version("OpenGL ES 3.1 Mesa 26.0.0"), 31);
+        assert_eq!(parse_version("OpenGL ES 3.2 Mesa 26.0.0-devel (git-abc)"), 32);
+        assert_eq!(parse_version("4.6 (Core Profile) Mesa 25.2.0"), 46);
+        assert_eq!(parse_version("4.6.0 NVIDIA 550.54"), 46);
+        assert_eq!(parse_version(""), 0);
     }
 
     /// A journal reaches a classic context only between `replay_begin` and `replay_end`. Handed
@@ -3381,6 +3468,40 @@ mod tests {
             );
         }
         v.context_destroy(ctx, &AllAttached);
+    }
+
+    /// A display of ours makes contexts in the GL the caller asked for, and init reads back which
+    /// arrived: GLES by default, a core-profile desktop context when desktop is asked for.
+    #[test]
+    fn the_host_gl_is_the_one_asked_for() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let up = |host_gl| {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            v.features.api()
+        };
+        assert!(up(HostGl::Gles).is_gles(), "GLES unless asked otherwise");
+        let desktop = up(HostGl::Desktop);
+        assert!(matches!(desktop, Api::Gl(v) if v >= 33), "a core desktop context: {desktop}");
     }
 
     /// What the vertex stage holds, and the stage of the shader the table holds under handle 3.

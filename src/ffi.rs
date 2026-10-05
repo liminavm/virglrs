@@ -28,7 +28,7 @@ use crate::abi::{
     self, Box3, Callbacks, CreateBlobArgs, DebugCallback, FreeDataCallback, GlCtxParam, GuestIov,
     ImportBlobArgs, LogCallback, ResourceCreateArgs, ResourceInfo, ResourceInfoExt, VmmPtr,
 };
-use crate::config::{CapsetId, Config};
+use crate::config::{CapsetId, Config, HostGl};
 use crate::fence;
 use crate::ids::{BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, RingId, RingIdx};
 use crate::renderer::{self, BlobMem, FdType, ImportDesc, Renderer};
@@ -68,6 +68,10 @@ fn config_of(flags: c_int) -> Config {
         // No flag carries it, so it takes the Rust default and `virgl_renderer_init` lets the
         // environment override it.
         linear_shared: Config::default().linear_shared,
+        // The C runs on desktop GL unless `USE_GLES` asks otherwise; this renderer serves GLES
+        // until its desktop leg is whole, so the flag's absence is honoured only by
+        // `virgl_renderer_init` under `VIRGLRS_DESKTOP_GL=1`.
+        host_gl: HostGl::Gles,
     }
 }
 
@@ -455,6 +459,11 @@ pub extern "C" fn virgl_renderer_init(
     // on unless set to `0`. See `Config::linear_shared`.
     if let Ok(v) = std::env::var("VIRGL_GBM_LAYOUT_ENABLE") {
         config.linear_shared = v != "0";
+    }
+    // Opt-in while the desktop leg is ported: a caller that did not ask for GLES and sets this
+    // gets desktop GL, as the C would give it.
+    if flags & abi::USE_GLES == 0 && std::env::var("VIRGLRS_DESKTOP_GL").as_deref() == Ok("1") {
+        config.host_gl = HostGl::Desktop;
     }
     eprintln!(
         "[virglrs] init flags={flags:#x} cb v{version} -- {}, GL {}{}",
@@ -3076,7 +3085,8 @@ mod tests {
                 vrend: true,
                 guest_vram: false,
                 video: false,
-                linear_shared: true
+                linear_shared: true,
+                host_gl: HostGl::Gles,
             }
         );
 
@@ -3089,7 +3099,8 @@ mod tests {
                 vrend: false,
                 guest_vram: true,
                 video: true,
-                linear_shared: true
+                linear_shared: true,
+                host_gl: HostGl::Gles,
             }
         );
 

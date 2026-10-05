@@ -21,7 +21,7 @@ use super::current::{Current, GlContext};
 use super::decode::Batch;
 use super::dirty::Dirty;
 use super::egl::{self, EglError, Version, Winsys};
-use super::features::{Feature, Features};
+use super::features::{Api, Feature, Features};
 use super::formats::{Description, Table};
 use super::gl::gles::*;
 use super::gl::{
@@ -2127,7 +2127,8 @@ impl Context {
                     let gl = host.gl;
                     gl.framebuffer_parameter_i(GL_FRAMEBUFFER_DEFAULT_WIDTH, width as GLint);
                     gl.framebuffer_parameter_i(GL_FRAMEBUFFER_DEFAULT_HEIGHT, height as GLint);
-                    if host.features.gles_version > 31 {
+                    // GLES 3.1 has no default layer count; every desktop core version does.
+                    if !matches!(host.features.api(), Api::Gles(v) if v <= 31) {
                         gl.framebuffer_parameter_i(GL_FRAMEBUFFER_DEFAULT_LAYERS, layers as GLint);
                     }
                     gl.framebuffer_parameter_i(GL_FRAMEBUFFER_DEFAULT_SAMPLES, samples as GLint);
