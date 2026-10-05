@@ -1958,6 +1958,15 @@ SABOTAGES = [
         'a_desktop_context_is_taken_only_when_asked_for',
     ),
     (
+        'a GLES cursor stored as RGBA is handed over unswapped',
+        'src/vrend/transfer.rs',
+        """        if res.entry(formats).is_some_and(|e| e.stores_bgra_as_rgba()) {
+            swizzle_bgra(""",
+        """        if res.entry(formats).is_some_and(|e| e.stores_bgra_as_rgba()) && false {
+            swizzle_bgra(""",
+        'a_bgra_cursor_reads_back_in_the_order_it_was_written_on_either_flavour',
+    ),
+    (
         'a desktop host refuses pipeline statistics queries',
         'src/vrend/context.rs',
         """            need(Feature::pipeline_statistics_query)?;""",

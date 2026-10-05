@@ -864,6 +864,10 @@ pub fn read_whole_2d(
     }
     if features.api().is_gles() {
         read_layer(gl, features, formats, res, 0, 0, 0, 0, w as GLsizei, h as GLsizei, dst)?;
+        // Stored as RGBA and swapped on upload, so swapped back here, as `read` does.
+        if res.entry(formats).is_some_and(|e| e.stores_bgra_as_rgba()) {
+            swizzle_bgra(&mut dst[..desc.blocks_high(h) as usize * stride]);
+        }
     } else {
         let entry = res.entry(formats).ok_or(Error::Unsupported)?;
         let whole = Box3 { x: 0, y: 0, z: 0, width: w as i32, height: h as i32, depth: 1 };

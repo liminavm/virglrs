@@ -2927,6 +2927,82 @@ mod tests {
         }
     }
 
+    /// A blue-first cursor reads back in the byte order it was written, on either flavour. A
+    /// GLES host stores B8G8R8A8 as RGBA and swaps on upload, so a read that does not swap back
+    /// hands the VMM a pointer with red and blue exchanged.
+    #[test]
+    fn a_bgra_cursor_reads_back_in_the_order_it_was_written_on_either_flavour() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let bgra = super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM");
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let mut v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            let (w, h) = (4u32, 4u32);
+            let res = ResourceHandle::new(1).expect("non-zero");
+            v.resource_create(
+                res,
+                resource::Args {
+                    target: TextureTarget::Texture2d,
+                    format: bgra,
+                    bind: resource::Bind::SAMPLER_VIEW,
+                    width: w,
+                    height: h,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )
+            .expect("a texture");
+            let info = transfer::Info {
+                level: 0,
+                stride: w * 4,
+                layer_stride: w * h * 4,
+                offset: 0,
+                region: crate::vrend::proto::Box3 {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    width: w as i32,
+                    height: h as i32,
+                    depth: 1,
+                },
+                synchronized: false,
+            };
+            // Blue, green, red, alpha: four bytes no swap leaves where they were.
+            let mut written: Vec<u8> = [0x10u8, 0x40, 0xc0, 0xff].repeat((w * h) as usize);
+            let from = [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(written.as_mut_ptr().cast()),
+                len: written.len(),
+            }];
+            let from = Iov::new(&from);
+            v.transfer(None, res, Some(&from), transfer::Through::ToHost(from.source()), &info)
+                .expect("the upload");
+            let cursor = v.cursor_contents(res).expect("a small 2D texture reads back");
+            assert_eq!(&cursor.pixels[..4], &written[..4], "{host_gl:?}: blue first, as written");
+            assert_eq!(cursor.pixels, written, "{host_gl:?}");
+        }
+    }
+
     /// A cursor no framebuffer can read reads back on desktop GL, as the C reads every cursor
     /// there: through `glGetTexImage`, whose compressed form hands the blocks back as stored.
     /// GLES has only the framebuffer, and answers nothing -- the control that says the desktop
@@ -3770,8 +3846,9 @@ mod tests {
         if offered {
             ran.expect("a host that offers the extension renders into the surface");
             let cursor = v.cursor_contents(res).expect("a 16x16 2D texture reads back");
+            // Red in B8G8R8A8's byte order: blue, green, red, alpha.
             assert!(
-                cursor.pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
+                cursor.pixels.as_chunks::<4>().0.iter().all(|p| *p == [0, 0, 0xff, 0xff]),
                 "the clear resolved into the texture: {:?}",
                 &cursor.pixels[..4]
             );
