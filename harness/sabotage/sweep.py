@@ -1992,6 +1992,28 @@ SABOTAGES = [
         'an_unaligned_cursor_reads_back_on_a_fresh_renderer_on_either_flavour',
     ),
     (
+        'a desktop host translates a separable stage as a linked one',
+        'src/vrend/shader/glsl/decl.rs',
+        """                ctx.separable_program = data != 0;""",
+        """                ctx.separable_program = data != 0 && data == 0;""",
+        'separable_stages_draw_as_a_pipeline_on_desktop_gl_and_linked_whole_on_gles',
+    ),
+    (
+        'a pipeline is linked but never bound',
+        'src/vrend/context/draw.rs',
+        """            ProgramObject::Pipeline { pipeline, .. } => gl.use_pipeline(bound, *pipeline),""",
+        """            ProgramObject::Pipeline { .. } => gl.use_program(bound, None),""",
+        'separable_stages_draw_as_a_pipeline_on_desktop_gl_and_linked_whole_on_gles',
+    ),
+    (
+        'a pipeline stage\'s uniforms land in whichever program was active',
+        'src/vrend/context/draw.rs',
+        """            sub.program_at(at).object.activate(gl, stage);
+""",
+        """""",
+        'separable_stages_draw_as_a_pipeline_on_desktop_gl_and_linked_whole_on_gles',
+    ),
+    (
         'a VMM that does not ask for GLES is given GLES anyway',
         'src/ffi.rs',
         """        host_gl: if flags & abi::USE_GLES != 0 { HostGl::Gles } else { HostGl::Desktop },""",

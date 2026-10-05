@@ -3786,14 +3786,19 @@ mod tests {
 
     /// What [`draw_over_target`] draws: a clear of a 16x16 target to `clear`, then -- when there
     /// is a fragment shader -- one triangle covering it, through the evaluation stage when `tess`
-    /// names the levels `SET_TESS_STATE` sends.
+    /// names the levels `SET_TESS_STATE` sends. `vs` replaces the pass-through vertex shader,
+    /// `consts` sets a stage's first constant, and `pipeline`, when given, is told whether the
+    /// host serves separable stages and whether the draw ran a program pipeline.
     struct OneDraw<'a> {
         host_gl: HostGl,
         format: &'a str,
         clear: [f32; 4],
+        vs: Option<&'a str>,
         fs: Option<&'a str>,
+        consts: &'a [(ShaderStage, [f32; 4])],
         logicop: Option<crate::vrend::pipe::LogicOp>,
         tess: Option<f32>,
+        pipeline: Option<&'a std::cell::Cell<Option<PipelineSeen>>>,
     }
 
     /// Draw `d` into a fresh target and read the target back. `Ok(None)` is a host without
@@ -3886,8 +3891,13 @@ mod tests {
                 .map(|f| f.to_bits())
                 .collect();
         let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
-        let (vs, tes, fs) =
-            (tgsi_words(PASS_VS), tgsi_words(PASS_TES), tgsi_words(d.fs.unwrap_or(RED_FS)));
+        let (vs, tes, fs) = (
+            tgsi_words(d.vs.unwrap_or(PASS_VS)),
+            tgsi_words(PASS_TES),
+            tgsi_words(d.fs.unwrap_or(RED_FS)),
+        );
+        let consts: Vec<(ShaderStage, Vec<u32>)> =
+            d.consts.iter().map(|(s, c)| (*s, c.map(f32::to_bits).to_vec())).collect();
         fn shader(stage: ShaderStage, text: &[u32]) -> Object<'_> {
             Object::Shader(ShaderCreate {
                 stage,
@@ -3975,6 +3985,9 @@ mod tests {
         if let Some(level) = d.tess {
             commands.push(Command::SetTessState([level; 6]));
         }
+        for (stage, data) in &consts {
+            commands.push(Command::SetConstantBuffer { stage: *stage, index: 0, data });
+        }
         let draw = d.fs.is_some();
         commands.extend(draw.then(|| {
             Command::DrawVbo(Draw {
@@ -4009,12 +4022,72 @@ mod tests {
             }
             Err(e) => Err(e),
             Ok(()) => {
+                // Asked of the sub-context's GL context, which the draw left current.
+                if let Some(p) = d.pipeline {
+                    let bound =
+                        v.gl.get_integer(crate::vrend::gl::gles::GL_PROGRAM_PIPELINE_BINDING);
+                    let served = v.shader_cfg.serves_separable();
+                    p.set(Some(PipelineSeen { served, bound: bound != 0 }));
+                }
                 let cursor = v.cursor_contents(target).expect("a 16x16 2D texture reads back");
                 Ok(Some(cursor.pixels))
             }
         };
         v.context_destroy(ctx, &AllAttached);
         out
+    }
+
+    /// Whether a host serves separable stages, and whether a draw ran a program pipeline.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct PipelineSeen {
+        served: bool,
+        bound: bool,
+    }
+
+    /// Separable stages run as a pipeline of their own programs on desktop GL with pipelines,
+    /// as the C runs them, and are linked whole elsewhere: GLES serves no separable program, and
+    /// a desktop host without pipelines never advertised them. Either way each stage's constant
+    /// reaches its own stage: green from the vertex shader through a generic, red added in the
+    /// fragment shader, so yellow -- where a constant written into the wrong stage's program
+    /// leaves one of the two out.
+    #[test]
+    fn separable_stages_draw_as_a_pipeline_on_desktop_gl_and_linked_whole_on_gles() {
+        const SEPARABLE_VS: &str = "VERT\nPROPERTY SEPARABLE_PROGRAM 1\nDCL IN[0]\n\
+                                    DCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL CONST[0]\n  \
+                                    0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], CONST[0]\n  2: END\n";
+        const SEPARABLE_FS: &str = "FRAG\nPROPERTY SEPARABLE_PROGRAM 1\n\
+                                    DCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n\
+                                    DCL CONST[0]\n  0: ADD OUT[0], IN[0], CONST[0]\n  1: END\n";
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let pipeline = std::cell::Cell::new(None);
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                vs: Some(SEPARABLE_VS),
+                fs: Some(SEPARABLE_FS),
+                consts: &[
+                    (ShaderStage::Vertex, [0.0, 1.0, 0.0, 0.5]),
+                    (ShaderStage::Fragment, [1.0, 0.0, 0.0, 0.5]),
+                ],
+                clear: [0.0; 4],
+                logicop: None,
+                tess: None,
+                pipeline: Some(&pipeline),
+            })
+            .expect("the draw runs")
+            .expect("no tessellation asked for");
+            assert!(
+                pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0xff, 0, 0xff]),
+                "{host_gl:?}: both stages' constants reached the target: {:?}",
+                &pixels[..4]
+            );
+            let seen = pipeline.get().expect("the draw ran");
+            assert_eq!(seen.bound, seen.served, "{host_gl:?}: a pipeline where it is served");
+            if host_gl == HostGl::Gles {
+                assert!(!seen.served, "GLES serves no separable stage");
+            }
+            eprintln!("{host_gl:?}: separable stages served: {}", seen.served);
+        }
     }
 
     /// An evaluation shader with no control shader is a valid guest pipeline. GLES will not link
@@ -4031,6 +4104,9 @@ mod tests {
                     format: "R8G8B8A8_UNORM",
                     clear: [0.0; 4],
                     fs: Some(RED_FS),
+                    vs: None,
+                    consts: &[],
+                    pipeline: None,
                     logicop: None,
                     tess: Some(level),
                 })
@@ -4068,6 +4144,9 @@ mod tests {
                 format: "R8G8B8A8_UNORM",
                 clear: [0.0; 4],
                 fs: Some(RED_ALL_CBUFS_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
                 logicop: Some(crate::vrend::pipe::LogicOp::Set),
                 tess: None,
             })
@@ -4088,6 +4167,9 @@ mod tests {
             format: "A8_UNORM",
             clear: [0.0; 4],
             fs: Some(OPAQUE_BLACK_FS),
+            vs: None,
+            consts: &[],
+            pipeline: None,
             logicop: None,
             tess: None,
         })
@@ -4106,6 +4188,9 @@ mod tests {
             format: "A8_UNORM",
             clear: [0.0, 0.0, 0.0, 1.0],
             fs: None,
+            vs: None,
+            consts: &[],
+            pipeline: None,
             logicop: None,
             tess: None,
         })

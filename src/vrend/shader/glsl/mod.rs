@@ -1268,6 +1268,7 @@ mod tests {
             has_texture_shadow_lod: false,
             has_vs_layer: false,
             has_vs_viewport_index: false,
+            has_separate_shader_objects: false,
         }
     }
 
@@ -1290,6 +1291,7 @@ mod tests {
             has_texture_shadow_lod: true,
             has_vs_layer: true,
             has_vs_viewport_index: true,
+            has_separate_shader_objects: true,
         }
     }
 

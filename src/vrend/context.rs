@@ -26,8 +26,8 @@ use super::formats::{Description, Table};
 use super::gl::gles::*;
 use super::gl::{
     BindingPoint, BoundProgram, BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei,
-    GLuint, Gl, ImageUnit, Immutable, ProgramName, QueryName, SamplerName, ShaderName, TextureName,
-    TextureUnit, TransformFeedbackName, UniformLocation, VertexArrayName,
+    GLuint, Gl, ImageUnit, Immutable, PipelineName, ProgramName, QueryName, SamplerName,
+    ShaderName, TextureName, TextureUnit, TransformFeedbackName, UniformLocation, VertexArrayName,
 };
 use super::journal::{self, Census, Entry, Retained, Seq, StateKey, Step, order, state_key};
 use super::pipe::slots::{
@@ -1086,7 +1086,7 @@ impl SubContext {
             if let Some(b) = p.sysval_buffer {
                 gl.delete_buffer(b);
             }
-            gl.delete_program(bound, p.id);
+            p.object.delete(gl, bound);
         }
         let objects: Vec<Object> = self.objects.drain().collect();
         for obj in objects {
@@ -2840,6 +2840,17 @@ impl Context {
     /// the text completes. A program the translator refuses is destroyed with its handle, as
     /// the C destroys it.
     fn select_new(&mut self, host: &mut Host<'_>, handle: ObjectHandle) -> Result<(), Fault> {
+        // `vrend_finish_shader`: what the selector says of its separability until its first
+        // translation says it instead.
+        let cfg = host.shader_cfg;
+        if cfg.serves_separable()
+            && let Some(Object::Shader(shader)) = self.sub_mut().objects.get_mut(&handle)
+            && shader.stage != ShaderStage::Compute
+            && let ShaderText::Whole(program) = &mut shader.text
+        {
+            program.translated.info.separable_program =
+                shader::query_separable_program(&program.tgsi.shader, cfg);
+        }
         if let Err(e) = self.select_object(host, Cmd::CreateObject, handle) {
             self.destroy_object(host, handle);
             return Err(e);

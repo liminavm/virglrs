@@ -587,8 +587,19 @@ fn emit_ios_generic(
     }
     let precise = if io.precise { "precise" } else { "" };
     let invariant = if io.invariant { "invariant" } else { "" };
+    // A separable stage meets its neighbours by location, not by name: generics count down from
+    // 31 so they cannot meet the patches, which count up. A fragment output is not an interface.
+    let layout = if ctx.separable_program
+        && io.name == Semantic::Generic
+        && !(ctx.prog_type == Processor::Fragment && inout != "in")
+    {
+        format!("layout(location = {}) ", 31 - io.sid as i32)
+    } else {
+        String::new()
+    };
 
     if io.first == io.last {
+        ctx.bufs.hdr(&layout);
         // Ugly: spaces are left to patch the interpolation in later.
         hdr!(
             ctx.bufs,
@@ -633,6 +644,7 @@ fn emit_ios_generic(
             let block = blockname(stage_prefix, io);
             let blockvar = blockvarname(stage_prefix, io, postfix);
             hdr!(ctx.bufs, "{} {} {{\n", inout, block);
+            ctx.bufs.hdr(&layout);
             hdr!(
                 ctx.bufs,
                 "{}{}\n{}     {} {}[{}]; \n}} {};\n",
@@ -645,6 +657,7 @@ fn emit_ios_generic(
                 blockvar
             );
         } else {
+            ctx.bufs.hdr(&layout);
             hdr!(
                 ctx.bufs,
                 "{}{}\n{}       {} {} {}{}[{}];\n",
@@ -777,9 +790,13 @@ fn emit_ios_generic_outputs(ctx: &mut Context<'_>, can_emit_generic: fn(&Io) -> 
     }
 }
 
-/// `emit_ios_patch`.
+/// `emit_ios_patch`. A separable stage gives each patch its location, counting up from the
+/// patch's index, where the generics count down from 31.
 fn emit_ios_patch(ctx: &mut Context<'_>, prefix: &str, io: &Io, inout: &str, size: i32) -> u64 {
     let mut emitted_patches = 0u64;
+    if ctx.separable_program {
+        hdr!(ctx.bufs, "layout(location = {}) ", io.sid);
+    }
     if io.last == io.first {
         hdr!(ctx.bufs, "{} {} vec4 {};\n", prefix, inout, io.glsl_name);
         emitted_patches |= bit64(io.sid);
@@ -1359,6 +1376,10 @@ fn emit_match_interfaces(
         let i = mask.trailing_zeros();
         mask &= mask - 1;
         emit_interp_info(ctx, semantic, i);
+        // The C's own numbering here, which is not the 31-down the declared generics take.
+        if semantic == Semantic::Generic && ctx.separable_program {
+            hdr!(ctx.bufs, "layout(location={}) ", i);
+        }
         hdr!(
             ctx.bufs,
             "out vec4 {}_{}{}{};\n",

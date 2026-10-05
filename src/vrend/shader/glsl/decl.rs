@@ -1095,10 +1095,11 @@ pub(super) fn iter_property(ctx: &mut Context<'_>, prop: &PropertyToken) -> Resu
             }
         }
         Property::SeparableProgram => {
-            // GLES is strict about how separable interfaces match -- it refuses, for one,
-            // an input without a matching output -- so separable programs stay off there. The
-            // C serves them on desktop GL through program pipelines, which this renderer does
-            // not have: every program is linked whole, which serves a separable one too.
+            if ctx.cfg.serves_separable() {
+                ctx.separable_program = data != 0;
+                ctx.shader_req_bits |= req::SEPERATE_SHADER_OBJECTS;
+                ctx.shader_req_bits |= req::EXPLICIT_ATTRIB_LOCATION;
+            }
         }
         other => {
             return fail(format!("Unhandled property: {:x}", other as u8));

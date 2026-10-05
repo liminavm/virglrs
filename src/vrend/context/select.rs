@@ -14,8 +14,8 @@
 //! and a key filled differently from the C is a different shader on the screen.
 //!
 //! `use_core_profile` is set on both flavours and `use_integer` on neither, so the signed and
-//! unsigned attribute masks stay clear; and `separable_program` is never set, so every stage's
-//! interface is matched against its neighbours.
+//! unsigned attribute masks stay clear. Two separable stages meet by location and are not
+//! matched against each other; every other pair is.
 
 use super::*;
 
@@ -59,6 +59,19 @@ pub struct Variant {
     pub var_info: shader::VarInfo,
     /// The compiled shader, once a program has been assembled with it.
     pub gl: Option<ShaderName>,
+    /// A separable stage's own program, linked at its compile, which every pipeline the stage
+    /// serves names.
+    pub separate: Option<Separate>,
+}
+
+/// `vrend_shader`'s `program_id` and `last_pipeline_id`: a separable variant's program, and the
+/// pipeline whose numbering its block bindings hold.
+pub struct Separate {
+    pub program: ProgramName,
+    /// Which program last numbered this one's uniform blocks. Pipelines sharing the stage number
+    /// them from different places, so a pipeline finding another's numbering here binds its own
+    /// again. A serial is never reused, so one that died names nothing that can match.
+    pub blocks_bound_for: Cell<Option<draw::ProgramSerial>>,
 }
 
 /// The control stage this host injects ahead of an evaluation shader the guest bound with none,
@@ -284,6 +297,21 @@ impl SubContext {
         self.bound_tgsi(stage).map(|p| &p.translated)
     }
 
+    /// Whether the shader being selected -- `handle` from the table, or the one bound at
+    /// `stage` -- is separable: the C's `sel->sinfo.separable_program`.
+    fn selected_separable(&self, handle: Option<ObjectHandle>, stage: ShaderStage) -> bool {
+        let program = match handle {
+            Some(h) => match self.objects.get(&h) {
+                Some(Object::Shader(Shader { text: ShaderText::Whole(p), .. })) => {
+                    Some(&p.translated)
+                }
+                _ => None,
+            },
+            None => self.bound_program(stage),
+        };
+        program.is_some_and(|p| p.info.separable_program)
+    }
+
     /// The guest's program bound at `stage`, when its text is whole.
     fn bound_tgsi(&self, stage: ShaderStage) -> Option<&Program> {
         let shader = match self.shaders[stage.index()].as_ref()? {
@@ -334,14 +362,18 @@ impl SubContext {
                 _ => {}
             }
         }
+        let separable = self.selected_separable(handle, stage);
         let prev = prev_type.and_then(|t| self.bound_program(t).map(|p| (t, p)));
         if let Some((_, prev)) = prev {
-            key.require_input_arrays = prev.info.has_output_arrays;
-            key.in_generic_expected_mask = prev.info.out_generic_emitted_mask;
-            key.in_texcoord_expected_mask = u64::from(prev.info.out_texcoord_emitted_mask);
-            key.in_patch_expected_mask = prev.info.out_patch_emitted_mask;
-            key.in_arrays = prev.info.output_arrays.clone();
-            key.force_invariant_inputs = prev.info.invariant_outputs;
+            // Two separable stages meet by location: neither is translated to the other.
+            if !prev.info.separable_program || !separable {
+                key.require_input_arrays = prev.info.has_output_arrays;
+                key.in_generic_expected_mask = prev.info.out_generic_emitted_mask;
+                key.in_texcoord_expected_mask = u64::from(prev.info.out_texcoord_emitted_mask);
+                key.in_patch_expected_mask = prev.info.out_patch_emitted_mask;
+                key.in_arrays = prev.info.output_arrays.clone();
+                key.force_invariant_inputs = prev.info.invariant_outputs;
+            }
             key.ssbo_binding_offset = (prev.info.ssbo_last_binding + 1) as u8;
             key.image_binding_offset = (prev.info.image_last_binding + 1) as u8;
             let var = prev.current_var_info();
@@ -401,6 +433,7 @@ impl SubContext {
         }
         if let Some(next_type) = next_type
             && let Some(next) = self.bound_program(next_type)
+            && (!next.info.separable_program || !separable)
         {
             key.use_pervertex_in = next.info.use_pervertex_in;
             key.require_output_arrays = next.info.has_input_arrays;
@@ -535,7 +568,10 @@ fn translate(
                 eprint!("GLSL:\n{}\n", strings.source());
             }
             program.translated.info = info;
-            program.translated.variants.insert(0, Variant { id, key, strings, var_info, gl: None });
+            program
+                .translated
+                .variants
+                .insert(0, Variant { id, key, strings, var_info, gl: None, separate: None });
             Ok(())
         }
         Err(error) => {
@@ -718,8 +754,14 @@ impl Context {
         let sub = self.sub_mut();
         let id = sub.mint_variant_id();
         let key = made_from.key.clone();
-        let mut variant =
-            Variant { id, key, strings, var_info: shader::VarInfo::default(), gl: None };
+        let mut variant = Variant {
+            id,
+            key,
+            strings,
+            var_info: shader::VarInfo::default(),
+            gl: None,
+            separate: None,
+        };
         if !compile(host.gl, stage, &mut variant) {
             return Err(Fault::Shader {
                 cmd,
@@ -734,14 +776,17 @@ impl Context {
     }
 
     /// `vrend_compile_shader` on the current variant of the shader bound at `stage`, when it has
-    /// no GL shader yet. Answers whether it compiled one.
+    /// no GL shader yet -- and, for a separable stage on a host with pipelines, its own program
+    /// linked. Answers whether it compiled one.
     fn compile_bound(
         &mut self,
-        host: &Host<'_>,
+        host: &mut Host<'_>,
         cmd: Cmd,
         stage: ShaderStage,
     ) -> Result<bool, Fault> {
         let gl = host.gl;
+        let separable_host = host.shader_cfg.serves_separable();
+        let dual_src = self.sub().blend.as_ref().is_some_and(|b| draw::blend_is_dual(b, 0));
         let Some(shader) = self.sub_mut().bound_shader_mut(stage) else {
             return Ok(false);
         };
@@ -756,6 +801,13 @@ impl Context {
         }
         if !compile(gl, stage, current) {
             return Err(Fault::Shader { cmd, what: "a shader the driver refused to compile" });
+        }
+        if separable_host && program.translated.info.separable_program {
+            let compiled = current.gl.expect("compiled a moment ago");
+            let info = &program.translated.info;
+            let made = draw::link_separable(host, cmd, stage, info, compiled, dual_src)?;
+            let current = program.translated.variants.first_mut().expect("compiled a moment ago");
+            current.separate = Some(Separate { program: made, blocks_bound_for: Cell::new(None) });
         }
         Ok(true)
     }

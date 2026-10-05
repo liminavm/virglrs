@@ -142,12 +142,23 @@ pub struct Config {
     pub has_texture_shadow_lod: bool,
     pub has_vs_layer: bool,
     pub has_vs_viewport_index: bool,
+    /// Program pipelines, which a separable stage needs to run as one. The C translates a
+    /// separable stage on any desktop host; one without pipelines never advertised them, and
+    /// translates and links the stage as any other.
+    pub has_separate_shader_objects: bool,
 }
 
 impl Config {
     /// The C's `cfg->use_gles`.
     pub fn is_gles(&self) -> bool {
         self.dialect == Dialect::Es
+    }
+
+    /// Whether a stage the guest marks separable is translated and run as one: on desktop GL
+    /// with program pipelines. GLES is strict about how separable interfaces match -- it
+    /// refuses, for one, an input without a matching output -- so the C serves none there.
+    pub fn serves_separable(&self) -> bool {
+        !self.is_gles() && self.has_separate_shader_objects
     }
 
     /// The C's `shader_cfg` fill at context creation, from the probed features and limits and
@@ -175,6 +186,7 @@ impl Config {
             has_texture_shadow_lod: has(Feature::texture_shadow_lod),
             has_vs_layer: has(Feature::vs_layer_viewport),
             has_vs_viewport_index: has(Feature::vs_viewport_index),
+            has_separate_shader_objects: has(Feature::separate_shader_objects),
         }
     }
 }
@@ -421,6 +433,58 @@ impl Info {
             .find(|a| index >= a.first && index < a.first + a.array_size)
             .map_or(-1, |a| a.first)
     }
+}
+
+/// `vrend_shader_query_separable_program`: whether the guest marked `shader` separable and its
+/// interface can be matched by location. Generics count down from 31 and patches up from 0, so
+/// the two ranges must not meet; and the semantics GLSL matches only by name cannot be
+/// guaranteed in every stage of a separable program, so a shader using one is not.
+///
+/// What a stage's selector says before its first translation: the translation then writes
+/// the property alone, as the C's `fill_sinfo` overwrites this.
+pub fn query_separable_program(shader: &tgsi::Shader, cfg: &Config) -> bool {
+    use tgsi::{File, Processor, Token};
+    let mut separable = false;
+    let mut unsupported_io = false;
+    // The C keeps these in bytes, and a semantic index past one wraps there too.
+    let (mut generic_in, mut patch_in, mut generic_out, mut patch_out) = (0u8, 0u8, 0u8, 0u8);
+    for token in &shader.tokens {
+        match token {
+            Token::Property(p) if p.name == tgsi::Property::SeparableProgram => {
+                separable = p.data != 0;
+            }
+            Token::Declaration(d) => {
+                // Vertex inputs and fragment outputs are not interfaces.
+                if (d.file == File::Input && shader.processor == Processor::Vertex)
+                    || (d.file == File::Output && shader.processor == Processor::Fragment)
+                {
+                    continue;
+                }
+                let index = d.semantic.index as u8;
+                let input = d.file == File::Input;
+                match d.semantic.name {
+                    Semantic::Patch if input => patch_in = patch_in.max(index),
+                    Semantic::Patch => patch_out = patch_out.max(index),
+                    Semantic::Generic if input => generic_in = generic_in.max(index),
+                    Semantic::Generic => generic_out = generic_out.max(index),
+                    Semantic::Color
+                    | Semantic::ClipVertex
+                    | Semantic::BColor
+                    | Semantic::TexCoord
+                    | Semantic::Fog => unsupported_io = true,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let max_varying = glsl::MAX_VARYING;
+    let supports = !unsupported_io
+        && u32::from(generic_in) + u32::from(patch_in) < max_varying
+        && u32::from(generic_out) + u32::from(patch_out) < max_varying
+        && u32::from(patch_in) < cfg.max_shader_patch_varyings
+        && u32::from(patch_out) < cfg.max_shader_patch_varyings;
+    separable && supports
 }
 
 /// `vrend_variable_shader_info`: what a translation tells the renderer that depends on the

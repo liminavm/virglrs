@@ -210,12 +210,70 @@ impl Linkage {
     }
 }
 
+/// What a draw runs: the stages linked into one program, or -- where every stage is separable
+/// -- a pipeline of the stages' own programs, as the C's `is_pipeline` chooses.
+///
+/// A uniform belongs to the program its stage lives in, so every lookup and every write goes
+/// through [`ProgramObject::of`] and [`ProgramObject::activate`]: which program that is, is this
+/// value's answer and nobody else's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProgramObject {
+    Linked(ProgramName),
+    Pipeline {
+        pipeline: PipelineName,
+        /// Each stage's own program, `None` for a stage the pipeline does not have.
+        stages: [Option<ProgramName>; ShaderStage::COUNT],
+    },
+}
+
+impl ProgramObject {
+    /// The program holding `stage`'s uniforms and blocks.
+    ///
+    /// Asked only for a stage the program links, by the walks over those stages: anything else
+    /// is a host invariant broken.
+    pub fn of(&self, stage: ShaderStage) -> ProgramName {
+        match self {
+            ProgramObject::Linked(p) => *p,
+            ProgramObject::Pipeline { stages, .. } => {
+                stages[stage.index()].expect("a pipeline asked for a stage it does not hold")
+            }
+        }
+    }
+
+    /// `vrend_set_active_pipeline_stage`: make `stage`'s program the one `glUniform*` writes to.
+    /// A linked program is already that program, so there is nothing to do.
+    pub fn activate(&self, gl: &Gl, stage: ShaderStage) {
+        if let ProgramObject::Pipeline { pipeline, stages } = self
+            && let Some(program) = stages[stage.index()]
+        {
+            gl.active_shader_program(*pipeline, program);
+        }
+    }
+
+    /// `vrend_use_program`.
+    pub fn use_in(&self, gl: &Gl, bound: &mut BoundProgram) {
+        match self {
+            ProgramObject::Linked(p) => gl.use_program(bound, Some(*p)),
+            ProgramObject::Pipeline { pipeline, .. } => gl.use_pipeline(bound, *pipeline),
+        }
+    }
+
+    /// The program or the pipeline, deleted. A pipeline's stage programs are their variants',
+    /// which outlive it and are deleted with them.
+    pub fn delete(self, gl: &Gl, bound: &mut BoundProgram) {
+        match self {
+            ProgramObject::Linked(p) => gl.delete_program(bound, p),
+            ProgramObject::Pipeline { pipeline, .. } => gl.delete_program_pipeline(bound, pipeline),
+        }
+    }
+}
+
 /// `vrend_linked_shader_program`: the variants of the bound stages linked into one GL program,
 /// and every location the draw path writes through.
 pub struct LinkedProgram {
     /// Names this program in the sub-context's list; stable while the program lives.
     pub serial: ProgramSerial,
-    pub id: ProgramName,
+    pub object: ProgramObject,
     pub linkage: Linkage,
     pub ubo_used_mask: [u32; ShaderStage::COUNT],
     pub samplers_used_mask: [u32; ShaderStage::COUNT],
@@ -245,10 +303,10 @@ pub struct LinkedProgram {
 
 impl LinkedProgram {
     /// A program with nothing looked up yet.
-    fn new(serial: ProgramSerial, id: ProgramName, linkage: Linkage) -> LinkedProgram {
+    fn new(serial: ProgramSerial, object: ProgramObject, linkage: Linkage) -> LinkedProgram {
         LinkedProgram {
             serial,
-            id,
+            object,
             linkage,
             ubo_used_mask: [0; ShaderStage::COUNT],
             samplers_used_mask: [0; ShaderStage::COUNT],
@@ -283,7 +341,7 @@ impl LinkedProgram {
     /// `bind_const_locs`, `bind_image_locs` and `bind_ssbo_locs` for one stage.
     fn bind_resource_locs(&mut self, gl: &Gl, features: &Features, l: &Linked<'_>) {
         let s = l.stage.index();
-        let id = self.id;
+        let id = self.object.of(l.stage);
         let prefix = stage_prefix(l.stage);
         if l.info.num_consts > 0 {
             self.const_location[s] = gl.get_uniform_location(id, &format!("{prefix}const0"));
@@ -329,24 +387,29 @@ impl LinkedProgram {
     fn bind_sampler_and_ubo_locs(
         &mut self,
         gl: &Gl,
-        l: &Linked<'_>,
+        stage: ShaderStage,
+        info: &shader::Info,
         mut next_ubo_id: BindingPoint,
     ) -> BindingPoint {
-        let s = l.stage.index();
-        let id = self.id;
-        let prefix = stage_prefix(l.stage);
-        let mut mask = l.info.samplers_used_mask;
+        let s = stage.index();
+        let id = self.object.of(stage);
+        let prefix = stage_prefix(stage);
+        self.object.activate(gl, stage);
+        self.sampler_locs[s].clear();
+        self.shadow_samp_mask_locs[s].clear();
+        self.shadow_samp_add_locs[s].clear();
+        let mut mask = info.samplers_used_mask;
         while mask != 0 {
             let i = mask.trailing_zeros() as i32;
             mask &= mask - 1;
-            let name = if !l.info.sampler_arrays.is_empty() {
-                let first = l.info.lookup_sampler_array(i);
+            let name = if !info.sampler_arrays.is_empty() {
+                let first = info.lookup_sampler_array(i);
                 format!("{prefix}samp{first}[{}]", i - first)
             } else {
                 format!("{prefix}samp{i}")
             };
             self.sampler_locs[s].push(gl.get_uniform_location(id, &name));
-            let (mask_loc, add_loc) = if l.info.shadow_samp_mask & (1 << i) != 0 {
+            let (mask_loc, add_loc) = if info.shadow_samp_mask & (1 << i) != 0 {
                 (
                     gl.get_uniform_location(id, &format!("{prefix}shadmask{i}")),
                     gl.get_uniform_location(id, &format!("{prefix}shadadd{i}")),
@@ -357,13 +420,13 @@ impl LinkedProgram {
             self.shadow_samp_mask_locs[s].push(mask_loc);
             self.shadow_samp_add_locs[s].push(add_loc);
         }
-        self.samplers_used_mask[s] = l.info.samplers_used_mask;
-        self.shadow_samp_mask[s] = l.info.shadow_samp_mask;
-        let mut mask = l.info.ubo_used_mask;
+        self.samplers_used_mask[s] = info.samplers_used_mask;
+        self.shadow_samp_mask[s] = info.shadow_samp_mask;
+        let mut mask = info.ubo_used_mask;
         while mask != 0 {
             let i = mask.trailing_zeros();
             mask &= mask - 1;
-            let name = if l.info.ubo_indirect {
+            let name = if info.ubo_indirect {
                 format!("{prefix}ubo[{}]", i.wrapping_sub(1) as i32)
             } else {
                 format!("{prefix}ubo{i}")
@@ -373,8 +436,51 @@ impl LinkedProgram {
             }
             next_ubo_id = next_ubo_id.next();
         }
-        self.ubo_used_mask[s] = l.info.ubo_used_mask;
+        self.ubo_used_mask[s] = info.ubo_used_mask;
         next_ubo_id
+    }
+
+    /// `rebind_ubo_and_sampler_locs`, with `bind_virgl_block_loc` after it: every stage's
+    /// sampler locations and block bindings, numbered through the stages in the C's order, then
+    /// the `VirglBlock` at the binding after the last.
+    ///
+    /// Block bindings are a program's state, and a separable stage's program is shared by every
+    /// pipeline it serves -- each numbering it from where the stages before it end -- so a
+    /// pipeline found again runs this again when another pipeline bound its stages since.
+    fn rebind_ubo_and_sampler_locs(&mut self, gl: &Gl, walk: &[(ShaderStage, &shader::Info)]) {
+        let mut next_ubo_id = BindingPoint::FIRST;
+        for (stage, info) in walk {
+            next_ubo_id = self.bind_sampler_and_ubo_locs(gl, *stage, info, next_ubo_id);
+        }
+        self.virgl_block_bind = None;
+        for (stage, _) in walk {
+            let id = self.object.of(*stage);
+            let Some(block) = gl.get_uniform_block_index(id, "VirglBlock") else {
+                continue;
+            };
+            let mut created = false;
+            if self.virgl_block_bind.is_none() {
+                self.virgl_block_bind = Some(next_ubo_id);
+                if self.sysval_buffer.is_none() {
+                    self.sysval_buffer = Some(gl.gen_buffer());
+                    created = true;
+                }
+            }
+            let bind = self.virgl_block_bind.expect("set a moment ago");
+            self.object.activate(gl, *stage);
+            gl.uniform_block_binding(id, block, bind);
+            let size = gl.uniform_block_data_size(id, block);
+            assert!(
+                size as usize >= Sysval::SIZE,
+                "the VirglBlock the shader declares holds the sysval block"
+            );
+            if created {
+                let buf = self.sysval_buffer.expect("made a moment ago");
+                gl.bind_buffer(GL_UNIFORM_BUFFER, Some(buf));
+                gl.buffer_data_null(GL_UNIFORM_BUFFER, size as usize, GL_DYNAMIC_DRAW);
+                gl.bind_buffer(GL_UNIFORM_BUFFER, None);
+            }
+        }
     }
 }
 
@@ -574,7 +680,7 @@ fn conv_dst_blend(f: BlendFactor) -> BlendFactor {
 }
 
 /// `util_blend_state_is_dual`: whether target `i` reads a second colour output.
-fn blend_is_dual(state: &BlendState, i: usize) -> bool {
+pub(super) fn blend_is_dual(state: &BlendState, i: usize) -> bool {
     let Some(eq) = state.rt[i].equation else {
         return false;
     };
@@ -705,6 +811,35 @@ struct Linked<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ProgramSerial(u64);
 
+/// A found pipeline whose stages another pipeline numbered since: the stages and what they
+/// declared, to number again. `None` for a program that needs nothing.
+fn stale_block_bindings<'a>(
+    prog: &LinkedProgram,
+    linked: &[Linked<'a>],
+) -> Option<Vec<(ShaderStage, &'a shader::Info)>> {
+    let ProgramObject::Pipeline { .. } = prog.object else {
+        return None;
+    };
+    let last = prog.linkage.last_stage();
+    let walk: Vec<&Linked<'a>> = C_STAGE_ORDER
+        .iter()
+        .filter(|s| s.index() <= last.index())
+        .filter_map(|s| linked.iter().find(|l| l.stage == *s))
+        .collect();
+    let stale = walk.iter().any(|l| {
+        l.variant.separate.as_ref().is_some_and(|s| s.blocks_bound_for.get() != Some(prog.serial))
+    });
+    if !stale {
+        return None;
+    }
+    for l in &walk {
+        if let Some(separate) = &l.variant.separate {
+            separate.blocks_bound_for.set(Some(prog.serial));
+        }
+    }
+    Some(walk.iter().map(|l| (l.stage, l.info)).collect())
+}
+
 impl SubContext {
     /// The next name, taken through a `Cell` so minting one does not need the whole
     /// sub-context: the program being named is built from a borrow of it.
@@ -775,7 +910,7 @@ impl SubContext {
                 if let Some(b) = p.sysval_buffer {
                     gl.delete_buffer(b);
                 }
-                gl.delete_program(bound, p.id);
+                p.object.delete(gl, bound);
             } else {
                 i += 1;
             }
@@ -805,14 +940,107 @@ pub(super) fn release_variants(
 ) {
     for v in variants {
         sub.forget_programs_of(gl, bound, v.id);
+        if let Some(separate) = v.separate {
+            gl.delete_program(bound, separate.program);
+        }
         if let Some(name) = v.gl {
             gl.delete_shader(name);
         }
     }
 }
 
-/// `add_shader_program`, the non-separable leg: the bound stages' variants linked into one
-/// program, with every location the draw path will write through looked up once.
+/// The fragment outputs' locations, told to `program` before its link. Answers whether the
+/// program is linked for dual-source blending, which it is when the blend asks for it and the
+/// shader has the second output to give.
+fn bind_fragment_outputs(
+    gl: &Gl,
+    features: &Features,
+    cmd: Cmd,
+    program: ProgramName,
+    fs: &shader::Info,
+    dual_src: bool,
+) -> Result<bool, Fault> {
+    if fs.num_outputs <= 1 {
+        return Ok(false);
+    }
+    if dual_src {
+        if !features.has(Feature::dual_src_blend) {
+            return Err(Fault::Shader { cmd, what: "dual-source blending the host lacks" });
+        }
+        gl.bind_frag_data_location_indexed(program, 0, 0, "fsout_c0");
+        gl.bind_frag_data_location_indexed(program, 0, 1, "fsout_c1");
+    } else if !features.api().is_gles() && features.has(Feature::dual_src_blend) {
+        // GLES shaders carry their output layout themselves; a desktop one is told it here.
+        for (i, &layout) in fs.fs_output_layout.iter().enumerate() {
+            if i < fs.num_outputs as usize && layout >= 0 {
+                let name = format!("fsout_c{layout}");
+                gl.bind_frag_data_location_indexed(program, layout as GLuint, 0, &name);
+            }
+        }
+    }
+    Ok(dual_src)
+}
+
+/// The vertex inputs' locations, told to `program` before its link, where the host binds
+/// attributes by location.
+fn bind_attrib_locations(gl: &Gl, features: &Features, program: ProgramName, vs: &shader::Info) {
+    if features.has(Feature::gles31_vertex_attrib_binding) {
+        let mut mask = vs.attrib_input_mask;
+        while mask != 0 {
+            let i = mask.trailing_zeros();
+            mask &= mask - 1;
+            gl.bind_attrib_location(program, i, &format!("in_{i}"));
+        }
+    }
+}
+
+/// `vrend_compile_shader`'s separable half and `vrend_link_separable_shader`: a separable
+/// stage's own program, made from its compiled shader and linked at once, so every pipeline it
+/// serves names a program that is ready. What the link fixes -- stream output, fragment output
+/// locations, attribute locations -- is fixed for the stage's life, as the C's is from its first
+/// link on.
+pub(super) fn link_separable(
+    host: &mut Host<'_>,
+    cmd: Cmd,
+    stage: ShaderStage,
+    info: &shader::Info,
+    shader: ShaderName,
+    dual_src: bool,
+) -> Result<ProgramName, Fault> {
+    let gl = host.gl;
+    let features = host.features;
+    let Some(program) = gl.create_program() else {
+        return Err(Fault::Shader { cmd, what: "the driver refused a program object" });
+    };
+    gl.program_separable(program);
+    gl.attach_shader(program, shader);
+    let fixed = match stage {
+        ShaderStage::Vertex | ShaderStage::Geometry | ShaderStage::TessEval => {
+            set_stream_out_varyings(gl, program, info);
+            if stage == ShaderStage::Vertex {
+                bind_attrib_locations(gl, features, program, info);
+            }
+            Ok(false)
+        }
+        ShaderStage::Fragment => bind_fragment_outputs(gl, features, cmd, program, info, dual_src),
+        _ => Ok(false),
+    };
+    let linked = fixed.and_then(|_| {
+        gl.link_program(program).map_err(|log| {
+            eprintln!("[virglrs] vrend: error linking a separable stage:\n{log}");
+            Fault::Shader { cmd, what: "a separable stage the driver refused to link" }
+        })
+    });
+    if let Err(e) = linked {
+        gl.delete_program(host.current.program(), program);
+        return Err(e);
+    }
+    Ok(program)
+}
+
+/// `add_shader_program`: the bound stages' variants linked into one program -- or, where every
+/// stage is separable, gathered into a pipeline of their own programs -- with every location
+/// the draw path will write through looked up once.
 fn add_shader_program(
     host: &mut Host<'_>,
     cmd: Cmd,
@@ -822,12 +1050,8 @@ fn add_shader_program(
 ) -> Result<LinkedProgram, Fault> {
     let gl = host.gl;
     let features = host.features;
-    let Some(id) = gl.create_program() else {
-        return Err(Fault::Shader { cmd, what: "the driver refused a program object" });
-    };
     let mut stages = [None; 5];
     for l in linked {
-        gl.attach_shader(id, l.gl);
         stages[l.stage.index()] = Some(l.variant.id);
     }
     let by_stage = |s: ShaderStage| linked.iter().find(|l| l.stage == s);
@@ -836,54 +1060,60 @@ fn add_shader_program(
     let gs = by_stage(ShaderStage::Geometry);
     let tes = by_stage(ShaderStage::TessEval);
 
-    // The stream-out layout belongs to the last stage before the rasterizer.
-    set_stream_out_varyings(gl, id, gs.or(tes).unwrap_or(vs).info);
-
-    let mut dual_src_linked = false;
-    if fs.info.num_outputs > 1 {
-        dual_src_linked = dual_src;
-        if dual_src_linked {
-            if features.has(Feature::dual_src_blend) {
-                gl.bind_frag_data_location_indexed(id, 0, 0, "fsout_c0");
-                gl.bind_frag_data_location_indexed(id, 0, 1, "fsout_c1");
-            } else {
-                return Err(Fault::Shader { cmd, what: "dual-source blending the host lacks" });
-            }
-        } else if !features.api().is_gles() && features.has(Feature::dual_src_blend) {
-            // GLES shaders carry their output layout themselves; a desktop one is told it here.
-            for (i, &layout) in fs.info.fs_output_layout.iter().enumerate() {
-                if i < fs.info.num_outputs as usize && layout >= 0 {
-                    let name = format!("fsout_c{layout}");
-                    gl.bind_frag_data_location_indexed(id, layout as GLuint, 0, &name);
-                }
-            }
-        }
-    }
-
-    if features.has(Feature::gles31_vertex_attrib_binding) {
-        let mut mask = vs.info.attrib_input_mask;
-        while mask != 0 {
-            let i = mask.trailing_zeros();
-            mask &= mask - 1;
-            gl.bind_attrib_location(id, i, &format!("in_{i}"));
-        }
-    }
-
-    if let Err(log) = gl.link_program(id) {
-        gl.delete_program(host.current.program(), id);
-        eprintln!("[virglrs] vrend: error linking program:\n{log}");
+    // The C's `separable`: every stage's selector says so. A stage's own program exists exactly
+    // when it did at its compile on a host with pipelines, so that is what is asked.
+    let separable = linked.iter().all(|l| l.variant.separate.is_some());
+    let (object, dual_src_linked) = if separable {
+        let pipeline = gl.gen_program_pipeline();
+        let mut programs = [None; ShaderStage::COUNT];
         for l in linked {
-            eprintln!("{}: GLSL:\n{}", stage_prefix(l.stage), l.variant.strings.source());
+            let program = l.variant.separate.as_ref().expect("asked a moment ago").program;
+            programs[l.stage.index()] = Some(program);
+            gl.use_program_stages(pipeline, stage_bit(l.stage), program);
         }
-        return Err(Fault::Shader { cmd, what: "a program the driver refused to link" });
-    }
+        // The C reports a pipeline the driver will not validate and carries on; the report
+        // poisons the context, which is what refusing it here does.
+        if !gl.validate_program_pipeline(pipeline) {
+            gl.delete_program_pipeline(host.current.program(), pipeline);
+            return Err(Fault::Shader { cmd, what: "a program pipeline the driver refused" });
+        }
+        let object = ProgramObject::Pipeline { pipeline, stages: programs };
+        (object, dual_src && fs.info.num_outputs > 1)
+    } else {
+        let Some(id) = gl.create_program() else {
+            return Err(Fault::Shader { cmd, what: "the driver refused a program object" });
+        };
+        for l in linked {
+            gl.attach_shader(id, l.gl);
+        }
+        // The stream-out layout belongs to the last stage before the rasterizer.
+        set_stream_out_varyings(gl, id, gs.or(tes).unwrap_or(vs).info);
+        let dual_src_linked = match bind_fragment_outputs(gl, features, cmd, id, fs.info, dual_src)
+        {
+            Ok(d) => d,
+            Err(e) => {
+                gl.delete_program(host.current.program(), id);
+                return Err(e);
+            }
+        };
+        bind_attrib_locations(gl, features, id, vs.info);
+        if let Err(log) = gl.link_program(id) {
+            gl.delete_program(host.current.program(), id);
+            eprintln!("[virglrs] vrend: error linking program:\n{log}");
+            for l in linked {
+                eprintln!("{}: GLSL:\n{}", stage_prefix(l.stage), l.variant.strings.source());
+            }
+            return Err(Fault::Shader { cmd, what: "a program the driver refused to link" });
+        }
+        (ProgramObject::Linked(id), dual_src_linked)
+    };
 
     let linkage = Linkage::Graphics { stages, dual_src: dual_src_linked };
     let last_stage = linkage.last_stage();
-    let mut prog = LinkedProgram::new(serial, id, linkage);
+    let mut prog = LinkedProgram::new(serial, object, linkage);
     prog.fs_blend_equation_advanced = fs.info.fs_blend_equation_advanced;
 
-    gl.use_program(host.current.program(), Some(id));
+    object.use_in(gl, host.current.program());
 
     // Stage order as the C walks it, vertex through the last stage.
     let walk: Vec<&Linked<'_>> = C_STAGE_ORDER
@@ -897,37 +1127,12 @@ fn add_shader_program(
             prog.reads_drawid = true;
         }
     }
-
-    // rebind_ubo_and_sampler_locs
-    let mut next_ubo_id = BindingPoint::FIRST;
+    let blocks: Vec<(ShaderStage, &shader::Info)> =
+        walk.iter().map(|l| (l.stage, l.info)).collect();
+    prog.rebind_ubo_and_sampler_locs(gl, &blocks);
     for l in &walk {
-        next_ubo_id = prog.bind_sampler_and_ubo_locs(gl, l, next_ubo_id);
-    }
-    // bind_virgl_block_loc: the block binds after the last UBO.
-    for _ in &walk {
-        let Some(block) = gl.get_uniform_block_index(id, "VirglBlock") else {
-            continue;
-        };
-        let mut created = false;
-        if prog.virgl_block_bind.is_none() {
-            prog.virgl_block_bind = Some(next_ubo_id);
-            if prog.sysval_buffer.is_none() {
-                prog.sysval_buffer = Some(gl.gen_buffer());
-                created = true;
-            }
-        }
-        let bind = prog.virgl_block_bind.expect("set a moment ago");
-        gl.uniform_block_binding(id, block, bind);
-        let size = gl.uniform_block_data_size(id, block);
-        assert!(
-            size as usize >= Sysval::SIZE,
-            "the VirglBlock the shader declares holds the sysval block"
-        );
-        if created {
-            let buf = prog.sysval_buffer.expect("made a moment ago");
-            gl.bind_buffer(GL_UNIFORM_BUFFER, Some(buf));
-            gl.buffer_data_null(GL_UNIFORM_BUFFER, size as usize, GL_DYNAMIC_DRAW);
-            gl.bind_buffer(GL_UNIFORM_BUFFER, None);
+        if let Some(separate) = &l.variant.separate {
+            separate.blocks_bound_for.set(Some(serial));
         }
     }
 
@@ -936,11 +1141,24 @@ fn add_shader_program(
     for l in &walk {
         if l.info.gles_use_tex_query_level {
             let name = format!("{}_texlod", stage_prefix(l.stage));
+            let id = prog.object.of(l.stage);
             prog.tex_levels_uniform_id[l.stage.index()] = gl.get_uniform_location(id, &name);
         }
     }
 
     Ok(prog)
+}
+
+/// The `glUseProgramStages` bit for a stage.
+fn stage_bit(stage: ShaderStage) -> GLbitfield {
+    match stage {
+        ShaderStage::Vertex => GL_VERTEX_SHADER_BIT,
+        ShaderStage::Fragment => GL_FRAGMENT_SHADER_BIT,
+        ShaderStage::Geometry => GL_GEOMETRY_SHADER_BIT,
+        ShaderStage::TessCtrl => GL_TESS_CONTROL_SHADER_BIT,
+        ShaderStage::TessEval => GL_TESS_EVALUATION_SHADER_BIT,
+        ShaderStage::Compute => panic!("a compute stage is never part of a pipeline"),
+    }
 }
 
 /// `add_cs_shader_program`: the compute stage's variant linked alone, with every location a
@@ -963,9 +1181,10 @@ fn add_cs_shader_program(
         eprintln!("cs: GLSL:\n{}", cs.variant.strings.source());
         return Err(Fault::Shader { cmd, what: "a program the driver refused to link" });
     }
-    let mut prog = LinkedProgram::new(serial, id, Linkage::Compute(cs.variant.id));
-    gl.use_program(host.current.program(), Some(id));
-    prog.bind_sampler_and_ubo_locs(gl, cs, BindingPoint::FIRST);
+    let object = ProgramObject::Linked(id);
+    let mut prog = LinkedProgram::new(serial, object, Linkage::Compute(cs.variant.id));
+    object.use_in(gl, host.current.program());
+    prog.bind_sampler_and_ubo_locs(gl, cs.stage, cs.info, BindingPoint::FIRST);
     prog.bind_resource_locs(gl, host.features, cs);
     Ok(prog)
 }
@@ -1019,7 +1238,21 @@ impl Context {
             .position(|p| p.linkage == want)
             .map(|at| ProgramSlot { at, serial: sub.programs[at].serial });
         let slot = match found {
-            Some(s) => s,
+            Some(s) => {
+                // A pipeline found again re-numbers the blocks of its shared stages when another
+                // pipeline numbered them since.
+                let stale = stale_block_bindings(sub.program_at(s), &linked).map(|walk| {
+                    walk.into_iter().map(|(st, i)| (st, i.clone())).collect::<Vec<_>>()
+                });
+                if let Some(walk) = stale {
+                    let walk: Vec<(ShaderStage, &shader::Info)> =
+                        walk.iter().map(|(st, i)| (*st, i)).collect();
+                    let prog = self.sub_mut().program_at_mut(s);
+                    prog.object.use_in(host.gl, host.current.program());
+                    prog.rebind_ubo_and_sampler_locs(host.gl, &walk);
+                }
+                s
+            }
             None => {
                 built = true;
                 let serial = sub.mint_program_serial();
@@ -1591,6 +1824,8 @@ impl Context {
             if stage.index() > last.index() {
                 continue;
             }
+            // A pipeline's uniforms are its stages' programs': this stage's is the one written.
+            sub.program_at(at).object.activate(gl, stage);
             next_ubo_id = Self::draw_bind_ubo(sub, host, at, stage, next_ubo_id);
             Self::draw_bind_const(sub, host, at, stage, new_program);
             next_sampler_id = Self::draw_bind_samplers(sub, host, at, stage, next_sampler_id);
@@ -1607,6 +1842,7 @@ impl Context {
             gl.bind_buffer_range(GL_UNIFORM_BUFFER, bind, buf, 0, Sysval::SIZE);
         }
         Self::draw_bind_abo(sub, host);
+        sub.program_at(at).object.activate(gl, ShaderStage::Fragment);
     }
 
     /// `vrend_draw_bind_vertex_binding`: the bound layout's VAO, and the vertex buffers when
@@ -1750,10 +1986,10 @@ impl Context {
             return Err(Fault::Shader { cmd, what: "a draw with no program" });
         };
         let prog = sub.program_at(at);
-        let prog_id = prog.id;
+        let object = prog.object;
         let reads_drawid = prog.reads_drawid;
         let fs_blend_advanced = prog.fs_blend_equation_advanced;
-        gl.use_program(host.current.program(), Some(prog_id));
+        object.use_in(gl, host.current.program());
 
         if features.has(Feature::draw_parameters) && reads_drawid {
             let drawid = draw.tess.map_or(0, |t| t.drawid) as i32;
@@ -2067,7 +2303,7 @@ impl Context {
         let stage = ShaderStage::Compute;
         let sub = self.sub_mut();
         let at = sub.program_slot().expect("a compute program was selected a moment ago");
-        gl.use_program(host.current.program(), Some(sub.program_at(at).id));
+        sub.program_at(at).object.use_in(gl, host.current.program());
         Self::draw_bind_ubo(sub, host, at, stage, BindingPoint::FIRST);
         Self::draw_bind_const(sub, host, at, stage, new_program);
         Self::draw_bind_samplers(sub, host, at, stage, TextureUnit::FIRST);
