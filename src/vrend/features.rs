@@ -121,7 +121,7 @@ features! {
     cube_map_array = (Gl(40), Gles(32), ["GL_ARB_texture_cube_map_array", "GL_EXT_texture_cube_map_array", "GL_OES_texture_cube_map_array"]),
     cull_distance = (Gl(45), Unavail, ["GL_ARB_cull_distance", "GL_EXT_clip_cull_distance"]),
     draw_instance = (Gl(31), Gles(30), ["GL_ARB_draw_instanced"]),
-    draw_parameters = (Gl(46), Unavail, ["ARB_shader_draw_parameters"]),
+    draw_parameters = (Gl(46), Unavail, ["GL_ARB_shader_draw_parameters"]),
     dual_src_blend = (Gl(33), Unavail, ["GL_ARB_blend_func_extended", "GL_EXT_blend_func_extended"]),
     depth_clamp = (Gl(32), Unavail, ["GL_ARB_depth_clamp", "GL_EXT_depth_clamp", "GL_NV_depth_clamp"]),
     enhanced_layouts = (Gl(44), Unavail, ["GL_ARB_enhanced_layouts"]),
@@ -134,7 +134,7 @@ features! {
     gl_conditional_render = (Gl(30), Unavail, []),
     gl_prim_restart = (Gl(31), Gles(30), []),
     gles_khr_robustness = (Unavail, Unavail, ["GL_KHR_robustness"]),
-    gles31_compatibility = (Gl(45), Gles(31), ["ARB_ES3_1_compatibility"]),
+    gles31_compatibility = (Gl(45), Gles(31), ["GL_ARB_ES3_1_compatibility"]),
     gles31_vertex_attrib_binding = (Gl(43), Gles(31), ["GL_ARB_vertex_attrib_binding"]),
     gpu_shader5 = (Gl(40), Gles(32), ["GL_ARB_gpu_shader5", "GL_EXT_gpu_shader5", "GL_OES_gpu_shader5"]),
     group_vote = (Gl(46), Unavail, ["GL_ARB_shader_group_vote"]),
@@ -164,7 +164,7 @@ features! {
     sample_shading = (Gl(40), Gles(32), ["GL_ARB_sample_shading", "GL_OES_sample_shading"]),
     samplers = (Gl(33), Gles(30), ["GL_ARB_sampler_objects"]),
     sampler_border_colors = (Gl(33), Gles(32), ["GL_ARB_sampler_objects", "GL_EXT_texture_border_clamp", "GL_OES_texture_border_clamp"]),
-    separate_shader_objects = (Gl(41), Gles(31), ["GL_ARB_seperate_shader_objects"]),
+    separate_shader_objects = (Gl(41), Gles(31), ["GL_ARB_separate_shader_objects"]),
     shader_clock = (Unavail, Unavail, ["GL_ARB_shader_clock"]),
     ssbo = (Gl(43), Gles(31), ["GL_ARB_shader_storage_buffer_object"]),
     ssbo_barrier = (Gl(43), Gles(31), ["GL_ARB_shader_storage_buffer_object"]),
@@ -370,6 +370,21 @@ impl Features {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every extension the table names is one the Khronos registry defines. A name no driver
+    /// advertises costs its feature on every host older than the core version, and nothing
+    /// reports it: the C misspells `GL_ARB_separate_shader_objects` and drops the `GL_` from two
+    /// more, and the port carried all three.
+    #[test]
+    fn every_extension_the_table_names_is_in_the_registry() {
+        let registry = include_str!("../../gl-gen/registry/gl.xml");
+        let unknown: Vec<&str> = Feature::ALL
+            .iter()
+            .flat_map(|f| f.extensions().iter().copied())
+            .filter(|e| !registry.contains(&format!("<extension name=\"{e}\"")))
+            .collect();
+        assert!(unknown.is_empty(), "not in the registry: {unknown:?}");
+    }
 
     /// A host that can only bind an EGL image as immutable storage adopts nothing: a decode plane,
     /// or a format without texture storage, binds through the OES entry point and it has none.

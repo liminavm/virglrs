@@ -1958,6 +1958,13 @@ SABOTAGES = [
         'a_desktop_context_is_taken_only_when_asked_for',
     ),
     (
+        'the separate-shader-objects extension is asked for under the C\'s misspelling',
+        'src/vrend/features.rs',
+        """["GL_ARB_separate_shader_objects"]""",
+        """["GL_ARB_seperate_shader_objects"]""",
+        'every_extension_the_table_names_is_in_the_registry',
+    ),
+    (
         'a desktop host refuses a copy between unrenderable formats',
         'src/vrend/context/blit.rs',
         """            if host.features.api().is_gles() {
