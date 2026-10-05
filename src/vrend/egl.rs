@@ -13,7 +13,7 @@
 //! made current with no surface, and the config is a formality the API insists on.
 //!
 //! What this module hands the rest of vrend is a [`Winsys`] that owns the display, [`Context`]s
-//! that cannot outlive it, and a [`Gles`] table loaded once a context is current. Nothing else
+//! that cannot outlive it, and a [`Procs`] table loaded once a context is current. Nothing else
 //! sees an `EGLDisplay` or an `EGLContext`.
 
 use core::ffi::CStr;
@@ -22,7 +22,7 @@ use std::fmt;
 use std::sync::Arc;
 
 pub(crate) use super::gl::types;
-use super::gl::{Gles, ProcAddr};
+use super::gl::{ProcAddr, Procs};
 use crate::surface::{Held, Surface};
 
 #[allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code, clippy::all)]
@@ -742,7 +742,7 @@ impl Winsys {
     /// be asked without owning it -- its version and its extensions.
     ///
     /// The client API is the embedder's choice too, and is not knowable until a context exists
-    /// and is current; [`Winsys::gles`]'s caller is what finds out what arrived.
+    /// and is current; [`Winsys::procs`]'s caller is what finds out what arrived.
     pub fn embedded(
         contexts: Box<dyn GlContexts>,
         versions: &[Version],
@@ -1367,10 +1367,10 @@ impl Winsys {
     /// The GLES entry points. Resolved through `eglGetProcAddress`, which for Mesa answers the
     /// same addresses whichever context is current -- dispatch happens behind them -- so one
     /// table serves every context of the display.
-    pub fn gles(&self) -> Gles {
+    pub fn procs(&self) -> Procs {
         // SAFETY: `eglGetProcAddress` answers each name with null or with the address of the GL
-        // command of that name, which is the contract `Gles::load` requires.
-        unsafe { Gles::load(&mut get_proc) }
+        // command of that name, which is the contract `Procs::load` requires.
+        unsafe { Procs::load(&mut get_proc) }
     }
 }
 
@@ -1853,7 +1853,7 @@ mod tests {
         let ctx =
             winsys.create_context(Version { major: 3, minor: 1 }, None).expect("a 3.1 context");
         winsys.make_current(&ctx).expect("current");
-        let gl = winsys.gles();
+        let gl = winsys.procs();
         for feature in ["GL_ES_VERSION_2_0", "GL_ES_VERSION_3_0", "GL_ES_VERSION_3_1"] {
             assert!(gl.has_all_of(feature), "{feature}: missing {:?}", gl.missing());
         }
@@ -1938,7 +1938,7 @@ mod tests {
         let ctx =
             winsys.create_context(Version { major: 3, minor: 1 }, None).expect("a 3.1 context");
         winsys.make_current(&ctx).expect("current");
-        let gl = Gl::new(winsys.gles());
+        let gl = Gl::new(winsys.procs());
 
         let surface = Surface::planar(64, 64, PlanarFormat::BiPlanar420).expect("a planar surface");
         assert!(surface.fill_plane(0, LUMA_BYTE), "the luma plane fills");
@@ -2018,7 +2018,7 @@ mod tests {
         assert!(layout.bytes_per_row() >= W * 4, "a pitch that holds a row");
         let surface = Arc::new(surface);
 
-        let gl = Gl::new(winsys.gles());
+        let gl = Gl::new(winsys.procs());
         let image = winsys
             .image_from_surface(Arc::clone(&surface) as Arc<dyn Held>)
             .expect("the driver images its own allocator's buffer");

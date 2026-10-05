@@ -7,7 +7,7 @@
 //! by `gl-gen`, for the reason `vulkan.rs` gives: a binding transcribed by hand can disagree with
 //! the driver about a parameter, and the disagreement is a stack smash rather than a compile
 //! error. Every entry point is resolved through `eglGetProcAddress` ([`super::egl`]), which is
-//! what makes the transmute in `Gles::load` sound: EGL promises the address of the function of
+//! what makes the transmute in `Procs::load` sound: EGL promises the address of the function of
 //! that name, and the registry gives that name its signature.
 //!
 //! [`Gl`] is the safe layer over the table, and the only thing the resource, transfer and blit
@@ -46,7 +46,7 @@ pub struct BoundProgram(Option<ProgramName>);
 use super::egl::Image;
 use super::features::Feature;
 
-pub use gles::Gles;
+pub use gles::Procs;
 use gles::*;
 pub use types::*;
 
@@ -306,7 +306,7 @@ mod procs {
 
     macro_rules! resolver {
         ($name:ident: $sig:ty = $first:ident $(, $rest:ident)* $(,)?) => {
-            pub fn $name(t: &Gles) -> Option<$sig> {
+            pub fn $name(t: &Procs) -> Option<$sig> {
                 t.$first() $(.or_else(|| t.$rest()))*
             }
         };
@@ -362,7 +362,7 @@ mod procs {
 
     /// One proc a feature stands for: the feature, the name a message gives it, and whether the
     /// driver exported any of its spellings.
-    pub type Behind = (Feature, &'static str, fn(&Gles) -> bool);
+    pub type Behind = (Feature, &'static str, fn(&Procs) -> bool);
 
     /// Every proc a feature stands for, with the feature and the name a message gives it.
     pub const BEHIND: &[Behind] = &[
@@ -426,16 +426,16 @@ mod procs {
 
 /// The driver's entry points behind a safe surface.
 pub struct Gl {
-    t: Gles,
+    t: Procs,
 }
 
 impl Gl {
-    pub fn new(t: Gles) -> Gl {
+    pub fn new(t: Procs) -> Gl {
         Gl { t }
     }
 
     /// The raw table, for the census of what the driver exports.
-    pub fn table(&self) -> &Gles {
+    pub fn table(&self) -> &Procs {
         &self.t
     }
 

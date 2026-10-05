@@ -1965,6 +1965,13 @@ SABOTAGES = [
         'the_host_gl_is_the_one_asked_for',
     ),
     (
+        'the proc table carries no desktop entry point',
+        'gl-gen/gen.py',
+        """    desktop, _ = gl.requirements('gl', GL_FEATURES, [])""",
+        """    desktop = []""",
+        'the_host_gl_is_the_one_asked_for',
+    ),
+    (
         'a sampler view binds whatever kind of resource its handle names now',
         'src/vrend/context.rs',
         """                (Storage::Texture(_), Span::Levels { .. }) => {}""",

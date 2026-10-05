@@ -370,7 +370,7 @@ impl Vrend {
                 (winsys, ctx0, version)
             }
         };
-        let gl = Gl::new(winsys.gles());
+        let gl = Gl::new(winsys.procs());
         let version_string = gl.get_string(GL_VERSION);
         // Whose choice the client API was depends on who minted the context, so it is read back
         // rather than assumed.
@@ -468,7 +468,7 @@ impl Vrend {
                 Ok(wait_ctx) => Some(waiter::Waiter::start(
                     display,
                     wait_ctx,
-                    Gl::new(winsys.gles()),
+                    Gl::new(winsys.procs()),
                     fences,
                     debug,
                 )),
@@ -3497,11 +3497,12 @@ mod tests {
                 crate::vrend::debug::Switches::default(),
             )
             .expect("vrend comes up");
-            v.features.api()
+            (v.features.api(), v.gl.table().has_glGetTexImage())
         };
-        assert!(up(HostGl::Gles).is_gles(), "GLES unless asked otherwise");
-        let desktop = up(HostGl::Desktop);
+        assert!(up(HostGl::Gles).0.is_gles(), "GLES unless asked otherwise");
+        let (desktop, get_tex_image) = up(HostGl::Desktop);
         assert!(matches!(desktop, Api::Gl(v) if v >= 33), "a core desktop context: {desktop}");
+        assert!(get_tex_image, "and the one table resolves desktop GL's own entry points");
     }
 
     /// What the vertex stage holds, and the stage of the shader the table holds under handle 3.

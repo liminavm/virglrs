@@ -924,7 +924,7 @@ mod tests {
         let version = Version { major: 3, minor: 1 };
         let ctx = winsys.create_context(version, None).expect("a 3.1 context");
         winsys.make_current(&ctx).expect("current");
-        let gl = Gl::new(winsys.gles());
+        let gl = Gl::new(winsys.procs());
 
         // The base texture, as a composite target's own storage is: RGBA8, one level.
         let base = gl.gen_texture();
@@ -1026,7 +1026,7 @@ mod tests {
         let version = Version { major: 3, minor: 1 };
         let ctx = winsys.create_context(version, None).expect("a 3.1 context");
         winsys.make_current(&ctx).expect("current");
-        let gl = Gl::new(winsys.gles());
+        let gl = Gl::new(winsys.procs());
         let features = Features::probe(crate::vrend::features::Api::Gles(31), gl.extensions());
 
         let texture = |levels: GLsizei| {

@@ -5,16 +5,18 @@
 
     gen.py --outdir DIR [--registry DIR]
 
-Emits `types.rs`, `gles.rs` and `egl.rs` into DIR: the C types the two APIs are declared in, every
-constant the chosen features and extensions require, and one proc table per API whose signatures
-are the registry's own. A binding transcribed by hand can disagree with the driver about a
+Emits `types.rs`, `gles.rs` and `egl.rs` into DIR: the C types the APIs are declared in, every
+constant the chosen features and extensions require, and a proc table for GL and one for EGL whose
+signatures are the registry's own. A binding transcribed by hand can disagree with the driver about a
 parameter, and the disagreement is a stack smash rather than a compile error -- which is the
 reason `vulkan.rs` gives for generating its tables from vk.xml, and it holds here unchanged.
 
-Which entry points exist is a decision this file makes, once, in the lists below. GLES is the
-target (`docs/design.md`, P3): every core command through 3.2 is in the table, so that
-"3.1 host, and these of 3.2's extensions" is a runtime census rather than a build-time guess, plus
-the extensions vrend reaches for by name. EGL is 1.0 through 1.5 plus what the surfaceless,
+Which entry points exist is a decision this file makes, once, in the lists below. vrend runs on
+GLES or on desktop GL's core profile, and one table serves both: a command has one name and one
+signature in the registry whichever API requires it, every entry is resolved by name and may be
+absent, and the `Gl` wrapper decides which spelling a flavour calls. Every core command of GLES
+through 3.2 and of desktop GL through 4.6 is in it, so "this host, and these extensions" is a
+runtime census rather than a build-time guess, plus the extensions vrend reaches for by name. EGL is 1.0 through 1.5 plus what the surfaceless,
 image-importing, fence-exporting winsys needs.
 """
 
@@ -27,6 +29,16 @@ HERE = Path(__file__).resolve().parent
 
 GLES_FEATURES = [
     'GL_ES_VERSION_2_0', 'GL_ES_VERSION_3_0', 'GL_ES_VERSION_3_1', 'GL_ES_VERSION_3_2',
+]
+
+# Desktop GL through 4.6. Only the core profile's requirements are taken: the compatibility
+# profile's commands are the C's other desktop leg, which vrend does not serve. An ARB extension's
+# entry points carry the core names, so a 3.3 host that has one is covered by these lists too.
+GL_FEATURES = [
+    'GL_VERSION_1_0', 'GL_VERSION_1_1', 'GL_VERSION_1_2', 'GL_VERSION_1_3', 'GL_VERSION_1_4',
+    'GL_VERSION_1_5', 'GL_VERSION_2_0', 'GL_VERSION_2_1', 'GL_VERSION_3_0', 'GL_VERSION_3_1',
+    'GL_VERSION_3_2', 'GL_VERSION_3_3', 'GL_VERSION_4_0', 'GL_VERSION_4_1', 'GL_VERSION_4_2',
+    'GL_VERSION_4_3', 'GL_VERSION_4_4', 'GL_VERSION_4_5', 'GL_VERSION_4_6',
 ]
 
 # What vrend asks a GLES host for beyond the core, by the names it uses. An extension here costs
@@ -321,6 +333,8 @@ class Registry:
             for req in block.findall('require'):
                 if 'api' in req.attrib and req.attrib['api'] != api:
                     continue
+                if req.attrib.get('profile') == 'compatibility':
+                    continue
                 for c in req.findall('command'):
                     if c.attrib['name'] not in seen_c:
                         seen_c.add(c.attrib['name'])
@@ -331,10 +345,17 @@ class Registry:
                         enums.append(e.attrib['name'])
 
         found = set()
+        removed = set()
         for f in self.root.findall('feature'):
             if f.attrib['api'] == api and f.attrib['name'] in features:
                 found.add(f.attrib['name'])
                 take(f)
+                # The core profile is the features' requirements less what a later version
+                # removes from it: desktop 1.0 requires `glBegin`, and 3.2's core drops it.
+                for rem in f.findall('remove'):
+                    if rem.attrib.get('profile', 'core') == 'core':
+                        removed |= {c.attrib['name'] for c in rem.findall('command')}
+                        removed |= {e.attrib['name'] for e in rem.findall('enum')}
         for x in self.root.find('extensions').findall('extension'):
             if x.attrib['name'] in extensions:
                 assert api in x.attrib['supported'].split('|'), \
@@ -344,7 +365,7 @@ class Registry:
         missing = set(features) | set(extensions)
         missing -= found
         assert not missing, 'not in the registry: %s' % sorted(missing)
-        return commands, enums
+        return [c for c in commands if c not in removed], [e for e in enums if e not in removed]
 
 
 def signature(reg, name):
@@ -480,13 +501,20 @@ def main():
 
     gl = Registry(Path(args.registry) / 'gl.xml')
     commands, _ = gl.requirements('gles2', GLES_FEATURES, GLES_EXTENSIONS)
+    desktop, _ = gl.requirements('gl', GL_FEATURES, [])
+    commands += [c for c in desktop if c not in set(commands)]
     body = [banner, 'use super::types::*;', 'use core::ffi::CStr;', 'use core::mem::transmute;', '']
     # Every constant the registry has, not only the chosen features': the format tables name
     # desktop enums that a GLES driver refuses at the probe, and the probe needs their values.
     body += render_consts(gl, list(gl.enums), 'GL')
     body.append('')
-    body += render_table(gl, 'Gles', commands, 'eglGetProcAddress')
-    body += render_census(gl, 'Gles', per_block_commands(gl, 'gles2', GLES_FEATURES + GLES_EXTENSIONS))
+    body += render_table(gl, 'Procs', commands, 'eglGetProcAddress')
+    body += render_census(
+        gl,
+        'Procs',
+        per_block_commands(gl, 'gles2', GLES_FEATURES + GLES_EXTENSIONS)
+        + per_block_commands(gl, 'gl', GL_FEATURES),
+    )
     (out / 'gles.rs').write_text('\n'.join(body))
 
     egl = Registry(Path(args.registry) / 'egl.xml')
