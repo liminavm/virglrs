@@ -333,6 +333,17 @@ mod procs {
         = gles [try_glMinSampleShading, try_glMinSampleShadingOES], gl [try_glMinSampleShading]);
     resolver!(clip_control: unsafe extern "C" fn(GLenum, GLenum)
         = gles [try_glClipControlEXT], gl [try_glClipControl]);
+    resolver!(viewport_indexed: unsafe extern "C" fn(GLuint, GLfloat, GLfloat, GLfloat, GLfloat)
+        = gles [try_glViewportIndexedfOES], gl [try_glViewportIndexedf]);
+    resolver!(scissor_indexed: unsafe extern "C" fn(GLuint, GLint, GLint, GLsizei, GLsizei)
+        = gles [try_glScissorIndexedOES], gl [try_glScissorIndexed]);
+    resolver!(depth_range_indexed_f: unsafe extern "C" fn(GLuint, GLfloat, GLfloat)
+        = gles [try_glDepthRangeIndexedfOES], gl []);
+    resolver!(depth_range_indexed_d: unsafe extern "C" fn(GLuint, f64, f64)
+        = gles [], gl [try_glDepthRangeIndexed]);
+    resolver!(polygon_offset_clamp: unsafe extern "C" fn(GLfloat, GLfloat, GLfloat)
+        = gles [try_glPolygonOffsetClampEXT],
+          gl [try_glPolygonOffsetClamp, try_glPolygonOffsetClampEXT]);
     resolver!(sampler_parameter_iuiv: unsafe extern "C" fn(GLuint, GLenum, *const GLuint)
         = gles [try_glSamplerParameterIuiv, try_glSamplerParameterIuivEXT, try_glSamplerParameterIuivOES], gl [try_glSamplerParameterIuiv]);
     resolver!(framebuffer_texture: unsafe extern "C" fn(GLenum, GLenum, GLuint, GLint)
@@ -391,6 +402,14 @@ mod procs {
         }),
         (Feature::sample_shading, "glMinSampleShading", |t, a| min_sample_shading(t, a).is_some()),
         (Feature::clip_control, "glClipControlEXT", |t, a| clip_control(t, a).is_some()),
+        (Feature::viewport_array, "glViewportIndexedf", |t, a| viewport_indexed(t, a).is_some()),
+        (Feature::viewport_array, "glScissorIndexed", |t, a| scissor_indexed(t, a).is_some()),
+        (Feature::viewport_array, "glDepthRangeIndexed", |t, a| {
+            depth_range_indexed_f(t, a).is_some() || depth_range_indexed_d(t, a).is_some()
+        }),
+        (Feature::polygon_offset_clamp, "glPolygonOffsetClamp", |t, a| {
+            polygon_offset_clamp(t, a).is_some()
+        }),
         (Feature::sampler_border_colors, "glSamplerParameterIuiv", |t, a| {
             sampler_parameter_iuiv(t, a).is_some()
         }),
@@ -512,6 +531,11 @@ impl Gl {
     /// probed, which they cannot be before there is a `Gl` to ask.
     pub fn new(t: Procs, api: Api) -> Gl {
         Gl { t, api, robust: RobustReads::Unbounded }
+    }
+
+    /// The API this table was resolved for.
+    pub fn api(&self) -> Api {
+        self.api
     }
 
     /// The bounded reads this driver serves.
@@ -730,6 +754,38 @@ impl Gl {
         };
     }
 
+    /// `glTexImage1D` with no data. Desktop GL only: GLES has no 1D textures.
+    pub fn tex_image_1d_null(
+        &self,
+        level: GLint,
+        internalformat: GLenum,
+        w: GLsizei,
+        format: GLenum,
+        ty: GLenum,
+    ) {
+        assert!(!self.api.is_gles(), "glTexImage1D on a GLES context");
+        // SAFETY: a null pixel pointer with no pixel unpack buffer bound reads nothing.
+        unsafe {
+            self.t.glTexImage1D()(
+                GL_TEXTURE_1D,
+                level,
+                internalformat as GLint,
+                w,
+                0,
+                format,
+                ty,
+                core::ptr::null(),
+            )
+        };
+    }
+
+    /// `glTexStorage1D`. Desktop GL only.
+    pub fn tex_storage_1d(&self, levels: GLsizei, internalformat: GLenum, w: GLsizei) {
+        assert!(!self.api.is_gles(), "glTexStorage1D on a GLES context");
+        // SAFETY: plain scalars.
+        unsafe { self.t.glTexStorage1D()(GL_TEXTURE_1D, levels, internalformat, w) };
+    }
+
     /// `glTexImage3D` with no data.
     #[allow(clippy::too_many_arguments)]
     pub fn tex_image_3d_null(
@@ -865,6 +921,60 @@ impl Gl {
         // from `data`, and `data` holds at least that many.
         unsafe {
             self.t.glTexSubImage2D()(target, level, x, y, w, h, format, ty, data.as_ptr().cast())
+        };
+        true
+    }
+
+    /// `glTexSubImage1D`. Desktop GL only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tex_sub_image_1d(
+        &self,
+        level: GLint,
+        x: GLint,
+        w: GLsizei,
+        format: GLenum,
+        ty: GLenum,
+        data: &[u8],
+    ) -> bool {
+        assert!(!self.api.is_gles(), "glTexSubImage1D on a GLES context");
+        let Some(need) = image_bytes(format, ty, w, 1, 1) else {
+            return false;
+        };
+        if data.len() < need {
+            return false;
+        }
+        // SAFETY: with alignment 1 -- which `Gl::unpack_tight` sets and every caller uses -- the
+        // driver reads exactly `need` bytes from `data`, and `data` holds at least that many.
+        unsafe {
+            self.t.glTexSubImage1D()(GL_TEXTURE_1D, level, x, w, format, ty, data.as_ptr().cast())
+        };
+        true
+    }
+
+    /// `glCompressedTexSubImage1D`. Desktop GL only; GL reads exactly `data.len()` bytes.
+    pub fn compressed_tex_sub_image_1d(
+        &self,
+        level: GLint,
+        x: GLint,
+        w: GLsizei,
+        format: GLenum,
+        data: &[u8],
+    ) -> bool {
+        assert!(!self.api.is_gles(), "glCompressedTexSubImage1D on a GLES context");
+        let Ok(size) = GLsizei::try_from(data.len()) else {
+            return false;
+        };
+        // SAFETY: the driver reads `size` bytes from `data`, and `size` is `data`'s length.
+        unsafe {
+            self.t.glCompressedTexSubImage1D()(
+                GL_TEXTURE_1D,
+                level,
+                x,
+                w,
+                format,
+                size,
+                data.as_ptr().cast(),
+            )
         };
         true
     }
@@ -1306,6 +1416,26 @@ impl Gl {
         };
     }
 
+    /// `glFramebufferTexture1D`. Desktop GL only.
+    pub fn framebuffer_texture_1d(
+        &self,
+        attachment: GLenum,
+        tex: Option<TextureName>,
+        level: GLint,
+    ) {
+        assert!(!self.api.is_gles(), "glFramebufferTexture1D on a GLES context");
+        // SAFETY: plain scalars.
+        unsafe {
+            self.t.glFramebufferTexture1D()(
+                GL_FRAMEBUFFER,
+                attachment,
+                GL_TEXTURE_1D,
+                tex.map_or(0, |t| t.0),
+                level,
+            )
+        };
+    }
+
     pub fn framebuffer_texture_layer(
         &self,
         attachment: GLenum,
@@ -1702,9 +1832,16 @@ impl Gl {
         unsafe { self.t.glClearColor()(rgba[0], rgba[1], rgba[2], rgba[3]) };
     }
 
-    pub fn clear_depth_f(&self, depth: f32) {
-        // SAFETY: plain scalar.
-        unsafe { self.t.glClearDepthf()(depth) };
+    /// The depth a clear writes: `glClearDepth`'s double on desktop GL, `glClearDepthf`'s float
+    /// on GLES, which has no other.
+    pub fn clear_depth(&self, depth: f64) {
+        if self.api.is_gles() {
+            // SAFETY: plain scalar.
+            unsafe { self.t.glClearDepthf()(depth as f32) };
+        } else {
+            // SAFETY: plain scalar.
+            unsafe { self.t.glClearDepth()(depth) };
+        }
     }
 
     pub fn clear_stencil(&self, stencil: GLint) {
@@ -1723,6 +1860,13 @@ impl Gl {
         unsafe { self.t.glClearBufferfv()(buffer, drawbuffer, value.as_ptr()) };
     }
 
+    /// `glLogicOp`. Desktop GL only: GLES has no logic op, and the shader emulates the ops it can.
+    pub fn logic_op(&self, op: GLenum) {
+        assert!(!self.api.is_gles(), "glLogicOp on a GLES context");
+        // SAFETY: a plain enum.
+        unsafe { self.t.glLogicOp()(op) };
+    }
+
     pub fn blend_color(&self, rgba: [f32; 4]) {
         // SAFETY: plain scalars.
         unsafe { self.t.glBlendColor()(rgba[0], rgba[1], rgba[2], rgba[3]) };
@@ -1736,6 +1880,46 @@ impl Gl {
     pub fn polygon_offset(&self, factor: f32, units: f32) {
         // SAFETY: plain scalars.
         unsafe { self.t.glPolygonOffset()(factor, units) };
+    }
+
+    /// `glPolygonOffsetClamp`: the core 4.6 name `GL_ARB_polygon_offset_clamp` shares, or
+    /// `GL_EXT_polygon_offset_clamp`'s.
+    pub fn polygon_offset_clamp(&self, factor: f32, units: f32, clamp: f32) {
+        let f = promised(
+            procs::polygon_offset_clamp(&self.t, self.api),
+            Feature::polygon_offset_clamp,
+            "glPolygonOffsetClamp",
+        );
+        // SAFETY: plain scalars.
+        unsafe { f(factor, units, clamp) };
+    }
+
+    /// `glPointSize`. Desktop GL only: GLES sizes points from the shader alone.
+    pub fn point_size(&self, size: f32) {
+        assert!(!self.api.is_gles(), "glPointSize on a GLES context");
+        // SAFETY: plain scalar.
+        unsafe { self.t.glPointSize()(size) };
+    }
+
+    /// `glPointParameteri`. Desktop GL only.
+    pub fn point_parameter_i(&self, pname: GLenum, value: GLint) {
+        assert!(!self.api.is_gles(), "glPointParameteri on a GLES context");
+        // SAFETY: plain scalars.
+        unsafe { self.t.glPointParameteri()(pname, value) };
+    }
+
+    /// `glPolygonMode`. Desktop GL only.
+    pub fn polygon_mode(&self, face: GLenum, mode: GLenum) {
+        assert!(!self.api.is_gles(), "glPolygonMode on a GLES context");
+        // SAFETY: plain scalars.
+        unsafe { self.t.glPolygonMode()(face, mode) };
+    }
+
+    /// `glProvokingVertex`. Desktop GL only.
+    pub fn provoking_vertex(&self, mode: GLenum) {
+        assert!(!self.api.is_gles(), "glProvokingVertex on a GLES context");
+        // SAFETY: plain scalar.
+        unsafe { self.t.glProvokingVertex()(mode) };
     }
 
     pub fn cull_face(&self, mode: GLenum) {
@@ -1774,9 +1958,56 @@ impl Gl {
         unsafe { self.t.glScissor()(x, y, w, h) };
     }
 
-    pub fn depth_range_f(&self, near: f32, far: f32) {
+    /// The depth range: `glDepthRange`'s doubles on desktop GL, `glDepthRangef`'s floats on
+    /// GLES, which has no other.
+    pub fn depth_range(&self, near: f64, far: f64) {
+        if self.api.is_gles() {
+            // SAFETY: plain scalars.
+            unsafe { self.t.glDepthRangef()(near as f32, far as f32) };
+        } else {
+            // SAFETY: plain scalars.
+            unsafe { self.t.glDepthRange()(near, far) };
+        }
+    }
+
+    /// `glViewportIndexedf`, `glScissorIndexed` and `glDepthRangeIndexed`: viewport `index` past
+    /// the first, behind `Feature::viewport_array` -- core in desktop GL 4.1, and
+    /// `GL_OES_viewport_array` on GLES, whose spellings these take there.
+    pub fn viewport_indexed(&self, index: GLuint, x: f32, y: f32, w: f32, h: f32) {
+        let f = promised(
+            procs::viewport_indexed(&self.t, self.api),
+            Feature::viewport_array,
+            "glViewportIndexedf",
+        );
         // SAFETY: plain scalars.
-        unsafe { self.t.glDepthRangef()(near, far) };
+        unsafe { f(index, x, y, w, h) };
+    }
+
+    pub fn scissor_indexed(&self, index: GLuint, x: GLint, y: GLint, w: GLsizei, h: GLsizei) {
+        let f = promised(
+            procs::scissor_indexed(&self.t, self.api),
+            Feature::viewport_array,
+            "glScissorIndexed",
+        );
+        // SAFETY: plain scalars.
+        unsafe { f(index, x, y, w, h) };
+    }
+
+    /// GLES takes the range in single precision (`glDepthRangeIndexedfOES`), desktop GL in
+    /// double.
+    pub fn depth_range_indexed(&self, index: GLuint, near: f64, far: f64) {
+        if let Some(f) = procs::depth_range_indexed_d(&self.t, self.api) {
+            // SAFETY: plain scalars.
+            unsafe { f(index, near, far) };
+            return;
+        }
+        let f = promised(
+            procs::depth_range_indexed_f(&self.t, self.api),
+            Feature::viewport_array,
+            "glDepthRangeIndexed",
+        );
+        // SAFETY: plain scalars.
+        unsafe { f(index, near as f32, far as f32) };
     }
 
     /// `glClipControlEXT`.
@@ -2208,6 +2439,27 @@ impl Gl {
         let name = std::ffi::CString::new(name).expect("an output name has no NUL");
         // SAFETY: a NUL-terminated string, live for the call.
         unsafe { f(program.0, color, index, name.as_ptr().cast::<GLchar>()) };
+    }
+
+    /// `glPatchParameterfv` for the default tessellation levels: four outer, two inner. Desktop
+    /// GL only.
+    pub fn patch_parameter_fv(&self, pname: GLenum, values: &[f32]) {
+        assert!(!self.api.is_gles(), "glPatchParameterfv on a GLES context");
+        let need = match pname {
+            GL_PATCH_DEFAULT_OUTER_LEVEL => 4,
+            GL_PATCH_DEFAULT_INNER_LEVEL => 2,
+            _ => panic!("glPatchParameterfv takes no {pname:#x}"),
+        };
+        assert_eq!(values.len(), need, "the driver reads {need} levels");
+        // SAFETY: the driver reads `need` floats for `pname`, and `values` holds exactly that many.
+        unsafe { self.t.glPatchParameterfv()(pname, values.as_ptr()) };
+    }
+
+    /// `glPrimitiveRestartIndex`. Desktop GL only: GLES restarts at the fixed index alone.
+    pub fn primitive_restart_index(&self, index: GLuint) {
+        assert!(!self.api.is_gles(), "glPrimitiveRestartIndex on a GLES context");
+        // SAFETY: plain scalar.
+        unsafe { self.t.glPrimitiveRestartIndex()(index) };
     }
 
     pub fn uniform_1i(&self, location: UniformLocation, v: GLint) {
@@ -2710,5 +2962,12 @@ mod tests {
         assert!(procs::clip_control(&only_ext, Api::Gl(46)).is_none(), "not desktop GL's");
         assert!(procs::clip_control(&only_core, Api::Gl(46)).is_some(), "desktop GL's own");
         assert!(procs::clip_control(&only_core, Api::Gles(32)).is_none(), "not GLES's");
+        // A feature granted on both APIs has a spelling on both: a GLES host advertising
+        // `GL_OES_viewport_array` is told viewports past the first are served, and a guest that
+        // sets one must reach the driver, not a desktop-only wrapper.
+        let all = winsys.procs();
+        assert!(procs::viewport_indexed(&all, Api::Gles(32)).is_some(), "OES on GLES");
+        assert!(procs::scissor_indexed(&all, Api::Gles(32)).is_some(), "OES on GLES");
+        assert!(procs::depth_range_indexed_f(&all, Api::Gles(32)).is_some(), "OES on GLES");
     }
 }

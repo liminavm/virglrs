@@ -560,8 +560,18 @@ pub fn write(
                         )
                     }
                 }
+                GL_TEXTURE_1D => {
+                    let lv = info.level as GLint;
+                    if l.compressed {
+                        gl.compressed_tex_sub_image_1d(lv, x, w, ifmt, &*data)
+                    } else {
+                        gl.tex_sub_image_1d(lv, x, w, glformat, gltype, &*data)
+                    }
+                }
                 _ => {
                     let lv = info.level as GLint;
+                    // A 1D array's layers are its rows.
+                    let (y, h) = if target == GL_TEXTURE_1D_ARRAY { (b.z, d) } else { (y, h) };
                     if l.compressed {
                         gl.compressed_tex_sub_image_2d(target, lv, x, y, w, h, ifmt, &*data)
                     } else {
@@ -648,7 +658,8 @@ pub fn attach_texture(
     let name = &name;
     match (target, layer) {
         (
-            GL_TEXTURE_2D_ARRAY
+            GL_TEXTURE_1D_ARRAY
+            | GL_TEXTURE_2D_ARRAY
             | GL_TEXTURE_2D_MULTISAMPLE_ARRAY
             | GL_TEXTURE_CUBE_MAP_ARRAY
             | GL_TEXTURE_3D
@@ -659,9 +670,13 @@ pub fn attach_texture(
             gl.framebuffer_texture(attachment, Some(*name), level);
         }
         (
-            GL_TEXTURE_2D_ARRAY | GL_TEXTURE_2D_MULTISAMPLE_ARRAY | GL_TEXTURE_CUBE_MAP_ARRAY,
+            GL_TEXTURE_1D_ARRAY
+            | GL_TEXTURE_2D_ARRAY
+            | GL_TEXTURE_2D_MULTISAMPLE_ARRAY
+            | GL_TEXTURE_CUBE_MAP_ARRAY,
             Some(layer),
         ) => gl.framebuffer_texture_layer(attachment, Some(*name), level, layer),
+        (GL_TEXTURE_1D, _) => gl.framebuffer_texture_1d(attachment, Some(*name), level),
         (GL_TEXTURE_3D, Some(layer)) => {
             need(Feature::texture_3d_attach)?;
             gl.framebuffer_texture_3d(attachment, Some(*name), level, layer);

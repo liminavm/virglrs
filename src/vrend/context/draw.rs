@@ -448,6 +448,119 @@ fn blend_factor(f: BlendFactor) -> GLenum {
     }
 }
 
+/// `vrend_patch_blend_state`'s patching: the blend state GL is told for the colour targets'
+/// formats, and whether a constant factor reads the blend colour's alpha in red. A target
+/// without alpha reads its destination alpha as one; an emulated-alpha target blends and masks
+/// its alpha in red, the channel that stores it.
+fn patch_blend(api: Api, state: &BlendState, targets: &[Option<Format>]) -> (BlendState, bool) {
+    let state = *state;
+    let mut new_state = state;
+    let mut swizzle_blend_color = false;
+    let patched = if state.independent_blend_enable { MAX_COLOR_BUFS } else { 1 };
+    for i in 0..patched {
+        let Some(Some(format)) = targets.get(i).copied() else {
+            continue;
+        };
+        if crate::vrend::formats::is_emulated_alpha(api, format) {
+            // The target's alpha is its red: blend and mask the alpha there, and nothing
+            // else.
+            let rt = state.rt[i];
+            if let Some(eq) = rt.equation {
+                new_state.rt[i].equation = Some(RtBlendEq {
+                    rgb: BlendEq {
+                        func: eq.rgb.func,
+                        src: conv_a8_blend(eq.alpha.src),
+                        dst: conv_a8_blend(eq.alpha.dst),
+                    },
+                    alpha: BlendEq {
+                        func: eq.alpha.func,
+                        src: BlendFactor::Zero,
+                        dst: BlendFactor::Zero,
+                    },
+                });
+            }
+            new_state.rt[i].colormask =
+                if rt.colormask & PIPE_MASK_A != 0 { PIPE_MASK_R } else { 0 };
+            if let Some(eq) = new_state.rt[i].equation
+                && (is_const_blend(eq.rgb.src) || is_const_blend(eq.rgb.dst))
+            {
+                swizzle_blend_color = true;
+            }
+            continue;
+        }
+        let has_alpha = format.describe().is_some_and(|d| d.has_alpha());
+        if has_alpha {
+            continue;
+        }
+        let Some(eq) = state.rt[i].equation else {
+            continue;
+        };
+        let dst = [eq.rgb.src, eq.rgb.dst, eq.alpha.src, eq.alpha.dst];
+        if !dst.iter().any(|f| is_dst_blend(*f)) {
+            continue;
+        }
+        new_state.rt[i].equation = Some(RtBlendEq {
+            rgb: BlendEq {
+                func: eq.rgb.func,
+                src: conv_dst_blend(eq.rgb.src),
+                dst: conv_dst_blend(eq.rgb.dst),
+            },
+            alpha: BlendEq {
+                func: eq.alpha.func,
+                src: conv_dst_blend(eq.alpha.src),
+                dst: conv_dst_blend(eq.alpha.dst),
+            },
+        });
+    }
+    (new_state, swizzle_blend_color)
+}
+
+/// `PIPE_MASK_R` and `PIPE_MASK_A` of a colour mask.
+const PIPE_MASK_R: u8 = 1;
+const PIPE_MASK_A: u8 = 8;
+
+/// `conv_a8_blend`: a destination-alpha factor on an emulated-alpha target, whose alpha is its
+/// colour's red.
+fn conv_a8_blend(f: BlendFactor) -> BlendFactor {
+    match f {
+        BlendFactor::DstAlpha => BlendFactor::DstColor,
+        BlendFactor::InvDstAlpha => BlendFactor::InvDstColor,
+        f => f,
+    }
+}
+
+fn is_const_blend(f: BlendFactor) -> bool {
+    matches!(
+        f,
+        BlendFactor::ConstColor
+            | BlendFactor::ConstAlpha
+            | BlendFactor::InvConstColor
+            | BlendFactor::InvConstAlpha
+    )
+}
+
+/// `translate_logicop`.
+fn logic_op(op: LogicOp) -> GLenum {
+    match op {
+        LogicOp::Clear => GL_CLEAR,
+        LogicOp::Nor => GL_NOR,
+        LogicOp::AndInverted => GL_AND_INVERTED,
+        LogicOp::CopyInverted => GL_COPY_INVERTED,
+        LogicOp::AndReverse => GL_AND_REVERSE,
+        LogicOp::Invert => GL_INVERT,
+        LogicOp::Xor => GL_XOR,
+        LogicOp::Nand => GL_NAND,
+        LogicOp::And => GL_AND,
+        LogicOp::Equiv => GL_EQUIV,
+        LogicOp::Noop => GL_NOOP,
+        LogicOp::OrInverted => GL_OR_INVERTED,
+        LogicOp::Copy => GL_COPY,
+        LogicOp::OrReverse => GL_OR_REVERSE,
+        LogicOp::Or => GL_OR,
+        LogicOp::Set => GL_SET,
+    }
+}
+
 fn is_dst_blend(f: BlendFactor) -> bool {
     matches!(f, BlendFactor::DstAlpha | BlendFactor::InvDstAlpha)
 }
@@ -736,8 +849,15 @@ fn add_shader_program(
             } else {
                 return Err(Fault::Shader { cmd, what: "dual-source blending the host lacks" });
             }
+        } else if !features.api().is_gles() && features.has(Feature::dual_src_blend) {
+            // GLES shaders carry their output layout themselves; a desktop one is told it here.
+            for (i, &layout) in fs.info.fs_output_layout.iter().enumerate() {
+                if i < fs.info.num_outputs as usize && layout >= 0 {
+                    let name = format!("fsout_c{layout}");
+                    gl.bind_frag_data_location_indexed(id, layout as GLuint, 0, &name);
+                }
+            }
         }
-        // Without dual-source blending the GLES shader carries its output layout itself.
     }
 
     if features.has(Feature::gles31_vertex_attrib_binding) {
@@ -924,47 +1044,22 @@ impl Context {
     }
 
     /// `vrend_patch_blend_state` and `vrend_hw_emit_blend`: the blend state as bound, patched
-    /// for targets without alpha, told to GL.
+    /// for targets without alpha and for alpha emulated in red, told to GL.
     pub(super) fn patch_blend_state(&mut self, host: &mut Host<'_>) {
         let gl = host.gl;
         let features = host.features;
+        let api = features.api();
         let sub = self.sub_mut();
         if sub.cbufs.iter().all(Option::is_none) {
             sub.blend_dirty = false;
             return;
         }
         let state = sub.blend.unwrap_or(ZERO_BLEND);
-        let mut new_state = state;
-        let targets = if state.independent_blend_enable { MAX_COLOR_BUFS } else { 1 };
-        for i in 0..targets {
-            let Some(Some(surf)) = sub.cbufs.get(i) else {
-                continue;
-            };
-            // Emulated alpha is a desktop-only case; on GLES only an alpha-less target patches.
-            let has_alpha = surf.format.describe().is_some_and(|d| d.has_alpha());
-            if has_alpha {
-                continue;
-            }
-            let Some(eq) = state.rt[i].equation else {
-                continue;
-            };
-            let dst = [eq.rgb.src, eq.rgb.dst, eq.alpha.src, eq.alpha.dst];
-            if !dst.iter().any(|f| is_dst_blend(*f)) {
-                continue;
-            }
-            new_state.rt[i].equation = Some(RtBlendEq {
-                rgb: BlendEq {
-                    func: eq.rgb.func,
-                    src: conv_dst_blend(eq.rgb.src),
-                    dst: conv_dst_blend(eq.rgb.dst),
-                },
-                alpha: BlendEq {
-                    func: eq.alpha.func,
-                    src: conv_dst_blend(eq.alpha.src),
-                    dst: conv_dst_blend(eq.alpha.dst),
-                },
-            });
+        let mut targets = [None; MAX_COLOR_BUFS];
+        for (t, s) in targets.iter_mut().zip(&sub.cbufs) {
+            *t = s.as_ref().map(|s| s.format);
         }
+        let (new_state, swizzle_blend_color) = patch_blend(api, &state, &targets);
 
         // vrend_hw_emit_blend
         let mut logicop_changed = false;
@@ -977,11 +1072,18 @@ impl Context {
             logicop_changed = true;
         }
         if logicop_changed {
-            // GLES has no logic op: the shader does it when it can.
-            if select::can_emulate_logicop(features, new_state.logicop_func) {
-                sub.shader_dirty = true;
+            if api.is_gles() {
+                // GLES has no logic op: the shader does it when it can.
+                if select::can_emulate_logicop(features, new_state.logicop_func) {
+                    sub.shader_dirty = true;
+                } else {
+                    host.todo.note("a logic op the shader cannot emulate");
+                }
+            } else if new_state.logicop_enable {
+                gl.enable(GL_COLOR_LOGIC_OP);
+                gl.logic_op(logic_op(new_state.logicop_func));
             } else {
-                host.todo.note("a logic op the shader cannot emulate");
+                gl.disable(GL_COLOR_LOGIC_OP);
             }
         }
         let mask = |m: u8| [m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0];
@@ -1048,11 +1150,16 @@ impl Context {
         sub.hw_blend.independent = new_state.independent_blend_enable;
         if features.has(Feature::multisample) {
             gl.set_enabled(GL_SAMPLE_ALPHA_TO_COVERAGE, new_state.alpha_to_coverage);
+            // GLES has no alpha-to-one.
+            if !api.is_gles() {
+                gl.set_enabled(GL_SAMPLE_ALPHA_TO_ONE, new_state.alpha_to_one);
+            }
         }
         gl.set_enabled(GL_DITHER, new_state.dither);
 
-        // Only emulated alpha swizzles the blend colour, and that is not a GLES case.
-        gl.blend_color(sub.blend_color);
+        // A constant factor on an emulated-alpha target reads the constant's alpha in red.
+        let color = sub.blend_color;
+        gl.blend_color(if swizzle_blend_color { [color[3], 0.0, 0.0, 0.0] } else { color });
         sub.blend_dirty = false;
     }
 
@@ -1297,11 +1404,20 @@ impl Context {
                     if !is_buffer && !multisampled {
                         let sampler =
                             sub.units[s].sampler(i).and_then(|h| match sub.objects.get(&h) {
-                                Some(Object::SamplerState(st)) => st.ids,
+                                Some(Object::SamplerState(st)) => Some(st),
                                 _ => None,
                             });
-                        if let Some(ids) = sampler {
-                            let id = if view.skip_srgb_decode { ids[0] } else { ids[1] };
+                        let alpha_in_red = crate::vrend::formats::is_emulated_alpha(
+                            host.features.api(),
+                            view.format,
+                        );
+                        let id = sampler.and_then(|st| match (st.ids, st.alpha_in_red) {
+                            (_, Some(a8)) if alpha_in_red => Some(a8),
+                            (Some(ids), _) if view.skip_srgb_decode => Some(ids[0]),
+                            (Some(ids), _) => Some(ids[1]),
+                            _ => None,
+                        });
+                        if let Some(id) = id {
                             gl.bind_sampler(next_sampler_id, Some(id));
                         }
                     }
@@ -1405,8 +1521,13 @@ impl Context {
                 continue;
             }
             let image_unit = ImageUnit::at(i + offset);
-            if prog.img_locs[s].get(i as usize).copied().flatten().is_none() {
+            let Some(loc) = prog.img_locs[s].get(i as usize).copied().flatten() else {
                 continue;
+            };
+            // A desktop shader declares its images by `location`, not `binding`, as the C's
+            // translator writes them, so the unit is the uniform's to be told.
+            if !features.api().is_gles() {
+                gl.uniform_1i(loc, (i + offset) as GLint);
             }
             let access = match iview.access {
                 ImageAccess::Read => GL_READ_ONLY,
@@ -1705,7 +1826,13 @@ impl Context {
         }
 
         if draw.primitive_restart {
-            gl.enable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+            // GLES restarts at the index type's maximum alone; desktop GL takes the guest's.
+            if features.api().is_gles() {
+                gl.enable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+            } else {
+                gl.enable(GL_PRIMITIVE_RESTART);
+                gl.primitive_restart_index(draw.restart_index);
+            }
         }
         if features.has(Feature::indirect_draw) {
             gl.bind_buffer(GL_DRAW_INDIRECT_BUFFER, indirect_buffer);
@@ -1839,7 +1966,11 @@ impl Context {
         }
 
         if draw.primitive_restart {
-            gl.disable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+            gl.disable(if features.api().is_gles() {
+                GL_PRIMITIVE_RESTART_FIXED_INDEX
+            } else {
+                GL_PRIMITIVE_RESTART
+            });
         }
         let sub = self.sub_mut();
         if let Some(i) = sub.current_so
@@ -2057,6 +2188,43 @@ fn image_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An emulated-alpha target blends its alpha in red: the alpha factors become the colour
+    /// ones, a destination alpha reads the red that stores it, only red is written and only if
+    /// alpha was, and a constant factor reads the constant's alpha. The C's table, and on GLES,
+    /// where nothing is emulated, an A8 target is left as bound.
+    #[test]
+    fn an_emulated_alpha_target_blends_its_alpha_in_red() {
+        use BlendFactor::*;
+        let a8 = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(Format::from_wire)
+            .find(|f| f.name() == "A8_UNORM")
+            .expect("A8 is a wire format");
+        let eq = |src, dst| BlendEq { func: BlendFunc::Add, src, dst };
+        let mut state = ZERO_BLEND;
+        state.rt[0] = RtBlend {
+            equation: Some(RtBlendEq {
+                rgb: eq(SrcColor, InvSrcColor),
+                alpha: eq(DstAlpha, InvDstAlpha),
+            }),
+            colormask: PIPE_MASK_A | 0x7,
+        };
+        let (patched, swizzle) = patch_blend(Api::Gl(46), &state, &[Some(a8)]);
+        assert_eq!(
+            patched.rt[0],
+            RtBlend {
+                equation: Some(RtBlendEq { rgb: eq(DstColor, InvDstColor), alpha: eq(Zero, Zero) }),
+                colormask: PIPE_MASK_R,
+            }
+        );
+        assert!(!swizzle, "no constant factor");
+        state.rt[0].equation = Some(RtBlendEq { rgb: eq(One, Zero), alpha: eq(ConstAlpha, Zero) });
+        state.rt[0].colormask = 0x7;
+        let (patched, swizzle) = patch_blend(Api::Gl(46), &state, &[Some(a8)]);
+        assert_eq!(patched.rt[0].colormask, 0, "alpha masked off writes nothing");
+        assert!(swizzle, "a constant factor reads the constant's alpha in red");
+        assert_eq!(patch_blend(Api::Gles(32), &state, &[Some(a8)]), (state, false));
+    }
 
     /// An image over some of an array's layers is a range for a view, not the whole texture and
     /// not nothing: `image.bin` is its pixel gate, and this pins the reading it rests on.

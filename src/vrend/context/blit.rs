@@ -432,14 +432,17 @@ impl Context {
         if b.mask & (PIPE_MASK_Z | PIPE_MASK_S) != 0 && gl_filter != GL_NEAREST {
             can_fbo = false;
         }
-        if dst_res.0.nr_samples > 1
-            || (b.mask & PIPE_MASK_RGBA != 0
-                && src_res.0.nr_samples > 1
-                && (b.src.region.x != b.dst.region.x
-                    || b.src.region.width != b.dst.region.width
-                    || dst_y1 != src_y1
-                    || dst_y2 != src_y2
-                    || b.src.format != b.dst.format))
+        // GLES will not blit into a multisampled framebuffer, nor out of one unless the regions
+        // and formats match exactly; desktop GL does both.
+        if host.features.api().is_gles()
+            && (dst_res.0.nr_samples > 1
+                || (b.mask & PIPE_MASK_RGBA != 0
+                    && src_res.0.nr_samples > 1
+                    && (b.src.region.x != b.dst.region.x
+                        || b.src.region.width != b.dst.region.width
+                        || dst_y1 != src_y1
+                        || dst_y2 != src_y2
+                        || b.src.format != b.dst.format)))
         {
             can_fbo = false;
         }
@@ -675,7 +678,9 @@ impl Context {
         }
         let src_ms = host.resource(cmd, b.src.resource)?.args.nr_samples;
         let dst_ms = host.resource(cmd, b.dst.resource)?.args.nr_samples;
-        if b.mask & (PIPE_MASK_Z | PIPE_MASK_S) != 0
+        // GLES cannot resolve a depth blit whose rectangles differ; desktop GL blits it as is.
+        if host.features.api().is_gles()
+            && b.mask & (PIPE_MASK_Z | PIPE_MASK_S) != 0
             && src_ms > 1
             && src_ms != dst_ms
             && (b.src.region.x != b.dst.region.x
@@ -929,6 +934,7 @@ impl Context {
         let fixup = ColorFixup {
             srgb_encode: !res.supports_view() && format.describe().is_some_and(|d| d.is_srgb()),
             swap_red_blue: res.needs_redblue_swizzle(format),
+            alpha_in_red: crate::vrend::formats::is_emulated_alpha(host.features.api(), format),
         };
         self.clear_prepare(host, fixup, buffers, colorf, depth, stencil);
         let mut bits: GLbitfield = 0;

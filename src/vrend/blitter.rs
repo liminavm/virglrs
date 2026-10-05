@@ -40,6 +40,17 @@ use crate::vrend::egl::{Version, Winsys};
 const FLOATS_PER_VERTEX: usize = 8;
 const VERTICES: usize = 4;
 
+/// `VS_PASSTHROUGH_GL`.
+const VS_PASSTHROUGH_GL: &str = "#version 130\n\
+// Blitter\n\
+in vec4 arg0;\n\
+in vec4 arg1;\n\
+out vec4 tc;\n\
+void main() {\n\
+\x20  gl_Position = arg0;\n\
+\x20  tc = arg1;\n\
+}\n";
+
 /// `VS_PASSTHROUGH_GLES`.
 const VS_PASSTHROUGH: &str = "#version 310 es\n\
 // Blitter\n\
@@ -129,6 +140,9 @@ pub struct Blitter {
     vbo: BufferName,
     fbo: FramebufferName,
     vs: ShaderName,
+    /// The GLSL the blit shaders are written in: the C's `#version 130` on a desktop host, whose
+    /// 1D and rectangle textures are real and need their own samplers, `310 es` on GLES.
+    dialect: Dialect,
     programs: HashMap<ProgramKey, ProgramName>,
     /// The two-plane YUV program, built on the first composite conversion. Not in `programs`:
     /// it answers to nothing a [`ProgramKey`] describes -- two sources rather than one, a fixed
@@ -326,11 +340,17 @@ impl Blitter {
         let vao = gl.gen_vertex_array();
         let vbo = gl.gen_buffer();
         let fbo = gl.gen_framebuffer();
+        let dialect = if gl.api().is_gles() { Dialect::Es } else { Dialect::Core };
         let vs = gl.create_shader(GL_VERTEX_SHADER).expect("the driver makes a vertex shader");
-        gl.compile_shader(vs, VS_PASSTHROUGH).expect("the blitter's passthrough shader compiles");
+        let vs_source = if dialect == Dialect::Es { VS_PASSTHROUGH } else { VS_PASSTHROUGH_GL };
+        gl.compile_shader(vs, vs_source).expect("the blitter's passthrough shader compiles");
         gl.bind_vertex_array(Some(vao));
         gl.bind_buffer(GL_ARRAY_BUFFER, Some(vbo));
-        Ok(Blitter { ctx, vao, vbo, fbo, vs, programs: HashMap::new(), yuv: None })
+        // The C's desktop blit context writes sRGB targets encoded unless a blit says otherwise.
+        if dialect == Dialect::Core {
+            gl.enable(GL_FRAMEBUFFER_SRGB);
+        }
+        Ok(Blitter { ctx, vao, vbo, fbo, vs, dialect, programs: HashMap::new(), yuv: None })
     }
 
     pub fn context(&self) -> &egl::Context {
@@ -585,7 +605,7 @@ impl Blitter {
         if let Some(p) = self.programs.get(&key) {
             return Some(*p);
         }
-        let source = fragment_source(key);
+        let source = fragment_source(key, self.dialect);
         let fs = gl.create_shader(GL_FRAGMENT_SHADER)?;
         if let Err(log) = gl.compile_shader(fs, &source) {
             eprintln!("[virglrs] vrend: the blitter's fragment shader failed to compile: {log}");
@@ -627,24 +647,28 @@ fn tgsi_texture(target: TextureTarget, num_samples: u32) -> tgsi::Texture {
     }
 }
 
-/// `blit_get_swizzle`, GLES leg without depth: the components of `tc` the fetch takes, and the
-/// integer coordinate type a `texelFetch` needs. The bool is whether that type is an array one,
-/// which is the only thing that decides which GLES header the shader gets.
+/// `blit_get_swizzle`: the components of `tc` the fetch takes, and the integer coordinate type a
+/// `texelFetch` needs. The bool is whether that type is an array one, which is the only thing
+/// that decides which GLES header the shader gets.
 fn coord_swizzle_and_type(
     target: tgsi::Texture,
     msaa: bool,
     depth: bool,
+    dialect: Dialect,
 ) -> (&'static str, &'static str, bool) {
     use tgsi::Texture::*;
+    let gles = dialect == Dialect::Es;
     match target {
         // `BLIT_USE_GLES | BLIT_USE_DEPTH`: GLES has no 1D sampler, so a depth 1D blit samples
         // the 2D one the shader declared and needs the second coordinate the colour path fakes
         // inline. This is the only thing depth changes about the coordinates.
-        D1 if depth => (".xy", "", false),
+        D1 if depth && gles => (".xy", "", false),
         Buffer | D1 => (".x", "", false),
         Msaa2d if msaa => (".xy", "ivec2", false),
         Msaa2d => (".xy", "", false),
-        Array1d => (".xyz", "", false),
+        // A 1D array is 2D on GLES, its layer the third coordinate; on desktop it is the second.
+        Array1d if gles => (".xyz", "", false),
+        Array1d => (".xy", "", false),
         D2 | Rect => (".xy", "", false),
         Msaa2dArray if msaa => (".xyz", "ivec3", true),
         Msaa2dArray | Shadow1d | Shadow2d | Shadow1dArray | ShadowRect | D3 | Cube | Array2d => {
@@ -709,17 +733,30 @@ pub fn dest_swizzle_snippet(swizzle: [Swizzle; 4]) -> String {
     out
 }
 
-/// The fragment shader for a key, as the C's `blit_build_frag_tex_col` prints it -- GLES leg,
-/// which is the only one this tree has a host for.
 /// `blit_build_frag_depth`: the fragment shader a depth-writing blit runs.
 ///
 /// None of the colour shader's machinery applies -- no return-type conversion, no destination
 /// swizzle, no sRGB -- because the one channel that exists goes to `gl_FragDepth`, and a depth
-/// has no colourspace. The header is the C's plain `HEADER_GLES`, which differs from the colour
-/// path's `FS_HEADER_GLES` only in the extension line this shader never needs.
-fn depth_fragment_source(tex: tgsi::Texture, msaa: bool) -> String {
-    let (coord, fetch_type, is_array) = coord_swizzle_and_type(tex, msaa, true);
-    let sampler = sampler_type_conv(Dialect::Es, tex).unwrap_or("2D");
+/// has no colourspace. The header is the C's plain `HEADER_GLES` or `HEADER_GL`, which differ
+/// from the colour path's `FS_HEADER_*` only in the extension line this shader never needs.
+fn depth_fragment_source(tex: tgsi::Texture, msaa: bool, dialect: Dialect) -> String {
+    let (coord, fetch_type, is_array) = coord_swizzle_and_type(tex, msaa, true, dialect);
+    let sampler = sampler_type_conv(dialect, tex).unwrap_or("2D");
+    if dialect == Dialect::Core {
+        // `HEADER_GL` with `FS_TEXFETCH_DS_BODY` / `FS_TEXFETCH_DS_MSAA_BODY`.
+        return if msaa {
+            format!(
+                "#version 130\n// Blitter\n#extension GL_ARB_texture_multisample : enable\n\
+                 uniform sampler{sampler} samp;\nin vec4 tc;\nvoid main() {{\n   gl_FragDepth = \
+                 float(texelFetch(samp, {fetch_type}(tc{coord}), 0).x);\n}}\n"
+            )
+        } else {
+            format!(
+                "#version 130\n// Blitter\nuniform mediump sampler{sampler} samp;\nin vec4 tc;\n\
+                 void main() {{\n   gl_FragDepth = float(texture(samp, tc{coord}).x);\n}}\n"
+            )
+        };
+    }
     let header = if msaa && is_array {
         "#version 310 es\n// Blitter\n#extension GL_OES_texture_storage_multisample_2d_array: \
          require\nprecision mediump float;\n"
@@ -740,19 +777,20 @@ fn depth_fragment_source(tex: tgsi::Texture, msaa: bool) -> String {
     format!("{header}uniform mediump sampler{sampler} samp;\nin vec4 tc;\n{body}")
 }
 
-pub fn fragment_source(key: ProgramKey) -> String {
+/// The fragment shader for a key, as the C's `blit_build_frag_tex_col` prints it in `dialect`.
+pub fn fragment_source(key: ProgramKey, dialect: Dialect) -> String {
     let tex = tgsi_texture(key.target, key.num_samples);
     let msaa = key.num_samples > 1;
     if !key.color {
-        return depth_fragment_source(tex, msaa);
+        return depth_fragment_source(tex, msaa, dialect);
     }
     let ret = return_type_for(key.src_format);
     // The C loops over every sample only where averaging them means something: an integer format
     // has no meaningful average, so it reads one.
     let loop_samples =
         if msaa && ret == tgsi::ReturnType::Unorm { key.num_samples } else { u32::from(msaa) };
-    let (coord, fetch_type, is_array) = coord_swizzle_and_type(tex, msaa, false);
-    let sampler = sampler_type_conv(Dialect::Es, tex).unwrap_or("2D");
+    let (coord, fetch_type, is_array) = coord_swizzle_and_type(tex, msaa, false, dialect);
+    let sampler = sampler_type_conv(dialect, tex).unwrap_or("2D");
     let prefix = sampler_return_conv(ret);
     let cvec4 = vec4_type(ret);
     // The C always prints the snippet, identity included -- `info->swizzle` is an array and its
@@ -771,11 +809,21 @@ pub fn fragment_source(key: ProgramKey) -> String {
     // `FS_HEADER_GLES` / `FS_HEADER_GLES_MS_ARRAY`: the multisample-array sampler is an extension
     // even where the rest of 3.1 is core, and the `%s` the C passes for the extension line is
     // empty for every other shader.
-    let header = if msaa && is_array {
-        "#version 310 es\n// Blitter\n#extension GL_OES_texture_storage_multisample_2d_array: \
-         require\n\nprecision mediump float;\n"
-    } else {
-        "#version 310 es\n// Blitter\n\nprecision mediump float;\n"
+    let header = match dialect {
+        // `FS_HEADER_GL`, whose `%s` is the extension a multisample or cube-array sampler needs
+        // in GLSL 1.30.
+        Dialect::Core if msaa => {
+            "#version 130\n// Blitter\n#extension GL_ARB_texture_multisample : enable\n"
+        }
+        Dialect::Core if matches!(tex, tgsi::Texture::CubeArray) => {
+            "#version 130\n// Blitter\n#extension GL_ARB_texture_cube_map_array : require\n"
+        }
+        Dialect::Core => "#version 130\n// Blitter\n",
+        Dialect::Es if msaa && is_array => {
+            "#version 310 es\n// Blitter\n#extension GL_OES_texture_storage_multisample_2d_array: \
+             require\n\nprecision mediump float;\n"
+        }
+        Dialect::Es => "#version 310 es\n// Blitter\n\nprecision mediump float;\n",
     };
     let body = if msaa {
         format!(
@@ -784,7 +832,7 @@ pub fn fragment_source(key: ProgramKey) -> String {
              decode(texelFetch(samp, {fetch_type}(tc{coord}), i));\n   texel = texel / \
              cvec4(num_samples);\n   FragColor = encode(cvec4({texel}));\n}}\n"
         )
-    } else if tex == tgsi::Texture::D1 {
+    } else if tex == tgsi::Texture::D1 && dialect == Dialect::Es {
         // GLES has no 1D sampler, so the C samples the 2D one it declared at the middle of the
         // one row that exists.
         format!(
@@ -1090,6 +1138,109 @@ mod tests {
         gl.bind_texture(GL_TEXTURE_2D, None);
     }
 
+    /// A 1D source is sampled through the sampler its flavour stores it as: a `sampler2D` over
+    /// the one row GLES keeps it in, a `sampler1D` over desktop GL's real 1D texture. A GLES
+    /// shader handed a desktop 1D texture samples nothing.
+    #[test]
+    fn a_1d_source_blits_through_the_sampler_its_flavour_declares() {
+        use super::super::egl::Flavour;
+        use crate::vrend::features::Api;
+
+        let _display = crate::vrend::one_display_at_a_time();
+        const W: u32 = 8;
+        for (flavour, version, api) in [
+            (Flavour::Gles, Version { major: 3, minor: 1 }, Api::Gles(31)),
+            (Flavour::Gl, Version { major: 3, minor: 3 }, Api::Gl(33)),
+        ] {
+            let winsys = Winsys::open(flavour).expect("the surfaceless display opens");
+            let ctx = winsys.create_context(version, None).expect("a context");
+            winsys.make_current(&ctx).expect("current");
+            let gl = Gl::new(winsys.procs(), api);
+            let features = Features::probe(api, gl.extensions());
+            let gl_target = if api.is_gles() { GL_TEXTURE_2D } else { GL_TEXTURE_1D };
+            let texture = |pixel: [u8; 4]| {
+                let name = gl.gen_texture();
+                gl.bind_texture(gl_target, Some(name));
+                gl.unpack_tight();
+                let row: Vec<u8> = (0..W).flat_map(|_| pixel).collect();
+                if api.is_gles() {
+                    gl.tex_storage_2d(gl_target, 1, GL_RGBA8, W as GLsizei, 1);
+                    let (f, t) = (GL_RGBA, GL_UNSIGNED_BYTE);
+                    assert!(gl.tex_sub_image_2d(gl_target, 0, 0, 0, W as GLsizei, 1, f, t, &row));
+                } else {
+                    gl.tex_storage_1d(1, GL_RGBA8, W as GLsizei);
+                    assert!(gl.tex_sub_image_1d(
+                        0,
+                        0,
+                        W as GLsizei,
+                        GL_RGBA,
+                        GL_UNSIGNED_BYTE,
+                        &row
+                    ));
+                }
+                gl.bind_texture(gl_target, None);
+                name
+            };
+            let src = texture([0xff, 0, 0, 0xff]);
+            let dst = texture([0, 0, 0, 0]);
+            gl.finish();
+
+            let mut blitter =
+                Blitter::open(&winsys, &gl, version, &ctx).expect("the blitter's context opens");
+            winsys.make_current(blitter.context()).expect("the blitter's context is current");
+            let rgba = Format::from_wire(67).expect("a format");
+            let job = Job {
+                src,
+                src_gl_target: gl_target,
+                src_target: TextureTarget::Texture1d,
+                src_w: W,
+                src_h: 1,
+                src_level: 0,
+                src_samples: 0,
+                src_format: rgba,
+                src_table_swizzle: None,
+                set_srgb_decode: false,
+                filter: TexFilter::Nearest,
+                src_box: (Point { x: 0, y: 0 }, W as i32, 1),
+                src_z: 0,
+                src_depth: 1,
+                src_texture_depth: 1,
+                color: true,
+                dst,
+                dst_gl_target: gl_target,
+                dst_attachment: GL_COLOR_ATTACHMENT0,
+                dst_target: TextureTarget::Texture1d,
+                dst_w: W,
+                dst_h: 1,
+                dst_level: 0,
+                dst_layer: 0,
+                dst_box: (Point { x: 0, y: 0 }, W as i32, 1),
+                dst_depth: 1,
+                swizzle: None,
+                manual_srgb_decode: false,
+                manual_srgb_encode: false,
+                framebuffer_srgb: None,
+                scissor: None,
+            };
+            blitter
+                .run(&gl, &features, &mut BoundProgram::default(), &job)
+                .unwrap_or_else(|e| panic!("{flavour:?}: the blit runs: {e:?}"));
+            gl.finish();
+
+            winsys.make_current(&ctx).expect("current");
+            let fb = gl.gen_framebuffer();
+            gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
+            transfer::attach_texture(&gl, &features, gl_target, dst, GL_COLOR_ATTACHMENT0, 0, None)
+                .expect("a 1D colour target attaches");
+            let mut px = vec![0u8; W as usize * 4];
+            assert!(gl.read_pixels(0, 0, W as GLsizei, 1, GL_RGBA, GL_UNSIGNED_BYTE, &mut px));
+            assert!(
+                px.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
+                "{flavour:?}: the blit carried the source: {px:?}"
+            );
+        }
+    }
+
     #[test]
     fn an_identity_swizzle_reads_every_channel_where_it_lies() {
         use Swizzle::*;
@@ -1155,7 +1306,7 @@ mod tests {
 
     #[test]
     fn a_depth_blit_writes_the_fragment_depth_and_nothing_else() {
-        let src = depth_fragment_source(tgsi::Texture::D2, false);
+        let src = depth_fragment_source(tgsi::Texture::D2, false, Dialect::Es);
         assert!(src.contains("gl_FragDepth = float(texture(samp, tc.xy).x);"), "{src}");
         // The colour shader's whole apparatus is absent, not merely unused: a depth has no
         // colourspace and no destination channels to reorder.
@@ -1169,14 +1320,15 @@ mod tests {
         // GLES has no 1D sampler. The colour path declares a 2D one and writes the missing
         // coordinate into the call; the depth path takes it from the vertex instead, and this is
         // the only thing `BLIT_USE_DEPTH` changes about the coordinates.
-        assert_eq!(coord_swizzle_and_type(tgsi::Texture::D1, false, true).0, ".xy");
-        assert_eq!(coord_swizzle_and_type(tgsi::Texture::D1, false, false).0, ".x");
-        assert_eq!(coord_swizzle_and_type(tgsi::Texture::D2, false, true).0, ".xy");
+        let es = Dialect::Es;
+        assert_eq!(coord_swizzle_and_type(tgsi::Texture::D1, false, true, es).0, ".xy");
+        assert_eq!(coord_swizzle_and_type(tgsi::Texture::D1, false, false, es).0, ".x");
+        assert_eq!(coord_swizzle_and_type(tgsi::Texture::D2, false, true, es).0, ".xy");
     }
 
     #[test]
     fn a_multisample_depth_source_reads_one_sample_rather_than_averaging() {
-        let src = depth_fragment_source(tgsi::Texture::Msaa2d, true);
+        let src = depth_fragment_source(tgsi::Texture::Msaa2d, true, Dialect::Es);
         assert!(src.contains("texelFetch(samp, ivec2(tc.xy), 0)"), "{src}");
         assert!(!src.contains("num_samples"), "{src}");
     }

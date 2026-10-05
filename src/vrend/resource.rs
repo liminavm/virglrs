@@ -11,7 +11,7 @@
 #[cfg(target_os = "macos")]
 use super::egl;
 use super::egl::{Image, Winsys};
-use super::features::{Feature, Features};
+use super::features::{Api, Feature, Features};
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
 use super::gl::{
@@ -1891,7 +1891,7 @@ fn plan(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Resu
         if a.bind == Bind::COMMAND_ARGS && !features.has(Feature::indirect_draw) {
             return Err(Refusal::IndirectUnsupported);
         }
-        return plan_storage(features, a);
+        return plan_storage(features, a, false);
     }
     let texture_binds = Bind(
         Bind::SAMPLER_VIEW.0
@@ -1962,16 +1962,16 @@ fn plan(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Resu
             return Err(Refusal::TooLarge);
         }
     }
-    plan_storage(features, a)
+    plan_storage(features, a, entry.is_some_and(|e| e.can_target_rectangle))
 }
 
 /// Which storage the arguments name, once they are known to be coherent.
 ///
 /// The target alone decides buffer from texture, exactly as the C's create path does. The bind
 /// says which *kind* of buffer, and that is the only place it is asked.
-fn plan_storage(features: &Features, a: &Args) -> Result<Plan, Refusal> {
+fn plan_storage(features: &Features, a: &Args, rect_ok: bool) -> Result<Plan, Refusal> {
     if a.target != TextureTarget::Buffer {
-        let gl_target = gl_target(a.target, a.nr_samples);
+        let gl_target = gl_target(features.api(), a.target, a.nr_samples, rect_ok);
         // A multisample array needs the entry point that makes one. Decided here rather than
         // half-way through allocating, where the refusal arrives after a texture has been
         // generated and has to be unwound.
@@ -2049,10 +2049,16 @@ fn alloc_buffer(
     Ok(Storage::Buffer { name, target, storage_flags, tbo: None })
 }
 
-/// `tgsitargettogltarget`, with the GLES rewrites `vrend_resource_alloc_texture` applies after
-/// it: RECT is never probed on GLES, 1D has no GL form.
-pub fn gl_target(target: TextureTarget, nr_samples: u32) -> GLenum {
+/// `tgsitargettogltarget`, with the rewrites `vrend_resource_alloc_texture` applies after it: a
+/// rectangle in a format that cannot be one is a 2D texture, and GLES, which has no 1D textures,
+/// stores 1D as 2D. `rect_ok` is the format's [`Entry::can_target_rectangle`], which only a
+/// desktop host ever answers yes.
+pub fn gl_target(api: Api, target: TextureTarget, nr_samples: u32, rect_ok: bool) -> GLenum {
+    let gles = api.is_gles();
     match target {
+        TextureTarget::Texture1d if !gles => GL_TEXTURE_1D,
+        TextureTarget::Array1d if !gles => GL_TEXTURE_1D_ARRAY,
+        TextureTarget::Rect if rect_ok => GL_TEXTURE_RECTANGLE,
         TextureTarget::Texture1d | TextureTarget::Rect => GL_TEXTURE_2D,
         TextureTarget::Texture2d if nr_samples > 1 => GL_TEXTURE_2D_MULTISAMPLE,
         TextureTarget::Texture2d => GL_TEXTURE_2D,
@@ -2597,9 +2603,23 @@ fn alloc_texture(
                 }
             }
         }
-        _ => {
+        GL_TEXTURE_1D => {
             if immutable {
-                gl.tex_storage_2d(target, levels, ifmt, w, h);
+                gl.tex_storage_1d(levels, ifmt, w);
+            } else {
+                for level in 0..levels {
+                    let mw = minify(a.width, level as u32) as GLsizei;
+                    gl.tex_image_1d_null(level, ifmt, mw, glformat, gltype);
+                }
+            }
+        }
+        _ => {
+            // A 1D array is a 2D texture whose rows are its layers, so its height never minifies.
+            let rows = |l: u32| {
+                if target == GL_TEXTURE_1D_ARRAY { a.array_size } else { minify(a.height, l) }
+            };
+            if immutable {
+                gl.tex_storage_2d(target, levels, ifmt, w, rows(0) as GLsizei);
             } else {
                 for level in 0..levels {
                     let l = level as u32;
@@ -2608,7 +2628,7 @@ fn alloc_texture(
                         level,
                         ifmt,
                         minify(a.width, l) as GLsizei,
-                        minify(a.height, l) as GLsizei,
+                        rows(l) as GLsizei,
                         glformat,
                         gltype,
                     );
@@ -3367,7 +3387,7 @@ mod tests {
                             // says which refusal.
                             if theirs
                                 && a.nr_samples > 1
-                                && gl_target(a.target, a.nr_samples)
+                                && gl_target(f.api(), a.target, a.nr_samples, false)
                                     == GL_TEXTURE_2D_MULTISAMPLE_ARRAY
                                 && !f.has(Feature::storage_multisample_2d_array)
                             {
@@ -3473,9 +3493,19 @@ mod tests {
 
     #[test]
     fn gles_has_no_1d_and_no_rect() {
-        assert_eq!(gl_target(TextureTarget::Texture1d, 0), GL_TEXTURE_2D);
-        assert_eq!(gl_target(TextureTarget::Rect, 0), GL_TEXTURE_2D);
-        assert_eq!(gl_target(TextureTarget::Array1d, 0), GL_TEXTURE_2D_ARRAY);
-        assert_eq!(gl_target(TextureTarget::Texture2d, 4), GL_TEXTURE_2D_MULTISAMPLE);
+        let gles = Api::Gles(32);
+        assert_eq!(gl_target(gles, TextureTarget::Texture1d, 0, false), GL_TEXTURE_2D);
+        assert_eq!(gl_target(gles, TextureTarget::Rect, 0, false), GL_TEXTURE_2D);
+        assert_eq!(gl_target(gles, TextureTarget::Array1d, 0, false), GL_TEXTURE_2D_ARRAY);
+        assert_eq!(gl_target(gles, TextureTarget::Texture2d, 4, false), GL_TEXTURE_2D_MULTISAMPLE);
+    }
+
+    #[test]
+    fn desktop_gl_stores_1d_as_1d_and_rect_as_rect_where_the_format_can_be_one() {
+        let gl = Api::Gl(46);
+        assert_eq!(gl_target(gl, TextureTarget::Texture1d, 0, false), GL_TEXTURE_1D);
+        assert_eq!(gl_target(gl, TextureTarget::Array1d, 0, false), GL_TEXTURE_1D_ARRAY);
+        assert_eq!(gl_target(gl, TextureTarget::Rect, 0, true), GL_TEXTURE_RECTANGLE);
+        assert_eq!(gl_target(gl, TextureTarget::Rect, 0, false), GL_TEXTURE_2D);
     }
 }

@@ -13,9 +13,8 @@
 //! ported line for line, because the key decides which variant -- so which GLSL -- a draw runs,
 //! and a key filled differently from the C is a different shader on the screen.
 //!
-//! Only the C's GLES leg is here. `use_core_profile` is set and `use_integer` is not, so the
-//! signed and unsigned attribute masks stay clear; `vrend_format_is_emulated_alpha` is false on
-//! GLES, so the A8 mask does too; and `separable_program` is never set, so every stage's
+//! `use_core_profile` is set on both flavours and `use_integer` on neither, so the signed and
+//! unsigned attribute masks stay clear; and `separable_program` is never set, so every stage's
 //! interface is matched against its neighbours.
 
 use super::*;
@@ -271,7 +270,8 @@ impl SubContext {
     /// `vrend_select_program`'s GLES test for `vrend_inject_tcs`: an evaluation shader with no
     /// control shader before it, which GLES will not link.
     pub(super) fn injects_tcs(&self) -> bool {
-        self.shaders[ShaderStage::TessCtrl.index()].is_none()
+        self.tcs_required
+            && self.shaders[ShaderStage::TessCtrl.index()].is_none()
             && self.shaders[ShaderStage::TessEval.index()].is_some()
     }
 
@@ -347,7 +347,7 @@ impl SubContext {
             let var = prev.current_var_info();
             key.num_in_clip = var.num_out_clip;
             key.num_in_cull = var.num_out_cull;
-            if stage == Fragment {
+            if stage == Fragment && features.api().is_gles() {
                 key.fs.available_color_in_bits = var.legacy_color_bits as u8;
             }
         }
@@ -357,7 +357,9 @@ impl SubContext {
             key.fs.lower_left_origin = !self.fbo_origin_upper_left;
             key.fs.swizzle_output_rgb_to_bgr = self.swizzle_output_rgb_to_bgr;
             key.fs.needs_manual_srgb_encode_bitmask = self.needs_manual_srgb_encode;
+            // GLES has no logic op, so the shader does it; desktop GL does it in the blender.
             if let Some(blend) = self.blend
+                && features.api().is_gles()
                 && blend.logicop_enable
                 && can_emulate_logicop(features, blend.logicop_func)
             {
@@ -390,7 +392,7 @@ impl SubContext {
                     next_type = Some(Geometry);
                 } else if key.tes_present {
                     // GLES: a TCS is injected before the TES, and it is the vertex stage's next.
-                    next_type = Some(TessCtrl);
+                    next_type = Some(if self.tcs_required { TessCtrl } else { TessEval });
                 }
             }
             TessCtrl => next_type = Some(TessEval),
@@ -439,7 +441,13 @@ impl SubContext {
             let mut add_alpha_test = true;
             let logicop = self.blend.is_some_and(|b| b.logicop_enable);
             for (i, surf) in self.cbufs.iter().enumerate() {
-                let Some(desc) = surf.as_ref().and_then(|s| s.format.describe()) else {
+                let Some(surf) = surf else {
+                    continue;
+                };
+                if crate::vrend::formats::is_emulated_alpha(host.features.api(), surf.format) {
+                    key.fs.cbufs_are_a8_bitmask |= 1 << i;
+                }
+                let Some(desc) = surf.format.describe() else {
                     continue;
                 };
                 if desc.is_pure_integer() {

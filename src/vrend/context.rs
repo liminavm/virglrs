@@ -595,6 +595,10 @@ pub struct Sampler {
     pub state: SamplerState,
     /// Two sampler objects: one skipping sRGB decode, one decoding.
     pub ids: Option<[SamplerName; 2]>,
+    /// A third, for a view of an emulated-alpha format (desktop GL only): its border colour's
+    /// alpha is in red, where the view's alpha is stored. The C rewrites the shared object's
+    /// border at the bind instead, which leaves it swizzled for whatever view binds it next.
+    pub alpha_in_red: Option<SamplerName>,
 }
 
 pub struct Surface {
@@ -774,6 +778,9 @@ pub struct ColorFixup {
     pub srgb_encode: bool,
     /// The destination is stored in the opposite channel order to the format that names it.
     pub swap_red_blue: bool,
+    /// The destination's alpha is stored in its red (`vrend_format_is_emulated_alpha`): the
+    /// clear's alpha goes there, and nothing else.
+    pub alpha_in_red: bool,
 }
 
 /// A surface as the framebuffer keeps it: everything attaching it needs, and nothing that has to
@@ -884,6 +891,9 @@ pub struct SubContext {
     blit_fbs: [FramebufferName; 2],
     vao: VertexArrayName,
     objects: Objects,
+    /// GLES will not link an evaluation stage without a control stage before it, so on a GLES
+    /// host one is injected; desktop GL links the pair as the guest bound it.
+    tcs_required: bool,
     /// Where this sub-context's own creation sits in the journal, so that a rebuild makes it
     /// before replaying anything into it.
     ///
@@ -998,6 +1008,7 @@ impl SubContext {
             blit_fbs,
             vao,
             objects: Objects::default(),
+            tcs_required: gl.api().is_gles(),
             created_at: Seq::default(),
             state: crate::Map::default(),
             long_shader: [None; ShaderStage::COUNT],
@@ -1177,10 +1188,8 @@ fn release(gl: &Gl, obj: Object) {
             }
         }
         Object::SamplerState(s) => {
-            if let Some(ids) = s.ids {
-                for id in ids {
-                    gl.delete_sampler(id);
-                }
+            for id in s.ids.into_iter().flatten().chain(s.alpha_in_red) {
+                gl.delete_sampler(id);
             }
         }
         // A surface owns nothing: its view belongs to the resource, which is what lets the
@@ -2099,6 +2108,16 @@ impl Context {
                 Ok(())
             }
             Command::SetTessState(factors) => {
+                // Desktop GL takes the defaults a missing control stage leaves; GLES has no such
+                // state, and an injected control stage writes them as constants instead.
+                if !host.features.api().is_gles() && host.has(Feature::tessellation) {
+                    let outer = [factors[0], factors[1], factors[2], factors[3]];
+                    host.gl.patch_parameter_fv(GL_PATCH_DEFAULT_OUTER_LEVEL, &outer);
+                    host.gl.patch_parameter_fv(
+                        GL_PATCH_DEFAULT_INNER_LEVEL,
+                        &[factors[4], factors[5]],
+                    );
+                }
                 let sub = self.sub_mut();
                 if sub.tess_factors.map(f32::to_bits) != factors.map(f32::to_bits) {
                     sub.tess_factors = factors;
@@ -2554,29 +2573,64 @@ impl Context {
         // Alpha test is the shader's on GLES.
     }
 
-    /// `vrend_hw_emit_rs`, the GLES branches: what the C emits on every rasterizer bind.
+    /// `vrend_hw_emit_rs` on a core profile: what the C emits on every rasterizer bind. GLES
+    /// lacks what the desktop arms set -- program point size, polygon modes, line and point
+    /// offsets, the provoking vertex, smoothing, `GL_MULTISAMPLE` -- and leaves them to the shader
+    /// or to nothing.
     fn emit_rs(&mut self, host: &mut Host<'_>) {
         let gl = host.gl;
         let features = host.features;
+        let desktop = !features.api().is_gles();
         let sub = self.sub_mut();
         let s = sub.rs_state();
         if features.has(Feature::depth_clamp) {
             gl.set_enabled(GL_DEPTH_CLAMP_EXT, !s.depth_clip);
+        }
+        if desktop {
+            gl.set_enabled(GL_PROGRAM_POINT_SIZE, s.point_size_per_vertex);
+            if !s.point_size_per_vertex && s.point_size != 0.0 {
+                gl.point_size(s.point_size);
+            }
         }
         gl.line_width(if s.line_width <= 0.0 { 1.0 } else { s.line_width });
         if s.rasterizer_discard != sub.hw_rs.rasterizer_discard {
             sub.hw_rs.rasterizer_discard = s.rasterizer_discard;
             gl.set_enabled(GL_RASTERIZER_DISCARD, s.rasterizer_discard);
         }
+        // A core profile has one mode for both faces; differing ones are the C's warning only.
+        if desktop && s.fill_front == s.fill_back {
+            gl.polygon_mode(GL_FRONT_AND_BACK, fill_mode(s.fill_front));
+        }
         gl.set_enabled(GL_POLYGON_OFFSET_FILL, s.offset_tri);
+        if desktop {
+            gl.set_enabled(GL_POLYGON_OFFSET_LINE, s.offset_line);
+            gl.set_enabled(GL_POLYGON_OFFSET_POINT, s.offset_point);
+        }
         sub.hw_rs.flatshade = s.flatshade;
         if s.clip_halfz != sub.hw_rs.clip_halfz && features.has(Feature::clip_control) {
             let rule = if s.clip_halfz { GL_ZERO_TO_ONE_EXT } else { GL_NEGATIVE_ONE_TO_ONE_EXT };
             gl.clip_control(GL_LOWER_LEFT_EXT, rule);
             sub.hw_rs.clip_halfz = s.clip_halfz;
         }
-        sub.hw_rs.flatshade_first = s.flatshade_first;
-        gl.polygon_offset(s.offset_scale, s.offset_units);
+        if s.flatshade_first != sub.hw_rs.flatshade_first {
+            sub.hw_rs.flatshade_first = s.flatshade_first;
+            if desktop {
+                gl.provoking_vertex(if s.flatshade_first {
+                    GL_FIRST_VERTEX_CONVENTION
+                } else {
+                    GL_LAST_VERTEX_CONVENTION
+                });
+            }
+        }
+        if desktop && features.has(Feature::polygon_offset_clamp) {
+            gl.polygon_offset_clamp(s.offset_scale, s.offset_units, s.offset_clamp);
+        } else {
+            gl.polygon_offset(s.offset_scale, s.offset_units);
+        }
+        if desktop && s.point_quad_rasterization {
+            let origin = if s.sprite_coord_mode { GL_UPPER_LEFT } else { GL_LOWER_LEFT };
+            gl.point_parameter_i(GL_POINT_SPRITE_COORD_ORIGIN, origin as GLint);
+        }
         match s.cull_face {
             CullFace::None => gl.disable(GL_CULL_FACE),
             face => {
@@ -2590,14 +2644,28 @@ impl Context {
         }
         // The C toggles GL_CLIP_PLANE0+i here even on GLES, where the enum does not exist and
         // the call is an error that poisons the context. Clip planes are the shader's on GLES;
-        // the toggle is dropped, and the C's error with it.
+        // the toggle is dropped there, and the C's error with it. A core profile names the same
+        // enums `GL_CLIP_DISTANCEi`, and takes them.
         if s.clip_plane_enable != sub.hw_rs.clip_plane_enable {
             sub.hw_rs.clip_plane_enable = s.clip_plane_enable;
+            if desktop {
+                for i in 0..8 {
+                    gl.set_enabled(GL_CLIP_DISTANCE0 + i, s.clip_plane_enable & (1 << i) != 0);
+                }
+            }
             sub.sysval.clip_plane_enabled = if s.clip_plane_enable != 0 { 1.0 } else { 0.0 };
+        }
+        if desktop {
+            gl.set_enabled(GL_LINE_SMOOTH, s.line_smooth);
+            gl.set_enabled(GL_POLYGON_SMOOTH, s.poly_smooth);
         }
         if features.has(Feature::multisample) {
             if features.has(Feature::sample_mask) {
                 gl.set_enabled(GL_SAMPLE_MASK, s.multisample);
+            }
+            // GLES has no GL_MULTISAMPLE.
+            if desktop {
+                gl.set_enabled(GL_MULTISAMPLE, s.multisample);
             }
             if features.has(Feature::sample_shading) {
                 gl.set_enabled(GL_SAMPLE_SHADING, s.force_persample_interp);
@@ -2807,7 +2875,11 @@ impl Context {
                 return Err(Fault::IllegalResource { cmd, handle: v.resource });
             }
         };
-        let mut target = resource::gl_target(v.target, res.args.nr_samples);
+        // The view's format decides whether a rectangle view is one: `vrend_create_sampler_view`
+        // asks it, not the resource's.
+        let rect_ok = host.formats.get(v.format).is_some_and(|e| e.can_target_rectangle);
+        let mut target =
+            resource::gl_target(host.features.api(), v.target, res.args.nr_samples, rect_ok);
         let elements = if is_buffer {
             target = tex_target;
             // A buffer view is an element range, first to last inclusive. The C binds one
@@ -3081,9 +3153,9 @@ impl Context {
             resource: v.resource,
             format: v.format,
             target,
-            // No format can be a rectangle target on GLES (`vrend_formats.c` probes only
-            // desktop GL for it), so every rectangle view is served by a 2D texture.
-            emulated_rect: !is_buffer && v.target == TextureTarget::Rect,
+            // A rectangle in a format that cannot be one is served by a 2D texture -- every
+            // rectangle on GLES, where `vrend_formats.c` never probes for it.
+            emulated_rect: !is_buffer && v.target == TextureTarget::Rect && target == GL_TEXTURE_2D,
             skip_srgb_decode: v.format != res.args.format
                 && res.args.format.describe().is_some_and(|d| d.is_srgb())
                 && !desc.is_some_and(|d| d.is_srgb()),
@@ -3170,6 +3242,15 @@ fn read_shader(text: &[u8], num_tokens: u32) -> Result<Program, Fault> {
 /// The swizzle that changes nothing, and so has nothing to clash over.
 const IDENTITY_SWIZZLE: [GLint; 4] =
     [GL_RED as GLint, GL_GREEN as GLint, GL_BLUE as GLint, GL_ALPHA as GLint];
+
+/// `translate_fill`.
+fn fill_mode(mode: FillMode) -> GLenum {
+    match mode {
+        FillMode::Fill => GL_FILL,
+        FillMode::Line => GL_LINE,
+        FillMode::Point => GL_POINT,
+    }
+}
 
 fn to_gl_swizzle(s: Swizzle) -> GLenum {
     match s {
@@ -3337,7 +3418,7 @@ fn vertex_elements(api: Api, elements: &[VertexElement]) -> Result<VertexElement
 /// `vrend_create_sampler_state`: two sampler objects with the state applied.
 fn create_sampler_state(host: &mut Host<'_>, s: SamplerState) -> Result<Sampler, Fault> {
     if !host.has(Feature::samplers) {
-        return Ok(Sampler { state: s, ids: None });
+        return Ok(Sampler { state: s, ids: None, alpha_in_red: None });
     }
     let gl = host.gl;
     let features = host.features;
@@ -3380,8 +3461,9 @@ fn create_sampler_state(host: &mut Host<'_>, s: SamplerState) -> Result<Sampler,
         (TexFilter::Linear, MipFilter::Nearest) => GL_LINEAR_MIPMAP_NEAREST,
     };
     let ids = [gl.gen_sampler(), gl.gen_sampler()];
-    for (i, id) in ids.iter().enumerate() {
-        let id = *id;
+    let alpha_in_red = (!features.api().is_gles()).then(|| gl.gen_sampler());
+    let all = ids.iter().map(|id| (*id, false)).chain(alpha_in_red.map(|id| (id, true)));
+    for (i, (id, swizzle_border)) in all.enumerate() {
         gl.sampler_parameter_i(id, GL_TEXTURE_WRAP_S, ws as GLint);
         gl.sampler_parameter_i(id, GL_TEXTURE_WRAP_T, wt as GLint);
         gl.sampler_parameter_i(id, GL_TEXTURE_WRAP_R, wr as GLint);
@@ -3396,15 +3478,24 @@ fn create_sampler_state(host: &mut Host<'_>, s: SamplerState) -> Result<Sampler,
             GL_TEXTURE_COMPARE_FUNC,
             (GL_NEVER + s.compare_func.wire()) as GLint,
         );
+        // GLES has neither a sampler LOD bias nor a per-sampler seamless cube switch.
+        if !features.api().is_gles() {
+            gl.sampler_parameter_f(id, GL_TEXTURE_LOD_BIAS, s.lod_bias);
+            if features.has(Feature::seamless_cubemap_per_texture) {
+                let seamless = GLint::from(s.seamless_cube_map);
+                gl.sampler_parameter_i(id, GL_TEXTURE_CUBE_MAP_SEAMLESS, seamless);
+            }
+        }
         if features.has(Feature::sampler_border_colors) {
-            gl.sampler_border_color(id, &s.border_color);
+            let c = s.border_color;
+            gl.sampler_border_color(id, &if swizzle_border { [c[3], c[1], c[2], 0] } else { c });
         }
         if features.has(Feature::texture_srgb_decode) {
             let decode = if i == 0 { GL_SKIP_DECODE_EXT } else { GL_DECODE_EXT };
             gl.sampler_parameter_i(id, GL_TEXTURE_SRGB_DECODE_EXT, decode as GLint);
         }
     }
-    Ok(Sampler { state: s, ids: Some(ids) })
+    Ok(Sampler { state: s, ids: Some(ids), alpha_in_red })
 }
 
 /// Write query `h`'s result into its buffer if it is ready. `Ok(false)` is a result not ready
@@ -3530,6 +3621,7 @@ impl Context {
     /// The lazy state a clear or draw flushes first: front face, stencil, scissor, viewport.
     fn flush_lazy_state(&mut self, host: &mut Host<'_>) {
         let gl = host.gl;
+        let viewport_array = host.has(Feature::viewport_array);
         let sub = self.sub_mut();
         let rs = sub.rs_state();
         let front_ccw = rs.front_ccw ^ !sub.fbo_origin_upper_left;
@@ -3595,28 +3687,33 @@ impl Context {
                     continue;
                 }
                 let s = sub.scissors[idx];
-                // Only viewport 0 has a scissor on this host: `glScissorIndexed` is
-                // viewport-array's, which GLES lacks.
+                let (x, y) = (s.minx as GLint, s.miny as GLint);
+                let w = s.maxx as GLsizei - s.minx as GLsizei;
+                let h = s.maxy as GLsizei - s.miny as GLsizei;
+                // Past viewport 0 a scissor needs viewport arrays.
                 if idx == 0 {
-                    gl.scissor(
-                        s.minx as GLint,
-                        s.miny as GLint,
-                        s.maxx as GLsizei - s.minx as GLsizei,
-                        s.maxy as GLsizei - s.miny as GLsizei,
-                    );
+                    gl.scissor(x, y, w, h);
+                } else if viewport_array {
+                    gl.scissor_indexed(idx as GLuint, x, y, w, h);
                 }
             }
             sub.scissor_dirty.clear();
         }
         if !sub.viewport_dirty.is_empty() {
             for idx in 0..MAX_VIEWPORTS {
-                if !sub.viewport_dirty.contains(idx as u32) || idx != 0 {
+                if !sub.viewport_dirty.contains(idx as u32) {
                     continue;
                 }
                 let v = sub.viewports[idx];
                 let cy = if sub.viewport_is_negative { v.y - v.height } else { v.y };
-                gl.viewport(v.x, cy, v.width, v.height);
-                gl.depth_range_f(v.near as f32, v.far as f32);
+                if idx == 0 {
+                    gl.viewport(v.x, cy, v.width, v.height);
+                    gl.depth_range(v.near, v.far);
+                } else if viewport_array {
+                    let i = idx as GLuint;
+                    gl.viewport_indexed(i, v.x as f32, cy as f32, v.width as f32, v.height as f32);
+                    gl.depth_range_indexed(i, v.near, v.far);
+                }
             }
             sub.viewport_dirty.clear();
         }
@@ -4360,7 +4457,9 @@ impl Context {
                 *c = encode_srgb(*c);
             }
         }
-        if fixup.swap_red_blue {
+        if fixup.alpha_in_red {
+            color = [color[3], 0.0, 0.0, 0.0];
+        } else if fixup.swap_red_blue {
             color.swap(0, 2);
         }
         let sub = self.sub_mut();
@@ -4376,7 +4475,7 @@ impl Context {
         }
         if buffers & PIPE_CLEAR_DEPTH != 0 {
             gl.depth_mask(true);
-            gl.clear_depth_f(depth as f32);
+            gl.clear_depth(depth);
         }
         if buffers & PIPE_CLEAR_STENCIL != 0 {
             gl.stencil_mask(!0);
@@ -4437,10 +4536,14 @@ impl Context {
         // resource here instead, which is a second reading of a question the bind already
         // answered -- and one the guest can make unanswerable by freeing the resource meanwhile.
         let sub = self.sub();
-        let fixup = ColorFixup {
-            srgb_encode: sub.needs_manual_srgb_encode & 1 != 0,
-            swap_red_blue: sub.swizzle_output_rgb_to_bgr & 1 != 0,
-        };
+        let fixup =
+            ColorFixup {
+                srgb_encode: sub.needs_manual_srgb_encode & 1 != 0,
+                swap_red_blue: sub.swizzle_output_rgb_to_bgr & 1 != 0,
+                alpha_in_red: sub.cbufs.first().and_then(Option::as_ref).is_some_and(|s| {
+                    super::formats::is_emulated_alpha(host.features.api(), s.format)
+                }),
+            };
         self.clear_prepare(host, fixup, buffers, colorf, depth, stencil);
         let sub = self.sub();
         let mut bits: GLbitfield = 0;

@@ -2853,6 +2853,111 @@ mod tests {
         assert_eq!(read_back(HostGl::Desktop), (true, true), "desktop GL reads {}", format.name());
     }
 
+    /// Desktop GL stores a 1D texture as one, and a 1D array as a 2D texture whose rows are its
+    /// layers; GLES has no 1D textures and stores both as 2D. Either way a box written to every
+    /// layer reads back as written -- a layer uploaded as the wrong row, or as a 2D image of a
+    /// target that is not one, does not.
+    #[test]
+    fn a_1d_texture_is_one_on_desktop_gl_and_round_trips_on_both() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let format = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == "R8G8B8A8_UNORM")
+            .expect("a wire format by that name");
+        let round_trip = |host_gl, target, layers: u32| {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let mut v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            let w = 8u32;
+            let res = ResourceHandle::new(1).expect("non-zero");
+            v.resource_create(
+                res,
+                resource::Args {
+                    target,
+                    format,
+                    bind: resource::Bind(
+                        resource::Bind::SAMPLER_VIEW.0 | resource::Bind::RENDER_TARGET.0,
+                    ),
+                    width: w,
+                    height: 1,
+                    depth: 1,
+                    array_size: layers,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )
+            .expect("a texture");
+            let gl_target = v
+                .resources
+                .sync()
+                .get(&res)
+                .and_then(|e| e.resource())
+                .and_then(|r| r.texture())
+                .map(|t| t.target)
+                .expect("a texture's storage");
+            let stride = w * 4;
+            let info = transfer::Info {
+                level: 0,
+                stride,
+                layer_stride: stride,
+                offset: 0,
+                region: crate::vrend::proto::Box3 {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    width: w as i32,
+                    height: 1,
+                    depth: layers as i32,
+                },
+                synchronized: false,
+            };
+            let n = (stride * layers) as usize;
+            let mut written: Vec<u8> = (0..n).map(|b| (b as u8).wrapping_mul(37)).collect();
+            let from = [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(written.as_mut_ptr().cast()),
+                len: written.len(),
+            }];
+            let from = Iov::new(&from);
+            v.transfer(None, res, Some(&from), transfer::Through::ToHost(from.source()), &info)
+                .expect("the upload");
+            let mut read = vec![0xa5u8; n];
+            let into = [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(read.as_mut_ptr().cast()),
+                len: read.len(),
+            }];
+            let into = Iov::new(&into);
+            v.transfer(None, res, Some(&from), transfer::Through::ToGuest(&into), &info)
+                .expect("the readback");
+            (gl_target, read == written)
+        };
+        use crate::vrend::gl::gles::{
+            GL_TEXTURE_1D, GL_TEXTURE_1D_ARRAY, GL_TEXTURE_2D, GL_TEXTURE_2D_ARRAY,
+        };
+        use TextureTarget::{Array1d, Texture1d};
+        assert_eq!(round_trip(HostGl::Gles, Texture1d, 1), (GL_TEXTURE_2D, true));
+        assert_eq!(round_trip(HostGl::Gles, Array1d, 3), (GL_TEXTURE_2D_ARRAY, true));
+        assert_eq!(round_trip(HostGl::Desktop, Texture1d, 1), (GL_TEXTURE_1D, true));
+        assert_eq!(round_trip(HostGl::Desktop, Array1d, 3), (GL_TEXTURE_1D_ARRAY, true));
+    }
+
     /// A desktop context is refused unless desktop GL was asked for, and then only a core profile
     /// at 3.3 or later. QEMU hands one over by default, and until the desktop leg is whole that
     /// must stay a refusal it can report, not a renderer running GLES code on desktop GL.
@@ -3372,12 +3477,22 @@ mod tests {
         v.context_destroy(ctx, &AllAttached);
     }
 
-    /// An evaluation shader with no control shader is a valid guest pipeline that GLES will not
-    /// link, so this host puts a control stage ahead of it, writing `SET_TESS_STATE`'s levels.
-    /// A host with tessellation draws the patch: one triangle covering the target, at levels of
-    /// one. A host without it never told the guest, and refuses the evaluation shader.
-    #[test]
-    fn an_evaluation_shader_without_a_control_shader_draws_its_patches() {
+    /// What [`draw_over_target`] draws: a clear of a 16x16 target to `clear`, then -- when there
+    /// is a fragment shader -- one triangle covering it, through the evaluation stage when `tess`
+    /// names the levels `SET_TESS_STATE` sends.
+    struct OneDraw<'a> {
+        host_gl: HostGl,
+        format: &'a str,
+        clear: [f32; 4],
+        fs: Option<&'a str>,
+        logicop: Option<crate::vrend::pipe::LogicOp>,
+        tess: Option<f32>,
+    }
+
+    /// Draw `d` into a fresh target and read the target back. `Ok(None)` is a host without
+    /// tessellation asked to tessellate, which refuses the evaluation shader as it never told the
+    /// guest it could.
+    fn draw_over_target(d: OneDraw<'_>) -> Result<Option<Vec<u8>>, Fault> {
         use crate::vrend::encode::encode;
         use crate::vrend::pipe::{LogicOp, PrimType};
         use crate::vrend::proto::{
@@ -3410,7 +3525,7 @@ mod tests {
             crate::vrend::debug::Switches::default(),
         );
         let mut v = Vrend::new(
-            Config::default(),
+            Config { host_gl: d.host_gl, ..Config::default() },
             &crate::budget::Budget::with_cap(None, false),
             retire.handle(),
             None,
@@ -3421,12 +3536,15 @@ mod tests {
         .expect("vrend comes up");
         let tessellates = v.features.has(Feature::tessellation);
         let format = |n| super::super::proto::Format::from_wire(n).expect("a known format");
-        let bgra = format(1);
+        let target_format = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == d.format)
+            .expect("a wire format by that name");
         let target = ResourceHandle::new(1).expect("a resource handle is non-zero");
         let vertices = ResourceHandle::new(2).expect("a resource handle is non-zero");
         let texture = resource::Args {
             target: TextureTarget::Texture2d,
-            format: bgra,
+            format: target_format,
             bind: resource::Bind(resource::Bind::RENDER_TARGET.0 | resource::Bind::SAMPLER_VIEW.0),
             width: 16,
             height: 16,
@@ -3461,7 +3579,8 @@ mod tests {
                 .map(|f| f.to_bits())
                 .collect();
         let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
-        let (vs, tes, fs) = (tgsi_words(PASS_VS), tgsi_words(PASS_TES), tgsi_words(RED_FS));
+        let (vs, tes, fs) =
+            (tgsi_words(PASS_VS), tgsi_words(PASS_TES), tgsi_words(d.fs.unwrap_or(RED_FS)));
         fn shader(stage: ShaderStage, text: &[u32]) -> Object<'_> {
             Object::Shader(ShaderCreate {
                 stage,
@@ -3472,8 +3591,7 @@ mod tests {
             })
         }
         let writes = RtBlend { equation: None, colormask: 0xf };
-        let mut wire = Vec::new();
-        for c in [
+        let mut commands = vec![
             Command::ResourceInlineWrite {
                 transfer: Transfer {
                     resource: vertices,
@@ -3486,11 +3604,17 @@ mod tests {
                 data: &corners,
             },
             Command::CreateObject { handle: o(1), object: shader(ShaderStage::Vertex, &vs) },
-            Command::CreateObject { handle: o(2), object: shader(ShaderStage::TessEval, &tes) },
             Command::CreateObject { handle: o(3), object: shader(ShaderStage::Fragment, &fs) },
             Command::BindShader { stage: ShaderStage::Vertex, handle: Some(o(1)) },
-            Command::BindShader { stage: ShaderStage::TessEval, handle: Some(o(2)) },
             Command::BindShader { stage: ShaderStage::Fragment, handle: Some(o(3)) },
+        ];
+        if d.tess.is_some() {
+            commands.extend([
+                Command::CreateObject { handle: o(2), object: shader(ShaderStage::TessEval, &tes) },
+                Command::BindShader { stage: ShaderStage::TessEval, handle: Some(o(2)) },
+            ]);
+        }
+        commands.extend([
             Command::CreateObject {
                 handle: o(4),
                 object: Object::VertexElements(vec![VertexElement {
@@ -3510,11 +3634,11 @@ mod tests {
                 handle: o(5),
                 object: Object::Blend(BlendState {
                     independent_blend_enable: false,
-                    logicop_enable: false,
+                    logicop_enable: d.logicop.is_some(),
                     dither: false,
                     alpha_to_coverage: false,
                     alpha_to_one: false,
-                    logicop_func: LogicOp::Copy,
+                    logicop_func: d.logicop.unwrap_or(LogicOp::Copy),
                     rt: [writes; 8],
                 }),
             },
@@ -3523,7 +3647,7 @@ mod tests {
                 handle: o(6),
                 object: Object::Surface(Surface {
                     resource: target,
-                    format: bgra,
+                    format: target_format,
                     first_element_or_level: 0,
                     last_element_or_layers: 0,
                     samples: 0,
@@ -3534,12 +3658,22 @@ mod tests {
                 start_slot: 0,
                 viewports: vec![Viewport { scale: [8.0, 8.0, 0.5], translate: [8.0, 8.0, 0.5] }],
             },
-            // What gallium sends before a first draw: the GL defaults.
-            Command::SetTessState([1.0; 6]),
+            Command::Clear {
+                buffers: 1 << 2,
+                color: d.clear.map(f32::to_bits),
+                depth: 0.0,
+                stencil: 0,
+            },
+        ]);
+        if let Some(level) = d.tess {
+            commands.push(Command::SetTessState([level; 6]));
+        }
+        let draw = d.fs.is_some();
+        commands.extend(draw.then(|| {
             Command::DrawVbo(Draw {
                 start: 0,
                 count: 3,
-                mode: PrimType::Patches,
+                mode: if d.tess.is_some() { PrimType::Patches } else { PrimType::Triangles },
                 indexed: false,
                 instance_count: 1,
                 index_bias: 0,
@@ -3549,33 +3683,128 @@ mod tests {
                 min_index: 0,
                 max_index: 2,
                 count_from_so: None,
-                tess: Some(TessDraw { vertices_per_patch: 3, drawid: 0 }),
+                tess: d.tess.map(|_| TessDraw { vertices_per_patch: 3, drawid: 0 }),
                 indirect: None,
-            }),
-        ] {
-            encode(&c, &mut wire);
+            })
+        }));
+        let mut wire = Vec::new();
+        for c in &commands {
+            encode(c, &mut wire);
         }
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
         v.context_create(ctx, &AllAttached).expect("a context");
         let ran = v.submit(ctx, &wire, &AllAttached).expect("the context is here");
-        if tessellates {
-            ran.expect("a host with tessellation draws the patch");
-            let cursor = v.cursor_contents(target).expect("a 16x16 2D texture reads back");
+        let out = match ran {
+            Err(Fault::Shader { cmd: crate::vrend::proto::Cmd::CreateObject, .. })
+                if d.tess.is_some() && !tessellates =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+            Ok(()) => {
+                let cursor = v.cursor_contents(target).expect("a 16x16 2D texture reads back");
+                Ok(Some(cursor.pixels))
+            }
+        };
+        v.context_destroy(ctx, &AllAttached);
+        out
+    }
+
+    /// An evaluation shader with no control shader is a valid guest pipeline. GLES will not link
+    /// it, so a GLES host puts a control stage ahead of it that writes `SET_TESS_STATE`'s levels;
+    /// desktop GL links it as bound and takes the levels as its patch defaults. Either way levels
+    /// of one draw the patch -- one triangle covering the target -- and levels of zero cull it. A
+    /// host without tessellation never told the guest, and refuses the evaluation shader.
+    #[test]
+    fn an_evaluation_shader_without_a_control_shader_draws_its_patches() {
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let draw = |level| {
+                draw_over_target(OneDraw {
+                    host_gl,
+                    format: "R8G8B8A8_UNORM",
+                    clear: [0.0; 4],
+                    fs: Some(RED_FS),
+                    logicop: None,
+                    tess: Some(level),
+                })
+                .expect("the draw runs")
+            };
+            let Some(drawn) = draw(1.0) else {
+                continue;
+            };
             assert!(
-                cursor.pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
-                "the patch covered the target: {:?}",
-                &cursor.pixels[..4]
+                drawn.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
+                "{host_gl:?}: the patch covered the target: {:?}",
+                &drawn[..4]
             );
-        } else {
+            let culled = draw(0.0).expect("tessellates");
             assert!(
-                matches!(
-                    ran,
-                    Err(Fault::Shader { cmd: crate::vrend::proto::Cmd::CreateObject, .. })
-                ),
-                "a host without tessellation refuses the evaluation shader: {ran:?}"
+                culled.iter().all(|b| *b == 0),
+                "{host_gl:?}: levels of zero cull the patch: {:?}",
+                &culled[..4]
             );
         }
-        v.context_destroy(ctx, &AllAttached);
+    }
+
+    /// A logic op is the blender's on desktop GL and the shader's on GLES, which emulates the ops
+    /// that need no framebuffer read. `SET` writes every bit whatever the shader output. The
+    /// GLES emulation declares its outputs only for a shader that writes every colour buffer, as
+    /// gallium marks one that writes `gl_FragColor`, so that is the shader drawn.
+    #[test]
+    fn a_logic_op_replaces_the_fragment_on_either_flavour() {
+        const RED_ALL_CBUFS_FS: &str = "FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n\
+                                        DCL OUT[0], COLOR\nIMM[0] FLT32 { 1.0, 0.0, 0.0, 1.0 }\n  \
+                                        0: MOV OUT[0], IMM[0]\n  1: END\n";
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(RED_ALL_CBUFS_FS),
+                logicop: Some(crate::vrend::pipe::LogicOp::Set),
+                tess: None,
+            })
+            .expect("the draw runs")
+            .expect("no tessellation asked for");
+            assert!(pixels.iter().all(|b| *b == 0xff), "{host_gl:?}: {:?}", &pixels[..4]);
+        }
+    }
+
+    /// A desktop core profile has no alpha textures: an A8 target is stored in red, and what the
+    /// shader writes to alpha has to land there. Black at full alpha tells the two apart.
+    #[test]
+    fn an_alpha_only_target_takes_the_shaders_alpha_on_desktop_gl() {
+        const OPAQUE_BLACK_FS: &str = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 { 0.0, 0.0, 0.0, 1.0 }\n  \
+                                       0: MOV OUT[0], IMM[0]\n  1: END\n";
+        let pixels = draw_over_target(OneDraw {
+            host_gl: HostGl::Desktop,
+            format: "A8_UNORM",
+            clear: [0.0; 4],
+            fs: Some(OPAQUE_BLACK_FS),
+            logicop: None,
+            tess: None,
+        })
+        .expect("the draw runs")
+        .expect("no tessellation asked for");
+        assert_eq!(pixels.len(), 16 * 16, "one byte a pixel");
+        assert!(pixels.iter().all(|b| *b == 0xff), "{:?}", &pixels[..4]);
+    }
+
+    /// A clear of an alpha-only target on desktop GL clears its red, which stores the alpha, to
+    /// the clear's alpha. Black at full alpha tells that from a clear of red to red.
+    #[test]
+    fn an_alpha_only_target_clears_to_the_clears_alpha_on_desktop_gl() {
+        let pixels = draw_over_target(OneDraw {
+            host_gl: HostGl::Desktop,
+            format: "A8_UNORM",
+            clear: [0.0, 0.0, 0.0, 1.0],
+            fs: None,
+            logicop: None,
+            tess: None,
+        })
+        .expect("the clear runs")
+        .expect("no tessellation asked for");
+        assert!(pixels.iter().all(|b| *b == 0xff), "{:?}", &pixels[..4]);
     }
 
     /// A display of ours makes contexts in the GL the caller asked for, and init reads back which
