@@ -2025,13 +2025,43 @@ SABOTAGES = [
         'every_extension_the_table_names_is_in_the_registry',
     ),
     (
-        'a desktop host refuses a copy between unrenderable formats',
+        'a desktop host copies unrenderable formats only through guest pages',
         'src/vrend/context/blit.rs',
         """            if host.features.api().is_gles() {
-                host.todo.note("the resource copy fallback through guest memory");""",
+                let (guest, ctx) = (host.guest, host.ctx);""",
         """            if host.features.api().is_gles() || !host.features.api().is_gles() {
-                host.todo.note("the resource copy fallback through guest memory");""",
+                let (guest, ctx) = (host.guest, host.ctx);""",
         'a_copy_between_unrenderable_textures_lands_on_desktop_gl',
+    ),
+    (
+        'a GLES host copies between unrenderable formats as desktop GL does',
+        'src/vrend/context/blit.rs',
+        """            if host.features.api().is_gles() {
+                let (guest, ctx) = (host.guest, host.ctx);""",
+        """            if host.features.api().is_gles() && false {
+                let (guest, ctx) = (host.guest, host.ctx);""",
+        'a_copy_between_unrenderable_textures_samples_as_the_copied_image',
+    ),
+    (
+        'the GLES copy fallback reads the source with the destination level\'s pitch',
+        'src/vrend/transfer.rs',
+        """        stride: u32::try_from(from.stride).map_err(|_| Error::IovOutOfRange)?,""",
+        """        stride: 0,""",
+        'a_copy_between_unrenderable_textures_samples_as_the_copied_image',
+    ),
+    (
+        'the GLES copy fallback takes the source box from the start of its row',
+        'src/vrend/transfer.rs',
+        """            + desc.blocks_wide(region.x as u32) as u64 * desc.block_bytes() as u64;""",
+        """            + 0;""",
+        'a_copy_between_unrenderable_textures_samples_as_the_copied_image',
+    ),
+    (
+        'the GLES copy fallback leaves the destination\'s pages as they were',
+        'src/vrend/transfer.rs',
+        """                || !dst_pages.copy_in_from(&mut written, to_at, &bytes)""",
+        """                || !dst_pages.copy_in_from(&mut written, to_at, &bytes[..0])""",
+        'a_copy_between_unrenderable_textures_samples_as_the_copied_image',
     ),
     (
         'the copy fallback reads its box from the start of the source level',

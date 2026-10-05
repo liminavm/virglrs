@@ -823,14 +823,32 @@ impl Context {
         }
         let can_render = |f: Format| formats.get(f).is_some_and(|e| e.can_render());
         if !can_render(sf) || !can_render(df) {
-            if host.features.api().is_gles() {
-                host.todo.note("the resource copy fallback through guest memory");
-                return Err(Fault::Unimplemented {
-                    cmd,
-                    what: "a copy between unrenderable formats",
-                });
-            }
             let origin = [dst_origin[0] as i32, dst_origin[1] as i32, dst_origin[2] as i32];
+            if host.features.api().is_gles() {
+                let (guest, ctx) = (host.guest, host.ctx);
+                let (Some(src_pages), Some(dst_pages)) =
+                    (guest.pages(ctx, src), guest.pages(ctx, dst))
+                else {
+                    return Err(Fault::Transfer { cmd, error: transfer::Error::NoPages });
+                };
+                let from =
+                    transfer::PagedBox::locate(host.resource(cmd, src)?, src_level, &src_box)
+                        .map_err(|error| Fault::Transfer { cmd, error })?;
+                let (dst_res, bound, staging) = host.resource_to_transfer(cmd, dst)?;
+                return transfer::copy_through_pages(
+                    gl,
+                    bound,
+                    formats,
+                    staging,
+                    &from,
+                    &src_pages.source(),
+                    dst_res,
+                    &dst_pages,
+                    dst_level,
+                    origin,
+                )
+                .map_err(|error| Fault::Transfer { cmd, error });
+            }
             let (src_res, dst_res) = (host.resource(cmd, src)?, host.resource(cmd, dst)?);
             return transfer::copy_through_readback(
                 gl, formats, src_res, src_level, &src_box, dst_res, dst_level, origin,

@@ -3132,7 +3132,8 @@ mod tests {
     /// `glGetCompressedTexImage` and the box is written into the destination. The box is one
     /// block, taken from the source's second column and put in the destination's second row,
     /// so a copy that ignored either origin -- the C's own fallback reads from the level's start
-    /// -- puts the wrong block in the wrong place. GLES has no such read, and refuses.
+    /// -- puts the wrong block in the wrong place. GLES has no such read, and with no guest pages
+    /// to copy through, refuses.
     #[test]
     fn a_copy_between_unrenderable_textures_lands_on_desktop_gl() {
         use crate::vrend::encode::encode;
@@ -3273,8 +3274,184 @@ mod tests {
             want[row..row + block].copy_from_slice(&src_bytes[block..2 * block]);
             Some(read == want)
         };
-        assert_eq!(copy(HostGl::Gles), None, "GLES has no fallback to copy RGTC1 through");
+        assert_eq!(copy(HostGl::Gles), None, "GLES has no pages here to copy RGTC1 through");
         assert_eq!(copy(HostGl::Desktop), Some(true), "desktop GL copies the one block");
+    }
+
+    /// A copy between two textures no framebuffer can hold, on a driver without
+    /// `glCopyImageSubData`, lands on either flavour: desktop GL reads the source back, and GLES,
+    /// which cannot, copies through the guest's pages, which the guest keeps whole behind exactly
+    /// such a texture. The copy is a box out of the source's base level into the destination's
+    /// second level at another place, so a copy that took either level's offset, pitch or origin
+    /// from the wrong side lands the wrong texels. What is scored is the destination sampled in a
+    /// draw, against the same draw of the copy's result uploaded directly -- and, on GLES, the
+    /// destination's pages, which a later copy out of it reads.
+    #[test]
+    fn a_copy_between_unrenderable_textures_samples_as_the_copied_image() {
+        use crate::vrend::pipe::TransferDirection;
+        use crate::vrend::pipe::{CompareFunc, MipFilter, Swizzle, TexFilter, TexWrap};
+        use crate::vrend::proto::{Box3, Command, Object, SamplerState, SamplerView, Transfer};
+        const SAMPLE_FS: &str = "FRAG\nDCL IN[0], POSITION, LINEAR\nDCL OUT[0], COLOR\n\
+                                 DCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\nDCL TEMP[0]\n\
+                                 IMM[0] FLT32 { 0.0625, 0.0625, 0.0, 0.0 }\n  \
+                                 0: MUL TEMP[0], IN[0], IMM[0]\n  \
+                                 1: TEX OUT[0], TEMP[0], SAMP[0], 2D\n  2: END\n";
+        let rgb9e5 = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == "R9G9B9E5_FLOAT")
+            .expect("R9G9B9E5_FLOAT is a wire format");
+        // Mantissas over an exponent of 16 are m / 256: exact, and distinct per texel.
+        let texel = |r: u32, g: u32, b: u32| (r | g << 9 | b << 18 | 16 << 27).to_le_bytes();
+        // Level 0 is 16x16 and level 1 8x8, four bytes a texel, tight and in order.
+        let (base, level1) = (16 * 16 * 4, 8 * 8 * 4);
+        let mut src = vec![0u8; base + level1];
+        for (n, px) in src.chunks_mut(4).enumerate() {
+            let (i, j) = (n as u32 % 16, n as u32 / 16);
+            px.copy_from_slice(&texel(32 * (i % 8), 32 * (j % 8), 32 * ((i + j) % 8)));
+        }
+        let mut dst = vec![0u8; base + level1];
+        for px in dst.chunks_mut(4) {
+            px.copy_from_slice(&texel(0, 0, 255));
+        }
+        // Source texels (4..8, 2..6) of level 0 land at (2..6, 4..8) of level 1.
+        let mut copied = dst.clone();
+        for j in 0..4 {
+            let from = ((2 + j) * 16 + 4) * 4;
+            let to = base + ((4 + j) * 8 + 2) * 4;
+            copied[to..to + 16].copy_from_slice(&src[from..from + 16]);
+        }
+        let draw = |host_gl, copy: bool| {
+            let (s, d) = (
+                ResourceHandle::new(10).expect("non-zero"),
+                ResourceHandle::new(11).expect("non-zero"),
+            );
+            let src_pages = std::cell::RefCell::new(src.clone());
+            let dst_pages =
+                std::cell::RefCell::new(if copy { dst.clone() } else { copied.clone() });
+            let args = resource::Args {
+                target: TextureTarget::Texture2d,
+                format: rgb9e5,
+                bind: resource::Bind::SAMPLER_VIEW,
+                width: 16,
+                height: 16,
+                depth: 1,
+                array_size: 1,
+                last_level: 1,
+                nr_samples: 0,
+                flags: resource::ResourceFlags(0),
+            };
+            let upload = |resource, level: u32, size: i32, offset: u32| Command::Transfer3d {
+                transfer: Transfer {
+                    resource,
+                    level,
+                    usage: 0,
+                    stride: 0,
+                    layer_stride: 0,
+                    region: Box3 { x: 0, y: 0, z: 0, width: size, height: size, depth: 1 },
+                },
+                offset,
+                direction: TransferDirection::ToHost,
+            };
+            let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
+            let mut before = vec![
+                upload(s, 0, 16, 0),
+                upload(s, 1, 8, base as u32),
+                upload(d, 0, 16, 0),
+                upload(d, 1, 8, base as u32),
+            ];
+            if copy {
+                before.push(Command::ResourceCopyRegion {
+                    dst: d,
+                    dst_level: 1,
+                    dst_x: 2,
+                    dst_y: 4,
+                    dst_z: 0,
+                    src: s,
+                    src_level: 0,
+                    src_region: Box3 { x: 4, y: 2, z: 0, width: 4, height: 4, depth: 1 },
+                });
+            }
+            before.extend([
+                Command::CreateObject {
+                    handle: o(20),
+                    object: Object::SamplerView(SamplerView {
+                        resource: d,
+                        format: rgb9e5,
+                        target: TextureTarget::Texture2d,
+                        first_element_or_layers: 0,
+                        // Level 1 alone.
+                        last_element_or_levels: 1 | 1 << 8,
+                        swizzle: [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+                    }),
+                },
+                Command::CreateObject {
+                    handle: o(21),
+                    object: Object::SamplerState(SamplerState {
+                        wrap_s: TexWrap::ClampToEdge,
+                        wrap_t: TexWrap::ClampToEdge,
+                        wrap_r: TexWrap::ClampToEdge,
+                        min_img_filter: TexFilter::Nearest,
+                        min_mip_filter: MipFilter::None,
+                        mag_img_filter: TexFilter::Nearest,
+                        compare_mode: false,
+                        compare_func: CompareFunc::LessEqual,
+                        seamless_cube_map: false,
+                        max_anisotropy: 0,
+                        lod_bias: 0.0,
+                        min_lod: 0.0,
+                        max_lod: 0.0,
+                        border_color: [0; 4],
+                    }),
+                },
+                Command::SetSamplerViews {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    views: vec![Some(o(20))],
+                },
+                Command::BindSamplerStates {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    states: vec![Some(o(21))],
+                },
+            ]);
+            let more = More {
+                resources: vec![(s, args), (d, args)],
+                before,
+                pages: vec![(s, &src_pages), (d, &dst_pages)],
+                // The copy-image road takes any same-format copy, so it is withdrawn: what is
+                // left is a driver older than GL 4.3 or GLES 3.2, which is where the C reaches
+                // its fallback.
+                withdrawn: vec![Feature::copy_image],
+                ..More::default()
+            };
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(SAMPLE_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            })
+            .expect("the draw runs")
+            .expect("no tessellation asked for");
+            (pixels, dst_pages.into_inner())
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let (direct, _) = draw(host_gl, false);
+            let (through_copy, pages) = draw(host_gl, true);
+            assert!(
+                direct.chunks(4).any(|p| p != &direct[..4]),
+                "{host_gl:?}: the premise: the copied box shows in the sampled level"
+            );
+            assert!(direct == through_copy, "{host_gl:?}: the copy samples as the image it made");
+            if host_gl == HostGl::Gles {
+                assert!(pages == copied, "GLES: the destination's pages hold the copy");
+            }
+        }
     }
 
     /// Desktop GL stores a 1D texture as one, and a 1D array as a 2D texture whose rows are its
@@ -3926,9 +4103,13 @@ mod tests {
     ///
     /// `indirect` draws every time through an indirect buffer instead; `after` is sent once the
     /// last draw is; and each of `read_back` -- a buffer and a length -- is read into `read` once
-    /// everything ran and a fence has answered any query the stream left waiting.
+    /// everything ran and a fence has answered any query the stream left waiting. `pages` are the
+    /// guest's pages behind a resource, held for the whole run, and `withdrawn` the features the
+    /// renderer is made to lack.
     #[derive(Default)]
     struct More<'a> {
+        pages: Vec<(ResourceHandle, &'a std::cell::RefCell<Vec<u8>>)>,
+        withdrawn: Vec<Feature>,
         resources: Vec<(ResourceHandle, resource::Args)>,
         before: Vec<crate::vrend::proto::Command<'a>>,
         redraws: Vec<Vec<crate::vrend::proto::Command<'a>>>,
@@ -3957,18 +4138,35 @@ mod tests {
 
             fn global_fence(&mut self, _: ClientFenceId) {}
         }
-        struct AllAttached;
+        struct AllAttached(Vec<(ResourceHandle, [crate::abi::GuestIov; 1])>);
         impl Guest for AllAttached {
             fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
                 true
             }
-            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
-                None
+            fn pages(&self, _: ContextId, handle: ResourceHandle) -> Option<Iov<'_>> {
+                self.0.iter().find(|(h, _)| *h == handle).map(|(_, iov)| Iov::new(iov))
             }
             fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
                 None
             }
         }
+        let mut held: Vec<_> = d
+            .more
+            .map_or(&[][..], |m| &m.pages)
+            .iter()
+            .map(|(h, p)| (*h, p.borrow_mut()))
+            .collect();
+        let guest = AllAttached(
+            held.iter_mut()
+                .map(|(h, p)| {
+                    let iov = crate::abi::GuestIov {
+                        base: crate::abi::VmmPtr(p.as_mut_ptr().cast()),
+                        len: p.len(),
+                    };
+                    (*h, [iov])
+                })
+                .collect(),
+        );
         let retire = crate::fence::Retirement::start(
             Box::new(Discard),
             crate::vrend::debug::Switches::default(),
@@ -3983,6 +4181,9 @@ mod tests {
             crate::vrend::debug::Switches::default(),
         )
         .expect("vrend comes up");
+        for &f in d.more.map_or(&[][..], |m| &m.withdrawn) {
+            v.features.clear(f);
+        }
         let tessellates = v.features.has(Feature::tessellation);
         let format = |n| super::super::proto::Format::from_wire(n).expect("a known format");
         let target_format = (0..crate::vrend::proto::FORMAT_MAX)
@@ -4168,8 +4369,8 @@ mod tests {
             encode(c, &mut wire);
         }
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
-        v.context_create(ctx, &AllAttached).expect("a context");
-        let ran = v.submit(ctx, &wire, &AllAttached).expect("the context is here");
+        v.context_create(ctx, &guest).expect("a context");
+        let ran = v.submit(ctx, &wire, &guest).expect("the context is here");
         let out = match ran {
             Err(Fault::Shader { cmd: crate::vrend::proto::Cmd::CreateObject, .. })
                 if d.tess.is_some() && !tessellates =>
@@ -4189,7 +4390,7 @@ mod tests {
                     && let Some(read) = m.read
                 {
                     // A fence naming no context answers every query left waiting.
-                    v.fence_global(None, ClientFenceId(1), &AllAttached);
+                    v.fence_global(None, ClientFenceId(1), &guest);
                     for &(handle, len) in &m.read_back {
                         let mut bytes = vec![0xa5u8; len as usize];
                         let into = [crate::abi::GuestIov {
@@ -4221,7 +4422,9 @@ mod tests {
                 Ok(Some(cursor.pixels))
             }
         };
-        v.context_destroy(ctx, &AllAttached);
+        v.context_destroy(ctx, &guest);
+        drop(guest);
+        drop(held);
         out
     }
 

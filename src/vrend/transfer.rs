@@ -18,7 +18,7 @@ use super::features::{Feature, Features};
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
 use super::gl::{BoundProgram, GLenum, GLint, GLsizei, Gl, TextureName, pixel_bytes};
-use super::proto::Box3;
+use super::proto::{Box3, Format};
 use super::resource::{Resource, Storage};
 use crate::guest_mem::{Cursor, Iov, Source};
 use std::fmt;
@@ -598,14 +598,114 @@ fn upload_box(
     Ok(())
 }
 
+/// Where a box of a resource sits in the guest's pages, settled from the resource before the copy
+/// borrows anything else: the guest lays a texture out as `virgl_resource_layout` does, every
+/// level tight and in order, each holding all its layers.
+pub struct PagedBox {
+    format: Format,
+    samples: u32,
+    region: Box3,
+    offset: u64,
+    stride: u64,
+    layer_stride: u64,
+}
+
+impl PagedBox {
+    pub fn locate(res: &Resource, level: u32, region: &Box3) -> Result<PagedBox, Error> {
+        let desc = res.args.format.describe().ok_or(Error::Unsupported)?;
+        let start = (0..level).try_fold(0u64, |at, l| Some(at + level_span(res, l)?));
+        let start = start.ok_or(Error::Unsupported)?;
+        let stride = desc.stride(res.width_at(level)) as u64;
+        let layer_stride = desc.blocks_high(res.height_at(level)) as u64 * stride;
+        let offset = start
+            + region.z as u64 * layer_stride
+            + desc.blocks_high(region.y as u32) as u64 * stride
+            + desc.blocks_wide(region.x as u32) as u64 * desc.block_bytes() as u64;
+        Ok(PagedBox {
+            format: res.args.format,
+            samples: res.args.nr_samples,
+            region: *region,
+            offset,
+            stride,
+            layer_stride,
+        })
+    }
+}
+
+/// Copy a box between two textures through the guest's pages: `vrend_resource_copy_fallback` on
+/// a GLES host, which has no texture read.
+///
+/// The guest keeps whole pages behind exactly the textures a GLES host cannot read back, so they
+/// hold what the texture holds: the box is uploaded from the source's pages into the destination
+/// at `origin`, as a transfer from them would be, and copied into the destination's pages at the
+/// same place, so a later copy out of the destination finds it there. The C writes the
+/// destination's pages at the source's box, and uploads from an offset into its buffer that only
+/// a whole level would have.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_through_pages(
+    gl: &Gl,
+    bound: &mut BoundProgram,
+    formats: &Table,
+    staging: &mut Staging,
+    from: &PagedBox,
+    src_pages: &Source<'_>,
+    dst: &mut Resource,
+    dst_pages: &Iov<'_>,
+    dst_level: u32,
+    [x, y, z]: [i32; 3],
+) -> Result<(), Error> {
+    // The C's own two refusals, as `copy_through_readback` makes them.
+    if from.format != dst.args.format || from.samples > 1 || dst.args.nr_samples > 1 {
+        return Err(Error::Unsupported);
+    }
+    let region = Box3 { x, y, z, ..from.region };
+    let to = PagedBox::locate(dst, dst_level, &region)?;
+    let desc = from.format.describe().ok_or(Error::Unsupported)?;
+    let row = desc.stride(region.width as u32) as usize;
+    let rows = desc.blocks_high(region.height as u32) as u64;
+    let layers = region.depth as u64;
+    if row == 0 || rows == 0 || layers == 0 {
+        return Ok(());
+    }
+    let span = |b: &PagedBox| b.offset + (layers - 1) * b.layer_stride + (rows - 1) * b.stride;
+    if span(&to) + row as u64 > dst_pages.len() {
+        return Err(Error::IovOutOfRange);
+    }
+    let info = Info {
+        level: dst_level,
+        stride: u32::try_from(from.stride).map_err(|_| Error::IovOutOfRange)?,
+        layer_stride: u32::try_from(from.layer_stride).map_err(|_| Error::IovOutOfRange)?,
+        offset: from.offset,
+        region,
+        synchronized: false,
+    };
+    write(gl, bound, formats, staging, dst, Some(dst_pages), src_pages, &info)?;
+    let mut bytes = vec![0u8; row];
+    let (mut read, mut written) = (Cursor::default(), Cursor::default());
+    for d in 0..layers {
+        for r in 0..rows {
+            let (at, to_at) = (
+                from.offset + d * from.layer_stride + r * from.stride,
+                to.offset + d * to.layer_stride + r * to.stride,
+            );
+            if !src_pages.copy_out_from(&mut read, at, &mut bytes)
+                || !dst_pages.copy_in_from(&mut written, to_at, &bytes)
+            {
+                return Err(Error::IovOutOfRange);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Copy a box between two textures by reading the source back: `vrend_resource_copy_fallback`
 /// on a desktop host, for a copy neither `glCopyImageSubData` nor a framebuffer blit can make.
 ///
 /// The source level is read whole, the box cut out of it, and the box written at `origin` in the
 /// destination -- texel coordinates, unflipped, as `glCopyImageSubData` takes them. The C cuts
 /// nothing: it writes the box's size from the start of the source level, so a box not at the
-/// origin copies the wrong texels. GLES has no texture read, and the C's GLES leg copies the
-/// guest's pages instead; this is desktop GL only.
+/// origin copies the wrong texels. GLES has no texture read, and copies through the guest's pages
+/// instead -- see [`copy_through_pages`].
 #[allow(clippy::too_many_arguments)]
 pub fn copy_through_readback(
     gl: &Gl,
