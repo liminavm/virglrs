@@ -3010,6 +3010,156 @@ mod tests {
         assert_eq!(read_back(HostGl::Desktop), Some(true), "desktop GL reads its blocks back");
     }
 
+    /// A copy between two textures no framebuffer can hold, on a driver without
+    /// `glCopyImageSubData`, lands on desktop GL: the source level is read with
+    /// `glGetCompressedTexImage` and the box is written into the destination. The box is one
+    /// block, taken from the source's second column and put in the destination's second row,
+    /// so a copy that ignored either origin -- the C's own fallback reads from the level's start
+    /// -- puts the wrong block in the wrong place. GLES has no such read, and refuses.
+    #[test]
+    fn a_copy_between_unrenderable_textures_lands_on_desktop_gl() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::Command;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let rgtc1 = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == "RGTC1_UNORM")
+            .expect("RGTC1_UNORM is a wire format");
+        let copy = |host_gl| {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let mut v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            // The copy-image road takes any same-format copy, so it is withdrawn: what is left is
+            // a driver older than GL 4.3, which is where the C reaches its fallback.
+            v.features.clear(Feature::copy_image);
+            let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+            v.context_create(ctx, &AllAttached).expect("a context");
+            let desc = rgtc1.describe().expect("described");
+            let (w, h) = (8u32, 8u32);
+            let stride = desc.stride(w);
+            let layer = stride * desc.blocks_high(h);
+            let block = desc.block_bytes() as usize;
+            let info = transfer::Info {
+                level: 0,
+                stride,
+                layer_stride: layer,
+                offset: 0,
+                region: crate::vrend::proto::Box3 {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    width: w as i32,
+                    height: h as i32,
+                    depth: 1,
+                },
+                synchronized: false,
+            };
+            let mut src_bytes: Vec<u8> =
+                (0..layer).map(|b| (b as u8).wrapping_mul(37) | 1).collect();
+            let mut dst_bytes = vec![0u8; layer as usize];
+            for (n, bytes) in [(1, &mut src_bytes), (2, &mut dst_bytes)] {
+                let res = ResourceHandle::new(n).expect("non-zero");
+                v.resource_create(
+                    res,
+                    resource::Args {
+                        target: TextureTarget::Texture2d,
+                        format: rgtc1,
+                        bind: resource::Bind::SAMPLER_VIEW,
+                        width: w,
+                        height: h,
+                        depth: 1,
+                        array_size: 1,
+                        last_level: 0,
+                        nr_samples: 0,
+                        flags: resource::ResourceFlags(0),
+                    },
+                )
+                .expect("a texture");
+                let from = [crate::abi::GuestIov {
+                    base: crate::abi::VmmPtr(bytes.as_mut_ptr().cast()),
+                    len: bytes.len(),
+                }];
+                let from = Iov::new(&from);
+                v.transfer(None, res, Some(&from), transfer::Through::ToHost(from.source()), &info)
+                    .expect("the upload");
+            }
+            let (src, dst) = (
+                ResourceHandle::new(1).expect("non-zero"),
+                ResourceHandle::new(2).expect("non-zero"),
+            );
+            let mut wire = Vec::new();
+            encode(
+                &Command::ResourceCopyRegion {
+                    dst,
+                    dst_level: 0,
+                    dst_x: 0,
+                    dst_y: 4,
+                    dst_z: 0,
+                    src,
+                    src_level: 0,
+                    src_region: crate::vrend::proto::Box3 {
+                        x: 4,
+                        y: 0,
+                        z: 0,
+                        width: 4,
+                        height: 4,
+                        depth: 1,
+                    },
+                },
+                &mut wire,
+            );
+            let ran = v.submit(ctx, &wire, &AllAttached).expect("the context is here");
+            if ran.is_err() {
+                return None;
+            }
+            let mut read = vec![0xa5u8; layer as usize];
+            let into = [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(read.as_mut_ptr().cast()),
+                len: read.len(),
+            }];
+            let into = Iov::new(&into);
+            v.transfer(None, dst, None, transfer::Through::ToGuest(&into), &info)
+                .expect("the destination reads back");
+            let mut want = vec![0u8; layer as usize];
+            // Source block (1, 0) is bytes [block, 2 * block); destination block (0, 1) starts a
+            // row of blocks down, at `stride`.
+            let row = stride as usize;
+            want[row..row + block].copy_from_slice(&src_bytes[block..2 * block]);
+            Some(read == want)
+        };
+        assert_eq!(copy(HostGl::Gles), None, "GLES has no fallback to copy RGTC1 through");
+        assert_eq!(copy(HostGl::Desktop), Some(true), "desktop GL copies the one block");
+    }
+
     /// Desktop GL stores a 1D texture as one, and a 1D array as a 2D texture whose rows are its
     /// layers; GLES has no 1D textures and stores both as 2D. Either way a box written to every
     /// layer reads back as written -- a layer uploaded as the wrong row, or as a 2D image of a

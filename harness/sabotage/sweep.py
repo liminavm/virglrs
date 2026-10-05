@@ -1958,6 +1958,23 @@ SABOTAGES = [
         'a_desktop_context_is_taken_only_when_asked_for',
     ),
     (
+        'a desktop host refuses a copy between unrenderable formats',
+        'src/vrend/context/blit.rs',
+        """            if host.features.api().is_gles() {
+                host.todo.note("the resource copy fallback through guest memory");""",
+        """            if host.features.api().is_gles() || !host.features.api().is_gles() {
+                host.todo.note("the resource copy fallback through guest memory");""",
+        'a_copy_between_unrenderable_textures_lands_on_desktop_gl',
+    ),
+    (
+        'the copy fallback reads its box from the start of the source level',
+        'src/vrend/transfer.rs',
+        """    read_box_whole_level(gl, entry, src, src_level, src_box, src_box.y, &l, &mut data)?;""",
+        """    let at_start = Box3 { x: 0, y: 0, ..*src_box };
+    read_box_whole_level(gl, entry, src, src_level, &at_start, 0, &l, &mut data)?;""",
+        'a_copy_between_unrenderable_textures_lands_on_desktop_gl',
+    ),
+    (
         'a desktop host reads a cursor only through a framebuffer',
         'src/vrend/transfer.rs',
         """    if features.api().is_gles() {
@@ -2144,8 +2161,8 @@ SABOTAGES = [
     (
         'every layer of a 1D array is uploaded into its first',
         'src/vrend/transfer.rs',
-        """                    let (y, h) = if target == GL_TEXTURE_1D_ARRAY { (b.z, d) } else { (y, h) };""",
-        """                    let (y, h) = (y, h);""",
+        """            let (y, h) = if target == GL_TEXTURE_1D_ARRAY { (z, d) } else { (y, h) };""",
+        """            let (y, h) = (y, h);""",
         'a_1d_texture_is_one_on_desktop_gl_and_round_trips_on_both',
     ),
     (

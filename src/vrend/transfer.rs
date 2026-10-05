@@ -512,81 +512,8 @@ pub fn write(
             let (x, y) = (b.x, upload_y(res, &b, invert));
             let (w, h, d) = (b.width, b.height, b.depth);
             gl.use_program(bound, None);
-            gl.bind_texture(target, Some(name));
-            gl.unpack_tight();
-            gl.drain_errors();
-            let (glformat, gltype, ifmt) =
-                (entry.gl.glformat, entry.gl.gltype, entry.gl.internalformat);
-            let sent = match target {
-                GL_TEXTURE_CUBE_MAP => {
-                    // One face per upload: the C refuses a cube box deeper than one face.
-                    if d != 1 {
-                        gl.bind_texture(target, None);
-                        return Err(Error::Unsupported);
-                    }
-                    let face = GL_TEXTURE_CUBE_MAP_POSITIVE_X + b.z as GLenum;
-                    if l.compressed {
-                        gl.compressed_tex_sub_image_2d(
-                            face,
-                            info.level as GLint,
-                            x,
-                            y,
-                            w,
-                            h,
-                            ifmt,
-                            &*data,
-                        )
-                    } else {
-                        gl.tex_sub_image_2d(
-                            face,
-                            info.level as GLint,
-                            x,
-                            y,
-                            w,
-                            h,
-                            glformat,
-                            gltype,
-                            &*data,
-                        )
-                    }
-                }
-                GL_TEXTURE_3D | GL_TEXTURE_2D_ARRAY | GL_TEXTURE_CUBE_MAP_ARRAY => {
-                    let lv = info.level as GLint;
-                    if l.compressed {
-                        gl.compressed_tex_sub_image_3d(target, lv, x, y, b.z, w, h, d, ifmt, &*data)
-                    } else {
-                        gl.tex_sub_image_3d(
-                            target, lv, x, y, b.z, w, h, d, glformat, gltype, &*data,
-                        )
-                    }
-                }
-                GL_TEXTURE_1D => {
-                    let lv = info.level as GLint;
-                    if l.compressed {
-                        gl.compressed_tex_sub_image_1d(lv, x, w, ifmt, &*data)
-                    } else {
-                        gl.tex_sub_image_1d(lv, x, w, glformat, gltype, &*data)
-                    }
-                }
-                _ => {
-                    let lv = info.level as GLint;
-                    // A 1D array's layers are its rows.
-                    let (y, h) = if target == GL_TEXTURE_1D_ARRAY { (b.z, d) } else { (y, h) };
-                    if l.compressed {
-                        gl.compressed_tex_sub_image_2d(target, lv, x, y, w, h, ifmt, &*data)
-                    } else {
-                        gl.tex_sub_image_2d(target, lv, x, y, w, h, glformat, gltype, &*data)
-                    }
-                }
-            };
-            let err = gl.drain_errors();
-            gl.bind_texture(target, None);
-            if !sent {
-                return Err(Error::Unsupported);
-            }
-            if err != GL_NO_ERROR {
-                return Err(Error::GlError(err));
-            }
+            let (origin, extent) = ([x, y, b.z], [w, h, d]);
+            upload_box(gl, entry, target, name, info.level, origin, extent, l.compressed, data)?;
             // A surface-backed resource has no host copy: the upload above is queued on this
             // context's queue and the consumer -- a venus context that imported the surface --
             // submits on its own, and Metal does not order work across queues. The guest's fence
@@ -598,6 +525,136 @@ pub fn write(
             Ok(())
         }
     }
+}
+
+/// Upload `data`, laid out tight, into a box of a texture level: the per-target half of
+/// `vrend_renderer_transfer_write_iov`, which the copy fallback shares. `origin` and `extent` are
+/// the driver's, with `y` already in GL's orientation; a cube takes one face, named by `z`.
+#[allow(clippy::too_many_arguments)]
+fn upload_box(
+    gl: &Gl,
+    entry: &Entry,
+    target: GLenum,
+    name: TextureName,
+    level: u32,
+    [x, y, z]: [GLint; 3],
+    [w, h, d]: [GLsizei; 3],
+    compressed: bool,
+    data: &[u8],
+) -> Result<(), Error> {
+    gl.bind_texture(target, Some(name));
+    gl.unpack_tight();
+    gl.drain_errors();
+    let (glformat, gltype, ifmt) = (entry.gl.glformat, entry.gl.gltype, entry.gl.internalformat);
+    let sent = match target {
+        GL_TEXTURE_CUBE_MAP => {
+            // One face per upload: the C refuses a cube box deeper than one face.
+            if d != 1 {
+                gl.bind_texture(target, None);
+                return Err(Error::Unsupported);
+            }
+            let face = GL_TEXTURE_CUBE_MAP_POSITIVE_X + z as GLenum;
+            if compressed {
+                gl.compressed_tex_sub_image_2d(face, level as GLint, x, y, w, h, ifmt, data)
+            } else {
+                gl.tex_sub_image_2d(face, level as GLint, x, y, w, h, glformat, gltype, data)
+            }
+        }
+        GL_TEXTURE_3D | GL_TEXTURE_2D_ARRAY | GL_TEXTURE_CUBE_MAP_ARRAY => {
+            let lv = level as GLint;
+            if compressed {
+                gl.compressed_tex_sub_image_3d(target, lv, x, y, z, w, h, d, ifmt, data)
+            } else {
+                gl.tex_sub_image_3d(target, lv, x, y, z, w, h, d, glformat, gltype, data)
+            }
+        }
+        GL_TEXTURE_1D => {
+            let lv = level as GLint;
+            if compressed {
+                gl.compressed_tex_sub_image_1d(lv, x, w, ifmt, data)
+            } else {
+                gl.tex_sub_image_1d(lv, x, w, glformat, gltype, data)
+            }
+        }
+        _ => {
+            let lv = level as GLint;
+            // A 1D array's layers are its rows.
+            let (y, h) = if target == GL_TEXTURE_1D_ARRAY { (z, d) } else { (y, h) };
+            if compressed {
+                gl.compressed_tex_sub_image_2d(target, lv, x, y, w, h, ifmt, data)
+            } else {
+                gl.tex_sub_image_2d(target, lv, x, y, w, h, glformat, gltype, data)
+            }
+        }
+    };
+    let err = gl.drain_errors();
+    gl.bind_texture(target, None);
+    if !sent {
+        return Err(Error::Unsupported);
+    }
+    if err != GL_NO_ERROR {
+        return Err(Error::GlError(err));
+    }
+    Ok(())
+}
+
+/// Copy a box between two textures by reading the source back: `vrend_resource_copy_fallback`
+/// on a desktop host, for a copy neither `glCopyImageSubData` nor a framebuffer blit can make.
+///
+/// The source level is read whole, the box cut out of it, and the box written at `origin` in the
+/// destination -- texel coordinates, unflipped, as `glCopyImageSubData` takes them. The C cuts
+/// nothing: it writes the box's size from the start of the source level, so a box not at the
+/// origin copies the wrong texels. GLES has no texture read, and the C's GLES leg copies the
+/// guest's pages instead; this is desktop GL only.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_through_readback(
+    gl: &Gl,
+    formats: &Table,
+    src: &Resource,
+    src_level: u32,
+    src_box: &Box3,
+    dst: &Resource,
+    dst_level: u32,
+    [x, y, z]: [GLint; 3],
+) -> Result<(), Error> {
+    // The C's own two refusals: one format read and written as another would be reinterpreted,
+    // and a multisampled level has no texture read.
+    if src.args.format != dst.args.format || src.args.nr_samples > 1 || dst.args.nr_samples > 1 {
+        return Err(Error::Unsupported);
+    }
+    let Storage::Texture(t) = &dst.storage else {
+        return Err(Error::Unsupported);
+    };
+    let entry = src.entry(formats).ok_or(Error::Unsupported)?;
+    let desc = src.args.format.describe().ok_or(Error::Unsupported)?;
+    let (w, h, d) = (src_box.width, src_box.height, src_box.depth);
+    let (blocks_wide, blocks_high) =
+        (desc.blocks_wide(w as u32) as u64, desc.blocks_high(h as u32) as u64);
+    let stride = blocks_wide * desc.block_bytes() as u64;
+    let l = Layout {
+        block: desc.block_bytes() as u64,
+        blocks_wide,
+        blocks_high,
+        depth: d as u64,
+        stride,
+        layer_stride: blocks_high * stride,
+        compressed: desc.is_compressed(),
+    }
+    .as_gl(entry, w as u64, h as u64);
+    if l.total() == 0 {
+        return Ok(());
+    }
+    let mut data = vec![0u8; usize::try_from(l.total()).map_err(|_| Error::IovOutOfRange)?];
+    read_box_whole_level(gl, entry, src, src_level, src_box, src_box.y, &l, &mut data)?;
+    if t.target == GL_TEXTURE_CUBE_MAP {
+        // A cube takes one face per upload.
+        for (face, bytes) in data.chunks(l.layer() as usize).enumerate() {
+            let at = [x, y, z + face as GLint];
+            upload_box(gl, entry, t.target, t.name, dst_level, at, [w, h, 1], l.compressed, bytes)?;
+        }
+        return Ok(());
+    }
+    upload_box(gl, entry, t.target, t.name, dst_level, [x, y, z], [w, h, d], l.compressed, &data)
 }
 
 /// The framebuffer attachment a format's texture goes on: `vrend_fb_bind_texture_id`.

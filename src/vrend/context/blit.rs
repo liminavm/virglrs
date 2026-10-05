@@ -823,8 +823,19 @@ impl Context {
         }
         let can_render = |f: Format| formats.get(f).is_some_and(|e| e.can_render());
         if !can_render(sf) || !can_render(df) {
-            host.todo.note("the resource copy fallback through guest memory");
-            return Err(Fault::Unimplemented { cmd, what: "a copy between unrenderable formats" });
+            if host.features.api().is_gles() {
+                host.todo.note("the resource copy fallback through guest memory");
+                return Err(Fault::Unimplemented {
+                    cmd,
+                    what: "a copy between unrenderable formats",
+                });
+            }
+            let origin = [dst_origin[0] as i32, dst_origin[1] as i32, dst_origin[2] as i32];
+            let (src_res, dst_res) = (host.resource(cmd, src)?, host.resource(cmd, dst)?);
+            return transfer::copy_through_readback(
+                gl, formats, src_res, src_level, &src_box, dst_res, dst_level, origin,
+            )
+            .map_err(|error| Fault::Transfer { cmd, error });
         }
         // The framebuffer blit.
         let (src_y0top, src_h) = (src_res.y_0_top(), src_res.args.height as i32);
