@@ -571,7 +571,7 @@ mod tests {
             .create_context(Version { major: 3, minor: 1 }, None)
             .expect("a GLES 3.1 context");
         winsys.make_current(&ctx).expect("ctx is current on this thread");
-        let gl = Gl::new(winsys.procs());
+        let gl = Gl::new(winsys.procs(), crate::vrend::features::Api::Gles(30));
         (display, winsys, ctx, gl)
     }
 

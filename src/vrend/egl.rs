@@ -1364,13 +1364,21 @@ impl Winsys {
         self.shared.image_of_surface(held, Some(plane))
     }
 
-    /// The GLES entry points. Resolved through `eglGetProcAddress`, which for Mesa answers the
+    /// The GL entry points. Resolved through `eglGetProcAddress`, which for Mesa answers the
     /// same addresses whichever context is current -- dispatch happens behind them -- so one
     /// table serves every context of the display.
     pub fn procs(&self) -> Procs {
         // SAFETY: `eglGetProcAddress` answers each name with null or with the address of the GL
         // command of that name, which is the contract `Procs::load` requires.
         unsafe { Procs::load(&mut get_proc) }
+    }
+
+    /// The entry points less every name `hide` picks out. Mesa answers every name whichever API
+    /// the context speaks, so a test of which spelling is asked for needs a table that lacks one.
+    #[cfg(test)]
+    pub fn procs_without(&self, hide: impl Fn(&CStr) -> bool) -> Procs {
+        // SAFETY: as `procs`; a hidden name is answered with null, which the contract allows.
+        unsafe { Procs::load(&mut |name| if hide(name) { None } else { get_proc(name) }) }
     }
 }
 
@@ -1938,7 +1946,7 @@ mod tests {
         let ctx =
             winsys.create_context(Version { major: 3, minor: 1 }, None).expect("a 3.1 context");
         winsys.make_current(&ctx).expect("current");
-        let gl = Gl::new(winsys.procs());
+        let gl = Gl::new(winsys.procs(), crate::vrend::features::Api::Gles(30));
 
         let surface = Surface::planar(64, 64, PlanarFormat::BiPlanar420).expect("a planar surface");
         assert!(surface.fill_plane(0, LUMA_BYTE), "the luma plane fills");
@@ -2018,7 +2026,7 @@ mod tests {
         assert!(layout.bytes_per_row() >= W * 4, "a pitch that holds a row");
         let surface = Arc::new(surface);
 
-        let gl = Gl::new(winsys.procs());
+        let gl = Gl::new(winsys.procs(), crate::vrend::features::Api::Gles(30));
         let image = winsys
             .image_from_surface(Arc::clone(&surface) as Arc<dyn Held>)
             .expect("the driver images its own allocator's buffer");

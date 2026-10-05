@@ -44,7 +44,7 @@ use core::ffi::CStr;
 pub struct BoundProgram(Option<ProgramName>);
 
 use super::egl::Image;
-use super::features::Feature;
+use super::features::{Api, Feature};
 
 pub use gles::Procs;
 use gles::*;
@@ -299,139 +299,184 @@ fn promised<T>(proc: Option<T>, feature: Feature, name: &str) -> T {
 mod procs {
     use super::gles::*;
     use super::{
-        Feature, GLbitfield, GLboolean, GLchar, GLeglImageOES, GLenum, GLfloat, GLint, GLintptr,
-        GLsizei, GLsizeiptr, GLuint,
+        Api, Feature, GLbitfield, GLboolean, GLchar, GLeglImageOES, GLenum, GLfloat, GLint,
+        GLintptr, GLsizei, GLsizeiptr, GLuint,
     };
     use core::ffi::c_void;
 
+    /// A resolver lists a spelling per API, and asks only the one its table was loaded under: a
+    /// driver may answer any name it knows with a stub, so a spelling the API does not have is
+    /// not something to fall back to.
     macro_rules! resolver {
-        ($name:ident: $sig:ty = $first:ident $(, $rest:ident)* $(,)?) => {
-            pub fn $name(t: &Procs) -> Option<$sig> {
-                t.$first() $(.or_else(|| t.$rest()))*
+        ($name:ident: $sig:ty = gles [$($es:ident),*], gl [$($gl:ident),*]) => {
+            pub fn $name(t: &Procs, api: Api) -> Option<$sig> {
+                let spellings: &[fn(&Procs) -> Option<$sig>] = match api {
+                    Api::Gles(_) => &[$(Procs::$es),*],
+                    Api::Gl(_) => &[$(Procs::$gl),*],
+                };
+                spellings.iter().find_map(|spelling| spelling(t))
             }
         };
     }
 
     resolver!(color_mask_i: unsafe extern "C" fn(GLuint, GLboolean, GLboolean, GLboolean, GLboolean)
-        = try_glColorMaski, try_glColorMaskiEXT, try_glColorMaskiOES);
-    resolver!(enable_i: unsafe extern "C" fn(GLenum, GLuint) = try_glEnablei, try_glEnableiEXT, try_glEnableiOES);
-    resolver!(disable_i: unsafe extern "C" fn(GLenum, GLuint) = try_glDisablei, try_glDisableiEXT, try_glDisableiOES);
+        = gles [try_glColorMaski, try_glColorMaskiEXT, try_glColorMaskiOES], gl [try_glColorMaski]);
+    resolver!(enable_i: unsafe extern "C" fn(GLenum, GLuint)
+        = gles [try_glEnablei, try_glEnableiEXT, try_glEnableiOES], gl [try_glEnablei]);
+    resolver!(disable_i: unsafe extern "C" fn(GLenum, GLuint)
+        = gles [try_glDisablei, try_glDisableiEXT, try_glDisableiOES], gl [try_glDisablei]);
     resolver!(blend_func_separate_i: unsafe extern "C" fn(GLuint, GLenum, GLenum, GLenum, GLenum)
-        = try_glBlendFuncSeparatei, try_glBlendFuncSeparateiEXT, try_glBlendFuncSeparateiOES);
+        = gles [try_glBlendFuncSeparatei, try_glBlendFuncSeparateiEXT, try_glBlendFuncSeparateiOES], gl [try_glBlendFuncSeparatei]);
     resolver!(blend_equation_separate_i: unsafe extern "C" fn(GLuint, GLenum, GLenum)
-        = try_glBlendEquationSeparatei, try_glBlendEquationSeparateiEXT, try_glBlendEquationSeparateiOES);
-    resolver!(min_sample_shading: unsafe extern "C" fn(GLfloat) = try_glMinSampleShading, try_glMinSampleShadingOES);
-    resolver!(clip_control: unsafe extern "C" fn(GLenum, GLenum) = try_glClipControlEXT);
+        = gles [try_glBlendEquationSeparatei, try_glBlendEquationSeparateiEXT, try_glBlendEquationSeparateiOES], gl [try_glBlendEquationSeparatei]);
+    resolver!(min_sample_shading: unsafe extern "C" fn(GLfloat)
+        = gles [try_glMinSampleShading, try_glMinSampleShadingOES], gl [try_glMinSampleShading]);
+    resolver!(clip_control: unsafe extern "C" fn(GLenum, GLenum)
+        = gles [try_glClipControlEXT], gl [try_glClipControl]);
     resolver!(sampler_parameter_iuiv: unsafe extern "C" fn(GLuint, GLenum, *const GLuint)
-        = try_glSamplerParameterIuiv, try_glSamplerParameterIuivEXT, try_glSamplerParameterIuivOES);
+        = gles [try_glSamplerParameterIuiv, try_glSamplerParameterIuivEXT, try_glSamplerParameterIuivOES], gl [try_glSamplerParameterIuiv]);
     resolver!(framebuffer_texture: unsafe extern "C" fn(GLenum, GLenum, GLuint, GLint)
-        = try_glFramebufferTexture, try_glFramebufferTextureEXT, try_glFramebufferTextureOES);
+        = gles [try_glFramebufferTexture, try_glFramebufferTextureEXT, try_glFramebufferTextureOES], gl [try_glFramebufferTexture]);
     resolver!(framebuffer_texture_3d: unsafe extern "C" fn(GLenum, GLenum, GLenum, GLuint, GLint, GLint)
-        = try_glFramebufferTexture3DOES);
+        = gles [try_glFramebufferTexture3DOES], gl [try_glFramebufferTexture3D]);
     resolver!(framebuffer_texture_2d_multisample: unsafe extern "C" fn(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei)
-        = try_glFramebufferTexture2DMultisampleEXT);
+        = gles [try_glFramebufferTexture2DMultisampleEXT], gl []);
     resolver!(texture_view: unsafe extern "C" fn(GLuint, GLenum, GLuint, GLenum, GLuint, GLuint, GLuint, GLuint)
-        = try_glTextureViewOES, try_glTextureViewEXT);
+        = gles [try_glTextureViewOES, try_glTextureViewEXT], gl [try_glTextureView]);
     resolver!(egl_image_target_tex_storage: unsafe extern "C" fn(GLenum, GLeglImageOES, *const GLint)
-        = try_glEGLImageTargetTexStorageEXT);
+        = gles [try_glEGLImageTargetTexStorageEXT], gl [try_glEGLImageTargetTexStorageEXT]);
     resolver!(egl_image_target_texture_2d: unsafe extern "C" fn(GLenum, GLeglImageOES)
-        = try_glEGLImageTargetTexture2DOES);
+        = gles [try_glEGLImageTargetTexture2DOES], gl [try_glEGLImageTargetTexture2DOES]);
     resolver!(copy_image_sub_data: unsafe extern "C" fn(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei)
-        = try_glCopyImageSubData, try_glCopyImageSubDataEXT, try_glCopyImageSubDataOES);
-    resolver!(tex_buffer: unsafe extern "C" fn(GLenum, GLenum, GLuint) = try_glTexBuffer, try_glTexBufferEXT, try_glTexBufferOES);
+        = gles [try_glCopyImageSubData, try_glCopyImageSubDataEXT, try_glCopyImageSubDataOES], gl [try_glCopyImageSubData]);
+    resolver!(tex_buffer: unsafe extern "C" fn(GLenum, GLenum, GLuint)
+        = gles [try_glTexBuffer, try_glTexBufferEXT, try_glTexBufferOES], gl [try_glTexBuffer]);
     resolver!(tex_buffer_range: unsafe extern "C" fn(GLenum, GLenum, GLuint, GLintptr, GLsizeiptr)
-        = try_glTexBufferRange, try_glTexBufferRangeEXT, try_glTexBufferRangeOES);
+        = gles [try_glTexBufferRange, try_glTexBufferRangeEXT, try_glTexBufferRangeOES], gl [try_glTexBufferRange]);
     resolver!(clear_tex_sub_image: unsafe extern "C" fn(GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, *const c_void)
-        = try_glClearTexSubImageEXT);
+        = gles [try_glClearTexSubImageEXT], gl [try_glClearTexSubImage]);
     resolver!(bind_frag_data_location_indexed: unsafe extern "C" fn(GLuint, GLuint, GLuint, *const GLchar)
-        = try_glBindFragDataLocationIndexedEXT);
+        = gles [try_glBindFragDataLocationIndexedEXT], gl [try_glBindFragDataLocationIndexed]);
     resolver!(draw_arrays_instanced_base_instance: unsafe extern "C" fn(GLenum, GLint, GLsizei, GLsizei, GLuint)
-        = try_glDrawArraysInstancedBaseInstanceEXT);
+        = gles [try_glDrawArraysInstancedBaseInstanceEXT], gl [try_glDrawArraysInstancedBaseInstance]);
     resolver!(draw_elements_instanced_base_instance: unsafe extern "C" fn(GLenum, GLsizei, GLenum, *const c_void, GLsizei, GLuint)
-        = try_glDrawElementsInstancedBaseInstanceEXT);
+        = gles [try_glDrawElementsInstancedBaseInstanceEXT], gl [try_glDrawElementsInstancedBaseInstance]);
     resolver!(draw_elements_instanced_base_vertex_base_instance: unsafe extern "C" fn(GLenum, GLsizei, GLenum, *const c_void, GLsizei, GLint, GLuint)
-        = try_glDrawElementsInstancedBaseVertexBaseInstanceEXT);
+        = gles [try_glDrawElementsInstancedBaseVertexBaseInstanceEXT], gl [try_glDrawElementsInstancedBaseVertexBaseInstance]);
     resolver!(multi_draw_arrays_indirect: unsafe extern "C" fn(GLenum, *const c_void, GLsizei, GLsizei)
-        = try_glMultiDrawArraysIndirectEXT);
+        = gles [try_glMultiDrawArraysIndirectEXT], gl [try_glMultiDrawArraysIndirect]);
     resolver!(multi_draw_elements_indirect: unsafe extern "C" fn(GLenum, GLenum, *const c_void, GLsizei, GLsizei)
-        = try_glMultiDrawElementsIndirectEXT);
-    resolver!(bind_program_pipeline: unsafe extern "C" fn(GLuint) = try_glBindProgramPipeline, try_glBindProgramPipelineEXT);
+        = gles [try_glMultiDrawElementsIndirectEXT], gl [try_glMultiDrawElementsIndirect]);
+    resolver!(bind_program_pipeline: unsafe extern "C" fn(GLuint)
+        = gles [try_glBindProgramPipeline, try_glBindProgramPipelineEXT], gl [try_glBindProgramPipeline]);
     resolver!(tex_storage_3d_multisample: unsafe extern "C" fn(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei, GLboolean)
-        = try_glTexStorage3DMultisample);
-    resolver!(buffer_storage: unsafe extern "C" fn(GLenum, GLsizeiptr, *const c_void, GLbitfield) = try_glBufferStorageEXT);
+        = gles [try_glTexStorage3DMultisample], gl [try_glTexStorage3DMultisample]);
+    resolver!(buffer_storage: unsafe extern "C" fn(GLenum, GLsizeiptr, *const c_void, GLbitfield)
+        = gles [try_glBufferStorageEXT], gl [try_glBufferStorage]);
 
     /// One proc a feature stands for: the feature, the name a message gives it, and whether the
     /// driver exported any of its spellings.
-    pub type Behind = (Feature, &'static str, fn(&Procs) -> bool);
+    pub type Behind = (Feature, &'static str, fn(&Procs, Api) -> bool);
 
     /// Every proc a feature stands for, with the feature and the name a message gives it.
     pub const BEHIND: &[Behind] = &[
-        (Feature::indep_blend, "glColorMaski", |t| color_mask_i(t).is_some()),
-        (Feature::indep_blend, "glEnablei", |t| enable_i(t).is_some()),
-        (Feature::indep_blend, "glDisablei", |t| disable_i(t).is_some()),
-        (Feature::indep_blend_func, "glBlendFuncSeparatei", |t| blend_func_separate_i(t).is_some()),
-        (Feature::indep_blend_func, "glBlendEquationSeparatei", |t| {
-            blend_equation_separate_i(t).is_some()
+        (Feature::indep_blend, "glColorMaski", |t, a| color_mask_i(t, a).is_some()),
+        (Feature::indep_blend, "glEnablei", |t, a| enable_i(t, a).is_some()),
+        (Feature::indep_blend, "glDisablei", |t, a| disable_i(t, a).is_some()),
+        (Feature::indep_blend_func, "glBlendFuncSeparatei", |t, a| {
+            blend_func_separate_i(t, a).is_some()
         }),
-        (Feature::sample_shading, "glMinSampleShading", |t| min_sample_shading(t).is_some()),
-        (Feature::clip_control, "glClipControlEXT", |t| clip_control(t).is_some()),
-        (Feature::sampler_border_colors, "glSamplerParameterIuiv", |t| {
-            sampler_parameter_iuiv(t).is_some()
+        (Feature::indep_blend_func, "glBlendEquationSeparatei", |t, a| {
+            blend_equation_separate_i(t, a).is_some()
         }),
-        (Feature::geometry_shader, "glFramebufferTexture", |t| framebuffer_texture(t).is_some()),
-        (Feature::texture_3d_attach, "glFramebufferTexture3DOES", |t| {
-            framebuffer_texture_3d(t).is_some()
+        (Feature::sample_shading, "glMinSampleShading", |t, a| min_sample_shading(t, a).is_some()),
+        (Feature::clip_control, "glClipControlEXT", |t, a| clip_control(t, a).is_some()),
+        (Feature::sampler_border_colors, "glSamplerParameterIuiv", |t, a| {
+            sampler_parameter_iuiv(t, a).is_some()
         }),
-        (Feature::implicit_msaa, "glFramebufferTexture2DMultisampleEXT", |t| {
-            framebuffer_texture_2d_multisample(t).is_some()
+        (Feature::geometry_shader, "glFramebufferTexture", |t, a| {
+            framebuffer_texture(t, a).is_some()
         }),
-        (Feature::texture_view, "glTextureView", |t| texture_view(t).is_some()),
-        (Feature::egl_image_storage, "glEGLImageTargetTexStorageEXT", |t| {
-            egl_image_target_tex_storage(t).is_some()
+        (Feature::texture_3d_attach, "glFramebufferTexture3DOES", |t, a| {
+            framebuffer_texture_3d(t, a).is_some()
         }),
-        (Feature::egl_image, "glEGLImageTargetTexture2DOES", |t| {
-            egl_image_target_texture_2d(t).is_some()
+        (Feature::implicit_msaa, "glFramebufferTexture2DMultisampleEXT", |t, a| {
+            framebuffer_texture_2d_multisample(t, a).is_some()
         }),
-        (Feature::copy_image, "glCopyImageSubData", |t| copy_image_sub_data(t).is_some()),
-        (Feature::arb_or_gles_ext_texture_buffer, "glTexBuffer", |t| tex_buffer(t).is_some()),
-        (Feature::texture_buffer_range, "glTexBufferRange", |t| tex_buffer_range(t).is_some()),
-        (Feature::clear_texture, "glClearTexSubImageEXT", |t| clear_tex_sub_image(t).is_some()),
-        (Feature::dual_src_blend, "glBindFragDataLocationIndexedEXT", |t| {
-            bind_frag_data_location_indexed(t).is_some()
+        (Feature::texture_view, "glTextureView", |t, a| texture_view(t, a).is_some()),
+        (Feature::egl_image_storage, "glEGLImageTargetTexStorageEXT", |t, a| {
+            egl_image_target_tex_storage(t, a).is_some()
         }),
-        (Feature::base_instance, "glDrawArraysInstancedBaseInstanceEXT", |t| {
-            draw_arrays_instanced_base_instance(t).is_some()
+        (Feature::egl_image, "glEGLImageTargetTexture2DOES", |t, a| {
+            egl_image_target_texture_2d(t, a).is_some()
         }),
-        (Feature::base_instance, "glDrawElementsInstancedBaseInstanceEXT", |t| {
-            draw_elements_instanced_base_instance(t).is_some()
+        (Feature::copy_image, "glCopyImageSubData", |t, a| copy_image_sub_data(t, a).is_some()),
+        (Feature::arb_or_gles_ext_texture_buffer, "glTexBuffer", |t, a| tex_buffer(t, a).is_some()),
+        (Feature::texture_buffer_range, "glTexBufferRange", |t, a| {
+            tex_buffer_range(t, a).is_some()
         }),
-        (Feature::base_instance, "glDrawElementsInstancedBaseVertexBaseInstanceEXT", |t| {
-            draw_elements_instanced_base_vertex_base_instance(t).is_some()
+        (Feature::clear_texture, "glClearTexSubImageEXT", |t, a| {
+            clear_tex_sub_image(t, a).is_some()
         }),
-        (Feature::multi_draw_indirect, "glMultiDrawArraysIndirectEXT", |t| {
-            multi_draw_arrays_indirect(t).is_some()
+        (Feature::dual_src_blend, "glBindFragDataLocationIndexedEXT", |t, a| {
+            bind_frag_data_location_indexed(t, a).is_some()
         }),
-        (Feature::multi_draw_indirect, "glMultiDrawElementsIndirectEXT", |t| {
-            multi_draw_elements_indirect(t).is_some()
+        (Feature::base_instance, "glDrawArraysInstancedBaseInstanceEXT", |t, a| {
+            draw_arrays_instanced_base_instance(t, a).is_some()
         }),
-        (Feature::separate_shader_objects, "glBindProgramPipeline", |t| {
-            bind_program_pipeline(t).is_some()
+        (Feature::base_instance, "glDrawElementsInstancedBaseInstanceEXT", |t, a| {
+            draw_elements_instanced_base_instance(t, a).is_some()
         }),
-        (Feature::storage_multisample_2d_array, "glTexStorage3DMultisample", |t| {
-            tex_storage_3d_multisample(t).is_some()
+        (Feature::base_instance, "glDrawElementsInstancedBaseVertexBaseInstanceEXT", |t, a| {
+            draw_elements_instanced_base_vertex_base_instance(t, a).is_some()
         }),
-        (Feature::arb_buffer_storage, "glBufferStorageEXT", |t| buffer_storage(t).is_some()),
+        (Feature::multi_draw_indirect, "glMultiDrawArraysIndirectEXT", |t, a| {
+            multi_draw_arrays_indirect(t, a).is_some()
+        }),
+        (Feature::multi_draw_indirect, "glMultiDrawElementsIndirectEXT", |t, a| {
+            multi_draw_elements_indirect(t, a).is_some()
+        }),
+        (Feature::separate_shader_objects, "glBindProgramPipeline", |t, a| {
+            bind_program_pipeline(t, a).is_some()
+        }),
+        (Feature::storage_multisample_2d_array, "glTexStorage3DMultisample", |t, a| {
+            tex_storage_3d_multisample(t, a).is_some()
+        }),
+        (Feature::arb_buffer_storage, "glBufferStorageEXT", |t, a| buffer_storage(t, a).is_some()),
     ];
+}
+
+/// `GL_VERSION`, read through a table before a [`Gl`] exists: the answer is what decides which API
+/// the `Gl` is built for.
+pub fn version_string(t: &Procs) -> String {
+    // SAFETY: `glGetString` returns null or a NUL-terminated string owned by the driver, live
+    // while the context is; it is copied out immediately.
+    let p = unsafe { t.glGetString()(GL_VERSION) };
+    if p.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(p.cast::<c_char>()) }.to_string_lossy().into_owned()
+}
+
+/// `GL_CONTEXT_PROFILE_MASK`, read as [`version_string`] is. Meaningful on desktop GL only.
+pub fn profile_mask(t: &Procs) -> GLenum {
+    let mut v: GLint = 0;
+    // SAFETY: `GL_CONTEXT_PROFILE_MASK` writes exactly one integer.
+    unsafe { t.glGetIntegerv()(GL_CONTEXT_PROFILE_MASK, &mut v) };
+    v as GLenum
 }
 
 /// The driver's entry points behind a safe surface.
 pub struct Gl {
     t: Procs,
+    /// The API the context the table was loaded under speaks, which picks each resolver's
+    /// spelling.
+    api: Api,
 }
 
 impl Gl {
-    pub fn new(t: Procs) -> Gl {
-        Gl { t }
+    pub fn new(t: Procs, api: Api) -> Gl {
+        Gl { t, api }
     }
 
     /// The raw table, for the census of what the driver exports.
@@ -444,7 +489,7 @@ impl Gl {
     pub fn missing_procs(&self) -> Vec<(Feature, &'static str)> {
         procs::BEHIND
             .iter()
-            .filter(|(_, _, present)| !present(&self.t))
+            .filter(|(_, _, present)| !present(&self.t, self.api))
             .map(|(f, name, _)| (*f, *name))
             .collect()
     }
@@ -725,7 +770,7 @@ impl Gl {
         d: GLsizei,
     ) {
         let f = promised(
-            procs::tex_storage_3d_multisample(&self.t),
+            procs::tex_storage_3d_multisample(&self.t, self.api),
             Feature::storage_multisample_2d_array,
             "glTexStorage3DMultisample",
         );
@@ -1010,7 +1055,7 @@ impl Gl {
 
     pub fn buffer_storage_null(&self, target: GLenum, size: usize, flags: GLbitfield) -> bool {
         let f = promised(
-            procs::buffer_storage(&self.t),
+            procs::buffer_storage(&self.t, self.api),
             Feature::arb_buffer_storage,
             "glBufferStorageEXT",
         );
@@ -1172,7 +1217,7 @@ impl Gl {
         layer: GLint,
     ) {
         let f = promised(
-            procs::framebuffer_texture_3d(&self.t),
+            procs::framebuffer_texture_3d(&self.t, self.api),
             Feature::texture_3d_attach,
             "glFramebufferTexture3DOES",
         );
@@ -1193,7 +1238,7 @@ impl Gl {
         samples: GLsizei,
     ) {
         let f = promised(
-            procs::framebuffer_texture_2d_multisample(&self.t),
+            procs::framebuffer_texture_2d_multisample(&self.t, self.api),
             Feature::implicit_msaa,
             "glFramebufferTexture2DMultisampleEXT",
         );
@@ -1222,7 +1267,7 @@ impl Gl {
     /// `glFramebufferTexture`: every layer of a layered texture.
     pub fn framebuffer_texture(&self, attachment: GLenum, tex: Option<TextureName>, level: GLint) {
         let f = promised(
-            procs::framebuffer_texture(&self.t),
+            procs::framebuffer_texture(&self.t, self.api),
             Feature::geometry_shader,
             "glFramebufferTexture",
         );
@@ -1245,7 +1290,11 @@ impl Gl {
         first_layer: GLuint,
         layers: GLuint,
     ) {
-        let f = promised(procs::texture_view(&self.t), Feature::texture_view, "glTextureView");
+        let f = promised(
+            procs::texture_view(&self.t, self.api),
+            Feature::texture_view,
+            "glTextureView",
+        );
         // SAFETY: plain scalars.
         unsafe {
             f(view.0, target, tex.0.0, internalformat, first_level, levels, first_layer, layers)
@@ -1264,7 +1313,7 @@ impl Gl {
     /// `glEGLImageTargetTexStorageEXT`: the bound texture takes `image` as immutable storage.
     pub fn egl_image_target_tex_storage(&self, target: GLenum, image: &Image) {
         let f = promised(
-            procs::egl_image_target_tex_storage(&self.t),
+            procs::egl_image_target_tex_storage(&self.t, self.api),
             Feature::egl_image_storage,
             "glEGLImageTargetTexStorageEXT",
         );
@@ -1276,7 +1325,7 @@ impl Gl {
     /// `glEGLImageTargetTexture2DOES`: the bound texture takes `image` as (mutable) storage.
     pub fn egl_image_target_texture_2d(&self, target: GLenum, image: &Image) {
         let f = promised(
-            procs::egl_image_target_texture_2d(&self.t),
+            procs::egl_image_target_texture_2d(&self.t, self.api),
             Feature::egl_image,
             "glEGLImageTargetTexture2DOES",
         );
@@ -1321,7 +1370,7 @@ impl Gl {
         extent: [GLsizei; 3],
     ) {
         let f = promised(
-            procs::copy_image_sub_data(&self.t),
+            procs::copy_image_sub_data(&self.t, self.api),
             Feature::copy_image,
             "glCopyImageSubData",
         );
@@ -1377,7 +1426,7 @@ impl Gl {
         match range {
             Some((offset, size)) => {
                 let f = promised(
-                    procs::tex_buffer_range(&self.t),
+                    procs::tex_buffer_range(&self.t, self.api),
                     Feature::texture_buffer_range,
                     "glTexBufferRange",
                 );
@@ -1388,7 +1437,7 @@ impl Gl {
             }
             None => {
                 let f = promised(
-                    procs::tex_buffer(&self.t),
+                    procs::tex_buffer(&self.t, self.api),
                     Feature::arb_or_gles_ext_texture_buffer,
                     "glTexBuffer",
                 );
@@ -1413,7 +1462,7 @@ impl Gl {
         value: &[u8],
     ) {
         let f = promised(
-            procs::clear_tex_sub_image(&self.t),
+            procs::clear_tex_sub_image(&self.t, self.api),
             Feature::clear_texture,
             "glClearTexSubImageEXT",
         );
@@ -1517,7 +1566,8 @@ impl Gl {
 
     /// `glColorMaski`.
     pub fn color_mask_i(&self, index: GLuint, rgba: [bool; 4]) {
-        let f = promised(procs::color_mask_i(&self.t), Feature::indep_blend, "glColorMaski");
+        let f =
+            promised(procs::color_mask_i(&self.t, self.api), Feature::indep_blend, "glColorMaski");
         // SAFETY: plain scalars.
         unsafe {
             f(
@@ -1589,7 +1639,7 @@ impl Gl {
     /// `glMinSampleShading`.
     pub fn min_sample_shading(&self, value: f32) {
         let f = promised(
-            procs::min_sample_shading(&self.t),
+            procs::min_sample_shading(&self.t, self.api),
             Feature::sample_shading,
             "glMinSampleShading",
         );
@@ -1614,7 +1664,11 @@ impl Gl {
 
     /// `glClipControlEXT`.
     pub fn clip_control(&self, origin: GLenum, depth: GLenum) {
-        let f = promised(procs::clip_control(&self.t), Feature::clip_control, "glClipControlEXT");
+        let f = promised(
+            procs::clip_control(&self.t, self.api),
+            Feature::clip_control,
+            "glClipControlEXT",
+        );
         // SAFETY: plain scalars.
         unsafe { f(origin, depth) };
     }
@@ -1731,7 +1785,7 @@ impl Gl {
     /// `glSamplerParameterIuiv` for the border colour.
     pub fn sampler_border_color(&self, s: SamplerName, color: &[GLuint; 4]) {
         let f = promised(
-            procs::sampler_parameter_iuiv(&self.t),
+            procs::sampler_parameter_iuiv(&self.t, self.api),
             Feature::sampler_border_colors,
             "glSamplerParameterIuiv",
         );
@@ -2030,7 +2084,7 @@ impl Gl {
         name: &str,
     ) {
         let f = promised(
-            procs::bind_frag_data_location_indexed(&self.t),
+            procs::bind_frag_data_location_indexed(&self.t, self.api),
             Feature::dual_src_blend,
             "glBindFragDataLocationIndexedEXT",
         );
@@ -2148,7 +2202,7 @@ impl Gl {
         dst_a: GLenum,
     ) {
         let f = promised(
-            procs::blend_func_separate_i(&self.t),
+            procs::blend_func_separate_i(&self.t, self.api),
             Feature::indep_blend_func,
             "glBlendFuncSeparatei",
         );
@@ -2159,7 +2213,7 @@ impl Gl {
     /// `glBlendEquationSeparatei`.
     pub fn blend_equation_separate_i(&self, buf: GLuint, rgb: GLenum, alpha: GLenum) {
         let f = promised(
-            procs::blend_equation_separate_i(&self.t),
+            procs::blend_equation_separate_i(&self.t, self.api),
             Feature::indep_blend_func,
             "glBlendEquationSeparatei",
         );
@@ -2170,9 +2224,9 @@ impl Gl {
     /// `glEnablei`/`glDisablei`.
     pub fn set_enabled_i(&self, cap: GLenum, index: GLuint, on: bool) {
         let f = if on {
-            promised(procs::enable_i(&self.t), Feature::indep_blend, "glEnablei")
+            promised(procs::enable_i(&self.t, self.api), Feature::indep_blend, "glEnablei")
         } else {
-            promised(procs::disable_i(&self.t), Feature::indep_blend, "glDisablei")
+            promised(procs::disable_i(&self.t, self.api), Feature::indep_blend, "glDisablei")
         };
         // SAFETY: plain scalars.
         unsafe { f(cap, index) };
@@ -2205,7 +2259,7 @@ impl Gl {
         base_instance: GLuint,
     ) {
         let f = promised(
-            procs::draw_arrays_instanced_base_instance(&self.t),
+            procs::draw_arrays_instanced_base_instance(&self.t, self.api),
             Feature::base_instance,
             "glDrawArraysInstancedBaseInstanceEXT",
         );
@@ -2315,7 +2369,7 @@ impl Gl {
         base_instance: GLuint,
     ) {
         let f = promised(
-            procs::draw_elements_instanced_base_instance(&self.t),
+            procs::draw_elements_instanced_base_instance(&self.t, self.api),
             Feature::base_instance,
             "glDrawElementsInstancedBaseInstanceEXT",
         );
@@ -2335,7 +2389,7 @@ impl Gl {
         base_instance: GLuint,
     ) {
         let f = promised(
-            procs::draw_elements_instanced_base_vertex_base_instance(&self.t),
+            procs::draw_elements_instanced_base_vertex_base_instance(&self.t, self.api),
             Feature::base_instance,
             "glDrawElementsInstancedBaseVertexBaseInstanceEXT",
         );
@@ -2373,7 +2427,7 @@ impl Gl {
         stride: GLsizei,
     ) {
         let f = promised(
-            procs::multi_draw_arrays_indirect(&self.t),
+            procs::multi_draw_arrays_indirect(&self.t, self.api),
             Feature::multi_draw_indirect,
             "glMultiDrawArraysIndirectEXT",
         );
@@ -2390,7 +2444,7 @@ impl Gl {
         stride: GLsizei,
     ) {
         let f = promised(
-            procs::multi_draw_elements_indirect(&self.t),
+            procs::multi_draw_elements_indirect(&self.t, self.api),
             Feature::multi_draw_indirect,
             "glMultiDrawElementsIndirectEXT",
         );
@@ -2423,7 +2477,7 @@ impl Gl {
     /// `glBindProgramPipeline(0)`.
     pub fn bind_program_pipeline_none(&self) {
         let f = promised(
-            procs::bind_program_pipeline(&self.t),
+            procs::bind_program_pipeline(&self.t, self.api),
             Feature::separate_shader_objects,
             "glBindProgramPipeline",
         );
@@ -2502,4 +2556,26 @@ pub enum FenceWait {
     Timeout,
     /// The driver refused the wait. Not a fence anyone should keep waiting on.
     Failed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::egl::{Flavour, Winsys};
+    use super::*;
+
+    /// A resolver asks for its API's spellings and no other: a desktop context with only the
+    /// GLES name of an entry point has none, and the reverse. A driver may answer a name its API
+    /// does not have with a stub, and a stub called in place of the real entry point does nothing
+    /// and reports no error.
+    #[test]
+    fn a_resolver_asks_only_for_its_apis_spelling() {
+        let _display = crate::vrend::one_display_at_a_time();
+        let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
+        let only_ext = winsys.procs_without(|n| n == c"glClipControl");
+        let only_core = winsys.procs_without(|n| n == c"glClipControlEXT");
+        assert!(procs::clip_control(&only_ext, Api::Gles(32)).is_some(), "GLES's own spelling");
+        assert!(procs::clip_control(&only_ext, Api::Gl(46)).is_none(), "not desktop GL's");
+        assert!(procs::clip_control(&only_core, Api::Gl(46)).is_some(), "desktop GL's own");
+        assert!(procs::clip_control(&only_core, Api::Gles(32)).is_none(), "not GLES's");
+    }
 }

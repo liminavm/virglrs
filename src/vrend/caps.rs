@@ -11,7 +11,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use super::features::{Feature, Features};
+use super::features::{Api, Feature, Features};
 use super::formats::Table;
 use super::gl::Gl;
 use super::gl::gles::*;
@@ -259,14 +259,19 @@ impl CapsV2 {
         c.v1.max_version = VIRGL2_VERSION;
 
         // vrend_fill_caps_glsl_version
-        c.v1.glsl_level = if api.gles_at_least(31) {
-            310
-        } else if api.gles_at_least(30) {
-            130
-        } else {
-            120
+        c.v1.glsl_level = match api {
+            Api::Gles(v) if v >= 31 => 310,
+            Api::Gles(v) if v >= 30 => 130,
+            Api::Gles(_) => 120,
+            Api::Gl(v) if v >= 33 => 10 * v,
+            Api::Gl(32) => 150,
+            Api::Gl(31) => 140,
+            Api::Gl(_) => 130,
         };
-        if has(Feature::tessellation) && has(Feature::geometry_shader) && has(Feature::gpu_shader5)
+        if c.v1.glsl_level < 400
+            && has(Feature::tessellation)
+            && has(Feature::geometry_shader)
+            && has(Feature::gpu_shader5)
         {
             // The C's own words: probably a lie, but gallium turns on OES_geometry_shader and
             // ARB_gpu_shader5 from it, and compute needs 430 unless the shader asks by name.
@@ -319,11 +324,13 @@ impl CapsV2 {
         bit(has(Feature::draw_instance), bset::INSTANCEID);
         bit(has(Feature::depth_clamp), bset::DEPTH_CLIP_DISABLE);
         bit(
-            features.has_extension("GL_ARB_fragment_coord_conventions"),
+            api.gl_at_least(32) || features.has_extension("GL_ARB_fragment_coord_conventions"),
             bset::FRAGMENT_COORD_CONVENTIONS,
         );
         bit(
-            features.has_extension("GL_ARB_seamless_cube_map") || api.gles_at_least(30),
+            api.gl_at_least(32)
+                || features.has_extension("GL_ARB_seamless_cube_map")
+                || api.gles_at_least(30),
             bset::SEAMLESS_CUBE_MAP,
         );
         bit(has(Feature::seamless_cubemap_per_texture), bset::SEAMLESS_CUBE_MAP_PER_TEXTURE);
@@ -334,16 +341,21 @@ impl CapsV2 {
         bit(has(Feature::indep_blend_func), bset::INDEP_BLEND_FUNC);
         bit(has(Feature::cube_map_array), bset::CUBE_MAP_ARRAY);
         bit(has(Feature::texture_query_lod), bset::TEXTURE_QUERY_LOD);
+        // Below 4.0 it takes gpu_shader5 as well, for bitfield insert.
         bit(
-            features.has_extension("GL_ARB_gpu_shader_fp64")
-                && features.has_extension("GL_ARB_gpu_shader5"),
+            api.gl_at_least(40)
+                || features.has_extension("GL_ARB_gpu_shader_fp64")
+                    && features.has_extension("GL_ARB_gpu_shader5"),
             bset::HAS_FP64,
         );
         bit(has(Feature::base_instance), bset::START_INSTANCE);
         bit(features.has_extension("GL_ARB_shader_stencil_export"), bset::SHADER_STENCIL_EXPORT);
         bit(has(Feature::conditional_render_inverted), bset::CONDITIONAL_RENDER_INVERTED);
-        bit(has(Feature::cull_distance), bset::HAS_CULL);
-        bit(features.has_extension("GL_ARB_derivative_control"), bset::DERIVATIVE_CONTROL);
+        bit(api.gl_at_least(45) || has(Feature::cull_distance), bset::HAS_CULL);
+        bit(
+            api.gl_at_least(45) || features.has_extension("GL_ARB_derivative_control"),
+            bset::DERIVATIVE_CONTROL,
+        );
         bit(has(Feature::polygon_offset_clamp), bset::POLYGON_OFFSET_CLAMP);
         bit(
             has(Feature::transform_feedback_overflow_query),
@@ -372,7 +384,7 @@ impl CapsV2 {
             }
             if has(Feature::transform_feedback3) {
                 v1.max_streamout_buffers = getu(GL_MAX_TRANSFORM_FEEDBACK_BUFFERS);
-            } else if get(GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS) >= 4 {
+            } else if !api.is_gles() || get(GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS) >= 4 {
                 // As with the earlier transform feedback, this is at least four.
                 v1.max_streamout_buffers = 4;
             }
@@ -384,7 +396,8 @@ impl CapsV2 {
             v1.max_tbo_size = limits.max_texture_buffer_size;
         }
         if has(Feature::texture_gather) {
-            v1.max_texture_gather_components = 4;
+            v1.max_texture_gather_components =
+                if api.is_gles() { 4 } else { getu(GL_MAX_PROGRAM_TEXTURE_GATHER_COMPONENTS_ARB) };
         }
         v1.max_viewports = if has(Feature::viewport_array) { getu(GL_MAX_VIEWPORTS) } else { 1 };
         v1.max_render_targets = limits.max_draw_buffers;
@@ -427,10 +440,22 @@ impl CapsV2 {
         let range = gl.get_float_range(GL_ALIASED_LINE_WIDTH_RANGE);
         c.min_aliased_line_width = range[0];
         c.max_aliased_line_width = range[1];
+        if !api.is_gles() {
+            let range = gl.get_float_range(GL_SMOOTH_POINT_SIZE_RANGE);
+            c.min_smooth_point_size = range[0];
+            c.max_smooth_point_size = range[1];
+            let range = gl.get_float_range(GL_SMOOTH_LINE_WIDTH_RANGE);
+            c.min_smooth_line_width = range[0];
+            c.max_smooth_line_width = range[1];
+        }
         c.max_texture_lod_bias = gl.get_float(GL_MAX_TEXTURE_LOD_BIAS);
         c.max_vertex_attribs = limits.max_vertex_attributes;
         // The GL minimum where the query does not exist.
-        let outputs = if api.gles_at_least(30) { get(GL_MAX_VERTEX_OUTPUT_COMPONENTS) } else { 64 };
+        let outputs = if api.gl_at_least(32) || api.gles_at_least(30) {
+            get(GL_MAX_VERTEX_OUTPUT_COMPONENTS)
+        } else {
+            64
+        };
         c.max_vertex_outputs = (outputs / 4).max(0) as u32;
         c.min_texel_offset = get(GL_MIN_PROGRAM_TEXEL_OFFSET);
         c.max_texel_offset = get(GL_MAX_PROGRAM_TEXEL_OFFSET);
@@ -480,7 +505,10 @@ impl CapsV2 {
                 getu(GL_MAX_VERTEX_IMAGE_UNIFORMS).min(PIPE_MAX_SHADER_IMAGES);
             c.max_shader_image_frag_compute =
                 getu(GL_MAX_FRAGMENT_IMAGE_UNIFORMS).min(PIPE_MAX_SHADER_IMAGES);
-            // GLES has no multisample images: `max_image_samples` stays zero.
+            // GLES has no multisample images: there `max_image_samples` stays zero.
+            if !api.is_gles() {
+                c.max_image_samples = getu(GL_MAX_IMAGE_SAMPLES);
+            }
         }
         // Before the probe and not after it, so the counts we advertise and the positions we
         // publish for them come out of one pass: the probe skips every count above what it is
@@ -505,8 +533,11 @@ impl CapsV2 {
         c.capability_bits |=
             cap::TGSI_INVARIANT | cap::SET_MIN_SAMPLES | cap::TGSI_PRECISE | cap::APP_TWEAK_SUPPORT;
         // Without the query, the specification's minimum.
-        c.max_vertex_attrib_stride =
-            if api.gles_at_least(31) { getu(GL_MAX_VERTEX_ATTRIB_STRIDE) } else { 2048 };
+        c.max_vertex_attrib_stride = if api.gl_at_least(44) || api.gles_at_least(31) {
+            getu(GL_MAX_VERTEX_ATTRIB_STRIDE)
+        } else {
+            2048
+        };
         if has(Feature::compute_shader) {
             c.max_compute_work_group_invocations = getu(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS);
             c.max_compute_shared_memory_size = getu(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE);
@@ -521,6 +552,21 @@ impl CapsV2 {
         if has(Feature::atomic_counters) {
             // The per-stage counters are desktop-only: on a GLES host atomics are lowered to
             // SSBOs. The counter buffers are queried on both.
+            if !api.is_gles() {
+                c.max_atomic_counters = per_stage(
+                    gl,
+                    features,
+                    [
+                        GL_MAX_VERTEX_ATOMIC_COUNTERS,
+                        GL_MAX_FRAGMENT_ATOMIC_COUNTERS,
+                        GL_MAX_GEOMETRY_ATOMIC_COUNTERS,
+                        GL_MAX_TESS_CONTROL_ATOMIC_COUNTERS,
+                        GL_MAX_TESS_EVALUATION_ATOMIC_COUNTERS,
+                        GL_MAX_COMPUTE_ATOMIC_COUNTERS,
+                    ],
+                );
+                c.max_combined_atomic_counters = getu(GL_MAX_COMBINED_ATOMIC_COUNTERS);
+            }
             c.max_atomic_counter_buffers = per_stage(
                 gl,
                 features,
@@ -562,7 +608,7 @@ impl CapsV2 {
         capbit(true, cap::TRANSFER);
         capbit(mixed_color_attachments_work(gl), cap::FBO_MIXED_COLOR_FORMATS);
         // ARB_gpu_shader_fp64 is exposed on top of ES.
-        capbit(true, cap::HOST_IS_GLES);
+        capbit(api.is_gles(), cap::HOST_IS_GLES);
         capbit(has(Feature::indirect_draw), cap::BIND_COMMAND_ARGS);
         capbit(has(Feature::multi_draw_indirect), cap::MULTI_DRAW_INDIRECT);
         capbit(has(Feature::indirect_params), cap::INDIRECT_PARAMS);

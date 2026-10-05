@@ -20,7 +20,7 @@ use super::current::{Current, GlContext};
 use super::egl::{self, EglError, Flavour, GlContexts, Version, Winsys};
 use super::features::{Api, Feature, Features};
 use super::formats::Table;
-use super::gl::gles::{GL_CONTEXT_CORE_PROFILE_BIT, GL_CONTEXT_PROFILE_MASK, GL_VERSION};
+use super::gl::gles::GL_CONTEXT_CORE_PROFILE_BIT;
 use super::gl::{self, GLenum, Gl};
 use super::journal::{Census, Seq};
 use super::pipe::TextureTarget;
@@ -370,13 +370,13 @@ impl Vrend {
                 (winsys, ctx0, version)
             }
         };
-        let gl = Gl::new(winsys.procs());
-        let version_string = gl.get_string(GL_VERSION);
+        let procs = winsys.procs();
+        let version_string = gl::version_string(&procs);
         // Whose choice the client API was depends on who minted the context, so it is read back
         // rather than assumed.
-        let profile = || gl.get_integer(GL_CONTEXT_PROFILE_MASK) as GLenum;
-        let api = host_api(&version_string, profile, config.host_gl)
+        let api = host_api(&version_string, || gl::profile_mask(&procs), config.host_gl)
             .map_err(|why| InitError::UnservedGl { version: version_string.clone(), why })?;
+        let gl = Gl::new(procs, api);
         let mut features = Features::probe(api, gl.extensions());
         if !winsys.has_gl_colorspace() {
             features.clear(Feature::srgb_write_control);
@@ -468,7 +468,7 @@ impl Vrend {
                 Ok(wait_ctx) => Some(waiter::Waiter::start(
                     display,
                     wait_ctx,
-                    Gl::new(winsys.procs()),
+                    Gl::new(winsys.procs(), api),
                     fences,
                     debug,
                 )),
@@ -3497,12 +3497,53 @@ mod tests {
                 crate::vrend::debug::Switches::default(),
             )
             .expect("vrend comes up");
-            (v.features.api(), v.gl.table().has_glGetTexImage())
+            let caps = v.caps();
+            // What the version and the extensions granted, before procs were reconciled.
+            let granted = Features::probe(v.features.api(), v.gl.extensions());
+            let withdrawn: Vec<_> =
+                v.gl.missing_procs()
+                    .into_iter()
+                    .filter(|(f, _)| granted.has(*f))
+                    .map(|(_, name)| name)
+                    .collect();
+            let bgra = (0..crate::vrend::proto::FORMAT_MAX)
+                .filter_map(crate::vrend::proto::Format::from_wire)
+                .find(|f| f.name() == "B8G8R8A8_UNORM")
+                .and_then(|f| v.formats.get(f))
+                .expect("every host has BGRA")
+                .gl
+                .glformat;
+            (
+                (v.features.api(), bgra),
+                v.gl.table().has_glGetTexImage(),
+                caps.capability_bits & caps::cap::HOST_IS_GLES != 0,
+                caps.v1.glsl_level,
+                withdrawn,
+            )
         };
-        assert!(up(HostGl::Gles).0.is_gles(), "GLES unless asked otherwise");
-        let (desktop, get_tex_image) = up(HostGl::Desktop);
+        let ((gles, gles_bgra), _, gles_says_gles, _, _) = up(HostGl::Gles);
+        assert!(gles.is_gles(), "GLES unless asked otherwise");
+        assert_eq!(
+            gles_bgra,
+            super::gl::gles::GL_RGBA,
+            "GLES keeps BGRA as RGBA and swaps on transfer"
+        );
+        assert!(gles_says_gles, "and the guest is told so");
+        let ((desktop, desktop_bgra), get_tex_image, desktop_says_gles, glsl, withdrawn) =
+            up(HostGl::Desktop);
+        assert_eq!(
+            desktop_bgra,
+            super::gl::gles::GL_BGRA,
+            "desktop GL's own format groups, where BGRA is native"
+        );
         assert!(matches!(desktop, Api::Gl(v) if v >= 33), "a core desktop context: {desktop}");
         assert!(get_tex_image, "and the one table resolves desktop GL's own entry points");
+        // The guest picks its GLSL and its fp64 emulation from these two.
+        assert!(!desktop_says_gles, "a desktop host does not call itself GLES");
+        assert!(glsl >= 330, "a desktop host's GLSL is its GL version's: {glsl}");
+        // A feature desktop GL grants is reached through desktop GL's spelling of its procs, not
+        // withdrawn for want of the GLES one.
+        assert!(withdrawn.is_empty(), "granted on desktop, then withdrawn: {withdrawn:?}");
     }
 
     /// What the vertex stage holds, and the stage of the shader the table holds under handle 3.

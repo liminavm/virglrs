@@ -2984,6 +2984,7 @@ mod tests {
             can_texture_storage: true,
             can_readback: true,
             can_multisample: false,
+            can_target_rectangle: false,
         });
         // A second format that multisamples, because the whole multisample branch is otherwise
         // unreachable: every rule under `nr_samples > 1` is guarded by the entry saying the
@@ -3003,6 +3004,7 @@ mod tests {
             can_texture_storage: true,
             can_readback: true,
             can_multisample: true,
+            can_target_rectangle: false,
         });
         t
     }

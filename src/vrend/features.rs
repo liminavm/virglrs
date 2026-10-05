@@ -3,10 +3,10 @@
 
 //! What the host's GL can do, decided once at init.
 //!
-//! The C's `feature_list`, GLES column: a feature is present when the context's version reaches
-//! the version that made it core, or when the driver advertises one of the extensions that
-//! provide it. Some features are extension-only (`Unavail` as the core version); some are core
-//! at a version this host never has, and are here so the table stays the C's, one row per row.
+//! The C's `feature_list`, both columns: a feature is present when the context's version reaches
+//! the version that made it core in its API, or when the driver advertises one of the extensions
+//! that provide it. Some features are extension-only (`Unavail` as the core version); some are
+//! core at a version a host never has, and are here so the table stays the C's, one row per row.
 
 use std::collections::BTreeSet;
 
@@ -28,6 +28,11 @@ impl Api {
         matches!(self, Api::Gles(v) if v >= version)
     }
 
+    /// Whether this is desktop GL at `version` or later: the C's `gl_ver >= version`.
+    pub fn gl_at_least(self, version: u32) -> bool {
+        matches!(self, Api::Gl(v) if v >= version)
+    }
+
     pub fn is_gles(self) -> bool {
         matches!(self, Api::Gles(_))
     }
@@ -42,15 +47,25 @@ impl std::fmt::Display for Api {
     }
 }
 
-/// The GLES version a feature became core at, or never.
+/// The version a feature became core at in one API, or never. A row carries one for desktop GL
+/// and one for GLES, and the macro refuses a row that puts either in the other's column.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Core {
     Unavail,
+    Gl(u32),
     Gles(u32),
 }
 
 macro_rules! features {
-    ($($name:ident = ($core:expr, [$($ext:literal),*]),)+) => {
+    ($($name:ident = ($gl:expr, $gles:expr, [$($ext:literal),*]),)+) => {
+        $(
+            const _: () = assert!(
+                matches!($gl, Core::Gl(_) | Core::Unavail)
+                    && matches!($gles, Core::Gles(_) | Core::Unavail),
+                concat!(stringify!($name), ": a desktop version in the GLES column, or the reverse"),
+            );
+        )+
+
         /// One capability of the host GL.
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
         #[allow(non_camel_case_types)]
@@ -63,8 +78,12 @@ macro_rules! features {
             /// be too small for the table it indexes -- add a row and the array grows with it.
             const COUNT: usize = Feature::ALL.len();
 
-            fn core(self) -> Core {
-                match self { $(Feature::$name => $core,)+ }
+            /// The version that made it core in `api`'s column.
+            fn core(self, api: Api) -> Core {
+                match (self, api) {
+                    $((Feature::$name, Api::Gl(_)) => $gl,
+                      (Feature::$name, Api::Gles(_)) => $gles,)+
+                }
             }
 
             fn extensions(self) -> &'static [&'static str] {
@@ -78,124 +97,124 @@ macro_rules! features {
     };
 }
 
-use Core::{Gles, Unavail};
+use Core::{Gl, Gles, Unavail};
 
 features! {
-    amd_pinned_memory = (Unavail, ["GL_AMD_pinned_memory"]),
-    arb_or_gles_ext_texture_buffer = (Unavail, ["GL_EXT_texture_buffer"]),
-    arb_robustness = (Unavail, ["GL_ARB_robustness"]),
-    arb_buffer_storage = (Unavail, ["GL_EXT_buffer_storage"]),
-    arrays_of_arrays = (Gles(31), ["GL_ARB_arrays_of_arrays"]),
-    ati_meminfo = (Unavail, ["GL_ATI_meminfo"]),
-    atomic_counters = (Gles(31), ["GL_ARB_shader_atomic_counters"]),
-    base_instance = (Unavail, ["GL_ARB_base_instance", "GL_EXT_base_instance"]),
-    barrier = (Gles(31), ["GL_ARB_shader_image_load_store"]),
-    bind_vertex_buffers = (Unavail, []),
-    bit_encoding = (Unavail, ["GL_ARB_shader_bit_encoding"]),
-    blend_equation_advanced = (Gles(32), ["GL_KHR_blend_equation_advanced"]),
-    clear_texture = (Unavail, ["GL_ARB_clear_texture", "GL_EXT_clear_texture"]),
-    clip_control = (Unavail, ["GL_ARB_clip_control", "GL_EXT_clip_control"]),
-    compute_shader = (Gles(31), ["GL_ARB_compute_shader"]),
-    copy_image = (Gles(32), ["GL_ARB_copy_image", "GL_EXT_copy_image", "GL_OES_copy_image"]),
-    conditional_render_inverted = (Unavail, ["GL_ARB_conditional_render_inverted"]),
-    conservative_depth = (Unavail, ["GL_ARB_conservative_depth", "GL_EXT_conservative_depth"]),
-    cube_map_array = (Gles(32), ["GL_ARB_texture_cube_map_array", "GL_EXT_texture_cube_map_array", "GL_OES_texture_cube_map_array"]),
-    cull_distance = (Unavail, ["GL_ARB_cull_distance", "GL_EXT_clip_cull_distance"]),
-    draw_instance = (Gles(30), ["GL_ARB_draw_instanced"]),
-    draw_parameters = (Unavail, ["ARB_shader_draw_parameters"]),
-    dual_src_blend = (Unavail, ["GL_ARB_blend_func_extended", "GL_EXT_blend_func_extended"]),
-    depth_clamp = (Unavail, ["GL_ARB_depth_clamp", "GL_EXT_depth_clamp", "GL_NV_depth_clamp"]),
-    enhanced_layouts = (Unavail, ["GL_ARB_enhanced_layouts"]),
-    egl_image = (Unavail, ["GL_OES_EGL_image"]),
-    egl_image_storage = (Unavail, ["GL_EXT_EGL_image_storage"]),
-    fb_no_attach = (Gles(31), ["GL_ARB_framebuffer_no_attachments"]),
-    framebuffer_fetch = (Unavail, ["GL_EXT_shader_framebuffer_fetch"]),
-    framebuffer_fetch_non_coherent = (Unavail, ["GL_EXT_shader_framebuffer_fetch_non_coherent"]),
-    geometry_shader = (Gles(32), ["GL_EXT_geometry_shader", "GL_OES_geometry_shader"]),
-    gl_conditional_render = (Unavail, []),
-    gl_prim_restart = (Gles(30), []),
-    gles_khr_robustness = (Unavail, ["GL_KHR_robustness"]),
-    gles31_compatibility = (Gles(31), ["ARB_ES3_1_compatibility"]),
-    gles31_vertex_attrib_binding = (Gles(31), ["GL_ARB_vertex_attrib_binding"]),
-    gpu_shader5 = (Gles(32), ["GL_ARB_gpu_shader5", "GL_EXT_gpu_shader5", "GL_OES_gpu_shader5"]),
-    group_vote = (Unavail, ["GL_ARB_shader_group_vote"]),
-    images = (Gles(31), ["GL_ARB_shader_image_load_store"]),
-    indep_blend = (Gles(32), ["GL_EXT_draw_buffers2", "GL_OES_draw_buffers_indexed"]),
-    indep_blend_func = (Gles(32), ["GL_ARB_draw_buffers_blend", "GL_OES_draw_buffers_indexed"]),
-    indirect_draw = (Gles(31), ["GL_ARB_draw_indirect"]),
-    indirect_params = (Unavail, ["GL_ARB_indirect_parameters"]),
-    khr_debug = (Gles(32), ["GL_KHR_debug"]),
-    memory_object = (Unavail, ["GL_EXT_memory_object"]),
-    memory_object_fd = (Unavail, ["GL_EXT_memory_object_fd"]),
-    mesa_invert = (Unavail, ["GL_MESA_pack_invert"]),
-    ms_scaled_blit = (Unavail, ["GL_EXT_framebuffer_multisample_blit_scaled"]),
-    multisample = (Gles(30), ["GL_ARB_texture_multisample"]),
-    multi_draw_indirect = (Unavail, ["GL_ARB_multi_draw_indirect", "GL_EXT_multi_draw_indirect"]),
-    nv_conditional_render = (Unavail, ["GL_NV_conditional_render"]),
-    nv_prim_restart = (Unavail, ["GL_NV_primitive_restart"]),
-    shader_noperspective_interpolation = (Unavail, ["GL_NV_shader_noperspective_interpolation", "GL_EXT_gpu_shader4"]),
-    nvx_gpu_memory_info = (Unavail, ["GL_NVX_gpu_memory_info"]),
-    pipeline_statistics_query = (Unavail, ["GL_ARB_pipeline_statistics_query"]),
-    polygon_offset_clamp = (Unavail, ["GL_ARB_polygon_offset_clamp", "GL_EXT_polygon_offset_clamp"]),
-    occlusion_query = (Unavail, ["GL_ARB_occlusion_query"]),
-    occlusion_query_boolean = (Gles(30), ["GL_EXT_occlusion_query_boolean", "GL_ARB_occlusion_query2"]),
-    qbo = (Unavail, ["GL_ARB_query_buffer_object"]),
-    robust_buffer_access = (Unavail, ["GL_ARB_robust_buffer_access_behavior", "GL_KHR_robust_buffer_access_behavior"]),
-    sample_mask = (Gles(31), ["GL_ARB_texture_multisample"]),
-    sample_shading = (Gles(32), ["GL_ARB_sample_shading", "GL_OES_sample_shading"]),
-    samplers = (Gles(30), ["GL_ARB_sampler_objects"]),
-    sampler_border_colors = (Gles(32), ["GL_ARB_sampler_objects", "GL_EXT_texture_border_clamp", "GL_OES_texture_border_clamp"]),
-    separate_shader_objects = (Gles(31), ["GL_ARB_seperate_shader_objects"]),
-    shader_clock = (Unavail, ["GL_ARB_shader_clock"]),
-    ssbo = (Gles(31), ["GL_ARB_shader_storage_buffer_object"]),
-    ssbo_barrier = (Gles(31), ["GL_ARB_shader_storage_buffer_object"]),
-    srgb_write_control = (Unavail, ["GL_EXT_sRGB_write_control"]),
-    stencil_texturing = (Gles(31), ["GL_ARB_stencil_texturing"]),
-    storage_multisample = (Gles(31), ["GL_ARB_texture_storage_multisample"]),
-    tessellation = (Gles(32), ["GL_ARB_tessellation_shader", "GL_OES_tessellation_shader", "GL_EXT_tessellation_shader"]),
-    texture_array = (Gles(30), ["GL_EXT_texture_array"]),
-    texture_barrier = (Unavail, ["GL_ARB_texture_barrier"]),
-    texture_buffer_range = (Gles(32), ["GL_ARB_texture_buffer_range"]),
-    texture_gather = (Gles(31), ["GL_ARB_texture_gather"]),
-    texture_mirror_clamp_to_edge = (Unavail, ["GL_ATI_texture_mirror_once", "GL_EXT_texture_mirror_clamp", "GL_ARB_texture_mirror_clamp_to_edge", "GL_EXT_texture_mirror_clamp_to_edge"]),
-    texture_mirror_clamp = (Unavail, ["GL_ATI_texture_mirror_once", "GL_EXT_texture_mirror_clamp"]),
-    texture_mirror_clamp_to_border = (Unavail, ["GL_EXT_texture_mirror_clamp"]),
-    texture_multisample = (Gles(31), ["GL_ARB_texture_multisample"]),
-    texture_query_lod = (Unavail, ["GL_ARB_texture_query_lod", "GL_EXT_texture_query_lod"]),
-    texture_shadow_lod = (Unavail, ["GL_EXT_texture_shadow_lod"]),
-    texture_srgb_decode = (Unavail, ["GL_EXT_texture_sRGB_decode"]),
-    texture_storage = (Gles(30), ["GL_ARB_texture_storage"]),
-    texture_view = (Unavail, ["GL_ARB_texture_view", "GL_OES_texture_view", "GL_EXT_texture_view"]),
-    timer_query = (Unavail, ["GL_ARB_timer_query", "GL_EXT_disjoint_timer_query"]),
-    transform_feedback = (Gles(30), ["GL_EXT_transform_feedback"]),
-    transform_feedback2 = (Gles(30), ["GL_ARB_transform_feedback2"]),
-    transform_feedback3 = (Unavail, ["GL_ARB_transform_feedback3"]),
-    transform_feedback_overflow_query = (Unavail, ["GL_ARB_transform_feedback_overflow_query"]),
-    txqs = (Unavail, ["GL_ARB_shader_texture_image_samples"]),
-    ubo = (Gles(30), ["GL_ARB_uniform_buffer_object"]),
-    viewport_array = (Unavail, ["GL_ARB_viewport_array", "GL_OES_viewport_array"]),
+    amd_pinned_memory = (Unavail, Unavail, ["GL_AMD_pinned_memory"]),
+    arb_or_gles_ext_texture_buffer = (Gl(31), Unavail, ["GL_EXT_texture_buffer"]),
+    arb_robustness = (Unavail, Unavail, ["GL_ARB_robustness"]),
+    arb_buffer_storage = (Gl(44), Unavail, ["GL_EXT_buffer_storage"]),
+    arrays_of_arrays = (Gl(43), Gles(31), ["GL_ARB_arrays_of_arrays"]),
+    ati_meminfo = (Unavail, Unavail, ["GL_ATI_meminfo"]),
+    atomic_counters = (Gl(42), Gles(31), ["GL_ARB_shader_atomic_counters"]),
+    base_instance = (Gl(42), Unavail, ["GL_ARB_base_instance", "GL_EXT_base_instance"]),
+    barrier = (Gl(42), Gles(31), ["GL_ARB_shader_image_load_store"]),
+    bind_vertex_buffers = (Gl(44), Unavail, []),
+    bit_encoding = (Gl(33), Unavail, ["GL_ARB_shader_bit_encoding"]),
+    blend_equation_advanced = (Unavail, Gles(32), ["GL_KHR_blend_equation_advanced"]),
+    clear_texture = (Gl(44), Unavail, ["GL_ARB_clear_texture", "GL_EXT_clear_texture"]),
+    clip_control = (Gl(45), Unavail, ["GL_ARB_clip_control", "GL_EXT_clip_control"]),
+    compute_shader = (Gl(43), Gles(31), ["GL_ARB_compute_shader"]),
+    copy_image = (Gl(43), Gles(32), ["GL_ARB_copy_image", "GL_EXT_copy_image", "GL_OES_copy_image"]),
+    conditional_render_inverted = (Gl(45), Unavail, ["GL_ARB_conditional_render_inverted"]),
+    conservative_depth = (Gl(42), Unavail, ["GL_ARB_conservative_depth", "GL_EXT_conservative_depth"]),
+    cube_map_array = (Gl(40), Gles(32), ["GL_ARB_texture_cube_map_array", "GL_EXT_texture_cube_map_array", "GL_OES_texture_cube_map_array"]),
+    cull_distance = (Gl(45), Unavail, ["GL_ARB_cull_distance", "GL_EXT_clip_cull_distance"]),
+    draw_instance = (Gl(31), Gles(30), ["GL_ARB_draw_instanced"]),
+    draw_parameters = (Gl(46), Unavail, ["ARB_shader_draw_parameters"]),
+    dual_src_blend = (Gl(33), Unavail, ["GL_ARB_blend_func_extended", "GL_EXT_blend_func_extended"]),
+    depth_clamp = (Gl(32), Unavail, ["GL_ARB_depth_clamp", "GL_EXT_depth_clamp", "GL_NV_depth_clamp"]),
+    enhanced_layouts = (Gl(44), Unavail, ["GL_ARB_enhanced_layouts"]),
+    egl_image = (Unavail, Unavail, ["GL_OES_EGL_image"]),
+    egl_image_storage = (Unavail, Unavail, ["GL_EXT_EGL_image_storage"]),
+    fb_no_attach = (Gl(43), Gles(31), ["GL_ARB_framebuffer_no_attachments"]),
+    framebuffer_fetch = (Unavail, Unavail, ["GL_EXT_shader_framebuffer_fetch"]),
+    framebuffer_fetch_non_coherent = (Unavail, Unavail, ["GL_EXT_shader_framebuffer_fetch_non_coherent"]),
+    geometry_shader = (Gl(32), Gles(32), ["GL_EXT_geometry_shader", "GL_OES_geometry_shader"]),
+    gl_conditional_render = (Gl(30), Unavail, []),
+    gl_prim_restart = (Gl(31), Gles(30), []),
+    gles_khr_robustness = (Unavail, Unavail, ["GL_KHR_robustness"]),
+    gles31_compatibility = (Gl(45), Gles(31), ["ARB_ES3_1_compatibility"]),
+    gles31_vertex_attrib_binding = (Gl(43), Gles(31), ["GL_ARB_vertex_attrib_binding"]),
+    gpu_shader5 = (Gl(40), Gles(32), ["GL_ARB_gpu_shader5", "GL_EXT_gpu_shader5", "GL_OES_gpu_shader5"]),
+    group_vote = (Gl(46), Unavail, ["GL_ARB_shader_group_vote"]),
+    images = (Gl(42), Gles(31), ["GL_ARB_shader_image_load_store"]),
+    indep_blend = (Gl(30), Gles(32), ["GL_EXT_draw_buffers2", "GL_OES_draw_buffers_indexed"]),
+    indep_blend_func = (Gl(40), Gles(32), ["GL_ARB_draw_buffers_blend", "GL_OES_draw_buffers_indexed"]),
+    indirect_draw = (Gl(40), Gles(31), ["GL_ARB_draw_indirect"]),
+    indirect_params = (Gl(46), Unavail, ["GL_ARB_indirect_parameters"]),
+    khr_debug = (Gl(43), Gles(32), ["GL_KHR_debug"]),
+    memory_object = (Unavail, Unavail, ["GL_EXT_memory_object"]),
+    memory_object_fd = (Unavail, Unavail, ["GL_EXT_memory_object_fd"]),
+    mesa_invert = (Unavail, Unavail, ["GL_MESA_pack_invert"]),
+    ms_scaled_blit = (Unavail, Unavail, ["GL_EXT_framebuffer_multisample_blit_scaled"]),
+    multisample = (Gl(32), Gles(30), ["GL_ARB_texture_multisample"]),
+    multi_draw_indirect = (Gl(43), Unavail, ["GL_ARB_multi_draw_indirect", "GL_EXT_multi_draw_indirect"]),
+    nv_conditional_render = (Unavail, Unavail, ["GL_NV_conditional_render"]),
+    nv_prim_restart = (Unavail, Unavail, ["GL_NV_primitive_restart"]),
+    shader_noperspective_interpolation = (Gl(31), Unavail, ["GL_NV_shader_noperspective_interpolation", "GL_EXT_gpu_shader4"]),
+    nvx_gpu_memory_info = (Unavail, Unavail, ["GL_NVX_gpu_memory_info"]),
+    pipeline_statistics_query = (Gl(46), Unavail, ["GL_ARB_pipeline_statistics_query"]),
+    polygon_offset_clamp = (Gl(46), Unavail, ["GL_ARB_polygon_offset_clamp", "GL_EXT_polygon_offset_clamp"]),
+    occlusion_query = (Gl(15), Unavail, ["GL_ARB_occlusion_query"]),
+    occlusion_query_boolean = (Gl(33), Gles(30), ["GL_EXT_occlusion_query_boolean", "GL_ARB_occlusion_query2"]),
+    qbo = (Gl(44), Unavail, ["GL_ARB_query_buffer_object"]),
+    robust_buffer_access = (Gl(43), Unavail, ["GL_ARB_robust_buffer_access_behavior", "GL_KHR_robust_buffer_access_behavior"]),
+    sample_mask = (Gl(32), Gles(31), ["GL_ARB_texture_multisample"]),
+    sample_shading = (Gl(40), Gles(32), ["GL_ARB_sample_shading", "GL_OES_sample_shading"]),
+    samplers = (Gl(33), Gles(30), ["GL_ARB_sampler_objects"]),
+    sampler_border_colors = (Gl(33), Gles(32), ["GL_ARB_sampler_objects", "GL_EXT_texture_border_clamp", "GL_OES_texture_border_clamp"]),
+    separate_shader_objects = (Gl(41), Gles(31), ["GL_ARB_seperate_shader_objects"]),
+    shader_clock = (Unavail, Unavail, ["GL_ARB_shader_clock"]),
+    ssbo = (Gl(43), Gles(31), ["GL_ARB_shader_storage_buffer_object"]),
+    ssbo_barrier = (Gl(43), Gles(31), ["GL_ARB_shader_storage_buffer_object"]),
+    srgb_write_control = (Gl(30), Unavail, ["GL_EXT_sRGB_write_control"]),
+    stencil_texturing = (Gl(43), Gles(31), ["GL_ARB_stencil_texturing"]),
+    storage_multisample = (Gl(43), Gles(31), ["GL_ARB_texture_storage_multisample"]),
+    tessellation = (Gl(40), Gles(32), ["GL_ARB_tessellation_shader", "GL_OES_tessellation_shader", "GL_EXT_tessellation_shader"]),
+    texture_array = (Gl(30), Gles(30), ["GL_EXT_texture_array"]),
+    texture_barrier = (Gl(45), Unavail, ["GL_ARB_texture_barrier"]),
+    texture_buffer_range = (Gl(43), Gles(32), ["GL_ARB_texture_buffer_range"]),
+    texture_gather = (Gl(40), Gles(31), ["GL_ARB_texture_gather"]),
+    texture_mirror_clamp_to_edge = (Unavail, Unavail, ["GL_ATI_texture_mirror_once", "GL_EXT_texture_mirror_clamp", "GL_ARB_texture_mirror_clamp_to_edge", "GL_EXT_texture_mirror_clamp_to_edge"]),
+    texture_mirror_clamp = (Unavail, Unavail, ["GL_ATI_texture_mirror_once", "GL_EXT_texture_mirror_clamp"]),
+    texture_mirror_clamp_to_border = (Unavail, Unavail, ["GL_EXT_texture_mirror_clamp"]),
+    texture_multisample = (Gl(32), Gles(31), ["GL_ARB_texture_multisample"]),
+    texture_query_lod = (Gl(40), Unavail, ["GL_ARB_texture_query_lod", "GL_EXT_texture_query_lod"]),
+    texture_shadow_lod = (Unavail, Unavail, ["GL_EXT_texture_shadow_lod"]),
+    texture_srgb_decode = (Unavail, Unavail, ["GL_EXT_texture_sRGB_decode"]),
+    texture_storage = (Gl(42), Gles(30), ["GL_ARB_texture_storage"]),
+    texture_view = (Gl(43), Unavail, ["GL_ARB_texture_view", "GL_OES_texture_view", "GL_EXT_texture_view"]),
+    timer_query = (Gl(33), Unavail, ["GL_ARB_timer_query", "GL_EXT_disjoint_timer_query"]),
+    transform_feedback = (Gl(30), Gles(30), ["GL_EXT_transform_feedback"]),
+    transform_feedback2 = (Gl(40), Gles(30), ["GL_ARB_transform_feedback2"]),
+    transform_feedback3 = (Gl(40), Unavail, ["GL_ARB_transform_feedback3"]),
+    transform_feedback_overflow_query = (Gl(46), Unavail, ["GL_ARB_transform_feedback_overflow_query"]),
+    txqs = (Gl(45), Unavail, ["GL_ARB_shader_texture_image_samples"]),
+    ubo = (Gl(31), Gles(30), ["GL_ARB_uniform_buffer_object"]),
+    viewport_array = (Gl(41), Unavail, ["GL_ARB_viewport_array", "GL_OES_viewport_array"]),
     // The second extension, where the C asks for the first: it lifts the first one's limit to
     // `GL_COLOR_ATTACHMENT0`, and the guest is told the same cap either way, so a guest that
     // attaches a depth buffer or a second colour buffer this way gets one host call for all of
     // them. It requires the first, so this host has both.
-    implicit_msaa = (Unavail, ["GL_EXT_multisampled_render_to_texture2"]),
-    anisotropic_filter = (Unavail, ["GL_EXT_texture_filter_anisotropic", "GL_ARB_texture_filter_anisotropic"]),
-    seamless_cubemap_per_texture = (Unavail, ["GL_AMD_seamless_cubemap_per_texture"]),
-    vs_layer_viewport = (Unavail, ["GL_AMD_vertex_shader_layer"]),
-    vs_viewport_index = (Unavail, ["GL_AMD_vertex_shader_viewport_index"]),
+    implicit_msaa = (Unavail, Unavail, ["GL_EXT_multisampled_render_to_texture2"]),
+    anisotropic_filter = (Gl(46), Unavail, ["GL_EXT_texture_filter_anisotropic", "GL_ARB_texture_filter_anisotropic"]),
+    seamless_cubemap_per_texture = (Unavail, Unavail, ["GL_AMD_seamless_cubemap_per_texture"]),
+    vs_layer_viewport = (Unavail, Unavail, ["GL_AMD_vertex_shader_layer"]),
+    vs_viewport_index = (Unavail, Unavail, ["GL_AMD_vertex_shader_viewport_index"]),
     // Not in the C's list, which tests these by name where it needs them.
-    s3tc = (Unavail, ["GL_EXT_texture_compression_s3tc"]),
-    rgtc = (Unavail, ["GL_EXT_texture_compression_rgtc"]),
-    bptc = (Unavail, ["GL_EXT_texture_compression_bptc"]),
-    astc = (Unavail, ["GL_KHR_texture_compression_astc_ldr"]),
-    etc2 = (Gles(30), []),
-    color_buffer_float = (Gles(32), ["GL_EXT_color_buffer_float"]),
-    nv_read_depth = (Unavail, ["GL_NV_read_depth"]),
-    nv_read_depth_stencil = (Unavail, ["GL_NV_read_depth_stencil"]),
-    nv_read_stencil = (Unavail, ["GL_NV_read_stencil"]),
+    s3tc = (Unavail, Unavail, ["GL_EXT_texture_compression_s3tc"]),
+    rgtc = (Unavail, Unavail, ["GL_ARB_texture_compression_rgtc", "GL_EXT_texture_compression_rgtc"]),
+    bptc = (Unavail, Unavail, ["GL_ARB_texture_compression_bptc", "GL_EXT_texture_compression_bptc"]),
+    astc = (Unavail, Unavail, ["GL_KHR_texture_compression_astc_ldr"]),
+    etc2 = (Unavail, Gles(30), []),
+    color_buffer_float = (Unavail, Gles(32), ["GL_EXT_color_buffer_float"]),
+    nv_read_depth = (Unavail, Unavail, ["GL_NV_read_depth"]),
+    nv_read_depth_stencil = (Unavail, Unavail, ["GL_NV_read_depth_stencil"]),
+    nv_read_stencil = (Unavail, Unavail, ["GL_NV_read_stencil"]),
     // Two the C calls without a feature: epoxy would abort on the missing symbol.
-    texture_3d_attach = (Unavail, ["GL_OES_texture_3D"]),
-    storage_multisample_2d_array = (Gles(32), ["GL_OES_texture_storage_multisample_2d_array"]),
+    texture_3d_attach = (Gl(30), Unavail, ["GL_OES_texture_3D"]),
+    storage_multisample_2d_array = (Gl(43), Gles(32), ["GL_ARB_texture_storage_multisample", "GL_OES_texture_storage_multisample_2d_array"]),
 }
 
 /// Which features a host has, as one bit each.
@@ -299,9 +318,9 @@ impl Features {
         let extensions: BTreeSet<String> = extensions.into_iter().collect();
         let mut have = FeatureSet::default();
         for f in Feature::ALL.iter().copied() {
-            let core = match f.core() {
-                Gles(v) => api.gles_at_least(v),
-                Unavail => false,
+            let core = match (f.core(api), api) {
+                (Gl(v), Api::Gl(have)) | (Gles(v), Api::Gles(have)) => have >= v,
+                _ => false,
             };
             if core || f.extensions().iter().any(|e| extensions.contains(*e)) {
                 have.insert(f);
@@ -406,6 +425,20 @@ mod tests {
         assert!(g.has(Feature::geometry_shader));
         assert!(g.has(Feature::arb_buffer_storage));
         assert!(!g.has(Feature::gles_khr_robustness));
+    }
+
+    /// A desktop context is judged by the desktop column alone: GL 3.3 is newer than GLES 3.2
+    /// by number and has none of what GLES 3.2 made core.
+    #[test]
+    fn a_desktop_version_reads_the_desktop_column() {
+        let gl33 = Features::probe(Api::Gl(33), []);
+        assert!(!gl33.has(Feature::copy_image), "core in GLES 3.2 and in GL 4.3");
+        assert!(!gl33.has(Feature::compute_shader), "core in GLES 3.1 and in GL 4.3");
+        assert!(gl33.has(Feature::samplers), "core in GL 3.3");
+        let gl46 = Features::probe(Api::Gl(46), []);
+        assert!(gl46.has(Feature::copy_image) && gl46.has(Feature::compute_shader));
+        assert!(gl46.has(Feature::clip_control), "desktop-only core, GL 4.5");
+        assert!(!Features::probe(Api::Gles(32), []).has(Feature::clip_control));
     }
 
     /// Multisampling is advertised only where every multisample texture can be made: GLES 3.1

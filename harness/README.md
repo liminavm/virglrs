@@ -532,6 +532,16 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   produces it and no plane ordering repairs it. The C's own rule is the same one
   (`vrend_planar_target_backable`); it answers yes for one format more.
   A fourth line is a regression.
+
+  `vrend.iris.caps` and `vrend-desktop.iris.caps` are the same capsets from the C on goiaba
+  (iris), on GLES (`--flags 0x819`) and on desktop GL (`--flags 0x809`); the Rust leg runs
+  desktop GL only under `VIRGLRS_DESKTOP_GL=1`. Both differ from the Rust leg's in three Linux
+  lines that have nothing to do with the flavour: `num_video_caps`/`video_caps` (the C leg there
+  reports no decoder), `capability_bits_v2`'s `SCANOUT_USES_GBM`, and
+  `supported_multisample_formats`, where the Rust leg also offers the four 4:2:0 YUV formats
+  163, 165, 166 and 167. That last one advertises more than the C and is open. GLES also differs
+  in `sampler`'s ASTC sRGB formats, as above; desktop GL never registers ASTC, on either leg. A
+  line the two flavours do not share is a desktop regression.
   `vrend-vp9stock.score` is VP9 hardware decode, 963 pictures through VideoToolbox, scored the
   ordinary way: the decoded planes land in guest resources and the sweep reads them back, so 240
   of the 243 decode-target resources carry pixels with a distinct hash per frame. It was recorded

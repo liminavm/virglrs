@@ -275,7 +275,7 @@ pub enum When {
     Gles,
     Astc,
     Etc2,
-    /// The desktop leg's; never added under GLES.
+    /// The desktop leg's: its own BGRA, Z32 and 10-bit spellings.
     DesktopGl,
 }
 
@@ -401,6 +401,9 @@ pub struct Entry {
     /// readback is safe to advertise.
     pub can_readback: bool,
     pub can_multisample: bool,
+    /// `VIRGL_TEXTURE_CAN_TARGET_RECTANGLE`: desktop GL took the triple as a rectangle texture.
+    /// Never set on GLES, which has no such target.
+    pub can_target_rectangle: bool,
 }
 
 impl Entry {
@@ -432,16 +435,19 @@ impl Table {
     /// current on this thread.
     pub fn probe(gl: &Gl, features: &Features) -> Table {
         let mut t = Table { entries: vec![None; FORMAT_COUNT] };
+        let gles = features.api().is_gles();
         for group in GL_GROUPS {
+            // ASTC and ETC2 are added by `vrend_build_format_list_gles`, so a desktop host that
+            // advertises the ASTC extension still has them withheld, as the C withholds them.
             let wanted = match group.when {
-                When::Always => true,
+                When::Always | When::SamplerOnly => true,
                 When::S3tc => features.has(Feature::s3tc),
                 When::Rgtc => features.has(Feature::rgtc),
                 When::Bptc => features.has(Feature::bptc),
-                When::Astc => features.has(Feature::astc),
-                When::Etc2 => features.has(Feature::etc2),
-                When::SamplerOnly | When::Gles => true,
-                When::DesktopGl => false,
+                When::Astc => gles && features.has(Feature::astc),
+                When::Etc2 => gles && features.has(Feature::etc2),
+                When::Gles => gles,
+                When::DesktopGl => !gles,
             };
             if !wanted {
                 continue;
@@ -452,12 +458,15 @@ impl Table {
                     continue;
                 }
                 if group.compressed || group.when == When::SamplerOnly {
+                    // Desktop GL reads any texture back with `glGetTexImage`; the YUV formats'
+                    // storage is RGBA, so the C's sampler-only insert carries no flag at all.
                     t.entries[at] = Some(Entry {
                         gl: *row,
                         bindings: Bindings { sampler_view: true, ..Bindings::default() },
                         can_texture_storage: false,
-                        can_readback: false,
+                        can_readback: !gles && group.compressed,
                         can_multisample: false,
+                        can_target_rectangle: false,
                     });
                     continue;
                 }
@@ -509,6 +518,21 @@ fn probe_row(gl: &Gl, features: &Features, row: &GlFormat) -> Option<Entry> {
     let entry = if gl.drain_errors() != GL_NO_ERROR {
         None
     } else {
+        let desktop = !features.api().is_gles();
+        // The C asks of whatever texture the rectangle target holds, which is its default object:
+        // the triple is all the answer depends on.
+        let can_target_rectangle = desktop && {
+            gl.tex_image_2d_null(
+                GL_TEXTURE_RECTANGLE,
+                0,
+                row.internalformat,
+                32,
+                32,
+                row.glformat,
+                row.gltype,
+            );
+            gl.drain_errors() == GL_NO_ERROR
+        };
         let desc = row.format.describe();
         let is_depth = desc.is_some_and(|d| d.is_depth_or_stencil());
         if is_depth {
@@ -529,12 +553,15 @@ fn probe_row(gl: &Gl, features: &Features, row: &GlFormat) -> Option<Entry> {
             render_target: complete && !is_depth,
             depth_stencil: complete && is_depth,
         };
-        let can_readback = complete
-            && if is_depth {
-                depth_stencil_can_readback(features, row.format)
-            } else {
-                color_can_readback(gl, features, row)
-            };
+        // Desktop GL reads any texture back with `glGetTexImage`; GLES has only `glReadPixels`,
+        // which hands back what the framebuffer and the implementation agree on.
+        let can_readback = desktop
+            || complete
+                && if is_depth {
+                    depth_stencil_can_readback(features, row.format)
+                } else {
+                    color_can_readback(gl, features, row)
+                };
         gl.drain_errors();
         Some(Entry {
             gl: *row,
@@ -542,6 +569,7 @@ fn probe_row(gl: &Gl, features: &Features, row: &GlFormat) -> Option<Entry> {
             can_texture_storage: false,
             can_readback,
             can_multisample: false,
+            can_target_rectangle,
         })
     };
     gl.bind_framebuffer(GL_FRAMEBUFFER, None);
