@@ -1247,12 +1247,11 @@ RPM Fusion's `mesa-va-drivers-freeworld`, because Fedora's Mesa is built without
 and upstream virglrenderer serves VA decode only on a Mesa driver, so on an Intel host the C leg
 decodes nothing and the gate is the published md5 alone.
 
-Two things a QEMU boot does not do by itself. Its `egl-headless` display mints a desktop-GL
-context unless asked for `gl=es`, and virglrs translates for GLES only, so it refuses the context
-and the guest boots with no 3D at all. And QEMU has no option that sets `USE_VIDEO`, so the rs
-leg is run with `VIRGLRS_VIDEO=1`, which the C ABI shim reads in its place. Either one missing
-reads, three steps later, as fluster skipping every decoder for want of a VA element -- the same
-as a host with no video silicon. So the script asserts virglrs's own `hardware video decode` line
+The boot asks `egl-headless` for `gl=es`, the host API the scores below were measured on; without
+it the display mints a desktop-GL context, which both legs serve. QEMU has no option that sets
+`USE_VIDEO`, so the rs leg is run with `VIRGLRS_VIDEO=1`, which the C ABI shim reads in its
+place. Without it the rs leg reads, three steps later, as fluster skipping every decoder for want
+of a VA element -- the same as a host with no video silicon. So the script asserts virglrs's own `hardware video decode` line
 rather than only that it loaded, and refuses a boot where QEMU says it could not initialise the
 renderer.
 

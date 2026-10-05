@@ -385,13 +385,13 @@ under `cage` on this host and draw the overview -- wallpaper, workspace thumbnai
 digit. Two independent boots, so anything nondeterministic in window placement or damage would
 have shown and did not.
 
-**Both legs must be booted under the same host GL API, and the desktop is where that is easiest to
-get wrong.** GTK hands QEMU a desktop GL 4.6 core context unless `GDK_GL=gles` is in the
-environment, and `gl=es` does not reach it because that path goes through GDK. The C leg accepts
-such a context and this renderer refuses it by name, so a comparison run without the variable is
-the C on desktop GL against a guest that quietly fell back to llvmpipe -- with a seated session,
-a running shell and a captured frame to say everything is fine. `renderer:` naming `virgl` is the
-control, and `grep -c virglrs` on the log is what says which leg drew it.
+**Both legs must be booted under the same host GL API.** GTK hands QEMU a desktop GL 4.6 core
+context unless `GDK_GL=gles` is in the environment, and `gl=es` does not reach it because that
+path goes through GDK. Both renderers take either, but a renderer that refuses its context leaves
+QEMU running with 3D off and the guest on llvmpipe -- with a seated session, a running shell and a
+captured frame to say everything is fine. `renderer:` naming `virgl` is the control, and
+`grep -c virglrs` on the log is what says which leg drew it. On desktop GL the overview matches
+the C's the same way: 22 pixels, all of them the clock.
 
 ## A new unsafe module is allowed, by decision
 
