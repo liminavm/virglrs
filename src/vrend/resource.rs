@@ -1820,7 +1820,20 @@ enum Plan {
     Texture { gl_target: GLenum },
 }
 
-/// `check_resource_valid` and the head of the C's create path, every rejection in the C's order.
+/// The last level a texture of this shape has: its mip chain ends where its largest extent --
+/// depth counts for a 3D texture -- reaches one.
+///
+/// The C allows `floor(log2(max(width, height))) + 1`, one level more than a 2D chain has, which
+/// leaves the refusal to the driver. Its rule is kept as a ceiling as well, so a deep 3D texture
+/// is not given levels the C would refuse.
+fn last_level_of(a: &Args) -> u32 {
+    let flat = a.width.max(a.height).max(1);
+    let deepest = if a.target == TextureTarget::Texture3d { flat.max(a.depth) } else { flat };
+    deepest.ilog2().min(flat.ilog2() + 1)
+}
+
+/// `check_resource_valid` and the head of the C's create path, every rejection in the C's order,
+/// but for the last level, which [`last_level_of`] decides.
 fn plan(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Result<Plan, Refusal> {
     use TextureTarget as T;
     let entry = formats.get(a.format);
@@ -1844,9 +1857,7 @@ fn plan(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Resu
         if a.target == T::Rect {
             return Err(Refusal::RectWithMipmaps);
         }
-        // The C accepts one level more than the extent has: `floor(log2(max)) + 1`.
-        let max = a.width.max(a.height).max(1);
-        if a.last_level > max.ilog2() + 1 {
+        if a.last_level > last_level_of(a) {
             return Err(Refusal::TooManyLevels);
         }
     }
@@ -3331,6 +3342,10 @@ mod tests {
             (64, 64, 1, 1, 0, 4),
             (99999, 64, 1, 1, 0, 0),
             (64, 64, 999, 1, 0, 0),
+            // A mip chain that ends at level 3, and the one level more the C accepts.
+            (8, 4, 1, 1, 3, 0),
+            (8, 4, 1, 1, 4, 0),
+            (4, 4, 16, 1, 3, 0),
         ];
         // MAP_PERSISTENT is in here for the deviation it exposes, below.
         let flags = [
@@ -3362,7 +3377,7 @@ mod tests {
                             };
                             let ours = plan(&f, &t, &l, &a).is_ok();
                             let mut theirs = c_check(&f, &t, &l, &a);
-                            // The one deviation, stated here because this is what would otherwise
+                            // A deviation, stated here because this is what would otherwise
                             // quietly re-litigate it: asked for a persistent or coherent mapping
                             // without `ARB_buffer_storage`, the C logs, leaves the buffer with no
                             // data store, and reports success. A buffer the guest cannot map is a
@@ -3378,6 +3393,15 @@ mod tests {
                                     BindKind::HostShadow | BindKind::GuestPages
                                 )
                             {
+                                theirs = false;
+                            }
+                            // The second deviation: the C accepts one level past the end of the
+                            // mip chain and leaves the refusal to the driver. See `last_level_of`.
+                            if theirs && a.last_level > last_level_of(&a) {
+                                assert!(matches!(
+                                    plan(&f, &t, &l, &a),
+                                    Err(Refusal::TooManyLevels)
+                                ));
                                 theirs = false;
                             }
                             // A table that multisamples a format on a host with no array entry
@@ -3458,10 +3482,19 @@ mod tests {
             tweak(&mut a);
             assert_eq!(plan(&f, &t, &l, &a).map(|_| ()), Err(*want), "{a:?}");
         }
-        // One level more than the extent has is accepted, as in the C.
+        // The 64x64 texture's chain ends at level 6; the C accepts a seventh and leaves the
+        // refusal to the driver, and this refuses it.
         let mut a = texture();
-        a.last_level = 7;
+        a.last_level = 6;
         assert!(plan(&f, &t, &l, &a).is_ok());
+        a.last_level = 7;
+        assert_eq!(plan(&f, &t, &l, &a).map(|_| ()), Err(Refusal::TooManyLevels));
+        // A 3D texture's chain runs as far as its depth does, up to the C's own ceiling.
+        a.target = TextureTarget::Texture3d;
+        (a.width, a.height, a.depth, a.last_level) = (4, 4, 16, 3);
+        assert!(plan(&f, &t, &l, &a).is_ok());
+        a.last_level = 4;
+        assert_eq!(plan(&f, &t, &l, &a).map(|_| ()), Err(Refusal::TooManyLevels));
     }
 
     #[test]

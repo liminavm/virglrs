@@ -2639,6 +2639,14 @@ SABOTAGES = [
         'a_logic_op_applies_to_a_shader_that_writes_one_colour_buffer',
     ),
     (
+        'a texture may ask for one level past its mip chain, as in the C',
+        'src/vrend/resource.rs',
+        """    deepest.ilog2().min(flat.ilog2() + 1)""",
+        """    let _ = deepest;
+    flat.ilog2() + 1""",
+        'the_checks_refuse_what_the_c_refuses',
+    ),
+    (
         'vkCmdSetColorWriteEnableEXT tells the driver one switch fewer',
         'src/venus/driver.rs',
         """        unsafe { f(cb, enables.len() as u32, enables.as_ptr()) };""",
