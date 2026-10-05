@@ -31,6 +31,12 @@ GLES_FEATURES = [
     'GL_ES_VERSION_2_0', 'GL_ES_VERSION_3_0', 'GL_ES_VERSION_3_1', 'GL_ES_VERSION_3_2',
 ]
 
+# Desktop GL's extensions vrend reaches for by name, where the C does: the robust reads, which it
+# takes under `GL_ARB_robustness` rather than through the core names a driver may only stub.
+GL_EXTENSIONS = [
+    'GL_ARB_robustness',
+]
+
 # Desktop GL through 4.6. Only the core profile's requirements are taken: the compatibility
 # profile's commands are the C's other desktop leg, which vrend does not serve. An ARB extension's
 # entry points carry the core names, so a 3.3 host that has one is covered by these lists too.
@@ -501,7 +507,7 @@ def main():
 
     gl = Registry(Path(args.registry) / 'gl.xml')
     commands, _ = gl.requirements('gles2', GLES_FEATURES, GLES_EXTENSIONS)
-    desktop, _ = gl.requirements('gl', GL_FEATURES, [])
+    desktop, _ = gl.requirements('gl', GL_FEATURES, GL_EXTENSIONS)
     commands += [c for c in desktop if c not in set(commands)]
     body = [banner, 'use super::types::*;', 'use core::ffi::CStr;', 'use core::mem::transmute;', '']
     # Every constant the registry has, not only the chosen features': the format tables name
@@ -513,7 +519,7 @@ def main():
         gl,
         'Procs',
         per_block_commands(gl, 'gles2', GLES_FEATURES + GLES_EXTENSIONS)
-        + per_block_commands(gl, 'gl', GL_FEATURES),
+        + per_block_commands(gl, 'gl', GL_FEATURES + GL_EXTENSIONS),
     )
     (out / 'gles.rs').write_text('\n'.join(body))
 

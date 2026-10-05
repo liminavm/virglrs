@@ -514,13 +514,17 @@ pub struct Element {
     pub gl_type: GLenum,
     pub normalized: bool,
     pub nr_channels: GLint,
+    /// What `glVertexAttribFormat` is given as the size: the channel count, or `GL_BGRA` for a
+    /// blue-first element on desktop GL, which reorders it as it fetches.
+    pub size: GLint,
     pub pure_integer: bool,
 }
 
 pub struct VertexElements {
     pub elements: Vec<Element>,
-    /// The elements whose format is stored blue first: the vertex shader reads them `.zyxw`,
-    /// since GLES has no `GL_BGRA` attribute size.
+    /// The elements whose format is stored blue first and that the vertex shader must read
+    /// `.zyxw`: GLES has no `GL_BGRA` attribute size. Empty on desktop GL, where the attribute's
+    /// `size` reorders them instead -- one swap, decided here for both places it could happen.
     pub zyxw_bitmask: u32,
     /// The vertex array object the elements are laid out in, made at the first bind.
     pub vao: Option<VertexArrayName>,
@@ -2326,7 +2330,7 @@ impl Context {
             proto::Object::Dsa(s) => Object::Dsa(s),
             proto::Object::Shader(s) => return self.create_shader(host, handle, s, wire),
             proto::Object::VertexElements(elements) => {
-                Object::VertexElements(vertex_elements(&elements)?)
+                Object::VertexElements(vertex_elements(host.features.api(), &elements)?)
             }
             proto::Object::SamplerView(v) => {
                 Object::SamplerView(self.create_sampler_view(host, v)?)
@@ -2633,15 +2637,9 @@ impl Context {
             for (i, e) in v.elements.iter().enumerate() {
                 let i = i as GLuint;
                 if e.pure_integer {
-                    gl.vertex_attrib_i_format(i, e.nr_channels, e.gl_type, e.base.src_offset);
+                    gl.vertex_attrib_i_format(i, e.size, e.gl_type, e.base.src_offset);
                 } else {
-                    gl.vertex_attrib_format(
-                        i,
-                        e.nr_channels,
-                        e.gl_type,
-                        e.normalized,
-                        e.base.src_offset,
-                    );
+                    gl.vertex_attrib_format(i, e.size, e.gl_type, e.normalized, e.base.src_offset);
                 }
                 gl.vertex_attrib_binding(i, e.base.vertex_buffer_index);
                 gl.vertex_binding_divisor(i, e.base.instance_divisor);
@@ -3289,7 +3287,7 @@ fn undo_bgra_swap(swizzle: &mut [GLint; 4]) {
 }
 
 /// `vrend_create_vertex_elements_state`: the GL type of each element from its format.
-fn vertex_elements(elements: &[VertexElement]) -> Result<VertexElements, Fault> {
+fn vertex_elements(api: Api, elements: &[VertexElement]) -> Result<VertexElements, Fault> {
     let mut out = Vec::with_capacity(elements.len());
     let mut zyxw_bitmask = 0;
     for (i, e) in elements.iter().enumerate() {
@@ -3318,7 +3316,10 @@ fn vertex_elements(elements: &[VertexElement]) -> Result<VertexElements, Fault> 
             _ => None,
         };
         let gl_type = by_channel.or(by_name).ok_or(Fault::IllegalVertexFormat(e.src_format))?;
-        if desc.nr_channels == 4 && desc.swizzle[0] == Some(Swizzle::Z) {
+        let blue_first = desc.nr_channels == 4 && desc.swizzle[0] == Some(Swizzle::Z);
+        let size =
+            if blue_first && !api.is_gles() { GL_BGRA as GLint } else { desc.nr_channels as GLint };
+        if blue_first && api.is_gles() {
             zyxw_bitmask |= 1 << i;
         }
         out.push(Element {
@@ -3326,6 +3327,7 @@ fn vertex_elements(elements: &[VertexElement]) -> Result<VertexElements, Fault> 
             gl_type,
             normalized: c0.normalized,
             nr_channels: desc.nr_channels as GLint,
+            size,
             pure_integer: desc.is_pure_integer(),
         });
     }
@@ -4553,7 +4555,7 @@ impl Context {
         let entry =
             res.entry(host.formats).ok_or(Fault::IllegalFormat { cmd, format: res.args.format })?;
         let mut bytes: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
-        if res.is_bgra() {
+        if entry.stores_bgra_as_rgba() {
             bytes.swap(0, 2);
         }
         if !host.has(Feature::clear_texture) {
@@ -5299,13 +5301,16 @@ mod tests {
 
     #[test]
     fn a_vertex_element_takes_its_gl_type_from_the_first_channel() {
-        let v = vertex_elements(&[
-            element("R32G32B32_FLOAT"),
-            element("R8G8B8A8_UNORM"),
-            element("R16G16_SINT"),
-            element("R10G10B10A2_UNORM"),
-            element("R11G11B10_FLOAT"),
-        ])
+        let v = vertex_elements(
+            Api::Gles(32),
+            &[
+                element("R32G32B32_FLOAT"),
+                element("R8G8B8A8_UNORM"),
+                element("R16G16_SINT"),
+                element("R10G10B10A2_UNORM"),
+                element("R11G11B10_FLOAT"),
+            ],
+        )
         .expect("every element has a type");
         let got: Vec<(GLenum, bool, GLint)> =
             v.elements.iter().map(|e| (e.gl_type, e.normalized, e.nr_channels)).collect();
@@ -5323,9 +5328,23 @@ mod tests {
         assert!(!v.elements[1].pure_integer);
     }
 
+    /// A blue-first element is swapped exactly once: by the shader on GLES, which has no
+    /// `GL_BGRA` size, and by the fetch on desktop GL, where the shader must then leave it be.
+    #[test]
+    fn a_blue_first_vertex_element_is_swapped_once() {
+        let gles = vertex_elements(Api::Gles(32), &[element("B8G8R8A8_UNORM")]).expect("typed");
+        assert_eq!((gles.zyxw_bitmask, gles.elements[0].size), (1, 4), "the shader swaps");
+        let desk = vertex_elements(Api::Gl(46), &[element("B8G8R8A8_UNORM")]).expect("typed");
+        assert_eq!(
+            (desk.zyxw_bitmask, desk.elements[0].size),
+            (0, GL_BGRA as GLint),
+            "the fetch swaps"
+        );
+    }
+
     #[test]
     fn a_vertex_format_with_no_gl_type_is_refused() {
-        let r = vertex_elements(&[element("DXT1_RGB")]);
+        let r = vertex_elements(Api::Gles(32), &[element("DXT1_RGB")]);
         assert!(matches!(r, Err(Fault::IllegalVertexFormat(_))));
     }
 

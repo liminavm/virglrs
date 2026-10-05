@@ -407,6 +407,14 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// A BGR* format spelled as RGB*: GLES's `gles_bgra_formats`, whose bytes are swapped on
+    /// every way in and out because GLES converts no formats. Desktop GL spells them `GL_BGRA`
+    /// and takes the bytes as they are. Read off the spelling, the one fact that decides it,
+    /// rather than off the API that chose the spelling.
+    pub fn stores_bgra_as_rgba(&self) -> bool {
+        super::resource::is_bgra(self.gl.format) && self.gl.glformat != GL_BGRA
+    }
+
     /// `VIRGL_TEXTURE_NEED_SWIZZLE`: the triple carries a texture swizzle.
     pub fn need_swizzle(&self) -> bool {
         self.gl.swizzle.is_some()

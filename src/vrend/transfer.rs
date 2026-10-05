@@ -503,7 +503,7 @@ pub fn write(
             if invert {
                 flip_rows(data, &l);
             }
-            if res.is_bgra() {
+            if entry.stores_bgra_as_rgba() {
                 swizzle_bgra(data);
             }
             if format_name == "Z24X8_UNORM" {
@@ -863,11 +863,16 @@ pub fn read(
                     Err(Error::NotReadable)
                 }
             };
-            if !can_readpixels {
+            // Desktop GL reads any texture back whole, which is what the C falls back to where
+            // a framebuffer cannot read it; GLES has only the framebuffer, and past it only the
+            // readonly answer.
+            let desktop = !features.api().is_gles();
+            if !can_readpixels && !desktop {
                 return readonly();
             }
             let format_name = res.args.format.name();
             let invert = res.y_0_top();
+            let compressed = l.compressed;
             let l = l.as_gl(entry, b.width as u64, b.height as u64);
             let total = usize::try_from(l.total()).map_err(|_| Error::IovOutOfRange)?;
             let data = staging.take(total);
@@ -875,7 +880,11 @@ pub fn read(
             let y = if invert { res.height_at(info.level) as GLint - b.y - b.height } else { b.y };
             gl.use_program(bound, None);
             gl.pack_tight();
+            let mut by_framebuffer = can_readpixels;
             for d in 0..l.depth as usize {
+                if !by_framebuffer {
+                    break;
+                }
                 let dst = &mut data[d * layer..(d + 1) * layer];
                 let r = read_layer(
                     gl,
@@ -891,19 +900,33 @@ pub fn read(
                     dst,
                 );
                 if let Err(e) = r {
-                    // A read the driver refused falls back to the readonly answer, as in the C:
-                    // the guest is told either that it already holds the bytes, or nothing.
+                    if !desktop {
+                        // A read the driver refused falls back to the readonly answer, as in
+                        // the C: the guest is told either that it already holds the bytes, or
+                        // nothing.
+                        eprintln!("[virglrs] readback of {}: {e}", format_name);
+                        return readonly();
+                    }
+                    by_framebuffer = false;
+                }
+            }
+            if !by_framebuffer {
+                // Read in the same orientation the framebuffer would have read, so the flip
+                // below serves both. The C's own fallback reads from the level's origin and does
+                // not flip; that agrees with this only for a whole level stored bottom-up.
+                let y = if compressed { b.y } else { y };
+                if let Err(e) = read_box_whole_level(gl, entry, res, info.level, &b, y, &l, data) {
                     eprintln!("[virglrs] readback of {}: {e}", format_name);
                     return readonly();
                 }
             }
-            if res.is_bgra() {
+            if entry.stores_bgra_as_rgba() {
                 swizzle_bgra(data);
             }
             if format_name == "Z24X8_UNORM" {
                 scale_depth(data, 1.0 / 256.0);
             }
-            if invert {
+            if invert && !compressed {
                 flip_rows(data, &l);
             }
             if !scatter(pages, info, &l, data) {
@@ -912,6 +935,95 @@ pub fn read(
             Ok(())
         }
     }
+}
+
+/// `vrend_transfer_send_getteximage`: desktop GL reads the whole level and the box is cut out of
+/// it, rows starting at `y` in GL's orientation, into `dst` laid out as `l`.
+#[allow(clippy::too_many_arguments)]
+fn read_box_whole_level(
+    gl: &Gl,
+    entry: &Entry,
+    res: &Resource,
+    level: u32,
+    b: &Box3,
+    y: GLint,
+    l: &Layout,
+    dst: &mut [u8],
+) -> Result<(), Error> {
+    let Storage::Texture(t) = &res.storage else {
+        return Err(Error::Unsupported);
+    };
+    let desc = res.args.format.describe().ok_or(Error::Unsupported)?;
+    let (w, h) = (res.width_at(level), res.height_at(level));
+    // Rows and their pitch in the whole level, in the same units `l` counts the box in: blocks
+    // for a compressed format, pixels of the GL triple otherwise.
+    let (row, rows) = if l.compressed {
+        (desc.blocks_wide(w) as u64 * l.block, desc.blocks_high(h) as u64)
+    } else {
+        (w as u64 * l.block, h as u64)
+    };
+    let (bx, by) = if l.compressed {
+        (desc.blocks_wide(b.x as u32) as u64, desc.blocks_high(y as u32) as u64)
+    } else {
+        (b.x as u64, y as u64)
+    };
+    let level_layer = row * rows;
+    let cube = t.target == GL_TEXTURE_CUBE_MAP;
+    // A cube is read a face at a time; anything else holds every layer in the one level.
+    let layers = match t.target {
+        GL_TEXTURE_CUBE_MAP => 1,
+        GL_TEXTURE_3D => res.depth_at(level) as u64,
+        GL_TEXTURE_1D_ARRAY | GL_TEXTURE_2D_ARRAY | GL_TEXTURE_CUBE_MAP_ARRAY => {
+            res.args.array_size as u64
+        }
+        _ => 1,
+    };
+    let size = usize::try_from(level_layer * layers).map_err(|_| Error::IovOutOfRange)?;
+    let mut whole = vec![0u8; size];
+    gl.bind_texture(t.target, Some(t.name));
+    let mut fetched_face = None;
+    for d in 0..l.depth {
+        let z = b.z as u64 + d;
+        let (target, src_layer) =
+            if cube { (GL_TEXTURE_CUBE_MAP_POSITIVE_X + z as GLenum, 0) } else { (t.target, z) };
+        if fetched_face != Some(target) {
+            gl.drain_errors();
+            let ok = if l.compressed {
+                gl.get_compressed_tex_image(target, level as GLint, &mut whole)
+            } else {
+                gl.get_tex_image(
+                    target,
+                    level as GLint,
+                    entry.gl.glformat,
+                    entry.gl.gltype,
+                    &mut whole,
+                )
+            };
+            let err = gl.drain_errors();
+            if !ok {
+                gl.bind_texture(t.target, None);
+                return Err(Error::Unsupported);
+            }
+            if err != GL_NO_ERROR {
+                gl.bind_texture(t.target, None);
+                return Err(Error::GlError(err));
+            }
+            fetched_face = Some(target);
+        }
+        for r in 0..l.blocks_high {
+            let src = (src_layer * level_layer + (by + r) * row + bx * l.block) as usize;
+            let out = (d * l.layer() + r * l.row()) as usize;
+            let n = l.row() as usize;
+            let (Some(from), Some(to)) = (whole.get(src..src + n), dst.get_mut(out..out + n))
+            else {
+                gl.bind_texture(t.target, None);
+                return Err(Error::BoxOutOfRange);
+            };
+            to.copy_from_slice(from);
+        }
+    }
+    gl.bind_texture(t.target, None);
+    Ok(())
 }
 
 #[cfg(test)]

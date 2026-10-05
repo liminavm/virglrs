@@ -21,7 +21,7 @@ use super::egl::{self, EglError, Flavour, GlContexts, Version, Winsys};
 use super::features::{Api, Feature, Features};
 use super::formats::Table;
 use super::gl::gles::GL_CONTEXT_CORE_PROFILE_BIT;
-use super::gl::{self, GLenum, Gl};
+use super::gl::{self, GLenum, Gl, RobustReads};
 use super::journal::{Census, Seq};
 use super::pipe::TextureTarget;
 use super::resource::{self, Args, Limits, Refusal, Resource};
@@ -382,6 +382,8 @@ impl Vrend {
             features.clear(Feature::srgb_write_control);
         }
         features.reconcile(&gl);
+        let robust = RobustReads::choose(api, &features);
+        let gl = gl.reading(robust);
         let limits = Limits::query(&gl, &features);
         let shader_cfg = shader::Config::probe(&gl, &features, &limits);
         let formats = Table::probe(&gl, &features);
@@ -468,7 +470,7 @@ impl Vrend {
                 Ok(wait_ctx) => Some(waiter::Waiter::start(
                     display,
                     wait_ctx,
-                    Gl::new(winsys.procs(), api),
+                    Gl::new(winsys.procs(), api).reading(robust),
                     fences,
                     debug,
                 )),
@@ -2745,6 +2747,112 @@ mod tests {
         v.context_destroy(ctx, &AllAttached);
     }
 
+    /// A texture no framebuffer can read reads back on desktop GL through
+    /// `glGetCompressedTexImage`, into pages other than the ones it was written from. GLES has no
+    /// such read, and refuses: the control that says the desktop answer came from the texture and
+    /// not from the pages it was uploaded from. A compressed format is never read through a
+    /// framebuffer, and its blocks come back as they were stored.
+    #[test]
+    fn a_texture_no_framebuffer_reads_reads_back_on_desktop_gl() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let up = |host_gl| {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            (v, retire)
+        };
+        // RGTC is core in desktop GL 3.0, so a desktop driver stores it rather than emulating it
+        // -- an emulated format is decompressed on upload, and reads back as whatever the driver
+        // makes of that.
+        let unreadable = |v: &Vrend, f: crate::vrend::proto::Format| {
+            v.formats.get(f).is_some_and(|e| e.bindings.sampler_view) && f.name() == "RGTC1_UNORM"
+        };
+        let format = {
+            let (gles, _g) = up(HostGl::Gles);
+            let (desk, _d) = up(HostGl::Desktop);
+            (0..crate::vrend::proto::FORMAT_MAX)
+                .filter_map(crate::vrend::proto::Format::from_wire)
+                .find(|&f| unreadable(&gles, f) && unreadable(&desk, f))
+                .expect("both flavours sample RGTC1")
+        };
+        let read_back = |host_gl| {
+            let (mut v, _retire) = up(host_gl);
+            let desc = format.describe().expect("described");
+            // Two blocks by two, so the box has rows and columns of blocks to get in order.
+            let (w, h) = (8u32, 8u32);
+            let stride = desc.stride(w);
+            let layer = stride * desc.blocks_high(h);
+            let res = ResourceHandle::new(1).expect("non-zero");
+            v.resource_create(
+                res,
+                resource::Args {
+                    target: TextureTarget::Texture2d,
+                    format,
+                    bind: resource::Bind::SAMPLER_VIEW,
+                    width: w,
+                    height: h,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )
+            .expect("a texture");
+            let info = transfer::Info {
+                level: 0,
+                stride,
+                layer_stride: layer,
+                offset: 0,
+                region: crate::vrend::proto::Box3 {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    width: w as i32,
+                    height: h as i32,
+                    depth: 1,
+                },
+                synchronized: false,
+            };
+            let n = layer as usize;
+            let mut written: Vec<u8> = (0..n).map(|b| (b as u8).wrapping_mul(37)).collect();
+            let from = [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(written.as_mut_ptr().cast()),
+                len: written.len(),
+            }];
+            let from = Iov::new(&from);
+            v.transfer(None, res, Some(&from), transfer::Through::ToHost(from.source()), &info)
+                .expect("the upload");
+            let mut read = vec![0xa5u8; n];
+            let into = [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(read.as_mut_ptr().cast()),
+                len: read.len(),
+            }];
+            let into = Iov::new(&into);
+            let r = v.transfer(None, res, Some(&from), transfer::Through::ToGuest(&into), &info);
+            (r.is_ok(), read == written)
+        };
+        assert_eq!(read_back(HostGl::Gles), (false, false), "GLES cannot read {}", format.name());
+        assert_eq!(read_back(HostGl::Desktop), (true, true), "desktop GL reads {}", format.name());
+    }
+
     /// A desktop context is refused unless desktop GL was asked for, and then only a core profile
     /// at 3.3 or later. QEMU hands one over by default, and until the desktop leg is whole that
     /// must stay a refusal it can report, not a renderer running GLES code on desktop GL.
@@ -3510,9 +3618,8 @@ mod tests {
                 .filter_map(crate::vrend::proto::Format::from_wire)
                 .find(|f| f.name() == "B8G8R8A8_UNORM")
                 .and_then(|f| v.formats.get(f))
-                .expect("every host has BGRA")
-                .gl
-                .glformat;
+                .expect("every host has BGRA");
+            let bgra = (bgra.gl.glformat, bgra.stores_bgra_as_rgba());
             (
                 (v.features.api(), bgra),
                 v.gl.table().has_glGetTexImage(),
@@ -3525,7 +3632,7 @@ mod tests {
         assert!(gles.is_gles(), "GLES unless asked otherwise");
         assert_eq!(
             gles_bgra,
-            super::gl::gles::GL_RGBA,
+            (super::gl::gles::GL_RGBA, true),
             "GLES keeps BGRA as RGBA and swaps on transfer"
         );
         assert!(gles_says_gles, "and the guest is told so");
@@ -3533,8 +3640,8 @@ mod tests {
             up(HostGl::Desktop);
         assert_eq!(
             desktop_bgra,
-            super::gl::gles::GL_BGRA,
-            "desktop GL's own format groups, where BGRA is native"
+            (super::gl::gles::GL_BGRA, false),
+            "desktop GL's own format groups, where BGRA is native and no transfer swaps it"
         );
         assert!(matches!(desktop, Api::Gl(v) if v >= 33), "a core desktop context: {desktop}");
         assert!(get_tex_image, "and the one table resolves desktop GL's own entry points");

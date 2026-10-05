@@ -1967,7 +1967,7 @@ SABOTAGES = [
     (
         'the proc table carries no desktop entry point',
         'gl-gen/gen.py',
-        """    desktop, _ = gl.requirements('gl', GL_FEATURES, [])""",
+        """    desktop, _ = gl.requirements('gl', GL_FEATURES, GL_EXTENSIONS)""",
         """    desktop = []""",
         'the_host_gl_is_the_one_asked_for',
     ),
@@ -2007,6 +2007,36 @@ SABOTAGES = [
         """                When::Gles => true,
                 When::DesktopGl => false,""",
         'the_host_gl_is_the_one_asked_for',
+    ),
+    (
+        'a desktop host answers readonly for a texture no framebuffer reads',
+        'src/vrend/transfer.rs',
+        """            if !can_readpixels && !desktop {""",
+        """            if !can_readpixels {""",
+        'a_texture_no_framebuffer_reads_reads_back_on_desktop_gl',
+    ),
+    (
+        'a desktop host swaps BGRA on transfer as GLES does',
+        'src/vrend/formats.rs',
+        """        super::resource::is_bgra(self.gl.format) && self.gl.glformat != GL_BGRA""",
+        """        super::resource::is_bgra(self.gl.format)""",
+        'the_host_gl_is_the_one_asked_for',
+    ),
+    (
+        'a desktop host swaps a blue-first vertex element in the shader as well',
+        'src/vrend/context.rs',
+        """        if blue_first && api.is_gles() {""",
+        """        if blue_first {""",
+        'a_blue_first_vertex_element_is_swapped_once',
+    ),
+    (
+        'a bounded read is chosen by whether its name resolves',
+        'src/vrend/gl.rs',
+        """        if features.has(Feature::arb_robustness) {
+            RobustReads::Arb""",
+        """        if features.has(Feature::arb_robustness) || api.gl_at_least(45) {
+            RobustReads::Arb""",
+        'the_bounded_reads_are_the_ones_the_driver_advertises',
     ),
     (
         'a desktop host is handed GLSL ES',

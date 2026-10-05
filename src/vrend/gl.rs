@@ -44,7 +44,7 @@ use core::ffi::CStr;
 pub struct BoundProgram(Option<ProgramName>);
 
 use super::egl::Image;
-use super::features::{Api, Feature};
+use super::features::{Api, Feature, Features};
 
 pub use gles::Procs;
 use gles::*;
@@ -472,11 +472,51 @@ pub struct Gl {
     /// The API the context the table was loaded under speaks, which picks each resolver's
     /// spelling.
     api: Api,
+    /// Which bounded read entry points this driver serves.
+    robust: RobustReads,
+}
+
+/// The bounded spellings of the reads -- `glReadnPixels*`, `glGetnTexImage*` -- that this driver
+/// serves, chosen as the C chooses them: by what the driver advertises, never by whether a name
+/// resolves. Mesa answers every name on either API, and a core name it only stubs writes nothing
+/// and reports no error, which reads back as zeros.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RobustReads {
+    /// `GL_ARB_robustness`: the `ARB` spellings of all three.
+    Arb,
+    /// Desktop GL 4.5 without the extension: `glReadnPixels` only.
+    Core,
+    /// `GL_KHR_robustness` on GLES: `glReadnPixelsKHR` only.
+    Khr,
+    /// None: the unbounded calls, sized from what the driver reports.
+    Unbounded,
+}
+
+impl RobustReads {
+    /// The C's order in `do_readpixels`.
+    pub fn choose(api: Api, features: &Features) -> RobustReads {
+        if features.has(Feature::arb_robustness) {
+            RobustReads::Arb
+        } else if api.gl_at_least(45) {
+            RobustReads::Core
+        } else if features.has(Feature::gles_khr_robustness) {
+            RobustReads::Khr
+        } else {
+            RobustReads::Unbounded
+        }
+    }
 }
 
 impl Gl {
+    /// A table with no bounded reads chosen: [`Gl::reading`] picks them once the features are
+    /// probed, which they cannot be before there is a `Gl` to ask.
     pub fn new(t: Procs, api: Api) -> Gl {
-        Gl { t, api }
+        Gl { t, api, robust: RobustReads::Unbounded }
+    }
+
+    /// The bounded reads this driver serves.
+    pub fn reading(self, robust: RobustReads) -> Gl {
+        Gl { robust, ..self }
     }
 
     /// The raw table, for the census of what the driver exports.
@@ -960,7 +1000,13 @@ impl Gl {
         }
         // Robust readback where the driver has it: the bound is the slice's own length, so
         // whatever the driver believes the image is, it cannot write past `dst`.
-        if let Some(f) = self.t.try_glReadnPixelsKHR()
+        let bounded = match self.robust {
+            RobustReads::Arb => self.t.try_glReadnPixelsARB(),
+            RobustReads::Core => self.t.try_glReadnPixels(),
+            RobustReads::Khr => self.t.try_glReadnPixelsKHR(),
+            RobustReads::Unbounded => None,
+        };
+        if let Some(f) = bounded
             && let Ok(size) = GLsizei::try_from(dst.len())
         {
             // SAFETY: the driver writes at most `size` bytes into `dst`, which holds `size`.
@@ -971,6 +1017,77 @@ impl Gl {
         // caller sets -- the driver writes exactly `need` bytes, and `dst` holds at least that.
         unsafe { self.t.glReadPixels()(x, y, w, h, format, ty, dst.as_mut_ptr().cast()) };
         true
+    }
+
+    /// `glGetTexImage`: the whole of one level of the texture bound to `target` -- one face, for
+    /// a cube-face target -- tightly packed into `dst`. Desktop GL only: GLES reads a texture
+    /// through a framebuffer or not at all. The bound is `dst`'s own length under
+    /// `GL_ARB_robustness`, and otherwise the level's size as the driver reports it, so a caller
+    /// that sized `dst` from a stale idea of the texture gets a refusal, not an overrun. The C
+    /// never calls the 4.5 core spelling here, and Mesa answers it without writing anything.
+    pub fn get_tex_image(
+        &self,
+        target: GLenum,
+        level: GLint,
+        format: GLenum,
+        ty: GLenum,
+        dst: &mut [u8],
+    ) -> bool {
+        assert!(!self.api.is_gles(), "glGetTexImage on a GLES context");
+        if self.robust == RobustReads::Arb
+            && let Some(f) = self.t.try_glGetnTexImageARB()
+            && let Ok(size) = GLsizei::try_from(dst.len())
+        {
+            // SAFETY: the driver writes at most `size` bytes into `dst`, which holds `size`.
+            unsafe { f(target, level, format, ty, size, dst.as_mut_ptr().cast()) };
+            return true;
+        }
+        let (w, h, d) = self.level_size(target, level);
+        let Some(need) = image_bytes(format, ty, w, h, d) else {
+            return false;
+        };
+        if dst.len() < need {
+            return false;
+        }
+        // SAFETY: with `Gl::pack_tight` set, which every readback sets, the driver writes the
+        // level's tightly packed image: `need` bytes, measured from the level it will read.
+        unsafe { self.t.glGetTexImage()(target, level, format, ty, dst.as_mut_ptr().cast()) };
+        true
+    }
+
+    /// `glGetCompressedTexImage`: [`Gl::get_tex_image`] for a compressed level, whose blocks
+    /// come back as they are stored.
+    pub fn get_compressed_tex_image(&self, target: GLenum, level: GLint, dst: &mut [u8]) -> bool {
+        assert!(!self.api.is_gles(), "glGetCompressedTexImage on a GLES context");
+        if self.robust == RobustReads::Arb
+            && let Some(f) = self.t.try_glGetnCompressedTexImageARB()
+            && let Ok(size) = GLsizei::try_from(dst.len())
+        {
+            // SAFETY: the driver writes at most `size` bytes into `dst`, which holds `size`.
+            unsafe { f(target, level, size, dst.as_mut_ptr().cast()) };
+            return true;
+        }
+        let need = self.tex_level_parameter(target, level, GL_TEXTURE_COMPRESSED_IMAGE_SIZE);
+        if usize::try_from(need).map_or(true, |need| dst.len() < need) {
+            return false;
+        }
+        // SAFETY: the driver writes the level's compressed image, whose size it reported as
+        // `need`, and `dst` holds at least that.
+        unsafe { self.t.glGetCompressedTexImage()(target, level, dst.as_mut_ptr().cast()) };
+        true
+    }
+
+    /// The level's width, height and depth as the driver holds them.
+    fn level_size(&self, target: GLenum, level: GLint) -> (GLsizei, GLsizei, GLsizei) {
+        let get = |pname| self.tex_level_parameter(target, level, pname);
+        (get(GL_TEXTURE_WIDTH), get(GL_TEXTURE_HEIGHT), get(GL_TEXTURE_DEPTH))
+    }
+
+    fn tex_level_parameter(&self, target: GLenum, level: GLint, pname: GLenum) -> GLint {
+        let mut v: GLint = 0;
+        // SAFETY: every parameter asked here writes exactly one integer.
+        unsafe { self.t.glGetTexLevelParameteriv()(target, level, pname, &mut v) };
+        v
     }
 
     /// Upload rows that are padded, rather than tightly packed.
@@ -2562,6 +2679,22 @@ pub enum FenceWait {
 mod tests {
     use super::super::egl::{Flavour, Winsys};
     use super::*;
+
+    /// The bounded reads are chosen by what the driver advertises, in the C's order: Mesa's iris
+    /// answers `glGetnCompressedTexImage` and writes nothing, so a name that resolves is no
+    /// evidence of a read that works.
+    #[test]
+    fn the_bounded_reads_are_the_ones_the_driver_advertises() {
+        let has = |api, ext: &[&str]| {
+            let f = Features::probe(api, ext.iter().map(|e| e.to_string()));
+            RobustReads::choose(api, &f)
+        };
+        assert_eq!(has(Api::Gl(46), &["GL_ARB_robustness"]), RobustReads::Arb);
+        assert_eq!(has(Api::Gl(46), &[]), RobustReads::Core, "4.5 made glReadnPixels core");
+        assert_eq!(has(Api::Gl(33), &[]), RobustReads::Unbounded);
+        assert_eq!(has(Api::Gles(32), &["GL_KHR_robustness"]), RobustReads::Khr);
+        assert_eq!(has(Api::Gles(32), &[]), RobustReads::Unbounded, "a GLES version is no gl_ver");
+    }
 
     /// A resolver asks for its API's spellings and no other: a desktop context with only the
     /// GLES name of an entry point has none, and the reverse. A driver may answer a name its API
