@@ -1958,6 +1958,50 @@ SABOTAGES = [
         'a_desktop_context_is_taken_only_when_asked_for',
     ),
     (
+        'a desktop host refuses pipeline statistics queries',
+        'src/vrend/context.rs',
+        """            need(Feature::pipeline_statistics_query)?;""",
+        """            return Err(Fault::Unimplemented { cmd, what: "that query type" });""",
+        'pipeline_statistics_and_overflow_queries_count_where_the_host_has_them',
+    ),
+    (
+        'every pipeline statistic counts the first one',
+        'src/vrend/context.rs',
+        """                .get(index as usize)""",
+        """                .get(0)""",
+        'pipeline_statistics_and_overflow_queries_count_where_the_host_has_them',
+    ),
+    (
+        'a query on a vertex stream counts on stream 0',
+        'src/vrend/context.rs',
+        """        if q.index > 0 {
+            host.gl.begin_query_indexed(q.gl_type, q.index, q.id);""",
+        """        if q.index > 0 && q.index == 0 {
+            host.gl.begin_query_indexed(q.gl_type, q.index, q.id);""",
+        'pipeline_statistics_and_overflow_queries_count_where_the_host_has_them',
+    ),
+    (
+        'a query result is never written into the query buffer',
+        'src/vrend/context.rs',
+        """        gl.query_object_into_buffer(id, pname, width, offset);""",
+        """        let _ = (id, pname, width, offset);""",
+        'a_query_result_lands_in_a_buffer_where_the_host_has_query_buffers',
+    ),
+    (
+        'a query buffer asked for availability gets the result',
+        'src/vrend/context.rs',
+        """            (-1, _) => GL_QUERY_RESULT_AVAILABLE,""",
+        """            (-1, _) => GL_QUERY_RESULT,""",
+        'a_query_result_lands_in_a_buffer_where_the_host_has_query_buffers',
+    ),
+    (
+        'an indirect draw never binds its count buffer',
+        'src/vrend/context/draw.rs',
+        """                gl.bind_buffer(GL_PARAMETER_BUFFER, count_buffer);""",
+        """                gl.bind_buffer(GL_PARAMETER_BUFFER, None);""",
+        'an_indirect_draw_count_is_read_from_its_buffer_where_the_host_has_one',
+    ),
+    (
         'a shader-buffer barrier is read from the bit the port used to give it',
         'src/vrend/context.rs',
         """        (1 << 1, shader_buffer),""",

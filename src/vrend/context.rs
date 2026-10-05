@@ -26,7 +26,7 @@ use super::formats::{Description, Table};
 use super::gl::gles::*;
 use super::gl::{
     BindingPoint, BoundProgram, BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei,
-    GLuint, Gl, ImageUnit, Immutable, PipelineName, ProgramName, QueryName, SamplerName,
+    GLuint, Gl, ImageUnit, Immutable, PipelineName, ProgramName, QueryName, QueryWord, SamplerName,
     ShaderName, TextureName, TextureUnit, TransformFeedbackName, UniformLocation, VertexArrayName,
 };
 use super::journal::{self, Census, Entry, Retained, Seq, StateKey, Step, order, state_key};
@@ -626,6 +626,8 @@ pub struct Query {
     pub gl_type: GLenum,
     pub id: QueryName,
     pub resource: ResourceHandle,
+    /// The vertex stream the query counts on; 0 is the unindexed query.
+    pub index: GLuint,
     /// The C's `fake_samples_passed`: an occlusion counter served as a boolean.
     pub fake_samples_passed: bool,
 }
@@ -2167,8 +2169,8 @@ impl Context {
                 self.set_atomic_buffers(host, start_slot, &buffers)
             }
             Command::SetDebugFlags(_) => Ok(()),
-            Command::GetQueryResultQbo { .. } => {
-                Err(Fault::Unimplemented { cmd: kind, what: "query buffer objects on GLES" })
+            Command::GetQueryResultQbo { query, buffer, wait, result_type, offset, index } => {
+                self.get_query_result_qbo(host, query, buffer, wait, result_type, offset, index)
             }
             Command::Transfer3d { transfer, offset, direction } => {
                 self.transfer3d(host, transfer, offset, direction)
@@ -3560,7 +3562,23 @@ fn answer_query(host: &mut Host<'_>, sub: &SubContext, h: ObjectHandle) -> Resul
     Ok(true)
 }
 
-/// `vrend_create_query`, the GLES leg.
+/// `query_stats_index_to_gl_map`: the statistic a pipeline-statistics query counts, by the
+/// `VIRGL_STAT_QUERY_*` index the guest sends in the query's index.
+const PIPELINE_STATISTICS: [GLenum; 11] = [
+    GL_VERTICES_SUBMITTED,
+    GL_PRIMITIVES_SUBMITTED,
+    GL_VERTEX_SHADER_INVOCATIONS,
+    GL_GEOMETRY_SHADER_INVOCATIONS,
+    GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED,
+    GL_CLIPPING_INPUT_PRIMITIVES,
+    GL_CLIPPING_OUTPUT_PRIMITIVES,
+    GL_FRAGMENT_SHADER_INVOCATIONS,
+    GL_TESS_CONTROL_SHADER_PATCHES,
+    GL_TESS_EVALUATION_SHADER_INVOCATIONS,
+    GL_COMPUTE_SHADER_INVOCATIONS,
+];
+
+/// `vrend_create_query`.
 fn create_query(host: &mut Host<'_>, q: QueryCreate) -> Result<Query, Fault> {
     let cmd = Cmd::CreateObject;
     let res = host.resource(cmd, q.resource)?;
@@ -3568,7 +3586,11 @@ fn create_query(host: &mut Host<'_>, q: QueryCreate) -> Result<Query, Fault> {
         return Err(Fault::IllegalResource { cmd, handle: q.resource });
     }
     let mut kind = q.kind;
+    let mut index = GLuint::from(q.index);
     let mut fake = false;
+    let need = |feature| {
+        if host.has(feature) { Ok(()) } else { Err(Fault::NoFeature { cmd, feature }) }
+    };
     if kind == QueryType::OcclusionCounter && !host.has(Feature::occlusion_query) {
         kind = QueryType::OcclusionPredicate;
         fake = true;
@@ -3585,15 +3607,28 @@ fn create_query(host: &mut Host<'_>, q: QueryCreate) -> Result<Query, Fault> {
         }
         QueryType::PrimitivesGenerated => GL_PRIMITIVES_GENERATED,
         QueryType::PrimitivesEmitted => GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN,
-        QueryType::SoOverflowPredicate
-        | QueryType::SoOverflowAnyPredicate
-        | QueryType::PipelineStatistics => {
-            return Err(Fault::Unimplemented { cmd, what: "that query type on GLES" });
+        QueryType::SoOverflowPredicate => {
+            need(Feature::transform_feedback_overflow_query)?;
+            GL_TRANSFORM_FEEDBACK_STREAM_OVERFLOW
+        }
+        QueryType::SoOverflowAnyPredicate => {
+            need(Feature::transform_feedback_overflow_query)?;
+            GL_TRANSFORM_FEEDBACK_OVERFLOW
+        }
+        QueryType::PipelineStatistics => {
+            need(Feature::pipeline_statistics_query)?;
+            // The index names the statistic, not a stream, so the query is begun unindexed.
+            let stat = PIPELINE_STATISTICS
+                .get(index as usize)
+                .copied()
+                .ok_or(Fault::OutOfRange { cmd, what: "a pipeline statistic" })?;
+            index = 0;
+            stat
         }
         QueryType::TimestampDisjoint | QueryType::SoStatistics | QueryType::GpuFinished => 0,
     };
     let id = host.gl.gen_query();
-    Ok(Query { kind, gl_type, id, resource: q.resource, fake_samples_passed: fake })
+    Ok(Query { kind, gl_type, id, resource: q.resource, index, fake_samples_passed: fake })
 }
 
 // ---- state ----
@@ -4700,25 +4735,85 @@ impl Context {
     }
 
     fn begin_query(&mut self, host: &mut Host<'_>, h: ObjectHandle) -> Result<(), Fault> {
-        let q = self.query(Cmd::BeginQuery, h)?;
+        let cmd = Cmd::BeginQuery;
+        let q = self.query(cmd, h)?;
+        if q.index > 0 && !host.has(Feature::transform_feedback3) {
+            return Err(Fault::NoFeature { cmd, feature: Feature::transform_feedback3 });
+        }
         if q.gl_type == GL_TIMESTAMP_EXT || q.gl_type == 0 {
             return Ok(());
         }
-        host.gl.begin_query(q.gl_type, q.id);
+        if q.index > 0 {
+            host.gl.begin_query_indexed(q.gl_type, q.index, q.id);
+        } else {
+            host.gl.begin_query(q.gl_type, q.id);
+        }
         Ok(())
     }
 
     fn end_query(&mut self, host: &mut Host<'_>, h: ObjectHandle) -> Result<(), Fault> {
-        let q = self.query(Cmd::EndQuery, h)?;
+        let cmd = Cmd::EndQuery;
+        let q = self.query(cmd, h)?;
+        if q.index > 0 && !host.has(Feature::transform_feedback3) {
+            return Err(Fault::NoFeature { cmd, feature: Feature::transform_feedback3 });
+        }
         // A timestamp has nothing to end: the END_QUERY is the moment it records. `create_query`
         // admits one only on a driver with timer queries, so the entry point is there.
         if q.gl_type == GL_TIMESTAMP_EXT {
             host.gl.query_timestamp(q.id);
             return Ok(());
         }
-        if q.gl_type != 0 {
+        if q.gl_type == 0 {
+            return Ok(());
+        }
+        if q.index > 0 {
+            host.gl.end_query_indexed(q.gl_type, q.index);
+        } else {
             host.gl.end_query(q.gl_type);
         }
+        Ok(())
+    }
+
+    /// `vrend_get_query_result_qbo`: have the GPU write the query's result -- or, for index -1,
+    /// whether it is available -- into a buffer at `offset`, as a word of `width`.
+    #[allow(clippy::too_many_arguments)]
+    fn get_query_result_qbo(
+        &mut self,
+        host: &mut Host<'_>,
+        h: ObjectHandle,
+        buffer: ResourceHandle,
+        wait: bool,
+        width: QueryValueType,
+        offset: u32,
+        index: i32,
+    ) -> Result<(), Fault> {
+        let cmd = Cmd::GetQueryResultQbo;
+        if !host.has(Feature::qbo) {
+            return Err(Fault::NoFeature { cmd, feature: Feature::qbo });
+        }
+        let q = self.query(cmd, h)?;
+        // A counter is faked only where the driver has no occlusion counters, which every
+        // driver with query buffers has: the C's scaled copy for that case is never reached.
+        assert!(!q.fake_samples_passed, "a host with query buffers counts occlusion samples");
+        let id = q.id;
+        let Storage::Buffer { name, .. } = host.resource(cmd, buffer)?.storage else {
+            return Err(Fault::IllegalResource { cmd, handle: buffer });
+        };
+        let pname = match (index, wait) {
+            (-1, _) => GL_QUERY_RESULT_AVAILABLE,
+            (_, true) => GL_QUERY_RESULT,
+            (_, false) => GL_QUERY_RESULT_NO_WAIT,
+        };
+        let width = match width {
+            QueryValueType::I32 => QueryWord::I32,
+            QueryValueType::U32 => QueryWord::U32,
+            QueryValueType::I64 => QueryWord::I64,
+            QueryValueType::U64 => QueryWord::U64,
+        };
+        let gl = host.gl;
+        gl.bind_buffer(GL_QUERY_BUFFER, Some(name));
+        gl.query_object_into_buffer(id, pname, width, offset);
+        gl.bind_buffer(GL_QUERY_BUFFER, None);
         Ok(())
     }
 

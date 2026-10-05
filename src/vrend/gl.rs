@@ -223,6 +223,15 @@ impl ShaderName {
 }
 
 /// The C's `GLvoid const *` offset into a bound buffer, as the draw and indirect calls spell it.
+/// The width and signedness of a query result written into a buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QueryWord {
+    I32,
+    U32,
+    I64,
+    U64,
+}
+
 fn offset_ptr(offset: u32) -> *const core::ffi::c_void {
     offset as usize as *const core::ffi::c_void
 }
@@ -389,6 +398,10 @@ mod procs {
         = gles [try_glMultiDrawArraysIndirectEXT], gl [try_glMultiDrawArraysIndirect]);
     resolver!(multi_draw_elements_indirect: unsafe extern "C" fn(GLenum, GLenum, *const c_void, GLsizei, GLsizei)
         = gles [try_glMultiDrawElementsIndirectEXT], gl [try_glMultiDrawElementsIndirect]);
+    resolver!(multi_draw_arrays_indirect_count: unsafe extern "C" fn(GLenum, *const c_void, GLintptr, GLsizei, GLsizei)
+        = gles [], gl [try_glMultiDrawArraysIndirectCount, try_glMultiDrawArraysIndirectCountARB]);
+    resolver!(multi_draw_elements_indirect_count: unsafe extern "C" fn(GLenum, GLenum, *const c_void, GLintptr, GLsizei, GLsizei)
+        = gles [], gl [try_glMultiDrawElementsIndirectCount, try_glMultiDrawElementsIndirectCountARB]);
     resolver!(bind_program_pipeline: unsafe extern "C" fn(GLuint)
         = gles [try_glBindProgramPipeline, try_glBindProgramPipelineEXT], gl [try_glBindProgramPipeline]);
     resolver!(gen_program_pipelines: unsafe extern "C" fn(GLsizei, *mut GLuint)
@@ -479,6 +492,12 @@ mod procs {
         }),
         (Feature::multi_draw_indirect, "glMultiDrawElementsIndirectEXT", |t, a| {
             multi_draw_elements_indirect(t, a).is_some()
+        }),
+        (Feature::indirect_params, "glMultiDrawArraysIndirectCount", |t, a| {
+            multi_draw_arrays_indirect_count(t, a).is_some()
+        }),
+        (Feature::indirect_params, "glMultiDrawElementsIndirectCount", |t, a| {
+            multi_draw_elements_indirect_count(t, a).is_some()
         }),
         (Feature::separate_shader_objects, "glBindProgramPipeline", |t, a| {
             bind_program_pipeline(t, a).is_some()
@@ -2260,6 +2279,44 @@ impl Gl {
         unsafe { self.t.glEndQuery()(target) };
     }
 
+    /// `glBeginQueryIndexed`: a query counting on vertex stream `index`. Desktop GL only, behind
+    /// `transform_feedback3`.
+    pub fn begin_query_indexed(&self, target: GLenum, index: GLuint, q: QueryName) {
+        assert!(!self.api.is_gles(), "glBeginQueryIndexed on a GLES context");
+        // SAFETY: plain scalars.
+        unsafe { self.t.glBeginQueryIndexed()(target, index, q.0) };
+    }
+
+    pub fn end_query_indexed(&self, target: GLenum, index: GLuint) {
+        assert!(!self.api.is_gles(), "glEndQueryIndexed on a GLES context");
+        // SAFETY: plain scalars.
+        unsafe { self.t.glEndQueryIndexed()(target, index) };
+    }
+
+    /// `glGetQueryObject*v` with a buffer bound to `GL_QUERY_BUFFER`: the GPU writes `pname` of
+    /// query `q` into that buffer at `offset`, as a word of `width`. Desktop GL only, behind `qbo`.
+    pub fn query_object_into_buffer(
+        &self,
+        q: QueryName,
+        pname: GLenum,
+        width: QueryWord,
+        offset: u32,
+    ) {
+        assert!(!self.api.is_gles(), "glGetQueryObject into a buffer on a GLES context");
+        let at = offset_ptr(offset).cast_mut();
+        // SAFETY: with a buffer bound to `GL_QUERY_BUFFER`, the pointer is an offset into it,
+        // never dereferenced on this side; the driver bounds the write by the buffer's size and
+        // raises an error past it.
+        unsafe {
+            match width {
+                QueryWord::I32 => self.t.glGetQueryObjectiv()(q.0, pname, at.cast()),
+                QueryWord::U32 => self.t.glGetQueryObjectuiv()(q.0, pname, at.cast()),
+                QueryWord::I64 => self.t.glGetQueryObjecti64v()(q.0, pname, at.cast()),
+                QueryWord::U64 => self.t.glGetQueryObjectui64v()(q.0, pname, at.cast()),
+            }
+        }
+    }
+
     /// `glQueryCounterEXT` with `GL_TIMESTAMP_EXT`: record the GPU's clock into `q` once every
     /// command before it has run. A timestamp's only command -- it has no begin and no end.
     pub fn query_timestamp(&self, q: QueryName) {
@@ -2987,6 +3044,43 @@ impl Gl {
         );
         // SAFETY: as `draw_arrays_indirect`.
         unsafe { f(mode, ty, offset_ptr(offset), draw_count, stride) };
+    }
+
+    /// `glMultiDrawArraysIndirectCount`: up to `max_draws` commands from `offset` into the bound
+    /// indirect buffer, as many as the count at `count_offset` into the bound parameter buffer.
+    pub fn multi_draw_arrays_indirect_count(
+        &self,
+        mode: GLenum,
+        offset: u32,
+        count_offset: u32,
+        max_draws: GLsizei,
+        stride: GLsizei,
+    ) {
+        let f = promised(
+            procs::multi_draw_arrays_indirect_count(&self.t, self.api),
+            Feature::indirect_params,
+            "glMultiDrawArraysIndirectCount",
+        );
+        // SAFETY: both offsets are into buffers bound for the call, which the driver bounds.
+        unsafe { f(mode, offset_ptr(offset), count_offset as GLintptr, max_draws, stride) };
+    }
+
+    pub fn multi_draw_elements_indirect_count(
+        &self,
+        mode: GLenum,
+        ty: GLenum,
+        offset: u32,
+        count_offset: u32,
+        max_draws: GLsizei,
+        stride: GLsizei,
+    ) {
+        let f = promised(
+            procs::multi_draw_elements_indirect_count(&self.t, self.api),
+            Feature::indirect_params,
+            "glMultiDrawElementsIndirectCount",
+        );
+        // SAFETY: as `multi_draw_arrays_indirect_count`.
+        unsafe { f(mode, ty, offset_ptr(offset), count_offset as GLintptr, max_draws, stride) };
     }
 
     pub fn patch_parameter_i(&self, name: GLenum, value: GLint) {

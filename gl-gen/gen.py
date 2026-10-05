@@ -32,9 +32,12 @@ GLES_FEATURES = [
 ]
 
 # Desktop GL's extensions vrend reaches for by name, where the C does: the robust reads, which it
-# takes under `GL_ARB_robustness` rather than through the core names a driver may only stub.
+# takes under `GL_ARB_robustness` rather than through the core names a driver may only stub; and
+# the indirect draw counts, whose extension spells its entry points with the suffix, so a host
+# older than 4.6 has them only under that name.
 GL_EXTENSIONS = [
     'GL_ARB_robustness',
+    'GL_ARB_indirect_parameters',
 ]
 
 # Desktop GL through 4.6. Only the core profile's requirements are taken: the compatibility

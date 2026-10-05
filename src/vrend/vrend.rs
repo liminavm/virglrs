@@ -3805,10 +3805,19 @@ mod tests {
     /// What a draw needs beyond one vertex buffer and one target: resources made before the
     /// stream, commands sent ahead of the draw, and further rounds of commands each followed by
     /// the same draw again. The target read back is the last draw's.
+    ///
+    /// `indirect` draws every time through an indirect buffer instead; `after` is sent once the
+    /// last draw is; and each of `read_back` -- a buffer and a length -- is read into `read` once
+    /// everything ran and a fence has answered any query the stream left waiting.
+    #[derive(Default)]
     struct More<'a> {
         resources: Vec<(ResourceHandle, resource::Args)>,
         before: Vec<crate::vrend::proto::Command<'a>>,
         redraws: Vec<Vec<crate::vrend::proto::Command<'a>>>,
+        indirect: Option<crate::vrend::proto::IndirectDraw>,
+        after: Vec<crate::vrend::proto::Command<'a>>,
+        read_back: Vec<(ResourceHandle, u32)>,
+        read: Option<&'a std::cell::RefCell<Vec<Vec<u8>>>>,
     }
 
     /// Draw `d` into a fresh target and read the target back. `Ok(None)` is a host without
@@ -4002,6 +4011,7 @@ mod tests {
             commands.push(Command::SetConstantBuffer { stage: *stage, index: 0, data });
         }
         let draw = d.fs.is_some();
+        let indirect = d.more.and_then(|m| m.indirect);
         let draw_vbo = || {
             Command::DrawVbo(Draw {
                 start: 0,
@@ -4016,8 +4026,12 @@ mod tests {
                 min_index: 0,
                 max_index: 2,
                 count_from_so: None,
-                tess: d.tess.map(|_| TessDraw { vertices_per_patch: 3, drawid: 0 }),
-                indirect: None,
+                tess: match d.tess {
+                    Some(_) => Some(TessDraw { vertices_per_patch: 3, drawid: 0 }),
+                    // The wire carries the tessellation words ahead of the indirect ones.
+                    None => indirect.map(|_| TessDraw { vertices_per_patch: 0, drawid: 0 }),
+                },
+                indirect,
             })
         };
         if let Some(m) = d.more {
@@ -4027,6 +4041,9 @@ mod tests {
         for round in d.more.map_or(&[][..], |m| &m.redraws) {
             commands.extend(round.iter().cloned());
             commands.push(draw_vbo());
+        }
+        if let Some(m) = d.more {
+            commands.extend(m.after.iter().cloned());
         }
         let mut wire = Vec::new();
         for c in &commands {
@@ -4050,12 +4067,339 @@ mod tests {
                     let served = v.shader_cfg.serves_separable();
                     p.set(Some(PipelineSeen { served, bound: bound != 0 }));
                 }
+                if let Some(m) = d.more
+                    && let Some(read) = m.read
+                {
+                    // A fence naming no context answers every query left waiting.
+                    v.fence_global(None, ClientFenceId(1), &AllAttached);
+                    for &(handle, len) in &m.read_back {
+                        let mut bytes = vec![0xa5u8; len as usize];
+                        let into = [crate::abi::GuestIov {
+                            base: crate::abi::VmmPtr(bytes.as_mut_ptr().cast()),
+                            len: bytes.len(),
+                        }];
+                        let into = Iov::new(&into);
+                        let info = transfer::Info {
+                            level: 0,
+                            stride: 0,
+                            layer_stride: 0,
+                            offset: 0,
+                            region: Box3 {
+                                x: 0,
+                                y: 0,
+                                z: 0,
+                                width: len as i32,
+                                height: 1,
+                                depth: 1,
+                            },
+                            synchronized: false,
+                        };
+                        v.transfer(None, handle, None, transfer::Through::ToGuest(&into), &info)
+                            .expect("a buffer the draw asked for reads back");
+                        read.borrow_mut().push(bytes);
+                    }
+                }
                 let cursor = v.cursor_contents(target).expect("a 16x16 2D texture reads back");
                 Ok(Some(cursor.pixels))
             }
         };
         v.context_destroy(ctx, &AllAttached);
         out
+    }
+
+    /// Whether a fresh renderer on `host_gl` has `feature`: what a test of a feature the host
+    /// may lack asks first, so that it scores the feature where it is and the refusal where not.
+    fn host_has(host_gl: HostGl, feature: Feature) -> bool {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let v = Vrend::new(
+            Config { host_gl, ..Config::default() },
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        v.features.has(feature)
+    }
+
+    /// A buffer of `width` bytes: host memory for `Bind::CUSTOM`, a GL buffer otherwise.
+    fn buffer_args(bind: resource::Bind, width: u32) -> resource::Args {
+        resource::Args {
+            target: TextureTarget::Buffer,
+            format: super::super::proto::Format::from_wire(64).expect("R8_UNORM"),
+            bind,
+            width,
+            height: 1,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags(0),
+        }
+    }
+
+    /// `RESOURCE_INLINE_WRITE` of `data` at the start of buffer `resource`.
+    fn inline_write(resource: ResourceHandle, data: &[u32]) -> crate::vrend::proto::Command<'_> {
+        use crate::vrend::proto::{Box3, Command, Transfer};
+        Command::ResourceInlineWrite {
+            transfer: Transfer {
+                resource,
+                level: 0,
+                usage: 0,
+                stride: 0,
+                layer_stride: 0,
+                region: Box3 {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    width: data.len() as i32 * 4,
+                    height: 1,
+                    depth: 1,
+                },
+            },
+            data,
+        }
+    }
+
+    /// Pipeline-statistics, stream-out overflow and per-stream queries count where the host has
+    /// them, as the C counts them: the one triangle submits three vertices and one primitive,
+    /// with no stream-out bound nothing overflowed, and with no geometry shader every primitive
+    /// is generated on stream 0 and none on stream 1. A statistic past the table is refused,
+    /// and a host without the queries -- GLES has none of them -- refuses them, as its caps never
+    /// offered them.
+    #[test]
+    fn pipeline_statistics_and_overflow_queries_count_where_the_host_has_them() {
+        use crate::vrend::pipe::QueryType;
+        use crate::vrend::proto::{Command, Object, QueryCreate};
+        let h = |n| ResourceHandle::new(n).expect("non-zero");
+        let o = |n| ObjectHandle::new(n).expect("non-zero");
+        // VIRGL_STAT_QUERY_IA_VERTICES and _IA_PRIMITIVES, then the overflow of any stream.
+        let queries = |stat0: u16| {
+            [
+                (o(20), h(10), QueryType::PipelineStatistics, stat0),
+                (o(21), h(11), QueryType::PipelineStatistics, 1),
+                (o(22), h(12), QueryType::SoOverflowAnyPredicate, 0),
+                (o(23), h(13), QueryType::PrimitivesGenerated, 0),
+                (o(24), h(14), QueryType::PrimitivesGenerated, 1),
+            ]
+        };
+        let run = |host_gl, stat0| {
+            let read = std::cell::RefCell::new(Vec::new());
+            let qs = queries(stat0);
+            let more = More {
+                resources: qs
+                    .iter()
+                    .map(|&(_, r, _, _)| (r, buffer_args(resource::Bind::CUSTOM, 16)))
+                    .collect(),
+                before: qs
+                    .iter()
+                    .flat_map(|&(q, resource, kind, index)| {
+                        let create = QueryCreate { kind, index, offset: 0, resource };
+                        [
+                            Command::CreateObject { handle: q, object: Object::Query(create) },
+                            Command::BeginQuery(q),
+                        ]
+                    })
+                    .collect(),
+                after: qs
+                    .iter()
+                    .flat_map(|&(q, ..)| {
+                        [Command::EndQuery(q), Command::GetQueryResult { query: q, wait: true }]
+                    })
+                    .collect(),
+                read_back: qs.iter().map(|&(_, r, _, _)| (r, 16)).collect(),
+                read: Some(&read),
+                ..Default::default()
+            };
+            let ran = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(RED_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            });
+            ran.map(|_| read.into_inner())
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let has = host_has(host_gl, Feature::pipeline_statistics_query)
+                && host_has(host_gl, Feature::transform_feedback_overflow_query)
+                && host_has(host_gl, Feature::transform_feedback3);
+            if !has {
+                let ran = run(host_gl, 0);
+                assert!(
+                    matches!(ran, Err(Fault::NoFeature { .. })),
+                    "{host_gl:?}: a host without the queries refuses them: {ran:?}"
+                );
+                continue;
+            }
+            let read = run(host_gl, 0).expect("the draw runs");
+            let word = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            let result = |b: &[u8]| u64::from_le_bytes(b[8..16].try_into().unwrap());
+            for (b, want) in read.iter().zip([3, 1, 0, 1, 0]) {
+                assert_eq!(word(b, 0), 1, "{host_gl:?}: VIRGL_QUERY_STATE_DONE");
+                assert_eq!(result(b), want, "{host_gl:?}: the counted value");
+            }
+            let past = run(host_gl, 11);
+            assert!(
+                matches!(past, Err(Fault::OutOfRange { .. })),
+                "{host_gl:?}: no twelfth statistic: {past:?}"
+            );
+        }
+    }
+
+    /// A query buffer object takes an occlusion query's result, and whether it is available,
+    /// into a GL buffer at the offsets the guest names, where the host has query buffers: the
+    /// triangle covers all 256 samples of the 16x16 target. A host without them refuses.
+    #[test]
+    fn a_query_result_lands_in_a_buffer_where_the_host_has_query_buffers() {
+        use crate::vrend::pipe::{QueryType, QueryValueType};
+        use crate::vrend::proto::{Command, Object, QueryCreate};
+        let (state, qbo) = (
+            ResourceHandle::new(10).expect("non-zero"),
+            ResourceHandle::new(11).expect("non-zero"),
+        );
+        let q = ObjectHandle::new(20).expect("non-zero");
+        let run = |host_gl| {
+            let read = std::cell::RefCell::new(Vec::new());
+            let ask = |offset, index| Command::GetQueryResultQbo {
+                query: q,
+                buffer: qbo,
+                wait: true,
+                result_type: QueryValueType::U32,
+                offset,
+                index,
+            };
+            let zeros = [0u32; 4];
+            let create = QueryCreate {
+                kind: QueryType::OcclusionCounter,
+                index: 0,
+                offset: 0,
+                resource: state,
+            };
+            let more = More {
+                resources: vec![
+                    (state, buffer_args(resource::Bind::CUSTOM, 16)),
+                    (qbo, buffer_args(resource::Bind::VERTEX_BUFFER, 16)),
+                ],
+                before: vec![
+                    inline_write(qbo, &zeros),
+                    Command::CreateObject { handle: q, object: Object::Query(create) },
+                    Command::BeginQuery(q),
+                ],
+                after: vec![Command::EndQuery(q), ask(4, 0), ask(8, -1)],
+                read_back: vec![(qbo, 16)],
+                read: Some(&read),
+                ..Default::default()
+            };
+            draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(RED_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            })
+            .map(|_| read.into_inner())
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let ran = run(host_gl);
+            if !host_has(host_gl, Feature::qbo) {
+                assert!(
+                    matches!(ran, Err(Fault::NoFeature { feature: Feature::qbo, .. })),
+                    "{host_gl:?}: a host without query buffers refuses: {ran:?}"
+                );
+                continue;
+            }
+            let read = ran.expect("the draw runs");
+            let word = |at: usize| u32::from_le_bytes(read[0][at..at + 4].try_into().unwrap());
+            assert_eq!(word(0), 0, "{host_gl:?}: nothing before the offset");
+            assert_eq!(word(4), 256, "{host_gl:?}: every sample of the target passed");
+            assert_eq!(word(8), 1, "{host_gl:?}: and the result was available");
+        }
+    }
+
+    /// An indirect draw with a count buffer draws as many of its commands as the buffer says,
+    /// where the host has indirect parameters: a count of zero leaves the target as cleared,
+    /// one draws the triangle. A host without them refuses the draw.
+    #[test]
+    fn an_indirect_draw_count_is_read_from_its_buffer_where_the_host_has_one() {
+        use crate::vrend::proto::IndirectDraw;
+        let (commands, count) = (
+            ResourceHandle::new(10).expect("non-zero"),
+            ResourceHandle::new(11).expect("non-zero"),
+        );
+        // DrawArraysIndirectCommand: three vertices, one instance, from the first.
+        let command = [3u32, 1, 0, 0];
+        let run = |host_gl, n: u32| {
+            let n = [n];
+            let more = More {
+                resources: vec![
+                    (commands, buffer_args(resource::Bind::VERTEX_BUFFER, 16)),
+                    (count, buffer_args(resource::Bind::VERTEX_BUFFER, 4)),
+                ],
+                before: vec![inline_write(commands, &command), inline_write(count, &n)],
+                indirect: Some(IndirectDraw {
+                    resource: commands,
+                    offset: 0,
+                    stride: 16,
+                    draw_count: 1,
+                    draw_count_offset: 0,
+                    draw_count_resource: Some(count),
+                }),
+                ..Default::default()
+            };
+            draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(RED_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            })
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            if !host_has(host_gl, Feature::indirect_params) {
+                let ran = run(host_gl, 1);
+                assert!(
+                    matches!(ran, Err(Fault::NoFeature { feature: Feature::indirect_params, .. })),
+                    "{host_gl:?}: a host without indirect parameters refuses: {ran:?}"
+                );
+                continue;
+            }
+            let none = run(host_gl, 0).expect("the draw runs").expect("no tessellation");
+            assert!(none.iter().all(|b| *b == 0), "{host_gl:?}: a count of zero draws nothing");
+            let one = run(host_gl, 1).expect("the draw runs").expect("no tessellation");
+            assert!(
+                one.chunks(4).all(|p| p == [0xff, 0, 0, 0xff]),
+                "{host_gl:?}: a count of one draws the triangle: {:?}",
+                &one[..4]
+            );
+        }
     }
 
     /// Whether a host serves separable stages, and whether a draw ran a program pipeline.
@@ -4238,6 +4582,7 @@ mod tests {
                 ],
                 vec![Command::BindShader { stage: fs, handle: Some(o(3)) }],
             ],
+            ..Default::default()
         };
         for host_gl in [HostGl::Gles, HostGl::Desktop] {
             let pipeline = std::cell::Cell::new(None);
@@ -4343,6 +4688,7 @@ mod tests {
                 vec![Command::BindShader { stage: ShaderStage::Vertex, handle: Some(o(20)) }],
                 vec![Command::BindShader { stage: ShaderStage::Vertex, handle: Some(o(1)) }],
             ],
+            ..Default::default()
         };
         for host_gl in [HostGl::Gles, HostGl::Desktop] {
             let pipeline = std::cell::Cell::new(None);

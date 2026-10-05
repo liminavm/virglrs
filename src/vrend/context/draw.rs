@@ -1930,8 +1930,7 @@ impl Context {
             }
             need(Feature::indirect_draw)?;
             if ind.draw_count_resource.is_some() {
-                // `feat_indirect_params` is desktop-only.
-                return Err(Fault::Unimplemented { cmd, what: "an indirect draw count" });
+                need(Feature::indirect_params)?;
             }
         }
         // GL takes every count as a signed 32-bit value. Past that, GL would raise an error the
@@ -1957,6 +1956,14 @@ impl Context {
             Some(ind) => match host.resource(cmd, ind.resource)?.storage {
                 Storage::Buffer { name, .. } => Some(name),
                 _ => return Err(Fault::IllegalResource { cmd, handle: ind.resource }),
+            },
+            None => None,
+        };
+        // The buffer the draw count is read from, for an indirect draw that has one.
+        let count_buffer = match indirect.and_then(|ind| ind.draw_count_resource) {
+            Some(handle) => match host.resource(cmd, handle)?.storage {
+                Storage::Buffer { name, .. } => Some(name),
+                _ => return Err(Fault::IllegalResource { cmd, handle }),
             },
             None => None,
         };
@@ -2108,6 +2115,9 @@ impl Context {
         }
         if features.has(Feature::indirect_draw) {
             gl.bind_buffer(GL_DRAW_INDIRECT_BUFFER, indirect_buffer);
+            if features.has(Feature::indirect_params) {
+                gl.bind_buffer(GL_PARAMETER_BUFFER, count_buffer);
+            }
         }
         if vertices_per_patch > 0 && features.has(Feature::tessellation) {
             gl.patch_parameter_i(GL_PATCH_VERTICES, vertices_per_patch);
@@ -2138,7 +2148,15 @@ impl Context {
             }
             if let Some(ind) = indirect {
                 let (draw_count, stride) = indirect_counts.expect("counted with the buffer");
-                if draw_count > 1 {
+                if count_buffer.is_some() {
+                    gl.multi_draw_arrays_indirect_count(
+                        mode,
+                        ind.offset,
+                        ind.draw_count_offset,
+                        draw_count,
+                        stride,
+                    );
+                } else if draw_count > 1 {
                     gl.multi_draw_arrays_indirect(mode, ind.offset, draw_count, stride);
                 } else {
                     gl.draw_arrays_indirect(mode, ind.offset);
@@ -2162,7 +2180,16 @@ impl Context {
             let ranged = draw.min_index != 0 || draw.max_index != u32::MAX;
             if let Some(ind) = indirect {
                 let (draw_count, stride) = indirect_counts.expect("counted with the buffer");
-                if draw_count > 1 {
+                if count_buffer.is_some() {
+                    gl.multi_draw_elements_indirect_count(
+                        mode,
+                        index_type,
+                        ind.offset,
+                        ind.draw_count_offset,
+                        draw_count,
+                        stride,
+                    );
+                } else if draw_count > 1 {
                     gl.multi_draw_elements_indirect(
                         mode, index_type, ind.offset, draw_count, stride,
                     );
