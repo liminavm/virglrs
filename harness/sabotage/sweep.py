@@ -1958,6 +1958,14 @@ SABOTAGES = [
         'a_desktop_context_is_taken_only_when_asked_for',
     ),
     (
+        'a framebuffer read runs at whatever pack state the context was left in',
+        'src/vrend/gl.rs',
+        """        self.pack_tight();
+        // Robust readback where the driver has it""",
+        """        // Robust readback where the driver has it""",
+        'an_unaligned_cursor_reads_back_on_a_fresh_renderer_on_either_flavour',
+    ),
+    (
         'a VMM that does not ask for GLES is given GLES anyway',
         'src/ffi.rs',
         """        host_gl: if flags & abi::USE_GLES != 0 { HostGl::Gles } else { HostGl::Desktop },""",

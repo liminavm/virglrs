@@ -1042,18 +1042,10 @@ impl Vrend {
         let status = self.gl.check_framebuffer_status();
         let mut got = 0;
         if status == GL_FRAMEBUFFER_COMPLETE {
-            // Tightly packed, then re-pitched below: `glReadPixels` writes one image at the
-            // pack state GL was told, and asking it to write at the caller's stride would make
-            // the pack state a second place the row length is decided.
-            //
-            // `pack_tight` and not the alignment alone. `Gl::read_pixels` bounds its slice
-            // against a tightly packed image and says so in its own SAFETY comment -- "with pack
-            // row length zero and alignment 1, which every caller sets" -- so a stale
-            // `GL_PACK_ROW_LENGTH` left on ctx0 by an earlier readback would have the driver
-            // write past the end of `packed` on any host without `glReadnPixelsKHR`. Four fields
-            // decide one fact, and this is the one place that names the fact.
+            // Tightly packed, then re-pitched below: `Gl::read_pixels` reads at a tight pack
+            // state, and asking it to write at the caller's stride would make the pack state a
+            // second place the row length is decided.
             let mut packed = vec![0u8; width as usize * rows as usize * 4];
-            self.gl.pack_tight();
             if self.gl.read_pixels(
                 0,
                 0,
@@ -2851,6 +2843,88 @@ mod tests {
         };
         assert_eq!(read_back(HostGl::Gles), (false, false), "GLES cannot read {}", format.name());
         assert_eq!(read_back(HostGl::Desktop), (true, true), "desktop GL reads {}", format.name());
+    }
+
+    /// A cursor whose rows are not a multiple of four bytes reads back as written, on a renderer
+    /// that has read nothing back before. GL's default pack alignment is 4, so a read that
+    /// leaves the pack state to whoever ran before it gets 3-byte rows padded to 4: offsets
+    /// nothing here knows, and on a host without bounded reads, bytes past the buffer.
+    #[test]
+    fn an_unaligned_cursor_reads_back_on_a_fresh_renderer_on_either_flavour() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let r8 = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == "R8_UNORM")
+            .expect("R8_UNORM is a wire format");
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let mut v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            let (w, h) = (3u32, 3u32);
+            let res = ResourceHandle::new(1).expect("non-zero");
+            v.resource_create(
+                res,
+                resource::Args {
+                    target: TextureTarget::Texture2d,
+                    format: r8,
+                    bind: resource::Bind::SAMPLER_VIEW,
+                    width: w,
+                    height: h,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )
+            .expect("a texture");
+            let info = transfer::Info {
+                level: 0,
+                stride: w,
+                layer_stride: w * h,
+                offset: 0,
+                region: crate::vrend::proto::Box3 {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    width: w as i32,
+                    height: h as i32,
+                    depth: 1,
+                },
+                synchronized: false,
+            };
+            let mut written: Vec<u8> = (1..=(w * h) as u8).map(|b| b.wrapping_mul(29)).collect();
+            let from = [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(written.as_mut_ptr().cast()),
+                len: written.len(),
+            }];
+            let from = Iov::new(&from);
+            v.transfer(None, res, Some(&from), transfer::Through::ToHost(from.source()), &info)
+                .expect("the upload");
+            let cursor = v.cursor_contents(res);
+            assert_eq!(
+                cursor.map(|c| c.pixels),
+                Some(written),
+                "{host_gl:?}: the cursor reads back as written"
+            );
+        }
     }
 
     /// Desktop GL stores a 1D texture as one, and a 1D array as a 2D texture whose rows are its

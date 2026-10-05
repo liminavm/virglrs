@@ -1090,7 +1090,8 @@ impl Gl {
     }
 
     /// Read a tightly packed `w`×`h` image out of the read framebuffer into `dst`. Refuses a
-    /// destination shorter than the image.
+    /// destination shorter than the image. Sets the pack state it reads under, so no caller has
+    /// to have.
     #[allow(clippy::too_many_arguments)]
     pub fn read_pixels(
         &self,
@@ -1108,6 +1109,7 @@ impl Gl {
         if dst.len() < need {
             return false;
         }
+        self.pack_tight();
         // Robust readback where the driver has it: the bound is the slice's own length, so
         // whatever the driver believes the image is, it cannot write past `dst`.
         let bounded = match self.robust {
@@ -1123,8 +1125,8 @@ impl Gl {
             unsafe { f(x, y, w, h, format, ty, size, dst.as_mut_ptr().cast()) };
             return true;
         }
-        // SAFETY: with pack row length zero and alignment 1 -- `Gl::pack_tight`, which every
-        // caller sets -- the driver writes exactly `need` bytes, and `dst` holds at least that.
+        // SAFETY: with the tight pack state set above, the driver writes exactly `need` bytes,
+        // and `dst` holds at least that.
         unsafe { self.t.glReadPixels()(x, y, w, h, format, ty, dst.as_mut_ptr().cast()) };
         true
     }
@@ -1144,6 +1146,7 @@ impl Gl {
         dst: &mut [u8],
     ) -> bool {
         assert!(!self.api.is_gles(), "glGetTexImage on a GLES context");
+        self.pack_tight();
         if self.robust == RobustReads::Arb
             && let Some(f) = self.t.try_glGetnTexImageARB()
             && let Ok(size) = GLsizei::try_from(dst.len())
@@ -1159,8 +1162,8 @@ impl Gl {
         if dst.len() < need {
             return false;
         }
-        // SAFETY: with `Gl::pack_tight` set, which every readback sets, the driver writes the
-        // level's tightly packed image: `need` bytes, measured from the level it will read.
+        // SAFETY: with the tight pack state set above, the driver writes the level's tightly
+        // packed image: `need` bytes, measured from the level it will read.
         unsafe { self.t.glGetTexImage()(target, level, format, ty, dst.as_mut_ptr().cast()) };
         true
     }
@@ -1259,9 +1262,9 @@ impl Gl {
     /// their offsets from the format's own stride, so a row that is not a multiple of four bytes
     /// -- a 127-wide R8 image, say -- would come back padded to a stride nothing else here knows
     /// about: the rows would be read at the wrong offsets, and the last one would be written past
-    /// the end of a buffer sized from the unpadded number. Every caller of `read_pixels` depends
-    /// on this having run, and none of them can see it from where they are.
-    pub fn pack_tight(&self) {
+    /// the end of a buffer sized from the unpadded number. So the reads set it themselves rather
+    /// than trusting whoever ran on the context before them.
+    fn pack_tight(&self) {
         self.pixel_store_i(GL_PACK_ROW_LENGTH, 0);
         self.pixel_store_i(GL_PACK_SKIP_PIXELS, 0);
         self.pixel_store_i(GL_PACK_SKIP_ROWS, 0);

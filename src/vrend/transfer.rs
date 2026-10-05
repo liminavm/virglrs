@@ -894,7 +894,6 @@ pub fn read(
             let layer = l.layer() as usize;
             let y = if invert { res.height_at(info.level) as GLint - b.y - b.height } else { b.y };
             gl.use_program(bound, None);
-            gl.pack_tight();
             let mut by_framebuffer = can_readpixels;
             for d in 0..l.depth as usize {
                 if !by_framebuffer {
