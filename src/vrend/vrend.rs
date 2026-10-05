@@ -3074,6 +3074,109 @@ mod tests {
         v.context_destroy(ctx, &AllAttached);
     }
 
+    /// A surface with samples its texture lacks is the guest's
+    /// `glFramebufferTexture2DMultisampleEXT`, which it is offered whenever the host has the
+    /// extension. Such a host renders into it and resolves into the texture; refusing it there
+    /// poisoned the first context that took the offer. A host without the extension never made
+    /// it, and says which feature a guest asking anyway lacks.
+    #[test]
+    fn a_multisampled_surface_renders_into_its_texture_where_the_host_offers_it() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::{Command, Object, Surface};
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        let offered = v.features.has(Feature::implicit_msaa);
+        let bgra = super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM");
+        let res = ResourceHandle::new(1).expect("a resource handle is non-zero");
+        v.resource_create(
+            res,
+            resource::Args {
+                target: TextureTarget::Texture2d,
+                format: bgra,
+                bind: resource::Bind(
+                    resource::Bind::RENDER_TARGET.0 | resource::Bind::SAMPLER_VIEW.0,
+                ),
+                width: 16,
+                height: 16,
+                depth: 1,
+                array_size: 1,
+                last_level: 0,
+                nr_samples: 0,
+                flags: resource::ResourceFlags(0),
+            },
+        )
+        .expect("a texture");
+        let o = |n: u32| crate::vrend::proto::ObjectHandle::new(n).expect("non-zero");
+        let red = [1.0f32.to_bits(), 0, 0, 1.0f32.to_bits()];
+        let mut wire = Vec::new();
+        for c in [
+            Command::CreateObject {
+                handle: o(1),
+                object: Object::Surface(Surface {
+                    resource: res,
+                    format: bgra,
+                    first_element_or_level: 0,
+                    last_element_or_layers: 0,
+                    samples: 4,
+                }),
+            },
+            Command::SetFramebufferState { zsurf: None, cbufs: vec![Some(o(1))] },
+            Command::Clear { buffers: 1 << 2, color: red, depth: 0.0, stencil: 0 },
+        ] {
+            encode(&c, &mut wire);
+        }
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &AllAttached).expect("a context");
+        let ran = v.submit(ctx, &wire, &AllAttached).expect("the context is here");
+        if offered {
+            ran.expect("a host that offers the extension renders into the surface");
+            let cursor = v.cursor_contents(res).expect("a 16x16 2D texture reads back");
+            assert!(
+                cursor.pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
+                "the clear resolved into the texture: {:?}",
+                &cursor.pixels[..4]
+            );
+        } else {
+            assert!(
+                matches!(ran, Err(Fault::NoFeature { feature: Feature::implicit_msaa, .. })),
+                "a host without the extension names it: {ran:?}"
+            );
+        }
+        v.context_destroy(ctx, &AllAttached);
+    }
+
     /// What the vertex stage holds, and the stage of the shader the table holds under handle 3.
     type ShaderSlot = (Option<Option<ObjectHandle>>, Option<ShaderStage>);
 

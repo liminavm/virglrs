@@ -680,6 +680,47 @@ pub fn attach_texture(
     Ok(())
 }
 
+/// Why a surface with samples of its own could not be attached.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NotMultisampled {
+    /// The host has no `GL_EXT_multisampled_render_to_texture2`, so the guest was not told it could.
+    Feature(Feature),
+    /// The extension renders into one 2D image -- a 2D texture, or one face of a cube -- and the
+    /// guest named something else, which its own GL would not have let it ask for.
+    Target,
+}
+
+/// [`attach_texture`] for a surface that asks for more samples than its texture has: the C's
+/// `vrend_framebuffer_texture_2d` with a sample count. The driver renders multisampled into
+/// storage it keeps to itself and resolves into the texture, which is what the guest's
+/// `glFramebufferTexture2DMultisampleEXT` asked of its own driver.
+#[allow(clippy::too_many_arguments)]
+pub fn attach_texture_multisample(
+    gl: &Gl,
+    features: &Features,
+    target: GLenum,
+    name: TextureName,
+    attachment: GLenum,
+    level: GLint,
+    layer: Option<GLint>,
+    samples: u32,
+) -> Result<(), NotMultisampled> {
+    if !features.has(Feature::implicit_msaa) {
+        return Err(NotMultisampled::Feature(Feature::implicit_msaa));
+    }
+    let textarget = match (target, layer) {
+        (GL_TEXTURE_2D, _) => GL_TEXTURE_2D,
+        (GL_TEXTURE_CUBE_MAP, Some(face @ 0..6)) => GL_TEXTURE_CUBE_MAP_POSITIVE_X + face as GLenum,
+        _ => return Err(NotMultisampled::Target),
+    };
+    let samples = GLsizei::try_from(samples).map_err(|_| NotMultisampled::Target)?;
+    gl.framebuffer_texture_2d_multisample(attachment, textarget, Some(name), level, samples);
+    if attachment == GL_DEPTH_ATTACHMENT {
+        gl.framebuffer_texture_2d(GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, None, 0);
+    }
+    Ok(())
+}
+
 /// Read one layer of the box out of a texture through a framebuffer: `do_readpixels`.
 #[allow(clippy::too_many_arguments)]
 fn read_layer(

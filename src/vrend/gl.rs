@@ -328,6 +328,8 @@ mod procs {
         = try_glFramebufferTexture, try_glFramebufferTextureEXT, try_glFramebufferTextureOES);
     resolver!(framebuffer_texture_3d: unsafe extern "C" fn(GLenum, GLenum, GLenum, GLuint, GLint, GLint)
         = try_glFramebufferTexture3DOES);
+    resolver!(framebuffer_texture_2d_multisample: unsafe extern "C" fn(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei)
+        = try_glFramebufferTexture2DMultisampleEXT);
     resolver!(texture_view: unsafe extern "C" fn(GLuint, GLenum, GLuint, GLenum, GLuint, GLuint, GLuint, GLuint)
         = try_glTextureViewOES, try_glTextureViewEXT);
     resolver!(egl_image_target_tex_storage: unsafe extern "C" fn(GLenum, GLeglImageOES, *const GLint)
@@ -379,6 +381,9 @@ mod procs {
         (Feature::geometry_shader, "glFramebufferTexture", |t| framebuffer_texture(t).is_some()),
         (Feature::texture_3d_attach, "glFramebufferTexture3DOES", |t| {
             framebuffer_texture_3d(t).is_some()
+        }),
+        (Feature::implicit_msaa, "glFramebufferTexture2DMultisampleEXT", |t| {
+            framebuffer_texture_2d_multisample(t).is_some()
         }),
         (Feature::texture_view, "glTextureView", |t| texture_view(t).is_some()),
         (Feature::egl_image_storage, "glEGLImageTargetTexStorageEXT", |t| {
@@ -1175,6 +1180,25 @@ impl Gl {
         unsafe {
             f(GL_FRAMEBUFFER, attachment, GL_TEXTURE_3D, tex.map_or(0, |t| t.0), level, layer)
         };
+    }
+
+    /// `glFramebufferTexture2DMultisampleEXT`: render into `tex` with `samples` samples the
+    /// driver keeps to itself and resolves into the texture.
+    pub fn framebuffer_texture_2d_multisample(
+        &self,
+        attachment: GLenum,
+        textarget: GLenum,
+        tex: Option<TextureName>,
+        level: GLint,
+        samples: GLsizei,
+    ) {
+        let f = promised(
+            procs::framebuffer_texture_2d_multisample(&self.t),
+            Feature::implicit_msaa,
+            "glFramebufferTexture2DMultisampleEXT",
+        );
+        // SAFETY: plain scalars.
+        unsafe { f(GL_FRAMEBUFFER, attachment, textarget, tex.map_or(0, |t| t.0), level, samples) };
     }
 
     pub fn check_framebuffer_status(&self) -> GLenum {

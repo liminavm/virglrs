@@ -1924,6 +1924,15 @@ SABOTAGES = [
         'a_command_a_replay_drops_does_not_refuse_the_next_live_submit',
     ),
     (
+        'a host offering implicit multisampling refuses the surface that takes the offer',
+        'src/vrend/transfer.rs',
+        """    if !features.has(Feature::implicit_msaa) {
+        return Err(NotMultisampled::Feature(Feature::implicit_msaa));""",
+        """    if !features.has(Feature::implicit_msaa) || samples > 0 {
+        return Err(NotMultisampled::Feature(Feature::implicit_msaa));""",
+        'a_multisampled_surface_renders_into_its_texture_where_the_host_offers_it',
+    ),
+    (
         'a sampler view binds whatever kind of resource its handle names now',
         'src/vrend/context.rs',
         """                (Storage::Texture(_), Span::Levels { .. }) => {}""",

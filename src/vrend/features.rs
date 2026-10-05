@@ -142,7 +142,11 @@ features! {
     txqs = (Unavail, ["GL_ARB_shader_texture_image_samples"]),
     ubo = (Gles(30), ["GL_ARB_uniform_buffer_object"]),
     viewport_array = (Unavail, ["GL_ARB_viewport_array", "GL_OES_viewport_array"]),
-    implicit_msaa = (Unavail, ["GL_EXT_multisampled_render_to_texture"]),
+    // The second extension, where the C asks for the first: it lifts the first one's limit to
+    // `GL_COLOR_ATTACHMENT0`, and the guest is told the same cap either way, so a guest that
+    // attaches a depth buffer or a second colour buffer this way gets one host call for all of
+    // them. It requires the first, so this host has both.
+    implicit_msaa = (Unavail, ["GL_EXT_multisampled_render_to_texture2"]),
     anisotropic_filter = (Unavail, ["GL_EXT_texture_filter_anisotropic", "GL_ARB_texture_filter_anisotropic"]),
     seamless_cubemap_per_texture = (Unavail, ["GL_AMD_seamless_cubemap_per_texture"]),
     vs_layer_viewport = (Unavail, ["GL_AMD_vertex_shader_layer"]),

@@ -3751,10 +3751,6 @@ impl Context {
         s: &BoundSurface,
         idx: u32,
     ) -> Result<(), Fault> {
-        if s.nr_samples > 0 {
-            host.todo.note("implicit multisample surfaces");
-            return Err(Fault::Unimplemented { cmd, what: "a multisampled surface" });
-        }
         let mut attachment = s.attachment;
         if attachment == GL_COLOR_ATTACHMENT0 {
             attachment += idx;
@@ -3793,6 +3789,24 @@ impl Context {
                  IOSurface id {id} ({w}x{h}, bind {bind:#x})",
                 host.ctx, s.resource,
             );
+        }
+        if s.nr_samples > 0 {
+            return transfer::attach_texture_multisample(
+                host.gl,
+                host.features,
+                s.textures.target,
+                name,
+                attachment,
+                s.level as GLint,
+                s.layer,
+                s.nr_samples,
+            )
+            .map_err(|why| match why {
+                transfer::NotMultisampled::Feature(feature) => Fault::NoFeature { cmd, feature },
+                transfer::NotMultisampled::Target => {
+                    Fault::OutOfRange { cmd, what: "a multisampled surface's texture target" }
+                }
+            });
         }
         transfer::attach_texture(
             host.gl,
