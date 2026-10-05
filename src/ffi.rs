@@ -40,7 +40,6 @@ use crate::vrend::pipe::TextureTarget;
 use crate::vrend::proto::{self, Format};
 use crate::vrend::resource::{Args as ClassicArgs, Bind, ResourceFlags};
 use crate::vrend::transfer;
-use crate::vrend::vrend::{InitError, UnservedGl};
 
 /// Decode a capset id the guest chose.
 ///
@@ -54,12 +53,14 @@ fn capset_of(raw: u32) -> CapsetId {
 
 /// Decode `virgl_renderer_init`'s flag word into what the renderer is being asked to be.
 ///
-/// Three of the eleven flags reach the renderer. The rest choose a winsys (EGL, GLES,
-/// surfaceless, DRM), a threading model we implement unconditionally (`THREAD_SYNC`,
-/// `ASYNC_FENCE_CB`, `RENDER_SERVER`), or a feature that is vrend's (`USE_VIDEO`) -- none of them
-/// is a question the renderer answers, so none of them is carried inward.
+/// Five of the eleven flags reach the renderer. The rest choose a winsys (EGL, surfaceless,
+/// DRM) or a threading model we implement unconditionally (`THREAD_SYNC`,
+/// `ASYNC_FENCE_CB`, `RENDER_SERVER`) -- none of them is a question the renderer answers, so none
+/// of them is carried inward.
 ///
-/// Note `NO_VIRGL` inverting: the ABI names the absence, [`Config`] names the presence.
+/// Note `NO_VIRGL` inverting: the ABI names the absence, [`Config`] names the presence. And
+/// `USE_GLES` absent is desktop GL, as in the C: QEMU's default displays pass no flag and hand
+/// over desktop contexts.
 fn config_of(flags: c_int) -> Config {
     Config {
         venus: flags & abi::VENUS != 0,
@@ -69,10 +70,7 @@ fn config_of(flags: c_int) -> Config {
         // No flag carries it, so it takes the Rust default and `virgl_renderer_init` lets the
         // environment override it.
         linear_shared: Config::default().linear_shared,
-        // The C runs on desktop GL unless `USE_GLES` asks otherwise; this renderer serves GLES
-        // until its desktop leg is whole, so the flag's absence is honoured only by
-        // `virgl_renderer_init` under `VIRGLRS_DESKTOP_GL=1`.
-        host_gl: HostGl::Gles,
+        host_gl: if flags & abi::USE_GLES != 0 { HostGl::Gles } else { HostGl::Desktop },
     }
 }
 
@@ -461,11 +459,6 @@ pub extern "C" fn virgl_renderer_init(
     if let Ok(v) = std::env::var("VIRGL_GBM_LAYOUT_ENABLE") {
         config.linear_shared = v != "0";
     }
-    // Opt-in while the desktop leg is ported: a caller that did not ask for GLES and sets this
-    // gets desktop GL, as the C would give it.
-    if flags & abi::USE_GLES == 0 && std::env::var("VIRGLRS_DESKTOP_GL").as_deref() == Ok("1") {
-        config.host_gl = HostGl::Desktop;
-    }
     eprintln!(
         "[virglrs] init flags={flags:#x} cb v{version} -- {}, GL {}{}",
         crate::renderer::unsupported_renderers(config),
@@ -480,9 +473,6 @@ pub extern "C" fn virgl_renderer_init(
         }
         Err(e) => {
             eprintln!("[virglrs] init: {e}");
-            if let InitError::UnservedGl { why: UnservedGl::NotAskedFor, .. } = e {
-                eprintln!("[virglrs] init: VIRGLRS_DESKTOP_GL=1 asks for desktop GL");
-            }
             *sink().lock().expect("the sink slot is never held across a panic") = None;
             EINVAL
         }
@@ -3090,7 +3080,7 @@ mod tests {
                 guest_vram: false,
                 video: false,
                 linear_shared: true,
-                host_gl: HostGl::Gles,
+                host_gl: HostGl::Desktop,
             }
         );
 
@@ -3104,7 +3094,7 @@ mod tests {
                 guest_vram: true,
                 video: true,
                 linear_shared: true,
-                host_gl: HostGl::Gles,
+                host_gl: HostGl::Desktop,
             }
         );
 
@@ -3113,6 +3103,7 @@ mod tests {
         assert!(!config_of(abi::NO_VIRGL).vrend, "NO_VIRGL means vrend is absent");
         assert!(config_of(abi::USE_GUEST_VRAM).guest_vram);
         assert!(config_of(abi::USE_VIDEO).video);
+        assert_eq!(config_of(abi::USE_GLES).host_gl, HostGl::Gles, "USE_GLES names GLES");
         assert_eq!(config_of(abi::USE_EGL), config_of(0), "a winsys flag reaches the renderer");
     }
 

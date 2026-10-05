@@ -1958,6 +1958,20 @@ SABOTAGES = [
         'a_desktop_context_is_taken_only_when_asked_for',
     ),
     (
+        'a VMM that does not ask for GLES is given GLES anyway',
+        'src/ffi.rs',
+        """        host_gl: if flags & abi::USE_GLES != 0 { HostGl::Gles } else { HostGl::Desktop },""",
+        """        host_gl: HostGl::Gles,""",
+        'the_init_flags_decode_into_the_configuration_they_name',
+    ),
+    (
+        'a VMM that asks for GLES is given desktop GL anyway',
+        'src/ffi.rs',
+        """        host_gl: if flags & abi::USE_GLES != 0 { HostGl::Gles } else { HostGl::Desktop },""",
+        """        host_gl: HostGl::Desktop,""",
+        'the_init_flags_decode_into_the_configuration_they_name',
+    ),
+    (
         'a display of ours makes GLES contexts when desktop GL is asked for',
         'src/vrend/vrend.rs',
         """                    HostGl::Desktop => (Flavour::Gl, DESKTOP_VERSIONS),""",

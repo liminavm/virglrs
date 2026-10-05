@@ -534,8 +534,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   A fourth line is a regression.
 
   `vrend.iris.caps` and `vrend-desktop.iris.caps` are the same capsets from the C on goiaba
-  (iris), on GLES (`--flags 0x819`) and on desktop GL (`--flags 0x809`); the Rust leg runs
-  desktop GL only under `VIRGLRS_DESKTOP_GL=1`. Both differ from the Rust leg's in three Linux
+  (iris), on GLES (`--flags 0x819`) and on desktop GL (`--flags 0x809`), which select the
+  same flavour on the Rust leg. Both differ from the Rust leg's in three Linux
   lines that have nothing to do with the flavour: `num_video_caps`/`video_caps` (the C leg there
   reports no decoder), `capability_bits_v2`'s `SCANOUT_USES_GBM`, and
   `supported_multisample_formats`, where the Rust leg also offers the four 4:2:0 YUV formats
@@ -662,8 +662,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   identical. It is 30 blocks, as the C's GLES log on iris is too; the 33-block GLES fixture is
   zink's.
   The test beside the GLES one holds the translator's desktop dialect to it; the live
-  differential is the same replay with `VIRGLRS_DESKTOP_GL=1` and `--no-rebuild` on the Rust
-  side, where the Rust leg logs three variant blocks more than the C on either flavour, and none
+  differential is the same replay, flags included, on the Rust side, where the Rust leg logs three variant blocks more than the C on either flavour, and none
   that differs.
   `blit.score` is the shader blitter's gate, and it is synthetic on purpose: no recorded session
   reaches the blitter at all. A desktop's blits are format-matched mip-chain reductions, which

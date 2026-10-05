@@ -43,8 +43,8 @@ pub struct Config {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HostGl {
     Gles,
-    /// A core-profile desktop context. Still being ported: until vrend serves it whole, only a
-    /// caller that asks for it by name gets it.
+    /// A core-profile desktop context, 3.3 or newer. The C ABI's default, as it is the C's, but
+    /// not this API's: limina takes the default, and its hosts are gated on GLES.
     Desktop,
 }
 
