@@ -452,6 +452,8 @@ impl Table {
     pub fn probe(gl: &Gl, features: &Features) -> Table {
         let mut t = Table { entries: vec![None; FORMAT_COUNT] };
         let gles = features.api().is_gles();
+        // The planar YUV rows, whose RGBA8 storage stands in for planes the guest only samples.
+        let mut stand_ins = vec![false; FORMAT_COUNT];
         for group in GL_GROUPS {
             // ASTC and ETC2 are added by `vrend_build_format_list_gles`, so a desktop host that
             // advertises the ASTC extension still has them withheld, as the C withholds them.
@@ -473,6 +475,7 @@ impl Table {
                 if t.entries[at].is_some() {
                     continue;
                 }
+                stand_ins[at] = group.when == When::SamplerOnly;
                 if group.compressed || group.when == When::SamplerOnly {
                     // Desktop GL reads any texture back with `glGetTexImage`; the YUV formats'
                     // storage is RGBA, so the C's sampler-only insert carries no flag at all.
@@ -493,11 +496,15 @@ impl Table {
             e.can_texture_storage = texture_storage_works(gl, e.gl.internalformat);
         }
         if features.multisample_textures() {
-            for e in t.entries.iter_mut().flatten() {
+            for (e, stand_in) in t.entries.iter_mut().zip(stand_ins) {
+                let Some(e) = e else { continue };
                 // On GLES a multisample texture is only ever made with `glTexStorage2DMultisample`,
-                // so a format without storage has no multisample form.
-                e.can_multisample =
-                    e.can_texture_storage && multisample_works(gl, e.gl.internalformat);
+                // so a format without storage has no multisample form. A stand-in's RGBA8 would
+                // take one, but a multisample texture is only ever rendered into, and the planes
+                // are only sampled.
+                e.can_multisample = !stand_in
+                    && e.can_texture_storage
+                    && multisample_works(gl, e.gl.internalformat);
             }
         }
         t

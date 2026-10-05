@@ -2586,6 +2586,15 @@ SABOTAGES = [
         'without_multisample_arrays_no_multisampling_is_advertised',
     ),
     (
+        'the planar YUV stand-ins are probed for multisampling like any row',
+        'src/vrend/formats.rs',
+        """                e.can_multisample = !stand_in
+                    && e.can_texture_storage""",
+        """                e.can_multisample = (stand_in || true)
+                    && e.can_texture_storage""",
+        'no_planar_yuv_format_is_advertised_multisampled_on_either_flavour',
+    ),
+    (
         'vkCmdSetColorWriteEnableEXT tells the driver one switch fewer',
         'src/venus/driver.rs',
         """        unsafe { f(cb, enables.len() as u32, enables.as_ptr()) };""",

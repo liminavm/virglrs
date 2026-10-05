@@ -2927,6 +2927,47 @@ mod tests {
         }
     }
 
+    /// No planar YUV format is advertised as multisampled, on either flavour. Its RGBA8 storage
+    /// would make a multisample texture, but one is only ever a render target, and the planes
+    /// are only sampled.
+    #[test]
+    fn no_planar_yuv_format_is_advertised_multisampled_on_either_flavour() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            let planar: Vec<_> = (0..crate::vrend::proto::FORMAT_MAX)
+                .filter_map(crate::vrend::proto::Format::from_wire)
+                .filter(|&f| super::super::video::guest_planes(f) > 1)
+                .collect();
+            assert!(!planar.is_empty(), "the premise: the wire has planar formats");
+            let multisampled: Vec<&str> = planar
+                .iter()
+                .filter(|&&f| v.formats.get(f).is_some_and(|e| e.can_multisample))
+                .map(|f| f.name())
+                .collect();
+            assert!(multisampled.is_empty(), "{host_gl:?}: multisampled planes: {multisampled:?}");
+        }
+    }
+
     /// A blue-first cursor reads back in the byte order it was written, on either flavour. A
     /// GLES host stores B8G8R8A8 as RGBA and swaps on upload, so a read that does not swap back
     /// hands the VMM a pointer with red and blue exchanged.
