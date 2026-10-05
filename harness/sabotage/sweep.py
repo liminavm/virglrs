@@ -1972,6 +1972,13 @@ SABOTAGES = [
         'the_host_gl_is_the_one_asked_for',
     ),
     (
+        'the packed-float vertex format is advertised under a number the wire does not give it',
+        'src/vrend/caps.rs',
+        """        .find(|f| f.name() == "R11G11B10_FLOAT")""",
+        """        .find(|f| f.wire() == 135)""",
+        'the_packed_float_vertex_format_is_the_wire_one',
+    ),
+    (
         'a sampler view binds whatever kind of resource its handle names now',
         'src/vrend/context.rs',
         """                (Storage::Texture(_), Span::Levels { .. }) => {}""",

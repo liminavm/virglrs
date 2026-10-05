@@ -304,7 +304,7 @@ impl CapsV2 {
             v1.prim_mask |= 1 << PrimType::Patches.wire();
         }
         if features.has_extension("GL_ARB_vertex_type_10f_11f_11f_rev") {
-            v1.vertexbuffer.set(Format::from_wire(R11G11B10_FLOAT).expect("a format"));
+            v1.vertexbuffer.set(packed_float());
         }
         let mut bit = |on: bool, b: u32| {
             if on {
@@ -690,8 +690,14 @@ impl CapsV2 {
     }
 }
 
-/// `VIRGL_FORMAT_R11G11B10_FLOAT`.
-const R11G11B10_FLOAT: u32 = 135;
+/// `VIRGL_FORMAT_R11G11B10_FLOAT`, found by name in the tables generated from `virgl_hw.h`
+/// rather than spelled as a number here that nothing checks.
+fn packed_float() -> Format {
+    (0..FORMAT_MAX)
+        .filter_map(Format::from_wire)
+        .find(|f| f.name() == "R11G11B10_FLOAT")
+        .expect("virgl_hw.h has R11G11B10_FLOAT")
+}
 
 /// One limit per stage, queried only for the stages this host has: vertex and fragment always,
 /// the rest behind their feature. A stage the host lacks reports zero.
@@ -961,6 +967,13 @@ mod tests {
         assert_eq!(parse_ceiling("0"), Some(1), "zero means none, and none is single-sampled");
         assert_eq!(parse_ceiling("all"), None, "garbage caps nothing, and says so");
         assert_eq!(parse_ceiling(""), None);
+    }
+
+    /// A desktop host with `GL_ARB_vertex_type_10f_11f_11f_rev` offers the packed-float vertex
+    /// format, and the bit it sets is that format's: the wire calls it 124.
+    #[test]
+    fn the_packed_float_vertex_format_is_the_wire_one() {
+        assert_eq!(packed_float().wire(), 124);
     }
 
     #[test]
