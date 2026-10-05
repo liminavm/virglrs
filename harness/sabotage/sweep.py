@@ -2022,7 +2022,9 @@ SABOTAGES = [
     (
         'a pipeline stage\'s uniforms land in whichever program was active',
         'src/vrend/context/draw.rs',
-        """            sub.program_at(at).object.activate(gl, stage);
+        """            if let Some(program) = sub.stage_program(at, stage) {
+                sub.program_at(at).object.activate(gl, program);
+            }
 """,
         """""",
         'separable_stages_draw_as_a_pipeline_on_desktop_gl_and_linked_whole_on_gles',

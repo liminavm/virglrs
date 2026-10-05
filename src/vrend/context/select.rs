@@ -541,17 +541,22 @@ impl SubContext {
 
 /// `vrend_shader_create`: the variant for `key`, translated and printed when asked, in the C's
 /// format so the two logs diff. A refused translation empties the chain, as the C's
-/// `current = NULL` does.
+/// `current = NULL` does, and hands back what it emptied: those variants own GL names, which only
+/// [`draw::release_variants`] may delete, so [`Context::release_refused`] is where they go.
 fn translate(
     host: &Host<'_>,
     cmd: Cmd,
     shader: &mut Shader,
     key: shader::Key,
     id: VariantId,
-) -> Result<(), Fault> {
+) -> Result<(), Refused> {
+    let refuse = |fault| Refused { fault, emptied: Vec::new() };
     let stage = shader.stage;
     let ShaderText::Whole(program) = &mut shader.text else {
-        return Err(Fault::Shader { cmd, what: "a shader selected before its text was whole" });
+        return Err(refuse(Fault::Shader {
+            cmd,
+            what: "a shader selected before its text was whole",
+        }));
     };
     let none = StreamOutput::default();
     let (req_local_mem, so_info) = match &shader.kind {
@@ -574,11 +579,18 @@ fn translate(
                 .insert(0, Variant { id, key, strings, var_info, gl: None, separate: None });
             Ok(())
         }
-        Err(error) => {
-            program.translated.variants.clear();
-            Err(Fault::Glsl { cmd, stage, error })
-        }
+        Err(error) => Err(Refused {
+            fault: Fault::Glsl { cmd, stage, error },
+            emptied: std::mem::take(&mut program.translated.variants),
+        }),
     }
+}
+
+/// A translation refused: the fault, and the variants the refusal emptied out of the chain.
+#[must_use]
+struct Refused {
+    fault: Fault,
+    emptied: Vec<Variant>,
 }
 
 /// `vrend_shader_select`'s cache: the variant for `key` moved to the head when the chain has
@@ -603,7 +615,7 @@ impl Context {
     /// whatever is bound then.
     pub(super) fn select_object(
         &mut self,
-        host: &Host<'_>,
+        host: &mut Host<'_>,
         cmd: Cmd,
         handle: ObjectHandle,
     ) -> Result<(), Fault> {
@@ -620,7 +632,22 @@ impl Context {
         if select_variant(shader, &key) {
             return Ok(());
         }
-        translate(host, cmd, shader, key, id)
+        let refused = translate(host, cmd, shader, key, id);
+        self.release_refused(host, refused)
+    }
+
+    /// A refused translation's fault, once the variants it emptied are released -- their GL
+    /// shaders, their own programs, and every program linking them.
+    fn release_refused(
+        &mut self,
+        host: &mut Host<'_>,
+        r: Result<(), Refused>,
+    ) -> Result<(), Fault> {
+        let Err(Refused { fault, emptied }) = r else {
+            return Ok(());
+        };
+        draw::release_variants(self.sub_mut(), host.gl, host.current.program(), emptied);
+        Err(fault)
     }
 
     /// `vrend_shader_select` on the shader bound at `stage`. Answers whether a variant had to be
@@ -628,7 +655,7 @@ impl Context {
     /// compare.
     fn select_bound(
         &mut self,
-        host: &Host<'_>,
+        host: &mut Host<'_>,
         cmd: Cmd,
         stage: ShaderStage,
     ) -> Result<bool, Fault> {
@@ -648,7 +675,8 @@ impl Context {
         if select_variant(shader, &key) {
             return Ok(false);
         }
-        translate(host, cmd, shader, key, id)?;
+        let refused = translate(host, cmd, shader, key, id);
+        self.release_refused(host, refused)?;
         Ok(true)
     }
 
