@@ -1958,6 +1958,13 @@ SABOTAGES = [
         'a_desktop_context_is_taken_only_when_asked_for',
     ),
     (
+        'a shader-buffer barrier is read from the bit the port used to give it',
+        'src/vrend/context.rs',
+        """        (1 << 1, shader_buffer),""",
+        """        (1 << 11, shader_buffer),""",
+        'each_gallium_barrier_bit_asks_for_its_own_gl_barrier',
+    ),
+    (
         'the separate-shader-objects extension is asked for under the C\'s misspelling',
         'src/vrend/features.rs',
         """["GL_ARB_separate_shader_objects"]""",

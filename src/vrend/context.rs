@@ -4380,36 +4380,37 @@ impl Context {
         if !host.has(Feature::barrier) {
             return;
         }
-        const ALL: u32 = 0xffff_ffff;
-        let bits = if flags == ALL {
-            GL_ALL_BARRIER_BITS
-        } else {
-            let pairs: [(u32, GLbitfield); 12] = [
-                (1 << 0, GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT),
-                (1 << 1, GL_ELEMENT_ARRAY_BARRIER_BIT),
-                (1 << 2, GL_UNIFORM_BARRIER_BIT),
-                (1 << 3, GL_TEXTURE_FETCH_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT),
-                (1 << 4, GL_SHADER_IMAGE_ACCESS_BARRIER_BIT),
-                (1 << 5, GL_COMMAND_BARRIER_BIT),
-                (1 << 6, GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT_EXT),
-                (1 << 7, GL_FRAMEBUFFER_BARRIER_BIT),
-                (1 << 8, GL_TRANSFORM_FEEDBACK_BARRIER_BIT),
-                (1 << 9, GL_BUFFER_UPDATE_BARRIER_BIT),
-                (1 << 10, GL_TEXTURE_UPDATE_BARRIER_BIT),
-                (
-                    1 << 11,
-                    GL_ATOMIC_COUNTER_BARRIER_BIT
-                        | if host.has(Feature::ssbo_barrier) {
-                            GL_SHADER_STORAGE_BARRIER_BIT
-                        } else {
-                            0
-                        },
-                ),
-            ];
-            pairs.iter().filter(|(f, _)| flags & f != 0).fold(0, |acc, (_, b)| acc | b)
-        };
-        host.gl.memory_barrier(bits);
+        host.gl.memory_barrier(barrier_bits(flags, host.features));
     }
+}
+
+/// `vrend_memory_barrier`'s reading of the guest's flags, which are gallium's `PIPE_BARRIER_*`
+/// bits as its own Mesa numbers them -- sent raw, so this is the C's table, bit for bit.
+/// `GLOBAL_BUFFER` (bit 11) has no GL barrier and asks for nothing.
+fn barrier_bits(flags: u32, features: &Features) -> GLbitfield {
+    const ALL: u32 = (1 << 14) - 1;
+    if flags & ALL == ALL {
+        return GL_ALL_BARRIER_BITS;
+    }
+    let shader_buffer = GL_ATOMIC_COUNTER_BARRIER_BIT
+        | if features.has(Feature::ssbo_barrier) { GL_SHADER_STORAGE_BARRIER_BIT } else { 0 };
+    let query_buffer = if features.has(Feature::qbo) { GL_QUERY_BUFFER_BARRIER_BIT } else { 0 };
+    let pairs: [(u32, GLbitfield); 13] = [
+        (1 << 0, GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT_EXT),
+        (1 << 1, shader_buffer),
+        (1 << 2, query_buffer),
+        (1 << 3, GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT),
+        (1 << 4, GL_ELEMENT_ARRAY_BARRIER_BIT),
+        (1 << 5, GL_UNIFORM_BARRIER_BIT),
+        (1 << 6, GL_COMMAND_BARRIER_BIT),
+        (1 << 7, GL_TEXTURE_FETCH_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT),
+        (1 << 8, GL_SHADER_IMAGE_ACCESS_BARRIER_BIT),
+        (1 << 9, GL_FRAMEBUFFER_BARRIER_BIT),
+        (1 << 10, GL_TRANSFORM_FEEDBACK_BARRIER_BIT),
+        (1 << 12, GL_BUFFER_UPDATE_BARRIER_BIT),
+        (1 << 13, GL_TEXTURE_UPDATE_BARRIER_BIT),
+    ];
+    pairs.iter().filter(|(f, _)| flags & f != 0).fold(0, |acc, (_, b)| acc | b)
 }
 
 /// `vrend_get_arb_format`: the R/RG internal format an A/L/I format samples as on a buffer.
@@ -5158,6 +5159,26 @@ fn video_result(cmd: Cmd, result: Result<(), video::Refusal>) -> Result<(), Faul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each of gallium's barrier bits asks for its own GL barrier, as the guest's Mesa numbers
+    /// them: a shader-buffer barrier is the atomic-counter and storage barrier, not the element
+    /// array's, and only the whole set is `GL_ALL_BARRIER_BITS`.
+    #[test]
+    fn each_gallium_barrier_bit_asks_for_its_own_gl_barrier() {
+        let desktop = Features::probe(Api::Gl(46), std::iter::empty());
+        let gles = Features::probe(Api::Gles(32), std::iter::empty());
+        let shader_buffer = GL_ATOMIC_COUNTER_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT;
+        assert_eq!(barrier_bits(1 << 1, &desktop), shader_buffer);
+        assert_eq!(barrier_bits(1 << 2, &desktop), GL_QUERY_BUFFER_BARRIER_BIT);
+        assert_eq!(barrier_bits(1 << 2, &gles), 0, "no query buffers on GLES");
+        assert_eq!(barrier_bits(1 << 3, &desktop), GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
+        assert_eq!(barrier_bits(1 << 6, &desktop), GL_COMMAND_BARRIER_BIT);
+        assert_eq!(barrier_bits(1 << 8, &desktop), GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        assert_eq!(barrier_bits(1 << 11, &desktop), 0, "a global buffer has no GL barrier");
+        assert_eq!(barrier_bits(1 << 13, &desktop), GL_TEXTURE_UPDATE_BARRIER_BIT);
+        assert_eq!(barrier_bits((1 << 14) - 1, &desktop), GL_ALL_BARRIER_BITS);
+        assert_eq!(barrier_bits(u32::MAX, &gles), GL_ALL_BARRIER_BITS);
+    }
 
     /// The layout reply is the C's struct, byte for byte, and says nothing for storage with none.
     ///
