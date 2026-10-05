@@ -240,6 +240,22 @@ fn detach_all(gl: &Gl) {
     gl.framebuffer_texture_2d(GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, None, 0);
 }
 
+/// How far from the origin a blit's coordinates, and the ends of its boxes, may lie.
+///
+/// A gallium blit box may run backwards or off its texture, so "inside the resource" is not the
+/// rule. But no texture is wider than 2^16 texels, so a box out past this addresses nothing a
+/// guest can mean, and refusing it keeps every sum the blit then makes -- the ends, the flips of a
+/// `y_0_top` resource, the layer offsets -- well inside an `i32`. The C makes the same sums
+/// unchecked, which in C is undefined behaviour.
+const BLIT_REACH: i64 = 1 << 24;
+
+/// Whether every coordinate of `r`, and every end, is within [`BLIT_REACH`] of the origin.
+fn within_reach(r: &Box3) -> bool {
+    let (x, y, z) = (i64::from(r.x), i64::from(r.y), i64::from(r.z));
+    let ends = [x + i64::from(r.width), y + i64::from(r.height), z + i64::from(r.depth)];
+    [x, y, z].into_iter().chain(ends).all(|v| v.abs() <= BLIT_REACH)
+}
+
 impl Context {
     /// Run something in the blitter's own GL context, and put the sub-context's back afterwards.
     ///
@@ -281,6 +297,9 @@ impl Context {
         let cmd = Cmd::Blit;
         let formats = host.formats;
         let (src, dst) = (b.src, b.dst);
+        if !within_reach(&src.region) || !within_reach(&dst.region) {
+            return Err(Fault::OutOfRange { cmd, what: "blit box" });
+        }
         let src_res = host.resource(cmd, src.resource)?;
         let dst_res = host.resource(cmd, dst.resource)?;
         for f in [src.format, dst.format] {

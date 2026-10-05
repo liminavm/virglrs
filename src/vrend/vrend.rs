@@ -3233,6 +3233,119 @@ mod tests {
         }
     }
 
+    /// A blit's boxes are the guest's own, and a gallium box may run backwards or off its texture,
+    /// so the blit cannot ask that they lie inside the resource. A coordinate or an end far past
+    /// any texture is refused; anything short of that, however stretched, is served or refused
+    /// without the coordinate arithmetic overflowing -- which, with overflow checks on, as in a
+    /// dev build of any consumer, aborts the process.
+    #[test]
+    fn a_blit_box_far_past_any_texture_is_refused_and_one_short_of_it_is_survived() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::pipe::TexFilter;
+        use crate::vrend::proto::{Blit, BlitTarget, Box3, Command, Scissor};
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let format = |n| super::super::proto::Format::from_wire(n).expect("a wire format");
+        // A source no framebuffer can hold, so the blit takes the blitter's shader, which is where
+        // a stretched box is scaled.
+        let (rgb9e5, rgba) = (format(125), format(67));
+        let far = 1 << 25;
+        let near = 1 << 23;
+        let r = |x, y, width, height| Box3 { x, y, z: 0, width, height, depth: 1 };
+        // (source box, destination box, refused as out of range)
+        let cases = [
+            (r(i32::MAX - 4, 0, 8, 8), r(0, 0, 8, 8), true),
+            (r(0, i32::MIN, 8, -8), r(0, 0, 8, 8), true),
+            (r(0, 0, 8, 8), r(far, 0, 8, 8), true),
+            (r(0, 0, 8, 8), r(0, 0, 8, -far), true),
+            (r(-near, -near, 1, 1), r(0, 0, near, near), false),
+            (r(15, 15, -near, -near), r(near, near, -1, -1), false),
+        ];
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let mut v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            let (src, dst) = (
+                ResourceHandle::new(1).expect("non-zero"),
+                ResourceHandle::new(2).expect("non-zero"),
+            );
+            let sampled = resource::Bind::SAMPLER_VIEW;
+            let target = resource::Bind(resource::Bind::RENDER_TARGET.0 | sampled.0);
+            for (handle, format, bind) in [(src, rgb9e5, sampled), (dst, rgba, target)] {
+                v.resource_create(
+                    handle,
+                    resource::Args {
+                        target: TextureTarget::Texture2d,
+                        format,
+                        bind,
+                        width: 16,
+                        height: 16,
+                        depth: 1,
+                        array_size: 1,
+                        last_level: 0,
+                        nr_samples: 0,
+                        flags: resource::ResourceFlags(0),
+                    },
+                )
+                .expect("a texture");
+            }
+            for (n, (from, to, refused)) in cases.into_iter().enumerate() {
+                // A context each, so that one refusal cannot be what refuses the next.
+                let ctx = ClassicCtx::for_test(ContextId::new(n as u32 + 1).expect("an id"));
+                v.context_create(ctx, &AllAttached).expect("a context");
+                let mut wire = Vec::new();
+                encode(
+                    &Command::Blit(Blit {
+                        mask: 0xf,
+                        filter: TexFilter::Nearest,
+                        scissor_enable: false,
+                        render_condition_enable: false,
+                        alpha_blend: false,
+                        scissor: Scissor { minx: 0, miny: 0, maxx: 0, maxy: 0 },
+                        dst: BlitTarget { resource: dst, level: 0, format: rgba, region: to },
+                        src: BlitTarget { resource: src, level: 0, format: rgb9e5, region: from },
+                    }),
+                    &mut wire,
+                );
+                let ran = v.submit(ctx, &wire, &AllAttached).expect("the context is here");
+                if refused {
+                    assert!(
+                        matches!(ran, Err(Fault::OutOfRange { .. })),
+                        "{host_gl:?}: {from:?} -> {to:?}: {ran:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A transfer's box is the guest's own, and the renderer sizes it before it checks it against
     /// the resource. A box whose bytes overflow any integer is refused like any other box outside
     /// the resource, not left to overflow: with overflow checks on, which a dev build of any

@@ -2677,6 +2677,20 @@ SABOTAGES = [
         'a_buffer_sampler_view_is_made_over_a_buffer_and_refused_over_a_texture',
     ),
     (
+        'a blit box out past any texture is served',
+        'src/vrend/context/blit.rs',
+        """        if !within_reach(&src.region) || !within_reach(&dst.region) {""",
+        """        if false && (!within_reach(&src.region) || !within_reach(&dst.region)) {""",
+        'a_blit_box_far_past_any_texture_is_refused_and_one_short_of_it_is_survived',
+    ),
+    (
+        'a stretched blit adds its scaled destination offset unchecked',
+        'src/vrend/blitter.rs',
+        """            x: (dst0.x + dst_width).saturating_add((s1.x as f32 * scale_x) as i32),""",
+        """            x: dst0.x + dst_width + (s1.x as f32 * scale_x) as i32,""",
+        'a_blit_box_far_past_any_texture_is_refused_and_one_short_of_it_is_survived',
+    ),
+    (
         'vkCmdSetColorWriteEnableEXT tells the driver one switch fewer',
         'src/venus/driver.rs',
         """        unsafe { f(cb, enables.len() as u32, enables.as_ptr()) };""",

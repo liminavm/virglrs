@@ -897,13 +897,16 @@ pub fn bounded_points(
     (
         Point { x: src0.x + s0.x, y: src0.y + s0.y },
         Point { x: src0.x + src_width + s1.x, y: src0.y + src_height + s1.y },
+        // A source pulled in by a few texels moves a destination stretched far enough by more
+        // than an `i32` holds; the cast saturates, and so does the sum, which leaves every
+        // destination that fits exactly where the C puts it.
         Point {
-            x: dst0.x + (s0.x as f32 * scale_x) as i32,
-            y: dst0.y + (s0.y as f32 * scale_y) as i32,
+            x: dst0.x.saturating_add((s0.x as f32 * scale_x) as i32),
+            y: dst0.y.saturating_add((s0.y as f32 * scale_y) as i32),
         },
         Point {
-            x: dst0.x + dst_width + (s1.x as f32 * scale_x) as i32,
-            y: dst0.y + dst_height + (s1.y as f32 * scale_y) as i32,
+            x: (dst0.x + dst_width).saturating_add((s1.x as f32 * scale_x) as i32),
+            y: (dst0.y + dst_height).saturating_add((s1.y as f32 * scale_y) as i32),
         },
     )
 }
