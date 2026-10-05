@@ -4266,6 +4266,111 @@ mod tests {
         }
     }
 
+    /// Two pipelines sharing a fragment stage number its uniform block differently: after a
+    /// vertex stage with a block of its own the fragment block is the second binding, after one
+    /// without it is the first. A block's binding lives in the stage's own program, so drawing
+    /// with the first pipeline again has to number it again. Left as the second pipeline set it,
+    /// the fragment stage reads the vertex stage's block -- white -- instead of its own red.
+    #[test]
+    fn a_pipeline_found_again_renumbers_its_shared_stages_blocks() {
+        use crate::vrend::proto::{Box3, Command, Object, ShaderChunk, ShaderCreate};
+        use crate::vrend::proto::{ShaderKind, StreamOutput, Transfer};
+        const VS_BLOCK: &str = "VERT\nPROPERTY SEPARABLE_PROGRAM 1\nDCL IN[0]\n\
+                                DCL OUT[0], POSITION\nDCL CONST[1][0]\n  \
+                                0: MUL OUT[0], IN[0], CONST[1][0]\n  1: END\n";
+        const VS_PLAIN: &str = "VERT\nPROPERTY SEPARABLE_PROGRAM 1\nDCL IN[0]\n\
+                                DCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n";
+        const FS_BLOCK: &str = "FRAG\nPROPERTY SEPARABLE_PROGRAM 1\nDCL OUT[0], COLOR\n\
+                                DCL CONST[1][0]\n  0: MOV OUT[0], CONST[1][0]\n  1: END\n";
+        let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
+        let (vs_ubo, fs_ubo) = (
+            ResourceHandle::new(10).expect("a resource handle is non-zero"),
+            ResourceHandle::new(11).expect("a resource handle is non-zero"),
+        );
+        let buffer = resource::Args {
+            target: TextureTarget::Buffer,
+            format: super::super::proto::Format::from_wire(64).expect("a known format"),
+            bind: resource::Bind::CONSTANT_BUFFER,
+            width: 16,
+            height: 1,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags(0),
+        };
+        let white: Vec<u32> = [1.0f32; 4].map(f32::to_bits).to_vec();
+        let red: Vec<u32> = [1.0f32, 0.0, 0.0, 1.0].map(f32::to_bits).to_vec();
+        let plain = tgsi_words(VS_PLAIN);
+        let write = |resource, data| Command::ResourceInlineWrite {
+            transfer: Transfer {
+                resource,
+                level: 0,
+                usage: 0,
+                stride: 0,
+                layer_stride: 0,
+                region: Box3 { x: 0, y: 0, z: 0, width: 16, height: 1, depth: 1 },
+            },
+            data,
+        };
+        let ubo = |stage, resource| Command::SetUniformBuffer {
+            stage,
+            index: 1,
+            offset: 0,
+            length: 16,
+            resource: Some(resource),
+        };
+        let more = More {
+            resources: vec![(vs_ubo, buffer), (fs_ubo, buffer)],
+            before: vec![
+                write(vs_ubo, &white),
+                write(fs_ubo, &red),
+                ubo(ShaderStage::Vertex, vs_ubo),
+                ubo(ShaderStage::Fragment, fs_ubo),
+                Command::CreateObject {
+                    handle: o(20),
+                    object: Object::Shader(ShaderCreate {
+                        stage: ShaderStage::Vertex,
+                        chunk: ShaderChunk::New { total_bytes: plain.len() as u32 * 4 },
+                        num_tokens: 300,
+                        kind: ShaderKind::Graphics { stream_output: StreamOutput::default() },
+                        text: &plain,
+                    }),
+                },
+            ],
+            // The pipeline without the vertex block, then the first one found again.
+            redraws: vec![
+                vec![Command::BindShader { stage: ShaderStage::Vertex, handle: Some(o(20)) }],
+                vec![Command::BindShader { stage: ShaderStage::Vertex, handle: Some(o(1)) }],
+            ],
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let pipeline = std::cell::Cell::new(None);
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                vs: Some(VS_BLOCK),
+                fs: Some(FS_BLOCK),
+                consts: &[],
+                clear: [0.0; 4],
+                logicop: None,
+                tess: None,
+                pipeline: Some(&pipeline),
+                more: Some(&more),
+            })
+            .unwrap_or_else(|e| panic!("{host_gl:?}: the draws run: {e:?}"))
+            .expect("no tessellation asked for");
+            assert!(
+                pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
+                "{host_gl:?}: the fragment stage read its own block: {:?}",
+                &pixels[..4]
+            );
+            let seen = pipeline.get().expect("the draws ran");
+            assert_eq!(seen.bound, seen.served, "{host_gl:?}: a pipeline where it is served");
+            eprintln!("{host_gl:?}: separable stages served: {}", seen.served);
+        }
+    }
+
     /// An evaluation shader with no control shader is a valid guest pipeline. GLES will not link
     /// it, so a GLES host puts a control stage ahead of it that writes `SET_TESS_STATE`'s levels;
     /// desktop GL links it as bound and takes the levels as its patch defaults. Either way levels

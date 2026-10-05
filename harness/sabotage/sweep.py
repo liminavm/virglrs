@@ -2056,6 +2056,13 @@ SABOTAGES = [
         'separable_stages_sampling_different_targets_draw_as_one_pipeline',
     ),
     (
+        'a pipeline found again keeps the block bindings another pipeline gave its stages',
+        'src/vrend/context/draw.rs',
+        """                if let Some(walk) = stale {""",
+        """                if let Some(walk) = stale.filter(|_| false) {""",
+        'a_pipeline_found_again_renumbers_its_shared_stages_blocks',
+    ),
+    (
         'a VMM that does not ask for GLES is given GLES anyway',
         'src/ffi.rs',
         """        host_gl: if flags & abi::USE_GLES != 0 { HostGl::Gles } else { HostGl::Desktop },""",
