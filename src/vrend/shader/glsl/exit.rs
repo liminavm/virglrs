@@ -329,13 +329,17 @@ fn emit_fragment_logicop(ctx: &mut Context<'_>) {
     let Some(func) = ctx.key.fs.logicop_func else {
         return;
     };
-    let n = ctx.outputs.len();
+    // The colour buffers the shader writes, by number: the outputs also hold depth and the
+    // sample mask, and the first colour need not be the first output.
+    let cbufs: Vec<usize> =
+        ctx.outputs.iter().filter(|o| o.name == Semantic::Color).map(|o| o.sid as usize).collect();
+    let n = cbufs.iter().max().map_or(0, |m| m + 1);
     let mut src = vec![String::new(); n];
     let mut src_fb = vec![String::new(); n];
     let mut scale = vec![0f64; n];
     let mut mask = vec![0i32; n];
 
-    for i in 0..n {
+    for &i in &cbufs {
         let bits = ctx.key.fs.surface_component_bits.get(i).copied().unwrap_or(0);
         mask[i] = (1i32.wrapping_shl(u32::from(bits))).wrapping_sub(1);
         scale[i] = f64::from(mask[i]);
@@ -364,7 +368,7 @@ fn emit_fragment_logicop(ctx: &mut Context<'_>) {
     }
 
     let mut full_op = vec![String::new(); n];
-    for i in 0..n {
+    for &i in &cbufs {
         full_op[i] = match func {
             LogicOp::Clear => "vec4(0)".to_string(),
             LogicOp::Noop => String::new(),
@@ -385,7 +389,7 @@ fn emit_fragment_logicop(ctx: &mut Context<'_>) {
         };
     }
 
-    for i in 0..n {
+    for &i in &cbufs {
         match func {
             LogicOp::Noop => {}
             LogicOp::Copy | LogicOp::Clear | LogicOp::Set => {

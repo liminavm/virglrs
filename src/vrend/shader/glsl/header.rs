@@ -1018,18 +1018,7 @@ fn emit_ios_fs(ctx: &mut Context<'_>) {
                 continue;
             }
             if ctx.key.fs.logicop_func.is_some() {
-                hdr!(ctx.bufs, "{} fsout_tmp_c{};\n", ty, i);
-            }
-            if ctx.logiop_require_inout() {
-                let noncoherent = if ctx.cfg.has_fbfetch_coherent { "" } else { ", noncoherent" };
-                hdr!(
-                    ctx.bufs,
-                    "layout (location={}{}) inout highp {} fsout_c{};\n",
-                    i,
-                    noncoherent,
-                    ty,
-                    i
-                );
+                emit_logicop_output(ctx, ty, i);
             } else {
                 hdr!(ctx.bufs, "layout (location={}) out {} fsout_c{};\n", i, ty, i);
             }
@@ -1037,6 +1026,17 @@ fn emit_ios_fs(ctx: &mut Context<'_>) {
     } else {
         for i in 0..ctx.outputs.len() {
             let output = ctx.outputs[i].clone();
+            // The emulated logic op writes its colour into a temporary and the op's result into
+            // the output, as the all-buffers declaration above does.
+            if output.name == Semantic::Color && ctx.key.fs.logicop_func.is_some() {
+                let ty = match output.ty {
+                    super::VecType::Float => "vec4",
+                    super::VecType::Int => "ivec4",
+                    super::VecType::Uint => "uvec4",
+                };
+                emit_logicop_output(ctx, ty, output.sid);
+                continue;
+            }
             if !output.glsl_predefined_no_emit {
                 let prefix =
                     if gles && output.name == Semantic::Color && !ctx.cfg.has_dual_src_blend {
@@ -1087,6 +1087,18 @@ fn emit_ios_fs(ctx: &mut Context<'_>) {
         if ctx.fs_uses_clipdist_input {
             ctx.bufs.hdr("vec4 clip_dist_temp[2];\n");
         }
+    }
+}
+
+/// A colour output under an emulated logic op: the shader's `fsout_tmp_c<n>`, and the buffer's
+/// `fsout_c<n>`, which the op reads back where it needs the framebuffer.
+fn emit_logicop_output(ctx: &mut Context<'_>, ty: &str, n: impl std::fmt::Display) {
+    hdr!(ctx.bufs, "{} fsout_tmp_c{};\n", ty, n);
+    if ctx.logiop_require_inout() {
+        let noncoherent = if ctx.cfg.has_fbfetch_coherent { "" } else { ", noncoherent" };
+        hdr!(ctx.bufs, "layout (location={}{}) inout highp {} fsout_c{};\n", n, noncoherent, ty, n);
+    } else {
+        hdr!(ctx.bufs, "layout (location={}) out {} fsout_c{};\n", n, ty, n);
     }
 }
 

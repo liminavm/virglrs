@@ -2595,6 +2595,20 @@ SABOTAGES = [
         'no_planar_yuv_format_is_advertised_multisampled_on_either_flavour',
     ),
     (
+        'a colour output written alone declares no logic-op output',
+        'src/vrend/shader/glsl/header.rs',
+        """            if output.name == Semantic::Color && ctx.key.fs.logicop_func.is_some() {""",
+        """            if false && output.name == Semantic::Color && ctx.key.fs.logicop_func.is_some() {""",
+        'a_logic_op_applies_to_a_shader_that_writes_one_colour_buffer',
+    ),
+    (
+        'the logic op numbers colour buffers by output position',
+        'src/vrend/shader/glsl/exit.rs',
+        """        ctx.outputs.iter().filter(|o| o.name == Semantic::Color).map(|o| o.sid as usize).collect();""",
+        """        (0..ctx.outputs.len()).collect();""",
+        'a_logic_op_applies_to_a_shader_that_writes_one_colour_buffer',
+    ),
+    (
         'vkCmdSetColorWriteEnableEXT tells the driver one switch fewer',
         'src/venus/driver.rs',
         """        unsafe { f(cb, enables.len() as u32, enables.as_ptr()) };""",

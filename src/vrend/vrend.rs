@@ -4903,6 +4903,40 @@ mod tests {
         }
     }
 
+    /// A logic op applies to a shader that writes its colour buffers one by one, as well as to
+    /// one that writes them all: on GLES the shader emulates it whichever way it declares its
+    /// outputs, and a depth output declared ahead of the colour is not a colour buffer.
+    /// `COPY_INVERTED` of opaque red is cyan at zero alpha, which only the shader's own colour
+    /// run through the op produces.
+    #[test]
+    fn a_logic_op_applies_to_a_shader_that_writes_one_colour_buffer() {
+        const DEPTH_THEN_RED_FS: &str = "FRAG\nDCL OUT[0], POSITION\nDCL OUT[1], COLOR\n\
+                                         IMM[0] FLT32 { 1.0, 0.0, 0.0, 1.0 }\n  \
+                                         0: MOV OUT[0].z, IMM[0].yyyy\n  \
+                                         1: MOV OUT[1], IMM[0]\n  2: END\n";
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(DEPTH_THEN_RED_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: None,
+                logicop: Some(crate::vrend::pipe::LogicOp::CopyInverted),
+                tess: None,
+            })
+            .expect("the draw runs")
+            .expect("no tessellation asked for");
+            assert!(
+                pixels.chunks(4).all(|p| p == [0, 0xff, 0xff, 0]),
+                "{host_gl:?}: {:?}",
+                &pixels[..4]
+            );
+        }
+    }
+
     /// A desktop core profile has no alpha textures: an A8 target is stored in red, and what the
     /// shader writes to alpha has to land there. Black at full alpha tells the two apart.
     #[test]
