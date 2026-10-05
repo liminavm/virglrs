@@ -2030,6 +2030,32 @@ SABOTAGES = [
         'separable_stages_draw_as_a_pipeline_on_desktop_gl_and_linked_whole_on_gles',
     ),
     (
+        'a pipeline is validated before its draw writes the sampler units it uses',
+        'src/vrend/context/draw.rs',
+        """        self.draw_bind_objects(host, at, new_program);
+        // A pipeline is validated once its stages' sampler units are the ones it draws with. The
+        // C reports one the driver refuses and carries on; the report poisons the context, which
+        // is what refusing it here does.
+        if let ProgramObject::Pipeline { pipeline, validated: false } = object {
+            if !gl.validate_program_pipeline(pipeline) {
+                return Err(Fault::Shader { cmd, what: "a program pipeline the driver refused" });
+            }
+            let prog = self.sub_mut().program_at_mut(at);
+            prog.object = ProgramObject::Pipeline { pipeline, validated: true };
+        }
+""",
+        """        if let ProgramObject::Pipeline { pipeline, validated: false } = object {
+            if !gl.validate_program_pipeline(pipeline) {
+                return Err(Fault::Shader { cmd, what: "a program pipeline the driver refused" });
+            }
+            let prog = self.sub_mut().program_at_mut(at);
+            prog.object = ProgramObject::Pipeline { pipeline, validated: true };
+        }
+        self.draw_bind_objects(host, at, new_program);
+""",
+        'separable_stages_sampling_different_targets_draw_as_one_pipeline',
+    ),
+    (
         'a VMM that does not ask for GLES is given GLES anyway',
         'src/ffi.rs',
         """        host_gl: if flags & abi::USE_GLES != 0 { HostGl::Gles } else { HostGl::Desktop },""",

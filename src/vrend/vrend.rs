@@ -3799,6 +3799,16 @@ mod tests {
         logicop: Option<crate::vrend::pipe::LogicOp>,
         tess: Option<f32>,
         pipeline: Option<&'a std::cell::Cell<Option<PipelineSeen>>>,
+        more: Option<&'a More<'a>>,
+    }
+
+    /// What a draw needs beyond one vertex buffer and one target: resources made before the
+    /// stream, commands sent ahead of the draw, and further rounds of commands each followed by
+    /// the same draw again. The target read back is the last draw's.
+    struct More<'a> {
+        resources: Vec<(ResourceHandle, resource::Args)>,
+        before: Vec<crate::vrend::proto::Command<'a>>,
+        redraws: Vec<Vec<crate::vrend::proto::Command<'a>>>,
     }
 
     /// Draw `d` into a fresh target and read the target back. `Ok(None)` is a host without
@@ -3883,6 +3893,9 @@ mod tests {
             },
         )
         .expect("a vertex buffer");
+        for (handle, args) in d.more.map_or(&[][..], |m| &m.resources) {
+            v.resource_create(*handle, *args).expect("a resource the draw asked for");
+        }
         // One triangle over the whole target, as clip-space xyzw.
         let corners: Vec<u32> =
             [[-1.0f32, -1.0, 0.0, 1.0], [3.0, -1.0, 0.0, 1.0], [-1.0, 3.0, 0.0, 1.0]]
@@ -3989,7 +4002,7 @@ mod tests {
             commands.push(Command::SetConstantBuffer { stage: *stage, index: 0, data });
         }
         let draw = d.fs.is_some();
-        commands.extend(draw.then(|| {
+        let draw_vbo = || {
             Command::DrawVbo(Draw {
                 start: 0,
                 count: 3,
@@ -4006,7 +4019,15 @@ mod tests {
                 tess: d.tess.map(|_| TessDraw { vertices_per_patch: 3, drawid: 0 }),
                 indirect: None,
             })
-        }));
+        };
+        if let Some(m) = d.more {
+            commands.extend(m.before.iter().cloned());
+        }
+        commands.extend(draw.then(draw_vbo));
+        for round in d.more.map_or(&[][..], |m| &m.redraws) {
+            commands.extend(round.iter().cloned());
+            commands.push(draw_vbo());
+        }
         let mut wire = Vec::new();
         for c in &commands {
             encode(c, &mut wire);
@@ -4073,6 +4094,7 @@ mod tests {
                 logicop: None,
                 tess: None,
                 pipeline: Some(&pipeline),
+                more: None,
             })
             .expect("the draw runs")
             .expect("no tessellation asked for");
@@ -4086,6 +4108,160 @@ mod tests {
             if host_gl == HostGl::Gles {
                 assert!(!seen.served, "GLES serves no separable stage");
             }
+            eprintln!("{host_gl:?}: separable stages served: {}", seen.served);
+        }
+    }
+
+    /// Separable stages sampling through different sampler types draw as one pipeline. A stage's
+    /// sampler units are its own program's state, so a pipeline made from stages other
+    /// pipelines drew with starts with the units those draws wrote: here the two-sampler vertex
+    /// stage's second 2D sampler and the cube sampler both sit at unit 1. Mesa refuses a pipeline
+    /// whose active samplers of different types share a unit other than 0, so a pipeline
+    /// validated before its draw writes the units it really uses is refused, and the context
+    /// poisoned, for a draw that is valid.
+    #[test]
+    fn separable_stages_sampling_different_targets_draw_as_one_pipeline() {
+        use crate::vrend::pipe::{CompareFunc, MipFilter, Swizzle, TexFilter, TexWrap};
+        use crate::vrend::proto::{Command, Object, SamplerState, SamplerView};
+        use crate::vrend::proto::{ShaderChunk, ShaderCreate, ShaderKind, StreamOutput};
+        const VS_ONE: &str = "VERT\nPROPERTY SEPARABLE_PROGRAM 1\nDCL IN[0]\n\
+                              DCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL SAMP[0]\n\
+                              DCL SVIEW[0], 2D, FLOAT\nDCL TEMP[0]\n\
+                              IMM[0] FLT32 { 0.5, 0.5, 0.0, 0.0 }\n  0: MOV OUT[0], IN[0]\n  \
+                              1: TXL TEMP[0], IMM[0], SAMP[0], 2D\n  2: MOV OUT[1], TEMP[0]\n  \
+                              3: END\n";
+        const VS_TWO: &str = "VERT\nPROPERTY SEPARABLE_PROGRAM 1\nDCL IN[0]\n\
+                              DCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\nDCL SAMP[0]\n\
+                              DCL SAMP[1]\nDCL SVIEW[0], 2D, FLOAT\nDCL SVIEW[1], 2D, FLOAT\n\
+                              DCL TEMP[0..1]\nIMM[0] FLT32 { 0.5, 0.5, 0.0, 0.0 }\n  \
+                              0: MOV OUT[0], IN[0]\n  1: TXL TEMP[0], IMM[0], SAMP[0], 2D\n  \
+                              2: TXL TEMP[1], IMM[0], SAMP[1], 2D\n  \
+                              3: ADD OUT[1], TEMP[0], TEMP[1]\n  4: END\n";
+        const FS_CUBE: &str = "FRAG\nPROPERTY SEPARABLE_PROGRAM 1\n\
+                               DCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n\
+                               DCL SAMP[0]\nDCL SVIEW[0], CUBE, FLOAT\nDCL TEMP[0]\n\
+                               IMM[0] FLT32 { 1.0, 0.0, 0.0, 1.0 }\n  \
+                               0: TEX TEMP[0], IMM[0], SAMP[0], CUBE\n  \
+                               1: ADD TEMP[0], TEMP[0], IN[0]\n  2: ADD OUT[0], TEMP[0], IMM[0]\n  \
+                               3: END\n";
+        const FS_RED: &str = "FRAG\nPROPERTY SEPARABLE_PROGRAM 1\nDCL OUT[0], COLOR\n\
+                              IMM[0] FLT32 { 1.0, 0.0, 0.0, 1.0 }\n  0: MOV OUT[0], IMM[0]\n  \
+                              1: END\n";
+        let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
+        let bgra = super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM");
+        let (flat, cube) = (
+            ResourceHandle::new(10).expect("a resource handle is non-zero"),
+            ResourceHandle::new(11).expect("a resource handle is non-zero"),
+        );
+        let texture = |target, array_size| resource::Args {
+            target,
+            format: bgra,
+            bind: resource::Bind::SAMPLER_VIEW,
+            width: 16,
+            height: 16,
+            depth: 1,
+            array_size,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags(0),
+        };
+        let view = |resource, target, last_layer: u32| {
+            Object::SamplerView(SamplerView {
+                resource,
+                format: bgra,
+                target,
+                first_element_or_layers: last_layer << 16,
+                last_element_or_levels: 0,
+                swizzle: [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+            })
+        };
+        let state = Object::SamplerState(SamplerState {
+            wrap_s: TexWrap::ClampToEdge,
+            wrap_t: TexWrap::ClampToEdge,
+            wrap_r: TexWrap::ClampToEdge,
+            min_img_filter: TexFilter::Nearest,
+            min_mip_filter: MipFilter::None,
+            mag_img_filter: TexFilter::Nearest,
+            compare_mode: false,
+            compare_func: CompareFunc::LessEqual,
+            seamless_cube_map: false,
+            max_anisotropy: 0,
+            lod_bias: 0.0,
+            min_lod: 0.0,
+            max_lod: 0.0,
+            border_color: [0; 4],
+        });
+        fn shader(handle: ObjectHandle, stage: ShaderStage, text: &[u32]) -> Command<'_> {
+            Command::CreateObject {
+                handle,
+                object: Object::Shader(ShaderCreate {
+                    stage,
+                    chunk: ShaderChunk::New { total_bytes: text.len() as u32 * 4 },
+                    num_tokens: 300,
+                    kind: ShaderKind::Graphics { stream_output: StreamOutput::default() },
+                    text,
+                }),
+            }
+        }
+        let (vs_two, fs_red) = (tgsi_words(VS_TWO), tgsi_words(FS_RED));
+        let (vs, fs) = (ShaderStage::Vertex, ShaderStage::Fragment);
+        let more = More {
+            resources: vec![
+                (flat, texture(TextureTarget::Texture2d, 1)),
+                (cube, texture(TextureTarget::Cube, 6)),
+            ],
+            before: vec![
+                Command::CreateObject {
+                    handle: o(20),
+                    object: view(flat, TextureTarget::Texture2d, 0),
+                },
+                Command::CreateObject { handle: o(21), object: view(cube, TextureTarget::Cube, 5) },
+                Command::CreateObject { handle: o(22), object: state },
+                shader(o(23), vs, &vs_two),
+                shader(o(24), fs, &fs_red),
+                Command::SetSamplerViews { stage: vs, start_slot: 0, views: vec![Some(o(20)); 2] },
+                Command::BindSamplerStates {
+                    stage: vs,
+                    start_slot: 0,
+                    states: vec![Some(o(22)); 2],
+                },
+                Command::SetSamplerViews { stage: fs, start_slot: 0, views: vec![Some(o(21))] },
+                Command::BindSamplerStates { stage: fs, start_slot: 0, states: vec![Some(o(22))] },
+            ],
+            // The first draw puts the cube sampler at unit 1, after the one-sampler vertex
+            // stage's; the second puts the two-sampler vertex stage's second sampler there; the
+            // third pairs those two stages.
+            redraws: vec![
+                vec![
+                    Command::BindShader { stage: vs, handle: Some(o(23)) },
+                    Command::BindShader { stage: fs, handle: Some(o(24)) },
+                ],
+                vec![Command::BindShader { stage: fs, handle: Some(o(3)) }],
+            ],
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let pipeline = std::cell::Cell::new(None);
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                vs: Some(VS_ONE),
+                fs: Some(FS_CUBE),
+                consts: &[],
+                clear: [0.0; 4],
+                logicop: None,
+                tess: None,
+                pipeline: Some(&pipeline),
+                more: Some(&more),
+            })
+            .unwrap_or_else(|e| panic!("{host_gl:?}: the draws run: {e:?}"))
+            .expect("no tessellation asked for");
+            assert!(
+                pixels.as_chunks::<4>().0.iter().all(|p| p[0] == 0xff),
+                "{host_gl:?}: the cube-sampling fragment stage's red reached the target: {:?}",
+                &pixels[..4]
+            );
+            let seen = pipeline.get().expect("the draws ran");
+            assert_eq!(seen.bound, seen.served, "{host_gl:?}: a pipeline where it is served");
             eprintln!("{host_gl:?}: separable stages served: {}", seen.served);
         }
     }
@@ -4107,6 +4283,7 @@ mod tests {
                     vs: None,
                     consts: &[],
                     pipeline: None,
+                    more: None,
                     logicop: None,
                     tess: Some(level),
                 })
@@ -4147,6 +4324,7 @@ mod tests {
                 vs: None,
                 consts: &[],
                 pipeline: None,
+                more: None,
                 logicop: Some(crate::vrend::pipe::LogicOp::Set),
                 tess: None,
             })
@@ -4170,6 +4348,7 @@ mod tests {
             vs: None,
             consts: &[],
             pipeline: None,
+            more: None,
             logicop: None,
             tess: None,
         })
@@ -4191,6 +4370,7 @@ mod tests {
             vs: None,
             consts: &[],
             pipeline: None,
+            more: None,
             logicop: None,
             tess: None,
         })

@@ -220,7 +220,14 @@ impl Linkage {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProgramObject {
     Linked(ProgramName),
-    Pipeline { pipeline: PipelineName },
+    Pipeline {
+        pipeline: PipelineName,
+        /// Whether the driver has validated the pipeline. That waits for the first draw: Mesa
+        /// refuses a pipeline whose stages' active samplers of different types share a unit, and
+        /// until the draw writes the units it will really use, each stage's are whatever the last
+        /// draw through its program left -- another pipeline's numbering, not this one's.
+        validated: bool,
+    },
 }
 
 impl ProgramObject {
@@ -1091,13 +1098,8 @@ fn add_shader_program(
             let program = l.variant.separate.as_ref().expect("asked a moment ago").program;
             gl.use_program_stages(pipeline, stage_bit(l.stage), program);
         }
-        // The C reports a pipeline the driver will not validate and carries on; the report
-        // poisons the context, which is what refusing it here does.
-        if !gl.validate_program_pipeline(pipeline) {
-            gl.delete_program_pipeline(host.current.program(), pipeline);
-            return Err(Fault::Shader { cmd, what: "a program pipeline the driver refused" });
-        }
-        let object = ProgramObject::Pipeline { pipeline };
+        // Validated at its first draw, not here, where the C validates it: see `validated`.
+        let object = ProgramObject::Pipeline { pipeline, validated: false };
         (object, dual_src && fs.info.num_outputs > 1)
     } else {
         let Some(id) = gl.create_program() else {
@@ -2027,6 +2029,16 @@ impl Context {
         }
 
         self.draw_bind_objects(host, at, new_program);
+        // A pipeline is validated once its stages' sampler units are the ones it draws with. The
+        // C reports one the driver refuses and carries on; the report poisons the context, which
+        // is what refusing it here does.
+        if let ProgramObject::Pipeline { pipeline, validated: false } = object {
+            if !gl.validate_program_pipeline(pipeline) {
+                return Err(Fault::Shader { cmd, what: "a program pipeline the driver refused" });
+            }
+            let prog = self.sub_mut().program_at_mut(at);
+            prog.object = ProgramObject::Pipeline { pipeline, validated: true };
+        }
         self.fill_sysval_uniform_block(host, at);
         self.draw_bind_vertex_binding(host);
 
