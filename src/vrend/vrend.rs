@@ -72,7 +72,7 @@ impl fmt::Display for InitError {
             InitError::UnservedGl { version, why } => {
                 let why = match why {
                     UnservedGl::NotAskedFor => {
-                        "desktop GL, which was not asked for (VIRGLRS_DESKTOP_GL=1 asks for it)"
+                        "desktop GL, which `Config::host_gl` did not ask for"
                     }
                     UnservedGl::Compatibility => "a compatibility profile, which is not served",
                     UnservedGl::TooOld => "older than the 3.3 core profile vrend needs",

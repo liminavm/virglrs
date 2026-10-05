@@ -40,6 +40,7 @@ use crate::vrend::pipe::TextureTarget;
 use crate::vrend::proto::{self, Format};
 use crate::vrend::resource::{Args as ClassicArgs, Bind, ResourceFlags};
 use crate::vrend::transfer;
+use crate::vrend::vrend::{InitError, UnservedGl};
 
 /// Decode a capset id the guest chose.
 ///
@@ -479,6 +480,9 @@ pub extern "C" fn virgl_renderer_init(
         }
         Err(e) => {
             eprintln!("[virglrs] init: {e}");
+            if let InitError::UnservedGl { why: UnservedGl::NotAskedFor, .. } = e {
+                eprintln!("[virglrs] init: VIRGLRS_DESKTOP_GL=1 asks for desktop GL");
+            }
             *sink().lock().expect("the sink slot is never held across a panic") = None;
             EINVAL
         }
