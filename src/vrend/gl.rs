@@ -33,15 +33,22 @@ pub mod gles {
 
 use core::ffi::CStr;
 
-/// What `glUseProgram` last left bound on a GL context.
+/// What `glUseProgram` or `glBindProgramPipeline` last left in use on a GL context.
 ///
-/// [`Gl::use_program`] takes one and there is nothing else to do with it, so a call site cannot
-/// bind a program without recording what it bound -- which is what makes skipping a redundant bind
-/// safe rather than a bet on every present and future caller. GL's current program is per-context
-/// state, so exactly one of these is ever the right one: the current context's, which
-/// [`super::current::Current`] owns and clears on a switch.
+/// [`Gl::use_program`] and [`Gl::use_pipeline`] take one and there is nothing else to do with it,
+/// so a call site cannot bind a program without recording what it bound -- which is what makes
+/// skipping a redundant bind safe rather than a bet on every present and future caller. GL's
+/// current program is per-context state, so exactly one of these is ever the right one: the
+/// current context's, which [`super::current::Current`] owns and clears on a switch.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct BoundProgram(Option<ProgramName>);
+pub struct BoundProgram(Option<InUse>);
+
+/// One of the two things a draw runs: a program, or a pipeline of separable ones.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InUse {
+    Program(ProgramName),
+    Pipeline(PipelineName),
+}
 
 use super::egl::Image;
 use super::features::{Api, Feature, Features};
@@ -134,6 +141,10 @@ pub struct ShaderName(GLuint);
 /// A program object the driver handed out. Never zero.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ProgramName(GLuint);
+
+/// A program pipeline object the driver handed out: separable programs, one a stage. Never zero.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PipelineName(GLuint);
 
 /// A binding point of an indexed buffer target: a uniform block, a shader storage block, an
 /// atomic counter buffer, a transform-feedback buffer. The target names the space, so an index
@@ -380,6 +391,20 @@ mod procs {
         = gles [try_glMultiDrawElementsIndirectEXT], gl [try_glMultiDrawElementsIndirect]);
     resolver!(bind_program_pipeline: unsafe extern "C" fn(GLuint)
         = gles [try_glBindProgramPipeline, try_glBindProgramPipelineEXT], gl [try_glBindProgramPipeline]);
+    resolver!(gen_program_pipelines: unsafe extern "C" fn(GLsizei, *mut GLuint)
+        = gles [try_glGenProgramPipelines], gl [try_glGenProgramPipelines]);
+    resolver!(delete_program_pipelines: unsafe extern "C" fn(GLsizei, *const GLuint)
+        = gles [try_glDeleteProgramPipelines], gl [try_glDeleteProgramPipelines]);
+    resolver!(use_program_stages: unsafe extern "C" fn(GLuint, GLbitfield, GLuint)
+        = gles [try_glUseProgramStages], gl [try_glUseProgramStages]);
+    resolver!(active_shader_program: unsafe extern "C" fn(GLuint, GLuint)
+        = gles [try_glActiveShaderProgram], gl [try_glActiveShaderProgram]);
+    resolver!(validate_program_pipeline: unsafe extern "C" fn(GLuint)
+        = gles [try_glValidateProgramPipeline], gl [try_glValidateProgramPipeline]);
+    resolver!(get_program_pipeline_iv: unsafe extern "C" fn(GLuint, GLenum, *mut GLint)
+        = gles [try_glGetProgramPipelineiv], gl [try_glGetProgramPipelineiv]);
+    resolver!(program_parameter_i: unsafe extern "C" fn(GLuint, GLenum, GLint)
+        = gles [try_glProgramParameteri], gl [try_glProgramParameteri]);
     resolver!(tex_storage_3d_multisample: unsafe extern "C" fn(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei, GLboolean)
         = gles [try_glTexStorage3DMultisample], gl [try_glTexStorage3DMultisample]);
     resolver!(buffer_storage: unsafe extern "C" fn(GLenum, GLsizeiptr, *const c_void, GLbitfield)
@@ -457,6 +482,27 @@ mod procs {
         }),
         (Feature::separate_shader_objects, "glBindProgramPipeline", |t, a| {
             bind_program_pipeline(t, a).is_some()
+        }),
+        (Feature::separate_shader_objects, "glGenProgramPipelines", |t, a| {
+            gen_program_pipelines(t, a).is_some()
+        }),
+        (Feature::separate_shader_objects, "glDeleteProgramPipelines", |t, a| {
+            delete_program_pipelines(t, a).is_some()
+        }),
+        (Feature::separate_shader_objects, "glUseProgramStages", |t, a| {
+            use_program_stages(t, a).is_some()
+        }),
+        (Feature::separate_shader_objects, "glActiveShaderProgram", |t, a| {
+            active_shader_program(t, a).is_some()
+        }),
+        (Feature::separate_shader_objects, "glValidateProgramPipeline", |t, a| {
+            validate_program_pipeline(t, a).is_some()
+        }),
+        (Feature::separate_shader_objects, "glGetProgramPipelineiv", |t, a| {
+            get_program_pipeline_iv(t, a).is_some()
+        }),
+        (Feature::separate_shader_objects, "glProgramParameteri", |t, a| {
+            program_parameter_i(t, a).is_some()
         }),
         (Feature::storage_multisample_2d_array, "glTexStorage3DMultisample", |t, a| {
             tex_storage_3d_multisample(t, a).is_some()
@@ -2297,7 +2343,7 @@ impl Gl {
     /// deleted one. Unbinding here is what keeps [`BoundProgram`] unable to name something gone,
     /// and taking it by `&mut` is what makes every delete site say so.
     pub fn delete_program(&self, bound: &mut BoundProgram, program: ProgramName) {
-        if bound.0 == Some(program) {
+        if bound.0 == Some(InUse::Program(program)) {
             self.use_program(bound, None);
         }
         // SAFETY: plain scalar.
@@ -2341,13 +2387,132 @@ impl Gl {
     /// before the driver gets to decide it has nothing to do -- and the draw path re-binds the
     /// same program on most draws. The C re-binds unconditionally (`vrend_use_program`); this does
     /// not, which is only sound because `bound` cannot go stale: see [`BoundProgram`].
+    ///
+    /// A pipeline in use is unbound first, as the C does: a program in use outranks a pipeline,
+    /// but `glUseProgram(0)` would hand the draw back to the pipeline still bound.
     pub fn use_program(&self, bound: &mut BoundProgram, program: Option<ProgramName>) {
-        if bound.0 == program {
+        let want = program.map(InUse::Program);
+        if bound.0 == want {
             return;
+        }
+        if let Some(InUse::Pipeline(_)) = bound.0 {
+            self.bind_program_pipeline(0);
         }
         // SAFETY: plain scalar; zero is "no program".
         unsafe { self.t.glUseProgram()(program.map_or(0, |p| p.0)) };
-        bound.0 = program;
+        bound.0 = want;
+    }
+
+    /// `vrend_use_program` for a pipeline: no program in use, so the pipeline is what draws.
+    /// Skipped when `bound` says GL already has it, as [`Gl::use_program`] is.
+    pub fn use_pipeline(&self, bound: &mut BoundProgram, pipeline: PipelineName) {
+        let want = Some(InUse::Pipeline(pipeline));
+        if bound.0 == want {
+            return;
+        }
+        // SAFETY: zero is "no program".
+        unsafe { self.t.glUseProgram()(0) };
+        self.bind_program_pipeline(pipeline.0);
+        bound.0 = want;
+    }
+
+    fn bind_program_pipeline(&self, pipeline: GLuint) {
+        let f = promised(
+            procs::bind_program_pipeline(&self.t, self.api),
+            Feature::separate_shader_objects,
+            "glBindProgramPipeline",
+        );
+        // SAFETY: a pipeline name, or zero for none.
+        unsafe { f(pipeline) };
+    }
+
+    /// `glGenProgramPipelines` for one pipeline.
+    pub fn gen_program_pipeline(&self) -> PipelineName {
+        let f = promised(
+            procs::gen_program_pipelines(&self.t, self.api),
+            Feature::separate_shader_objects,
+            "glGenProgramPipelines",
+        );
+        let mut id: GLuint = 0;
+        // SAFETY: writes exactly one name.
+        unsafe { f(1, &mut id) };
+        assert_ne!(id, 0, "the driver names a pipeline it generated");
+        PipelineName(id)
+    }
+
+    /// `glDeleteProgramPipelines` for one pipeline, out of use first if it is in use, for the
+    /// reason [`Gl::delete_program`] gives.
+    pub fn delete_program_pipeline(&self, bound: &mut BoundProgram, pipeline: PipelineName) {
+        if bound.0 == Some(InUse::Pipeline(pipeline)) {
+            self.use_program(bound, None);
+        }
+        let f = promised(
+            procs::delete_program_pipelines(&self.t, self.api),
+            Feature::separate_shader_objects,
+            "glDeleteProgramPipelines",
+        );
+        // SAFETY: reads exactly one name.
+        unsafe { f(1, &pipeline.0) };
+    }
+
+    /// `glProgramParameteri(GL_PROGRAM_SEPARABLE, GL_TRUE)`: the program will be one stage of a
+    /// pipeline. Set before the link, which is when it counts.
+    pub fn program_separable(&self, program: ProgramName) {
+        let f = promised(
+            procs::program_parameter_i(&self.t, self.api),
+            Feature::separate_shader_objects,
+            "glProgramParameteri",
+        );
+        // SAFETY: plain scalars.
+        unsafe { f(program.0, GL_PROGRAM_SEPARABLE, GL_TRUE as GLint) };
+    }
+
+    /// `glUseProgramStages`: `program` serves the stages `stages` names in `pipeline`.
+    pub fn use_program_stages(
+        &self,
+        pipeline: PipelineName,
+        stages: GLbitfield,
+        program: ProgramName,
+    ) {
+        let f = promised(
+            procs::use_program_stages(&self.t, self.api),
+            Feature::separate_shader_objects,
+            "glUseProgramStages",
+        );
+        // SAFETY: plain scalars.
+        unsafe { f(pipeline.0, stages, program.0) };
+    }
+
+    /// `glActiveShaderProgram`: the program in `pipeline` that `glUniform*` writes to.
+    pub fn active_shader_program(&self, pipeline: PipelineName, program: ProgramName) {
+        let f = promised(
+            procs::active_shader_program(&self.t, self.api),
+            Feature::separate_shader_objects,
+            "glActiveShaderProgram",
+        );
+        // SAFETY: plain scalars.
+        unsafe { f(pipeline.0, program.0) };
+    }
+
+    /// `glValidateProgramPipeline` and its `GL_VALIDATE_STATUS`.
+    pub fn validate_program_pipeline(&self, pipeline: PipelineName) -> bool {
+        let validate = promised(
+            procs::validate_program_pipeline(&self.t, self.api),
+            Feature::separate_shader_objects,
+            "glValidateProgramPipeline",
+        );
+        let get = promised(
+            procs::get_program_pipeline_iv(&self.t, self.api),
+            Feature::separate_shader_objects,
+            "glGetProgramPipelineiv",
+        );
+        let mut status: GLint = 0;
+        // SAFETY: a plain scalar, then a query that writes exactly one integer.
+        unsafe {
+            validate(pipeline.0);
+            get(pipeline.0, GL_VALIDATE_STATUS, &mut status);
+        }
+        status != 0
     }
 
     /// `glGetUniformLocation`; `None` when the program has no such uniform.
@@ -2848,13 +3013,7 @@ impl Gl {
 
     /// `glBindProgramPipeline(0)`.
     pub fn bind_program_pipeline_none(&self) {
-        let f = promised(
-            procs::bind_program_pipeline(&self.t, self.api),
-            Feature::separate_shader_objects,
-            "glBindProgramPipeline",
-        );
-        // SAFETY: zero is "no pipeline".
-        unsafe { f(0) };
+        self.bind_program_pipeline(0);
     }
 
     pub fn finish(&self) {
