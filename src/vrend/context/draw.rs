@@ -635,7 +635,7 @@ impl SubContext {
     fn linked_stages(&self) -> Result<Vec<Linked<'_>>, ShaderStage> {
         let mut out = Vec::new();
         for stage in GRAPHICS_STAGES {
-            if self.shaders[stage.index()].is_none() {
+            if !self.has_stage(stage) {
                 continue;
             }
             out.push(self.linked_stage(stage).ok_or(stage)?);
@@ -643,8 +643,8 @@ impl SubContext {
         Ok(out)
     }
 
-    /// The current variant of the stage bound at `stage`, compiled, or `None` when there is no
-    /// such variant.
+    /// The current variant of the stage at `stage`, compiled, or `None` when there is no such
+    /// variant.
     fn linked_stage(&self, stage: ShaderStage) -> Option<Linked<'_>> {
         let program = self.bound_program(stage)?;
         let variant = program.variants.first()?;
@@ -679,11 +679,21 @@ pub(super) fn release_shader(
     shader: Shader,
 ) {
     if let ShaderText::Whole(p) = shader.text {
-        for v in p.variants {
-            sub.forget_programs_of(gl, bound, v.id);
-            if let Some(name) = v.gl {
-                gl.delete_shader(name);
-            }
+        release_variants(sub, gl, bound, p.translated.variants);
+    }
+}
+
+/// The programs linking each of `variants`, then each variant's GL shader.
+pub(super) fn release_variants(
+    sub: &mut SubContext,
+    gl: &Gl,
+    bound: &mut BoundProgram,
+    variants: Vec<Variant>,
+) {
+    for v in variants {
+        sub.forget_programs_of(gl, bound, v.id);
+        if let Some(name) = v.gl {
+            gl.delete_shader(name);
         }
     }
 }
@@ -857,8 +867,9 @@ impl Context {
         &mut self,
         host: &mut Host<'_>,
         cmd: Cmd,
+        vertices_per_patch: u32,
     ) -> Result<Selected, Fault> {
-        let mut built = self.select_program(host, cmd)?;
+        let mut built = self.select_program(host, cmd, vertices_per_patch)?;
         let sub = self.sub();
         let dual_src = sub.blend.as_ref().is_some_and(|b| blend_is_dual(b, 0));
         let linked = match sub.linked_stages() {
@@ -1573,6 +1584,13 @@ impl Context {
         }
 
         let sub = self.sub_mut();
+        // An injected control stage declares the draw's patch size, so another size is another
+        // shader. Asked of the one in use rather than of a remembered size, which could disagree.
+        if sub.injects_tcs()
+            && sub.passthrough.as_ref().is_some_and(|p| !p.made_for_patch(vertices_per_patch))
+        {
+            sub.shader_dirty = true;
+        }
         if sub.prim_mode != draw.mode {
             // Only a switch in or out of points changes the shader variants.
             if sub.prim_mode == PrimType::Points || draw.mode == PrimType::Points {
@@ -1597,7 +1615,7 @@ impl Context {
         let compute_bound = sub.program().is_some_and(|p| matches!(p.linkage, Linkage::Compute(_)));
         if sub.shader_dirty || sub.vbo_dirty || compute_bound {
             selected = host.tally.mark();
-            let s = self.select_linked_program(host, cmd)?;
+            let s = self.select_linked_program(host, cmd, vertices_per_patch as u32)?;
             new_program = s.changed;
             built = s.built;
         }

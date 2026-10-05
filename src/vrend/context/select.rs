@@ -20,10 +20,17 @@
 
 use super::*;
 
-/// `vrend_shader_selector`'s translated half: the program, what the latest translation said
-/// about it, and every variant it has been selected as.
+/// `vrend_shader_selector`'s translated half: the guest's program, and what translating it made.
 pub struct Program {
     pub tgsi: tgsi::Program,
+    pub translated: Translated,
+}
+
+/// What a stage's translations made, whoever wrote the program: what the latest one said about
+/// it, and every variant it has been selected as. The neighbours and the link read a stage
+/// through this, so they cannot tell a guest's program from one this host injected.
+#[derive(Default)]
+pub struct Translated {
     /// `sel->sinfo`: written by every translation, so it describes the newest variant. What
     /// it says that the key does not change is what the neighbours read.
     pub info: shader::Info,
@@ -32,7 +39,7 @@ pub struct Program {
     pub variants: Vec<Variant>,
 }
 
-impl Program {
+impl Translated {
     /// `sel->current->var_sinfo`, or the C's zeroed struct when there is no current variant.
     fn current_var_info(&self) -> shader::VarInfo {
         self.variants.first().map(|v| v.var_info.clone()).unwrap_or_default()
@@ -53,6 +60,37 @@ pub struct Variant {
     pub var_info: shader::VarInfo,
     /// The compiled shader, once a program has been assembled with it.
     pub gl: Option<ShaderName>,
+}
+
+/// The control stage this host injects ahead of an evaluation shader the guest bound with none,
+/// because GLES will not link one without the other: `vrend_inject_tcs`. The guest never sees
+/// it, so it is no object of theirs and no binding; the sub-context holds the one in use.
+///
+/// The C makes a new one at every selection and leaks the last. This one is made again only when
+/// what it is made from changed, and what it is made from is all here, compared whole -- so the
+/// TCS a draw links cannot be one made for another vertex shader, patch size or factors.
+pub struct Passthrough {
+    made_from: PassthroughInputs,
+    pub translated: Translated,
+}
+
+impl Passthrough {
+    /// Whether this was made for a draw of `vertices` vertices a patch.
+    pub fn made_for_patch(&self, vertices: GLsizei) -> bool {
+        i64::from(self.made_from.vertices_per_patch) == i64::from(vertices)
+    }
+}
+
+/// Everything `vrend_shader_create_passthrough_tcs` reads, but the translator's config, which a
+/// renderer never changes.
+#[derive(PartialEq)]
+struct PassthroughInputs {
+    /// The vertex shader's declarations: the outputs it writes are what the TCS copies.
+    vs: Vec<tgsi::Declaration>,
+    key: shader::Key,
+    vertices_per_patch: u8,
+    /// `SET_TESS_STATE`'s levels, by bits: the TCS writes them as constants.
+    tess_factors: [u32; 6],
 }
 
 /// What a sub-context has bound at a stage, and when. The C holds a reference, so a shader the
@@ -223,8 +261,31 @@ impl SubContext {
         id
     }
 
-    /// The program bound at `stage`, when a shader is bound there and its text is whole.
-    pub(super) fn bound_program(&self, stage: ShaderStage) -> Option<&Program> {
+    /// Whether the pipeline has a stage at `stage`: the guest bound one there, or it is the
+    /// control stage this host injects ahead of an evaluation shader that has none.
+    pub(super) fn has_stage(&self, stage: ShaderStage) -> bool {
+        self.shaders[stage.index()].is_some()
+            || (stage == ShaderStage::TessCtrl && self.injects_tcs())
+    }
+
+    /// `vrend_select_program`'s GLES test for `vrend_inject_tcs`: an evaluation shader with no
+    /// control shader before it, which GLES will not link.
+    pub(super) fn injects_tcs(&self) -> bool {
+        self.shaders[ShaderStage::TessCtrl.index()].is_none()
+            && self.shaders[ShaderStage::TessEval.index()].is_some()
+    }
+
+    /// What was translated for the stage at `stage`, when the pipeline has one and its text is
+    /// whole: the guest's program, or the control stage this host injected.
+    pub(super) fn bound_program(&self, stage: ShaderStage) -> Option<&Translated> {
+        if stage == ShaderStage::TessCtrl && self.injects_tcs() {
+            return self.passthrough.as_ref().map(|p| &p.translated);
+        }
+        self.bound_tgsi(stage).map(|p| &p.translated)
+    }
+
+    /// The guest's program bound at `stage`, when its text is whole.
+    fn bound_tgsi(&self, stage: ShaderStage) -> Option<&Program> {
         let shader = match self.shaders[stage.index()].as_ref()? {
             Bound::Object { handle, .. } => match self.objects.get(handle) {
                 Some(Object::Shader(s)) => s,
@@ -405,7 +466,7 @@ impl SubContext {
             key.vs.attrib_zyxw_bitmask = ve.zyxw_bitmask;
         }
         key.gs_present = self.shaders[Geometry.index()].is_some() || stage == Geometry;
-        key.tcs_present = self.shaders[TessCtrl.index()].is_some() || stage == TessCtrl;
+        key.tcs_present = self.has_stage(TessCtrl) || stage == TessCtrl;
         key.tes_present = self.shaders[TessEval.index()].is_some() || stage == TessEval;
         if stage != Compute {
             self.sync_shader_io(host.features, handle, stage, &mut key);
@@ -465,12 +526,12 @@ fn translate(
             if log {
                 eprint!("GLSL:\n{}\n", strings.source());
             }
-            program.info = info;
-            program.variants.insert(0, Variant { id, key, strings, var_info, gl: None });
+            program.translated.info = info;
+            program.translated.variants.insert(0, Variant { id, key, strings, var_info, gl: None });
             Ok(())
         }
         Err(error) => {
-            program.variants.clear();
+            program.translated.variants.clear();
             Err(Fault::Glsl { cmd, stage, error })
         }
     }
@@ -482,12 +543,13 @@ fn select_variant(shader: &mut Shader, key: &shader::Key) -> bool {
     let ShaderText::Whole(program) = &mut shader.text else {
         return false;
     };
-    let Some(i) = program.variants.iter().position(|v| v.key == *key) else {
+    let variants = &mut program.translated.variants;
+    let Some(i) = variants.iter().position(|v| v.key == *key) else {
         return false;
     };
     if i != 0 {
-        let v = program.variants.remove(i);
-        program.variants.insert(0, v);
+        let v = variants.remove(i);
+        variants.insert(0, v);
     }
     true
 }
@@ -551,7 +613,15 @@ impl Context {
     /// a stage's key reads its neighbours' newest variants -- and compiled. The program that
     /// links them is `Context::select_linked_program`'s. Answers whether any stage was
     /// translated or compiled.
-    pub(super) fn select_program(&mut self, host: &mut Host<'_>, cmd: Cmd) -> Result<bool, Fault> {
+    ///
+    /// `vertices_per_patch` is the draw's, which an injected control stage declares as its
+    /// output patch size.
+    pub(super) fn select_program(
+        &mut self,
+        host: &mut Host<'_>,
+        cmd: Cmd,
+        vertices_per_patch: u32,
+    ) -> Result<bool, Fault> {
         use ShaderStage::*;
         let bound = |s: &Context, stage: ShaderStage| s.sub().shaders[stage.index()].is_some();
         if !bound(self, Vertex) || !bound(self, Fragment) {
@@ -561,28 +631,98 @@ impl Context {
             });
         }
         let mut built = self.select_bound(host, cmd, Vertex)?;
-        if bound(self, TessCtrl) {
-            built |= self.select_bound(host, cmd, TessCtrl)?;
-        } else if bound(self, TessEval) {
-            host.todo.note("tessellation without a control shader");
-            return Err(Fault::Unimplemented {
-                cmd,
-                what: "an injected tessellation control shader",
-            });
-        }
+        built |= self.select_tcs(host, cmd, vertices_per_patch)?;
         built |= self.select_bound(host, cmd, TessEval)?;
         built |= self.select_bound(host, cmd, Geometry)?;
         built |= self.select_bound(host, cmd, Fragment)?;
         // The C's second round, its workaround for duplicated compilation (#180).
         built |= self.select_bound(host, cmd, Geometry)?;
         built |= self.select_bound(host, cmd, TessEval)?;
-        built |= self.select_bound(host, cmd, TessCtrl)?;
+        built |= self.select_tcs(host, cmd, vertices_per_patch)?;
         built |= self.select_bound(host, cmd, Vertex)?;
 
         for stage in [Vertex, Fragment, Geometry, TessCtrl, TessEval] {
             built |= self.compile_bound(host, cmd, stage)?;
         }
         Ok(built)
+    }
+
+    /// The control stage: the guest's, or the one injected ahead of an evaluation shader that
+    /// has none. Answers whether anything was translated or compiled.
+    fn select_tcs(
+        &mut self,
+        host: &mut Host<'_>,
+        cmd: Cmd,
+        vertices_per_patch: u32,
+    ) -> Result<bool, Fault> {
+        if self.sub().injects_tcs() {
+            self.select_passthrough(host, cmd, vertices_per_patch)
+        } else {
+            self.select_bound(host, cmd, ShaderStage::TessCtrl)
+        }
+    }
+
+    /// `vrend_inject_tcs`: the control stage for the bound vertex shader under the key and the
+    /// tessellation state of the moment, translated and compiled as the C does at once, and kept
+    /// until what it was made from changes. Answers whether it was made.
+    fn select_passthrough(
+        &mut self,
+        host: &mut Host<'_>,
+        cmd: Cmd,
+        vertices_per_patch: u32,
+    ) -> Result<bool, Fault> {
+        let stage = ShaderStage::TessCtrl;
+        let vertices_per_patch = u8::try_from(vertices_per_patch)
+            .map_err(|_| Fault::OutOfRange { cmd, what: "a patch size" })?;
+        let sub = self.sub();
+        let Some(vs) = sub.bound_tgsi(ShaderStage::Vertex) else {
+            return Err(Fault::Shader {
+                cmd,
+                what: "a control stage for a vertex shader not whole",
+            });
+        };
+        let made_from = PassthroughInputs {
+            vs: vs
+                .tgsi
+                .shader
+                .tokens
+                .iter()
+                .filter_map(|t| match t {
+                    tgsi::Token::Declaration(d) => Some(*d),
+                    _ => None,
+                })
+                .collect(),
+            key: sub.fill_shader_key(host, None, stage),
+            vertices_per_patch,
+            tess_factors: sub.tess_factors.map(f32::to_bits),
+        };
+        if sub.passthrough.as_ref().is_some_and(|p| p.made_from == made_from) {
+            return Ok(false);
+        }
+        let (strings, info) = shader::create_passthrough_tcs(
+            host.shader_cfg,
+            &vs.tgsi.shader,
+            &made_from.key,
+            &sub.tess_factors,
+            vertices_per_patch,
+        )
+        .map_err(|error| Fault::Glsl { cmd, stage, error })?;
+        let sub = self.sub_mut();
+        let id = sub.mint_variant_id();
+        let key = made_from.key.clone();
+        let mut variant =
+            Variant { id, key, strings, var_info: shader::VarInfo::default(), gl: None };
+        if !compile(host.gl, stage, &mut variant) {
+            return Err(Fault::Shader {
+                cmd,
+                what: "an injected control shader the driver refused",
+            });
+        }
+        let translated = Translated { info, variants: vec![variant] };
+        if let Some(old) = sub.passthrough.replace(Passthrough { made_from, translated }) {
+            draw::release_variants(sub, host.gl, host.current.program(), old.translated.variants);
+        }
+        Ok(true)
     }
 
     /// `vrend_compile_shader` on the current variant of the shader bound at `stage`, when it has
@@ -600,7 +740,7 @@ impl Context {
         let ShaderText::Whole(program) = &mut shader.text else {
             return Ok(false);
         };
-        let Some(current) = program.variants.first_mut() else {
+        let Some(current) = program.translated.variants.first_mut() else {
             return Err(Fault::Shader { cmd, what: "a stage with no variant to compile" });
         };
         if current.gl.is_some() {
@@ -655,7 +795,8 @@ impl Context {
             let stage = ShaderStage::from_wire(i as u32).expect("six stages");
             self.bind_shader(host, *h, stage);
         }
-        let r = self.select_linked_program(host, cmd).map(|_| ());
+        // The C links with a patch size of one; a draw selects again with its own.
+        let r = self.select_linked_program(host, cmd, 1).map(|_| ());
         let sub = self.sub_mut();
         sub.shaders = prev;
         sub.shader_dirty = true;

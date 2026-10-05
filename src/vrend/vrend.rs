@@ -3177,6 +3177,212 @@ mod tests {
         v.context_destroy(ctx, &AllAttached);
     }
 
+    /// An evaluation shader with no control shader is a valid guest pipeline that GLES will not
+    /// link, so this host puts a control stage ahead of it, writing `SET_TESS_STATE`'s levels.
+    /// A host with tessellation draws the patch: one triangle covering the target, at levels of
+    /// one. A host without it never told the guest, and refuses the evaluation shader.
+    #[test]
+    fn an_evaluation_shader_without_a_control_shader_draws_its_patches() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::pipe::{LogicOp, PrimType};
+        use crate::vrend::proto::{
+            BlendState, Box3, Command, Draw, Object, ObjectType, RtBlend, ShaderChunk,
+            ShaderCreate, ShaderKind, StreamOutput, Surface, TessDraw, Transfer, VertexBuffer,
+            VertexElement, Viewport,
+        };
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        let tessellates = v.features.has(Feature::tessellation);
+        let format = |n| super::super::proto::Format::from_wire(n).expect("a known format");
+        let bgra = format(1);
+        let target = ResourceHandle::new(1).expect("a resource handle is non-zero");
+        let vertices = ResourceHandle::new(2).expect("a resource handle is non-zero");
+        let texture = resource::Args {
+            target: TextureTarget::Texture2d,
+            format: bgra,
+            bind: resource::Bind(resource::Bind::RENDER_TARGET.0 | resource::Bind::SAMPLER_VIEW.0),
+            width: 16,
+            height: 16,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags(0),
+        };
+        v.resource_create(target, texture).expect("a texture");
+        v.resource_create(
+            vertices,
+            resource::Args {
+                target: TextureTarget::Buffer,
+                format: format(64),
+                bind: resource::Bind::VERTEX_BUFFER,
+                width: 48,
+                height: 1,
+                depth: 1,
+                array_size: 1,
+                last_level: 0,
+                nr_samples: 0,
+                flags: resource::ResourceFlags(0),
+            },
+        )
+        .expect("a vertex buffer");
+        // One triangle over the whole target, as clip-space xyzw.
+        let corners: Vec<u32> =
+            [[-1.0f32, -1.0, 0.0, 1.0], [3.0, -1.0, 0.0, 1.0], [-1.0, 3.0, 0.0, 1.0]]
+                .iter()
+                .flatten()
+                .map(|f| f.to_bits())
+                .collect();
+        let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
+        let (vs, tes, fs) = (tgsi_words(PASS_VS), tgsi_words(PASS_TES), tgsi_words(RED_FS));
+        fn shader(stage: ShaderStage, text: &[u32]) -> Object<'_> {
+            Object::Shader(ShaderCreate {
+                stage,
+                chunk: ShaderChunk::New { total_bytes: text.len() as u32 * 4 },
+                num_tokens: 300,
+                kind: ShaderKind::Graphics { stream_output: StreamOutput::default() },
+                text,
+            })
+        }
+        let writes = RtBlend { equation: None, colormask: 0xf };
+        let mut wire = Vec::new();
+        for c in [
+            Command::ResourceInlineWrite {
+                transfer: Transfer {
+                    resource: vertices,
+                    level: 0,
+                    usage: 0,
+                    stride: 0,
+                    layer_stride: 0,
+                    region: Box3 { x: 0, y: 0, z: 0, width: 48, height: 1, depth: 1 },
+                },
+                data: &corners,
+            },
+            Command::CreateObject { handle: o(1), object: shader(ShaderStage::Vertex, &vs) },
+            Command::CreateObject { handle: o(2), object: shader(ShaderStage::TessEval, &tes) },
+            Command::CreateObject { handle: o(3), object: shader(ShaderStage::Fragment, &fs) },
+            Command::BindShader { stage: ShaderStage::Vertex, handle: Some(o(1)) },
+            Command::BindShader { stage: ShaderStage::TessEval, handle: Some(o(2)) },
+            Command::BindShader { stage: ShaderStage::Fragment, handle: Some(o(3)) },
+            Command::CreateObject {
+                handle: o(4),
+                object: Object::VertexElements(vec![VertexElement {
+                    src_offset: 0,
+                    instance_divisor: 0,
+                    vertex_buffer_index: 0,
+                    src_format: format(31),
+                }]),
+            },
+            Command::BindObject { kind: ObjectType::VertexElements, handle: Some(o(4)) },
+            Command::SetVertexBuffers(vec![VertexBuffer {
+                stride: 16,
+                offset: 0,
+                resource: Some(vertices),
+            }]),
+            Command::CreateObject {
+                handle: o(5),
+                object: Object::Blend(BlendState {
+                    independent_blend_enable: false,
+                    logicop_enable: false,
+                    dither: false,
+                    alpha_to_coverage: false,
+                    alpha_to_one: false,
+                    logicop_func: LogicOp::Copy,
+                    rt: [writes; 8],
+                }),
+            },
+            Command::BindObject { kind: ObjectType::Blend, handle: Some(o(5)) },
+            Command::CreateObject {
+                handle: o(6),
+                object: Object::Surface(Surface {
+                    resource: target,
+                    format: bgra,
+                    first_element_or_level: 0,
+                    last_element_or_layers: 0,
+                    samples: 0,
+                }),
+            },
+            Command::SetFramebufferState { zsurf: None, cbufs: vec![Some(o(6))] },
+            Command::SetViewportState {
+                start_slot: 0,
+                viewports: vec![Viewport { scale: [8.0, 8.0, 0.5], translate: [8.0, 8.0, 0.5] }],
+            },
+            // What gallium sends before a first draw: the GL defaults.
+            Command::SetTessState([1.0; 6]),
+            Command::DrawVbo(Draw {
+                start: 0,
+                count: 3,
+                mode: PrimType::Patches,
+                indexed: false,
+                instance_count: 1,
+                index_bias: 0,
+                start_instance: 0,
+                primitive_restart: false,
+                restart_index: 0,
+                min_index: 0,
+                max_index: 2,
+                count_from_so: None,
+                tess: Some(TessDraw { vertices_per_patch: 3, drawid: 0 }),
+                indirect: None,
+            }),
+        ] {
+            encode(&c, &mut wire);
+        }
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &AllAttached).expect("a context");
+        let ran = v.submit(ctx, &wire, &AllAttached).expect("the context is here");
+        if tessellates {
+            ran.expect("a host with tessellation draws the patch");
+            let cursor = v.cursor_contents(target).expect("a 16x16 2D texture reads back");
+            assert!(
+                cursor.pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
+                "the patch covered the target: {:?}",
+                &cursor.pixels[..4]
+            );
+        } else {
+            assert!(
+                matches!(
+                    ran,
+                    Err(Fault::Shader { cmd: crate::vrend::proto::Cmd::CreateObject, .. })
+                ),
+                "a host without tessellation refuses the evaluation shader: {ran:?}"
+            );
+        }
+        v.context_destroy(ctx, &AllAttached);
+    }
+
     /// What the vertex stage holds, and the stage of the shader the table holds under handle 3.
     type ShaderSlot = (Option<Option<ObjectHandle>>, Option<ShaderStage>);
 
@@ -3262,6 +3468,13 @@ mod tests {
 
     const PASS_VS: &str =
         "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n  0: MOV OUT[0], IN[0]\n  1: END\n";
+    /// Triangles, each vertex the patch's corners weighted by the tessellation coordinate.
+    const PASS_TES: &str = "TESS_EVAL\nPROPERTY TES_PRIM_MODE 4\nPROPERTY TES_SPACING 2\n\
+                            PROPERTY TES_VERTEX_ORDER_CW 0\nPROPERTY TES_POINT_MODE 0\n\
+                            DCL IN[][0], POSITION\nDCL SV[0], TESSCOORD\nDCL OUT[0], POSITION\n\
+                            DCL TEMP[0]\n  0: MUL TEMP[0], IN[0][0], SV[0].xxxx\n  \
+                            1: MAD TEMP[0], IN[1][0], SV[0].yyyy, TEMP[0]\n  \
+                            2: MAD OUT[0], IN[2][0], SV[0].zzzz, TEMP[0]\n  3: END\n";
     const RED_FS: &str = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 { 1.0, 0.0, 0.0, 1.0 }\n  \
                           0: MOV OUT[0], IMM[0]\n  1: END\n";
 

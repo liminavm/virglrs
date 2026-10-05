@@ -949,6 +949,12 @@ pub struct SubContext {
     /// `textureQueryLevels` emulation.
     texture_levels: [Vec<GLint>; ShaderStage::COUNT],
     shaders: [Option<Bound>; ShaderStage::COUNT],
+    /// The control stage injected ahead of an evaluation shader bound without one.
+    passthrough: Option<select::Passthrough>,
+    /// `SET_TESS_STATE`'s default outer and inner levels, which an injected control stage
+    /// writes: the C keeps them in one global for every context, and gallium's state is a
+    /// pipe context's.
+    tess_factors: [f32; 6],
     /// A stage was bound or its key's inputs changed: the draw re-selects the variants.
     shader_dirty: bool,
     /// The last draw's primitive mode, which the fragment shader's key reads; the C's is zero
@@ -1027,6 +1033,8 @@ impl SubContext {
             units: Default::default(),
             texture_levels: Default::default(),
             shaders: Default::default(),
+            passthrough: None,
+            tess_factors: [0.0; 6],
             shader_dirty: false,
             prim_mode: PrimType::Points,
             programs: Vec::new(),
@@ -1076,6 +1084,9 @@ impl SubContext {
             if let Some(Bound::Owned(o)) = b {
                 draw::release_shader(&mut self, gl, bound, o.shader);
             }
+        }
+        if let Some(p) = self.passthrough.take() {
+            draw::release_variants(&mut self, gl, bound, p.translated.variants);
         }
         self.gl_ctx
     }
@@ -2083,7 +2094,15 @@ impl Context {
                 self.bind_shader(host, handle, stage);
                 Ok(())
             }
-            Command::SetTessState(_) => Ok(()),
+            Command::SetTessState(factors) => {
+                let sub = self.sub_mut();
+                if sub.tess_factors.map(f32::to_bits) != factors.map(f32::to_bits) {
+                    sub.tess_factors = factors;
+                    // An injected control stage writes them as constants.
+                    sub.shader_dirty |= sub.injects_tcs();
+                }
+                Ok(())
+            }
             Command::SetMinSamples(n) => {
                 self.set_min_samples(host, n);
                 Ok(())
@@ -3146,7 +3165,7 @@ fn read_shader(text: &[u8], num_tokens: u32) -> Result<Program, Fault> {
     let shader =
         tgsi::Program::parse(text, num_tokens).map_err(|error| Fault::Tgsi { cmd, error })?;
     let tgsi = tgsi::Program::scan(shader).map_err(|error| Fault::Tgsi { cmd, error })?;
-    Ok(Program { tgsi, info: shader::Info::default(), variants: Vec::new() })
+    Ok(Program { tgsi, translated: select::Translated::default() })
 }
 
 /// The swizzle that changes nothing, and so has nothing to clash over.

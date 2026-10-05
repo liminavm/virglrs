@@ -1933,6 +1933,22 @@ SABOTAGES = [
         'a_multisampled_surface_renders_into_its_texture_where_the_host_offers_it',
     ),
     (
+        'an evaluation shader without a control shader is refused, not given one',
+        'src/vrend/context/select.rs',
+        """        if self.sub().injects_tcs() {
+            self.select_passthrough(host, cmd, vertices_per_patch)""",
+        """        if self.sub().injects_tcs() {
+            Err(Fault::Unimplemented { cmd, what: "an injected tessellation control shader" })""",
+        'an_evaluation_shader_without_a_control_shader_draws_its_patches',
+    ),
+    (
+        'an injected control shader writes levels the guest never set',
+        'src/vrend/context.rs',
+        """                    sub.tess_factors = factors;""",
+        """                    let _ = factors;""",
+        'an_evaluation_shader_without_a_control_shader_draws_its_patches',
+    ),
+    (
         'a sampler view binds whatever kind of resource its handle names now',
         'src/vrend/context.rs',
         """                (Storage::Texture(_), Span::Levels { .. }) => {}""",
