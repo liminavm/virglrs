@@ -577,11 +577,9 @@ buildable throughout as the A-side reference.
   EGL image is a Mesa dmabuf quirk (a `GL_RGB8` import) the C's own macOS path says does
   not apply to an IOSurface, and the `LIMINA_VREND_*IOSURFACE*` environment switches are
   debugging aids with no reader here. Not served yet, each counted and named in the log
-  when a stream asks: tessellation without a control shader (the C's injected TCS),
-  advanced blend equations, a layered image bound as a subset of its levels or layers,
-  the C's bridge of UBO 0 into the constant array,
-  implicit-multisample surfaces, the resource-copy fallback through guest memory,
-  video. The shader blitter is in, both paths: a blit whose ends disagree
+  when a stream asks: advanced blend equations, a layered image bound as a subset of its
+  levels or layers, the C's bridge of UBO 0 into the constant array, the resource-copy
+  fallback through guest memory, video. The shader blitter is in, both paths: a blit whose ends disagree
   about their swizzle, that swaps red and blue for an IOSurface-backed end, or that has
   to convert a colourspace by hand, runs as a textured quad in the blitter's own shared
   GL context, and `blit.score` pins five such blits against the C. A blit whose two ends
