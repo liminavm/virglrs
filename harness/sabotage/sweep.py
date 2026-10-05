@@ -2647,6 +2647,20 @@ SABOTAGES = [
         'the_checks_refuse_what_the_c_refuses',
     ),
     (
+        'a transfer box is sized in 32 bits before it is checked',
+        'src/vrend/transfer.rs',
+        """    desc.size_2d(desc.stride(extent(r.width)), extent(r.height))""",
+        """    Some((desc.blocks_wide(extent(r.width)) * desc.block_bytes()) as u64 * desc.blocks_high(extent(r.height)) as u64)""",
+        'a_transfer_box_too_large_to_size_is_refused',
+    ),
+    (
+        'a transfer box too large for a u64 is sized anyway',
+        'src/vrend/transfer.rs',
+        """        .and_then(|layer| layer.checked_mul(extent(r.depth) as u64))""",
+        """        .map(|layer| layer * extent(r.depth) as u64)""",
+        'kani:a_box_of_any_size_is_sized_without_overflow',
+    ),
+    (
         'the texture-target table panics on a buffer',
         'src/vrend/resource.rs',
         """        TextureTarget::Buffer => return None,""",

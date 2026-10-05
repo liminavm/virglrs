@@ -15,7 +15,7 @@
 //! `GLuint`, and a box past 4 GiB wraps into an accepted transfer.
 
 use super::features::{Feature, Features};
-use super::formats::{Entry, Table};
+use super::formats::{Description, Entry, Table};
 use super::gl::gles::*;
 use super::gl::{BoundProgram, GLenum, GLint, GLsizei, Gl, TextureName, pixel_bytes};
 use super::proto::{Box3, Format};
@@ -204,7 +204,7 @@ fn layout(res: &Resource, info: &Info, size: u64) -> Result<Layout, Error> {
         }
         info.stride as u64
     } else {
-        desc.stride(res.width_at(info.level)) as u64
+        desc.stride(res.width_at(info.level))
     };
     let layer_stride = if info.layer_stride != 0 {
         if (info.layer_stride as u64) < blocks_high * stride {
@@ -238,7 +238,7 @@ fn layout(res: &Resource, info: &Info, size: u64) -> Result<Layout, Error> {
 /// than one it sizes by guessing.
 pub fn level_span(res: &Resource, level: u32) -> Option<u64> {
     let desc = res.args.format.describe()?;
-    let stride = desc.stride(res.width_at(level)) as u64;
+    let stride = desc.stride(res.width_at(level));
     let rows = desc.blocks_high(res.height_at(level)) as u64;
     Some(stride * rows * res.depth_at(level).max(1) as u64)
 }
@@ -247,13 +247,17 @@ pub fn level_span(res: &Resource, level: u32) -> Option<u64> {
 /// strides in the pages. Zero for a format this tree cannot describe, which the transfer will
 /// refuse anyway.
 pub fn box_bytes(res: &Resource, info: &Info) -> u64 {
-    let Some(desc) = res.args.format.describe() else {
-        return 0;
-    };
-    let r = &info.region;
-    desc.stride(r.width.max(0) as u32) as u64
-        * desc.blocks_high(r.height.max(0) as u32) as u64
-        * r.depth.max(0) as u64
+    res.args.format.describe().map_or(0, |desc| tight_bytes(desc, &info.region))
+}
+
+/// The bytes `r` spans laid out tight in `desc`'s blocks. The box is the guest's and not yet
+/// checked against anything, so a size that does not fit a `u64` is zero: the transfer that
+/// follows refuses a box that large as outside the resource.
+fn tight_bytes(desc: &Description, r: &Box3) -> u64 {
+    let extent = |v: i32| v.max(0) as u32;
+    desc.size_2d(desc.stride(extent(r.width)), extent(r.height))
+        .and_then(|layer| layer.checked_mul(extent(r.depth) as u64))
+        .unwrap_or(0)
 }
 
 /// The whole of a level, as the box a capture reads and a restore writes.
@@ -615,7 +619,7 @@ impl PagedBox {
         let desc = res.args.format.describe().ok_or(Error::Unsupported)?;
         let start = (0..level).try_fold(0u64, |at, l| Some(at + level_span(res, l)?));
         let start = start.ok_or(Error::Unsupported)?;
-        let stride = desc.stride(res.width_at(level)) as u64;
+        let stride = desc.stride(res.width_at(level));
         let layer_stride = desc.blocks_high(res.height_at(level)) as u64 * stride;
         let offset = start
             + region.z as u64 * layer_stride
@@ -952,16 +956,14 @@ pub fn read_whole_2d(
 ) -> Result<(), Error> {
     let desc = res.args.format.describe().ok_or(Error::Unsupported)?;
     let (w, h) = (res.args.width, res.args.height);
-    let stride = desc.stride(w) as usize;
-    // Widened deliberately. `size_2d` is `blocks_high * stride` in u32, and a resource large
-    // enough to wrap that product would pass a guard computed from it while GL still wrote the
-    // real number of rows -- past the end of a `dst` this function had just called big enough.
-    // Today's only caller refuses anything over 128x128 before it gets here, so nothing reaches
-    // that; the guard is this function's own contract rather than its caller's, and a public
-    // helper should not depend on who happens to call it.
-    if (dst.len() as u64) < desc.blocks_high(h) as u64 * stride as u64 {
+    // GL writes every row of the image, so `dst` must hold them all. Today's only caller refuses
+    // anything over 128x128 before it gets here; the guard is this function's own contract
+    // rather than its caller's, and a public helper should not depend on who happens to call it.
+    let image = desc.size_2d(desc.stride(w), h).ok_or(Error::Unsupported)?;
+    if (dst.len() as u64) < image {
         return Err(Error::Unsupported);
     }
+    let stride = desc.stride(w) as usize;
     if features.api().is_gles() {
         read_layer(gl, features, formats, res, 0, 0, 0, 0, w as GLsizei, h as GLsizei, dst)?;
         // Stored as RGBA and swapped on upload, so swapped back here, as `read` does.
@@ -1218,6 +1220,43 @@ fn read_box_whole_level(
     }
     gl.bind_texture(t.target, None);
     Ok(())
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// One format of each block shape the table has: a byte, a 12-byte RGB triple, sixteen
+    /// bytes, and 4x4 and 12x12 compressed blocks. Each is concrete, so its divisors are; a
+    /// format Kani picks makes every one of them symbolic and the proof does not finish.
+    const SHAPES: [u32; 5] = [64, 30, 31, 105, 292];
+
+    fn any_box() -> Box3 {
+        Box3 {
+            x: kani::any(),
+            y: kani::any(),
+            z: kani::any(),
+            width: kani::any(),
+            height: kani::any(),
+            depth: kani::any(),
+        }
+    }
+
+    /// A transfer's box is sized before anything checks it, so sizing it must not overflow or
+    /// panic for any box the wire can carry, in a format of any block shape: Kani fails the proof
+    /// on either. The exact sizes are the unit tests'; asking Kani to equate the result with a
+    /// second product of the same symbolic extents is a multiplier miter, and does not finish.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn a_box_of_any_size_is_sized_without_overflow() {
+        for wire in SHAPES {
+            let desc = Format::from_wire(wire).and_then(Format::describe).expect("a table format");
+            let r = any_box();
+            let got = tight_bytes(desc, &r);
+            kani::cover!(got == 0 && r.width > 0 && r.height > 0 && r.depth > 0, "too large");
+            kani::cover!(got > u32::MAX as u64, "past 32 bits");
+        }
+    }
 }
 
 #[cfg(test)]

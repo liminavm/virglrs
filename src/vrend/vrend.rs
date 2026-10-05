@@ -974,7 +974,11 @@ impl Vrend {
         }
         let desc = res.args.format.describe()?;
         let mut pixels =
-            vec![0u8; desc.size_2d(desc.stride(res.args.width), res.args.height) as usize];
+            vec![
+                0u8;
+                usize::try_from(desc.size_2d(desc.stride(res.args.width), res.args.height)?)
+                    .ok()?
+            ];
         transfer::read_whole_2d(&self.gl, &self.features, &self.formats, res, &mut pixels).ok()?;
         Some(Cursor { width: res.args.width, height: res.args.height, pixels })
     }
@@ -2789,7 +2793,7 @@ mod tests {
             let desc = format.describe().expect("described");
             // Two blocks by two, so the box has rows and columns of blocks to get in order.
             let (w, h) = (8u32, 8u32);
-            let stride = desc.stride(w);
+            let stride = desc.stride(w) as u32;
             let layer = stride * desc.blocks_high(h);
             let res = ResourceHandle::new(1).expect("non-zero");
             v.resource_create(
@@ -3079,7 +3083,7 @@ mod tests {
             let desc = rgtc1.describe().expect("described");
             // Two blocks by two, so the rows of blocks have an order to keep.
             let (w, h) = (8u32, 8u32);
-            let stride = desc.stride(w);
+            let stride = desc.stride(w) as u32;
             let layer = stride * desc.blocks_high(h);
             let res = ResourceHandle::new(1).expect("non-zero");
             v.resource_create(
@@ -3229,6 +3233,95 @@ mod tests {
         }
     }
 
+    /// A transfer's box is the guest's own, and the renderer sizes it before it checks it against
+    /// the resource. A box whose bytes overflow any integer is refused like any other box outside
+    /// the resource, not left to overflow: with overflow checks on, which a dev build of any
+    /// consumer has, that overflow aborts the process.
+    #[test]
+    fn a_transfer_box_too_large_to_size_is_refused() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::{Box3, Command, Transfer};
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &AllAttached).expect("a context");
+        let rgba = super::super::proto::Format::from_wire(67).expect("R8G8B8A8_UNORM");
+        assert_eq!(rgba.name(), "R8G8B8A8_UNORM");
+        let res = ResourceHandle::new(1).expect("non-zero");
+        v.resource_create(
+            res,
+            resource::Args {
+                target: TextureTarget::Texture2d,
+                format: rgba,
+                bind: resource::Bind::SAMPLER_VIEW,
+                width: 16,
+                height: 16,
+                depth: 1,
+                array_size: 1,
+                last_level: 0,
+                nr_samples: 0,
+                flags: resource::ResourceFlags(0),
+            },
+        )
+        .expect("a texture");
+        // Each extent alone, then all three: a row of 2^31 four-byte texels overflows a u32, and
+        // the three together overflow a u64.
+        let max = i32::MAX;
+        for (width, height, depth) in [(max, 1, 1), (1, max, max), (max, max, max)] {
+            let mut wire = Vec::new();
+            encode(
+                &Command::ResourceInlineWrite {
+                    transfer: Transfer {
+                        resource: res,
+                        level: 0,
+                        usage: 0,
+                        stride: 0,
+                        layer_stride: 0,
+                        region: Box3 { x: 0, y: 0, z: 0, width, height, depth },
+                    },
+                    data: &[0; 4],
+                },
+                &mut wire,
+            );
+            let ran = v.submit(ctx, &wire, &AllAttached).expect("the context is here");
+            assert!(
+                matches!(ran, Err(Fault::Transfer { error: transfer::Error::BoxOutOfRange, .. })),
+                "{width}x{height}x{depth}: {ran:?}"
+            );
+        }
+    }
+
     /// A copy between two textures no framebuffer can hold, on a driver without
     /// `glCopyImageSubData`, lands on desktop GL: the source level is read with
     /// `glGetCompressedTexImage` and the box is written into the destination. The box is one
@@ -3285,7 +3378,7 @@ mod tests {
             v.context_create(ctx, &AllAttached).expect("a context");
             let desc = rgtc1.describe().expect("described");
             let (w, h) = (8u32, 8u32);
-            let stride = desc.stride(w);
+            let stride = desc.stride(w) as u32;
             let layer = stride * desc.blocks_high(h);
             let block = desc.block_bytes() as usize;
             let info = transfer::Info {

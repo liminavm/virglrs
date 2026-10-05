@@ -978,9 +978,13 @@ it survives the session it was found in.
     single-threaded code and cannot see into C. It pays where control flow is fixed, data is
     wide, and nothing allocates: `RingLayout::parse` is proved equal to its rules for every value
     of every `usize` field (`src/venus/ring.rs`), the decoder's `read_bytes`, `peek_bytes` and
-    arena charge for every length a guest can send (`src/venus/cs.rs`), and `Iov::walk_from` for
-    every list of up to three entries of any 32-bit length (`src/guest_mem.rs`), each in under a
-    minute and a gigabyte. Code that grows a `Vec` or branches on accumulated state does not fit: the
+    arena charge for every length a guest can send (`src/venus/cs.rs`), `Iov::walk_from` for
+    every list of up to three entries of any 32-bit length (`src/guest_mem.rs`), and a transfer
+    box's size for any box the wire carries in every block shape (`src/vrend/transfer.rs`), each
+    in under a minute and a gigabyte. Multiplying symbolic values is affordable; asserting that a
+    product equals a second product of the same values is a multiplier miter, which ran past 25
+    minutes with no verdict, so such a harness proves freedom from overflow and leaves the exact
+    values to unit tests. Code that grows a `Vec` or branches on accumulated state does not fit: the
     object table reached 22 GB with no verdict, and `sync::decode`, which builds its result
     vector, ran past 10 minutes at 6 GB. The harness counts as much as the code: comparing two
     slices of symbolic length unrolls `memcmp` without bound, so a harness compares one index

@@ -145,14 +145,16 @@ impl Description {
         depth.div_ceil(self.block.depth)
     }
 
-    /// `util_format_get_stride`: the bytes one row of blocks takes.
-    pub fn stride(&self, width: u32) -> u32 {
-        self.blocks_wide(width) * self.block_bytes()
+    /// `util_format_get_stride`: the bytes one row of blocks takes. Wide enough for any width:
+    /// a guest's width reaches this unchecked, and the C's `u32` wraps.
+    pub fn stride(&self, width: u32) -> u64 {
+        self.blocks_wide(width) as u64 * self.block_bytes() as u64
     }
 
-    /// `util_format_get_2d_size`: the bytes a `height`-pixel image takes at `stride`.
-    pub fn size_2d(&self, stride: u32, height: u32) -> u32 {
-        self.blocks_high(height) * stride
+    /// `util_format_get_2d_size`: the bytes a `height`-pixel image takes at `stride`, if that
+    /// fits a `u64`.
+    pub fn size_2d(&self, stride: u64, height: u32) -> Option<u64> {
+        (self.blocks_high(height) as u64).checked_mul(stride)
     }
 
     pub fn is_plain(&self) -> bool {
@@ -726,7 +728,7 @@ mod tests {
         let (_, bgra) = by_name("B8G8R8A8_UNORM");
         assert_eq!(bgra.block_bytes(), 4);
         assert_eq!(bgra.stride(33), 132);
-        assert_eq!(bgra.size_2d(132, 7), 924);
+        assert_eq!(bgra.size_2d(132, 7), Some(924));
         assert!(bgra.is_plain() && !bgra.is_compressed() && bgra.has_alpha());
 
         let (_, dxt1) = by_name("DXT1_RGB");

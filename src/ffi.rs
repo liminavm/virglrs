@@ -1223,6 +1223,11 @@ pub extern "C" fn virgl_renderer_resource_get_info(
         // reading whatever was in its struct before the call and believing this put it there.
         let (virgl_format, width, height, depth, flags, stride) =
             described.unwrap_or((0, 0, 0, 0, 0, 0));
+        // The C's field is 32 bits and its computation wraps; a pitch that does not fit is a
+        // resource this cannot describe, not a smaller number.
+        let Ok(stride) = u32::try_from(stride) else {
+            return EINVAL;
+        };
         // The scanout's whole description, as the VMM will read it. `tex_id` in particular: a
         // VMM with a GL display hands that name to its own compositor, so two live resources
         // reporting one name is a corrupted display rather than a wrong number.
