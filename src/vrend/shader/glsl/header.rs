@@ -25,8 +25,117 @@ fn emit_ext(ctx: &mut Context<'_>, name: &str, verb: &str) {
     ctx.bufs.ver_ext(&format!("#extension GL_{name} : {verb}\n"));
 }
 
-/// `emit_header`, GLES leg.
+/// `shader_req_table`: the extension a desktop shader requires for each requirement bit, in the
+/// order the C emits them.
+const SHADER_REQ_TABLE: [(u64, &str); 31] = [
+    (req::SAMPLER_RECT, "ARB_texture_rectangle"),
+    (req::CUBE_ARRAY, "ARB_texture_cube_map_array"),
+    (req::INTS, "ARB_shader_bit_encoding"),
+    (req::SAMPLER_MS, "ARB_texture_multisample"),
+    (req::INSTANCE_ID, "ARB_draw_instanced"),
+    (req::LODQ, "ARB_texture_query_lod"),
+    (req::TXQ_LEVELS, "ARB_texture_query_levels"),
+    (req::TG4, "ARB_texture_gather"),
+    (req::VIEWPORT_IDX, "ARB_viewport_array"),
+    (req::STENCIL_EXPORT, "ARB_shader_stencil_export"),
+    (req::LAYER, "ARB_fragment_layer_viewport"),
+    (req::SAMPLE_SHADING, "ARB_sample_shading"),
+    (req::GPU_SHADER5, "ARB_gpu_shader5"),
+    (req::DERIVATIVE_CONTROL, "ARB_derivative_control"),
+    (req::FP64, "ARB_gpu_shader_fp64"),
+    (req::IMAGE_LOAD_STORE, "ARB_shader_image_load_store"),
+    (req::ES31_COMPAT, "ARB_ES3_1_compatibility"),
+    (req::IMAGE_SIZE, "ARB_shader_image_size"),
+    (req::TXQS, "ARB_shader_texture_image_samples"),
+    (req::FBFETCH, "EXT_shader_framebuffer_fetch"),
+    (req::SHADER_CLOCK, "ARB_shader_clock"),
+    (req::SHADER_INTEGER_FUNC, "MESA_shader_integer_functions"),
+    (req::SHADER_ATOMIC_FLOAT, "NV_shader_atomic_float"),
+    (req::CONSERVATIVE_DEPTH, "ARB_conservative_depth"),
+    (req::BLEND_EQUATION_ADVANCED, "KHR_blend_equation_advanced"),
+    (req::TEXTURE_SHADOW_LOD, "EXT_texture_shadow_lod"),
+    (req::AMD_VS_LAYER, "AMD_vertex_shader_layer"),
+    (req::AMD_VIEWPORT_IDX, "AMD_vertex_shader_viewport_index"),
+    (req::SHADER_DRAW_PARAMETERS, "ARB_shader_draw_parameters"),
+    (req::SHADER_GROUP_VOTE, "ARB_shader_group_vote"),
+    (req::EXPLICIT_UNIFORM_LOCATION, "ARB_explicit_uniform_location"),
+];
+
+/// `emit_header`.
 pub(super) fn emit_header(ctx: &mut Context<'_>) {
+    if ctx.cfg.is_gles() {
+        emit_header_es(ctx);
+    } else {
+        emit_header_core(ctx);
+    }
+}
+
+/// `emit_header`, desktop leg: the lowest `#version` the shader needs, and an extension for each
+/// requirement the walk found.
+fn emit_header_core(ctx: &mut Context<'_>) {
+    let bits = ctx.shader_req_bits;
+    if ctx.prog_type == Processor::Compute {
+        ctx.bufs.ver_ext("#version 330\n");
+        emit_ext(ctx, "ARB_compute_shader", "require");
+    } else if ctx.glsl_ver_required > 150 {
+        ctx.bufs.ver_ext(&format!("#version {}\n", ctx.glsl_ver_required));
+    } else if matches!(
+        ctx.prog_type,
+        Processor::Geometry | Processor::TessEval | Processor::TessCtrl
+    ) || ctx.glsl_ver_required == 150
+    {
+        ctx.bufs.ver_ext("#version 150\n");
+    } else if ctx.glsl_ver_required == 140 {
+        ctx.bufs.ver_ext("#version 140\n");
+    } else {
+        ctx.bufs.ver_ext("#version 130\n");
+    }
+
+    if bits & req::ENHANCED_LAYOUTS != 0 {
+        emit_ext(ctx, "ARB_enhanced_layouts", "require");
+    }
+    if bits & req::SEPERATE_SHADER_OBJECTS != 0 {
+        emit_ext(ctx, "ARB_separate_shader_objects", "require");
+    }
+    if bits & req::EXPLICIT_ATTRIB_LOCATION != 0 {
+        emit_ext(ctx, "ARB_explicit_attrib_location", "require");
+    }
+    if bits & req::ARRAYS_OF_ARRAYS != 0 {
+        emit_ext(ctx, "ARB_arrays_of_arrays", "require");
+    }
+    if matches!(ctx.prog_type, Processor::TessCtrl | Processor::TessEval) {
+        emit_ext(ctx, "ARB_tessellation_shader", "require");
+    }
+    // The C's `use_explicit_locations` is never set, so its vertex-stage
+    // `ARB_explicit_attrib_location` is never emitted.
+    if ctx.prog_type == Processor::Fragment && ctx.fs_emit_layout() {
+        emit_ext(ctx, "ARB_fragment_coord_conventions", "require");
+    }
+    if ctx.ubo_used_mask != 0 {
+        emit_ext(ctx, "ARB_uniform_buffer_object", "require");
+    }
+    if ctx.num_cull_dist_prop != 0 || ctx.key.num_in_cull != 0 || ctx.key.num_out_cull != 0 {
+        emit_ext(ctx, "ARB_cull_distance", "require");
+    }
+    if ctx.ssbo_used_mask != 0 {
+        emit_ext(ctx, "ARB_shader_storage_buffer_object", "require");
+    }
+    if !ctx.abo_idx.is_empty() {
+        emit_ext(ctx, "ARB_shader_atomic_counters", "require");
+        emit_ext(ctx, "ARB_shader_atomic_counter_ops", "require");
+    }
+    for (bit, name) in SHADER_REQ_TABLE {
+        if bit == req::SAMPLER_RECT && ctx.glsl_ver_required >= 140 {
+            continue;
+        }
+        if bits & bit != 0 {
+            emit_ext(ctx, name, "require");
+        }
+    }
+}
+
+/// `emit_header`, GLES leg.
+fn emit_header_es(ctx: &mut Context<'_>) {
     let bits = ctx.shader_req_bits;
     ctx.bufs.ver_ext(&format!("#version {} es\n", ctx.cfg.glsl_version));
 
@@ -152,9 +261,9 @@ fn aux_string(location: Location) -> &'static str {
 /// `emit_sampler_decl`.
 fn emit_sampler_decl(ctx: &mut Context<'_>, i: u32, range: i32, sampler: Sampler) {
     let sname = proc_prefix(ctx.prog_type);
-    let precision = "highp";
+    let precision = if ctx.cfg.is_gles() { "highp" } else { "" };
     let ptc = sampler_return_conv(sampler.ret);
-    let stc = sampler_type_conv(sampler.ty).unwrap_or("");
+    let stc = sampler_type_conv(ctx.cfg.dialect, sampler.ty).unwrap_or("");
     let is_shad = samplertype_is_shadow(sampler.ty);
     if range != 0 {
         hdr!(
@@ -181,12 +290,13 @@ fn emit_sampler_decl(ctx: &mut Context<'_>, i: u32, range: i32, sampler: Sampler
 fn emit_image_decl(ctx: &mut Context<'_>, i: u32, range: i32, image: Image) {
     let volatile_str = if image.vflag { "volatile " } else { "" };
     let coherent_str = if image.coherent { "coherent " } else { "" };
-    let precision = "highp ";
+    let gles = ctx.cfg.is_gles();
+    let precision = if gles { "highp " } else { "" };
     let mut access = "";
     let (formatstr, itype) = internalformat_string(image.decl.format);
     let ptc = sampler_return_conv(itype);
     let sname = proc_prefix(ctx.prog_type);
-    let stc = sampler_type_conv(image.decl.resource).unwrap_or("");
+    let stc = sampler_type_conv(ctx.cfg.dialect, image.decl.resource).unwrap_or("");
 
     // From ARB_shader_image_load_store: an image used for loads or atomics must carry a format
     // qualifier matching its unit; one used only for stores need not, but a declared one must
@@ -195,23 +305,26 @@ fn emit_image_decl(ctx: &mut Context<'_>, i: u32, range: i32, image: Image) {
     let r32 = matches!(formatstr, "r32f" | "r32i" | "r32ui");
     if !image.decl.writable {
         access = "readonly ";
-    } else if image.decl.format == 0 || !r32 {
+    } else if image.decl.format == 0 || (gles && !r32) {
         access = "writeonly ";
         require_format_specifier = !formatstr.is_empty();
     }
 
     let binding = i + u32::from(ctx.key.image_binding_offset);
+    let loc_bind = if gles { "binding" } else { "location" };
     if require_format_specifier {
         hdr!(
             ctx.bufs,
-            "layout(binding={}, {}) ",
+            "layout({}={}, {}) ",
+            loc_bind,
             binding,
             if formatstr.is_empty() { "rgba32f" } else { formatstr }
         );
     } else {
         hdr!(
             ctx.bufs,
-            "layout(binding={}{}{}) ",
+            "layout({}={}{}{}) ",
+            loc_bind,
             binding,
             if formatstr.is_empty() { ", rgba32f" } else { ", " },
             formatstr
@@ -329,7 +442,7 @@ fn emit_ios_common(ctx: &mut Context<'_>) -> u32 {
         }
     }
 
-    if ctx.gles_use_tex_query_level {
+    if ctx.cfg.is_gles() && ctx.gles_use_tex_query_level {
         hdr!(
             ctx.bufs,
             "uniform int {}_texlod[{}];\n",
@@ -807,7 +920,19 @@ fn depth_layout(layout: u32) -> Option<&'static str> {
 
 /// `emit_ios_fs`.
 fn emit_ios_fs(ctx: &mut Context<'_>) {
-    // `fs_emit_layout` only chooses a `gl_FragCoord` layout on desktop GL.
+    let gles = ctx.cfg.is_gles();
+    // GLES has no `gl_FragCoord` layout: there the position input is offset instead.
+    if ctx.fs_emit_layout() && !gles {
+        let upper_left = ctx.fs_lower_left_origin == ctx.key.fs.lower_left_origin;
+        let comma = if upper_left && ctx.fs_integer_pixel_center { ',' } else { ' ' };
+        hdr!(
+            ctx.bufs,
+            "layout({}{}{}) in vec4 gl_FragCoord;\n",
+            if upper_left { "origin_upper_left" } else { "" },
+            comma,
+            if ctx.fs_integer_pixel_center { "pixel_center_integer" } else { "" }
+        );
+    }
     if ctx.early_depth_stencil {
         ctx.bufs.hdr("layout(early_fragment_tests) in;\n");
     }
@@ -820,13 +945,15 @@ fn emit_ios_fs(ctx: &mut Context<'_>) {
         let mut prefix = "";
         let mut auxprefix = "";
 
-        if input.name == Semantic::Color
+        if gles
+            && input.name == Semantic::Color
             && u32::from(ctx.key.fs.available_color_in_bits) & bit32(input.sid) == 0
         {
             hdr!(ctx.bufs, "vec4 {} = vec4(0.0, 0.0, 0.0, 0.0);\n", input.glsl_name);
             continue;
         }
-        if input.name == Semantic::BColor
+        if gles
+            && input.name == Semantic::BColor
             && u32::from(ctx.key.fs.available_color_in_bits) & (bit32(input.sid) << 2) == 0
         {
             hdr!(ctx.bufs, "vec4 {} = vec4(0.0, 0.0, 0.0, 0.0);\n", input.glsl_name);
@@ -869,6 +996,10 @@ fn emit_ios_fs(ctx: &mut Context<'_>) {
             "vec4"
         };
         for i in 0..ctx.cfg.max_draw_buffers {
+            if !gles {
+                hdr!(ctx.bufs, "out {} fsout_c{};\n", ty, i);
+                continue;
+            }
             if ctx.key.fs.logicop_func.is_some() {
                 hdr!(ctx.bufs, "{} fsout_tmp_c{};\n", ty, i);
             }
@@ -890,11 +1021,12 @@ fn emit_ios_fs(ctx: &mut Context<'_>) {
         for i in 0..ctx.outputs.len() {
             let output = ctx.outputs[i].clone();
             if !output.glsl_predefined_no_emit {
-                let prefix = if output.name == Semantic::Color && !ctx.cfg.has_dual_src_blend {
-                    format!("layout(location = {})", output.sid)
-                } else {
-                    String::new()
-                };
+                let prefix =
+                    if gles && output.name == Semantic::Color && !ctx.cfg.has_dual_src_blend {
+                        format!("layout(location = {})", output.sid)
+                    } else {
+                        String::new()
+                    };
                 emit_ios_generic(
                     ctx,
                     IoDir::Out,
@@ -1351,6 +1483,9 @@ fn iter_vs_declaration(ctx: &mut Context<'_>, decl: &Declaration) {
         }
         Semantic::Patch | Semantic::Generic if (io.first != io.last || io.array_id > 0) => {
             ctx.guest_sent_io_arrays = true;
+            if !ctx.cfg.is_gles() {
+                ctx.shader_req_bits |= req::ARRAYS_OF_ARRAYS;
+            }
         }
         _ => {}
     }

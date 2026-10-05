@@ -91,7 +91,10 @@ pub(super) mod req {
     pub const PSIZE: u64 = 1 << 21;
     pub const IMAGE_ATOMIC: u64 = 1 << 22;
     pub const CLIP_DISTANCE: u64 = 1 << 23;
+    pub const ENHANCED_LAYOUTS: u64 = 1 << 24;
     pub const SEPERATE_SHADER_OBJECTS: u64 = 1 << 25;
+    pub const ARRAYS_OF_ARRAYS: u64 = 1 << 26;
+    pub const SHADER_INTEGER_FUNC: u64 = 1 << 27;
     pub const SHADER_ATOMIC_FLOAT: u64 = 1 << 28;
     pub const NV_IMAGE_FORMATS: u64 = 1 << 29;
     pub const CONSERVATIVE_DEPTH: u64 = 1 << 30;
@@ -102,6 +105,7 @@ pub(super) mod req {
     pub const SHADER_NOPERSPECTIVE_INTERPOLATION: u64 = 1 << 35;
     pub const TEXTURE_SHADOW_LOD: u64 = 1 << 36;
     pub const AMD_VS_LAYER: u64 = 1 << 37;
+    pub const AMD_VIEWPORT_IDX: u64 = 1 << 38;
     pub const SHADER_DRAW_PARAMETERS: u64 = 1 << 39;
     pub const SHADER_GROUP_VOTE: u64 = 1 << 40;
     pub const EXPLICIT_UNIFORM_LOCATION: u64 = 1 << 41;
@@ -637,14 +641,25 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// `fs_emit_layout`: whether the fragment stage declares a `gl_FragCoord` layout. An
+    /// integer pixel center always does; an origin does when the shader's and the framebuffer's
+    /// agree, which is when the two flips cancel into the upper-left convention.
+    pub fn fs_emit_layout(&self) -> bool {
+        self.fs_integer_pixel_center || self.fs_lower_left_origin == self.key.fs.lower_left_origin
+    }
+
     /// `require_glsl_ver`.
     pub fn require_glsl_ver(&self, v: u32) -> u32 {
         v.max(self.glsl_ver_required)
     }
 
-    /// `prefer_generic_io_block`, GLES leg: arrays of arrays are never preferred on GLES, so
-    /// the answer depends only on the stage and the direction.
+    /// `prefer_generic_io_block`: arrays of arrays where desktop GL has them, and otherwise
+    /// blocks for the stages whose inputs must be arrays -- but never for the fragment stage,
+    /// whose `interpolateAt*` cannot dereference a block member.
     pub fn prefer_generic_io_block(&self, io: IoDir) -> bool {
+        if self.cfg.has_arrays_of_arrays && !self.cfg.is_gles() {
+            return false;
+        }
         match self.prog_type {
             Processor::Fragment => false,
             Processor::TessCtrl => true,
@@ -1041,6 +1056,12 @@ pub fn convert(
     if ctx.bufs.required_sysval_uniform_decls != 0 {
         ctx.glsl_ver_required = ctx.require_glsl_ver(140);
     }
+    if !cfg.is_gles()
+        && !key.in_arrays.layout.is_empty()
+        && matches!(ctx.prog_type, Processor::Geometry | Processor::TessCtrl | Processor::TessEval)
+    {
+        ctx.shader_req_bits |= req::ARRAYS_OF_ARRAYS;
+    }
 
     if ctx.prog_type == Processor::Fragment {
         // The C's qsort is not stable; two outputs of one semantic and index are declared
@@ -1049,13 +1070,13 @@ pub fn convert(
         ctx.outputs.sort_by_key(|l| (l.name as u8, l.sid));
     }
 
-    // The C gates this on `glsl_version < 320` for GLES and `>= 320` for desktop, which
-    // between them is every version.
+    // The C gates this on `glsl_version < 320` for GLES and `>= 320` for either, which between
+    // them is every GLES version and every desktop one this renderer runs on (3.30 and up).
     let fs_info = &key.fs_info;
     if !fs_info.interps.is_empty() && fs_info.has_sample_input {
         ctx.shader_req_bits |= req::GPU_SHADER5;
     }
-    if !fs_info.interps.is_empty() && fs_info.has_noperspective {
+    if !fs_info.interps.is_empty() && fs_info.has_noperspective && cfg.is_gles() {
         ctx.shader_req_bits |= req::SHADER_NOPERSPECTIVE_INTERPOLATION;
     }
 
@@ -1225,13 +1246,14 @@ pub fn create_passthrough_tcs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vrend::shader::MAX_SHADER_IMAGES;
+    use crate::vrend::shader::{Dialect, MAX_SHADER_IMAGES};
     use crate::vrend::tgsi::fixture;
 
     /// The host's configuration when the corpus was recorded: GLES 3.1 on zink over
     /// KosmicKrisp, as `vrend_renderer.c` fills `shader_cfg`.
     pub(crate) fn corpus_cfg() -> Config {
         Config {
+            dialect: Dialect::Es,
             glsl_version: 310,
             max_draw_buffers: 8,
             max_shader_patch_varyings: 30,
@@ -1249,10 +1271,32 @@ mod tests {
         }
     }
 
-    fn translate(block: &fixture::Block, key: &Key) -> String {
+    /// The host's configuration when the desktop corpus was recorded: desktop GL 4.6 core on
+    /// iris, as `vrend_renderer.c` fills `shader_cfg` there.
+    pub(crate) fn desktop_corpus_cfg() -> Config {
+        Config {
+            dialect: Dialect::Core,
+            glsl_version: 460,
+            max_draw_buffers: 8,
+            max_shader_patch_varyings: 32,
+            has_arrays_of_arrays: true,
+            has_gpu_shader5: true,
+            has_es31_compat: true,
+            has_conservative_depth: true,
+            has_dual_src_blend: true,
+            has_fbfetch_coherent: true,
+            has_cull_distance: true,
+            has_nopersective: true,
+            has_texture_shadow_lod: true,
+            has_vs_layer: true,
+            has_vs_viewport_index: true,
+        }
+    }
+
+    fn translate(cfg: &Config, block: &fixture::Block, key: &Key) -> String {
         let shader = tgsi::text::parse(block.tgsi.as_bytes(), u32::MAX).expect("the corpus parses");
         let program = tgsi::Program::scan(shader).expect("the corpus scans");
-        let (strings, _, _) = convert(&corpus_cfg(), &program, 0, key, &StreamOutput::default())
+        let (strings, _, _) = convert(cfg, &program, 0, key, &StreamOutput::default())
             .unwrap_or_else(|e| panic!("{e}"));
         strings.source()
     }
@@ -1263,8 +1307,17 @@ mod tests {
     /// interpolated -- and the C's header names it: an interpolation qualifier on a generic
     /// is the fragment stage's, and a generic declared for the other stage's sake is one it
     /// expected. This reads those back into a key.
-    fn key_from_glsl(processor: Processor, glsl: &str) -> Key {
+    fn key_from_glsl(shader: &Shader, glsl: &str) -> Key {
+        let processor = shader.processor;
         let mut key = Key::default();
+        // A desktop fragment stage declares `origin_upper_left` exactly when its origin and the
+        // framebuffer's agree. GLES declares no origin, so there the key's is left alone.
+        let es = glsl.lines().next().is_some_and(|l| l.ends_with(" es"));
+        if processor == Processor::Fragment && !es {
+            let fs_lower = shader.property(tgsi::Property::FsCoordOrigin).unwrap_or(0) != 0;
+            let agree = glsl.contains("origin_upper_left");
+            key.fs.lower_left_origin = if agree { fs_lower } else { !fs_lower };
+        }
         for line in glsl.lines() {
             let words: Vec<&str> = line.split_whitespace().collect();
             let Some(name) = words.last().and_then(|w| w.strip_suffix(';')) else {
@@ -1299,15 +1352,14 @@ mod tests {
         key
     }
 
-    /// Every block of the corpus translates to the C's GLSL, byte for byte.
-    #[test]
-    fn every_corpus_shader_translates_to_the_c_glsl() {
+    /// The blocks of `blocks` that translate under `cfg` to something other than the C's GLSL.
+    fn differing(cfg: &Config, blocks: &[fixture::Block]) -> Vec<usize> {
         let mut failures = Vec::new();
-        for (i, block) in fixture::blocks().iter().enumerate() {
+        for (i, block) in blocks.iter().enumerate() {
             let shader =
                 tgsi::text::parse(block.tgsi.as_bytes(), u32::MAX).expect("the corpus parses");
-            let key = key_from_glsl(shader.processor, block.glsl);
-            let glsl = translate(block, &key);
+            let key = key_from_glsl(&shader, block.glsl);
+            let glsl = translate(cfg, block, &key);
             if glsl != block.glsl {
                 failures.push(i);
                 if std::env::var_os("VIRGLRS_TEST_VERBOSE").is_some() {
@@ -1315,6 +1367,22 @@ mod tests {
                 }
             }
         }
+        failures
+    }
+
+    /// Every block of the corpus translates to the C's GLSL, byte for byte.
+    #[test]
+    fn every_corpus_shader_translates_to_the_c_glsl() {
+        let failures = differing(&corpus_cfg(), &fixture::blocks());
+        assert!(failures.is_empty(), "shaders differing from the C: {failures:?}");
+    }
+
+    /// The same corpus on a desktop GL host translates to the C's desktop GLSL, byte for byte:
+    /// the lowest `#version` each shader needs, an extension per requirement, no precision
+    /// qualifiers and no fragment output locations.
+    #[test]
+    fn every_corpus_shader_translates_to_the_c_desktop_glsl() {
+        let failures = differing(&desktop_corpus_cfg(), &fixture::desktop_blocks());
         assert!(failures.is_empty(), "shaders differing from the C: {failures:?}");
     }
 

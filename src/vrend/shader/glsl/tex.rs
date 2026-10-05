@@ -127,11 +127,16 @@ pub(super) fn emit_txq(
         return;
     };
 
-    // No LOD for these texture types; RECT is emulated with a plain 2D texture, which wants
-    // LOD 0.
+    // No LOD for these texture types; but GLES emulates RECT with a plain 2D texture, which
+    // wants LOD 0.
+    let gles = ctx.cfg.is_gles();
     match texture {
-        Texture::Rect | Texture::ShadowRect => bias = ", 0".to_string(),
-        Texture::Buffer | Texture::Msaa2d | Texture::Msaa2dArray => {}
+        Texture::Rect | Texture::ShadowRect if gles => bias = ", 0".to_string(),
+        Texture::Rect
+        | Texture::ShadowRect
+        | Texture::Buffer
+        | Texture::Msaa2d
+        | Texture::Msaa2dArray => {}
         _ => bias = format!(", int({}.x)", srcs[0]),
     }
 
@@ -145,23 +150,34 @@ pub(super) fn emit_txq(
             if wm & 0x7 != 0 {
                 twm = WRITEMASK_W;
             }
-            let src = &inst.src[1];
-            let gles_sampler_index = ctx.samplers_used.count_below(sampler);
-            let sampler_str = if ctx.info.is_indirect(File::Sampler) && src.indirect {
-                format!("addr{}+{}", src.ind.index, gles_sampler_index)
+            if !gles {
+                emit!(
+                    ctx.bufs,
+                    "{}{} = {}(textureQueryLevels({}));\n",
+                    dst,
+                    wm_string(twm),
+                    dtypeprefix.s(),
+                    srcs[sampler_index]
+                );
             } else {
-                format!("{gles_sampler_index}")
-            };
-            emit!(
-                ctx.bufs,
-                "{}{} = {}({}_texlod[{}]);\n",
-                dst,
-                wm_string(twm),
-                dtypeprefix.s(),
-                proc_prefix(ctx.info.processor),
-                sampler_str
-            );
-            ctx.gles_use_tex_query_level = true;
+                let src = &inst.src[1];
+                let gles_sampler_index = ctx.samplers_used.count_below(sampler);
+                let sampler_str = if ctx.info.is_indirect(File::Sampler) && src.indirect {
+                    format!("addr{}+{}", src.ind.index, gles_sampler_index)
+                } else {
+                    format!("{gles_sampler_index}")
+                };
+                emit!(
+                    ctx.bufs,
+                    "{}{} = {}({}_texlod[{}]);\n",
+                    dst,
+                    wm_string(twm),
+                    dtypeprefix.s(),
+                    proc_prefix(ctx.info.processor),
+                    sampler_str
+                );
+                ctx.gles_use_tex_query_level = true;
+            }
         }
 
         if wm & 0x7 != 0 {
@@ -188,9 +204,11 @@ pub(super) fn emit_txq(
     }
 
     if wm & 0x7 != 0 {
-        let txq_returns_vec = texture != Texture::Buffer;
+        // Desktop GL's `textureSize` of a 1D texture is a scalar.
+        let txq_returns_vec = texture != Texture::Buffer
+            && (gles || !matches!(texture, Texture::D1 | Texture::Shadow1d));
         let wm_buffer;
-        let writemask = if matches!(texture, Texture::Array1d | Texture::Shadow1dArray) {
+        let writemask = if gles && matches!(texture, Texture::Array1d | Texture::Shadow1dArray) {
             wm_buffer = format!(".xz{writemask}");
             wm_buffer.as_str()
         } else {
@@ -312,9 +330,15 @@ fn fill_offset_buffer(ctx: &mut Context<'_>, inst: &Instruction, offset_buf: &mu
             }
             let Some(imd) = ctx.imm.get(off.index as usize).copied() else {
                 // The C reads an immediate slot the program never filled: zeros.
-                return fill_immediate_offset(texture, [0; 4], off.swizzle, offset_buf);
+                return fill_immediate_offset(
+                    ctx.cfg.is_gles(),
+                    texture,
+                    [0; 4],
+                    off.swizzle,
+                    offset_buf,
+                );
             };
-            fill_immediate_offset(texture, imd.val, off.swizzle, offset_buf)
+            fill_immediate_offset(ctx.cfg.is_gles(), texture, imd.val, off.swizzle, offset_buf)
         }
         File::Temporary => {
             let temp_buf = get_temp(ctx, false, 0, i32::from(off.index));
@@ -393,6 +417,7 @@ fn fill_offset_buffer(ctx: &mut Context<'_>, inst: &Instruction, offset_buf: &mu
 
 #[must_use = "false refuses the shader, and the translation must fail on it"]
 fn fill_immediate_offset(
+    gles: bool,
     texture: Texture,
     val: [u32; 4],
     swizzle: [u8; 3],
@@ -400,8 +425,12 @@ fn fill_immediate_offset(
 ) -> bool {
     let v = |i: usize| val[(swizzle[i] & 3) as usize] as i32;
     match texture {
-        Texture::D1 | Texture::Array1d | Texture::Shadow1d | Texture::Shadow1dArray => {
+        // GLES emulates 1D with 2D textures.
+        Texture::D1 | Texture::Array1d | Texture::Shadow1d | Texture::Shadow1dArray if gles => {
             offset_buf.push_str(&format!(", ivec2({}, 0)", v(0)));
+        }
+        Texture::D1 | Texture::Array1d | Texture::Shadow1d | Texture::Shadow1dArray => {
+            offset_buf.push_str(&format!(", int({})", v(0)));
         }
         Texture::Rect
         | Texture::ShadowRect
@@ -441,7 +470,11 @@ pub(super) fn emit_lodq(
     emit!(ctx.bufs, "{} = {}(textureQueryLOD({}, ", dst, dinfo.dstconv.s(), srcs[1]);
     match inst.tex().texture {
         Texture::D1 | Texture::Array1d | Texture::Shadow1d | Texture::Shadow1dArray => {
-            emit!(ctx.bufs, "vec2({}.x, 0)", srcs[0]);
+            if ctx.cfg.is_gles() {
+                emit!(ctx.bufs, "vec2({}.x, 0)", srcs[0]);
+            } else {
+                emit!(ctx.bufs, "{}.x", srcs[0]);
+            }
         }
         Texture::D2
         | Texture::Array2d
@@ -492,6 +525,7 @@ pub(super) fn translate_tex(
     };
 
     let is_shad = samplertype_is_shadow(texture);
+    let gles = ctx.cfg.is_gles();
 
     match ctx.samplers[slot].ret {
         ReturnType::Sint => {
@@ -572,10 +606,10 @@ pub(super) fn translate_tex(
             }
         }
         Opcode::Txb | Opcode::Txl => {
-            // A 1D array is emulated with a 2D array, which has no shadow lookup with bias
+            // GLES emulates a 1D array with a 2D array, which has no shadow lookup with bias
             // unless EXT_texture_shadow_lod is there; the bias is dropped rather than
             // compiling a shader that cannot compile.
-            if !(!ctx.cfg.has_texture_shadow_lod && texture == Texture::Shadow1dArray) {
+            if !(gles && !ctx.cfg.has_texture_shadow_lod && texture == Texture::Shadow1dArray) {
                 bias_buf.push_str(&format!(", {}.w", srcs[0]));
             }
         }
@@ -597,7 +631,12 @@ pub(super) fn translate_tex(
             sampler_index = 3;
             match texture {
                 Texture::D1 | Texture::Shadow1d | Texture::Array1d | Texture::Shadow1dArray => {
-                    bias_buf.push_str(&format!(", vec2({}.x, 0), vec2({}.x, 0)", srcs[1], srcs[2]));
+                    if gles {
+                        bias_buf
+                            .push_str(&format!(", vec2({}.x, 0), vec2({}.x, 0)", srcs[1], srcs[2]));
+                    } else {
+                        bias_buf.push_str(&format!(", {}.x, {}.x", srcs[1], srcs[2]));
+                    }
                 }
                 Texture::D2
                 | Texture::Shadow2d
@@ -618,6 +657,13 @@ pub(super) fn translate_tex(
         Opcode::Tg4 => {
             sampler_index = 2;
             ctx.shader_req_bits |= super::req::TG4;
+            if !gles
+                && (num_offsets > 1
+                    || is_shad
+                    || ctx.shader_req_bits & super::req::SAMPLER_RECT != 0)
+            {
+                ctx.shader_req_bits |= super::req::GPU_SHADER5;
+            }
             if num_offsets == 1 && inst.tex_offsets[0].file != File::Immediate {
                 ctx.shader_req_bits |= super::req::GPU_SHADER5;
             }
@@ -678,6 +724,7 @@ pub(super) fn translate_tex(
     }
     // EXT_texture_shadow_lod also adds the missing textureOffset for 2DArrayShadow in GLES.
     if (has_bias || has_offset)
+        && gles
         && matches!(texture, Texture::Shadow1dArray | Texture::Shadow2dArray)
     {
         ctx.shader_req_bits |= super::req::TEXTURE_SHADOW_LOD;
@@ -695,10 +742,11 @@ pub(super) fn translate_tex(
     if inst.opcode != Opcode::Txf
         && Key::view_mask_get(&ctx.key.sampler_views_emulated_rect_mask, slot.index())
     {
-        // No LOD for these texture types; RECT is emulated with a plain 2D texture, which
-        // wants LOD 0.
+        // No LOD for these texture types; but GLES emulates RECT with a plain 2D texture,
+        // which wants LOD 0.
         let lod = match texture {
             Texture::Buffer | Texture::Msaa2d | Texture::Msaa2dArray => "",
+            Texture::Rect | Texture::ShadowRect if !gles => "",
             _ => ", 0",
         };
         coord = match inst.opcode {
@@ -728,7 +776,7 @@ pub(super) fn translate_tex(
     let wm_or_none = if dinfo.dst_override_no_wm[0] { "" } else { writemask };
 
     if inst.opcode == Opcode::Txf {
-        if matches!(texture, Texture::D1 | Texture::Array1d | Texture::Rect) {
+        if gles && matches!(texture, Texture::D1 | Texture::Array1d | Texture::Rect) {
             if texture == Texture::D1 {
                 emit!(
                     ctx.bufs,
@@ -821,7 +869,7 @@ pub(super) fn translate_tex(
         // TGSI returns 1.0 in alpha.
         let cname = proc_prefix(ctx.prog_type);
         let src_index = inst.src[sampler_index].index;
-        if texture == Texture::Shadow1d {
+        if gles && texture == Texture::Shadow1d {
             if inst.opcode == Opcode::Txp {
                 emit!(
                     ctx.bufs,
@@ -861,7 +909,7 @@ pub(super) fn translate_tex(
                     writemask
                 );
             }
-        } else if texture == Texture::Shadow1dArray {
+        } else if gles && texture == Texture::Shadow1dArray {
             emit!(
                 ctx.bufs,
                 "{} = {}({}(vec4(vec4(texture{}({}, vec4({}{}, 0).xwyz {}{})) * {}shadmask{} + {}shadadd{}){}));\n",
@@ -900,7 +948,7 @@ pub(super) fn translate_tex(
                 writemask
             );
         }
-    } else if texture == Texture::D1 {
+    } else if gles && texture == Texture::D1 {
         // GLES has no 1D texture: a 2D texture is sampled at 0.5.
         if inst.opcode == Opcode::Txp {
             emit!(
@@ -932,7 +980,7 @@ pub(super) fn translate_tex(
                 wm_or_none
             );
         }
-    } else if texture == Texture::Array1d {
+    } else if gles && texture == Texture::Array1d {
         if inst.opcode == Opcode::Txp {
             emit!(
                 ctx.bufs,
@@ -983,12 +1031,13 @@ pub(super) fn translate_tex(
     }
 }
 
-/// `get_coord_prefix`, GLES leg.
-fn coord_prefix(resource: Texture) -> (Qual, bool) {
+/// `get_coord_prefix`.
+fn coord_prefix(resource: Texture, gles: bool) -> (Qual, bool) {
+    // GLES emulates 1D images with 2D ones.
     match resource {
-        Texture::D1 => (Qual::IVec2, false),
+        Texture::D1 => (if gles { Qual::IVec2 } else { Qual::Int }, false),
         Texture::Buffer => (Qual::Int, false),
-        Texture::Array1d => (Qual::IVec3, false),
+        Texture::Array1d => (if gles { Qual::IVec3 } else { Qual::IVec2 }, false),
         Texture::D2 | Texture::Rect => (Qual::IVec2, false),
         Texture::D3 | Texture::Cube | Texture::Array2d | Texture::CubeArray => (Qual::IVec3, false),
         Texture::Msaa2d => (Qual::IVec2, true),
@@ -1095,14 +1144,25 @@ fn emit_store_mem(
     }
 }
 
-/// `make_ssbo_varstring`, GLES leg: an indirect index never reaches the name here, the
+/// `make_ssbo_varstring`. `indirect` names the address register of an indirect access; desktop
+/// GL indexes the array with it, and on GLES, which cannot index an array of blocks with it, the
 /// callers switch over the array instead.
-pub(super) fn make_ssbo_varstring(ctx: &Context<'_>, register_index: u32) -> String {
+pub(super) fn make_ssbo_varstring(
+    ctx: &Context<'_>,
+    register_index: u32,
+    indirect: Option<i16>,
+) -> String {
     let cname = proc_prefix(ctx.prog_type);
     let atomic_ssbo = ctx.ssbo_atomic_mask & bit32(register_index) != 0;
     let atomic_str = if atomic_ssbo { "atomic" } else { "" };
     let base = if atomic_ssbo { ctx.ssbo_atomic_array_base } else { ctx.ssbo_array_base };
     if ctx.info.is_indirect(File::Buffer) {
+        if let Some(addr) = indirect.filter(|_| !ctx.cfg.is_gles()) {
+            return format!(
+                "{cname}ssboarr{atomic_str}[addr{addr} + {}].{cname}ssbocontents{base}",
+                register_index.wrapping_sub(base) as i32
+            );
+        }
         format!(
             "{cname}ssboarr{atomic_str}[{}].{cname}ssbocontents{base}",
             register_index.wrapping_sub(base) as i32
@@ -1144,7 +1204,7 @@ pub(super) fn translate_store(
         }
 
         let resource = ctx.images[image].decl.resource;
-        let (coord_prefix, is_ms) = coord_prefix(resource);
+        let (coord_prefix, is_ms) = coord_prefix(resource, ctx.cfg.is_gles());
         let conversion = if sinfo.override_no_cast[0] { "" } else { Qual::FloatBitsToInt.s() };
         let (_, itype) = internalformat_string(inst.memory.map_or(0, |m| m.format));
         let ms_str = if is_ms { format!("int({}.w),", srcs[0]) } else { String::new() };
@@ -1153,7 +1213,7 @@ pub(super) fn translate_store(
             ReturnType::Sint => Qual::FloatBitsToInt,
             _ => Qual::None,
         };
-        if !dst_reg.indirect {
+        if !ctx.cfg.is_gles() || !dst_reg.indirect {
             emit!(
                 ctx.bufs,
                 "imageStore({},{}({}({})),{}{}({}));\n",
@@ -1210,7 +1270,7 @@ pub(super) fn translate_store(
         };
         let conversion = if sinfo.override_no_cast[1] { "" } else { dtypeprefix.s() };
 
-        if !dst_reg.indirect {
+        if !ctx.cfg.is_gles() || !dst_reg.indirect {
             emit_store_mem(ctx, dst, dst_reg.writemask, srcs, conversion);
         } else {
             let atomic_ssbo = ctx.ssbo_atomic_mask & bit32(dst_reg.index as u32) != 0;
@@ -1224,7 +1284,7 @@ pub(super) fn translate_store(
             );
             for i in 0..array_count {
                 emit!(ctx.bufs, "case {}:\n", i);
-                let dst_tmp = make_ssbo_varstring(ctx, (i + start) as u32);
+                let dst_tmp = make_ssbo_varstring(ctx, (i + start) as u32, None);
                 emit_store_mem(ctx, &dst_tmp, dst_reg.writemask, srcs, conversion);
                 ctx.bufs.emit("break;\n");
             }
@@ -1286,7 +1346,8 @@ pub(super) fn translate_load(
             ctx.bufs.set_error();
             return false;
         }
-        let (coord_prefix, is_ms) = coord_prefix(ctx.images[sreg].decl.resource);
+        let gles = ctx.cfg.is_gles();
+        let (coord_prefix, is_ms) = coord_prefix(ctx.images[sreg].decl.resource, gles);
         let conversion = if sinfo.override_no_cast[1] { "" } else { Qual::FloatBitsToInt.s() };
         let (_, itype) = internalformat_string(ctx.images[sreg].decl.format);
         let ms_str = if is_ms { format!(", int({}.w)", srcs[1]) } else { String::new() };
@@ -1297,15 +1358,16 @@ pub(super) fn translate_load(
             _ => Qual::None,
         };
 
-        // On GLES `WR` becomes `writeonly`, since most formats have to be one or the other:
+        // On desktop GL `WR` is writable; on GLES it becomes `writeonly`, since most formats
+        // have to be one or the other:
         // an image declared `WR` and read from loses its writable flag. Formats that allow
         // both are unaffected; for the others a write fails instead of the read, which is no
         // regression, as both were never possible.
-        if ctx.images[sreg].decl.writable && !is_r32_format(ctx.images[sreg].decl.format) {
+        if gles && ctx.images[sreg].decl.writable && !is_r32_format(ctx.images[sreg].decl.format) {
             ctx.images[sreg].decl.writable = false;
         }
 
-        if !src.indirect {
+        if !gles || !src.indirect {
             emit!(
                 ctx.bufs,
                 "{} = {}(imageLoad({}, {}({}({})){}){});\n",
@@ -1369,7 +1431,7 @@ pub(super) fn translate_load(
             Qual::UintBitsToFloat
         };
 
-        if !src.indirect {
+        if !ctx.cfg.is_gles() || !src.indirect {
             emit_load_mem(
                 ctx,
                 &mydst,
@@ -1391,7 +1453,7 @@ pub(super) fn translate_load(
             );
             for i in 0..array_count {
                 emit!(ctx.bufs, "case {}:\n", i);
-                let s = make_ssbo_varstring(ctx, (i + start) as u32);
+                let s = make_ssbo_varstring(ctx, (i + start) as u32, None);
                 emit_load_mem(
                     ctx,
                     &mydst,
@@ -1447,9 +1509,12 @@ pub(super) fn translate_resq(
             emit!(ctx.bufs, "{} = {}(imageSamples({}));\n", dst, Qual::IntBitsToFloat.s(), srcs[0]);
         }
         if inst.dst[0].writemask & 0x7 != 0 {
-            let swizzle_mask = if mem_texture == Texture::Array1d { ".xz" } else { "" };
+            let gles = ctx.cfg.is_gles();
+            let swizzle_mask = if gles && mem_texture == Texture::Array1d { ".xz" } else { "" };
             ctx.shader_req_bits |= super::req::IMAGE_SIZE | super::req::INTS;
-            let skip_emit_writemask = mem_texture == Texture::Buffer;
+            // Desktop GL's `imageSize` of a 1D image is a scalar.
+            let skip_emit_writemask =
+                mem_texture == Texture::Buffer || (!gles && mem_texture == Texture::D1);
             emit!(
                 ctx.bufs,
                 "{} = {}(imageSize({}){}{});\n",
@@ -1533,7 +1598,7 @@ pub(super) fn translate_atomic(
     }
 
     if let Some(sreg) = image {
-        let (coord_prefix, is_ms) = coord_prefix(ctx.images[sreg].decl.resource);
+        let (coord_prefix, is_ms) = coord_prefix(ctx.images[sreg].decl.resource, ctx.cfg.is_gles());
         let conversion = if sinfo.override_no_cast[1] { "" } else { Qual::FloatBitsToInt.s() };
         let ms_str = if is_ms { format!(", int({}.w)", srcs[1]) } else { String::new() };
 
@@ -1542,7 +1607,7 @@ pub(super) fn translate_atomic(
             return;
         }
 
-        if !src.indirect {
+        if !ctx.cfg.is_gles() || !src.indirect {
             emit!(
                 ctx.bufs,
                 "{} = {}(imageAtomic{}({}, {}({}({})){}, {}({}({})){}));\n",

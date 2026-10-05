@@ -113,10 +113,20 @@ impl AdvancedBlend {
     }
 }
 
+/// The GLSL the translator writes: the C's `use_gles`. Decided by the host's API once, at init.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dialect {
+    /// GLSL ES, at the host's own version.
+    Es,
+    /// Desktop GLSL, core profile, at the lowest version the shader needs.
+    Core,
+}
+
 /// `vrend_shader_cfg`: what the host's GL can do, as the translator needs to know it. Read once
 /// from the probed features when the renderer comes up.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Config {
+    pub dialect: Dialect,
     pub glsl_version: u32,
     /// At most eight (`PIPE_MAX_COLOR_BUFS`).
     pub max_draw_buffers: u32,
@@ -135,12 +145,19 @@ pub struct Config {
 }
 
 impl Config {
+    /// The C's `cfg->use_gles`.
+    pub fn is_gles(&self) -> bool {
+        self.dialect == Dialect::Es
+    }
+
     /// The C's `shader_cfg` fill at context creation, from the probed features and limits and
     /// the driver's `GL_SHADING_LANGUAGE_VERSION`.
     pub fn probe(gl: &Gl, features: &Features, limits: &Limits) -> Config {
         let has = |f| features.has(f);
+        let dialect = if features.api().is_gles() { Dialect::Es } else { Dialect::Core };
         Config {
-            glsl_version: glsl_es_version(&gl.get_string(GL_SHADING_LANGUAGE_VERSION)),
+            dialect,
+            glsl_version: glsl_version(dialect, &gl.get_string(GL_SHADING_LANGUAGE_VERSION)),
             max_draw_buffers: limits.max_draw_buffers,
             max_shader_patch_varyings: if has(Feature::tessellation) {
                 gl.get_integer(GL_MAX_TESS_PATCH_COMPONENTS).max(0) as u32 / 4
@@ -162,11 +179,16 @@ impl Config {
     }
 }
 
-/// `get_glsl_version`, the GLES leg: "OpenGL ES GLSL ES 3.10" is 310. The C's `sscanf` skips
-/// four words and reads `major.minor`; a string that does not fit is version 0, which the C
-/// refuses at context creation and the translator would refuse at the first shader.
-fn glsl_es_version(s: &str) -> u32 {
-    let mut words = s.split_whitespace().skip(4);
+/// `get_glsl_version`: "OpenGL ES GLSL ES 3.10" is 310 on GLES, and "4.60 NVIDIA" is 460 on
+/// desktop GL. The C's `sscanf` skips four words on GLES and none on desktop, and reads
+/// `major.minor`; a string that does not fit is version 0, which the C refuses at context
+/// creation and the translator would refuse at the first shader.
+fn glsl_version(dialect: Dialect, s: &str) -> u32 {
+    let skip = match dialect {
+        Dialect::Es => 4,
+        Dialect::Core => 0,
+    };
+    let mut words = s.split_whitespace().skip(skip);
     let Some(v) = words.next() else {
         return 0;
     };
@@ -424,22 +446,29 @@ pub fn sampler_return_conv(ty: tgsi::ReturnType) -> char {
     }
 }
 
-/// `vrend_shader_samplertypeconv`, GLES leg: the GLSL sampler type for a TGSI texture target.
-/// `1D` targets sample as `2D` because GLES has no one-dimensional sampler.
-pub fn sampler_type_conv(target: tgsi::Texture) -> Option<&'static str> {
+/// `vrend_shader_samplertypeconv`: the GLSL sampler type for a TGSI texture target. GLES has
+/// neither one-dimensional nor rectangle samplers, so those targets sample as `2D` there.
+pub fn sampler_type_conv(dialect: Dialect, target: tgsi::Texture) -> Option<&'static str> {
     use tgsi::Texture::*;
+    let core = dialect == Dialect::Core;
     Some(match target {
         Buffer => "Buffer",
+        D1 if core => "1D",
         D1 => "2D",
         D2 => "2D",
         D3 => "3D",
         Cube => "Cube",
+        Rect if core => "2DRect",
         Rect => "2D",
+        Shadow1d if core => "1DShadow",
         Shadow1d => "2DShadow",
         Shadow2d => "2DShadow",
+        ShadowRect if core => "2DRectShadow",
         ShadowRect => "2DShadow",
+        Array1d if core => "1DArray",
         Array1d => "2DArray",
         Array2d => "2DArray",
+        Shadow1dArray if core => "1DArrayShadow",
         Shadow1dArray => "2DArrayShadow",
         Shadow2dArray => "2DArrayShadow",
         ShadowCube => "CubeShadow",
@@ -456,9 +485,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_glsl_es_version_is_read_as_the_c_reads_it() {
-        assert_eq!(glsl_es_version("OpenGL ES GLSL ES 3.10"), 310);
-        assert_eq!(glsl_es_version("OpenGL ES GLSL ES 3.20 (zink)"), 320);
-        assert_eq!(glsl_es_version("3.10"), 0);
+    fn the_glsl_version_is_read_as_the_c_reads_it() {
+        assert_eq!(glsl_version(Dialect::Es, "OpenGL ES GLSL ES 3.10"), 310);
+        assert_eq!(glsl_version(Dialect::Es, "OpenGL ES GLSL ES 3.20 (zink)"), 320);
+        assert_eq!(glsl_version(Dialect::Es, "3.10"), 0);
+        assert_eq!(glsl_version(Dialect::Core, "4.60"), 460);
+        assert_eq!(glsl_version(Dialect::Core, "3.30 NVIDIA via Cg compiler"), 330);
     }
 }

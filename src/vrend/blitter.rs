@@ -30,7 +30,7 @@ use super::gl::{
 };
 use super::pipe::{Swizzle, TexFilter, TextureTarget};
 use super::proto::Format;
-use super::shader::{sampler_return_conv, sampler_type_conv};
+use super::shader::{Dialect, sampler_return_conv, sampler_type_conv};
 use super::transfer;
 use super::{egl, tgsi};
 use crate::vrend::egl::{Version, Winsys};
@@ -719,7 +719,7 @@ pub fn dest_swizzle_snippet(swizzle: [Swizzle; 4]) -> String {
 /// path's `FS_HEADER_GLES` only in the extension line this shader never needs.
 fn depth_fragment_source(tex: tgsi::Texture, msaa: bool) -> String {
     let (coord, fetch_type, is_array) = coord_swizzle_and_type(tex, msaa, true);
-    let sampler = sampler_type_conv(tex).unwrap_or("2D");
+    let sampler = sampler_type_conv(Dialect::Es, tex).unwrap_or("2D");
     let header = if msaa && is_array {
         "#version 310 es\n// Blitter\n#extension GL_OES_texture_storage_multisample_2d_array: \
          require\nprecision mediump float;\n"
@@ -752,7 +752,7 @@ pub fn fragment_source(key: ProgramKey) -> String {
     let loop_samples =
         if msaa && ret == tgsi::ReturnType::Unorm { key.num_samples } else { u32::from(msaa) };
     let (coord, fetch_type, is_array) = coord_swizzle_and_type(tex, msaa, false);
-    let sampler = sampler_type_conv(tex).unwrap_or("2D");
+    let sampler = sampler_type_conv(Dialect::Es, tex).unwrap_or("2D");
     let prefix = sampler_return_conv(ret);
     let cvec4 = vec4_type(ret);
     // The C always prints the snippet, identity included -- `info->swizzle` is an array and its

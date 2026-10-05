@@ -434,7 +434,8 @@ fn get_destination_info(
                 dinfo.dest_index = i32::from(dst_reg.index);
             }
             File::Buffer => {
-                ctx.dst_bufs[i] = make_ssbo_varstring(ctx, dst_reg.index as u32);
+                let indirect = dst_reg.indirect.then_some(dst_reg.ind.index);
+                ctx.dst_bufs[i] = make_ssbo_varstring(ctx, dst_reg.index as u32, indirect);
                 dinfo.dest_index = i32::from(dst_reg.index);
             }
             File::Memory => ctx.dst_bufs[i] = "values".to_string(),
@@ -1104,7 +1105,8 @@ fn get_source_info(
                 sinfo.binding = Binding::Image(ImageSlot::new(src.index));
             }
             File::Buffer => {
-                ctx.src_bufs[i] = make_ssbo_varstring(ctx, src.index as u32);
+                let indirect = src.indirect.then_some(src.ind.index);
+                ctx.src_bufs[i] = make_ssbo_varstring(ctx, src.index as u32, indirect);
                 sinfo.binding = Binding::Other(i32::from(src.index));
             }
             File::Memory => {
@@ -1169,6 +1171,9 @@ fn get_source_info(
                     let idx = (src.swizzle[j] & 3) as usize;
                     if inst.opcode == Opcode::Tg4 && i == 1 && j == 0 && imd.val[idx] > 0 {
                         sinfo.tg4_has_component = true;
+                        if !ctx.cfg.is_gles() {
+                            ctx.shader_req_bits |= req::GPU_SHADER5;
+                        }
                     }
                     let temp = match imd.ty {
                         ImmType::Float32 => {
@@ -1363,8 +1368,12 @@ fn get_source_info(
     true
 }
 
-/// `rewrite_1d_image_coordinate`, GLES leg: a 1D image is a 2D one with a zero row.
+/// `rewrite_1d_image_coordinate`: on GLES a 1D image is a 2D one with a zero row. Desktop GL has
+/// 1D images and takes the coordinate as it is.
 fn rewrite_1d_image_coordinate(ctx: &mut Context<'_>, inst: &Instruction) {
+    if !ctx.cfg.is_gles() {
+        return;
+    }
     let texture = inst.memory.map_or(Texture::Buffer, |m| m.texture);
     if inst.src[0].file == File::Image && (texture == Texture::D1 || texture == Texture::Array1d) {
         let buf = ctx.src_bufs[1].clone();
@@ -1432,6 +1441,12 @@ fn rewrite_io_ranged(ctx: &mut Context<'_>) {
         if ctx.prefer_generic_io_block(IoDir::Out) {
             ctx.glsl_ver_required = ctx.require_glsl_ver(150);
         }
+    }
+    if (ctx.has_output_arrays || ctx.has_input_arrays)
+        && ctx.cfg.has_arrays_of_arrays
+        && !ctx.cfg.is_gles()
+    {
+        ctx.shader_req_bits |= req::ARRAYS_OF_ARRAYS;
     }
 }
 
@@ -1621,8 +1636,16 @@ pub(super) fn iter_instruction(ctx: &mut Context<'_>, inst: &Instruction) -> Res
         if ctx.so.is_some() {
             prepare_so_movs(ctx);
         }
-        // GLES allows no invariant specifiers on inputs, so the key's forced invariants are
-        // desktop only.
+        // GLES allows no invariant specifiers on inputs, but desktop GL below GLSL 4.30 needs
+        // them to match the previous stage's outputs.
+        if !ctx.cfg.is_gles() {
+            for input in &mut ctx.inputs {
+                let bit_pos = super::varying_bit_from_semantic_and_index(input.name, input.sid);
+                let slot = (bit_pos / 32) as usize;
+                let bit = 1u32 << (bit_pos & 0x1f);
+                input.invariant = ctx.key.force_invariant_inputs[slot] & bit != 0;
+            }
+        }
     }
 
     if !get_destination_info(ctx, inst, &mut dinfo, &mut fp64_dsts, &mut writemask) {
@@ -1831,7 +1854,7 @@ pub(super) fn iter_instruction(ctx: &mut Context<'_>, inst: &Instruction) -> Res
         Round | Dround => {
             // There is no TGSI opcode for roundEven; a guest's roundEven arrives as ROUND and
             // goes back out as roundEven.
-            if ctx.cfg.glsl_version >= 300 {
+            if (ctx.cfg.is_gles() && ctx.cfg.glsl_version >= 300) || ctx.cfg.glsl_version >= 400 {
                 op1!("roundEven");
             } else {
                 op1!("round");
@@ -2146,11 +2169,13 @@ pub(super) fn iter_instruction(ctx: &mut Context<'_>, inst: &Instruction) -> Res
         UmulHi => {
             emit!(ctx.bufs, "umulExtended({}, {}, umul_temp, mul_utemp);\n", srcs[0], srcs[1]);
             emit!(ctx.bufs, "{} = {}({}(umul_temp{}));\n", dst0, dstconv, dtp, wm);
+            mul_hi_reqs(ctx);
             ctx.write_mul_utemp = true;
         }
         ImulHi => {
             emit!(ctx.bufs, "imulExtended({}, {}, imul_temp, mul_itemp);\n", srcs[0], srcs[1]);
             emit!(ctx.bufs, "{} = {}({}(imul_temp{}));\n", dst0, dstconv, dtp, wm);
+            mul_hi_reqs(ctx);
             ctx.write_mul_itemp = true;
         }
         Ibfe | Ubfe => {
@@ -2277,4 +2302,12 @@ fn immediate_word(ctx: &Context<'_>, inst: &Instruction) -> Result<u32, Failure>
         return fail(format!("Immediate range exceeded, max is {MAX_IMMEDIATE}"));
     }
     Ok(ctx.imm.get(src.index as usize).map_or(0, |imd| imd.val[(src.swizzle[0] & 3) as usize]))
+}
+
+/// What `umulExtended` and `imulExtended` need of a desktop host: GLES 3.1 has them in core.
+fn mul_hi_reqs(ctx: &mut Context<'_>) {
+    if !ctx.cfg.is_gles() {
+        ctx.shader_req_bits |=
+            if ctx.cfg.has_gpu_shader5 { req::GPU_SHADER5 } else { req::SHADER_INTEGER_FUNC };
+    }
 }

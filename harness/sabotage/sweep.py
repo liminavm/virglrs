@@ -2009,6 +2009,22 @@ SABOTAGES = [
         'the_host_gl_is_the_one_asked_for',
     ),
     (
+        'a desktop host is handed GLSL ES',
+        'src/vrend/shader/glsl/header.rs',
+        """    if ctx.cfg.is_gles() {
+        emit_header_es(ctx);""",
+        """    if true {
+        emit_header_es(ctx);""",
+        'every_corpus_shader_translates_to_the_c_desktop_glsl',
+    ),
+    (
+        'a desktop sampler is declared with a GLES precision',
+        'src/vrend/shader/glsl/header.rs',
+        """    let precision = if ctx.cfg.is_gles() { "highp" } else { "" };""",
+        """    let precision = "highp";""",
+        'every_corpus_shader_translates_to_the_c_desktop_glsl',
+    ),
+    (
         'a sampler view binds whatever kind of resource its handle names now',
         'src/vrend/context.rs',
         """                (Storage::Texture(_), Span::Levels { .. }) => {}""",

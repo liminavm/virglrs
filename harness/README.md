@@ -656,6 +656,15 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   construction to the C as well as the translation. Under `--nodraw` that is the 16 blocks of
   shader creation and `LINK_SHADER`; with draws it is all 33, the seventeen more being the
   variants selected at draw time.
+  `vrend-shaders-desktop.iris.txt` is the same corpus as the C translates it for a desktop GL
+  host: iris on goiaba, recorded with a debug build of the pinned upstream C and
+  `--no-rebuild --flags 0x809` (desktop GL, as QEMU's default displays give it), twice and byte
+  identical. It is 30 blocks, as the C's GLES log on iris is too; the 33-block GLES fixture is
+  zink's.
+  The test beside the GLES one holds the translator's desktop dialect to it; the live
+  differential is the same replay with `VIRGLRS_DESKTOP_GL=1` and `--no-rebuild` on the Rust
+  side, where the Rust leg logs three variant blocks more than the C on either flavour, and none
+  that differs.
   `blit.score` is the shader blitter's gate, and it is synthetic on purpose: no recorded session
   reaches the blitter at all. A desktop's blits are format-matched mip-chain reductions, which
   take `glBlitFramebuffer`, so a blitter could be ported, get every other fixture in this tree

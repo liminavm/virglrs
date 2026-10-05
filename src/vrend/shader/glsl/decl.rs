@@ -348,7 +348,10 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
                     ctx.shader_req_bits |= req::GPU_SHADER5;
                     ctx.has_sample_input = true;
                 }
-                if decl.interp.interpolate == Interpolate::Linear && ctx.cfg.has_nopersective {
+                if decl.interp.interpolate == Interpolate::Linear
+                    && ctx.cfg.is_gles()
+                    && ctx.cfg.has_nopersective
+                {
                     ctx.shader_req_bits |= req::SHADER_NOPERSPECTIVE_INTERPOLATION;
                     ctx.has_noperspective = true;
                 }
@@ -455,7 +458,9 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
                         ctx.inputs[i].override_no_wm = true;
                         name_prefix = "gl_ViewportIndex";
                         ctx.shader_req_bits |= req::LAYER;
-                        ctx.shader_req_bits |= req::VIEWPORT_IDX;
+                        if ctx.cfg.is_gles() {
+                            ctx.shader_req_bits |= req::VIEWPORT_IDX;
+                        }
                     }
                 }
                 Semantic::Layer => {
@@ -520,7 +525,8 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
                         ctx.inputs[i].glsl_no_index = true;
                         ctx.inputs[i].glsl_gl_block = true;
                     } else if processor == Processor::Fragment {
-                        name_prefix = if ctx.fs_integer_pixel_center {
+                        // Desktop GL declares the integer pixel center as a layout instead.
+                        name_prefix = if ctx.cfg.is_gles() && ctx.fs_integer_pixel_center {
                             "(gl_FragCoord - vec4(0.5, 0.5, 0.0, 0.0))"
                         } else {
                             "gl_FragCoord"
@@ -543,8 +549,7 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
                 }
                 Semantic::PCoord => {
                     if processor == Processor::Fragment {
-                        name_prefix = "vec4(gl_PointCoord.x, mix(1.0 - gl_PointCoord.y, gl_PointCoord.y, clamp(winsys_adjust_y, 0.0, 1.0)), 0.0, 1.0)";
-                        ctx.bufs.required_sysval_uniform_decls |= sysval::WINSYS_ADJUST_Y;
+                        name_prefix = point_coord(ctx);
                         ctx.inputs[i].glsl_predefined_no_emit = true;
                         ctx.inputs[i].glsl_no_index = true;
                         ctx.inputs[i].num_components = 4;
@@ -559,8 +564,7 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
                     if processor == Processor::Fragment
                         && ctx.key.fs.coord_replace & bit32(ctx.inputs[i].sid) != 0
                     {
-                        name_prefix = "vec4(gl_PointCoord.x, mix(1.0 - gl_PointCoord.y, gl_PointCoord.y, clamp(winsys_adjust_y, 0.0, 1.0)), 0.0, 1.0)";
-                        ctx.bufs.required_sysval_uniform_decls |= sysval::WINSYS_ADJUST_Y;
+                        name_prefix = point_coord(ctx);
                         ctx.inputs[i].glsl_predefined_no_emit = true;
                         ctx.inputs[i].glsl_no_index = true;
                         ctx.inputs[i].num_components = 4;
@@ -571,6 +575,14 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
                         && (ctx.inputs[i].first != ctx.inputs[i].last || ctx.inputs[i].array_id > 0)
                     {
                         ctx.guest_sent_io_arrays = true;
+                        if !ctx.cfg.is_gles()
+                            && matches!(
+                                ctx.prog_type,
+                                Processor::Geometry | Processor::TessCtrl | Processor::TessEval
+                            )
+                        {
+                            ctx.shader_req_bits |= req::ARRAYS_OF_ARRAYS;
+                        }
                     }
                 }
                 other => {
@@ -802,15 +814,23 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
                     }
                 }
                 Semantic::ViewportIndex => {
-                    // The vertex-shader leg is desktop only (`!use_gles`).
-                    if processor == Processor::Geometry {
+                    // The vertex-shader leg is desktop only.
+                    if processor == Processor::Geometry
+                        || (processor == Processor::Vertex
+                            && !ctx.cfg.is_gles()
+                            && ctx.cfg.has_vs_viewport_index)
+                    {
                         ctx.outputs[i].glsl_predefined_no_emit = true;
                         ctx.outputs[i].glsl_no_index = true;
                         ctx.outputs[i].override_no_wm = true;
                         ctx.outputs[i].is_int = true;
                         name_prefix = "gl_ViewportIndex";
-                        ctx.shader_req_bits |= req::VIEWPORT_IDX;
-                        ctx.glsl_ver_required = ctx.require_glsl_ver(140);
+                        if processor == Processor::Geometry {
+                            ctx.shader_req_bits |= req::VIEWPORT_IDX;
+                            ctx.glsl_ver_required = ctx.require_glsl_ver(140);
+                        } else {
+                            ctx.shader_req_bits |= req::AMD_VIEWPORT_IDX;
+                        }
                     }
                 }
                 Semantic::TessOuter => {
@@ -838,6 +858,14 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
                     }
                     if ctx.outputs[i].first != ctx.outputs[i].last || ctx.outputs[i].array_id > 0 {
                         ctx.guest_sent_io_arrays = true;
+                        if !ctx.cfg.is_gles()
+                            && matches!(
+                                ctx.prog_type,
+                                Processor::Geometry | Processor::TessCtrl | Processor::TessEval
+                            )
+                        {
+                            ctx.shader_req_bits |= req::ARRAYS_OF_ARRAYS;
+                        }
                     }
                 }
                 other => {
@@ -1061,14 +1089,16 @@ pub(super) fn iter_property(ctx: &mut Context<'_>, prop: &PropertyToken) -> Resu
         Property::CsFixedBlockDepth => ctx.local_cs_block_size[2] = data as u16,
         Property::FsBlendEquationAdvanced => {
             ctx.fs_blend_equation_advanced = data;
-            if ctx.cfg.glsl_version < 320 {
+            if !ctx.cfg.is_gles() || ctx.cfg.glsl_version < 320 {
                 ctx.glsl_ver_required = ctx.require_glsl_ver(150);
                 ctx.shader_req_bits |= req::BLEND_EQUATION_ADVANCED;
             }
         }
         Property::SeparableProgram => {
             // GLES is strict about how separable interfaces match -- it refuses, for one,
-            // an input without a matching output -- so separable programs stay off there.
+            // an input without a matching output -- so separable programs stay off there. The
+            // C serves them on desktop GL through program pipelines, which this renderer does
+            // not have: every program is linked whole, which serves a separable one too.
         }
         other => {
             return fail(format!("Unhandled property: {:x}", other as u8));
@@ -1101,4 +1131,15 @@ pub(super) fn iter_immediate(ctx: &mut Context<'_>, imm: &Immediate) -> Result<(
     }
     ctx.imm.push(Immed { ty: imm.ty, val });
     Ok(())
+}
+
+/// The point-sprite coordinate a fragment input reads: on GLES with its y flipped to follow the
+/// winsys, by the same uniform that flips the position; on desktop GL as it is.
+fn point_coord(ctx: &mut Context<'_>) -> &'static str {
+    if ctx.cfg.is_gles() {
+        ctx.bufs.required_sysval_uniform_decls |= sysval::WINSYS_ADJUST_Y;
+        "vec4(gl_PointCoord.x, mix(1.0 - gl_PointCoord.y, gl_PointCoord.y, clamp(winsys_adjust_y, 0.0, 1.0)), 0.0, 1.0)"
+    } else {
+        "vec4(gl_PointCoord, 0.0, 1.0)"
+    }
 }
