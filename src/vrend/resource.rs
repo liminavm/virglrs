@@ -1981,8 +1981,7 @@ fn plan(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Resu
 /// The target alone decides buffer from texture, exactly as the C's create path does. The bind
 /// says which *kind* of buffer, and that is the only place it is asked.
 fn plan_storage(features: &Features, a: &Args, rect_ok: bool) -> Result<Plan, Refusal> {
-    if a.target != TextureTarget::Buffer {
-        let gl_target = gl_target(features.api(), a.target, a.nr_samples, rect_ok);
+    if let Some(gl_target) = gl_target(features.api(), a.target, a.nr_samples, rect_ok) {
         // A multisample array needs the entry point that makes one. Decided here rather than
         // half-way through allocating, where the refusal arrives after a texture has been
         // generated and has to be unwound.
@@ -2064,9 +2063,17 @@ fn alloc_buffer(
 /// rectangle in a format that cannot be one is a 2D texture, and GLES, which has no 1D textures,
 /// stores 1D as 2D. `rect_ok` is the format's [`Entry::can_target_rectangle`], which only a
 /// desktop host ever answers yes.
-pub fn gl_target(api: Api, target: TextureTarget, nr_samples: u32, rect_ok: bool) -> GLenum {
+///
+/// `None` for a buffer, which is no texture: what a buffer is bound as is the resource's to say,
+/// and a target from the wire may be either.
+pub fn gl_target(
+    api: Api,
+    target: TextureTarget,
+    nr_samples: u32,
+    rect_ok: bool,
+) -> Option<GLenum> {
     let gles = api.is_gles();
-    match target {
+    Some(match target {
         TextureTarget::Texture1d if !gles => GL_TEXTURE_1D,
         TextureTarget::Array1d if !gles => GL_TEXTURE_1D_ARRAY,
         TextureTarget::Rect if rect_ok => GL_TEXTURE_RECTANGLE,
@@ -2079,8 +2086,8 @@ pub fn gl_target(api: Api, target: TextureTarget, nr_samples: u32, rect_ok: bool
         TextureTarget::Array2d if nr_samples > 1 => GL_TEXTURE_2D_MULTISAMPLE_ARRAY,
         TextureTarget::Array2d => GL_TEXTURE_2D_ARRAY,
         TextureTarget::CubeArray => GL_TEXTURE_CUBE_MAP_ARRAY,
-        TextureTarget::Buffer => unreachable!("a buffer has no texture target"),
-    }
+        TextureTarget::Buffer => return None,
+    })
 }
 
 /// The planar IOSurface behind a composite decode target, and an image per plane.
@@ -3412,7 +3419,7 @@ mod tests {
                             if theirs
                                 && a.nr_samples > 1
                                 && gl_target(f.api(), a.target, a.nr_samples, false)
-                                    == GL_TEXTURE_2D_MULTISAMPLE_ARRAY
+                                    == Some(GL_TEXTURE_2D_MULTISAMPLE_ARRAY)
                                 && !f.has(Feature::storage_multisample_2d_array)
                             {
                                 assert!(matches!(
@@ -3527,18 +3534,21 @@ mod tests {
     #[test]
     fn gles_has_no_1d_and_no_rect() {
         let gles = Api::Gles(32);
-        assert_eq!(gl_target(gles, TextureTarget::Texture1d, 0, false), GL_TEXTURE_2D);
-        assert_eq!(gl_target(gles, TextureTarget::Rect, 0, false), GL_TEXTURE_2D);
-        assert_eq!(gl_target(gles, TextureTarget::Array1d, 0, false), GL_TEXTURE_2D_ARRAY);
-        assert_eq!(gl_target(gles, TextureTarget::Texture2d, 4, false), GL_TEXTURE_2D_MULTISAMPLE);
+        assert_eq!(gl_target(gles, TextureTarget::Texture1d, 0, false), Some(GL_TEXTURE_2D));
+        assert_eq!(gl_target(gles, TextureTarget::Rect, 0, false), Some(GL_TEXTURE_2D));
+        assert_eq!(gl_target(gles, TextureTarget::Array1d, 0, false), Some(GL_TEXTURE_2D_ARRAY));
+        assert_eq!(
+            gl_target(gles, TextureTarget::Texture2d, 4, false),
+            Some(GL_TEXTURE_2D_MULTISAMPLE)
+        );
     }
 
     #[test]
     fn desktop_gl_stores_1d_as_1d_and_rect_as_rect_where_the_format_can_be_one() {
         let gl = Api::Gl(46);
-        assert_eq!(gl_target(gl, TextureTarget::Texture1d, 0, false), GL_TEXTURE_1D);
-        assert_eq!(gl_target(gl, TextureTarget::Array1d, 0, false), GL_TEXTURE_1D_ARRAY);
-        assert_eq!(gl_target(gl, TextureTarget::Rect, 0, true), GL_TEXTURE_RECTANGLE);
-        assert_eq!(gl_target(gl, TextureTarget::Rect, 0, false), GL_TEXTURE_2D);
+        assert_eq!(gl_target(gl, TextureTarget::Texture1d, 0, false), Some(GL_TEXTURE_1D));
+        assert_eq!(gl_target(gl, TextureTarget::Array1d, 0, false), Some(GL_TEXTURE_1D_ARRAY));
+        assert_eq!(gl_target(gl, TextureTarget::Rect, 0, true), Some(GL_TEXTURE_RECTANGLE));
+        assert_eq!(gl_target(gl, TextureTarget::Rect, 0, false), Some(GL_TEXTURE_2D));
     }
 }

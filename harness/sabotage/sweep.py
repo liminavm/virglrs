@@ -2647,6 +2647,22 @@ SABOTAGES = [
         'the_checks_refuse_what_the_c_refuses',
     ),
     (
+        'the texture-target table panics on a buffer',
+        'src/vrend/resource.rs',
+        """        TextureTarget::Buffer => return None,""",
+        """        TextureTarget::Buffer => unreachable!("a buffer has no texture target"),""",
+        'a_buffer_sampler_view_is_made_over_a_buffer_and_refused_over_a_texture',
+    ),
+    (
+        'a buffer sampler view looks its target up as a texture\'s',
+        'src/vrend/context.rs',
+        """        let target = if is_buffer {
+            tex_target""",
+        """        let target = if false {
+            tex_target""",
+        'a_buffer_sampler_view_is_made_over_a_buffer_and_refused_over_a_texture',
+    ),
+    (
         'vkCmdSetColorWriteEnableEXT tells the driver one switch fewer',
         'src/venus/driver.rs',
         """        unsafe { f(cb, enables.len() as u32, enables.as_ptr()) };""",

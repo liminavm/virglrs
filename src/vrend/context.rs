@@ -2891,10 +2891,15 @@ impl Context {
         // The view's format decides whether a rectangle view is one: `vrend_create_sampler_view`
         // asks it, not the resource's.
         let rect_ok = host.formats.get(v.format).is_some_and(|e| e.can_target_rectangle);
-        let mut target =
-            resource::gl_target(host.features.api(), v.target, res.args.nr_samples, rect_ok);
+        // A buffer is sampled as the texture buffer it is, whatever target the view names; a
+        // texture viewed as a buffer is a view of something it is not.
+        let target = if is_buffer {
+            tex_target
+        } else {
+            resource::gl_target(host.features.api(), v.target, res.args.nr_samples, rect_ok)
+                .ok_or(Fault::IllegalResource { cmd, handle: v.resource })?
+        };
         let elements = if is_buffer {
-            target = tex_target;
             // A buffer view is an element range, first to last inclusive. The C binds one
             // past the host's texel limit shortened to fit and reports the view made; the
             // range is the guest's claim about the resource, and a claim past the limit is

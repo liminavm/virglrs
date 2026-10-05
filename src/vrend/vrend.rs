@@ -3127,6 +3127,108 @@ mod tests {
         assert_eq!(read_back(HostGl::Desktop), Some(true), "desktop GL reads its blocks back");
     }
 
+    /// A sampler view of a texture buffer names the buffer target, and is made where the host has
+    /// texture buffers -- elsewhere the caps offer none and the range is refused; a view naming
+    /// the buffer target over a texture is refused. Neither may reach the texture-target table,
+    /// which has no entry for a buffer.
+    #[test]
+    fn a_buffer_sampler_view_is_made_over_a_buffer_and_refused_over_a_texture() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::pipe::Swizzle;
+        use crate::vrend::proto::{Command, Object, SamplerView};
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let r8 = super::super::proto::Format::from_wire(64).expect("R8_UNORM");
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let mut v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            let (buffer, texture) = (
+                ResourceHandle::new(1).expect("non-zero"),
+                ResourceHandle::new(2).expect("non-zero"),
+            );
+            v.resource_create(buffer, buffer_args(resource::Bind::SAMPLER_VIEW, 64))
+                .expect("a texture buffer");
+            v.resource_create(
+                texture,
+                resource::Args {
+                    target: TextureTarget::Texture2d,
+                    format: r8,
+                    bind: resource::Bind::SAMPLER_VIEW,
+                    width: 8,
+                    height: 8,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )
+            .expect("a texture");
+            let tbo = v.features.has(Feature::arb_or_gles_ext_texture_buffer);
+            // A context each, so that the first refusal cannot be what refuses the second.
+            for (n, resource) in [(1, buffer), (2, texture)] {
+                let ctx = ClassicCtx::for_test(ContextId::new(n).expect("a context id"));
+                v.context_create(ctx, &AllAttached).expect("a context");
+                let mut wire = Vec::new();
+                encode(
+                    &Command::CreateObject {
+                        handle: ObjectHandle::new(n).expect("non-zero"),
+                        object: Object::SamplerView(SamplerView {
+                            resource,
+                            format: r8,
+                            target: TextureTarget::Buffer,
+                            first_element_or_layers: 0,
+                            last_element_or_levels: 63,
+                            swizzle: [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+                        }),
+                    },
+                    &mut wire,
+                );
+                let ran = v.submit(ctx, &wire, &AllAttached).expect("the context is here");
+                let as_wanted = match (resource == buffer, tbo) {
+                    (true, true) => ran.is_ok(),
+                    (true, false) => matches!(ran, Err(Fault::OutOfRange { .. })),
+                    (false, _) => {
+                        matches!(ran, Err(Fault::IllegalResource { handle, .. }) if handle == texture)
+                    }
+                };
+                assert!(
+                    as_wanted,
+                    "{host_gl:?} (texture buffers: {tbo}): view of {resource:?}: {ran:?}"
+                );
+            }
+        }
+    }
+
     /// A copy between two textures no framebuffer can hold, on a driver without
     /// `glCopyImageSubData`, lands on desktop GL: the source level is read with
     /// `glGetCompressedTexImage` and the box is written into the destination. The box is one
