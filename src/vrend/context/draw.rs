@@ -1765,16 +1765,15 @@ impl Context {
         let formats = host.formats;
         let s = stage.index();
         let prog = sub.program_at(at);
-        if sub.images[s].is_empty() || prog.img_locs[s].is_empty() || !features.has(Feature::images)
-        {
+        if prog.img_locs[s].is_empty() || !features.has(Feature::images) {
             return;
         }
         let prog_mask = prog.images_used_mask[s];
         let offset = prog.image_binding_offset[s];
-        for (&i, iview) in &sub.images[s] {
-            if i as usize >= MAX_SHADER_IMAGES || prog_mask & (1 << i) == 0 {
-                continue;
-            }
+        // Every slot the program reads, bound or not: GL keeps a unit's image until another is
+        // bound there, so a slot the guest emptied would read what an earlier draw left. The C
+        // walks only the slots holding views.
+        for i in (0..MAX_SHADER_IMAGES as u32).filter(|i| prog_mask & (1 << i) != 0) {
             let image_unit = ImageUnit::at(i + offset);
             let Some(loc) = prog.img_locs[s].get(i as usize).copied().flatten() else {
                 continue;
@@ -1784,6 +1783,10 @@ impl Context {
             if !features.api().is_gles() {
                 gl.uniform_1i(loc, (i + offset) as GLint);
             }
+            let Some(iview) = sub.images[s].get(&i) else {
+                gl.bind_image_texture(image_unit, None, 0, false, 0, GL_READ_ONLY, GL_R32UI);
+                continue;
+            };
             let access = match iview.access {
                 ImageAccess::Read => GL_READ_ONLY,
                 ImageAccess::Write => GL_WRITE_ONLY,

@@ -2842,6 +2842,18 @@ SABOTAGES = [
         'a_texture_buffer_past_the_texel_limit_is_sized_as_the_limit',
     ),
     (
+        'an emptied image slot keeps the unit an earlier draw bound',
+        'src/vrend/context/draw.rs',
+        """            let Some(iview) = sub.images[s].get(&i) else {
+                gl.bind_image_texture(image_unit, None, 0, false, 0, GL_READ_ONLY, GL_R32UI);
+                continue;
+            };""",
+        """            let Some(iview) = sub.images[s].get(&i) else {
+                continue;
+            };""",
+        'an_emptied_image_slot_reads_nothing',
+    ),
+    (
         'an indexed draw under transform feedback on GLES is drawn indexed',
         'src/vrend/context/draw.rs',
         """        let deindexed = draw.indexed""",
