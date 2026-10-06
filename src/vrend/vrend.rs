@@ -4972,6 +4972,32 @@ mod tests {
     }
 
     /// A buffer of `width` bytes: host memory for `Bind::CUSTOM`, a GL buffer otherwise.
+    /// Whether a renderer of `host_gl` offers the guest `format` for sampling.
+    fn offered(host_gl: HostGl, format: crate::vrend::proto::Format) -> bool {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let v = Vrend::new(
+            Config { host_gl, ..Config::default() },
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        v.caps().v1.sampler.has(format)
+    }
+
     fn buffer_args(bind: resource::Bind, width: u32) -> resource::Args {
         resource::Args {
             target: TextureTarget::Buffer,
@@ -6321,6 +6347,82 @@ mod tests {
                     "{host_gl:?}: {advertised} images offered, the {stage} stage takes {takes}"
                 );
             }
+        }
+    }
+
+    /// A guest samples the RGB32 formats only from texture buffers, so they are offered only
+    /// where such a buffer works: here, one is made and sampled wherever RGB32F is offered.
+    #[test]
+    fn rgb32_is_offered_only_where_its_texture_buffer_samples() {
+        use crate::vrend::pipe::Swizzle;
+        use crate::vrend::proto::{Box3, Command, Object, SamplerView, Transfer};
+        const FS: &str = "FRAG\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], BUFFER, FLOAT\n\
+                          DCL TEMP[0]\nIMM[0] INT32 { 0, 0, 0, 0 }\n  \
+                          0: TXF TEMP[0], IMM[0], SAMP[0], BUFFER\n  1: MOV OUT[0], TEMP[0]\n  \
+                          2: END\n";
+        let rgb32f = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == "R32G32B32_FLOAT")
+            .expect("a wire format");
+        let texels = ResourceHandle::new(10).expect("a resource handle is non-zero");
+        let red = [1.0f32, 0.0, 0.0].map(f32::to_bits);
+        let more = More {
+            resources: vec![(texels, buffer_args(resource::Bind::SAMPLER_VIEW, 12))],
+            before: vec![
+                Command::ResourceInlineWrite {
+                    transfer: Transfer {
+                        resource: texels,
+                        level: 0,
+                        usage: 0,
+                        stride: 0,
+                        layer_stride: 0,
+                        region: Box3 { x: 0, y: 0, z: 0, width: 12, height: 1, depth: 1 },
+                    },
+                    data: &red,
+                },
+                Command::CreateObject {
+                    handle: ObjectHandle::new(20).expect("non-zero"),
+                    object: Object::SamplerView(SamplerView {
+                        resource: texels,
+                        format: rgb32f,
+                        target: TextureTarget::Buffer,
+                        first_element_or_layers: 0,
+                        last_element_or_levels: 0,
+                        swizzle: [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+                    }),
+                },
+                Command::SetSamplerViews {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    views: vec![Some(ObjectHandle::new(20).expect("non-zero"))],
+                },
+            ],
+            ..Default::default()
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            if !offered(host_gl, rgb32f) {
+                eprintln!("{host_gl:?}: RGB32F is not offered");
+                continue;
+            }
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                vs: None,
+                fs: Some(FS),
+                consts: &[],
+                clear: [0.0; 4],
+                logicop: None,
+                tess: None,
+                pipeline: None,
+                more: Some(&more),
+            })
+            .unwrap_or_else(|e| panic!("{host_gl:?}: RGB32F is offered, but its buffer: {e:?}"))
+            .expect("no tessellation asked for");
+            assert!(
+                pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
+                "{host_gl:?}: the texture buffer's red was sampled: {:?}",
+                &pixels[..4]
+            );
         }
     }
 

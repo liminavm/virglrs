@@ -2756,8 +2756,8 @@ SABOTAGES = [
     (
         'a format the driver rounds is offered',
         'src/vrend/caps.rs',
-        """            if entry.bindings.sampler_view && entry.stores_exactly {""",
-        """            if entry.bindings.sampler_view {""",
+        """            if entry.bindings.sampler_view && entry.stores_exactly && (rgb32_buffers || !rgb32) {""",
+        """            if entry.bindings.sampler_view && (rgb32_buffers || !rgb32) {""",
         'every_format_offered_is_stored_exactly',
     ),
     (
@@ -2819,6 +2819,13 @@ SABOTAGES = [
         """                            ImageSpan::Layers { level: im.level_size & 0xff, first, last }""",
         """                            ImageSpan::Layers { level: im.level_size, first, last }""",
         'an_image_binds_at_the_level_in_the_low_byte',
+    ),
+    (
+        'RGB32 is offered without asking whether its texture buffer works',
+        'src/vrend/caps.rs',
+        """        let rgb32_buffers = rgb32_texture_buffers_work(gl, features);""",
+        """        let rgb32_buffers = true || rgb32_texture_buffers_work(gl, features);""",
+        'rgb32_is_offered_only_where_its_texture_buffer_samples',
     ),
     (
         'an indexed draw under transform feedback on GLES is drawn indexed',

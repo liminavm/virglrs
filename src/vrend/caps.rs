@@ -403,6 +403,10 @@ impl CapsV2 {
         v1.max_render_targets = limits.max_draw_buffers;
         v1.max_samples = getu(GL_MAX_SAMPLES);
         let mut planar_target = false;
+        // The guest samples the RGB32 formats only from texture buffers, so their bit says that
+        // a texture buffer of them works: desktop GL before 4.0 takes one only with
+        // `ARB_texture_buffer_object_rgb32`, which zink on KosmicKrisp lacks.
+        let rgb32_buffers = rgb32_texture_buffers_work(gl, features);
         for raw in 0..FORMAT_MAX {
             let format = Format::from_wire(raw).expect("below FORMAT_MAX");
             let Some(entry) = formats.get(format) else { continue };
@@ -416,7 +420,9 @@ impl CapsV2 {
             }
             // A format the driver rounds is served but not offered: a guest packs its values
             // for the format and would read them back rounded.
-            if entry.bindings.sampler_view && entry.stores_exactly {
+            let rgb32 =
+                matches!(format.name(), "R32G32B32_FLOAT" | "R32G32B32_SINT" | "R32G32B32_UINT");
+            if entry.bindings.sampler_view && entry.stores_exactly && (rgb32_buffers || !rgb32) {
                 v1.sampler.set(format);
                 // What the capset's planar-target bit is about: not that some layout could be
                 // backed, but that one was actually offered here. Read off the bit that offers
@@ -794,6 +800,26 @@ fn per_stage(
         }
     }
     out
+}
+
+/// Whether a texture buffer of `GL_RGB32F` is taken.
+fn rgb32_texture_buffers_work(gl: &Gl, features: &Features) -> bool {
+    if !features.has(Feature::arb_or_gles_ext_texture_buffer) {
+        return false;
+    }
+    let buf = gl.gen_buffer();
+    gl.bind_buffer(GL_TEXTURE_BUFFER, Some(buf));
+    gl.buffer_data_null(GL_TEXTURE_BUFFER, 48, GL_STATIC_DRAW);
+    let tex = gl.gen_texture();
+    gl.bind_texture(GL_TEXTURE_BUFFER, Some(tex));
+    gl.drain_errors();
+    gl.tex_buffer(GL_RGB32F, buf, None);
+    let taken = gl.drain_errors() == GL_NO_ERROR;
+    gl.bind_texture(GL_TEXTURE_BUFFER, None);
+    gl.bind_buffer(GL_TEXTURE_BUFFER, None);
+    gl.delete_texture(tex);
+    gl.delete_buffer(buf);
+    taken
 }
 
 /// `vrend_check_framebuffer_mixed_color_attachements`: whether one framebuffer takes an RGBA
