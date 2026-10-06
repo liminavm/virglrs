@@ -2814,6 +2814,13 @@ SABOTAGES = [
         'the_image_count_for_the_other_stages_fits_each_of_them',
     ),
     (
+        'an image binds at the whole level word',
+        'src/vrend/context.rs',
+        """                            ImageSpan::Layers { level: im.level_size & 0xff, first, last }""",
+        """                            ImageSpan::Layers { level: im.level_size, first, last }""",
+        'an_image_binds_at_the_level_in_the_low_byte',
+    ),
+    (
         'an indexed draw under transform feedback on GLES is drawn indexed',
         'src/vrend/context/draw.rs',
         """        let deindexed = draw.indexed""",

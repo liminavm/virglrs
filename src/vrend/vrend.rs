@@ -5809,6 +5809,87 @@ mod tests {
         }
     }
 
+    /// A texture image's level is the low byte of the wire's level word. Mesa sends a
+    /// `pipe_image_view`'s union as it lies, and above the 8-bit level the word holds whatever the
+    /// guest left there: `0xffff_0000` from a stock guest's piglit. Taken whole, that is level
+    /// -65536, which GL refuses to bind.
+    #[test]
+    fn an_image_binds_at_the_level_in_the_low_byte() {
+        use crate::vrend::pipe::ImageAccess;
+        use crate::vrend::proto::{Box3, Command, ShaderImage, Transfer};
+        const FS: &str = "FRAG\nDCL OUT[0], COLOR\n\
+                          DCL IMAGE[0], 2D, PIPE_FORMAT_R8G8B8A8_UNORM, WR\n\
+                          DCL TEMP[0]\nIMM[0] INT32 { 3, 2, 0, 0 }\n  \
+                          0: LOAD TEMP[0], IMAGE[0], IMM[0], 2D, PIPE_FORMAT_R8G8B8A8_UNORM\n  \
+                          1: MOV OUT[0], TEMP[0]\n  2: END\n";
+        let rgba8 = super::super::proto::Format::from_wire(67).expect("R8G8B8A8_UNORM");
+        let image = ResourceHandle::new(10).expect("a resource handle is non-zero");
+        let red = [0xff00_00ffu32; 16];
+        let more = More {
+            resources: vec![(
+                image,
+                resource::Args {
+                    target: TextureTarget::Texture2d,
+                    format: rgba8,
+                    bind: resource::Bind::SAMPLER_VIEW,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )],
+            before: vec![
+                Command::ResourceInlineWrite {
+                    transfer: Transfer {
+                        resource: image,
+                        level: 0,
+                        usage: 0,
+                        stride: 16,
+                        layer_stride: 0,
+                        region: Box3 { x: 0, y: 0, z: 0, width: 4, height: 4, depth: 1 },
+                    },
+                    data: &red,
+                },
+                Command::SetShaderImages {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    images: vec![Some(ShaderImage {
+                        format: rgba8,
+                        access: ImageAccess::Read,
+                        layer_offset: 0,
+                        level_size: 0xffff_0000,
+                        resource: image,
+                    })],
+                },
+            ],
+            ..Default::default()
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                vs: None,
+                fs: Some(FS),
+                consts: &[],
+                clear: [0.0; 4],
+                logicop: None,
+                tess: None,
+                pipeline: None,
+                more: Some(&more),
+            })
+            .unwrap_or_else(|e| panic!("{host_gl:?}: the load draws: {e:?}"))
+            .expect("no tessellation asked for");
+            assert!(
+                pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
+                "{host_gl:?}: the image's red was loaded: {:?}",
+                &pixels[..4]
+            );
+        }
+    }
+
     /// A rectangle in a format desktop GL cannot hold as one -- here RGTC1, which a guest picks
     /// for `GL_COMPRESSED_RED` -- is stored as a 2D texture, so the shader has to sample it as
     /// one. Declared as a rectangle sampler, the draw samples nothing; sized or fetched without

@@ -4288,7 +4288,9 @@ impl Context {
                             if last < first {
                                 return Err(Fault::OutOfRange { cmd, what: "image layers" });
                             }
-                            ImageSpan::Layers { level: im.level_size, first, last }
+                            // The level is `pipe_image_view`'s 8-bit field; Mesa sends the union
+                            // as it lies, so the rest of the word is whatever the guest left there.
+                            ImageSpan::Layers { level: im.level_size & 0xff, first, last }
                         }
                         Storage::Buffer { .. } => {
                             // A buffer image is a texel range: `layer_offset` and `level_size`
