@@ -453,6 +453,15 @@ impl Blitter {
                     }
                     TextureTarget::Array1d => v[5] = layer_coord,
                     TextureTarget::Array2d => v[6] = layer_coord,
+                    // A cube is sampled by direction: the face's corner becomes the vector that
+                    // points at it, and a cube array's layer names the face and the cube both.
+                    TextureTarget::Cube | TextureTarget::CubeArray => {
+                        let layer = layer_coord as u32;
+                        v[4..7].copy_from_slice(&cube_direction(layer % 6, tex[i]));
+                        if job.src_target == TextureTarget::CubeArray {
+                            v[7] = (layer / 6) as f32;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -923,6 +932,21 @@ pub fn texcoords(normalized: bool, w: u32, h: u32, p0: Point, p1: Point) -> [f32
         ]
     } else {
         [p0.x as f32, p0.y as f32, p1.x as f32, p1.y as f32]
+    }
+}
+
+/// `util_map_texcoords2d_onto_cubemap`: a normalised coordinate on cube face `face` (GL's order,
+/// +X first) as the direction that samples that texel.
+fn cube_direction(face: u32, [s, t]: [f32; 2]) -> [f32; 3] {
+    let (sc, tc) = (2.0 * s - 1.0, 2.0 * t - 1.0);
+    match face {
+        0 => [1.0, -tc, -sc],
+        1 => [-1.0, -tc, sc],
+        2 => [sc, 1.0, tc],
+        3 => [sc, -1.0, -tc],
+        4 => [sc, -tc, 1.0],
+        5 => [-sc, -tc, -1.0],
+        _ => unreachable!("a cube has six faces, and {face} is not one"),
     }
 }
 

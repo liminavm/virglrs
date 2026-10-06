@@ -3349,7 +3349,8 @@ mod tests {
     /// A blit into a layered destination lands at the layers its box names. The source here is one
     /// no framebuffer can hold, so the blit draws through the blitter's shader one destination
     /// slice at a time, and each slice is counted from the box's first: a 3D destination's box
-    /// starts at a slice of its own, and an array box deeper than one layer walks its layers.
+    /// starts at a slice of its own, and an array box deeper than one layer walks its layers. A
+    /// cube source's box names a face, and the face is what lands.
     #[test]
     fn a_blit_through_the_blitter_lands_at_the_destination_box_s_layers() {
         use crate::vrend::encode::encode;
@@ -3418,6 +3419,28 @@ mod tests {
                 region(1, 2),
                 [None, Some(red), Some(green), None],
             ),
+            // A cube face is sampled by the direction that points at it: +Z and -Y, each the
+            // only red face of its cube.
+            (
+                TextureTarget::Cube,
+                vec![green, green, green, green, red, green],
+                TextureTarget::Array2d,
+                1,
+                4,
+                region(4, 1),
+                region(0, 1),
+                [Some(red), None, None, None],
+            ),
+            (
+                TextureTarget::Cube,
+                vec![green, green, green, red, green, green],
+                TextureTarget::Array2d,
+                1,
+                4,
+                region(3, 1),
+                region(2, 1),
+                [None, None, Some(red), None],
+            ),
         ];
         for host_gl in [HostGl::Gles, HostGl::Desktop] {
             for (n, (src_target, src_layers, dst_target, depth, array_size, from, to, want)) in
@@ -3475,15 +3498,21 @@ mod tests {
                         len: bytes.len(),
                     }];
                     let from = Iov::new(&from);
-                    let info = info(0, count as i32);
-                    v.transfer(
-                        None,
-                        handle,
-                        Some(&from),
-                        transfer::Through::ToHost(from.source()),
-                        &info,
-                    )
-                    .expect("the upload");
+                    // A layer at a time: a cube takes one face per upload.
+                    for z in 0..count {
+                        let info = transfer::Info {
+                            offset: (z as usize * layer_bytes) as u64,
+                            ..info(z as i32, 1)
+                        };
+                        v.transfer(
+                            None,
+                            handle,
+                            Some(&from),
+                            transfer::Through::ToHost(from.source()),
+                            &info,
+                        )
+                        .expect("the upload");
+                    }
                 }
                 let mut wire = Vec::new();
                 encode(

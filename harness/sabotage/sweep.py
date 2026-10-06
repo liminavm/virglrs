@@ -3508,6 +3508,20 @@ SABOTAGES = [
         '        false\n    }\n',
         'parked_query',
     ),
+    (
+        'the blitter samples a cube source with the face 2D coordinate',
+        'src/vrend/blitter.rs',
+        """                        v[4..7].copy_from_slice(&cube_direction(layer % 6, tex[i]));""",
+        """                        let _ = cube_direction(layer % 6, tex[i]);""",
+        'a_blit_through_the_blitter_lands_at_the_destination_box_s_layers',
+    ),
+    (
+        'the blitter samples every cube source at its first face',
+        'src/vrend/blitter.rs',
+        """                        v[4..7].copy_from_slice(&cube_direction(layer % 6, tex[i]));""",
+        """                        v[4..7].copy_from_slice(&cube_direction(0, tex[i]));""",
+        'a_blit_through_the_blitter_lands_at_the_destination_box_s_layers',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the
