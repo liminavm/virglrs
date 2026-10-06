@@ -5704,6 +5704,111 @@ mod tests {
         }
     }
 
+    /// A fragment shader drawing into an integer target writes the integer bits it holds. Its
+    /// colour output has to be declared integer: zink on KosmicKrisp converts a float output to
+    /// the target's integers, which turns every bit pattern into zero. Written from an
+    /// immediate, a constant, a flat varying and an image load, each typed output also has to
+    /// compile, which wants the bit casts a plain `#version 150` lacks.
+    #[test]
+    fn an_integer_target_takes_the_bits_the_shader_writes() {
+        use crate::vrend::pipe::ImageAccess;
+        use crate::vrend::proto::{Box3, Command, ShaderImage, Transfer};
+        const IMM: &str = "FRAG\nDCL OUT[0], COLOR\n\
+                           IMM[0] UINT32 { 1065353216, 1073741824, 1077936128, 1082130432 }\n  \
+                           0: MOV OUT[0], IMM[0]\n  1: END\n";
+        // The fragment stage's only integer is its output's cast.
+        const VS: &str = "VERT\nDCL IN[0]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\n\
+                          IMM[0] UINT32 { 1065353216, 1073741824, 1077936128, 1082130432 }\n  \
+                          0: MOV OUT[0], IN[0]\n  1: MOV OUT[1], IMM[0]\n  2: END\n";
+        const VARYING: &str = "FRAG\nDCL IN[0], GENERIC[0], CONSTANT\nDCL OUT[0], COLOR\n  \
+                               0: MOV OUT[0], IN[0]\n  1: END\n";
+        const CONST: &str = "FRAG\nDCL OUT[0], COLOR\nDCL CONST[0]\n  0: MOV OUT[0], CONST[0]\n  \
+                             1: END\n";
+        const LOAD: &str = "FRAG\nDCL OUT[0], COLOR\n\
+                            DCL IMAGE[0], 2D, PIPE_FORMAT_R32G32B32A32_UINT, WR\n\
+                            IMM[0] INT32 { 0, 0, 0, 0 }\n  \
+                            0: LOAD OUT[0], IMAGE[0], IMM[0], 2D, PIPE_FORMAT_R32G32B32A32_UINT\n  \
+                            1: END\n";
+        let rgba32ui = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == "R32G32B32A32_UINT")
+            .expect("a wire format");
+        let image = ResourceHandle::new(10).expect("a resource handle is non-zero");
+        let texel = [1.0f32, 2.0, 3.0, 4.0].map(f32::to_bits);
+        let more = More {
+            resources: vec![(
+                image,
+                resource::Args {
+                    target: TextureTarget::Texture2d,
+                    format: rgba32ui,
+                    bind: resource::Bind::SAMPLER_VIEW,
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )],
+            before: vec![
+                Command::ResourceInlineWrite {
+                    transfer: Transfer {
+                        resource: image,
+                        level: 0,
+                        usage: 0,
+                        stride: 16,
+                        layer_stride: 0,
+                        region: Box3 { x: 0, y: 0, z: 0, width: 1, height: 1, depth: 1 },
+                    },
+                    data: &texel,
+                },
+                Command::SetShaderImages {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    images: vec![Some(ShaderImage {
+                        format: rgba32ui,
+                        access: ImageAccess::Read,
+                        layer_offset: 0,
+                        level_size: 0,
+                        resource: image,
+                    })],
+                },
+            ],
+            ..Default::default()
+        };
+        let consts = [(ShaderStage::Fragment, texel.map(f32::from_bits))];
+        let want: Vec<u8> = texel.iter().flat_map(|w| w.to_le_bytes()).collect();
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            for (what, vs, fs) in [
+                ("immediate", None, IMM),
+                ("constant", None, CONST),
+                ("varying", Some(VS), VARYING),
+                ("image load", None, LOAD),
+            ] {
+                let pixels = draw_over_target(OneDraw {
+                    host_gl,
+                    format: "R32G32B32A32_UINT",
+                    vs,
+                    fs: Some(fs),
+                    consts: &consts,
+                    clear: [0.0; 4],
+                    logicop: None,
+                    tess: None,
+                    pipeline: None,
+                    more: Some(&more),
+                })
+                .unwrap_or_else(|e| panic!("{host_gl:?}: the {what} draws: {e:?}"))
+                .expect("no tessellation asked for");
+                assert!(
+                    pixels.chunks(16).all(|p| p == want),
+                    "{host_gl:?}: the {what}'s bits reached the target: {:?}",
+                    &pixels[..16]
+                );
+            }
+        }
+    }
+
     /// A rectangle in a format desktop GL cannot hold as one -- here RGTC1, which a guest picks
     /// for `GL_COMPRESSED_RED` -- is stored as a 2D texture, so the shader has to sample it as
     /// one. Declared as a rectangle sampler, the draw samples nothing; sized or fetched without

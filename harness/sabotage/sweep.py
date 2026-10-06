@@ -2784,6 +2784,29 @@ SABOTAGES = [
         'a_format_is_held_exactly_only_at_a_depth_that_holds_its_values',
     ),
     (
+        'an unsigned integer target gets a float output',
+        'src/vrend/context/select.rs',
+        """                        key.fs.cbufs_unsigned_int_bitmask |= 1 << i;""",
+        """""",
+        'an_integer_target_takes_the_bits_the_shader_writes',
+    ),
+    (
+        'an integer output is cast without integer GLSL',
+        'src/vrend/shader/glsl/decl.rs',
+        """                        if ctx.outputs[i].ty != VecType::Float {
+                            ctx.shader_req_bits |= req::INTS;""",
+        """                        if false {
+                            ctx.shader_req_bits |= req::INTS;""",
+        'an_integer_target_takes_the_bits_the_shader_writes',
+    ),
+    (
+        'an image load into an integer output stays float',
+        'src/vrend/shader/glsl/tex.rs',
+        """        let (open, close) = if typed_output {""",
+        """        let (open, close) = if false && typed_output {""",
+        'an_integer_target_takes_the_bits_the_shader_writes',
+    ),
+    (
         'an indexed draw under transform feedback on GLES is drawn indexed',
         'src/vrend/context/draw.rs',
         """        let deindexed = draw.indexed""",

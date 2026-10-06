@@ -1359,6 +1359,15 @@ pub(super) fn translate_load(
             ReturnType::Sint => Qual::IntBitsToFloat,
             _ => Qual::None,
         };
+        // Loaded into an integer output, the float bits go on through that output's own cast.
+        let typed_output =
+            matches!(dinfo.dtypeprefix, Qual::FloatBitsToUint | Qual::FloatBitsToInt)
+                && inst.dst[0].file == File::Output;
+        let (open, close) = if typed_output {
+            (format!("{}({}(", dinfo.dstconv.s(), dinfo.dtypeprefix.s()), "))")
+        } else {
+            (String::new(), "")
+        };
 
         // On desktop GL `WR` is writable; on GLES it becomes `writeonly`, since most formats
         // have to be one or the other:
@@ -1372,15 +1381,17 @@ pub(super) fn translate_load(
         if !gles || !src.indirect {
             emit!(
                 ctx.bufs,
-                "{} = {}(imageLoad({}, {}({}({})){}){});\n",
+                "{} = {}{}(imageLoad({}, {}({}({})){}){}){};\n",
                 dst,
+                open,
                 dtypeprefix.s(),
                 srcs[0],
                 coord_prefix.s(),
                 conversion,
                 srcs[1],
                 ms_str,
-                wm
+                wm,
+                close
             );
         } else if let Some(image) = ctx.lookup_image_array_ptr(i32::from(src.index)) {
             let image = ctx.image_arrays[image];
@@ -1397,16 +1408,18 @@ pub(super) fn translate_load(
                 let s = format!("{cname}img{basearrayidx}[{i}]");
                 emit!(
                     ctx.bufs,
-                    "case {}: {} = {}(imageLoad({}, {}({}({})){}){});break;\n",
+                    "case {}: {} = {}{}(imageLoad({}, {}({}({})){}){}){};break;\n",
                     i,
                     dst,
+                    open,
                     dtypeprefix.s(),
                     s,
                     coord_prefix.s(),
                     conversion,
                     srcs[1],
                     ms_str,
-                    wm
+                    wm,
+                    close
                 );
             }
             ctx.bufs.emit("}\n");

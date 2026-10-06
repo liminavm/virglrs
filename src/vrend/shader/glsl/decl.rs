@@ -744,6 +744,10 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
                             u32::from(ctx.key.fs.cbufs_unsigned_int_bitmask),
                             ctx.outputs[i].sid,
                         );
+                        // An integer output is written through a bit cast.
+                        if ctx.outputs[i].ty != VecType::Float {
+                            ctx.shader_req_bits |= req::INTS;
+                        }
                         name_prefix =
                             if ctx.key.fs.logicop_func.is_some() { "fsout_tmp" } else { "fsout" };
                     } else if ctx.glsl_ver_required < 140 {

@@ -13,9 +13,11 @@
 //! ported line for line, because the key decides which variant -- so which GLSL -- a draw runs,
 //! and a key filled differently from the C is a different shader on the screen.
 //!
-//! `use_core_profile` is set on both flavours and `use_integer` on neither, so the signed and
-//! unsigned attribute masks stay clear. Two separable stages meet by location and are not
-//! matched against each other; every other pair is.
+//! `use_core_profile` is set on both flavours. `use_integer` is set on neither, so the signed and
+//! unsigned attribute masks stay clear; the colour buffers' integer masks the C also keeps behind
+//! it are always filled, since a float output into an integer target is undefined and zink on
+//! KosmicKrisp writes zeros for it. Two separable stages meet by location and are not matched
+//! against each other; every other pair is.
 
 use super::*;
 
@@ -485,6 +487,12 @@ impl SubContext {
                 };
                 if desc.is_pure_integer() {
                     add_alpha_test = false;
+                    // The C's `UPDATE_INT_SIGN_MASK`, without its `use_integer` gate.
+                    if desc.is_pure_uint() {
+                        key.fs.cbufs_unsigned_int_bitmask |= 1 << i;
+                    } else {
+                        key.fs.cbufs_signed_int_bitmask |= 1 << i;
+                    }
                 }
                 // Read only under a logic op, as the C reads it.
                 if logicop {
