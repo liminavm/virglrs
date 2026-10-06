@@ -214,9 +214,6 @@ pub struct Job {
     /// reads it off the destination resource inside `vrend_fb_bind_texture_id`; the blitter here
     /// holds no resources, so the caller resolves it once and passes the answer.
     pub dst_attachment: GLenum,
-    /// The destination's gallium target, which decides whether the attached layer is the one the
-    /// guest named or this pass's slice.
-    pub dst_target: TextureTarget,
     pub dst_w: u32,
     pub dst_h: u32,
     pub dst_level: u32,
@@ -420,14 +417,10 @@ impl Blitter {
             let scale = job.src_depth as f32 / job.dst_depth as f32;
             let offset = ((job.src_depth - 1) as f32 - (job.dst_depth - 1) as f32 * scale) * 0.5;
             let src_z = (dst_z as f32 + offset) * scale;
-            // The DESTINATION's target decides this: a layered destination is attached at the
-            // layer the guest named, and only a plain one walks its slices.
-            let layer = match job.dst_target {
-                TextureTarget::Cube | TextureTarget::Array1d | TextureTarget::Array2d => {
-                    job.dst_layer
-                }
-                _ => dst_z,
-            };
+            // The box's first layer or slice, and this one counted from it. The C attaches a
+            // layered destination at the first layer for every slice, and a 3D one from slice 0
+            // whatever the box says.
+            let layer = job.dst_layer + dst_z;
             if let Err(feature) = transfer::attach_texture(
                 gl,
                 features,
@@ -1118,7 +1111,6 @@ mod tests {
             dst,
             dst_gl_target: GL_TEXTURE_2D,
             dst_attachment: GL_COLOR_ATTACHMENT0,
-            dst_target: TextureTarget::Texture2d,
             dst_w: W,
             dst_h: W,
             dst_level: 0,
@@ -1212,7 +1204,6 @@ mod tests {
                 dst,
                 dst_gl_target: gl_target,
                 dst_attachment: GL_COLOR_ATTACHMENT0,
-                dst_target: TextureTarget::Texture1d,
                 dst_w: W,
                 dst_h: 1,
                 dst_level: 0,

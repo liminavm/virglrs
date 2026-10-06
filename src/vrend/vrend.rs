@@ -3346,6 +3346,193 @@ mod tests {
         }
     }
 
+    /// A blit into a layered destination lands at the layers its box names. The source here is one
+    /// no framebuffer can hold, so the blit draws through the blitter's shader one destination
+    /// slice at a time, and each slice is counted from the box's first: a 3D destination's box
+    /// starts at a slice of its own, and an array box deeper than one layer walks its layers.
+    #[test]
+    fn a_blit_through_the_blitter_lands_at_the_destination_box_s_layers() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::pipe::TexFilter;
+        use crate::vrend::proto::{Blit, BlitTarget, Box3, Command, Scissor};
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let named = |name: &str| {
+            (0..crate::vrend::proto::FORMAT_MAX)
+                .filter_map(crate::vrend::proto::Format::from_wire)
+                .find(|f| f.name() == name)
+                .expect("a wire format")
+        };
+        let (rgb9e5, rgba) = (named("R9G9B9E5_FLOAT"), named("R8G8B8A8_UNORM"));
+        // An RGB9E5 texel of exponent 16 reads its mantissas over 256, so 256 is 1.0.
+        let texel = |r: u32, g: u32, b: u32| (r | g << 9 | b << 18 | 16 << 27).to_le_bytes();
+        let (red, green) = (texel(256, 0, 0), texel(0, 256, 0));
+        let (w, h) = (4u32, 4u32);
+        let layer_bytes = (w * h * 4) as usize;
+        let region = |z, depth| Box3 { x: 0, y: 0, z, width: w as i32, height: h as i32, depth };
+        let info = |z, depth| transfer::Info {
+            level: 0,
+            stride: w * 4,
+            layer_stride: w * h * 4,
+            offset: 0,
+            region: region(z, depth),
+            synchronized: false,
+        };
+        // (source target, source layers, destination target, destination depth, destination
+        // layers, the blit's source box, its destination box, the destination's layers after it)
+        let cases = [
+            (
+                TextureTarget::Texture2d,
+                vec![red],
+                TextureTarget::Texture3d,
+                4,
+                1,
+                region(0, 1),
+                region(2, 1),
+                [None, None, Some(red), None],
+            ),
+            (
+                TextureTarget::Array2d,
+                vec![red, green],
+                TextureTarget::Array2d,
+                1,
+                4,
+                region(0, 2),
+                region(1, 2),
+                [None, Some(red), Some(green), None],
+            ),
+        ];
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            for (n, (src_target, src_layers, dst_target, depth, array_size, from, to, want)) in
+                cases.iter().cloned().enumerate()
+            {
+                let retire = crate::fence::Retirement::start(
+                    Box::new(Discard),
+                    crate::vrend::debug::Switches::default(),
+                );
+                let mut v = Vrend::new(
+                    Config { host_gl, ..Config::default() },
+                    &crate::budget::Budget::with_cap(None, false),
+                    retire.handle(),
+                    None,
+                    crate::vrend::resource::Condemned::default(),
+                    crate::vrend::debug::Traces::default(),
+                    crate::vrend::debug::Switches::default(),
+                )
+                .expect("vrend comes up");
+                let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+                v.context_create(ctx, &AllAttached).expect("a context");
+                let (src, dst) = (
+                    ResourceHandle::new(1).expect("non-zero"),
+                    ResourceHandle::new(2).expect("non-zero"),
+                );
+                let sampled = resource::Bind::SAMPLER_VIEW;
+                let rendered = resource::Bind(resource::Bind::RENDER_TARGET.0 | sampled.0);
+                let mut src_bytes: Vec<u8> =
+                    src_layers.iter().flat_map(|t| t.repeat((w * h) as usize)).collect();
+                let src_count = src_layers.len() as u32;
+                let dst_count = depth.max(array_size);
+                let mut dst_bytes = vec![0u8; layer_bytes * dst_count as usize];
+                for (handle, target, format, bind, depth, array_size, bytes, count) in [
+                    (src, src_target, rgb9e5, sampled, 1, src_count, &mut src_bytes, src_count),
+                    (dst, dst_target, rgba, rendered, depth, array_size, &mut dst_bytes, dst_count),
+                ] {
+                    v.resource_create(
+                        handle,
+                        resource::Args {
+                            target,
+                            format,
+                            bind,
+                            width: w,
+                            height: h,
+                            depth,
+                            array_size,
+                            last_level: 0,
+                            nr_samples: 0,
+                            flags: resource::ResourceFlags(0),
+                        },
+                    )
+                    .expect("a texture");
+                    let from = [crate::abi::GuestIov {
+                        base: crate::abi::VmmPtr(bytes.as_mut_ptr().cast()),
+                        len: bytes.len(),
+                    }];
+                    let from = Iov::new(&from);
+                    let info = info(0, count as i32);
+                    v.transfer(
+                        None,
+                        handle,
+                        Some(&from),
+                        transfer::Through::ToHost(from.source()),
+                        &info,
+                    )
+                    .expect("the upload");
+                }
+                let mut wire = Vec::new();
+                encode(
+                    &Command::Blit(Blit {
+                        mask: 0xf,
+                        filter: TexFilter::Nearest,
+                        scissor_enable: false,
+                        render_condition_enable: false,
+                        alpha_blend: false,
+                        scissor: Scissor { minx: 0, miny: 0, maxx: 0, maxy: 0 },
+                        dst: BlitTarget { resource: dst, level: 0, format: rgba, region: to },
+                        src: BlitTarget { resource: src, level: 0, format: rgb9e5, region: from },
+                    }),
+                    &mut wire,
+                );
+                let ran = v.submit(ctx, &wire, &AllAttached).expect("the context is here");
+                assert!(ran.is_ok(), "{host_gl:?} case {n}: {ran:?}");
+                let mut read = vec![0xa5u8; layer_bytes * dst_count as usize];
+                let into = [crate::abi::GuestIov {
+                    base: crate::abi::VmmPtr(read.as_mut_ptr().cast()),
+                    len: read.len(),
+                }];
+                let into = Iov::new(&into);
+                v.transfer(
+                    None,
+                    dst,
+                    None,
+                    transfer::Through::ToGuest(&into),
+                    &info(0, dst_count as i32),
+                )
+                .expect("the destination reads back");
+                for (layer, want) in want.iter().enumerate() {
+                    let pixel = match want {
+                        Some(t) if *t == red => [0xff, 0, 0, 0xff],
+                        Some(_) => [0, 0xff, 0, 0xff],
+                        None => [0; 4],
+                    };
+                    let got = &read[layer * layer_bytes..(layer + 1) * layer_bytes];
+                    assert!(
+                        got.as_chunks::<4>().0.iter().all(|p| *p == pixel),
+                        "{host_gl:?} case {n}: layer {layer} should be {pixel:?}, starts {:?}",
+                        &got[..4]
+                    );
+                }
+                v.context_destroy(ctx, &AllAttached);
+            }
+        }
+    }
+
     /// A transfer's box is the guest's own, and the renderer sizes it before it checks it against
     /// the resource. A box whose bytes overflow any integer is refused like any other box outside
     /// the resource, not left to overflow: with overflow checks on, which a dev build of any

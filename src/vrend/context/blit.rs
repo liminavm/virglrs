@@ -552,7 +552,6 @@ impl Context {
             color,
             dst_gl_target: dst_end.target(),
             dst_attachment: transfer::attachment_for(dst_res, formats),
-            dst_target: dst_res.args.target,
             dst_w: dst_res.width_at(b.dst.level),
             dst_h: dst_res.height_at(b.dst.level),
             dst_level: b.dst.level,

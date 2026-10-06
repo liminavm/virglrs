@@ -2691,6 +2691,20 @@ SABOTAGES = [
         'a_blit_box_far_past_any_texture_is_refused_and_one_short_of_it_is_survived',
     ),
     (
+        'the blitter draws every destination slice from slice 0',
+        'src/vrend/blitter.rs',
+        """            let layer = job.dst_layer + dst_z;""",
+        """            let layer = dst_z;""",
+        'a_blit_through_the_blitter_lands_at_the_destination_box_s_layers',
+    ),
+    (
+        'the blitter draws every destination slice at the box\'s first layer',
+        'src/vrend/blitter.rs',
+        """            let layer = job.dst_layer + dst_z;""",
+        """            let layer = job.dst_layer;""",
+        'a_blit_through_the_blitter_lands_at_the_destination_box_s_layers',
+    ),
+    (
         'vkCmdSetColorWriteEnableEXT tells the driver one switch fewer',
         'src/venus/driver.rs',
         """        unsafe { f(cb, enables.len() as u32, enables.as_ptr()) };""",
