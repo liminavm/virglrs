@@ -271,6 +271,7 @@ pub fn pixel_bytes(format: GLenum, ty: GLenum) -> Option<usize> {
         GL_UNSIGNED_SHORT | GL_SHORT | GL_HALF_FLOAT | GL_HALF_FLOAT_OES => 2,
         GL_UNSIGNED_INT | GL_INT | GL_FLOAT => 4,
         // Packed types: the whole pixel in one word, whatever the component count.
+        GL_UNSIGNED_BYTE_3_3_2 | GL_UNSIGNED_BYTE_2_3_3_REV => return Some(1),
         GL_UNSIGNED_SHORT_5_6_5
         | GL_UNSIGNED_SHORT_4_4_4_4
         | GL_UNSIGNED_SHORT_5_5_5_1
@@ -1175,6 +1176,13 @@ impl Gl {
             return false;
         }
         self.pack_tight();
+        // Desktop GL clamps a read from a normalized buffer to [0, 1] unless told not to, which
+        // turns every negative snorm value into zero; the guest's own GL does that clamping where
+        // its state asks for it. GLES never clamps a read.
+        if !self.api.is_gles() {
+            // SAFETY: plain scalars.
+            unsafe { self.t.glClampColor()(GL_CLAMP_READ_COLOR, GL_FALSE as GLenum) };
+        }
         // Robust readback where the driver has it: the bound is the slice's own length, so
         // whatever the driver believes the image is, it cannot write past `dst`.
         let bounded = match self.robust {

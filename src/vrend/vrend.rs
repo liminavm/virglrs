@@ -5389,6 +5389,112 @@ mod tests {
         }
     }
 
+    /// On a desktop host, a texture of each of these formats reads back the bytes uploaded into
+    /// it, whole and after a sub-box upload. Desktop GL clamps a read from a normalized buffer
+    /// to [0, 1] unless told not to, which zeroes every negative snorm value; and it uploads
+    /// through a packed type a GLES host has no use for.
+    #[test]
+    fn a_desktop_texture_reads_back_what_was_uploaded() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let mut v = Vrend::new(
+            Config { host_gl: HostGl::Desktop, ..Config::default() },
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        let info = |x: i32, y: i32, w: i32, h: i32, stride: u32| transfer::Info {
+            level: 0,
+            stride,
+            layer_stride: 0,
+            offset: 0,
+            region: crate::vrend::proto::Box3 { x, y, z: 0, width: w, height: h, depth: 1 },
+            synchronized: false,
+        };
+        let iov = |bytes: &mut [u8]| crate::abi::GuestIov {
+            base: crate::abi::VmmPtr(bytes.as_mut_ptr().cast()),
+            len: bytes.len(),
+        };
+        let formats =
+            ["R8_SNORM", "R8G8B8A8_SNORM", "R16G16B16A16_SNORM", "RGTC1_SNORM", "B2G3R3_UNORM"];
+        for (n, name) in formats.into_iter().enumerate() {
+            let format = (0..crate::vrend::proto::FORMAT_MAX)
+                .filter_map(crate::vrend::proto::Format::from_wire)
+                .find(|f| f.name() == name)
+                .expect("a wire format");
+            let d = format.describe().expect("described");
+            let res = ResourceHandle::new(n as u32 + 1).expect("non-zero");
+            let (w, h) = (64u32, 32u32);
+            v.resource_create(
+                res,
+                resource::Args {
+                    target: TextureTarget::Texture2d,
+                    format,
+                    bind: resource::Bind::SAMPLER_VIEW,
+                    width: w,
+                    height: h,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let stride = d.stride(w) as u32;
+            let upload = |v: &mut Vrend, bytes: &mut [u8], i: &transfer::Info| {
+                let from = [iov(bytes)];
+                let from = Iov::new(&from);
+                v.transfer(None, res, Some(&from), transfer::Through::ToHost(from.source()), i)
+                    .unwrap_or_else(|e| panic!("{name}: upload {e:?}"));
+            };
+            let read = |v: &mut Vrend| {
+                let mut read = vec![0xa5u8; (stride * d.blocks_high(h)) as usize];
+                let into = [iov(&mut read)];
+                let into = Iov::new(&into);
+                v.transfer(
+                    None,
+                    res,
+                    None,
+                    transfer::Through::ToGuest(&into),
+                    &info(0, 0, w as i32, h as i32, stride),
+                )
+                .unwrap_or_else(|e| panic!("{name}: read {e:?}"));
+                read
+            };
+            // Every byte value, so a negative snorm and every bit of a packed one is in there.
+            let mut want: Vec<u8> = (0..stride * d.blocks_high(h))
+                .map(|i| (i as u8).wrapping_mul(29).wrapping_add(7))
+                .collect();
+            upload(&mut v, &mut want.clone(), &info(0, 0, w as i32, h as i32, stride));
+            assert!(read(&mut v) == want, "{name}: whole");
+            let (x, y, sw, sh) = (8u32, 4u32, 16u32, 8u32);
+            let row = d.stride(sw) as usize;
+            let mut sub: Vec<u8> = (0..row * d.blocks_high(sh) as usize)
+                .map(|i| (i as u8).wrapping_mul(13).wrapping_add(200))
+                .collect();
+            upload(&mut v, &mut sub, &info(x as i32, y as i32, sw as i32, sh as i32, row as u32));
+            for r in 0..d.blocks_high(sh) as usize {
+                let at = (d.blocks_high(y) as usize + r) * stride as usize + d.stride(x) as usize;
+                want[at..at + row].copy_from_slice(&sub[r * row..(r + 1) * row]);
+            }
+            assert!(read(&mut v) == want, "{name}: after a sub-box");
+        }
+    }
+
     /// Whether a host serves separable stages, and whether a draw ran a program pipeline.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     struct PipelineSeen {

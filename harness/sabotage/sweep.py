@@ -2084,8 +2084,8 @@ SABOTAGES = [
         'a framebuffer read runs at whatever pack state the context was left in',
         'src/vrend/gl.rs',
         """        self.pack_tight();
-        // Robust readback where the driver has it""",
-        """        // Robust readback where the driver has it""",
+        // Desktop GL clamps a read""",
+        """        // Desktop GL clamps a read""",
         'an_unaligned_cursor_reads_back_on_a_fresh_renderer_on_either_flavour',
     ),
     (
@@ -2703,6 +2703,24 @@ SABOTAGES = [
         """            let layer = job.dst_layer + dst_z;""",
         """            let layer = job.dst_layer;""",
         'a_blit_through_the_blitter_lands_at_the_destination_box_s_layers',
+    ),
+    (
+        'desktop GL clamps a read-back to [0, 1]',
+        'src/vrend/gl.rs',
+        """        if !self.api.is_gles() {
+            // SAFETY: plain scalars.
+            unsafe { self.t.glClampColor()(GL_CLAMP_READ_COLOR, GL_FALSE as GLenum) };""",
+        """        if false {
+            // SAFETY: plain scalars.
+            unsafe { self.t.glClampColor()(GL_CLAMP_READ_COLOR, GL_FALSE as GLenum) };""",
+        'a_desktop_texture_reads_back_what_was_uploaded',
+    ),
+    (
+        'a 3-3-2 pixel has no size',
+        'src/vrend/gl.rs',
+        """        GL_UNSIGNED_BYTE_3_3_2 | GL_UNSIGNED_BYTE_2_3_3_REV => return Some(1),""",
+        """""",
+        'a_desktop_texture_reads_back_what_was_uploaded',
     ),
     (
         'an indexed draw under transform feedback on GLES is drawn indexed',
