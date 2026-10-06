@@ -5704,6 +5704,134 @@ mod tests {
         }
     }
 
+    /// A rectangle in a format desktop GL cannot hold as one -- here RGTC1, which a guest picks
+    /// for `GL_COMPRESSED_RED` -- is stored as a 2D texture, so the shader has to sample it as
+    /// one. Declared as a rectangle sampler, the draw samples nothing; sized or fetched without
+    /// a LOD, the 2D sampler does not compile. A sample, a fetch and a size query each draw what
+    /// the texture holds, on both flavours.
+    #[test]
+    fn a_rectangle_stored_as_2d_samples_as_2d() {
+        use crate::vrend::pipe::{CompareFunc, MipFilter, Swizzle, TexFilter, TexWrap};
+        use crate::vrend::proto::{Box3, Command, Object, SamplerState, SamplerView, Transfer};
+        const TEX: &str = "FRAG\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], RECT, FLOAT\n\
+                           DCL TEMP[0]\nIMM[0] FLT32 { 8.0, 8.0, 0.0, 0.0 }\n  \
+                           0: TEX TEMP[0], IMM[0], SAMP[0], RECT\n  1: MOV OUT[0], TEMP[0]\n  \
+                           2: END\n";
+        const TXF: &str = "FRAG\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], RECT, FLOAT\n\
+                           DCL TEMP[0]\nIMM[0] INT32 { 8, 8, 0, 0 }\n  \
+                           0: TXF TEMP[0], IMM[0], SAMP[0], RECT\n  1: MOV OUT[0], TEMP[0]\n  \
+                           2: END\n";
+        // The width, 16, scaled to 1.0.
+        const TXQ: &str = "FRAG\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], RECT, FLOAT\n\
+                           DCL TEMP[0]\nIMM[0] INT32 { 0, 0, 0, 0 }\n\
+                           IMM[1] FLT32 { 0.0625, 0.0, 0.0, 1.0 }\n  \
+                           0: TXQ TEMP[0], IMM[0].xxxx, SAMP[0], RECT\n  \
+                           1: I2F TEMP[0], TEMP[0]\n  2: MUL OUT[0], TEMP[0].xxxx, IMM[1]\n  \
+                           3: END\n";
+        let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
+        let rgtc1 = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == "RGTC1_UNORM")
+            .expect("a wire format");
+        let rect = ResourceHandle::new(10).expect("a resource handle is non-zero");
+        // Every 4x4 block is red 255 at both endpoints: full red throughout.
+        let blocks: Vec<u32> = [0x0000_ffffu32, 0].repeat(16);
+        let more = More {
+            resources: vec![(
+                rect,
+                resource::Args {
+                    target: TextureTarget::Rect,
+                    format: rgtc1,
+                    bind: resource::Bind::SAMPLER_VIEW,
+                    width: 16,
+                    height: 16,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )],
+            before: vec![
+                Command::ResourceInlineWrite {
+                    transfer: Transfer {
+                        resource: rect,
+                        level: 0,
+                        usage: 0,
+                        stride: 32,
+                        layer_stride: 0,
+                        region: Box3 { x: 0, y: 0, z: 0, width: 16, height: 16, depth: 1 },
+                    },
+                    data: &blocks,
+                },
+                Command::CreateObject {
+                    handle: o(20),
+                    object: Object::SamplerView(SamplerView {
+                        resource: rect,
+                        format: rgtc1,
+                        target: TextureTarget::Rect,
+                        first_element_or_layers: 0,
+                        last_element_or_levels: 0,
+                        swizzle: [Swizzle::X, Swizzle::Zero, Swizzle::Zero, Swizzle::One],
+                    }),
+                },
+                Command::CreateObject {
+                    handle: o(21),
+                    object: Object::SamplerState(SamplerState {
+                        wrap_s: TexWrap::ClampToEdge,
+                        wrap_t: TexWrap::ClampToEdge,
+                        wrap_r: TexWrap::ClampToEdge,
+                        min_img_filter: TexFilter::Nearest,
+                        min_mip_filter: MipFilter::None,
+                        mag_img_filter: TexFilter::Nearest,
+                        compare_mode: false,
+                        compare_func: CompareFunc::LessEqual,
+                        seamless_cube_map: false,
+                        max_anisotropy: 0,
+                        lod_bias: 0.0,
+                        min_lod: 0.0,
+                        max_lod: 0.0,
+                        border_color: [0; 4],
+                    }),
+                },
+                Command::SetSamplerViews {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    views: vec![Some(o(20))],
+                },
+                Command::BindSamplerStates {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    states: vec![Some(o(21))],
+                },
+            ],
+            ..Default::default()
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            for (what, fs) in [("sample", TEX), ("fetch", TXF), ("size query", TXQ)] {
+                let pixels = draw_over_target(OneDraw {
+                    host_gl,
+                    format: "R8G8B8A8_UNORM",
+                    vs: None,
+                    fs: Some(fs),
+                    consts: &[],
+                    clear: [0.0; 4],
+                    logicop: None,
+                    tess: None,
+                    pipeline: None,
+                    more: Some(&more),
+                })
+                .unwrap_or_else(|e| panic!("{host_gl:?}: the {what} draws: {e:?}"))
+                .expect("no tessellation asked for");
+                assert!(
+                    pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
+                    "{host_gl:?}: the {what} draws the rectangle's red: {:?}",
+                    &pixels[..4]
+                );
+            }
+        }
+    }
+
     /// Two pipelines sharing a fragment stage number its uniform block differently: after a
     /// vertex stage with a block of its own the fragment block is the second binding, after one
     /// without it is the first. A block's binding lives in the stage's own program, so drawing

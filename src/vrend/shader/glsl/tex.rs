@@ -6,7 +6,7 @@
 
 use super::inst::{Binding, DestInfo, SourceInfo};
 use super::{
-    Context, MAX_IMMEDIATE, Qual, bit32, emit, proc_prefix, samplertype_is_shadow,
+    Context, MAX_IMMEDIATE, Qual, bit32, emit, proc_prefix, rect_is_2d, samplertype_is_shadow,
     samplertype_to_req_bits, swiz_char, swizzle_string, wm_string,
 };
 use crate::vrend::pipe::slots::{ImageSlot, SamplerSlot};
@@ -127,11 +127,12 @@ pub(super) fn emit_txq(
         return;
     };
 
-    // No LOD for these texture types; but GLES emulates RECT with a plain 2D texture, which
-    // wants LOD 0.
+    // No LOD for these texture types; but a rectangle held by a plain 2D texture wants LOD 0.
     let gles = ctx.cfg.is_gles();
     match texture {
-        Texture::Rect | Texture::ShadowRect if gles => bias = ", 0".to_string(),
+        Texture::Rect | Texture::ShadowRect if rect_is_2d(ctx, sampler.index()) => {
+            bias = ", 0".to_string()
+        }
         Texture::Rect
         | Texture::ShadowRect
         | Texture::Buffer
@@ -742,11 +743,10 @@ pub(super) fn translate_tex(
     if inst.opcode != Opcode::Txf
         && Key::view_mask_get(&ctx.key.sampler_views_emulated_rect_mask, slot.index())
     {
-        // No LOD for these texture types; but GLES emulates RECT with a plain 2D texture,
-        // which wants LOD 0.
+        // No LOD for these texture types; but the view is a rectangle held by a plain 2D
+        // texture, which wants LOD 0.
         let lod = match texture {
             Texture::Buffer | Texture::Msaa2d | Texture::Msaa2dArray => "",
-            Texture::Rect | Texture::ShadowRect if !gles => "",
             _ => ", 0",
         };
         coord = match inst.opcode {
@@ -776,7 +776,9 @@ pub(super) fn translate_tex(
     let wm_or_none = if dinfo.dst_override_no_wm[0] { "" } else { writemask };
 
     if inst.opcode == Opcode::Txf {
-        if gles && matches!(texture, Texture::D1 | Texture::Array1d | Texture::Rect) {
+        if (gles && matches!(texture, Texture::D1 | Texture::Array1d))
+            || (texture == Texture::Rect && rect_is_2d(ctx, slot.index()))
+        {
             if texture == Texture::D1 {
                 emit!(
                     ctx.bufs,

@@ -10,14 +10,14 @@ use super::tex::internalformat_string;
 use super::{
     ARRAY_STARTS_AT_A_SLOT, Context, Failure, Image, Io, IoDir, MAX_SO_OUTPUTS, Qual, Sampler,
     Strings, bit32, bit64, emit, gs_input_prim_to_size, hdr, prim_to_name, prim_to_tes_name,
-    proc_prefix, req, samplertype_is_shadow, spacing_string, stage_output_name_prefix,
+    proc_prefix, rect_is_2d, req, samplertype_is_shadow, spacing_string, stage_output_name_prefix,
 };
 use crate::vrend::pipe::slots::{ImageSlot, SamplerSlot};
 use crate::vrend::shader::{
     AdvancedBlend, Config, FragmentInfo, Info, Key, sampler_return_conv, sampler_type_conv,
 };
 use crate::vrend::tgsi::{
-    Declaration, File, Interpolate, Location, Processor, Semantic, Shader, Token, scan,
+    Declaration, File, Interpolate, Location, Processor, Semantic, Shader, Texture, Token, scan,
 };
 
 /// `emit_ext`.
@@ -263,7 +263,14 @@ fn emit_sampler_decl(ctx: &mut Context<'_>, i: u32, range: i32, sampler: Sampler
     let sname = proc_prefix(ctx.prog_type);
     let precision = if ctx.cfg.is_gles() { "highp" } else { "" };
     let ptc = sampler_return_conv(sampler.ret);
-    let stc = sampler_type_conv(ctx.cfg.dialect, sampler.ty).unwrap_or("");
+    // A rectangle whose texture is 2D is declared 2D: a rectangle sampler bound to it samples
+    // nothing. The C declares the rectangle regardless.
+    let ty = match sampler.ty {
+        Texture::Rect if rect_is_2d(ctx, i as usize) => Texture::D2,
+        Texture::ShadowRect if rect_is_2d(ctx, i as usize) => Texture::Shadow2d,
+        ty => ty,
+    };
+    let stc = sampler_type_conv(ctx.cfg.dialect, ty).unwrap_or("");
     let is_shad = samplertype_is_shadow(sampler.ty);
     if range != 0 {
         hdr!(

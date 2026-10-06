@@ -853,6 +853,13 @@ pub(super) fn samplertype_is_shadow(t: Texture) -> bool {
     )
 }
 
+/// Whether a rectangle sampler in slot `index` samples a plain 2D texture: always on GLES, which
+/// has no rectangles, and on desktop where the view's format cannot be a rectangle and its texture
+/// was made 2D. Such a slot is declared, sized and fetched as 2D, which wants a LOD.
+pub(super) fn rect_is_2d(ctx: &Context<'_>, index: usize) -> bool {
+    ctx.cfg.is_gles() || Key::view_mask_get(&ctx.key.sampler_views_emulated_rect_mask, index)
+}
+
 /// `samplertype_to_req_bits`.
 pub(super) fn samplertype_to_req_bits(t: Texture) -> u64 {
     match t {
