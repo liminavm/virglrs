@@ -6043,6 +6043,203 @@ mod tests {
         }
     }
 
+    /// A guest regenerating mipmaps re-uploads level 0 through a staging buffer and blits each
+    /// level into the next: sampled afterwards, every level shows the new level 0, not what the
+    /// first upload put there.
+    #[test]
+    fn a_regenerated_mip_chain_shows_the_new_base_level() {
+        use crate::vrend::pipe::{CompareFunc, MipFilter, Swizzle, TexFilter, TexWrap};
+        use crate::vrend::proto::{
+            Blit, BlitTarget, Box3, Command, CopyDirection, Object, SamplerState, SamplerView,
+            Scissor, Transfer,
+        };
+        let rgba8 = super::super::proto::Format::from_wire(67).expect("R8G8B8A8_UNORM");
+        let r8 = super::super::proto::Format::from_wire(64).expect("R8_UNORM");
+        let (tex, stage) = (
+            ResourceHandle::new(10).expect("non-zero"),
+            ResourceHandle::new(11).expect("non-zero"),
+        );
+        let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
+        // Levels 0..4 green, tight and in order, then a red level 0.
+        let sides = [128u32, 64, 32, 16, 8, 4, 2, 1];
+        let mut bytes = Vec::new();
+        let mut offsets = Vec::new();
+        for side in sides {
+            offsets.push(bytes.len() as u32);
+            for _ in 0..side * side {
+                bytes.extend_from_slice(&[0, 0, 0xff, 0]);
+            }
+        }
+        let red_at = bytes.len() as u32;
+        for _ in 0..128 * 128 {
+            bytes.extend_from_slice(&[0xff, 0, 0, 0]);
+        }
+        let stage_len = bytes.len();
+        let pages = std::cell::RefCell::new(bytes);
+        let upload = |level: u32, offset: u32| {
+            let side = sides[level as usize] as i32;
+            Command::CopyTransfer3d {
+                direction: CopyDirection::ToHost,
+                transfer: Transfer {
+                    resource: tex,
+                    level,
+                    usage: 10,
+                    stride: side as u32 * 4,
+                    layer_stride: (side * side) as u32 * 4,
+                    region: Box3 { x: 0, y: 0, z: 0, width: side, height: side, depth: 1 },
+                },
+                staging: stage,
+                staging_offset: offset,
+                synchronized: true,
+            }
+        };
+        let level = |level, side| BlitTarget {
+            resource: tex,
+            level,
+            format: rgba8,
+            region: Box3 { x: 0, y: 0, z: 0, width: side, height: side, depth: 1 },
+        };
+        let view = |handle| Command::CreateObject {
+            handle,
+            object: Object::SamplerView(SamplerView {
+                resource: tex,
+                format: rgba8,
+                target: TextureTarget::Texture2d,
+                first_element_or_layers: 0,
+                last_element_or_levels: 7 << 8,
+                swizzle: [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+            }),
+        };
+        let mut before: Vec<Command<'_>> = (0..8).map(|l| upload(l, offsets[l as usize])).collect();
+        before.push(view(o(20)));
+        // Sampled once before the new base arrives.
+        let mut regenerate = vec![upload(0, red_at)];
+        for l in 1..8u32 {
+            regenerate.push(Command::Blit(Blit {
+                mask: 0xf,
+                filter: TexFilter::Linear,
+                scissor_enable: false,
+                render_condition_enable: false,
+                alpha_blend: false,
+                scissor: Scissor { minx: 0, miny: 0, maxx: 0, maxy: 0 },
+                dst: level(l, sides[l as usize] as i32),
+                src: level(l - 1, sides[l as usize - 1] as i32),
+            }));
+        }
+        regenerate.extend([
+            view(o(22)),
+            Command::DestroyObject {
+                kind: super::super::proto::ObjectType::SamplerView,
+                handle: o(20),
+            },
+            Command::SetSamplerViews {
+                stage: ShaderStage::Fragment,
+                start_slot: 0,
+                views: vec![Some(o(22))],
+            },
+        ]);
+        before.extend([
+            Command::CreateObject {
+                handle: o(21),
+                object: Object::SamplerState(SamplerState {
+                    wrap_s: TexWrap::ClampToEdge,
+                    wrap_t: TexWrap::ClampToEdge,
+                    wrap_r: TexWrap::Repeat,
+                    min_img_filter: TexFilter::Linear,
+                    min_mip_filter: MipFilter::Nearest,
+                    mag_img_filter: TexFilter::Linear,
+                    compare_mode: false,
+                    compare_func: CompareFunc::LessEqual,
+                    seamless_cube_map: false,
+                    max_anisotropy: 0,
+                    lod_bias: 0.0,
+                    min_lod: 0.0,
+                    max_lod: 16.0,
+                    border_color: [0; 4],
+                }),
+            },
+            Command::SetSamplerViews {
+                stage: ShaderStage::Fragment,
+                start_slot: 0,
+                views: vec![Some(o(20))],
+            },
+            Command::BindSamplerStates {
+                stage: ShaderStage::Fragment,
+                start_slot: 0,
+                states: vec![Some(o(21))],
+            },
+        ]);
+        let more = More {
+            resources: vec![
+                (
+                    tex,
+                    resource::Args {
+                        target: TextureTarget::Texture2d,
+                        format: rgba8,
+                        bind: resource::Bind(
+                            resource::Bind::SAMPLER_VIEW.0 | resource::Bind::RENDER_TARGET.0,
+                        ),
+                        width: 128,
+                        height: 128,
+                        depth: 1,
+                        array_size: 1,
+                        last_level: 7,
+                        nr_samples: 0,
+                        flags: resource::ResourceFlags(0),
+                    },
+                ),
+                (
+                    stage,
+                    resource::Args {
+                        target: TextureTarget::Buffer,
+                        format: r8,
+                        bind: resource::Bind::STAGING,
+                        width: stage_len as u32,
+                        height: 1,
+                        depth: 1,
+                        array_size: 1,
+                        last_level: 0,
+                        nr_samples: 0,
+                        flags: resource::ResourceFlags(0),
+                    },
+                ),
+            ],
+            before,
+            redraws: vec![regenerate],
+            pages: vec![(stage, &pages)],
+            ..Default::default()
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            for lod in ["0.0", "1.0"] {
+                let fs = format!(
+                    "FRAG\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\n\
+                     DCL TEMP[0]\nIMM[0] FLT32 {{ 0.5, 0.5, 0.0, {lod} }}\n  \
+                     0: TXL TEMP[0], IMM[0], SAMP[0], 2D\n  1: MOV OUT[0], TEMP[0]\n  \
+                     2: END\n"
+                );
+                let pixels = draw_over_target(OneDraw {
+                    host_gl,
+                    format: "R8G8B8A8_UNORM",
+                    vs: None,
+                    fs: Some(&fs),
+                    consts: &[],
+                    clear: [0.0; 4],
+                    logicop: None,
+                    tess: None,
+                    pipeline: None,
+                    more: Some(&more),
+                })
+                .unwrap_or_else(|e| panic!("{host_gl:?}: the draws run: {e:?}"))
+                .expect("no tessellation asked for");
+                assert!(
+                    pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0]),
+                    "{host_gl:?}: level {lod} shows the new red base: {:?}",
+                    &pixels[..4]
+                );
+            }
+        }
+    }
+
     /// A rectangle in a format desktop GL cannot hold as one -- here RGTC1, which a guest picks
     /// for `GL_COMPRESSED_RED` -- is stored as a 2D texture, so the shader has to sample it as
     /// one. Declared as a rectangle sampler, the draw samples nothing; sized or fetched without
