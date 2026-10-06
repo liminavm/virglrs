@@ -336,15 +336,30 @@ fn swizzle_bgra(data: &mut [u8]) {
     }
 }
 
-/// `vrend_scale_depth`: `Z24X8_UNORM` travels with its depth in the high 24 bits, and GL wants
-/// it scaled by 256 one way and back the other. The float round trip is the C's, rounding and
-/// all, because the golden readbacks carry it.
-fn scale_depth(data: &mut [u8], scale: f32) {
-    const MYSCALE: f32 = 1.0 / 0xff_ffff as f32;
+/// `Z24X8_UNORM` keeps its depth in the low 24 bits; GL moves a depth texture as a 32-bit unorm.
+/// The two are one number at two precisions, `z * (2^32 - 1) / (2^24 - 1)` apart, and the C's
+/// `vrend_scale_depth` went through a float and dropped the low byte both ways.
+///
+/// Going to GL, the exact value is rounded up, not to nearest: a driver may bring a 32-bit unorm
+/// down to its own 24 bits by rounding, by truncating, or by shifting, and only a value at or
+/// just above the exact one lands on the same depth under all three. zink on KosmicKrisp
+/// truncates a 64x64 upload, and stored one step low whatever rounded down.
+const Z24_MAX: u64 = 0xff_ffff;
+const Z32_MAX: u64 = 0xffff_ffff;
+
+fn z24_to_gl(data: &mut [u8]) {
     for word in data.as_chunks_mut::<4>().0 {
-        let v = u32::from_ne_bytes(*word);
-        let d = (((v >> 8) as f32) * MYSCALE * scale).clamp(0.0, 1.0);
-        *word = (((d / MYSCALE) as u32) << 8).to_ne_bytes();
+        let z = (u32::from_ne_bytes(*word) & 0xff_ffff) as u64;
+        *word = ((z * Z32_MAX).div_ceil(Z24_MAX) as u32).to_ne_bytes();
+    }
+}
+
+/// The inverse of [`z24_to_gl`], rounded to nearest: a driver keeping the depth as a float hands
+/// back a hair either side of the exact value.
+fn z24_from_gl(data: &mut [u8]) {
+    for word in data.as_chunks_mut::<4>().0 {
+        let u = u32::from_ne_bytes(*word) as u64;
+        *word = (((u * Z24_MAX + Z32_MAX / 2) / Z32_MAX) as u32).to_ne_bytes();
     }
 }
 
@@ -511,7 +526,7 @@ pub fn write(
                 swizzle_bgra(data);
             }
             if format_name == "Z24X8_UNORM" {
-                scale_depth(data, 256.0);
+                z24_to_gl(data);
             }
             let (x, y) = (b.x, upload_y(res, &b, invert));
             let (w, h, d) = (b.width, b.height, b.depth);
@@ -1120,7 +1135,7 @@ pub fn read(
                 swizzle_bgra(data);
             }
             if format_name == "Z24X8_UNORM" {
-                scale_depth(data, 1.0 / 256.0);
+                z24_from_gl(data);
             }
             if invert && !compressed {
                 flip_rows(data, &l);
@@ -1335,23 +1350,36 @@ mod tests {
     }
 
     #[test]
-    fn bgra_swaps_and_depth_scales_like_the_c() {
+    fn bgra_swaps_its_red_and_blue() {
         let mut px = [1u8, 2, 3, 4, 5, 6, 7, 8];
         swizzle_bgra(&mut px);
         assert_eq!(px, [3, 2, 1, 4, 7, 6, 5, 8]);
-        // The C's arithmetic: `1/0xffffff` rounds to 2^-24 in f32, so a 24-bit value scaled by
-        // 256 lands one ulp above the C's `CLAMP` would suggest, and the round trip is not the
-        // identity. Both are what the goldens were recorded through.
-        let mut z = 0x0080_0000u32.to_ne_bytes().to_vec();
-        scale_depth(&mut z, 256.0);
-        assert_eq!(u32::from_ne_bytes(z[..4].try_into().unwrap()), 0x8000_0000);
-        let mut back = 0x8000_0000u32.to_ne_bytes().to_vec();
-        scale_depth(&mut back, 1.0 / 256.0);
-        assert_eq!(u32::from_ne_bytes(back[..4].try_into().unwrap()), 0x0080_0000);
-        // Saturates: the top of the range clamps to 1.0 and comes back one ulp short of it.
-        let mut full = 0xffff_ff00u32.to_ne_bytes().to_vec();
-        scale_depth(&mut full, 256.0);
-        assert_eq!(u32::from_ne_bytes(full[..4].try_into().unwrap()), 0xffff_fe00);
+    }
+
+    /// Every 24-bit depth survives the trip to GL's 32-bit unorm and back, whatever the guest left
+    /// in the padding byte. What goes to GL is the exact unorm rounded up, so a driver bringing it
+    /// to 24 bits by rounding, truncating or shifting lands on the same depth; what comes back a
+    /// hair either side of the exact unorm, as from a driver keeping a float, reads as that depth.
+    #[test]
+    fn a_24_bit_depth_goes_to_gl_and_back_exactly() {
+        for z in [0u32, 1, 0xff, 0x6c00, 0x12_3456, 0x7f_ffff, 0x80_0000, 0xff_fffe, 0xff_ffff] {
+            let mut word = (0xa5 << 24 | z).to_ne_bytes();
+            z24_to_gl(&mut word);
+            let gl = u32::from_ne_bytes(word) as u64;
+            let (z64, exact) = (z as u64, z as f64 / 0xff_ffff as f64 * 0xffff_ffffu32 as f64);
+            assert_eq!(gl, exact.ceil() as u64, "{z:#x} goes to GL's unorm, rounded up");
+            assert_eq!((gl * Z24_MAX + Z32_MAX / 2) / Z32_MAX, z64, "{z:#x}, rounded by GL");
+            assert_eq!(gl * Z24_MAX / Z32_MAX, z64, "{z:#x}, truncated by GL");
+            assert_eq!(gl >> 8, z64, "{z:#x}, shifted by GL");
+            z24_from_gl(&mut word);
+            assert_eq!(u32::from_ne_bytes(word), z, "{z:#x} comes back");
+            let unorm = exact.round() as u32;
+            for near in [unorm.saturating_sub(1), unorm, unorm.saturating_add(1)] {
+                let mut from_gl = near.to_ne_bytes();
+                z24_from_gl(&mut from_gl);
+                assert_eq!(u32::from_ne_bytes(from_gl), z, "GL's {near:#x} reads as {z:#x}");
+            }
+        }
     }
 
     /// The planar bug the C carries, expressed as the property that makes it impossible here.

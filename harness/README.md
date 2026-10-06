@@ -160,13 +160,11 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   rebuild report, which a pin fixes; that is the lever, not an environment variable, and there is
   deliberately no `VREND_CONTENT=0` here.
 
-  **`Z24X8_UNORM` does not survive the round trip on this stack.** Read back, written and read
-  again, such a resource differs by one byte per texel — the same resources,
-  the same offsets and the same counts under the C as under virglrs, so it is the GL path and not
-  either renderer. It is pinned per corpus rather than excluded from the capture, because
-  excluding it would be a behaviour change against the reference for a buffer every frame clears
-  anyway. Its stencil-carrying twin `S8_UINT_Z24_UNORM` is in the same corpus and does not
-  deviate, so this is that format and not depth as a class.
+  **`Z24X8_UNORM` survives the round trip in virglrs and not in the C.** Its depth is the low 24
+  bits, and GL moves it as a 32-bit unorm. virglrs rescales exactly, and rounds up on the way in
+  because zink on KosmicKrisp truncates. The C goes through a float and drops the low byte both
+  ways, so under the C such a resource differs by one byte per texel after a rebuild. No pin
+  records that, because the C leg runs without the rebuild.
 
   **A planar level is skipped, and the composite corpora are where that shows.** A texture
   transfer moves one GL triple, so a decode target with its planes chained behind it has no
@@ -456,7 +454,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
       --expect fixtures/vrend-webgl.score --rebuild-expect fixtures/vrend-webgl.rebuild
   ```
 
-  That pin also carries a depth deviation, which `sampled` carries alone — replay that one as
+  `sampled` has a rebuild pin too; replay it as
   `./vrend-replay.sh ../vm/captures/sampled.bin --renderer rs --expect fixtures/sampled.score
   --rebuild-expect fixtures/sampled.rebuild`.
 

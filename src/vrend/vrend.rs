@@ -3562,6 +3562,117 @@ mod tests {
         }
     }
 
+    /// A 24-bit depth reads back as the guest wrote it, low byte and all: the trip through GL's
+    /// 32-bit unorm is exact both ways.
+    #[test]
+    fn a_24_bit_depth_reads_back_as_written() {
+        use crate::vrend::proto::Box3;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let z24 = super::super::proto::Format::from_wire(21).expect("Z24X8_UNORM");
+        let (w, h) = (64u32, 64u32);
+        // Depths whose low byte a lossy trip would drop, and depths whose low byte is zero, which
+        // a driver converting GL's 32-bit unorm by truncation stores one step low.
+        let depths: Vec<u32> = (0..w * h)
+            .map(|i| match i % 2 {
+                0 => (0x12_3456 + i * 0x01_0101) & 0xff_ffff,
+                _ => ((0x05 + i * 0x0d3f) & 0xffff) << 8,
+            })
+            .collect();
+        let info = transfer::Info {
+            level: 0,
+            stride: w * 4,
+            layer_stride: w * h * 4,
+            offset: 0,
+            region: Box3 { x: 0, y: 0, z: 0, width: w as i32, height: h as i32, depth: 1 },
+            synchronized: false,
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let mut v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+            v.context_create(ctx, &AllAttached).expect("a context");
+            let res = ResourceHandle::new(1).expect("non-zero");
+            v.resource_create(
+                res,
+                resource::Args {
+                    target: TextureTarget::Texture2d,
+                    format: z24,
+                    bind: resource::Bind(
+                        resource::Bind::DEPTH_STENCIL.0 | resource::Bind::SAMPLER_VIEW.0,
+                    ),
+                    width: w,
+                    height: h,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )
+            .expect("a depth texture");
+            let mut bytes: Vec<u8> = depths.iter().flat_map(|z| z.to_ne_bytes()).collect();
+            let from = [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(bytes.as_mut_ptr().cast()),
+                len: bytes.len(),
+            }];
+            let from = Iov::new(&from);
+            v.transfer(None, res, None, transfer::Through::ToHost(from.source()), &info)
+                .expect("the upload");
+            let mut read = vec![0xa5u8; bytes.len()];
+            let into = [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(read.as_mut_ptr().cast()),
+                len: read.len(),
+            }];
+            let into = Iov::new(&into);
+            v.transfer(None, res, None, transfer::Through::ToGuest(&into), &info)
+                .expect("the depth reads back");
+            let got: Vec<u32> = read
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_ne_bytes(*b) & 0xff_ffff)
+                .collect();
+            let wrong = got.iter().zip(&depths).position(|(g, d)| g != d);
+            assert!(
+                wrong.is_none(),
+                "{host_gl:?}: texel {wrong:?} reads {:#x}, written {:#x}",
+                wrong.map_or(0, |i| got[i]),
+                wrong.map_or(0, |i| depths[i])
+            );
+            v.context_destroy(ctx, &AllAttached);
+        }
+    }
+
     /// A transfer's box is the guest's own, and the renderer sizes it before it checks it against
     /// the resource. A box whose bytes overflow any integer is refused like any other box outside
     /// the resource, not left to overflow: with overflow checks on, which a dev build of any

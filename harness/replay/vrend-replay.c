@@ -1177,8 +1177,8 @@ static bool contents_agree(const void *a, uint64_t a_len, const void *b, uint64_
       }
    }
    /* The line goes into the pinned report, not just onto stderr: a resource that does not
-    * survive the round trip is a fact about this corpus on this host -- a depth buffer whose
-    * low byte does not come back is one -- and a fact that is only true of some resources is
+    * survive the round trip is a fact about this corpus on this host -- a format the driver
+    * cannot hold exactly would be one -- and a fact that is only true of some resources is
     * pinned, the way a dropped journal entry is, rather than being argued about per run. */
    rb_addf("ctx %u: content %u entries, %u all-zero, %u missing, %u differ\n", src, n_a, zeros,
            *missing, differ);

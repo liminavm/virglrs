@@ -3522,6 +3522,27 @@ SABOTAGES = [
         """                        v[4..7].copy_from_slice(&cube_direction(0, tex[i]));""",
         'a_blit_through_the_blitter_lands_at_the_destination_box_s_layers',
     ),
+    (
+        'a 24-bit depth upload drops its low byte on the way to GL',
+        'src/vrend/transfer.rs',
+        """        *word = ((z * Z32_MAX).div_ceil(Z24_MAX) as u32).to_ne_bytes();""",
+        """        *word = ((z >> 8 << 16) as u32).to_ne_bytes();""",
+        'a_24_bit_depth_reads_back_as_written',
+    ),
+    (
+        'a 24-bit depth goes to GL rounded to nearest, which a truncating driver stores one step low',
+        'src/vrend/transfer.rs',
+        """        *word = ((z * Z32_MAX).div_ceil(Z24_MAX) as u32).to_ne_bytes();""",
+        """        *word = (((z * Z32_MAX + Z24_MAX / 2) / Z24_MAX) as u32).to_ne_bytes();""",
+        'a_24_bit_depth_reads_back_as_written',
+    ),
+    (
+        'a 24-bit depth readback drops the low byte GL gave it',
+        'src/vrend/transfer.rs',
+        """        *word = (((u * Z24_MAX + Z32_MAX / 2) / Z32_MAX) as u32).to_ne_bytes();""",
+        """        *word = ((u >> 16 << 8) as u32).to_ne_bytes();""",
+        'a_24_bit_depth_reads_back_as_written',
+    ),
 ]
 
 # Not here, and deliberately: "the ring loop never calls `wait_ring.changed()` after advancing the

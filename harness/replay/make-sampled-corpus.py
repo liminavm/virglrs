@@ -75,13 +75,14 @@ def pattern(tag, w, h):
 
 
 def depth_pattern(w, h):
-    """A depth ramp with no symmetry in x or y, written as Z24X8_UNORM: the depth is the high 24
-    bits and the low byte is padding."""
+    """A depth ramp with no symmetry in x or y, written as Z24X8_UNORM: the depth is the low 24
+    bits and the high byte is padding. It spans the whole range, and its low byte is zero so a
+    renderer that drops that byte on the way to GL, as the C does, samples the same texels."""
     px = bytearray()
     for y in range(h):
         for x in range(w):
-            d = ((x * 977 + y * 4093) & 0xFFFFFF)
-            px += bytes((0, d & 0xFF, (d >> 8) & 0xFF, (d >> 16) & 0xFF))
+            d = ((x * 1031 + y * 16411) & 0xFFFF) << 8
+            px += bytes((d & 0xFF, (d >> 8) & 0xFF, (d >> 16) & 0xFF, 0))
     return bytes(px)
 
 
