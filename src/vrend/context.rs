@@ -561,7 +561,7 @@ pub enum Span {
     },
 }
 
-/// A buffer view's element range, checked against the host's texel limit when the view was made.
+/// A buffer view's element range, shortened to the host's texel limit when the view was made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Elements {
     first: u32,
@@ -569,11 +569,13 @@ pub struct Elements {
 }
 
 impl Elements {
-    /// `first..=last`, or `None` when that is empty or ends past `limit` texels.
-    fn within(first: u32, last: u32, limit: u32) -> Option<Elements> {
+    /// `first..=last` shortened to end at `limit` texels, as GL clamps a texture buffer's size
+    /// to its maximum. `None` when the range is empty or starts at or past `limit`, which leaves
+    /// nothing to shorten it to.
+    fn clamped(first: u32, last: u32, limit: u32) -> Option<Elements> {
         let count = last.checked_sub(first)?.checked_add(1)?;
-        (u64::from(first) + u64::from(count) <= u64::from(limit))
-            .then_some(Elements { first, count })
+        let room = limit.checked_sub(first).filter(|&r| r > 0)?;
+        Some(Elements { first, count: count.min(room) })
     }
 
     /// The range as a byte offset and a byte size, for texels `block` bytes wide.
@@ -2902,13 +2904,12 @@ impl Context {
                 .ok_or(Fault::IllegalResource { cmd, handle: v.resource })?
         };
         let elements = if is_buffer {
-            // A buffer view is an element range, first to last inclusive. The C binds one
-            // past the host's texel limit shortened to fit and reports the view made; the
-            // range is the guest's claim about the resource, and a claim past the limit is
-            // refused here instead.
+            // A buffer view is an element range, first to last inclusive. A texture buffer
+            // larger than the host's texel limit is legal GL and is sampled as that many
+            // texels, so a range past the limit is shortened to it, as the C does.
             let (first, last) = (v.first_element_or_layers, v.last_element_or_levels);
             Some(
-                Elements::within(first, last, host.limits.max_texture_buffer_size)
+                Elements::clamped(first, last, host.limits.max_texture_buffer_size)
                     .ok_or(Fault::OutOfRange { cmd, what: "buffer view range" })?,
             )
         } else {
@@ -4294,10 +4295,8 @@ impl Context {
                         }
                         Storage::Buffer { .. } => {
                             // A buffer image is a texel range: `layer_offset` and `level_size`
-                            // are its byte offset and length. The C binds a range past the
-                            // host's texel limit shortened to fit, reporting success for a
-                            // view it did not make; the range is the guest's claim about the
-                            // resource, and a claim past the limit is refused here instead.
+                            // are its byte offset and length. A range past the host's texel
+                            // limit is shortened to it, as GL clamps a texture buffer's size.
                             let Some(bs) = im
                                 .format
                                 .describe()
@@ -4306,12 +4305,13 @@ impl Context {
                             else {
                                 return Err(Fault::IllegalFormat { cmd, format: im.format });
                             };
-                            let texels =
-                                u64::from(im.layer_offset / bs) + u64::from(im.level_size / bs);
-                            if texels > u64::from(host.limits.max_texture_buffer_size) {
+                            let (first, texels) = (im.layer_offset / bs, im.level_size / bs);
+                            let limit = host.limits.max_texture_buffer_size;
+                            if first > limit {
                                 return Err(Fault::OutOfRange { cmd, what: "image buffer range" });
                             }
-                            ImageSpan::Bytes { offset: im.layer_offset, size: im.level_size }
+                            let size = texels.min(limit - first) * bs;
+                            ImageSpan::Bytes { offset: im.layer_offset, size }
                         }
                         // Staging and host memory have no GL object to bind.
                         Storage::Guest | Storage::Host(_) => {

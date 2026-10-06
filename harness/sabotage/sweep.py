@@ -2828,6 +2828,20 @@ SABOTAGES = [
         'rgb32_is_offered_only_where_its_texture_buffer_samples',
     ),
     (
+        'a buffer view past the texel limit keeps its length',
+        'src/vrend/context.rs',
+        """        Some(Elements { first, count: count.min(room) })""",
+        """        Some(Elements { first, count })""",
+        'a_texture_buffer_past_the_texel_limit_is_sized_as_the_limit',
+    ),
+    (
+        'a buffer image past the texel limit keeps its length',
+        'src/vrend/context.rs',
+        """                            let size = texels.min(limit - first) * bs;""",
+        """                            let size = texels * bs;""",
+        'a_texture_buffer_past_the_texel_limit_is_sized_as_the_limit',
+    ),
+    (
         'an indexed draw under transform feedback on GLES is drawn indexed',
         'src/vrend/context/draw.rs',
         """        let deindexed = draw.indexed""",

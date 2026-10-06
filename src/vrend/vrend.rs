@@ -4601,7 +4601,8 @@ mod tests {
     /// everything ran and a fence has answered any query the stream left waiting. `pages` are the
     /// guest's pages behind a resource, held for the whole run, and `withdrawn` the features the
     /// renderer is made to lack. `stream_output` is the vertex shader's, and `draw` replaces the
-    /// one triangle drawn.
+    /// one triangle drawn. `texel_limit` lowers the renderer's texture-buffer texel limit, which
+    /// GL's own is far past anything a test wants to allocate.
     #[derive(Default)]
     struct More<'a> {
         stream_output: Option<crate::vrend::proto::StreamOutput>,
@@ -4615,6 +4616,7 @@ mod tests {
         after: Vec<crate::vrend::proto::Command<'a>>,
         read_back: Vec<(ResourceHandle, u32)>,
         read: Option<&'a std::cell::RefCell<Vec<Vec<u8>>>>,
+        texel_limit: Option<u32>,
     }
 
     /// Draw `d` into a fresh target and read the target back. `Ok(None)` is a host without
@@ -4681,6 +4683,9 @@ mod tests {
         .expect("vrend comes up");
         for &f in d.more.map_or(&[][..], |m| &m.withdrawn) {
             v.features.clear(f);
+        }
+        if let Some(limit) = d.more.and_then(|m| m.texel_limit) {
+            v.limits.max_texture_buffer_size = limit;
         }
         let tessellates = v.features.has(Feature::tessellation);
         let format = |n| super::super::proto::Format::from_wire(n).expect("a known format");
@@ -4972,9 +4977,8 @@ mod tests {
     }
 
     /// A buffer of `width` bytes: host memory for `Bind::CUSTOM`, a GL buffer otherwise.
-    /// Whether a renderer of `host_gl` offers the guest `format` for sampling.
-    fn offered(host_gl: HostGl, format: crate::vrend::proto::Format) -> bool {
-        let _display = crate::vrend::one_display_at_a_time();
+    /// A renderer of `host_gl`, brought up to ask what it offers.
+    fn renderer(host_gl: HostGl) -> Vrend {
         struct Discard;
         impl crate::fence::FenceSink for Discard {
             fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
@@ -4985,7 +4989,7 @@ mod tests {
             Box::new(Discard),
             crate::vrend::debug::Switches::default(),
         );
-        let v = Vrend::new(
+        Vrend::new(
             Config { host_gl, ..Config::default() },
             &crate::budget::Budget::with_cap(None, false),
             retire.handle(),
@@ -4994,8 +4998,19 @@ mod tests {
             crate::vrend::debug::Traces::default(),
             crate::vrend::debug::Switches::default(),
         )
-        .expect("vrend comes up");
-        v.caps().v1.sampler.has(format)
+        .expect("vrend comes up")
+    }
+
+    /// Whether a renderer of `host_gl` offers the guest `format` for sampling.
+    fn offered(host_gl: HostGl, format: crate::vrend::proto::Format) -> bool {
+        let _display = crate::vrend::one_display_at_a_time();
+        renderer(host_gl).caps().v1.sampler.has(format)
+    }
+
+    /// Whether a renderer of `host_gl` has `feature`.
+    fn serves(host_gl: HostGl, feature: Feature) -> bool {
+        let _display = crate::vrend::one_display_at_a_time();
+        renderer(host_gl).features.has(feature)
     }
 
     fn buffer_args(bind: resource::Bind, width: u32) -> resource::Args {
@@ -6345,6 +6360,91 @@ mod tests {
                 assert!(
                     advertised <= takes,
                     "{host_gl:?}: {advertised} images offered, the {stage} stage takes {takes}"
+                );
+            }
+        }
+    }
+
+    /// A texture buffer larger than the host's texel limit is legal GL, and is sized as the limit.
+    /// Under a limit of 4, a view of 8 texels -- through a sampler and through an image -- reads
+    /// back 4 texels from the shader, where it was refused and the context poisoned.
+    #[test]
+    fn a_texture_buffer_past_the_texel_limit_is_sized_as_the_limit() {
+        use crate::vrend::pipe::{ImageAccess, Swizzle};
+        use crate::vrend::proto::{Command, Object, SamplerView, ShaderImage};
+        // The size, 4, scaled to 0.25: red 64.
+        const VIEW: &str = "FRAG\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], BUFFER, FLOAT\n\
+                            DCL TEMP[0]\nIMM[0] INT32 { 0, 0, 0, 0 }\n\
+                            IMM[1] FLT32 { 0.0625, 0.0, 0.0, 1.0 }\n  \
+                            0: TXQ TEMP[0], IMM[0].xxxx, SAMP[0], BUFFER\n  \
+                            1: I2F TEMP[0], TEMP[0]\n  2: MUL OUT[0], TEMP[0].xxxx, IMM[1]\n  \
+                            3: END\n";
+        const IMAGE: &str = "FRAG\nDCL OUT[0], COLOR\n\
+                             DCL IMAGE[0], BUFFER, PIPE_FORMAT_R32_FLOAT, WR\nDCL TEMP[0]\n\
+                             IMM[0] FLT32 { 0.0625, 0.0, 0.0, 1.0 }\n  \
+                             0: RESQ TEMP[0].x, IMAGE[0]\n  1: I2F TEMP[0], TEMP[0]\n  \
+                             2: MUL OUT[0], TEMP[0].xxxx, IMM[0]\n  3: END\n";
+        let r32f = super::super::proto::Format::from_wire(28).expect("R32_FLOAT");
+        let texels = ResourceHandle::new(10).expect("a resource handle is non-zero");
+        let view = ObjectHandle::new(20).expect("non-zero");
+        let more = More {
+            resources: vec![(texels, buffer_args(resource::Bind::SAMPLER_VIEW, 32))],
+            before: vec![
+                Command::CreateObject {
+                    handle: view,
+                    object: Object::SamplerView(SamplerView {
+                        resource: texels,
+                        format: r32f,
+                        target: TextureTarget::Buffer,
+                        first_element_or_layers: 0,
+                        last_element_or_levels: 7,
+                        swizzle: [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+                    }),
+                },
+                Command::SetSamplerViews {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    views: vec![Some(view)],
+                },
+                Command::SetShaderImages {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    images: vec![Some(ShaderImage {
+                        format: r32f,
+                        access: ImageAccess::ReadWrite,
+                        layer_offset: 0,
+                        level_size: 32,
+                        resource: texels,
+                    })],
+                },
+            ],
+            texel_limit: Some(4),
+            ..Default::default()
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            if !serves(host_gl, Feature::arb_or_gles_ext_texture_buffer) {
+                eprintln!("{host_gl:?}: no texture buffers");
+                continue;
+            }
+            for (what, fs) in [("sampler view", VIEW), ("image", IMAGE)] {
+                let pixels = draw_over_target(OneDraw {
+                    host_gl,
+                    format: "R8G8B8A8_UNORM",
+                    vs: None,
+                    fs: Some(fs),
+                    consts: &[],
+                    clear: [0.0; 4],
+                    logicop: None,
+                    tess: None,
+                    pipeline: None,
+                    more: Some(&more),
+                })
+                .unwrap_or_else(|e| panic!("{host_gl:?}: the {what} draws: {e:?}"))
+                .expect("no tessellation asked for");
+                assert!(
+                    pixels.as_chunks::<4>().0.iter().all(|p| *p == [64, 0, 0, 255]),
+                    "{host_gl:?}: the {what} is sized as the limit: {:?}",
+                    &pixels[..4]
                 );
             }
         }
