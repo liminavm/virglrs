@@ -6192,6 +6192,57 @@ mod tests {
 
     /// A display of ours makes contexts in the GL the caller asked for, and init reads back which
     /// arrived: GLES by default, a core-profile desktop context when desktop is asked for.
+    /// The guest is given one image count for the vertex, geometry and tessellation stages, and
+    /// uses it in each: a stage that takes fewer fails the guest's link. So the count is no more
+    /// than any of those stages takes, as the driver tells it here.
+    #[test]
+    fn the_image_count_for_the_other_stages_fits_each_of_them() {
+        use crate::vrend::gl::gles::*;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            if !v.features.has(Feature::images) {
+                continue;
+            }
+            let advertised = v.caps().max_shader_image_other_stages;
+            let mut stages = vec![("vertex", GL_MAX_VERTEX_IMAGE_UNIFORMS)];
+            if v.features.has(Feature::geometry_shader) {
+                stages.push(("geometry", GL_MAX_GEOMETRY_IMAGE_UNIFORMS));
+            }
+            if v.features.has(Feature::tessellation) {
+                stages.push(("tessellation control", GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS));
+                stages.push(("tessellation evaluation", GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS));
+            }
+            for (stage, name) in stages {
+                let takes = v.gl.get_integer(name).max(0) as u32;
+                eprintln!("{host_gl:?}: the {stage} stage takes {takes} images");
+                assert!(
+                    advertised <= takes,
+                    "{host_gl:?}: {advertised} images offered, the {stage} stage takes {takes}"
+                );
+            }
+        }
+    }
+
     /// A format is offered to the guest only where the driver stores every value of it exactly.
     /// A driver may hold a sized format at another depth -- zink on KosmicKrisp holds 3-3-2 as
     /// 5-6-5 -- and a guest told the host holds it packs values the host then rounds. Each format

@@ -503,8 +503,34 @@ impl CapsV2 {
                 getu(GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS).min(MAX_COMBINED_SSBO_BINDING_POINTS);
         }
         if has(Feature::images) {
-            c.max_shader_image_other_stages =
-                getu(GL_MAX_VERTEX_IMAGE_UNIFORMS).min(PIPE_MAX_SHADER_IMAGES);
+            // One count stands for every stage but the fragment and compute ones, so it is the
+            // least any of them takes: zink on KosmicKrisp takes images in the vertex stage and
+            // none in the geometry stage, where the C's vertex count fails the guest's link.
+            let images = per_stage(
+                gl,
+                features,
+                [
+                    GL_MAX_VERTEX_IMAGE_UNIFORMS,
+                    GL_MAX_FRAGMENT_IMAGE_UNIFORMS,
+                    GL_MAX_GEOMETRY_IMAGE_UNIFORMS,
+                    GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS,
+                    GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS,
+                    GL_MAX_COMPUTE_IMAGE_UNIFORMS,
+                ],
+            );
+            let other = [
+                (ShaderStage::Vertex, true),
+                (ShaderStage::Geometry, has(Feature::geometry_shader)),
+                (ShaderStage::TessCtrl, has(Feature::tessellation)),
+                (ShaderStage::TessEval, has(Feature::tessellation)),
+            ];
+            c.max_shader_image_other_stages = other
+                .iter()
+                .filter(|(_, present)| *present)
+                .map(|(stage, _)| images[stage.index()])
+                .min()
+                .unwrap_or(0)
+                .min(PIPE_MAX_SHADER_IMAGES);
             c.max_shader_image_frag_compute =
                 getu(GL_MAX_FRAGMENT_IMAGE_UNIFORMS).min(PIPE_MAX_SHADER_IMAGES);
             // GLES has no multisample images: there `max_image_samples` stays zero.

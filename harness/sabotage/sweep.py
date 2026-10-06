@@ -2807,6 +2807,13 @@ SABOTAGES = [
         'an_integer_target_takes_the_bits_the_shader_writes',
     ),
     (
+        'the other stages are offered the vertex stage images',
+        'src/vrend/caps.rs',
+        """                .map(|(stage, _)| images[stage.index()])""",
+        """                .map(|_| images[ShaderStage::Vertex.index()])""",
+        'the_image_count_for_the_other_stages_fits_each_of_them',
+    ),
+    (
         'an indexed draw under transform feedback on GLES is drawn indexed',
         'src/vrend/context/draw.rs',
         """        let deindexed = draw.indexed""",
