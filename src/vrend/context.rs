@@ -52,6 +52,8 @@ use std::sync::Arc;
 
 #[path = "context/blit.rs"]
 mod blit;
+#[path = "context/deindex.rs"]
+pub(crate) mod deindex;
 #[path = "context/draw.rs"]
 mod draw;
 #[path = "context/select.rs"]

@@ -4600,9 +4600,12 @@ mod tests {
     /// last draw is; and each of `read_back` -- a buffer and a length -- is read into `read` once
     /// everything ran and a fence has answered any query the stream left waiting. `pages` are the
     /// guest's pages behind a resource, held for the whole run, and `withdrawn` the features the
-    /// renderer is made to lack.
+    /// renderer is made to lack. `stream_output` is the vertex shader's, and `draw` replaces the
+    /// one triangle drawn.
     #[derive(Default)]
     struct More<'a> {
+        stream_output: Option<crate::vrend::proto::StreamOutput>,
+        draw: Option<crate::vrend::proto::Draw>,
         pages: Vec<(ResourceHandle, &'a std::cell::RefCell<Vec<u8>>)>,
         withdrawn: Vec<Feature>,
         resources: Vec<(ResourceHandle, resource::Args)>,
@@ -4734,12 +4737,17 @@ mod tests {
         );
         let consts: Vec<(ShaderStage, Vec<u32>)> =
             d.consts.iter().map(|(s, c)| (*s, c.map(f32::to_bits).to_vec())).collect();
-        fn shader(stage: ShaderStage, text: &[u32]) -> Object<'_> {
+        let vs_stream_output = d.more.and_then(|m| m.stream_output.clone()).unwrap_or_default();
+        fn shader<'t>(stage: ShaderStage, text: &'t [u32], so: &StreamOutput) -> Object<'t> {
+            let stream_output = match stage {
+                ShaderStage::Vertex => so.clone(),
+                _ => StreamOutput::default(),
+            };
             Object::Shader(ShaderCreate {
                 stage,
                 chunk: ShaderChunk::New { total_bytes: text.len() as u32 * 4 },
                 num_tokens: 300,
-                kind: ShaderKind::Graphics { stream_output: StreamOutput::default() },
+                kind: ShaderKind::Graphics { stream_output },
                 text,
             })
         }
@@ -4756,14 +4764,23 @@ mod tests {
                 },
                 data: &corners,
             },
-            Command::CreateObject { handle: o(1), object: shader(ShaderStage::Vertex, &vs) },
-            Command::CreateObject { handle: o(3), object: shader(ShaderStage::Fragment, &fs) },
+            Command::CreateObject {
+                handle: o(1),
+                object: shader(ShaderStage::Vertex, &vs, &vs_stream_output),
+            },
+            Command::CreateObject {
+                handle: o(3),
+                object: shader(ShaderStage::Fragment, &fs, &vs_stream_output),
+            },
             Command::BindShader { stage: ShaderStage::Vertex, handle: Some(o(1)) },
             Command::BindShader { stage: ShaderStage::Fragment, handle: Some(o(3)) },
         ];
         if d.tess.is_some() {
             commands.extend([
-                Command::CreateObject { handle: o(2), object: shader(ShaderStage::TessEval, &tes) },
+                Command::CreateObject {
+                    handle: o(2),
+                    object: shader(ShaderStage::TessEval, &tes, &vs_stream_output),
+                },
                 Command::BindShader { stage: ShaderStage::TessEval, handle: Some(o(2)) },
             ]);
         }
@@ -4826,7 +4843,11 @@ mod tests {
         }
         let draw = d.fs.is_some();
         let indirect = d.more.and_then(|m| m.indirect);
+        let replaced = d.more.and_then(|m| m.draw);
         let draw_vbo = || {
+            if let Some(draw) = replaced {
+                return Command::DrawVbo(draw);
+            }
             Command::DrawVbo(Draw {
                 start: 0,
                 count: 3,
@@ -5214,6 +5235,156 @@ mod tests {
                 one.chunks(4).all(|p| p == [0xff, 0, 0, 0xff]),
                 "{host_gl:?}: a count of one draws the triangle: {:?}",
                 &one[..4]
+            );
+        }
+    }
+
+    /// An indexed draw under transform feedback on a GLES host that refuses one -- GLES before 3.2
+    /// without `OES_geometry_shader` -- captures the vertices its indices name, in their order,
+    /// and primitive restart cuts it where the index says. The host's own feature is withdrawn,
+    /// so a GLES that has it takes the same road. The capture is the triangle's corners in the
+    /// order the indices give, which no draw of the vertex buffer in its own order produces.
+    ///
+    /// The vertices are gathered into buffers the guest's count and strides size, so a draw that
+    /// would gather past the bounds is refused before anything is allocated for it.
+    #[test]
+    fn an_indexed_draw_under_transform_feedback_captures_its_indexed_vertices() {
+        use crate::vrend::context::deindex;
+        use crate::vrend::pipe::PrimType;
+        use crate::vrend::proto::{
+            Command, Draw, IndexBuffer, IndexType, Object, SoBuffer, SoOutput, StreamOutput,
+            StreamoutTarget, VertexBuffer,
+        };
+        let (indices, captured) = (
+            ResourceHandle::new(10).expect("non-zero"),
+            ResourceHandle::new(11).expect("non-zero"),
+        );
+        let target = ObjectHandle::new(20).expect("non-zero");
+        // The vertex buffer the harness draws: three corners, xyzw each.
+        let corners = [[-1.0f32, -1.0, 0.0, 1.0], [3.0, -1.0, 0.0, 1.0], [-1.0, 3.0, 0.0, 1.0]];
+        // `index_list` is U32 indices written into the index buffer; `unwritten` instead draws
+        // that many U8 indices out of a buffer left as made, and `stride` is the vertex buffer's.
+        let run = |mode, index_list: &[u32], restart, unwritten: Option<u32>, stride: u32| {
+            let (index_type, count, index_bytes) = match unwritten {
+                Some(n) => (IndexType::U8, n, n),
+                None => (IndexType::U32, index_list.len() as u32, 4 * index_list.len() as u32),
+            };
+            let read = std::cell::RefCell::new(Vec::new());
+            let capture_bytes = 6 * 16;
+            let more = More {
+                stream_output: Some(StreamOutput {
+                    stride: [4, 0, 0, 0],
+                    outputs: vec![SoOutput {
+                        register_index: 0,
+                        start_component: 0,
+                        num_components: 4,
+                        output_buffer: SoBuffer::from_wire(0).expect("buffer 0"),
+                        dst_offset: 0,
+                        stream: 0,
+                    }],
+                }),
+                resources: vec![
+                    (indices, buffer_args(resource::Bind::INDEX_BUFFER, index_bytes)),
+                    (captured, buffer_args(resource::Bind::STREAM_OUTPUT, capture_bytes)),
+                ],
+                before: [
+                    (!index_list.is_empty()).then(|| inline_write(indices, index_list)),
+                    Some(inline_write(captured, &[0u32; 24])),
+                ]
+                .into_iter()
+                .flatten()
+                .chain([
+                    Command::SetVertexBuffers(vec![VertexBuffer {
+                        stride,
+                        offset: 0,
+                        resource: Some(ResourceHandle::new(2).expect("the harness's vertices")),
+                    }]),
+                    Command::CreateObject {
+                        handle: target,
+                        object: Object::StreamoutTarget(StreamoutTarget {
+                            resource: captured,
+                            buffer_offset: 0,
+                            buffer_size: capture_bytes,
+                        }),
+                    },
+                    Command::SetStreamoutTargets { append_bitmask: 0, targets: vec![Some(target)] },
+                    Command::SetIndexBuffer(Some(IndexBuffer {
+                        resource: indices,
+                        index_type,
+                        offset: 0,
+                    })),
+                ])
+                .collect(),
+                draw: Some(Draw {
+                    start: 0,
+                    count,
+                    mode,
+                    indexed: true,
+                    instance_count: 1,
+                    index_bias: 0,
+                    start_instance: 0,
+                    primitive_restart: restart,
+                    restart_index: u32::MAX,
+                    min_index: 0,
+                    max_index: 2,
+                    count_from_so: None,
+                    tess: None,
+                    indirect: None,
+                }),
+                after: vec![Command::SetStreamoutTargets { append_bitmask: 0, targets: vec![] }],
+                read_back: vec![(captured, capture_bytes)],
+                read: Some(&read),
+                withdrawn: vec![Feature::geometry_shader],
+                ..Default::default()
+            };
+            draw_over_target(OneDraw {
+                host_gl: HostGl::Gles,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(RED_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            })
+            .map(|_| read.into_inner().remove(0))
+        };
+        let floats = |bytes: &[u8]| -> Vec<[f32; 4]> {
+            bytes
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .map(|v| {
+                    std::array::from_fn(|i| {
+                        f32::from_le_bytes(v[i * 4..i * 4 + 4].try_into().unwrap())
+                    })
+                })
+                .collect()
+        };
+        let (a, b, c) = (corners[0], corners[1], corners[2]);
+        let got = run(PrimType::Triangles, &[2, 0, 1, 1, 2, 0], false, None, 16)
+            .expect("the draw is served");
+        assert_eq!(floats(&got), [c, a, b, b, c, a], "in index order");
+        // A strip cut in two by a restart is two triangles, each from its own run.
+        let got = run(PrimType::TriangleStrip, &[0, 1, 2, u32::MAX, 2, 1, 0], true, None, 16)
+            .expect("the draw is served");
+        assert_eq!(floats(&got), [a, b, c, c, b, a], "one triangle per run");
+        // One vertex past the count bound; and, at a count inside it, a stride that takes one
+        // binding's gathered vertices past theirs.
+        let past_count = deindex::MAX_VERTICES + 1;
+        let wide = 32;
+        let past_bytes = (deindex::MAX_GATHERED / wide) as u32 + 1;
+        assert!(past_bytes <= deindex::MAX_VERTICES, "the second draw passes the first bound");
+        for (count, stride, what) in [
+            (past_count, 16, "a de-indexed draw's vertex count"),
+            (past_bytes, wide as u32, "a de-indexed draw's gathered vertices"),
+        ] {
+            let ran = run(PrimType::Points, &[], false, Some(count), stride);
+            assert!(
+                matches!(ran, Err(Fault::OutOfRange { what: w, .. }) if w == what),
+                "{count} vertices of stride {stride}: {ran:?}"
             );
         }
     }

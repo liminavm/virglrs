@@ -2051,6 +2051,7 @@ impl Context {
 
         let mut index_type = GL_UNSIGNED_INT;
         let mut ib_offset = 0;
+        let mut index_buffer = None;
         if draw.indexed {
             // The C skips an indexed draw with no index buffer, or one that reads past it,
             // with a warning and success. Both are the guest's claim about its own buffer,
@@ -2078,6 +2079,7 @@ impl Context {
                 IndexType::U32 => GL_UNSIGNED_INT,
             };
             ib_offset = ib.offset;
+            index_buffer = Some((name, ib.index_type, ib.offset));
         } else {
             gl.bind_buffer(GL_ELEMENT_ARRAY_BUFFER, None);
         }
@@ -2135,7 +2137,24 @@ impl Context {
         }
 
         let mode = prim_mode(draw.mode);
-        if !draw.indexed {
+        // GLES before 3.2 refuses every indexed draw while transform feedback is active; see
+        // `deindex`. `geometry_shader` is that version or the extension that lifts the rule.
+        let sub = self.sub();
+        let capturing = sub.current_so.is_some_and(|i| sub.streamouts[i].xfb == Xfb::Started);
+        let deindexed = draw.indexed
+            && capturing
+            && features.api().is_gles()
+            && !features.has(Feature::geometry_shader);
+        if deindexed {
+            if indirect.is_some() {
+                return Err(Fault::Unimplemented {
+                    cmd,
+                    what: "an indirect indexed draw under transform feedback on a GLES host",
+                });
+            }
+            let ib = index_buffer.expect("an indexed draw bound its index buffer");
+            self.draw_deindexed(host, &draw, mode, ib, instances)?;
+        } else if !draw.indexed {
             // The C draws `cso` vertices from zero when the wire names a stream-out object to
             // count from -- the handle's number, as it is: the count is never read from the
             // object. A handle is not a count, and no corpus has asked; refused until one does.
@@ -2281,6 +2300,158 @@ impl Context {
         }
         Ok(())
     }
+
+    /// An indexed draw served as arrays, on a host that refuses it as it is: see `deindex`.
+    ///
+    /// The indices are read back, and every vertex buffer whose vertices they name -- not an
+    /// instanced one, whose vertices the instance names, nor one of stride zero, which every
+    /// vertex shares -- is gathered into a buffer of its own in index order and bound in its
+    /// place for the draw. Each run that primitive restart leaves is one array draw. The guest's
+    /// bindings are back before this returns.
+    ///
+    /// Reading the buffers back waits for the GPU to finish writing them. That is the price of
+    /// serving the draw at all, and only an indexed draw under transform feedback on such a host
+    /// pays it.
+    fn draw_deindexed(
+        &mut self,
+        host: &mut Host<'_>,
+        draw: &Draw,
+        mode: GLenum,
+        (index_buffer, index_type, index_offset): (BufferName, IndexType, u32),
+        instances: GLsizei,
+    ) -> Result<(), Fault> {
+        let cmd = Cmd::DrawVbo;
+        let gl = host.gl;
+        let unread = |gl: &Gl| Fault::Gl {
+            cmd,
+            error: match gl.drain_errors() {
+                GL_NO_ERROR => GL_OUT_OF_MEMORY,
+                e => e,
+            },
+            object: None,
+        };
+        // The gathered buffers are sized by the guest's count and strides, so both are bounded
+        // before anything is allocated: a draw past them is refused, not allocated for.
+        if draw.count > deindex::MAX_VERTICES {
+            return Err(Fault::OutOfRange { cmd, what: "a de-indexed draw's vertex count" });
+        }
+        let len = draw.count as usize * index_type.bytes() as usize;
+        let indices =
+            read_buffer(gl, index_buffer, index_offset as usize, len).ok_or_else(|| unread(gl))?;
+        let resolved = deindex::resolve(
+            &indices,
+            index_type,
+            draw.count as usize,
+            draw.index_bias,
+            draw.primitive_restart,
+        );
+        let (lo, hi) = resolved.span().unwrap_or((0, 0));
+
+        // The bindings to gather: each with its stride, and how many bytes from a vertex's start
+        // its attributes read. The divisor a binding has is the one its own attribute index set,
+        // as the vertex elements' VAO was laid out.
+        let sub = self.sub();
+        let elements: &[Element] = match sub.ve.and_then(|h| sub.objects.get(&h)) {
+            Some(Object::VertexElements(v)) => &v.elements,
+            _ => &[],
+        };
+        let mut gathers = Vec::new();
+        for (slot, vbo) in sub.vbos.iter().enumerate() {
+            let divisor = elements.get(slot).map_or(0, |e| e.base.instance_divisor);
+            let reach = elements
+                .iter()
+                .filter(|e| e.base.vertex_buffer_index as usize == slot)
+                .map(|e| {
+                    // A format with no description reads no further than the stride covers.
+                    let bytes = e.base.src_format.describe().map_or(0, |d| d.block_bytes());
+                    u64::from(e.base.src_offset) + u64::from(bytes)
+                })
+                .max();
+            let (Some(reach), Some(resource)) = (reach, vbo.resource) else { continue };
+            if divisor != 0 || vbo.stride == 0 {
+                continue;
+            }
+            gathers.push((slot, resource, u64::from(vbo.offset), u64::from(vbo.stride), reach));
+        }
+
+        let mut made = Vec::new();
+        for (slot, resource, offset, stride, reach) in gathers {
+            let res = host.resource(cmd, resource)?;
+            let Storage::Buffer { name, .. } = res.storage else {
+                return Err(Fault::IllegalResource { cmd, handle: resource });
+            };
+            let size = u64::from(res.args.width);
+            // Wider than the stride when an attribute reads past it, so each gathered vertex
+            // carries every byte its attributes read.
+            let width = stride.max(reach);
+            if (resolved.vertices.len() as u64).saturating_mul(width) > deindex::MAX_GATHERED {
+                return Err(Fault::OutOfRange {
+                    cmd,
+                    what: "a de-indexed draw's gathered vertices",
+                });
+            }
+            let from = offset.saturating_add(lo.saturating_mul(stride)).min(size);
+            let to =
+                offset.saturating_add(hi.saturating_mul(stride)).saturating_add(width).min(size);
+            let src = read_buffer(gl, name, from as usize, (to - from) as usize)
+                .ok_or_else(|| unread(gl))?;
+            let bytes = deindex::gather(&src, lo, stride, width as usize, &resolved.vertices);
+            let buf = gl.gen_buffer();
+            gl.bind_buffer(GL_ARRAY_BUFFER, Some(buf));
+            gl.buffer_data(GL_ARRAY_BUFFER, &bytes, GL_STREAM_DRAW);
+            gl.bind_vertex_buffer(slot as GLuint, Some(buf), 0, width as u32);
+            made.push(buf);
+        }
+        gl.bind_buffer(GL_ARRAY_BUFFER, None);
+
+        for run in &resolved.runs {
+            let (first, count) = (run.start as GLint, run.len() as GLsizei);
+            if draw.instance_count > 0 {
+                if draw.start_instance > 0 {
+                    gl.draw_arrays_instanced_base_instance(
+                        mode,
+                        first,
+                        count,
+                        instances,
+                        draw.start_instance,
+                    );
+                } else {
+                    gl.draw_arrays_instanced(mode, first, count, instances);
+                }
+            } else {
+                gl.draw_arrays(mode, first, count);
+            }
+        }
+
+        for buf in made {
+            gl.delete_buffer(buf);
+        }
+        // The guest's own buffers go back into the slots now, not at the next draw that finds
+        // them dirty: the gathered ones are deleted, and a slot left naming one draws nothing.
+        self.sub_mut().vbo_dirty = true;
+        self.draw_bind_vertex_binding(host);
+        Ok(())
+    }
+}
+
+/// `len` bytes of buffer `name` from `offset`, read back through a scratch copy: the guest's
+/// buffer may be an immutable store made without `GL_MAP_READ_BIT`, or mapped already, and
+/// neither can be mapped for reading again. `None` when the driver refuses the copy or the map.
+fn read_buffer(gl: &Gl, name: BufferName, offset: usize, len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let scratch = gl.gen_buffer();
+    gl.bind_buffer(GL_COPY_READ_BUFFER, Some(name));
+    gl.bind_buffer(GL_COPY_WRITE_BUFFER, Some(scratch));
+    let read = (gl.buffer_data_null(GL_COPY_WRITE_BUFFER, len, GL_STREAM_READ)
+        && gl.copy_buffer_sub_data(offset, 0, len))
+    .then(|| gl.map_buffer_read(GL_COPY_WRITE_BUFFER, 0, len, <[u8]>::to_vec))
+    .flatten();
+    gl.bind_buffer(GL_COPY_READ_BUFFER, None);
+    gl.bind_buffer(GL_COPY_WRITE_BUFFER, None);
+    gl.delete_buffer(scratch);
+    read
 }
 
 impl Context {
