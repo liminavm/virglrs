@@ -414,7 +414,9 @@ impl CapsV2 {
             {
                 continue;
             }
-            if entry.bindings.sampler_view {
+            // A format the driver rounds is served but not offered: a guest packs its values
+            // for the format and would read them back rounded.
+            if entry.bindings.sampler_view && entry.stores_exactly {
                 v1.sampler.set(format);
                 // What the capset's planar-target bit is about: not that some layout could be
                 // backed, but that one was actually offered here. Read off the bit that offers

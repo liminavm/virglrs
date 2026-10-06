@@ -1269,6 +1269,12 @@ impl Gl {
         (get(GL_TEXTURE_WIDTH), get(GL_TEXTURE_HEIGHT), get(GL_TEXTURE_DEPTH))
     }
 
+    /// The bits the driver stores of each of a level's red, green, blue and alpha.
+    pub fn channel_bits(&self, target: GLenum, level: GLint) -> [u32; 4] {
+        [GL_TEXTURE_RED_SIZE, GL_TEXTURE_GREEN_SIZE, GL_TEXTURE_BLUE_SIZE, GL_TEXTURE_ALPHA_SIZE]
+            .map(|p| self.tex_level_parameter(target, level, p).max(0) as u32)
+    }
+
     fn tex_level_parameter(&self, target: GLenum, level: GLint, pname: GLenum) -> GLint {
         let mut v: GLint = 0;
         // SAFETY: every parameter asked here writes exactly one integer.

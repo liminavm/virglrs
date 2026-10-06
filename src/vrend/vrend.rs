@@ -6087,6 +6087,76 @@ mod tests {
 
     /// A display of ours makes contexts in the GL the caller asked for, and init reads back which
     /// arrived: GLES by default, a core-profile desktop context when desktop is asked for.
+    /// A format is offered to the guest only where the driver stores every value of it exactly.
+    /// A driver may hold a sized format at another depth -- zink on KosmicKrisp holds 3-3-2 as
+    /// 5-6-5 -- and a guest told the host holds it packs values the host then rounds. Each format
+    /// offered is made again here and the driver asked what it stores.
+    #[test]
+    fn every_format_offered_is_stored_exactly() {
+        use crate::vrend::gl::gles::GL_TEXTURE_2D;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            let api = v.features.api();
+            if api.is_gles() && !api.gles_at_least(31) {
+                continue;
+            }
+            let (mut offered, mut withheld) = (0, vec![]);
+            for f in (0..crate::vrend::proto::FORMAT_MAX)
+                .filter_map(crate::vrend::proto::Format::from_wire)
+            {
+                let Some(entry) = v.formats.get(f) else { continue };
+                let Some(d) = f.describe() else { continue };
+                if d.is_compressed() || !v.caps().v1.sampler.has(f) && entry.stores_exactly {
+                    continue;
+                }
+                let tex = v.gl.gen_texture();
+                v.gl.bind_texture(GL_TEXTURE_2D, Some(tex));
+                let g = entry.gl;
+                v.gl.tex_image_2d_null(
+                    GL_TEXTURE_2D,
+                    0,
+                    g.internalformat,
+                    4,
+                    4,
+                    g.glformat,
+                    g.gltype,
+                );
+                let held = v.gl.channel_bits(GL_TEXTURE_2D, 0);
+                v.gl.bind_texture(GL_TEXTURE_2D, None);
+                v.gl.delete_texture(tex);
+                let exact = crate::vrend::formats::holds_exactly(d, held);
+                if v.caps().v1.sampler.has(f) {
+                    assert!(exact, "{host_gl:?}: {} is offered but stored as {held:?}", f.name());
+                    offered += 1;
+                } else {
+                    assert!(!exact, "{host_gl:?}: {} is stored exactly as {held:?}", f.name());
+                    withheld.push(f.name());
+                }
+            }
+            eprintln!("{host_gl:?}: {offered} offered, withheld as rounded: {withheld:?}");
+        }
+    }
+
     #[test]
     fn the_host_gl_is_the_one_asked_for() {
         let _display = crate::vrend::one_display_at_a_time();

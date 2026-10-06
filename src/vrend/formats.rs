@@ -406,6 +406,9 @@ pub struct Entry {
     /// `VIRGL_TEXTURE_CAN_TARGET_RECTANGLE`: desktop GL took the triple as a rectangle texture.
     /// Never set on GLES, which has no such target.
     pub can_target_rectangle: bool,
+    /// The driver stores every value of the format exactly; see [`holds_exactly`]. A format it
+    /// rounds is still served, since its bytes go in and out unchanged, but not offered.
+    pub stores_exactly: bool,
 }
 
 impl Entry {
@@ -488,6 +491,7 @@ impl Table {
                         can_readback: !gles && group.compressed,
                         can_multisample: false,
                         can_target_rectangle: false,
+                        stores_exactly: true,
                     });
                     continue;
                 }
@@ -543,6 +547,13 @@ fn probe_row(gl: &Gl, features: &Features, row: &GlFormat) -> Option<Entry> {
     let entry = if gl.drain_errors() != GL_NO_ERROR {
         None
     } else {
+        // GLES before 3.1 cannot ask a level what it stores.
+        let api = features.api();
+        let stores_exactly = (api.is_gles() && !api.gles_at_least(31))
+            || row
+                .format
+                .describe()
+                .is_none_or(|d| holds_exactly(d, gl.channel_bits(GL_TEXTURE_2D, 0)));
         let desktop = !features.api().is_gles();
         // The C asks of whatever texture the rectangle target holds, which is its default object:
         // the triple is all the answer depends on.
@@ -595,6 +606,7 @@ fn probe_row(gl: &Gl, features: &Features, row: &GlFormat) -> Option<Entry> {
             can_readback,
             can_multisample: false,
             can_target_rectangle,
+            stores_exactly,
         })
     };
     gl.bind_framebuffer(GL_FRAMEBUFFER, None);
@@ -602,6 +614,37 @@ fn probe_row(gl: &Gl, features: &Features, row: &GlFormat) -> Option<Entry> {
     gl.delete_framebuffer(fb);
     gl.delete_texture(tex);
     entry
+}
+
+/// Whether a driver storing `held` bits of each of red, green, blue and alpha holds every value
+/// of `desc`'s normalised channels exactly. A driver may store a sized format at another depth:
+/// zink on KosmicKrisp stores `GL_R3_G3_B2` as 5-6-5, where 6/7 reads back as 27/31. A guest that
+/// was told the host holds the format packs its values for that format and reads them back
+/// rounded, so such a format is not offered. A deeper channel holds an unsigned one exactly when
+/// its bits are a multiple of the format's, a signed one when its magnitude bits are.
+pub(crate) fn holds_exactly(desc: &Description, held: [u32; 4]) -> bool {
+    if desc.is_compressed() || !matches!(desc.colorspace, Colorspace::Rgb | Colorspace::Srgb) {
+        return true;
+    }
+    held.iter().zip(desc.swizzle).all(|(&held, swizzle)| {
+        let channel = match swizzle {
+            Some(Swizzle::X) => desc.channels[0],
+            Some(Swizzle::Y) => desc.channels[1],
+            Some(Swizzle::Z) => desc.channels[2],
+            Some(Swizzle::W) => desc.channels[3],
+            _ => return true,
+        };
+        if !channel.normalized || channel.bits == 0 || held == 0 {
+            return true;
+        }
+        match channel.ty {
+            ChannelType::Unsigned => held % channel.bits == 0,
+            ChannelType::Signed if channel.bits > 1 && held > 1 => {
+                (held - 1) % (channel.bits - 1) == 0
+            }
+            _ => true,
+        }
+    })
 }
 
 /// `color_format_can_readback`: whether `glReadPixels` on GLES hands this colour format back in
@@ -662,6 +705,34 @@ fn multisample_works(gl: &Gl, internalformat: GLenum) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deeper channel holds a normalised one exactly only where every value lands on one of its
+    /// own: an unsigned channel when its bits are a multiple, a signed one when its magnitude bits
+    /// are. 3-3-2 in 5-6-5 is the one a driver here picks, and does not.
+    #[test]
+    fn a_format_is_held_exactly_only_at_a_depth_that_holds_its_values() {
+        let named = |name: &str| {
+            (0..FORMAT_MAX)
+                .filter_map(Format::from_wire)
+                .find(|f| f.name() == name)
+                .and_then(Format::describe)
+                .expect("a described format")
+        };
+        for (name, held, exact) in [
+            ("B2G3R3_UNORM", [3, 3, 2, 0], true),
+            ("B2G3R3_UNORM", [5, 6, 5, 0], false),
+            ("B2G3R3_UNORM", [8, 8, 8, 8], false),
+            ("B2G3R3_UNORM", [6, 6, 4, 0], true),
+            ("R8G8B8A8_UNORM", [16, 16, 16, 16], true),
+            ("B5G6R5_UNORM", [8, 8, 8, 0], false),
+            ("R8_SNORM", [16, 0, 0, 0], false),
+            ("R8_SNORM", [15, 0, 0, 0], true),
+            ("R16_FLOAT", [32, 0, 0, 0], true),
+            ("R8_UINT", [7, 0, 0, 0], true),
+        ] {
+            assert_eq!(holds_exactly(named(name), held), exact, "{name} held as {held:?}");
+        }
+    }
 
     /// A scanout format is one a display controller has a fourcc for, and nothing else.
     ///

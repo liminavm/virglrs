@@ -1411,6 +1411,7 @@ mod tests {
             can_readback: false,
             can_multisample: false,
             can_target_rectangle: false,
+            stores_exactly: true,
         };
 
         // What gallium says a tight 64x64 NV12 box spans, which is what the C bounds-checks.
