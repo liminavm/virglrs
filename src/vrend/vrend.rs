@@ -6574,6 +6574,140 @@ mod tests {
         }
     }
 
+    /// A shader that loads a texel and stores to it, or stores and then loads, sees its own
+    /// accesses in the order it made them. On GLES an RGBA32F image is loaded through a
+    /// `readonly` declaration and stored through a `writeonly` one of the same unit, and a driver
+    /// may reorder a load from the `readonly` one past a store to the other: a fragment then
+    /// reads the value it is about to write, or misses the one it wrote. The image is wide
+    /// because a narrow one hid it. Each fragment owns one texel, six apart, so any wrong answer
+    /// is an access out of order rather than two fragments sharing a texel.
+    #[test]
+    fn loads_and_stores_through_one_image_keep_their_order() {
+        use crate::vrend::pipe::ImageAccess;
+        use crate::vrend::proto::{Box3, Command, ShaderImage, Transfer};
+        let f32x4 = crate::vrend::proto::Format::from_wire(31).expect("R32G32B32A32_FLOAT");
+        assert_eq!(f32x4.name(), "R32G32B32A32_FLOAT");
+        let image = ResourceHandle::new(10).expect("a resource handle is non-zero");
+        let (width, spacing) = (1536u32, 6u32);
+        // Every texel holds its own index in each channel's first word: texel t is 4t..4t+3.
+        let texels: Vec<u32> = (0..width * 4).map(|i| (i as f32).to_bits()).collect();
+        // Which texel the fragment at (x, y) of the 16x16 target owns, as `TEMP[1].x`.
+        let owner = "  0: F2I TEMP[0].xy, IN[0].xyyy\n  1: SHL TEMP[1].x, TEMP[0].yyyy, IMM[0].xxxx\n  \
+             2: UADD TEMP[1].x, TEMP[1].xxxx, TEMP[0].xxxx\n  \
+             3: UMUL TEMP[1].x, TEMP[1].xxxx, IMM[0].yyyy\n";
+        let header = format!(
+            "FRAG\nDCL IN[0], POSITION, LINEAR\nDCL OUT[0], COLOR\n\
+             DCL IMAGE[0], 1D, PIPE_FORMAT_R32G32B32A32_FLOAT, WR\nDCL TEMP[0..2]\n\
+             IMM[0] UINT32 {{ 4, {spacing}, 0, 0 }}\nIMM[1] FLT32 {{ 33.0, 33.0, 33.0, 33.0 }}\n"
+        );
+        let load = "LOAD TEMP[2], IMAGE[0], TEMP[1], 1D, PIPE_FORMAT_R32G32B32A32_FLOAT";
+        let store = "STORE IMAGE[0], TEMP[1], IMM[1], 1D, PIPE_FORMAT_R32G32B32A32_FLOAT";
+        // (what the order is, the shader, what fragment `i` reads back)
+        type Expect = fn(u32) -> f32;
+        let cases: [(&str, String, Expect); 2] = [
+            (
+                "a load before a store",
+                format!(
+                    "{header}{owner}  4: {load}\n  5: {store}\n  6: MOV OUT[0], TEMP[2]\n  7: END\n"
+                ),
+                |t| (4 * t) as f32,
+            ),
+            (
+                "a store before a load",
+                format!(
+                    "{header}{owner}  4: {store}\n  5: {load}\n  6: MOV OUT[0], TEMP[2]\n  7: END\n"
+                ),
+                |_| 33.0,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (order, fs, expect) in &cases {
+            let more = More {
+                resources: vec![(
+                    image,
+                    resource::Args {
+                        target: TextureTarget::Texture1d,
+                        format: f32x4,
+                        bind: resource::Bind::SAMPLER_VIEW,
+                        width,
+                        height: 1,
+                        depth: 1,
+                        array_size: 1,
+                        last_level: 0,
+                        nr_samples: 0,
+                        flags: resource::ResourceFlags(0),
+                    },
+                )],
+                before: vec![
+                    Command::ResourceInlineWrite {
+                        transfer: Transfer {
+                            resource: image,
+                            level: 0,
+                            usage: 0,
+                            stride: width * 16,
+                            layer_stride: 0,
+                            region: Box3 {
+                                x: 0,
+                                y: 0,
+                                z: 0,
+                                width: width as i32,
+                                height: 1,
+                                depth: 1,
+                            },
+                        },
+                        data: &texels,
+                    },
+                    Command::SetShaderImages {
+                        stage: ShaderStage::Fragment,
+                        start_slot: 0,
+                        images: vec![Some(ShaderImage {
+                            format: f32x4,
+                            access: ImageAccess::ReadWrite,
+                            layer_offset: 0,
+                            level_size: 0,
+                            resource: image,
+                        })],
+                    },
+                ],
+                ..Default::default()
+            };
+            for host_gl in [HostGl::Gles, HostGl::Desktop] {
+                let pixels = draw_over_target(OneDraw {
+                    host_gl,
+                    format: "R32G32B32A32_FLOAT",
+                    vs: None,
+                    fs: Some(fs),
+                    consts: &[],
+                    clear: [0.0; 4],
+                    logicop: None,
+                    tess: None,
+                    pipeline: None,
+                    more: Some(&more),
+                })
+                .unwrap_or_else(|e| panic!("{host_gl:?}, {order}: the draw runs: {e:?}"))
+                .expect("no tessellation asked for");
+                let read: Vec<f32> = pixels
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .map(|p| f32::from_ne_bytes([p[0], p[1], p[2], p[3]]))
+                    .collect();
+                let wrong: Vec<usize> =
+                    (0..read.len()).filter(|&i| read[i] != expect(i as u32 * spacing)).collect();
+                if let Some(&first) = wrong.first() {
+                    failures.push(format!(
+                        "{host_gl:?}, {order}: {} of {} fragments read out of order, first at \
+                         fragment {first}: {}",
+                        wrong.len(),
+                        read.len(),
+                        read[first]
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
     /// An RGBA32F image a shader both loads and stores is read and written. GLES allows that only
     /// in an r32 format, so there the store goes through a `writeonly` declaration of the same
     /// unit and the load through a `readonly` one; declared once, the shader does not compile.

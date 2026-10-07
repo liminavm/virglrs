@@ -3624,6 +3624,17 @@ SABOTAGES = [
         'a_1d_image_stores_to_the_texel_it_names',
     ),
     (
+        'a load through a GLES store alias is left unordered against the stores',
+        'src/vrend/shader/glsl/tex.rs',
+        """        if alias {
+            ctx.bufs.emit("memoryBarrierImage();\\n");
+        }""",
+        """        if alias && false {
+            ctx.bufs.emit("memoryBarrierImage();\\n");
+        }""",
+        'loads_and_stores_through_one_image_keep_their_order',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",
