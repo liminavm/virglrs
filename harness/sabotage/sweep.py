@@ -2864,10 +2864,10 @@ SABOTAGES = [
         'a de-indexed draw ignores primitive restart',
         'src/vrend/context/draw.rs',
         """            draw.index_bias,
-            draw.primitive_restart,
+            draw.primitive_restart.then_some(draw.restart_index),
         );""",
         """            draw.index_bias,
-            false,
+            None,
         );""",
         'an_indexed_draw_under_transform_feedback_captures_its_indexed_vertices',
     ),
@@ -3647,6 +3647,15 @@ SABOTAGES = [
         """            if streams < 4 {""",
         """            if streams < 1 {""",
         'pipeline_statistics_and_overflow_queries_count_where_the_host_has_them',
+    ),
+    (
+        'a GLES draw restarting at another index is drawn from its own indices',
+        'src/vrend/context/draw.rs',
+        """                    if draw.primitive_restart
+                        && features.api().is_gles()""",
+        """                    if draw.primitive_restart
+                        && features.api().is_gles() && false""",
+        'an_indirect_draw_restarts_at_the_guest_s_restart_index',
     ),
     (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',

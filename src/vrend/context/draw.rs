@@ -2099,6 +2099,7 @@ impl Context {
         let mut index_type = GL_UNSIGNED_INT;
         let mut ib_offset = 0;
         let mut index_buffer = None;
+        let mut index_buffer_len = 0;
         if draw.indexed {
             // The C skips an indexed draw with no index buffer, or one that reads past it,
             // with a warning and success. Both are the guest's claim about its own buffer,
@@ -2127,6 +2128,7 @@ impl Context {
             };
             ib_offset = ib.offset;
             index_buffer = Some((name, ib.index_type, ib.offset));
+            index_buffer_len = res.args.width as usize;
         } else {
             gl.bind_buffer(GL_ELEMENT_ARRAY_BUFFER, None);
         }
@@ -2237,6 +2239,48 @@ impl Context {
             }
         } else {
             let ranged = draw.min_index != 0 || draw.max_index != u32::MAX;
+            // GLES restarts only at the index type's maximum: a draw restarting at another index
+            // draws from its indices widened, its restart index made the one GLES knows. A
+            // direct draw's own indices are widened from its offset; an indirect one names its
+            // first index in the buffer, so the whole buffer is, and keeps its positions.
+            let widened = match index_buffer {
+                Some((name, ty, offset))
+                    if draw.primitive_restart
+                        && features.api().is_gles()
+                        && draw.restart_index != deindex::fixed_restart(ty) =>
+                {
+                    let (from, len) = if indirect.is_some() {
+                        (0, index_buffer_len)
+                    } else {
+                        (offset as usize, count as usize * ty.bytes() as usize)
+                    };
+                    if len / ty.bytes() as usize > deindex::MAX_VERTICES as usize {
+                        return Err(Fault::OutOfRange {
+                            cmd,
+                            what: "an index buffer widened for a restart index",
+                        });
+                    }
+                    let bytes = read_buffer(gl, name, from, len).ok_or_else(|| Fault::Gl {
+                        cmd,
+                        error: match gl.drain_errors() {
+                            GL_NO_ERROR => GL_OUT_OF_MEMORY,
+                            e => e,
+                        },
+                        object: None,
+                    })?;
+                    let buf = gl.gen_buffer();
+                    gl.bind_buffer(GL_ELEMENT_ARRAY_BUFFER, Some(buf));
+                    gl.buffer_data(
+                        GL_ELEMENT_ARRAY_BUFFER,
+                        &deindex::widen(&bytes, ty, draw.restart_index),
+                        GL_STREAM_DRAW,
+                    );
+                    Some(buf)
+                }
+                _ => None,
+            };
+            let (index_type, ib_offset) =
+                if widened.is_some() { (GL_UNSIGNED_INT, 0) } else { (index_type, ib_offset) };
             if let Some(ind) = indirect {
                 let (draw_count, stride) = indirect_counts.expect("counted with the buffer");
                 if count_buffer.is_some() {
@@ -2321,6 +2365,9 @@ impl Context {
             } else {
                 gl.draw_elements(mode, count, index_type, ib_offset);
             }
+            if let Some(buf) = widened {
+                gl.delete_buffer(buf);
+            }
         }
 
         if draw.primitive_restart {
@@ -2398,7 +2445,7 @@ impl Context {
             index_type,
             draw.count as usize,
             draw.index_bias,
-            draw.primitive_restart,
+            draw.primitive_restart.then_some(draw.restart_index),
         );
         let (lo, hi) = resolved.span().unwrap_or((0, 0));
 

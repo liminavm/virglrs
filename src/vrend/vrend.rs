@@ -5706,6 +5706,95 @@ mod tests {
         }
     }
 
+    /// An indirect draw restarts primitives at the guest's restart index, whatever it is. GLES
+    /// restarts only at the index type's maximum, so there the indices are widened with the
+    /// restart index made the one GLES knows, and the command's first index still names the
+    /// same index. From the second, the indices are `0, r, 0, 1, 2` with `r` the restart index:
+    /// honoured, the first run is too short for a triangle and `0, 1, 2` covers the target;
+    /// ignored, the first triangle names a vertex the buffer does not hold and nothing covers
+    /// it. Only indirect draws are scored: KosmicKrisp skips the restart of a direct list draw
+    /// unless `LIMINA_KK_NOLISTRESTART=0`, at any index.
+    #[test]
+    fn an_indirect_draw_restarts_at_the_guest_s_restart_index() {
+        use crate::vrend::pipe::PrimType;
+        use crate::vrend::proto::{Command, Draw, IndexBuffer, IndexType, IndirectDraw, TessDraw};
+        let (indices, commands) = (
+            ResourceHandle::new(10).expect("non-zero"),
+            ResourceHandle::new(11).expect("non-zero"),
+        );
+        // DrawElementsIndirectCommand: five indices, one instance, from the second.
+        let command = [5u32, 1, 1, 0, 0];
+        let run = |host_gl, restart_index: u32| {
+            // Six u16 indices, two to a word: a pad the command skips, then 0, r, 0, 1, 2.
+            let words = [7u32, restart_index, 1 | (2 << 16)];
+            let more = More {
+                resources: vec![
+                    (indices, buffer_args(resource::Bind::INDEX_BUFFER, 12)),
+                    (commands, buffer_args(resource::Bind::VERTEX_BUFFER, 20)),
+                ],
+                before: vec![
+                    inline_write(indices, &words),
+                    inline_write(commands, &command),
+                    Command::SetIndexBuffer(Some(IndexBuffer {
+                        resource: indices,
+                        index_type: IndexType::U16,
+                        offset: 0,
+                    })),
+                ],
+                draw: Some(Draw {
+                    start: 0,
+                    count: 5,
+                    mode: PrimType::Triangles,
+                    indexed: true,
+                    instance_count: 1,
+                    index_bias: 0,
+                    start_instance: 0,
+                    primitive_restart: true,
+                    restart_index,
+                    min_index: 0,
+                    max_index: u32::MAX,
+                    count_from_so: None,
+                    // The wire carries the tessellation words ahead of the indirect ones.
+                    tess: Some(TessDraw { vertices_per_patch: 0, drawid: 0 }),
+                    indirect: Some(IndirectDraw {
+                        resource: commands,
+                        offset: 0,
+                        stride: 20,
+                        draw_count: 1,
+                        draw_count_offset: 0,
+                        draw_count_resource: None,
+                    }),
+                }),
+                ..Default::default()
+            };
+            draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(RED_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            })
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            for restart_index in [42, 0xffff] {
+                let pixels = run(host_gl, restart_index)
+                    .unwrap_or_else(|e| panic!("{host_gl:?}, restart at {restart_index}: {e:?}"))
+                    .expect("no tessellation");
+                assert!(
+                    pixels.chunks(4).all(|p| p == [0xff, 0, 0, 0xff]),
+                    "{host_gl:?}, restart at {restart_index}: the second run covers the target: \
+                     {:?}",
+                    &pixels[..4]
+                );
+            }
+        }
+    }
+
     /// An indexed draw under transform feedback on a GLES host that refuses one -- GLES before 3.2
     /// without `OES_geometry_shader` -- captures the vertices its indices name, in their order,
     /// and primitive restart cuts it where the index says. The host's own feature is withdrawn,
