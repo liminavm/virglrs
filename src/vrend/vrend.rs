@@ -3702,10 +3702,19 @@ mod tests {
             }
         }
         let (w, h) = (16u32, 8u32);
-        // (format, its block's bytes). Every block holds its own words, so a block read from the
-        // wrong place, or a row of blocks out of order, reads as a different one; a BC7 block's
-        // low byte keeps it in mode 6.
-        for (name, block) in [("BPTC_RGBA_UNORM", 16u32), ("RGTC1_UNORM", 8)] {
+        // (format, its block's bytes), one of each family, read on whichever flavour offers it.
+        // Every block holds its own words, so a block read from the wrong place, or a row of
+        // blocks out of order, reads as a different one; a BC7 block's low byte keeps it in
+        // mode 6. A driver that stored a family decoded would hand back other blocks.
+        for (name, block) in [
+            ("BPTC_RGBA_UNORM", 16u32),
+            ("RGTC1_UNORM", 8),
+            ("DXT1_RGB", 8),
+            ("ETC2_RGB8", 8),
+            ("ETC2_RGBA8", 16),
+            ("ASTC_4x4", 16),
+        ] {
+            let mut read_on = vec![];
             let format = (0..crate::vrend::proto::FORMAT_MAX)
                 .filter_map(crate::vrend::proto::Format::from_wire)
                 .find(|f| f.name() == name)
@@ -3745,6 +3754,10 @@ mod tests {
                     crate::vrend::debug::Switches::default(),
                 )
                 .expect("vrend comes up");
+                if v.formats.get(format).is_none() {
+                    continue;
+                }
+                read_on.push(host_gl);
                 let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
                 v.context_create(ctx, &AllAttached).expect("a context");
                 let res = ResourceHandle::new(1).expect("non-zero");
@@ -3794,6 +3807,7 @@ mod tests {
                 }
                 v.context_destroy(ctx, &AllAttached);
             }
+            assert!(!read_on.is_empty(), "{name} is offered on some flavour");
         }
     }
 
@@ -5269,6 +5283,28 @@ mod tests {
     fn offered(host_gl: HostGl, format: crate::vrend::proto::Format) -> bool {
         let _display = crate::vrend::one_display_at_a_time();
         renderer(host_gl).caps().v1.sampler.has(format)
+    }
+
+    /// A compressed format is advertised for readback wherever its blocks read back: on desktop
+    /// GL always, on GLES where copy-image is there to copy them out. Left out of the mask, the
+    /// guest reads one by blitting it into a float texture and encoding what it reads again,
+    /// which hands piglit's BPTC `compressedteximage` other blocks than the ones it stored.
+    #[test]
+    fn a_compressed_format_is_advertised_readable_where_its_blocks_read_back() {
+        let bc7 = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == "BPTC_RGBA_UNORM")
+            .expect("a wire format");
+        assert!(serves(HostGl::Gles, Feature::copy_image), "this GLES host copies images");
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let _display = crate::vrend::one_display_at_a_time();
+            let v = renderer(host_gl);
+            assert!(v.caps().v1.sampler.has(bc7), "{host_gl:?} samples BC7");
+            assert!(
+                v.caps().supported_readback_formats.has(bc7),
+                "{host_gl:?} advertises BC7 for readback"
+            );
+        }
     }
 
     /// Whether a renderer of `host_gl` has `feature`.

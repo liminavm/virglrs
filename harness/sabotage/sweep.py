@@ -3551,6 +3551,13 @@ SABOTAGES = [
         'an_image_loaded_and_stored_in_one_shader_is_read_and_written',
     ),
     (
+        'a GLES host keeps compressed formats out of the readback mask as the C does',
+        'src/vrend/formats.rs',
+        """                    let blocks_read = !gles || features.has(Feature::copy_image);""",
+        """                    let blocks_read = !gles;""",
+        'a_compressed_format_is_advertised_readable_where_its_blocks_read_back',
+    ),
+    (
         'a GLES compressed readback answers from the pages the guest already holds',
         'src/vrend/transfer.rs',
         """            if !desktop && l.compressed && features.has(Feature::copy_image) {""",

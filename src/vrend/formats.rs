@@ -482,13 +482,18 @@ impl Table {
                 }
                 stand_ins[at] = group.when == When::SamplerOnly;
                 if group.compressed || group.when == When::SamplerOnly {
-                    // Desktop GL reads any texture back with `glGetTexImage`; the YUV formats'
-                    // storage is RGBA, so the C's sampler-only insert carries no flag at all.
+                    // Desktop GL reads any texture back with `glGetTexImage`, and GLES reads a
+                    // compressed one by copying its blocks into a texture it can read, which
+                    // needs copy-image. The YUV formats' storage is RGBA, so the C's
+                    // sampler-only insert carries no flag at all. Advertised, the guest reads
+                    // the blocks; not advertised, it decompresses through a blit and encodes
+                    // them again, which does not give back what it stored.
+                    let blocks_read = !gles || features.has(Feature::copy_image);
                     t.entries[at] = Some(Entry {
                         gl: *row,
                         bindings: Bindings { sampler_view: true, ..Bindings::default() },
                         can_texture_storage: false,
-                        can_readback: !gles && group.compressed,
+                        can_readback: group.compressed && blocks_read,
                         can_multisample: false,
                         can_target_rectangle: false,
                         stores_exactly: true,
