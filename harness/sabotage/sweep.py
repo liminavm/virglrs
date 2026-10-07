@@ -3635,6 +3635,13 @@ SABOTAGES = [
         'loads_and_stores_through_one_image_keep_their_order',
     ),
     (
+        'a GLES texture buffer range needs ES 3.2, not GL_EXT_texture_buffer',
+        'src/vrend/features.rs',
+        """["GL_ARB_texture_buffer_range", "GL_EXT_texture_buffer", "GL_OES_texture_buffer"]""",
+        """["GL_ARB_texture_buffer_range"]""",
+        'a_texture_buffer_past_the_texel_limit_is_sized_as_the_limit',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",

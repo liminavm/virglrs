@@ -174,7 +174,7 @@ features! {
     tessellation = (Gl(40), Gles(32), ["GL_ARB_tessellation_shader", "GL_OES_tessellation_shader", "GL_EXT_tessellation_shader"]),
     texture_array = (Gl(30), Gles(30), ["GL_EXT_texture_array"]),
     texture_barrier = (Gl(45), Unavail, ["GL_ARB_texture_barrier"]),
-    texture_buffer_range = (Gl(43), Gles(32), ["GL_ARB_texture_buffer_range"]),
+    texture_buffer_range = (Gl(43), Gles(32), ["GL_ARB_texture_buffer_range", "GL_EXT_texture_buffer", "GL_OES_texture_buffer"]),
     texture_gather = (Gl(40), Gles(31), ["GL_ARB_texture_gather"]),
     texture_mirror_clamp_to_edge = (Unavail, Unavail, ["GL_ATI_texture_mirror_once", "GL_EXT_texture_mirror_clamp", "GL_ARB_texture_mirror_clamp_to_edge", "GL_EXT_texture_mirror_clamp_to_edge"]),
     texture_mirror_clamp = (Unavail, Unavail, ["GL_ATI_texture_mirror_once", "GL_EXT_texture_mirror_clamp"]),
