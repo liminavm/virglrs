@@ -373,6 +373,10 @@ mod procs {
         = gles [try_glFramebufferTexture3DOES], gl [try_glFramebufferTexture3D]);
     resolver!(framebuffer_texture_2d_multisample: unsafe extern "C" fn(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei)
         = gles [try_glFramebufferTexture2DMultisampleEXT], gl []);
+    resolver!(draw_transform_feedback: unsafe extern "C" fn(GLenum, GLuint)
+        = gles [], gl [try_glDrawTransformFeedback]);
+    resolver!(draw_transform_feedback_instanced: unsafe extern "C" fn(GLenum, GLuint, GLsizei)
+        = gles [], gl [try_glDrawTransformFeedbackInstanced]);
     resolver!(texture_view: unsafe extern "C" fn(GLuint, GLenum, GLuint, GLenum, GLuint, GLuint, GLuint, GLuint)
         = gles [try_glTextureViewOES, try_glTextureViewEXT], gl [try_glTextureView]);
     resolver!(egl_image_target_tex_storage: unsafe extern "C" fn(GLenum, GLeglImageOES, *const GLint)
@@ -462,6 +466,12 @@ mod procs {
             framebuffer_texture_2d_multisample(t, a).is_some()
         }),
         (Feature::texture_view, "glTextureView", |t, a| texture_view(t, a).is_some()),
+        (Feature::transform_feedback_draw, "glDrawTransformFeedback", |t, a| {
+            draw_transform_feedback(t, a).is_some()
+        }),
+        (Feature::transform_feedback_instanced, "glDrawTransformFeedbackInstanced", |t, a| {
+            draw_transform_feedback_instanced(t, a).is_some()
+        }),
         (Feature::egl_image_storage, "glEGLImageTargetTexStorageEXT", |t, a| {
             egl_image_target_tex_storage(t, a).is_some()
         }),
@@ -2254,6 +2264,33 @@ impl Gl {
     pub fn bind_transform_feedback(&self, tf: Option<TransformFeedbackName>) {
         // SAFETY: plain scalar.
         unsafe { self.t.glBindTransformFeedback()(GL_TRANSFORM_FEEDBACK, tf.map_or(0, |t| t.0)) };
+    }
+
+    /// `glDrawTransformFeedback`: as many vertices as `tf` captured when its capture ended.
+    pub fn draw_transform_feedback(&self, mode: GLenum, tf: TransformFeedbackName) {
+        let f = promised(
+            procs::draw_transform_feedback(&self.t, self.api),
+            Feature::transform_feedback_draw,
+            "glDrawTransformFeedback",
+        );
+        // SAFETY: plain scalars.
+        unsafe { f(mode, tf.0) };
+    }
+
+    /// `glDrawTransformFeedbackInstanced`.
+    pub fn draw_transform_feedback_instanced(
+        &self,
+        mode: GLenum,
+        tf: TransformFeedbackName,
+        instances: GLsizei,
+    ) {
+        let f = promised(
+            procs::draw_transform_feedback_instanced(&self.t, self.api),
+            Feature::transform_feedback_instanced,
+            "glDrawTransformFeedbackInstanced",
+        );
+        // SAFETY: plain scalars.
+        unsafe { f(mode, tf.0, instances) };
     }
 
     pub fn end_transform_feedback(&self) {

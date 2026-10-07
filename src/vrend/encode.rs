@@ -199,7 +199,7 @@ impl Encoder<'_> {
                 self.u(d.restart_index);
                 self.u(d.min_index);
                 self.u(d.max_index);
-                self.u(obj(d.count_from_so));
+                self.u(d.count_from_so.map_or(0, std::num::NonZeroU32::get));
                 if let Some(t) = &d.tess {
                     self.u(t.vertices_per_patch);
                     self.u(t.drawid);

@@ -2133,6 +2133,13 @@ impl Context {
             gl.bind_buffer(GL_ELEMENT_ARRAY_BUFFER, None);
         }
 
+        // Ended before the current object's capture begins: ending binds the counted object,
+        // which GL refuses while another capture is active.
+        let counted = match draw.count_from_so {
+            Some(size) if !draw.indexed => Some(self.counted_capture(host, cmd, size)?),
+            _ => None,
+        };
+
         let sub = self.sub_mut();
         if let Some(i) = sub.current_so {
             match sub.streamouts[i].xfb {
@@ -2197,17 +2204,13 @@ impl Context {
             let ib = index_buffer.expect("an indexed draw bound its index buffer");
             self.draw_deindexed(host, &draw, mode, ib, instances)?;
         } else if !draw.indexed {
-            // The C draws `cso` vertices from zero when the wire names a stream-out object to
-            // count from -- the handle's number, as it is: the count is never read from the
-            // object. A handle is not a count, and no corpus has asked; refused until one does.
-            if draw.count_from_so.is_some() {
-                host.todo.note("a draw counted from a stream-out object");
-                return Err(Fault::Unimplemented {
-                    cmd,
-                    what: "a draw counted from a stream-out object",
-                });
-            }
-            if let Some(ind) = indirect {
+            if let Some(tf) = counted {
+                if draw.instance_count > 1 {
+                    gl.draw_transform_feedback_instanced(mode, tf, instances);
+                } else {
+                    gl.draw_transform_feedback(mode, tf);
+                }
+            } else if let Some(ind) = indirect {
                 let (draw_count, stride) = indirect_counts.expect("counted with the buffer");
                 if count_buffer.is_some() {
                     gl.multi_draw_arrays_indirect_count(
@@ -2401,6 +2404,59 @@ impl Context {
             _ => 0,
         };
         host.traces.stream.draw_fb(host.ctx, width, height, sub.cbufs.len() as u32, name);
+    }
+
+    /// The transform feedback object a draw counted from a stream-out target draws from.
+    ///
+    /// Guest virgl names the target only by its size in bytes, so it is found as the most
+    /// recently bound object whose first target has that size; two live targets of one size draw
+    /// from the later. The C draws that many vertices from zero instead, which runs past what
+    /// was captured. A capture the guest paused is ended here: GL counts from the last end, the
+    /// guest ended it before drawing from it, and a pause and an end look alike on the wire --
+    /// both unbind the targets. Its next binding begins a new capture.
+    ///
+    /// GLES has no `glDrawTransformFeedback`, so such a host refuses the draw.
+    fn counted_capture(
+        &mut self,
+        host: &mut Host<'_>,
+        cmd: Cmd,
+        size: std::num::NonZeroU32,
+    ) -> Result<TransformFeedbackName, Fault> {
+        if !host.has(Feature::transform_feedback_draw) {
+            return Err(Fault::NoFeature { cmd, feature: Feature::transform_feedback_draw });
+        }
+        let sub = self.sub();
+        let first_size = |so: &Streamout| match so.targets.first().copied().flatten() {
+            Some(h) => match sub.objects.get(&h) {
+                Some(Object::StreamoutTarget(t)) => Some(t.buffer_size),
+                _ => None,
+            },
+            None => None,
+        };
+        let Some(i) = sub.streamouts.iter().rposition(|so| first_size(so) == Some(size.get()))
+        else {
+            return Err(Fault::OutOfRange {
+                cmd,
+                what: "a draw counted from no stream-out target",
+            });
+        };
+        if sub.current_so == Some(i) {
+            return Err(Fault::OutOfRange {
+                cmd,
+                what: "a draw counted from the stream-out target it captures into",
+            });
+        }
+        let gl = host.gl;
+        let sub = self.sub_mut();
+        let so = &mut sub.streamouts[i];
+        let tf = so.id;
+        if so.xfb == Xfb::Paused {
+            gl.bind_transform_feedback(Some(tf));
+            gl.end_transform_feedback();
+            so.xfb = Xfb::NeedBegin;
+            gl.bind_transform_feedback(sub.current_so.map(|c| sub.streamouts[c].id));
+        }
+        Ok(tf)
     }
 
     /// An indexed draw served as arrays, on a host that refuses it as it is: see `deindex`.

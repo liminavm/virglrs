@@ -4373,10 +4373,15 @@ impl Context {
             self.sub_mut().current_so = None;
             return Ok(());
         }
+        // The list runs from least to most recently bound, which is the order a draw counted
+        // from a target searches it in (`counted_capture`).
         if let Some(i) = self.sub().streamouts.iter().position(|so| so.targets == targets) {
             let sub = self.sub_mut();
-            sub.current_so = Some(i);
-            gl.bind_transform_feedback(Some(sub.streamouts[i].id));
+            let so = sub.streamouts.remove(i);
+            sub.streamouts.push(so);
+            let last = sub.streamouts.len() - 1;
+            sub.current_so = Some(last);
+            gl.bind_transform_feedback(Some(sub.streamouts[last].id));
             return Ok(());
         }
         let id = gl.gen_transform_feedback();

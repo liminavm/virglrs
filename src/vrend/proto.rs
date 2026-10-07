@@ -580,7 +580,10 @@ pub struct Draw {
     pub restart_index: u32,
     pub min_index: u32,
     pub max_index: u32,
-    pub count_from_so: Option<ObjectHandle>,
+    /// The draw counts its vertices from a stream-out target: what was captured into it, as
+    /// `glDrawTransformFeedback` counts. Guest virgl names the target by its `buffer_size`, in
+    /// bytes -- not a handle and not a count -- so this is the size the host finds it by.
+    pub count_from_so: Option<std::num::NonZeroU32>,
     pub tess: Option<TessDraw>,
     pub indirect: Option<IndirectDraw>,
 }

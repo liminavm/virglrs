@@ -812,7 +812,7 @@ fn draw_vbo(w: &Words) -> Result<Command<'static>, Refused> {
         restart_index: w.u(9),
         min_index: w.u(10),
         max_index: w.u(11),
-        count_from_so: w.object_or_none(12),
+        count_from_so: std::num::NonZeroU32::new(w.u(12)),
         tess,
         indirect,
     }))
@@ -1423,7 +1423,7 @@ mod tests {
                 restart_index: 0xffff,
                 min_index: 0,
                 max_index: 99,
-                count_from_so: Some(o(10)),
+                count_from_so: std::num::NonZeroU32::new(96),
                 tess: None,
                 indirect: None,
             }),

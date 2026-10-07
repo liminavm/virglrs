@@ -189,6 +189,9 @@ features! {
     transform_feedback = (Gl(30), Gles(30), ["GL_EXT_transform_feedback"]),
     transform_feedback2 = (Gl(40), Gles(30), ["GL_ARB_transform_feedback2"]),
     transform_feedback3 = (Gl(40), Unavail, ["GL_ARB_transform_feedback3"]),
+    // `glDrawTransformFeedback`, which GLES has at no version.
+    transform_feedback_draw = (Gl(40), Unavail, ["GL_ARB_transform_feedback2"]),
+    transform_feedback_instanced = (Gl(42), Unavail, ["GL_ARB_transform_feedback_instanced"]),
     transform_feedback_overflow_query = (Gl(46), Unavail, ["GL_ARB_transform_feedback_overflow_query"]),
     txqs = (Gl(45), Unavail, ["GL_ARB_shader_texture_image_samples"]),
     ubo = (Gl(31), Gles(30), ["GL_ARB_uniform_buffer_object"]),

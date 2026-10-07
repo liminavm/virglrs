@@ -5869,6 +5869,143 @@ mod tests {
         }
     }
 
+    /// A draw counted from a stream-out target draws what was captured into it, as
+    /// `glDrawTransformFeedback` counts, where guest virgl names the target only by its size in
+    /// bytes. The harness's triangle is captured into a buffer with room for six vertices, which
+    /// is then overwritten: its first three vertices with a triangle in the left half, the next
+    /// three with a trap in the right half. The count stays the capture's, three vertices, so
+    /// only the left half is drawn; the C's count, the size in bytes, would reach the trap. GLES
+    /// has no `glDrawTransformFeedback`, and refuses the draw.
+    #[test]
+    fn a_draw_counted_from_a_stream_out_target_draws_what_was_captured() {
+        use crate::vrend::pipe::PrimType;
+        use crate::vrend::proto::{
+            Command, Draw, Object, SoBuffer, SoOutput, StreamOutput, StreamoutTarget, VertexBuffer,
+        };
+        let captured = ResourceHandle::new(10).expect("non-zero");
+        let target = ObjectHandle::new(20).expect("non-zero");
+        let capture_bytes = 6 * 16;
+        let vertex = |x: f32, y: f32| [x, y, 0.0, 1.0].map(f32::to_bits);
+        let overwritten: Vec<u32> = [
+            vertex(-1.0, -1.0),
+            vertex(0.0, -1.0),
+            vertex(-1.0, 1.0),
+            vertex(0.0, -1.0),
+            vertex(1.0, -1.0),
+            vertex(1.0, 1.0),
+        ]
+        .concat();
+        let run = |host_gl, instances: u32| {
+            let counted = Draw {
+                start: 0,
+                count: 0,
+                mode: PrimType::Triangles,
+                indexed: false,
+                instance_count: instances,
+                index_bias: 0,
+                start_instance: 0,
+                primitive_restart: false,
+                restart_index: 0,
+                min_index: 0,
+                max_index: u32::MAX,
+                count_from_so: std::num::NonZeroU32::new(capture_bytes),
+                tess: None,
+                indirect: None,
+            };
+            let more = More {
+                stream_output: Some(StreamOutput {
+                    stride: [4, 0, 0, 0],
+                    outputs: vec![SoOutput {
+                        register_index: 0,
+                        start_component: 0,
+                        num_components: 4,
+                        output_buffer: SoBuffer::from_wire(0).expect("buffer 0"),
+                        dst_offset: 0,
+                        stream: 0,
+                    }],
+                }),
+                resources: vec![(
+                    captured,
+                    buffer_args(resource::Bind::STREAM_OUTPUT, capture_bytes),
+                )],
+                before: vec![
+                    inline_write(captured, &[0u32; 24]),
+                    Command::CreateObject {
+                        handle: target,
+                        object: Object::StreamoutTarget(StreamoutTarget {
+                            resource: captured,
+                            buffer_offset: 0,
+                            buffer_size: capture_bytes,
+                        }),
+                    },
+                    Command::SetStreamoutTargets { append_bitmask: 0, targets: vec![Some(target)] },
+                ],
+                after: vec![
+                    Command::SetStreamoutTargets { append_bitmask: 0, targets: vec![] },
+                    inline_write(captured, &overwritten),
+                    Command::Clear { buffers: 1 << 2, color: [0; 4], depth: 0.0, stencil: 0 },
+                    Command::SetVertexBuffers(vec![VertexBuffer {
+                        stride: 16,
+                        offset: 0,
+                        resource: Some(captured),
+                    }]),
+                    Command::DrawVbo(counted),
+                ],
+                ..Default::default()
+            };
+            draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(RED_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            })
+            .map(|pixels| {
+                // Red pixels in the left half and in the right half of the 16x16 target.
+                let pixels = pixels.expect("the target is read back");
+                let mut red = [0; 2];
+                for (i, px) in pixels.chunks(4).enumerate() {
+                    if px[0] == 0xff {
+                        red[usize::from(i % 16 >= 8)] += 1;
+                    }
+                }
+                red
+            })
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            if !host_has(host_gl, Feature::transform_feedback_draw) {
+                let ran = run(host_gl, 1);
+                assert!(
+                    matches!(
+                        ran,
+                        Err(Fault::NoFeature { feature: Feature::transform_feedback_draw, .. })
+                    ),
+                    "{host_gl:?}: a host without glDrawTransformFeedback refuses: {ran:?}"
+                );
+                continue;
+            }
+            let mut instances = vec![1];
+            if host_has(host_gl, Feature::transform_feedback_instanced) {
+                instances.push(2);
+            }
+            for n in instances {
+                let [left, right] =
+                    run(host_gl, n).unwrap_or_else(|e| panic!("{host_gl:?} x{n}: {e:?}"));
+                assert!(left > 0, "{host_gl:?} x{n}: the captured vertices are drawn");
+                assert_eq!(right, 0, "{host_gl:?} x{n}: no vertex past the capture is drawn");
+            }
+        }
+        assert!(
+            host_has(HostGl::Desktop, Feature::transform_feedback_draw),
+            "the premise: desktop GL draws from transform feedback"
+        );
+    }
+
     /// An indexed draw under transform feedback on a GLES host that refuses one -- GLES before 3.2
     /// without `OES_geometry_shader` -- captures the vertices its indices name, in their order,
     /// and primitive restart cuts it where the index says. The host's own feature is withdrawn,

@@ -3672,6 +3672,13 @@ SABOTAGES = [
         'a_memory_info_query_writes_the_host_s_memory_into_the_guest_s_buffer',
     ),
     (
+        'a draw counted from a stream-out target draws every vertex its buffer holds',
+        'src/vrend/context/draw.rs',
+        """                    gl.draw_transform_feedback(mode, tf);""",
+        """                    gl.draw_arrays(mode, 0, { let _ = tf; 6 });""",
+        'a_draw_counted_from_a_stream_out_target_draws_what_was_captured',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",
