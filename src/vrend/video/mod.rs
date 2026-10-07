@@ -1489,10 +1489,19 @@ impl Av1 {
         };
 
         // The held frame first, under its own shape: decode order is preserved, and it is this
-        // descriptor's reference map that makes its refresh exact.
+        // descriptor's reference map that makes its refresh exact. A host failure on it loses
+        // that frame only: this descriptor's frame is a different one, and returning here would
+        // leave it without a shape, so END_FRAME would drop it too.
         if let Some((unit, owed)) = self.obu.flush_held(&desc) {
             let engine = self.route.engine(handle, &owed.shape, &unit.bytes, budget);
-            host.submit(handle, &owed.shape, &unit.bytes, owed.target.as_ref(), engine)?;
+            if let Err(why) =
+                host.submit(handle, &owed.shape, &unit.bytes, owed.target.as_ref(), engine)
+            {
+                eprintln!(
+                    "[virglrs] video codec {handle}: the held AV1 frame was not decoded ({why:?}); \
+                     its target keeps what it held, and the next frame goes on"
+                );
+            }
         }
 
         let (fallback_width, fallback_height) = fallback;
@@ -2544,6 +2553,8 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         units: Vec<(Vec<u8>, Went, Engine)>,
+        /// Refuse the next unit as a host decoder failing it would, and record nothing.
+        refuse_next: bool,
     }
 
     impl Submit for Recorder {
@@ -2555,6 +2566,9 @@ mod tests {
             delivery: Delivery<'_>,
             engine: Engine,
         ) -> Result<(), Refusal> {
+            if std::mem::take(&mut self.refuse_next) {
+                return Err(Refusal::HostRefusedFrame);
+            }
             let went = match delivery {
                 Delivery::To(buffer) => Went::To(Arc::as_ptr(buffer)),
                 Delivery::Withheld(buffer) => Went::Withheld(Arc::as_ptr(buffer)),
@@ -2665,6 +2679,29 @@ mod tests {
             .expect("the frame after it");
         assert_eq!(host.units[10].1, Went::Nowhere, "the slot claim delivers nothing");
         assert!(host.units[10..].iter().all(|u| u.2 == Engine::Software { replay: None }));
+    }
+
+    /// A host failure decoding the held frame loses that frame and nothing else: the frame whose
+    /// descriptor flushed it still gets its shape and goes out at END_FRAME.
+    #[test]
+    fn a_held_frame_the_host_refuses_does_not_drop_the_next_frame() {
+        let mut av1 = Av1::new(true);
+        let mut host = Recorder::default();
+        let mut map = av1_to_the_wall(&mut av1, &mut host, false);
+
+        let held = av1_target();
+        av1_frame(&mut av1, &mut host, &av1::test_frame(false, false, false, map), &held)
+            .expect("a hidden inter frame");
+        assert_eq!(host.units.len(), 8, "the hidden frame is held, not submitted");
+
+        map[0] = 9;
+        let next = av1_target();
+        host.refuse_next = true;
+        av1_frame(&mut av1, &mut host, &av1::test_frame(false, true, false, map), &next)
+            .expect("the frame after a refused held frame is still decoded");
+        assert!(!host.refuse_next, "the held frame was the one refused");
+        assert_eq!(host.units.len(), 9, "only the incoming frame reached the decoder");
+        assert_eq!(host.units[8].1, Went::To(Arc::as_ptr(&next)), "and it delivers");
     }
 
     /// A held super-resolution frame switches the stream when it goes out, a descriptor later.
