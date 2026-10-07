@@ -119,6 +119,7 @@ pub(super) mod sysval {
     pub const ALPHA_REF_VAL: u8 = 1 << 2;
     pub const PSTIPPLE_SAMPLER: u8 = 1 << 3;
     pub const DRAWID_BASE: u8 = 1 << 4;
+    pub const POINT_SIZE: u8 = 1 << 5;
 }
 
 /// `MAX_VARYING`.
@@ -1247,6 +1248,10 @@ pub(super) fn emit_required_sysval_uniforms(bufs: &mut Buffers) {
     bufs.hdr("\tfloat alpha_ref_val;\n");
     bufs.hdr("\tbool clip_plane_enabled;\n");
     bufs.hdr("\tint drawid_base;\n");
+    // Declared only where a stage reads it, so every other block is the C's.
+    if bufs.required_sysval_uniform_decls & sysval::POINT_SIZE != 0 {
+        bufs.hdr("\tfloat point_size;\n");
+    }
     bufs.hdr("};\n");
 }
 

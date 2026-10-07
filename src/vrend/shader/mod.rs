@@ -319,6 +319,9 @@ pub struct Key {
     pub require_input_arrays: bool,
     pub require_output_arrays: bool,
     pub use_pervertex_in: bool,
+    /// The vertex stage writes the rasterizer's point size, `VirglBlock`'s `point_size`, into
+    /// `gl_PointSize`: GLES has no fixed point size, only the one the last stage writes.
+    pub fixed_point_size: bool,
 }
 
 impl Default for Key {
@@ -356,6 +359,7 @@ impl Default for Key {
             require_input_arrays: false,
             require_output_arrays: false,
             use_pervertex_in: false,
+            fixed_point_size: false,
         }
     }
 }

@@ -53,6 +53,9 @@ pub struct Sysval {
     pub alpha_ref_val: f32,
     pub clip_plane_enabled: f32,
     pub drawid_base: i32,
+    /// The rasterizer's fixed point size, which a GLES vertex stage writes itself. A member the
+    /// block declares only in a shader that reads it; uploaded always, past the C's block.
+    pub point_size: f32,
 }
 
 impl Default for Sysval {
@@ -65,6 +68,7 @@ impl Default for Sysval {
             alpha_ref_val: 0.0,
             clip_plane_enabled: 0.0,
             drawid_base: 0,
+            point_size: 1.0,
         }
     }
 }
@@ -93,11 +97,16 @@ impl Sysval {
             put(&self.alpha_ref_val.to_ne_bytes());
             put(&self.clip_plane_enabled.to_ne_bytes());
             put(&self.drawid_base.to_ne_bytes());
+            put(&self.point_size.to_ne_bytes());
+            put(&[0; 12]);
         }
         debug_assert_eq!(at, Sysval::SIZE);
     }
 
-    const SIZE: usize = shader::NUM_CLIP_PLANES * 16 + shader::POLYGON_STIPPLE_SIZE * 16 + 16;
+    /// The C's block: the clip planes, the stipple rows and the four scalars after them.
+    const C_SIZE: usize = shader::NUM_CLIP_PLANES * 16 + shader::POLYGON_STIPPLE_SIZE * 16 + 16;
+    /// The C's block and `point_size`, padded to the sixteen bytes std140 rounds a block to.
+    const SIZE: usize = Sysval::C_SIZE + 16;
 }
 
 /// How many times a [`Tracked`] value has been reached mutably. Monotonic, so a value changed and
@@ -463,15 +472,17 @@ impl LinkedProgram {
             let bind = self.virgl_block_bind.expect("set a moment ago");
             self.object.activate(gl, id);
             gl.uniform_block_binding(id, block, bind);
-            let size = gl.uniform_block_data_size(id, block);
+            // A stage declares `point_size` only where it reads it, so blocks of one program
+            // can be the C's or that and one more member; the buffer holds the larger.
+            let size = gl.uniform_block_data_size(id, block) as usize;
             assert!(
-                size as usize >= Sysval::SIZE,
-                "the VirglBlock the shader declares holds the sysval block"
+                size >= Sysval::C_SIZE,
+                "the VirglBlock the shader declares holds the C's sysval block"
             );
             if created {
                 let buf = self.sysval_buffer.expect("made a moment ago");
                 gl.bind_buffer(GL_UNIFORM_BUFFER, Some(buf));
-                gl.buffer_data_null(GL_UNIFORM_BUFFER, size as usize, GL_DYNAMIC_DRAW);
+                gl.buffer_data_null(GL_UNIFORM_BUFFER, size.max(Sysval::SIZE), GL_DYNAMIC_DRAW);
                 gl.bind_buffer(GL_UNIFORM_BUFFER, None);
             }
         }

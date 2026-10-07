@@ -509,6 +509,10 @@ impl SubContext {
         key.pstipple_enabled = rs.poly_stipple_enable;
         key.color_two_side = rs.light_twoside;
         key.flatshade = rs.flatshade;
+        key.fixed_point_size = host.features.api().is_gles()
+            && !rs.point_size_per_vertex
+            && rs.point_size != 0.0
+            && rs.point_size != 1.0;
         if stage == Vertex
             && let Some(Object::VertexElements(ve)) = self.ve.and_then(|h| self.objects.get(&h))
         {

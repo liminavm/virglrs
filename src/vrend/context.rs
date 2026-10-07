@@ -1236,7 +1236,7 @@ const ZERO_BLEND: BlendState = BlendState {
 };
 
 /// The C's zeroed `pipe_rasterizer_state`.
-const ZERO_RS: RasterizerState = RasterizerState {
+pub(crate) const ZERO_RS: RasterizerState = RasterizerState {
     flatshade: false,
     depth_clip: false,
     clip_halfz: false,
@@ -2597,6 +2597,8 @@ impl Context {
             if !s.point_size_per_vertex && s.point_size != 0.0 {
                 gl.point_size(s.point_size);
             }
+        } else if sub.sysval.point_size != s.point_size {
+            sub.sysval.point_size = s.point_size;
         }
         gl.line_width(if s.line_width <= 0.0 { 1.0 } else { s.line_width });
         if s.rasterizer_discard != sub.hw_rs.rasterizer_discard {

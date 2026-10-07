@@ -3551,6 +3551,20 @@ SABOTAGES = [
         'an_image_loaded_and_stored_in_one_shader_is_read_and_written',
     ),
     (
+        'a GLES vertex stage leaves the point size to the driver as the C does',
+        'src/vrend/context/select.rs',
+        """        key.fixed_point_size = host.features.api().is_gles()""",
+        """        key.fixed_point_size = false && host.features.api().is_gles()""",
+        'a_fixed_point_size_draws_points_that_size',
+    ),
+    (
+        'a GLES vertex stage writes a point size the rasterizer never told it',
+        'src/vrend/context.rs',
+        """            sub.sysval.point_size = s.point_size;""",
+        """            sub.sysval.point_size = 1.0;""",
+        'a_fixed_point_size_draws_points_that_size',
+    ),
+    (
         'only an 8-bit alpha target has its alpha moved into red',
         'src/vrend/formats.rs',
         """    formats.get(format).is_some_and(|e| e.gl.swizzle == Some(ALPHA_FROM_RED))""",

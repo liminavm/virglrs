@@ -3673,6 +3673,80 @@ mod tests {
         }
     }
 
+    /// A point drawn at a fixed size other than one is that size on both flavours, from a vertex
+    /// shader that writes no size of its own. GLES has no fixed point size, so there the vertex
+    /// stage writes the rasterizer's into `gl_PointSize`; left alone, the driver draws whatever
+    /// size it likes -- piglit's `pos-array` probed beside a one-pixel point.
+    #[test]
+    fn a_fixed_point_size_draws_points_that_size() {
+        use crate::vrend::pipe::PrimType;
+        use crate::vrend::proto::{Command, Draw, Object, ObjectType};
+        const VS: &str = "VERT\nDCL OUT[0], POSITION\nIMM[0] FLT32 { 0.0, 0.0, 0.0, 1.0 }\n  \
+                          0: MOV OUT[0], IMM[0]\n  1: END\n";
+        const FS: &str = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 { 1.0, 1.0, 0.0, 1.0 }\n  \
+                          0: MOV OUT[0], IMM[0]\n  1: END\n";
+        let rs = ObjectHandle::new(30).expect("non-zero");
+        let more = More {
+            before: vec![
+                Command::CreateObject {
+                    handle: rs,
+                    object: Object::Rasterizer(crate::vrend::proto::RasterizerState {
+                        point_size: 4.0,
+                        half_pixel_center: true,
+                        depth_clip: true,
+                        ..crate::vrend::context::ZERO_RS
+                    }),
+                },
+                Command::BindObject { kind: ObjectType::Rasterizer, handle: Some(rs) },
+            ],
+            draw: Some(Draw {
+                start: 0,
+                count: 1,
+                mode: PrimType::Points,
+                indexed: false,
+                instance_count: 1,
+                index_bias: 0,
+                start_instance: 0,
+                primitive_restart: false,
+                restart_index: 0,
+                min_index: 0,
+                max_index: 0,
+                count_from_so: None,
+                tess: None,
+                indirect: None,
+            }),
+            ..Default::default()
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                vs: Some(VS),
+                fs: Some(FS),
+                consts: &[],
+                clear: [0.0; 4],
+                logicop: None,
+                tess: None,
+                pipeline: None,
+                more: Some(&more),
+            })
+            .unwrap_or_else(|e| panic!("{host_gl:?}: the point draws: {e:?}"))
+            .expect("no tessellation asked for");
+            let at = |x: usize, y: usize| &pixels[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4];
+            // A point of four centred on the target's middle covers pixels 6 to 9 each way.
+            for (x, y) in [(6, 6), (9, 6), (6, 9), (9, 9)] {
+                assert_eq!(
+                    at(x, y),
+                    [0xff, 0xff, 0, 0xff],
+                    "{host_gl:?}: ({x}, {y}) is in the point"
+                );
+            }
+            for (x, y) in [(5, 5), (10, 10), (0, 0)] {
+                assert_eq!(at(x, y), [0, 0, 0, 0], "{host_gl:?}: ({x}, {y}) is outside it");
+            }
+        }
+    }
+
     /// A draw into an alpha-only target stores the fragment's alpha. GL has no such render
     /// target on either flavour for 16-bit alpha or integer alpha, so the texture is red with its
     /// alpha sampled from red, and the shader has to write its alpha there. Written as bound, the

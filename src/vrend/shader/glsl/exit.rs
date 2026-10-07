@@ -322,6 +322,12 @@ pub(super) fn handle_vertex_proc_exit(ctx: &mut Context<'_>) {
     if ctx.key.vs.fog_fixup_mask != 0 {
         emit_fog_fixup_write(ctx);
     }
+    // Last, so it stands over any size the shader wrote, as a fixed size does in GL. A
+    // geometry or tessellation stage would need GLES's point-size extensions to write it.
+    if ctx.key.fixed_point_size && !ctx.key.gs_present && !ctx.key.tes_present {
+        ctx.bufs.emit("gl_PointSize = point_size;\n");
+        ctx.bufs.required_sysval_uniform_decls |= sysval::POINT_SIZE;
+    }
 }
 
 /// `emit_fragment_logicop`.
