@@ -3686,6 +3686,20 @@ SABOTAGES = [
         'a_buffer_view_of_a_format_the_host_has_no_texture_of_samples',
     ),
     (
+        'a render condition is recorded but never applied',
+        'src/vrend/context.rs',
+        """            gl.begin_conditional_render(id, glmode);""",
+        """            let _ = (id, glmode);""",
+        'a_render_condition_drops_a_draw_its_query_failed',
+    ),
+    (
+        'an unconditional clear runs under the render condition',
+        'src/vrend/context.rs',
+        """        let applied = self.applied_render_condition(host).filter(|_| unconditional)?;""",
+        """        let applied = self.applied_render_condition(host).filter(|_| !unconditional)?;""",
+        'a_render_condition_drops_a_draw_its_query_failed',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",

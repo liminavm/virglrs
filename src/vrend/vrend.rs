@@ -7972,6 +7972,105 @@ mod tests {
         }
     }
 
+    /// A draw under a render condition is dropped while the condition's query says so: an
+    /// occlusion query that counted nothing drops it, one that counted the harness's triangle
+    /// lets it through, and an inverted condition does the opposite. A surface clear the guest
+    /// sent unconditional clears under a failed condition, and one sent conditional does not.
+    /// GLES has no conditional rendering, never offered it, and draws.
+    #[test]
+    fn a_render_condition_drops_a_draw_its_query_failed() {
+        use crate::vrend::pipe::{QueryType, RenderCondMode};
+        use crate::vrend::proto::{Command, Object, QueryCreate};
+        let result = ResourceHandle::new(10).expect("non-zero");
+        let query = ObjectHandle::new(20).expect("non-zero");
+        let create = Command::CreateObject {
+            handle: query,
+            object: Object::Query(QueryCreate {
+                kind: QueryType::OcclusionCounter,
+                index: 0,
+                offset: 0,
+                resource: result,
+            }),
+        };
+        let condition = |inverted| Command::SetRenderCondition {
+            query: Some(query),
+            condition: inverted,
+            mode: RenderCondMode::Wait,
+        };
+        // The first pixel once the last draw, and `after`, ran.
+        let pixel = |host_gl, passed: bool, inverted: bool, after: Vec<Command<'static>>| {
+            let more = if passed {
+                // The first draw is counted; the condition then holds the redraw.
+                More {
+                    resources: vec![(result, buffer_args(resource::Bind::CUSTOM, 16))],
+                    before: vec![create.clone(), Command::BeginQuery(query)],
+                    redraws: vec![vec![
+                        Command::EndQuery(query),
+                        Command::Clear { buffers: 1 << 2, color: [0; 4], depth: 0.0, stencil: 0 },
+                        condition(inverted),
+                    ]],
+                    ..Default::default()
+                }
+            } else {
+                More {
+                    resources: vec![(result, buffer_args(resource::Bind::CUSTOM, 16))],
+                    before: vec![
+                        create.clone(),
+                        Command::BeginQuery(query),
+                        Command::EndQuery(query),
+                        condition(inverted),
+                    ],
+                    after,
+                    ..Default::default()
+                }
+            };
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(RED_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            })
+            .unwrap_or_else(|e| panic!("{host_gl:?} passed {passed} inverted {inverted}: {e:?}"))
+            .expect("the target is read back");
+            [pixels[0], pixels[1], pixels[2], pixels[3]]
+        };
+        let run = |host_gl, passed, inverted| pixel(host_gl, passed, inverted, vec![])[0] == 0xff;
+        // The harness's colour buffer is surface 6.
+        let green = |enabled| Command::ClearSurface {
+            render_condition_enable: enabled,
+            buffers: 1 << 2,
+            surface: ObjectHandle::new(6).expect("non-zero"),
+            color: [0.0f32, 1.0, 0.0, 1.0].map(f32::to_bits),
+            dst_x: 0,
+            dst_y: 0,
+            width: 16,
+            height: 16,
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let applies = host_has(host_gl, Feature::gl_conditional_render);
+            assert_eq!(run(host_gl, false, false), !applies, "{host_gl:?}: a failed query");
+            assert!(run(host_gl, true, false), "{host_gl:?}: a passed query");
+            let unconditional = pixel(host_gl, false, false, vec![green(false)]);
+            assert_eq!(unconditional[1], 0xff, "{host_gl:?}: an unconditional clear");
+            let conditional = pixel(host_gl, false, false, vec![green(true)]);
+            assert_eq!(conditional[1] == 0xff, !applies, "{host_gl:?}: a conditional clear");
+            if host_has(host_gl, Feature::conditional_render_inverted) {
+                assert!(run(host_gl, false, true), "{host_gl:?}: a failed query, inverted");
+                assert!(!run(host_gl, true, true), "{host_gl:?}: a passed query, inverted");
+            }
+        }
+        assert!(
+            host_has(HostGl::Desktop, Feature::conditional_render_inverted),
+            "the premise: desktop GL renders conditionally, inverted too"
+        );
+    }
+
     /// A buffer view of an alpha format samples its texels as alpha, as `vrend_get_arb_format`
     /// and the shader's swizzle make it, where the host has no texture of the format to look up:
     /// the core profile has no `GL_ALPHA16F`. Creating such a view was refused, which cost the

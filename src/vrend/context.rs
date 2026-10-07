@@ -1024,7 +1024,9 @@ pub struct SubContext {
     abos: BTreeMap<u32, Ssbo>,
     streamouts: Vec<Streamout>,
     current_so: Option<usize>,
-    render_condition: Option<(ObjectHandle, bool, RenderCondMode)>,
+    /// The render condition, as the query and mode GL was given: the C's `cond_render_q_id`
+    /// and `cond_render_gl_mode`. Recorded where the host cannot apply it.
+    render_condition: Option<(QueryName, GLenum)>,
     /// Queries the guest asked for whose result was not ready yet: `vrend_state.waiting_query_list`,
     /// per sub-context because a query object belongs to the GL context that made it. Names only,
     /// so a query destroyed while parked simply fails to resolve and drops out.
@@ -2085,7 +2087,12 @@ impl Context {
                 }
                 Ok(())
             }
-            Command::Blit(b) => self.blit(host, &b),
+            Command::Blit(b) => {
+                let paused = self.pause_render_condition(host, !b.render_condition_enable);
+                let ran = self.blit(host, &b);
+                self.resume_render_condition(host, paused);
+                ran
+            }
             Command::ResourceCopyRegion {
                 dst,
                 dst_level,
@@ -2129,7 +2136,7 @@ impl Context {
                 self.set_streamout_targets(host, &targets)
             }
             Command::SetRenderCondition { query, condition, mode } => {
-                self.set_render_condition(query, condition, mode);
+                self.set_render_condition(host, query, condition, mode);
                 Ok(())
             }
             Command::SetUniformBuffer { stage, index, offset, length, resource } => {
@@ -2327,7 +2334,7 @@ impl Context {
                 Err(Fault::Unimplemented { cmd: kind, what: "video encode" })
             }
             Command::ClearSurface {
-                render_condition_enable: _,
+                render_condition_enable,
                 buffers,
                 surface,
                 color,
@@ -2335,13 +2342,18 @@ impl Context {
                 dst_y,
                 width,
                 height,
-            } => self.clear_surface(
-                host,
-                surface,
-                buffers as u32,
-                color,
-                [dst_x, dst_y, width, height],
-            ),
+            } => {
+                let paused = self.pause_render_condition(host, !render_condition_enable);
+                let ran = self.clear_surface(
+                    host,
+                    surface,
+                    buffers as u32,
+                    color,
+                    [dst_x, dst_y, width, height],
+                );
+                self.resume_render_condition(host, paused);
+                ran
+            }
         }
     }
 }
@@ -4430,22 +4442,86 @@ impl Context {
         Ok(())
     }
 
-    /// `vrend_render_condition` on a host without conditional rendering: recorded, never
-    /// applied; an unknown query is ignored as the C ignores it.
+    /// `vrend_render_condition`: draws, clears and conditional blits are dropped while the
+    /// query's answer says so, `condition` inverting it. A host with conditional rendering
+    /// applies it in GL; one without -- GLES -- only records it, and its caps never offered it.
+    /// An unknown query is ignored as the C ignores it, and so is an inverted condition on a
+    /// host that cannot invert, whose caps did not offer one either.
     fn set_render_condition(
         &mut self,
+        host: &mut Host<'_>,
         query: Option<ObjectHandle>,
         condition: bool,
         mode: RenderCondMode,
     ) {
+        let gl = host.gl;
+        // The previous condition ends first: GL refuses a begin while one is active.
+        if self.applied_render_condition(host).is_some() {
+            gl.end_conditional_render();
+        }
         let sub = self.sub_mut();
-        match query {
-            None => sub.render_condition = None,
-            Some(h) => {
-                if matches!(sub.objects.get(&h), Some(Object::Query(_))) {
-                    sub.render_condition = Some((h, condition, mode));
-                }
-            }
+        sub.render_condition = None;
+        let Some(h) = query else { return };
+        let Some(Object::Query(q)) = sub.objects.get(&h) else { return };
+        if condition && !host.has(Feature::conditional_render_inverted) {
+            return;
+        }
+        // GL conditions only on whether samples passed or a stream overflowed; begun on any
+        // other query it is an error that would cost the guest its context.
+        if host.has(Feature::gl_conditional_render)
+            && !matches!(
+                q.gl_type,
+                GL_SAMPLES_PASSED
+                    | GL_ANY_SAMPLES_PASSED
+                    | GL_ANY_SAMPLES_PASSED_CONSERVATIVE
+                    | GL_TRANSFORM_FEEDBACK_OVERFLOW
+                    | GL_TRANSFORM_FEEDBACK_STREAM_OVERFLOW
+            )
+        {
+            host.todo.note("a render condition on a query GL cannot condition on");
+            return;
+        }
+        let glmode = match (mode, condition) {
+            (RenderCondMode::Wait, false) => GL_QUERY_WAIT,
+            (RenderCondMode::NoWait, false) => GL_QUERY_NO_WAIT,
+            (RenderCondMode::ByRegionWait, false) => GL_QUERY_BY_REGION_WAIT,
+            (RenderCondMode::ByRegionNoWait, false) => GL_QUERY_BY_REGION_NO_WAIT,
+            (RenderCondMode::Wait, true) => GL_QUERY_WAIT_INVERTED,
+            (RenderCondMode::NoWait, true) => GL_QUERY_NO_WAIT_INVERTED,
+            (RenderCondMode::ByRegionWait, true) => GL_QUERY_BY_REGION_WAIT_INVERTED,
+            (RenderCondMode::ByRegionNoWait, true) => GL_QUERY_BY_REGION_NO_WAIT_INVERTED,
+        };
+        sub.render_condition = Some((q.id, glmode));
+        if let Some((id, glmode)) = self.applied_render_condition(host) {
+            gl.begin_conditional_render(id, glmode);
+        }
+    }
+
+    /// The render condition where the host applies it in GL.
+    fn applied_render_condition(&self, host: &Host<'_>) -> Option<(QueryName, GLenum)> {
+        self.sub().render_condition.filter(|_| host.has(Feature::gl_conditional_render))
+    }
+
+    /// `vrend_pause_render_condition`: a blit or clear the guest sent unconditional runs with
+    /// the condition ended, and [`Self::resume_render_condition`] begins it again after. The
+    /// sub-context's own GL context is the one the condition lives in, whatever the command
+    /// made current in between.
+    #[must_use]
+    fn pause_render_condition(
+        &self,
+        host: &mut Host<'_>,
+        unconditional: bool,
+    ) -> Option<(QueryName, GLenum)> {
+        let applied = self.applied_render_condition(host).filter(|_| unconditional)?;
+        self.make_current(host);
+        host.gl.end_conditional_render();
+        Some(applied)
+    }
+
+    fn resume_render_condition(&self, host: &mut Host<'_>, paused: Option<(QueryName, GLenum)>) {
+        if let Some((id, glmode)) = paused {
+            self.make_current(host);
+            host.gl.begin_conditional_render(id, glmode);
         }
     }
 

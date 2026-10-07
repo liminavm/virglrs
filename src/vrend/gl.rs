@@ -2266,6 +2266,17 @@ impl Gl {
         unsafe { self.t.glBindTransformFeedback()(GL_TRANSFORM_FEEDBACK, tf.map_or(0, |t| t.0)) };
     }
 
+    /// `glBeginConditionalRender`: draws and blits are dropped while `query`'s answer says so.
+    pub fn begin_conditional_render(&self, query: QueryName, mode: GLenum) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glBeginConditionalRender()(query.0, mode) };
+    }
+
+    pub fn end_conditional_render(&self) {
+        // SAFETY: takes nothing.
+        unsafe { self.t.glEndConditionalRender()() };
+    }
+
     /// `glDrawTransformFeedback`: as many vertices as `tf` captured when its capture ended.
     pub fn draw_transform_feedback(&self, mode: GLenum, tf: TransformFeedbackName) {
         let f = promised(
