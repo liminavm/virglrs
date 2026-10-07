@@ -315,6 +315,8 @@ pub(super) struct Image {
     pub image_return: ReturnType,
     pub vflag: bool,
     pub coherent: bool,
+    /// Something reads the image: a load, an atomic or a size query names it as a source.
+    pub loaded: bool,
 }
 
 impl Default for Image {
@@ -324,7 +326,18 @@ impl Default for Image {
             image_return: ReturnType::Unorm,
             vflag: false,
             coherent: false,
+            loaded: false,
         }
+    }
+}
+
+impl Image {
+    /// GLES lets an image be both read and written only in an r32 format; any other has to be
+    /// declared `readonly` or `writeonly`. A writable image in such a format is stored to through
+    /// a `writeonly` declaration of its own, `<stage>imgw<n>` on the same unit, and the plain name
+    /// is declared `readonly` for whatever reads it. Desktop GL declares one writable image.
+    pub fn stored_through_alias(&self, gles: bool) -> bool {
+        gles && self.decl.writable && !tex::is_r32_format(self.decl.format)
     }
 }
 

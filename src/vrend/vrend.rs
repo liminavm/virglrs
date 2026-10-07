@@ -6071,6 +6071,95 @@ mod tests {
         }
     }
 
+    /// An RGBA32F image a shader both loads and stores is read and written. GLES allows that only
+    /// in an r32 format, so there the store goes through a `writeonly` declaration of the same
+    /// unit and the load through a `readonly` one; declared once, the shader does not compile.
+    /// After a barrier, the second draw loads what the first stored.
+    #[test]
+    fn an_image_loaded_and_stored_in_one_shader_is_read_and_written() {
+        use crate::vrend::pipe::ImageAccess;
+        use crate::vrend::proto::{Box3, Command, ShaderImage, Transfer};
+        const FS: &str = "FRAG\nDCL OUT[0], COLOR\n\
+                          DCL IMAGE[0], 2D, PIPE_FORMAT_R32G32B32A32_FLOAT, WR\n\
+                          DCL TEMP[0]\nIMM[0] INT32 { 1, 1, 0, 0 }\n\
+                          IMM[1] FLT32 { 0.25, 0.5, 0.75, 1.0 }\n  \
+                          0: LOAD TEMP[0], IMAGE[0], IMM[0], 2D, PIPE_FORMAT_R32G32B32A32_FLOAT\n  \
+                          1: STORE IMAGE[0], IMM[0], IMM[1], 2D, PIPE_FORMAT_R32G32B32A32_FLOAT\n  \
+                          2: MOV OUT[0], TEMP[0]\n  3: END\n";
+        let f32x4 = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == "R32G32B32A32_FLOAT")
+            .expect("a wire format");
+        let image = ResourceHandle::new(10).expect("a resource handle is non-zero");
+        let ones: Vec<u32> = (0..16 * 4).map(|_| 1.0f32.to_bits()).collect();
+        let more = More {
+            resources: vec![(
+                image,
+                resource::Args {
+                    target: TextureTarget::Texture2d,
+                    format: f32x4,
+                    bind: resource::Bind::SAMPLER_VIEW,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: resource::ResourceFlags(0),
+                },
+            )],
+            before: vec![
+                Command::ResourceInlineWrite {
+                    transfer: Transfer {
+                        resource: image,
+                        level: 0,
+                        usage: 0,
+                        stride: 64,
+                        layer_stride: 0,
+                        region: Box3 { x: 0, y: 0, z: 0, width: 4, height: 4, depth: 1 },
+                    },
+                    data: &ones,
+                },
+                Command::SetShaderImages {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    images: vec![Some(ShaderImage {
+                        format: f32x4,
+                        access: ImageAccess::ReadWrite,
+                        layer_offset: 0,
+                        level_size: 0,
+                        resource: image,
+                    })],
+                },
+            ],
+            // Every barrier bit, as a guest would send between the two.
+            redraws: vec![vec![Command::MemoryBarrier(!0)]],
+            ..Default::default()
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                vs: None,
+                fs: Some(FS),
+                consts: &[],
+                clear: [0.0; 4],
+                logicop: None,
+                tess: None,
+                pipeline: None,
+                more: Some(&more),
+            })
+            .unwrap_or_else(|e| panic!("{host_gl:?}: the draws run: {e:?}"))
+            .expect("no tessellation asked for");
+            // Texel (1, 1) holds the store; every fragment loads it.
+            assert!(
+                pixels.as_chunks::<4>().0.iter().all(|p| *p == [0x40, 0x80, 0xbf, 0xff]),
+                "{host_gl:?}: the second draw loads the first one's store: {:?}",
+                &pixels[..4]
+            );
+        }
+    }
+
     /// An image slot the guest empties is empty to the next draw: GL keeps a unit's image until
     /// something else is bound there, so a draw that binds only the slots holding views leaves
     /// an emptied one reading, and adding into, the image an earlier draw bound. A load from an

@@ -3537,6 +3537,20 @@ SABOTAGES = [
         'a_24_bit_depth_reads_back_as_written',
     ),
     (
+        'a GLES image both loaded and stored is declared once',
+        'src/vrend/shader/glsl/mod.rs',
+        """        gles && self.decl.writable && !tex::is_r32_format(self.decl.format)""",
+        """        gles && self.decl.writable && !tex::is_r32_format(self.decl.format) && false""",
+        'an_image_loaded_and_stored_in_one_shader_is_read_and_written',
+    ),
+    (
+        'a GLES image read beside its store alias is never declared for the read',
+        'src/vrend/shader/glsl/inst.rs',
+        """                    ctx.images[slot].loaded = true;""",
+        """                    let _ = slot;""",
+        'an_image_loaded_and_stored_in_one_shader_is_read_and_written',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",

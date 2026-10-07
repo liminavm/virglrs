@@ -338,6 +338,12 @@ impl LinkedProgram {
             self.num_consts[s] = l.info.num_consts as usize;
         }
         let mask = l.info.images_used_mask;
+        // A GLES image stored to in a format it cannot also be read in is declared twice, its
+        // stores through the `writeonly` alias `imgw<n>`, and one only ever stored to has no plain
+        // name at all; either name says the program uses the unit.
+        let location = |plain: &str, alias: &str| {
+            gl.get_uniform_location(id, plain).or_else(|| gl.get_uniform_location(id, alias))
+        };
         if (mask != 0 || !l.info.image_arrays.is_empty()) && features.has(Feature::images) {
             let nsamp = (32 - mask.leading_zeros()) as usize;
             let mut locs = vec![None; nsamp];
@@ -345,8 +351,9 @@ impl LinkedProgram {
                 for arr in &l.info.image_arrays {
                     for j in 0..arr.array_size {
                         let name = format!("{prefix}img{}[{j}]", arr.first);
+                        let alias = format!("{prefix}imgw{}[{j}]", arr.first);
                         // An image the compiler dropped has no location; the draw skips it.
-                        let loc = gl.get_uniform_location(id, &name);
+                        let loc = location(&name, &alias);
                         let slot = (arr.first + j) as usize;
                         if slot >= locs.len() {
                             locs.resize(slot + 1, None);
@@ -358,7 +365,7 @@ impl LinkedProgram {
                 for (i, loc) in locs.iter_mut().enumerate() {
                     if mask & (1 << i) != 0 {
                         let name = format!("{prefix}img{i}");
-                        *loc = gl.get_uniform_location(id, &name);
+                        *loc = location(&name, &format!("{prefix}imgw{i}"));
                     }
                 }
             }

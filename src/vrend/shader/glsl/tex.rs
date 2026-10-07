@@ -76,7 +76,7 @@ pub(super) fn internalformat_string(virgl_format: u16) -> (&'static str, ReturnT
 
 /// Whether a wire format is one of the three whose images GLES lets a shader both read and
 /// write (`R32_FLOAT`, `R32_SINT`, `R32_UINT`).
-fn is_r32_format(virgl_format: u16) -> bool {
+pub(super) fn is_r32_format(virgl_format: u16) -> bool {
     let name =
         Format::from_wire(u32::from(virgl_format)).and_then(Format::describe).map(|d| d.name);
     matches!(name, Some("R32_FLOAT" | "R32_SINT" | "R32_UINT"))
@@ -1238,12 +1238,17 @@ pub(super) fn translate_store(
                 i32::from(dst_reg.index) - basearrayidx
             );
             let cname = proc_prefix(ctx.prog_type);
+            let gles = ctx.cfg.is_gles();
+            let alias = ImageSlot::new(basearrayidx)
+                .is_some_and(|s| ctx.images[s].stored_through_alias(gles));
+            let w = if alias { "w" } else { "" };
             for i in 0..array_size {
                 emit!(
                     ctx.bufs,
-                    "case {}: imageStore({}img{}[{}],{}({}({})),{}{}({})); break;\n",
+                    "case {}: imageStore({}img{}{}[{}],{}({}({})),{}{}({})); break;\n",
                     i,
                     cname,
+                    w,
                     basearrayidx,
                     i,
                     coord_prefix.s(),
@@ -1368,15 +1373,6 @@ pub(super) fn translate_load(
         } else {
             (String::new(), "")
         };
-
-        // On desktop GL `WR` is writable; on GLES it becomes `writeonly`, since most formats
-        // have to be one or the other:
-        // an image declared `WR` and read from loses its writable flag. Formats that allow
-        // both are unaffected; for the others a write fails instead of the read, which is no
-        // regression, as both were never possible.
-        if gles && ctx.images[sreg].decl.writable && !is_r32_format(ctx.images[sreg].decl.format) {
-            ctx.images[sreg].decl.writable = false;
-        }
 
         if !gles || !src.indirect {
             emit!(

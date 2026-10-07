@@ -407,29 +407,37 @@ fn get_destination_info(
             }
             File::Image => {
                 let cname = proc_prefix(ctx.prog_type);
+                let gles = ctx.cfg.is_gles();
+                let aliased = |ctx: &Context<'_>, index: i32| {
+                    ImageSlot::new(index).is_some_and(|s| ctx.images[s].stored_through_alias(gles))
+                };
                 if ctx.info.is_indirect(File::Image) {
                     let basearrayidx = ctx.lookup_image_array(i32::from(dst_reg.index));
+                    let w = if aliased(ctx, basearrayidx) { "w" } else { "" };
                     if dst_reg.indirect {
                         if dst_reg.ind.file != File::Address {
                             return false;
                         }
                         ctx.dst_bufs[i] = format!(
-                            "{}img{}[addr{} + {}]",
+                            "{}img{}{}[addr{} + {}]",
                             cname,
+                            w,
                             basearrayidx,
                             dst_reg.ind.index,
                             i32::from(dst_reg.index) - basearrayidx
                         );
                     } else {
                         ctx.dst_bufs[i] = format!(
-                            "{}img{}[{}]",
+                            "{}img{}{}[{}]",
                             cname,
+                            w,
                             basearrayidx,
                             i32::from(dst_reg.index) - basearrayidx
                         );
                     }
                 } else {
-                    ctx.dst_bufs[i] = format!("{}img{}", cname, dst_reg.index);
+                    let w = if aliased(ctx, i32::from(dst_reg.index)) { "w" } else { "" };
+                    ctx.dst_bufs[i] = format!("{}img{}{}", cname, w, dst_reg.index);
                 }
                 dinfo.dest_index = i32::from(dst_reg.index);
             }
@@ -1101,6 +1109,15 @@ fn get_source_info(
                     }
                 } else {
                     ctx.src_bufs[i] = format!("{}img{}{}", cname, src.index, swizzle);
+                }
+                // Read under its plain name, which a GLES store alias leaves to whatever reads.
+                let read = if ctx.info.is_indirect(File::Image) {
+                    ImageSlot::new(ctx.lookup_image_array(i32::from(src.index)))
+                } else {
+                    ImageSlot::new(src.index)
+                };
+                if let Some(slot) = read {
+                    ctx.images[slot].loaded = true;
                 }
                 sinfo.binding = Binding::Image(ImageSlot::new(src.index));
             }

@@ -299,7 +299,6 @@ fn emit_image_decl(ctx: &mut Context<'_>, i: u32, range: i32, image: Image) {
     let coherent_str = if image.coherent { "coherent " } else { "" };
     let gles = ctx.cfg.is_gles();
     let precision = if gles { "highp " } else { "" };
-    let mut access = "";
     let (formatstr, itype) = internalformat_string(image.decl.format);
     let ptc = sampler_return_conv(itype);
     let sname = proc_prefix(ctx.prog_type);
@@ -308,39 +307,31 @@ fn emit_image_decl(ctx: &mut Context<'_>, i: u32, range: i32, image: Image) {
     // From ARB_shader_image_load_store: an image used for loads or atomics must carry a format
     // qualifier matching its unit; one used only for stores need not, but a declared one must
     // match.
-    let mut require_format_specifier = true;
-    let r32 = matches!(formatstr, "r32f" | "r32i" | "r32ui");
-    if !image.decl.writable {
-        access = "readonly ";
-    } else if image.decl.format == 0 || (gles && !r32) {
-        access = "writeonly ";
-        require_format_specifier = !formatstr.is_empty();
-    }
-
     let binding = i + u32::from(ctx.key.image_binding_offset);
     let loc_bind = if gles { "binding" } else { "location" };
-    if require_format_specifier {
+    let mut declare = |access: &str, require_format_specifier: bool, alias: &str| {
+        if require_format_specifier {
+            hdr!(
+                ctx.bufs,
+                "layout({}={}, {}) ",
+                loc_bind,
+                binding,
+                if formatstr.is_empty() { "rgba32f" } else { formatstr }
+            );
+        } else {
+            hdr!(
+                ctx.bufs,
+                "layout({}={}{}{}) ",
+                loc_bind,
+                binding,
+                if formatstr.is_empty() { ", rgba32f" } else { ", " },
+                formatstr
+            );
+        }
+        let array = if range != 0 { format!("[{range}]") } else { String::new() };
         hdr!(
             ctx.bufs,
-            "layout({}={}, {}) ",
-            loc_bind,
-            binding,
-            if formatstr.is_empty() { "rgba32f" } else { formatstr }
-        );
-    } else {
-        hdr!(
-            ctx.bufs,
-            "layout({}={}{}{}) ",
-            loc_bind,
-            binding,
-            if formatstr.is_empty() { ", rgba32f" } else { ", " },
-            formatstr
-        );
-    }
-    if range != 0 {
-        hdr!(
-            ctx.bufs,
-            "{}{}{}uniform {}{}image{} {}img{}[{}];\n",
+            "{}{}{}uniform {}{}image{} {}img{}{}{};\n",
             access,
             volatile_str,
             coherent_str,
@@ -348,22 +339,22 @@ fn emit_image_decl(ctx: &mut Context<'_>, i: u32, range: i32, image: Image) {
             ptc,
             stc,
             sname,
+            alias,
             i,
-            range
+            array
         );
+    };
+    if image.stored_through_alias(gles) {
+        declare("writeonly ", !formatstr.is_empty(), "w");
+        if image.loaded {
+            declare("readonly ", true, "");
+        }
+    } else if !image.decl.writable {
+        declare("readonly ", true, "");
+    } else if image.decl.format == 0 {
+        declare("writeonly ", !formatstr.is_empty(), "");
     } else {
-        hdr!(
-            ctx.bufs,
-            "{}{}{}uniform {}{}image{} {}img{};\n",
-            access,
-            volatile_str,
-            coherent_str,
-            precision,
-            ptc,
-            stc,
-            sname,
-            i
-        );
+        declare("", true, "");
     }
 }
 
