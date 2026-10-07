@@ -125,6 +125,9 @@ it. Fix the template.
 - Every behaviour fix carries a harness case that would have caught it (`harness/README.md`).
 - On macOS, `scripts/cross-check-linux.sh` type-checks every Linux `cfg` arm, VA-API included.
   It runs nothing: goiaba still runs the Linux tests before a push.
+- `fuzz/` is its own workspace, so no build of the crate compiles it: run
+  `cargo check --manifest-path fuzz/Cargo.toml --bins` before committing, or a target that
+  stopped building fuzzes nothing and says so to no one.
 - **A documented C limitation is a hypothesis until the harness reproduces it.** The C tree
   carries workarounds whose comments assert things that are no longer true; porting one
   faithfully carries the folklore forward and hides that the real bug was fixed elsewhere.
