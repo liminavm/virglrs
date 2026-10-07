@@ -3665,6 +3665,13 @@ SABOTAGES = [
         'a_256_byte_ring_stays_walkable',
     ),
     (
+        'a memory info query is refused though the caps advertise it',
+        'src/vrend/context.rs',
+        """            Command::GetMemoryInfo(out) => self.get_memory_info(host, out),""",
+        """            Command::GetMemoryInfo(_) => Err(Fault::Unimplemented { cmd: kind, what: "blob resources" }),""",
+        'a_memory_info_query_writes_the_host_s_memory_into_the_guest_s_buffer',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",

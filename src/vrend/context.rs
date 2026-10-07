@@ -2280,10 +2280,7 @@ impl Context {
             Command::GetPipeResourceLayout { out, target } => {
                 self.get_pipe_resource_layout(host, out, target)
             }
-            Command::GetMemoryInfo(_) => {
-                host.todo.note(kind.name());
-                Err(Fault::Unimplemented { cmd: kind, what: "blob resources" })
-            }
+            Command::GetMemoryInfo(out) => self.get_memory_info(host, out),
             Command::SendStringMarker { .. } => Ok(()),
             Command::LinkShader(handles) => self.link_shader(host, handles),
             Command::CreateVideoCodec(codec) => self.create_video_codec(host, codec, wire),
@@ -4928,32 +4925,69 @@ impl Context {
     ) -> Result<(), Fault> {
         let cmd = Cmd::GetPipeResourceLayout;
         let layout = host.resource(cmd, target)?.surface().and_then(|s| s.exported_layout());
-        let reply = resource_layout_reply(layout.as_ref());
-        let ctx = host.ctx;
-        let guest = host.guest;
-        let res = host.resource_mut(cmd, out)?;
-        let mut wrote_shadow = false;
-        if let Storage::Host(shadow) = &mut res.storage
-            && shadow.bytes().len() >= reply.len()
-        {
-            shadow.bytes_mut()[..reply.len()].copy_from_slice(&reply);
-            wrote_shadow = true;
-        }
-        let delivered = guest.pages(ctx, out).is_some_and(|pages| pages.copy_in(0, &reply));
-        if let Storage::Host(shadow) = &mut res.storage {
-            if delivered {
-                shadow.mirrored();
-            } else if wrote_shadow {
-                shadow.unmirrored();
-            }
-        }
-        // A buffer the reply fits in neither copy of is the guest's mistake, and the C's answer
-        // to it: the resource is illegal for this command.
-        if !delivered && !wrote_shadow {
-            return Err(Fault::IllegalResource { cmd, handle: out });
-        }
-        Ok(())
+        reply_into(host, cmd, out, &resource_layout_reply(layout.as_ref()))
     }
+
+    /// `vrend_renderer_get_meminfo`: the host's memory, as `GL_NVX_gpu_memory_info` and
+    /// `GL_ATI_meminfo` report it, written into the guest's `out`. The guest asks only when its
+    /// caps said the host has one of the two; a field neither fills is zero, where the C leaves
+    /// whatever the guest's buffer held.
+    fn get_memory_info(&mut self, host: &mut Host<'_>, out: ResourceHandle) -> Result<(), Fault> {
+        let cmd = Cmd::GetMemoryInfo;
+        self.make_current(host);
+        let gl = host.gl;
+        // total_device, avail_device, total_staging, avail_staging, device_evicted,
+        // device_evictions: `struct virgl_memory_info`, in KiB as both extensions count.
+        let mut info = [0u32; 6];
+        if host.has(Feature::nvx_gpu_memory_info) {
+            let device = gl.get_integer(GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX);
+            let total = gl.get_integer(GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX);
+            info[0] = device as u32;
+            info[2] = total.wrapping_sub(device) as u32;
+            info[5] = gl.get_integer(GL_GPU_MEMORY_INFO_EVICTION_COUNT_NVX) as u32;
+            info[4] = gl.get_integer(GL_GPU_MEMORY_INFO_EVICTED_MEMORY_NVX) as u32;
+        }
+        if host.has(Feature::ati_meminfo) {
+            let free = gl.vbo_free_memory_ati();
+            info[1] = free[0] as u32;
+            info[3] = free[2] as u32;
+        }
+        let reply: Vec<u8> = info.iter().flat_map(|w| w.to_le_bytes()).collect();
+        reply_into(host, cmd, out, &reply)
+    }
+}
+
+/// Write `reply` to the start of the guest's resource `out`: into its guest pages, and into its
+/// host shadow when it has one, so a later read of either sees it. A resource the reply fits in
+/// neither is the guest's mistake, and the C's answer to it: the resource is illegal for `cmd`.
+fn reply_into(
+    host: &mut Host<'_>,
+    cmd: Cmd,
+    out: ResourceHandle,
+    reply: &[u8],
+) -> Result<(), Fault> {
+    let ctx = host.ctx;
+    let guest = host.guest;
+    let res = host.resource_mut(cmd, out)?;
+    let mut wrote_shadow = false;
+    if let Storage::Host(shadow) = &mut res.storage
+        && shadow.bytes().len() >= reply.len()
+    {
+        shadow.bytes_mut()[..reply.len()].copy_from_slice(reply);
+        wrote_shadow = true;
+    }
+    let delivered = guest.pages(ctx, out).is_some_and(|pages| pages.copy_in(0, reply));
+    if let Storage::Host(shadow) = &mut res.storage {
+        if delivered {
+            shadow.mirrored();
+        } else if wrote_shadow {
+            shadow.unmirrored();
+        }
+    }
+    if !delivered && !wrote_shadow {
+        return Err(Fault::IllegalResource { cmd, handle: out });
+    }
+    Ok(())
 }
 
 /// `struct virgl_resource_layout`, as the guest's virgl driver reads it back.

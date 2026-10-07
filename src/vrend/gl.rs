@@ -647,6 +647,15 @@ impl Gl {
         v
     }
 
+    /// `GL_VBO_FREE_MEMORY_ATI`: free memory, the largest free block, free auxiliary memory and
+    /// its largest free block, in KiB. The one query this crate makes that writes four integers.
+    pub fn vbo_free_memory_ati(&self) -> [GLint; 4] {
+        let mut v: [GLint; 4] = [0; 4];
+        // SAFETY: `GL_VBO_FREE_MEMORY_ATI` writes four integers, and `v` holds four.
+        unsafe { self.t.glGetIntegerv()(GL_VBO_FREE_MEMORY_ATI, v.as_mut_ptr()) };
+        v
+    }
+
     /// `glGetIntegeri_v`: one integer of an indexed state.
     pub fn get_integer_i(&self, name: GLenum, index: GLuint) -> GLint {
         let mut v: GLint = 0;

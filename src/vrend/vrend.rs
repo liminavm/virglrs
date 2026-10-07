@@ -5706,6 +5706,60 @@ mod tests {
         }
     }
 
+    /// A guest asking for the host's memory gets it in its buffer, as `struct virgl_memory_info`,
+    /// where the host has `GL_NVX_gpu_memory_info` or `GL_ATI_meminfo` -- the caps advertise
+    /// memory info on either, and zink has both on desktop GL. A field no extension fills is
+    /// zero, not what the buffer held. A buffer too small for the reply is refused.
+    #[test]
+    fn a_memory_info_query_writes_the_host_s_memory_into_the_guest_s_buffer() {
+        use crate::vrend::proto::Command;
+        let out = ResourceHandle::new(10).expect("non-zero");
+        let run = |host_gl, size: u32| {
+            let pages = std::cell::RefCell::new(vec![0xaau8; size as usize]);
+            let more = More {
+                resources: vec![(out, buffer_args(resource::Bind::CUSTOM, size))],
+                before: vec![Command::GetMemoryInfo(out)],
+                pages: vec![(out, &pages)],
+                ..Default::default()
+            };
+            draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: None,
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            })
+            .map(|_| pages.into_inner())
+        };
+        let mut reported = false;
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let (nvx, ati) = (
+                host_has(host_gl, Feature::nvx_gpu_memory_info),
+                host_has(host_gl, Feature::ati_meminfo),
+            );
+            let bytes = run(host_gl, 24).unwrap_or_else(|e| panic!("{host_gl:?}: {e:?}"));
+            let word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+            assert!(
+                bytes.iter().all(|&b| b != 0xaa),
+                "{host_gl:?}: every field written: {bytes:?}"
+            );
+            assert_eq!(word(0) != 0, nvx, "{host_gl:?}: device memory where NVX reports it");
+            assert_eq!(word(1) != 0, ati, "{host_gl:?}: free device memory where ATI reports it");
+            reported |= nvx || ati;
+            let small = run(host_gl, 8);
+            assert!(
+                matches!(small, Err(Fault::IllegalResource { .. })),
+                "{host_gl:?}: a buffer too small for the reply: {small:?}"
+            );
+        }
+        assert!(reported, "the premise: some flavour of this host reports its memory");
+    }
+
     /// An indirect draw restarts primitives at the guest's restart index, whatever it is. GLES
     /// restarts only at the index type's maximum, so there the indices are widened with the
     /// restart index made the one GLES knows, and the command's first index still names the
