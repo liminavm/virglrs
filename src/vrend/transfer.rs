@@ -1079,6 +1079,31 @@ pub fn read(
             // a framebuffer cannot read it; GLES has only the framebuffer, and past it only the
             // readonly answer.
             let desktop = !features.api().is_gles();
+            // GLES can neither fetch compressed blocks nor render into them, but it can copy them
+            // into an uncompressed texture whose texel is one block, and read that. The readonly
+            // answer is the guest's own pages, which hold what the texture holds only while
+            // nothing but transfers from them has written it.
+            if !desktop && l.compressed && features.has(Feature::copy_image) {
+                let Storage::Texture(t) = &res.storage else {
+                    return Err(Error::Unsupported);
+                };
+                let total = usize::try_from(l.total()).map_err(|_| Error::IovOutOfRange)?;
+                let data = staging.take(total);
+                let layer = l.layer() as usize;
+                for d in 0..l.depth as usize {
+                    let origin = [b.x, b.y, b.z + d as GLint];
+                    let dst = &mut data[d * layer..(d + 1) * layer];
+                    let read = read_blocks(gl, t.name, t.target, info.level, origin, &b, &l, dst);
+                    if let Err(e) = read {
+                        eprintln!("[virglrs] readback of {}: {e}", res.args.format.name());
+                        return readonly();
+                    }
+                }
+                if !scatter(pages, info, &l, data) {
+                    return Err(Error::IovOutOfRange);
+                }
+                return Ok(());
+            }
             if !can_readpixels && !desktop {
                 return readonly();
             }
@@ -1146,6 +1171,76 @@ pub fn read(
             Ok(())
         }
     }
+}
+
+/// Read one layer of a compressed box as its blocks, laid out as `l`: copy them into a texture
+/// of the integer format whose texel is one block, and read that through a framebuffer. The
+/// copy is `glCopyImageSubData`, which matches a compressed format to an uncompressed one by
+/// block size; 8 and 16 bytes are the only sizes a compressed format here has.
+#[allow(clippy::too_many_arguments)]
+fn read_blocks(
+    gl: &Gl,
+    src: TextureName,
+    target: GLenum,
+    level: u32,
+    origin: [GLint; 3],
+    b: &Box3,
+    l: &Layout,
+    dst: &mut [u8],
+) -> Result<(), Error> {
+    let (internal, words) = match l.block {
+        8 => (GL_RG32UI, 2),
+        16 => (GL_RGBA32UI, 4),
+        _ => return Err(Error::Unsupported),
+    };
+    let (bw, bh) = (l.blocks_wide as GLsizei, l.blocks_high as GLsizei);
+    let tmp = gl.gen_texture();
+    gl.bind_texture(GL_TEXTURE_2D, Some(tmp));
+    gl.tex_storage_2d(GL_TEXTURE_2D, 1, internal, bw, bh);
+    gl.bind_texture(GL_TEXTURE_2D, None);
+    gl.drain_errors();
+    gl.copy_image_sub_data(
+        src,
+        target,
+        level as GLint,
+        origin,
+        tmp,
+        GL_TEXTURE_2D,
+        0,
+        [0, 0, 0],
+        [b.width, b.height, 1],
+    );
+    let copy_err = gl.drain_errors();
+    // An integer framebuffer always reads as `GL_RGBA_INTEGER`/`GL_UNSIGNED_INT`, four words a
+    // texel whatever the format holds; an 8-byte block is the first two.
+    let mut texels = vec![0u8; bw as usize * bh as usize * 16];
+    let previous = gl.framebuffer_binding();
+    let fb = gl.gen_framebuffer();
+    gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
+    gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(tmp), 0);
+    let read = gl.read_pixels(0, 0, bw, bh, GL_RGBA_INTEGER, GL_UNSIGNED_INT, &mut texels);
+    let read_err = gl.drain_errors();
+    gl.bind_framebuffer(GL_FRAMEBUFFER, previous);
+    gl.delete_framebuffer(fb);
+    gl.delete_texture(tmp);
+    if copy_err != GL_NO_ERROR {
+        return Err(Error::GlError(copy_err));
+    }
+    if !read {
+        return Err(Error::Unsupported);
+    }
+    if read_err != GL_NO_ERROR {
+        return Err(Error::GlError(read_err));
+    }
+    let block = l.block as usize;
+    for (r, row) in texels.chunks_exact(bw as usize * 16).enumerate() {
+        let out = r * l.row() as usize;
+        let to = dst.get_mut(out..out + bw as usize * block).ok_or(Error::BoxOutOfRange)?;
+        for (to, texel) in to.chunks_exact_mut(block).zip(row.as_chunks::<16>().0) {
+            to.copy_from_slice(&texel[..words * 4]);
+        }
+    }
+    Ok(())
 }
 
 /// `vrend_transfer_send_getteximage`: desktop GL reads the whole level and the box is cut out of

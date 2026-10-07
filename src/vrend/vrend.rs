@@ -2743,13 +2743,13 @@ mod tests {
         v.context_destroy(ctx, &AllAttached);
     }
 
-    /// A texture no framebuffer can read reads back on desktop GL through
-    /// `glGetCompressedTexImage`, into pages other than the ones it was written from. GLES has no
-    /// such read, and refuses: the control that says the desktop answer came from the texture and
-    /// not from the pages it was uploaded from. A compressed format is never read through a
-    /// framebuffer, and its blocks come back as they were stored.
+    /// A texture no framebuffer can read reads back into pages other than the ones it was written
+    /// from: desktop GL through `glGetCompressedTexImage`, GLES by copying the blocks into an
+    /// integer texture it can read. The answer from the pages the guest already holds is a
+    /// refusal for any other pages, so a read that succeeds came from the texture. A compressed
+    /// format is never read through a framebuffer, and its blocks come back as they were stored.
     #[test]
-    fn a_texture_no_framebuffer_reads_reads_back_on_desktop_gl() {
+    fn a_texture_no_framebuffer_reads_reads_back_on_either_flavour() {
         let _display = crate::vrend::one_display_at_a_time();
         struct Discard;
         impl crate::fence::FenceSink for Discard {
@@ -2845,7 +2845,7 @@ mod tests {
             let r = v.transfer(None, res, Some(&from), transfer::Through::ToGuest(&into), &info);
             (r.is_ok(), read == written)
         };
-        assert_eq!(read_back(HostGl::Gles), (false, false), "GLES cannot read {}", format.name());
+        assert_eq!(read_back(HostGl::Gles), (true, true), "GLES reads {}", format.name());
         assert_eq!(read_back(HostGl::Desktop), (true, true), "desktop GL reads {}", format.name());
     }
 
@@ -3670,6 +3670,130 @@ mod tests {
                 wrong.map_or(0, |i| depths[i])
             );
             v.context_destroy(ctx, &AllAttached);
+        }
+    }
+
+    /// A compressed texture reads back the blocks it holds, into pages other than the ones they
+    /// came from. GLES has no `glGetCompressedTexImage` and cannot render into a compressed
+    /// format, so there the blocks are copied into an uncompressed texture of the same block size
+    /// and read from that. Without it GLES refuses the read into any pages but the guest's own,
+    /// and into those answers with whatever they hold, which is not what the texture holds once
+    /// anything but a transfer from them has written it.
+    #[test]
+    fn a_compressed_texture_reads_back_its_blocks() {
+        use crate::vrend::proto::Box3;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct AllAttached;
+        impl Guest for AllAttached {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                None
+            }
+        }
+        let (w, h) = (16u32, 8u32);
+        // (format, its block's bytes). Every block holds its own words, so a block read from the
+        // wrong place, or a row of blocks out of order, reads as a different one; a BC7 block's
+        // low byte keeps it in mode 6.
+        for (name, block) in [("BPTC_RGBA_UNORM", 16u32), ("RGTC1_UNORM", 8)] {
+            let format = (0..crate::vrend::proto::FORMAT_MAX)
+                .filter_map(crate::vrend::proto::Format::from_wire)
+                .find(|f| f.name() == name)
+                .expect("a wire format");
+            let words = block / 4;
+            let blocks: Vec<u32> = (0..w / 4 * h / 4 * words)
+                .map(|i| 0x40 | (i * 0x0103_0507) << 8 | (i % words))
+                .collect();
+            let row = w / 4 * block;
+            let whole = transfer::Info {
+                level: 0,
+                stride: row,
+                layer_stride: row * h / 4,
+                offset: 0,
+                region: Box3 { x: 0, y: 0, z: 0, width: w as i32, height: h as i32, depth: 1 },
+                synchronized: false,
+            };
+            // The middle two blocks of the second row, into pages laid out for just them.
+            let part = transfer::Info {
+                stride: 2 * block,
+                layer_stride: 2 * block,
+                region: Box3 { x: 4, y: 4, z: 0, width: 8, height: 4, depth: 1 },
+                ..whole
+            };
+            for host_gl in [HostGl::Gles, HostGl::Desktop] {
+                let retire = crate::fence::Retirement::start(
+                    Box::new(Discard),
+                    crate::vrend::debug::Switches::default(),
+                );
+                let mut v = Vrend::new(
+                    Config { host_gl, ..Config::default() },
+                    &crate::budget::Budget::with_cap(None, false),
+                    retire.handle(),
+                    None,
+                    crate::vrend::resource::Condemned::default(),
+                    crate::vrend::debug::Traces::default(),
+                    crate::vrend::debug::Switches::default(),
+                )
+                .expect("vrend comes up");
+                let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+                v.context_create(ctx, &AllAttached).expect("a context");
+                let res = ResourceHandle::new(1).expect("non-zero");
+                v.resource_create(
+                    res,
+                    resource::Args {
+                        target: TextureTarget::Texture2d,
+                        format,
+                        bind: resource::Bind::SAMPLER_VIEW,
+                        width: w,
+                        height: h,
+                        depth: 1,
+                        array_size: 1,
+                        last_level: 0,
+                        nr_samples: 0,
+                        flags: resource::ResourceFlags(0),
+                    },
+                )
+                .expect("a compressed texture");
+                let mut bytes: Vec<u8> = blocks.iter().flat_map(|b| b.to_le_bytes()).collect();
+                let from = [crate::abi::GuestIov {
+                    base: crate::abi::VmmPtr(bytes.as_mut_ptr().cast()),
+                    len: bytes.len(),
+                }];
+                let from = Iov::new(&from);
+                v.transfer(None, res, None, transfer::Through::ToHost(from.source()), &whole)
+                    .expect("the upload");
+                let (row, block) = (row as usize, block as usize);
+                let middle = [&bytes[row + block..row + 3 * block]].concat();
+                for (what, info, expect) in [("whole", &whole, &bytes), ("part", &part, &middle)] {
+                    let mut read = vec![0xa5u8; expect.len()];
+                    let into = [crate::abi::GuestIov {
+                        base: crate::abi::VmmPtr(read.as_mut_ptr().cast()),
+                        len: read.len(),
+                    }];
+                    let into = Iov::new(&into);
+                    v.transfer(None, res, None, transfer::Through::ToGuest(&into), info)
+                        .unwrap_or_else(|e| panic!("{host_gl:?} {name} {what}: read back: {e}"));
+                    let wrong =
+                        read.chunks(block).zip(expect.chunks(block)).position(|(r, b)| r != b);
+                    assert!(
+                        wrong.is_none(),
+                        "{host_gl:?} {name} {what}: block {wrong:?} reads {:02x?}, written {:02x?}",
+                        wrong.map(|i| &read[i * block..(i + 1) * block]),
+                        wrong.map(|i| &expect[i * block..(i + 1) * block])
+                    );
+                }
+                v.context_destroy(ctx, &AllAttached);
+            }
         }
     }
 

@@ -2215,7 +2215,7 @@ SABOTAGES = [
         'src/vrend/transfer.rs',
         """            if !can_readpixels && !desktop {""",
         """            if !can_readpixels {""",
-        'a_texture_no_framebuffer_reads_reads_back_on_desktop_gl',
+        'a_texture_no_framebuffer_reads_reads_back_on_either_flavour',
     ),
     (
         'a desktop host swaps BGRA on transfer as GLES does',
@@ -3549,6 +3549,20 @@ SABOTAGES = [
         """                    ctx.images[slot].loaded = true;""",
         """                    let _ = slot;""",
         'an_image_loaded_and_stored_in_one_shader_is_read_and_written',
+    ),
+    (
+        'a GLES compressed readback answers from the pages the guest already holds',
+        'src/vrend/transfer.rs',
+        """            if !desktop && l.compressed && features.has(Feature::copy_image) {""",
+        """            if !desktop && l.compressed && features.has(Feature::copy_image) && false {""",
+        'a_compressed_texture_reads_back_its_blocks',
+    ),
+    (
+        'a GLES compressed readback copies from the level origin, not the box',
+        'src/vrend/transfer.rs',
+        """                    let origin = [b.x, b.y, b.z + d as GLint];""",
+        """                    let origin = [0, 0, b.z + d as GLint];""",
+        'a_compressed_texture_reads_back_its_blocks',
     ),
     (
         'a GLES 1D image load takes the coordinate the guest wrote',
