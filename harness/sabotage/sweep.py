@@ -3551,6 +3551,20 @@ SABOTAGES = [
         'an_image_loaded_and_stored_in_one_shader_is_read_and_written',
     ),
     (
+        'a GLES 1D image load takes the coordinate the guest wrote',
+        'src/vrend/shader/glsl/inst.rs',
+        """    let coordinate = if inst.src[0].file == File::Image {""",
+        """    let coordinate = if inst.src[0].file == File::Image && false {""",
+        'a_1d_image_loads_the_texel_it_names',
+    ),
+    (
+        'a GLES 1D image store takes the coordinate the guest wrote, as the C does',
+        'src/vrend/shader/glsl/inst.rs',
+        """    } else if inst.dst[0].file == File::Image {""",
+        """    } else if inst.dst[0].file == File::Image && false {""",
+        'a_1d_image_stores_to_the_texel_it_names',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",

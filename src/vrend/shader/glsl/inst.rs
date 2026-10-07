@@ -1387,14 +1387,26 @@ fn get_source_info(
 
 /// `rewrite_1d_image_coordinate`: on GLES a 1D image is a 2D one with a zero row. Desktop GL has
 /// 1D images and takes the coordinate as it is.
+///
+/// A load or an atomic names the image as its first source and the coordinate as its second; a
+/// store writes the image as its destination and takes the coordinate first. The C tests only
+/// for the first shape, so its stores address a 1D image at a row read from whatever the
+/// register's second component holds, and a 1D array's at a layer of zero.
 fn rewrite_1d_image_coordinate(ctx: &mut Context<'_>, inst: &Instruction) {
     if !ctx.cfg.is_gles() {
         return;
     }
     let texture = inst.memory.map_or(Texture::Buffer, |m| m.texture);
-    if inst.src[0].file == File::Image && (texture == Texture::D1 || texture == Texture::Array1d) {
-        let buf = ctx.src_bufs[1].clone();
-        ctx.src_bufs[1] = if texture == Texture::D1 {
+    let coordinate = if inst.src[0].file == File::Image {
+        1
+    } else if inst.dst[0].file == File::Image {
+        0
+    } else {
+        return;
+    };
+    if texture == Texture::D1 || texture == Texture::Array1d {
+        let buf = ctx.src_bufs[coordinate].clone();
+        ctx.src_bufs[coordinate] = if texture == Texture::D1 {
             format!("vec2(vec4({buf}).x, 0)")
         } else {
             format!("vec3({buf}.xy, 0).xzy")

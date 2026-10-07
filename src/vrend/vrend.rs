@@ -6071,6 +6071,209 @@ mod tests {
         }
     }
 
+    /// A 1D image, or one layer of a 1D array, loads the texel its coordinate names. GLES has no 1D
+    /// textures, so there the texture is a one-row 2D one, and the image is declared and addressed
+    /// as that.
+    #[test]
+    fn a_1d_image_loads_the_texel_it_names() {
+        use crate::vrend::pipe::ImageAccess;
+        use crate::vrend::proto::{Box3, Command, ShaderImage, Transfer};
+        let rgba8 = super::super::proto::Format::from_wire(67).expect("R8G8B8A8_UNORM");
+        let image = ResourceHandle::new(10).expect("a resource handle is non-zero");
+        // Texel 2 of layer 1 is red; everything else is green.
+        let mut texels = [0xff00_ff00u32; 8];
+        texels[4 + 2] = 0xff00_00ff;
+        // (resource, its layers, the image as declared, its coordinate, the layers bound)
+        for (target, array_size, tgsi, coord, layers) in [
+            (TextureTarget::Texture1d, 1, "1D", "2, 0, 0, 0", 0),
+            (TextureTarget::Array1d, 2, "1D_ARRAY", "2, 1, 0, 0", 1 << 16),
+            // Layer 1 alone, which the shader sees as a plain 1D image.
+            (TextureTarget::Array1d, 2, "1D", "2, 0, 0, 0", 1 | 1 << 16),
+        ] {
+            let fs = format!(
+                "FRAG\nDCL OUT[0], COLOR\n\
+                 DCL IMAGE[0], {tgsi}, PIPE_FORMAT_R8G8B8A8_UNORM, WR\n\
+                 DCL TEMP[0]\nIMM[0] INT32 {{ {coord} }}\n  \
+                 0: LOAD TEMP[0], IMAGE[0], IMM[0], {tgsi}, PIPE_FORMAT_R8G8B8A8_UNORM\n  \
+                 1: MOV OUT[0], TEMP[0]\n  2: END\n"
+            );
+            // A single texture holds both layers' worth; a plain 1D one holds the second's row.
+            let data: &[u32] = if array_size == 1 { &texels[4..] } else { &texels };
+            let more = More {
+                resources: vec![(
+                    image,
+                    resource::Args {
+                        target,
+                        format: rgba8,
+                        bind: resource::Bind::SAMPLER_VIEW,
+                        width: 4,
+                        height: 1,
+                        depth: 1,
+                        array_size,
+                        last_level: 0,
+                        nr_samples: 0,
+                        flags: resource::ResourceFlags(0),
+                    },
+                )],
+                before: vec![
+                    Command::ResourceInlineWrite {
+                        transfer: Transfer {
+                            resource: image,
+                            level: 0,
+                            usage: 0,
+                            stride: 16,
+                            layer_stride: 16,
+                            region: Box3 {
+                                x: 0,
+                                y: 0,
+                                z: 0,
+                                width: 4,
+                                height: 1,
+                                depth: array_size as i32,
+                            },
+                        },
+                        data,
+                    },
+                    Command::SetShaderImages {
+                        stage: ShaderStage::Fragment,
+                        start_slot: 0,
+                        images: vec![Some(ShaderImage {
+                            format: rgba8,
+                            access: ImageAccess::Read,
+                            layer_offset: layers,
+                            level_size: 0,
+                            resource: image,
+                        })],
+                    },
+                ],
+                ..Default::default()
+            };
+            for host_gl in [HostGl::Gles, HostGl::Desktop] {
+                let pixels = draw_over_target(OneDraw {
+                    host_gl,
+                    format: "R8G8B8A8_UNORM",
+                    vs: None,
+                    fs: Some(&fs),
+                    consts: &[],
+                    clear: [0.0; 4],
+                    logicop: None,
+                    tess: None,
+                    pipeline: None,
+                    more: Some(&more),
+                })
+                .unwrap_or_else(|e| {
+                    panic!("{host_gl:?} {target:?} as {tgsi}: the load draws: {e:?}")
+                })
+                .expect("no tessellation asked for");
+                assert!(
+                    pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
+                    "{host_gl:?} {target:?} as {tgsi}: the named texel was loaded: {:?}",
+                    &pixels[..4]
+                );
+            }
+        }
+    }
+
+    /// A store to a 1D image, or to a layer of a 1D array, lands on the texel its coordinate
+    /// names. On GLES the image is a one-row 2D one, so the coordinate has to become (x, 0) or
+    /// (x, 0, layer) as a load's does: left as the guest wrote it, a 1D store addresses whatever
+    /// row the register's y holds and a 1D array's the row its layer names, both past the image.
+    /// After a barrier, the second draw loads what the first stored.
+    #[test]
+    fn a_1d_image_stores_to_the_texel_it_names() {
+        use crate::vrend::pipe::ImageAccess;
+        use crate::vrend::proto::{Box3, Command, ShaderImage, Transfer};
+        let rgba8 = super::super::proto::Format::from_wire(67).expect("R8G8B8A8_UNORM");
+        let image = ResourceHandle::new(10).expect("a resource handle is non-zero");
+        let zeros = [0u32; 8];
+        // (resource, its layers, the image as declared, its coordinate)
+        for (target, array_size, tgsi, coord) in [
+            // y is not part of a 1D coordinate, and a store must not read it as a row.
+            (TextureTarget::Texture1d, 1, "1D", "2, 5, 0, 0"),
+            (TextureTarget::Array1d, 2, "1D_ARRAY", "2, 1, 0, 0"),
+        ] {
+            let fs = format!(
+                "FRAG\nDCL OUT[0], COLOR\n\
+                 DCL IMAGE[0], {tgsi}, PIPE_FORMAT_R8G8B8A8_UNORM, WR\n\
+                 DCL TEMP[0]\nIMM[0] INT32 {{ {coord} }}\nIMM[1] FLT32 {{ 1.0, 0.0, 0.0, 1.0 }}\n  \
+                 0: LOAD TEMP[0], IMAGE[0], IMM[0], {tgsi}, PIPE_FORMAT_R8G8B8A8_UNORM\n  \
+                 1: STORE IMAGE[0], IMM[0], IMM[1], {tgsi}, PIPE_FORMAT_R8G8B8A8_UNORM\n  \
+                 2: MOV OUT[0], TEMP[0]\n  3: END\n"
+            );
+            let more = More {
+                resources: vec![(
+                    image,
+                    resource::Args {
+                        target,
+                        format: rgba8,
+                        bind: resource::Bind::SAMPLER_VIEW,
+                        width: 4,
+                        height: 1,
+                        depth: 1,
+                        array_size,
+                        last_level: 0,
+                        nr_samples: 0,
+                        flags: resource::ResourceFlags(0),
+                    },
+                )],
+                before: vec![
+                    Command::ResourceInlineWrite {
+                        transfer: Transfer {
+                            resource: image,
+                            level: 0,
+                            usage: 0,
+                            stride: 16,
+                            layer_stride: 16,
+                            region: Box3 {
+                                x: 0,
+                                y: 0,
+                                z: 0,
+                                width: 4,
+                                height: 1,
+                                depth: array_size as i32,
+                            },
+                        },
+                        data: &zeros[..4 * array_size as usize],
+                    },
+                    Command::SetShaderImages {
+                        stage: ShaderStage::Fragment,
+                        start_slot: 0,
+                        images: vec![Some(ShaderImage {
+                            format: rgba8,
+                            access: ImageAccess::ReadWrite,
+                            layer_offset: (array_size - 1) << 16,
+                            level_size: 0,
+                            resource: image,
+                        })],
+                    },
+                ],
+                redraws: vec![vec![Command::MemoryBarrier(!0)]],
+                ..Default::default()
+            };
+            for host_gl in [HostGl::Gles, HostGl::Desktop] {
+                let pixels = draw_over_target(OneDraw {
+                    host_gl,
+                    format: "R8G8B8A8_UNORM",
+                    vs: None,
+                    fs: Some(&fs),
+                    consts: &[],
+                    clear: [0.0; 4],
+                    logicop: None,
+                    tess: None,
+                    pipeline: None,
+                    more: Some(&more),
+                })
+                .unwrap_or_else(|e| panic!("{host_gl:?} {target:?}: the draws run: {e:?}"))
+                .expect("no tessellation asked for");
+                assert!(
+                    pixels.as_chunks::<4>().0.iter().all(|p| *p == [0xff, 0, 0, 0xff]),
+                    "{host_gl:?} {target:?}: the second draw loads the first one's store: {:?}",
+                    &pixels[..4]
+                );
+            }
+        }
+    }
+
     /// An RGBA32F image a shader both loads and stores is read and written. GLES allows that only
     /// in an r32 format, so there the store goes through a `writeonly` declaration of the same
     /// unit and the load through a `readonly` one; declared once, the shader does not compile.
