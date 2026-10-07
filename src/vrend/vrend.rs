@@ -5766,10 +5766,25 @@ mod tests {
     /// same index. From the second, the indices are `0, r, 0, 1, 2` with `r` the restart index:
     /// honoured, the first run is too short for a triangle and `0, 1, 2` covers the target;
     /// ignored, the first triangle names a vertex the buffer does not hold and nothing covers
-    /// it. Only indirect draws are scored: KosmicKrisp skips the restart of a direct list draw
-    /// unless `LIMINA_KK_NOLISTRESTART=0`, at any index.
+    /// it.
     #[test]
     fn an_indirect_draw_restarts_at_the_guest_s_restart_index() {
+        draws_restart_at_the_guest_s_restart_index(true);
+    }
+
+    /// The same draw made directly: its own indices from its offset are widened on GLES. Ignored
+    /// on macOS, where KosmicKrisp skips the restart of a direct list draw unless
+    /// `LIMINA_KK_NOLISTRESTART=0`; run it there with `--ignored` and that set.
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "KosmicKrisp skips direct list restart unless LIMINA_KK_NOLISTRESTART=0"
+    )]
+    fn a_direct_draw_restarts_at_the_guest_s_restart_index() {
+        draws_restart_at_the_guest_s_restart_index(false);
+    }
+
+    fn draws_restart_at_the_guest_s_restart_index(indirect: bool) {
         use crate::vrend::pipe::PrimType;
         use crate::vrend::proto::{Command, Draw, IndexBuffer, IndexType, IndirectDraw, TessDraw};
         let (indices, commands) = (
@@ -5779,7 +5794,8 @@ mod tests {
         // DrawElementsIndirectCommand: five indices, one instance, from the second.
         let command = [5u32, 1, 1, 0, 0];
         let run = |host_gl, restart_index: u32| {
-            // Six u16 indices, two to a word: a pad the command skips, then 0, r, 0, 1, 2.
+            // Six u16 indices, two to a word: a pad the draw skips, then 0, r, 0, 1, 2. The
+            // indirect command skips it by its first index, the direct draw by its offset.
             let words = [7u32, restart_index, 1 | (2 << 16)];
             let more = More {
                 resources: vec![
@@ -5792,7 +5808,7 @@ mod tests {
                     Command::SetIndexBuffer(Some(IndexBuffer {
                         resource: indices,
                         index_type: IndexType::U16,
-                        offset: 0,
+                        offset: if indirect { 0 } else { 2 },
                     })),
                 ],
                 draw: Some(Draw {
@@ -5809,8 +5825,8 @@ mod tests {
                     max_index: u32::MAX,
                     count_from_so: None,
                     // The wire carries the tessellation words ahead of the indirect ones.
-                    tess: Some(TessDraw { vertices_per_patch: 0, drawid: 0 }),
-                    indirect: Some(IndirectDraw {
+                    tess: indirect.then_some(TessDraw { vertices_per_patch: 0, drawid: 0 }),
+                    indirect: indirect.then_some(IndirectDraw {
                         resource: commands,
                         offset: 0,
                         stride: 20,
@@ -5837,12 +5853,16 @@ mod tests {
         for host_gl in [HostGl::Gles, HostGl::Desktop] {
             for restart_index in [42, 0xffff] {
                 let pixels = run(host_gl, restart_index)
-                    .unwrap_or_else(|e| panic!("{host_gl:?}, restart at {restart_index}: {e:?}"))
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{host_gl:?}, indirect {indirect}, restart at {restart_index}: {e:?}"
+                        )
+                    })
                     .expect("no tessellation");
                 assert!(
                     pixels.chunks(4).all(|p| p == [0xff, 0, 0, 0xff]),
-                    "{host_gl:?}, restart at {restart_index}: the second run covers the target: \
-                     {:?}",
+                    "{host_gl:?}, indirect {indirect}, restart at {restart_index}: the second run \
+                     covers the target: {:?}",
                     &pixels[..4]
                 );
             }
