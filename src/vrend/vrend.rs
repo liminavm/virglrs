@@ -3673,6 +3673,48 @@ mod tests {
         }
     }
 
+    /// A draw into an alpha-only target stores the fragment's alpha. GL has no such render
+    /// target on either flavour for 16-bit alpha or integer alpha, so the texture is red with its
+    /// alpha sampled from red, and the shader has to write its alpha there. Written as bound, the
+    /// target holds the fragment's red: piglit's `getteximage-formats` read GL_ALPHA16 back so on
+    /// a GLES host, where the C never moves the alpha.
+    #[test]
+    fn an_alpha_target_stores_the_fragment_alpha() {
+        const FLOAT: &str = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 { 0.25, 0.5, 0.125, 0.75 }\n  \
+                             0: MOV OUT[0], IMM[0]\n  1: END\n";
+        const UINT: &str = "FRAG\nDCL OUT[0], COLOR\nIMM[0] UINT32 { 5, 6, 7, 77 }\n  \
+                            0: MOV OUT[0], IMM[0]\n  1: END\n";
+        // (target, shader, each texel's bytes)
+        let cases: [(&str, &str, &[u8]); 3] = [
+            ("A16_UNORM", FLOAT, &0xbfffu16.to_ne_bytes()),
+            ("A8_UINT", UINT, &[77]),
+            ("A16_UINT", UINT, &77u16.to_ne_bytes()),
+        ];
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            for (format, fs, texel) in cases {
+                let pixels = draw_over_target(OneDraw {
+                    host_gl,
+                    format,
+                    vs: None,
+                    fs: Some(fs),
+                    consts: &[],
+                    clear: [0.0; 4],
+                    logicop: None,
+                    tess: None,
+                    pipeline: None,
+                    more: None,
+                })
+                .unwrap_or_else(|e| panic!("{host_gl:?} {format}: the draw runs: {e:?}"))
+                .expect("no tessellation asked for");
+                assert!(
+                    pixels.chunks(texel.len()).all(|p| p == texel),
+                    "{host_gl:?} {format}: the target holds the alpha {texel:02x?}: {:02x?}",
+                    &pixels[..texel.len()]
+                );
+            }
+        }
+    }
+
     /// A compressed texture reads back the blocks it holds, into pages other than the ones they
     /// came from. GLES has no `glGetCompressedTexImage` and cannot render into a compressed
     /// format, so there the blocks are copied into an uncompressed texture of the same block size

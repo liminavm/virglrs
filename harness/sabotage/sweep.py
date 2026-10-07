@@ -3551,6 +3551,14 @@ SABOTAGES = [
         'an_image_loaded_and_stored_in_one_shader_is_read_and_written',
     ),
     (
+        'only an 8-bit alpha target has its alpha moved into red',
+        'src/vrend/formats.rs',
+        """    formats.get(format).is_some_and(|e| e.gl.swizzle == Some(ALPHA_FROM_RED))""",
+        """    formats.get(format).is_some_and(|e| e.gl.swizzle == Some(ALPHA_FROM_RED))
+        && "A8_UNORM" == format.name()""",
+        'an_alpha_target_stores_the_fragment_alpha',
+    ),
+    (
         'a GLES host keeps compressed formats out of the readback mask as the C does',
         'src/vrend/formats.rs',
         """                    let blocks_read = !gles || features.has(Feature::copy_image);""",

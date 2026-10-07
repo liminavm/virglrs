@@ -552,7 +552,11 @@ fn blend_factor(f: BlendFactor) -> GLenum {
 /// formats, and whether a constant factor reads the blend colour's alpha in red. A target
 /// without alpha reads its destination alpha as one; an emulated-alpha target blends and masks
 /// its alpha in red, the channel that stores it.
-fn patch_blend(api: Api, state: &BlendState, targets: &[Option<Format>]) -> (BlendState, bool) {
+fn patch_blend(
+    emulated_alpha: impl Fn(Format) -> bool,
+    state: &BlendState,
+    targets: &[Option<Format>],
+) -> (BlendState, bool) {
     let state = *state;
     let mut new_state = state;
     let mut swizzle_blend_color = false;
@@ -561,7 +565,7 @@ fn patch_blend(api: Api, state: &BlendState, targets: &[Option<Format>]) -> (Ble
         let Some(Some(format)) = targets.get(i).copied() else {
             continue;
         };
-        if crate::vrend::formats::is_emulated_alpha(api, format) {
+        if emulated_alpha(format) {
             // The target's alpha is its red: blend and mask the alpha there, and nothing
             // else.
             let rt = state.rt[i];
@@ -1311,6 +1315,7 @@ impl Context {
         let gl = host.gl;
         let features = host.features;
         let api = features.api();
+        let formats = host.formats;
         let sub = self.sub_mut();
         if sub.cbufs.iter().all(Option::is_none) {
             sub.blend_dirty = false;
@@ -1321,7 +1326,8 @@ impl Context {
         for (t, s) in targets.iter_mut().zip(&sub.cbufs) {
             *t = s.as_ref().map(|s| s.format);
         }
-        let (new_state, swizzle_blend_color) = patch_blend(api, &state, &targets);
+        let emulated_alpha = |f| crate::vrend::formats::is_emulated_alpha(formats, f);
+        let (new_state, swizzle_blend_color) = patch_blend(emulated_alpha, &state, &targets);
 
         // vrend_hw_emit_blend
         let mut logicop_changed = false;
@@ -1669,10 +1675,8 @@ impl Context {
                                 Some(Object::SamplerState(st)) => Some(st),
                                 _ => None,
                             });
-                        let alpha_in_red = crate::vrend::formats::is_emulated_alpha(
-                            host.features.api(),
-                            view.format,
-                        );
+                        let alpha_in_red =
+                            crate::vrend::formats::is_emulated_alpha(host.formats, view.format);
                         let id = sampler.and_then(|st| match (st.ids, st.alpha_in_red) {
                             (_, Some(a8)) if alpha_in_red => Some(a8),
                             (Some(ids), _) if view.skip_srgb_decode => Some(ids[0]),
@@ -2689,7 +2693,7 @@ mod tests {
             }),
             colormask: PIPE_MASK_A | 0x7,
         };
-        let (patched, swizzle) = patch_blend(Api::Gl(46), &state, &[Some(a8)]);
+        let (patched, swizzle) = patch_blend(|_| true, &state, &[Some(a8)]);
         assert_eq!(
             patched.rt[0],
             RtBlend {
@@ -2700,10 +2704,10 @@ mod tests {
         assert!(!swizzle, "no constant factor");
         state.rt[0].equation = Some(RtBlendEq { rgb: eq(One, Zero), alpha: eq(ConstAlpha, Zero) });
         state.rt[0].colormask = 0x7;
-        let (patched, swizzle) = patch_blend(Api::Gl(46), &state, &[Some(a8)]);
+        let (patched, swizzle) = patch_blend(|_| true, &state, &[Some(a8)]);
         assert_eq!(patched.rt[0].colormask, 0, "alpha masked off writes nothing");
         assert!(swizzle, "a constant factor reads the constant's alpha in red");
-        assert_eq!(patch_blend(Api::Gles(32), &state, &[Some(a8)]), (state, false));
+        assert_eq!(patch_blend(|_| false, &state, &[Some(a8)]), (state, false));
     }
 
     /// An image over some of an array's layers is a range for a view, not the whole texture and

@@ -4592,14 +4592,15 @@ impl Context {
         // resource here instead, which is a second reading of a question the bind already
         // answered -- and one the guest can make unanswerable by freeing the resource meanwhile.
         let sub = self.sub();
-        let fixup =
-            ColorFixup {
-                srgb_encode: sub.needs_manual_srgb_encode & 1 != 0,
-                swap_red_blue: sub.swizzle_output_rgb_to_bgr & 1 != 0,
-                alpha_in_red: sub.cbufs.first().and_then(Option::as_ref).is_some_and(|s| {
-                    super::formats::is_emulated_alpha(host.features.api(), s.format)
-                }),
-            };
+        let fixup = ColorFixup {
+            srgb_encode: sub.needs_manual_srgb_encode & 1 != 0,
+            swap_red_blue: sub.swizzle_output_rgb_to_bgr & 1 != 0,
+            alpha_in_red: sub
+                .cbufs
+                .first()
+                .and_then(Option::as_ref)
+                .is_some_and(|s| super::formats::is_emulated_alpha(host.formats, s.format)),
+        };
         self.clear_prepare(host, fixup, buffers, colorf, depth, stencil);
         let sub = self.sub();
         let mut bits: GLbitfield = 0;

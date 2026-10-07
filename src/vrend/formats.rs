@@ -19,7 +19,7 @@
 //! the wire header assigns numbers gallium never named. Every table here that names a format
 //! names one with a description, and the tests hold it to that.
 
-use super::features::{Api, Feature, Features};
+use super::features::{Feature, Features};
 use super::gl::gles::*;
 use super::gl::{GLenum, Gl};
 use super::pipe::Swizzle;
@@ -437,11 +437,13 @@ impl Entry {
 }
 
 /// `vrend_format_is_emulated_alpha`: an alpha-only format stored in the red channel, which a
-/// render target of it must then be written through. The C answers this on a desktop core
-/// profile only, which has no alpha textures and stores A8/A16 as `GL_R8`/`GL_R16` swizzled
-/// `000R`; on GLES it answers false, and so does this.
-pub fn is_emulated_alpha(api: Api, format: Format) -> bool {
-    !api.is_gles() && matches!(format.name(), "A8_UNORM" | "A16_UNORM")
+/// render target of it must then be written through. The table says which those are: the rows
+/// that sample their alpha from red. The C names A8 and A16 on a desktop core profile only, but
+/// GLES has no 16-bit alpha either and stores A16 the same way, as both flavours store the
+/// integer alpha formats; a draw into one of those wrote the fragment's red.
+pub fn is_emulated_alpha(formats: &Table, format: Format) -> bool {
+    const ALPHA_FROM_RED: [Swizzle; 4] = [Swizzle::Zero, Swizzle::Zero, Swizzle::Zero, Swizzle::X];
+    formats.get(format).is_some_and(|e| e.gl.swizzle == Some(ALPHA_FROM_RED))
 }
 
 /// The host's format table: every wire format the driver accepts, probed once at init the way

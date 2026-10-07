@@ -981,7 +981,7 @@ impl Context {
         let fixup = ColorFixup {
             srgb_encode: !res.supports_view() && format.describe().is_some_and(|d| d.is_srgb()),
             swap_red_blue: res.needs_redblue_swizzle(format),
-            alpha_in_red: crate::vrend::formats::is_emulated_alpha(host.features.api(), format),
+            alpha_in_red: crate::vrend::formats::is_emulated_alpha(host.formats, format),
         };
         self.clear_prepare(host, fixup, buffers, colorf, depth, stencil);
         let mut bits: GLbitfield = 0;

@@ -479,7 +479,7 @@ impl SubContext {
                 let Some(surf) = surf else {
                     continue;
                 };
-                if crate::vrend::formats::is_emulated_alpha(host.features.api(), surf.format) {
+                if crate::vrend::formats::is_emulated_alpha(host.formats, surf.format) {
                     key.fs.cbufs_are_a8_bitmask |= 1 << i;
                 }
                 let Some(desc) = surf.format.describe() else {
