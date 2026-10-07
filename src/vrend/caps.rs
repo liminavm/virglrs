@@ -259,15 +259,7 @@ impl CapsV2 {
         c.v1.max_version = VIRGL2_VERSION;
 
         // vrend_fill_caps_glsl_version
-        c.v1.glsl_level = match api {
-            Api::Gles(v) if v >= 31 => 310,
-            Api::Gles(v) if v >= 30 => 130,
-            Api::Gles(_) => 120,
-            Api::Gl(v) if v >= 33 => 10 * v,
-            Api::Gl(32) => 150,
-            Api::Gl(31) => 140,
-            Api::Gl(_) => 130,
-        };
+        c.v1.glsl_level = base_glsl_level(api);
         if c.v1.glsl_level < 400
             && has(Feature::tessellation)
             && has(Feature::geometry_shader)
@@ -940,6 +932,24 @@ fn query_multisample_caps(gl: &Gl, max_samples: u32, locations: &mut [u32; 8]) -
     confirmed
 }
 
+/// The GLSL feature level the guest is told, before the stages the host has raise it: what the
+/// guest's desktop GL derives its version and its shading language from.
+///
+/// A GLES 3.1 host is told 330 where the C says 310. The guest reads the level as desktop GLSL,
+/// where 310 lands it at GL 3.2 and GLSL 1.50; ESSL 3.10 holds what GLSL 3.30 adds over 1.50, so
+/// 330 is the level the host can serve, and the guest offers GL 3.3.
+fn base_glsl_level(api: Api) -> u32 {
+    match api {
+        Api::Gles(v) if v >= 31 => 330,
+        Api::Gles(v) if v >= 30 => 130,
+        Api::Gles(_) => 120,
+        Api::Gl(v) if v >= 33 => 10 * v,
+        Api::Gl(32) => 150,
+        Api::Gl(31) => 140,
+        Api::Gl(_) => 130,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,6 +959,15 @@ mod tests {
     /// the middle would hand it the wrong limits with no error anywhere.
     ///
     /// Ground truth: `harness/abi/layout.txt`, dumped by the compiler from `virgl_hw.h`.
+    #[test]
+    fn a_gles_3_1_host_offers_the_guest_glsl_3_30() {
+        assert_eq!(base_glsl_level(Api::Gles(31)), 330);
+        assert_eq!(base_glsl_level(Api::Gles(32)), 330);
+        assert_eq!(base_glsl_level(Api::Gles(30)), 130);
+        assert_eq!(base_glsl_level(Api::Gl(33)), 330);
+        assert_eq!(base_glsl_level(Api::Gl(46)), 460);
+    }
+
     #[test]
     fn the_capsets_match_the_c_header() {
         assert_eq!(size_of::<CapsV1>(), 308);

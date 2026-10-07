@@ -3537,6 +3537,13 @@ SABOTAGES = [
         'a_24_bit_depth_reads_back_as_written',
     ),
     (
+        'a GLES 3.1 host tells the guest GLSL 310 as the C does',
+        'src/vrend/caps.rs',
+        """        Api::Gles(v) if v >= 31 => 330,""",
+        """        Api::Gles(v) if v >= 31 => 310,""",
+        'a_gles_3_1_host_offers_the_guest_glsl_3_30',
+    ),
+    (
         'a 24-bit depth readback drops the low byte GL gave it',
         'src/vrend/transfer.rs',
         """        *word = (((u * Z24_MAX + Z32_MAX / 2) / Z32_MAX) as u32).to_ne_bytes();""",
