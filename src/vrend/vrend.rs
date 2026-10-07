@@ -8211,7 +8211,11 @@ mod tests {
                     g.glformat,
                     g.gltype,
                 );
-                let held = v.gl.channel_bits(GL_TEXTURE_2D, 0);
+                let held = if d.colorspace == crate::vrend::formats::Colorspace::Zs {
+                    [v.gl.depth_bits(GL_TEXTURE_2D, 0), 0, 0, 0]
+                } else {
+                    v.gl.channel_bits(GL_TEXTURE_2D, 0)
+                };
                 v.gl.bind_texture(GL_TEXTURE_2D, None);
                 v.gl.delete_texture(tex);
                 let exact = crate::vrend::formats::holds_exactly(d, held);

@@ -1294,6 +1294,11 @@ impl Gl {
             .map(|p| self.tex_level_parameter(target, level, p).max(0) as u32)
     }
 
+    /// The depth bits a level stores, zero where it has none.
+    pub fn depth_bits(&self, target: GLenum, level: GLint) -> u32 {
+        self.tex_level_parameter(target, level, GL_TEXTURE_DEPTH_SIZE).max(0) as u32
+    }
+
     fn tex_level_parameter(&self, target: GLenum, level: GLint, pname: GLenum) -> GLint {
         let mut v: GLint = 0;
         // SAFETY: every parameter asked here writes exactly one integer.

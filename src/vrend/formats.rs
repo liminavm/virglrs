@@ -557,10 +557,14 @@ fn probe_row(gl: &Gl, features: &Features, row: &GlFormat) -> Option<Entry> {
         // GLES before 3.1 cannot ask a level what it stores.
         let api = features.api();
         let stores_exactly = (api.is_gles() && !api.gles_at_least(31))
-            || row
-                .format
-                .describe()
-                .is_none_or(|d| holds_exactly(d, gl.channel_bits(GL_TEXTURE_2D, 0)));
+            || row.format.describe().is_none_or(|d| {
+                let held = if d.colorspace == Colorspace::Zs {
+                    [gl.depth_bits(GL_TEXTURE_2D, 0), 0, 0, 0]
+                } else {
+                    gl.channel_bits(GL_TEXTURE_2D, 0)
+                };
+                holds_exactly(d, held)
+            });
         let desktop = !features.api().is_gles();
         // The C asks of whatever texture the rectangle target holds, which is its default object:
         // the triple is all the answer depends on.
@@ -629,7 +633,19 @@ fn probe_row(gl: &Gl, features: &Features, row: &GlFormat) -> Option<Entry> {
 /// was told the host holds the format packs its values for that format and reads them back
 /// rounded, so such a format is not offered. A deeper channel holds an unsigned one exactly when
 /// its bits are a multiple of the format's, a signed one when its magnitude bits are.
+///
+/// For a depth format `held` is the depth bits first. A depth value is read back at the format's
+/// own precision, so a deeper store holds it; a shallower one does not -- iris stores
+/// `GL_DEPTH_COMPONENT32` in 24 bits, where 0.5 reads back as `0x80000080`.
 pub(crate) fn holds_exactly(desc: &Description, held: [u32; 4]) -> bool {
+    if desc.colorspace == Colorspace::Zs {
+        let depth = match desc.swizzle[0] {
+            Some(Swizzle::X) => desc.channels[0],
+            Some(Swizzle::Y) => desc.channels[1],
+            _ => return true,
+        };
+        return !depth.normalized || held[0] == 0 || held[0] >= depth.bits;
+    }
     if desc.is_compressed() || !matches!(desc.colorspace, Colorspace::Rgb | Colorspace::Srgb) {
         return true;
     }
@@ -736,6 +752,12 @@ mod tests {
             ("R8_SNORM", [15, 0, 0, 0], true),
             ("R16_FLOAT", [32, 0, 0, 0], true),
             ("R8_UINT", [7, 0, 0, 0], true),
+            ("Z32_UNORM", [24, 0, 0, 0], false),
+            ("Z32_UNORM", [32, 0, 0, 0], true),
+            ("Z16_UNORM", [24, 0, 0, 0], true),
+            ("Z24_UNORM_S8_UINT", [24, 0, 0, 0], true),
+            ("S8_UINT_Z24_UNORM", [16, 0, 0, 0], false),
+            ("Z32_FLOAT", [24, 0, 0, 0], true),
         ] {
             assert_eq!(holds_exactly(named(name), held), exact, "{name} held as {held:?}");
         }

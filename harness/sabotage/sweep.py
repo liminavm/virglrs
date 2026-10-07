@@ -3700,6 +3700,13 @@ SABOTAGES = [
         'a_render_condition_drops_a_draw_its_query_failed',
     ),
     (
+        'a depth format stored shallower than its bits is offered',
+        'src/vrend/formats.rs',
+        """        return !depth.normalized || held[0] == 0 || held[0] >= depth.bits;""",
+        """        return true;""",
+        'a_format_is_held_exactly_only_at_a_depth_that_holds_its_values',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",
