@@ -21,6 +21,7 @@ use super::gl::{BoundProgram, GLenum, GLint, GLsizei, Gl, TextureName, pixel_byt
 use super::proto::{Box3, Format};
 use super::resource::{Resource, Storage};
 use crate::guest_mem::{Cursor, Iov, Source};
+use crate::ids::{ContextId, ResourceHandle};
 use std::fmt;
 
 /// Where a transfer lands in the resource, and how the guest laid it out in the pages.
@@ -444,6 +445,43 @@ impl Staging {
 /// `pages` is where the bytes come from -- the resource's own pages for a `TRANSFER3D`, another
 /// resource's for a `COPY_TRANSFER3D`; `own` is the resource's own pages, which a host-side
 /// buffer mirrors.
+/// Tell `stream` of a transfer of `info` on `handle`, and for one to the host, the bytes it reads
+/// from `source`: the span [`write`] reads, from the same offset.
+pub fn record(
+    stream: &crate::trace::Recorder,
+    ctx: Option<ContextId>,
+    handle: ResourceHandle,
+    res: &Resource,
+    info: &Info,
+    source: Option<&Source<'_>>,
+) {
+    if !stream.armed() {
+        return;
+    }
+    let b = info.region;
+    let at = crate::trace::TransferBox {
+        level: info.level,
+        x: b.x as u32,
+        y: b.y as u32,
+        width: b.width as u32,
+        height: b.height as u32,
+        stride: info.stride,
+        offset: info.offset,
+    };
+    let direction = match source {
+        Some(_) => crate::trace::Direction::ToHost,
+        None => crate::trace::Direction::FromHost,
+    };
+    stream.transfer(ctx, handle, direction, at);
+    if let Some(source) = source {
+        stream.transfer_bytes(ctx, handle, info.offset, || {
+            let span = layout(res, info, source.len()).ok()?.span();
+            let mut bytes = vec![0u8; usize::try_from(span).ok()?];
+            source.copy_out(info.offset, &mut bytes).then_some(bytes)
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn write(
     gl: &Gl,

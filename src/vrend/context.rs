@@ -122,7 +122,7 @@ impl Todo {
 pub struct Host<'a> {
     pub gl: &'a Gl,
     /// limina's trace knobs, as the renderer read them when it was built.
-    pub traces: super::debug::Traces,
+    pub traces: &'a super::debug::Traces,
     /// `VIRGLRS_DEBUG`'s switches, as the renderer read them when it was built.
     pub debug: super::debug::Switches,
     /// Which batch is running, for the one thing that has to know: whether a copy of a guest's
@@ -157,6 +157,13 @@ pub struct Host<'a> {
     pub budget: &'a crate::budget::Classic,
     /// Whether any decode target has a picture in flight; see [`video::pending::Unsettled`].
     pub unsettled: &'a video::pending::Unsettled,
+}
+
+/// Every byte a blob's source offers, from its offset zero: what a recording of its pixels holds,
+/// in the blob's own layout so a replay applies its own stride to them.
+fn whole_source(src: &PixelSource<'_>) -> Option<Vec<u8>> {
+    let mut bytes = vec![0u8; usize::try_from(src.len()).ok()?];
+    src.copy_out(0, &mut bytes).then_some(bytes)
 }
 
 impl Host<'_> {
@@ -227,6 +234,7 @@ impl Host<'_> {
             self.settle(res);
         }
         if let Some(res) = self.resources.get_mut(&handle).and_then(|s| s.resource_mut()) {
+            self.traces.stream.blob_bytes(handle, || whole_source(&src));
             res.take_guest_pixels(gl, formats, batch, &src);
         }
     }
@@ -1614,6 +1622,12 @@ impl Context {
                 if !self.dropped_in_replay(host.ctx, kind, &f) {
                     return self.poison(host.ctx, f);
                 }
+            }
+            // What the guest sent and this context accepted, recorded once it ran: a command's
+            // transfer bytes are recorded while it runs, and the replayer reads them as the
+            // command after them. A rebuild's replay of the journal is not the guest's stream.
+            if self.replay.is_none() {
+                host.traces.stream.command(host.ctx, wire);
             }
         }
         Ok(())
@@ -4691,6 +4705,9 @@ impl Context {
         // Asked here and not held: the bytes are the VMM's or the exporter's, and the source
         // borrows the table for this call only.
         let pixels = host.guest.blob_pixels(host.ctx, resource);
+        if let Some(src) = &pixels {
+            host.traces.stream.blob_bytes(resource, || whole_source(src));
+        }
         match untyped.upgrade(
             host.gl,
             host.winsys,
@@ -4998,8 +5015,12 @@ impl Context {
             return Err(Fault::IllegalResource { cmd, handle: t.resource });
         };
         let began = host.tally.mark();
+        let stream = &host.traces.stream;
         let (res, bound, staging) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, offset as u64, false);
+        let source = pages.source();
+        let recorded = (direction == TransferDirection::ToHost).then_some(&source);
+        transfer::record(stream, Some(ctx), t.resource, res, &info, recorded);
         let bytes = transfer::box_bytes(res, &info);
         let r = match direction {
             TransferDirection::ToHost => transfer::write(
@@ -5049,8 +5070,15 @@ impl Context {
         };
         let own = guest.pages(ctx, t.resource);
         let began = host.tally.mark();
+        let stream = &host.traces.stream;
         let (res, bound, staging) = host.resource_to_transfer(cmd, t.resource)?;
         let info = Self::info(&t, staging_offset as u64, synchronized);
+        // Only a copy to the host is recorded, as the C records it: the replayer feeds its bytes
+        // to the staging resource the command names.
+        if direction == CopyDirection::ToHost {
+            let source = staging_pages.source();
+            transfer::record(stream, Some(ctx), t.resource, res, &info, Some(&source));
+        }
         let bytes = transfer::box_bytes(res, &info);
         let r = match direction {
             CopyDirection::ToHost => transfer::write(

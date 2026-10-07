@@ -7,6 +7,9 @@
 # consumes the prefix can tell which it got.
 #
 #   install.sh [prefix]     default: ./prefix
+#
+# VIRGLRS_FEATURES is handed to cargo as --features: `trace` builds a prefix that records what it
+# is asked to do when LIMINA_VREND_TRACE arms it (src/trace.rs).
 set -euo pipefail
 cd "$(dirname "$0")"
 HERE="$(pwd)"
@@ -21,7 +24,7 @@ PREFIX="$(cd "$PREFIX" && pwd)"
 
 VERSION=1.3.0
 
-cargo build --release
+cargo build --release ${VIRGLRS_FEATURES:+--features "$VIRGLRS_FEATURES"}
 
 # The versioned name is the real file and the bare name a symlink to it, which is the shape meson
 # installs and therefore the shape a consumer of this prefix expects to find. What differs between

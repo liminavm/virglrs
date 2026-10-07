@@ -101,13 +101,23 @@ pub struct Retirement {
 }
 
 impl Retirement {
+    /// Start the thread that hands answered fences to `sink`.
     pub fn start(sink: Box<dyn FenceSink>, debug: crate::vrend::debug::Switches) -> Retirement {
+        Retirement::recording(sink, debug, crate::trace::Recorder::default())
+    }
+
+    /// [`Retirement::start`], recording each fence to `stream` as it is handed over.
+    pub fn recording(
+        sink: Box<dyn FenceSink>,
+        debug: crate::vrend::debug::Switches,
+        stream: crate::trace::Recorder,
+    ) -> Retirement {
         let q =
             Arc::new((Mutex::new(Queue { jobs: VecDeque::new(), stopped: false }), Condvar::new()));
         let qt = Arc::clone(&q);
         let thread = thread::Builder::new()
             .name("virglrs-fence".into())
-            .spawn(move || run(sink, qt, debug))
+            .spawn(move || run(sink, qt, debug, stream))
             .expect("spawning the fence retirement thread");
         Retirement { inner: Arc::new(Inner { q, thread: Mutex::new(Some(thread)) }) }
     }
@@ -178,6 +188,7 @@ fn run(
     mut sink: Box<dyn FenceSink>,
     q: Arc<(Mutex<Queue>, Condvar)>,
     debug: crate::vrend::debug::Switches,
+    stream: crate::trace::Recorder,
 ) {
     let (m, cv) = &*q;
     loop {
@@ -204,8 +215,14 @@ fn run(
             eprintln!("[virglrs] fence: delivering {what} to the VMM");
         }
         match job {
-            Job::Context(ctx, ring, fence) => sink.context_fence(ctx, ring, fence),
-            Job::Global(id) => sink.global_fence(id),
+            Job::Context(ctx, ring, fence) => {
+                stream.retire(Some(ctx), fence.0);
+                sink.context_fence(ctx, ring, fence)
+            }
+            Job::Global(id) => {
+                stream.retire(None, id.0 as u64);
+                sink.global_fence(id)
+            }
             Job::Present(id) => sink.present_fence(id),
             Job::Stop => {
                 m.lock().expect("the fence queue lock is never held across a panic").stopped = true;

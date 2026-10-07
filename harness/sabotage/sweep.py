@@ -3551,6 +3551,15 @@ SABOTAGES = [
         'an_image_loaded_and_stored_in_one_shader_is_read_and_written',
     ),
     (
+        'a recorded resource event is stamped with the sequence of the record before it',
+        'src/trace.rs',
+        """        let seq = s.seq;
+        s.res.push(ev.encode(seq));""",
+        """        let seq = s.seq.saturating_sub(1);
+        s.res.push(ev.encode(seq));""",
+        'a_dump_reads_back_its_records_in_the_c_layout',
+    ),
+    (
         'a de-indexed draw numbers its vertex IDs from zero',
         'src/vrend/context/select.rs',
         """        key.vs.vertex_id_from_input = stage == Vertex && self.deindexing;""",

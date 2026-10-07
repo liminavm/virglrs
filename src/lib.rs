@@ -82,6 +82,7 @@ pub mod metal;
 pub mod renderer;
 pub mod stats;
 pub mod surface;
+pub mod trace;
 pub mod venus;
 pub mod vrend;
 #[allow(unsafe_code)]

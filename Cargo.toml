@@ -48,6 +48,10 @@ video-oracle = ["dep:cc"]
 # a Linux host decodes nothing and advertises no video. It needs libva's headers to build; no
 # effect on macOS, which decodes through VideoToolbox.
 vaapi = ["dep:cros-libva"]
+
+# Arm the classic command recorder (`src/trace.rs`) from `LIMINA_VREND_TRACE`. Off by default: an
+# armed environment then says it records nothing.
+trace = ["dep:nix"]
 default = ["vaapi"]
 
 [dependencies]
@@ -56,6 +60,8 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 dav1d = "0.11.1"
 libc = "0.2"
 rustc-hash = "2.1"
+# The `trace` feature's FIFO, made without an unsafe block of our own.
+nix = { version = "0.31.3", default-features = false, features = ["fs"], optional = true }
 
 # Pinned to a rev: the latest release (0.0.13) does not build against libva 1.23.
 [target.'cfg(target_os = "linux")'.dependencies]

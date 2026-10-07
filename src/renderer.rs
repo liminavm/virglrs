@@ -760,7 +760,7 @@ impl Renderer {
         let condemned = vrend::resource::Condemned::default();
         let traces = vrend::debug::Traces::from_env();
         let debug = vrend::debug::Switches::from_env();
-        let fences = Retirement::start(fences, debug);
+        let fences = Retirement::recording(fences, debug, traces.stream.clone());
         let vrend = if config.vrend {
             Some(vrend::vrend::Vrend::new(
                 config,
@@ -768,7 +768,7 @@ impl Renderer {
                 fences.handle(),
                 contexts,
                 condemned.clone(),
-                traces,
+                traces.clone(),
                 debug,
             )?)
         } else {
@@ -849,6 +849,19 @@ impl Renderer {
             None => None,
         };
         self.insert(handle, Backing::Classic { args, surface }, iov);
+        self.traces.stream.resource(crate::trace::ResEvent::Create {
+            handle,
+            target: args.target.wire(),
+            format: args.format.wire(),
+            bind: args.bind.0,
+            width: args.width,
+            height: args.height,
+            depth: args.depth,
+            array_size: args.array_size,
+            last_level: args.last_level,
+            nr_samples: args.nr_samples,
+            flags: args.flags.0,
+        });
         Ok(())
     }
 
@@ -866,6 +879,21 @@ impl Renderer {
         iov: Vec<GuestIov>,
     ) -> Result<(), Error> {
         self.free_handle(handle)?;
+        // Recorded before the paths below, which have many exits: a create that then fails is
+        // one a replay skips, where a missed one is a resource it never builds.
+        let (blob_mem, blob_id, ctx) = match desc.source {
+            BlobSource::Guest => (crate::trace::BlobMem::Guest, 0, None),
+            BlobSource::HostMinted { ctx } => (crate::trace::BlobMem::Host3d, 0, Some(ctx)),
+            BlobSource::InContext { ctx, id } => (crate::trace::BlobMem::Host3d, id.0, Some(ctx)),
+        };
+        self.traces.stream.resource(crate::trace::ResEvent::Blob {
+            handle,
+            size: desc.size,
+            blob_mem,
+            blob_flags: desc.blob_flags,
+            blob_id,
+            ctx,
+        });
         let storage = match desc.source {
             BlobSource::Guest => BlobStorage::Guest,
             BlobSource::HostMinted { ctx } => {
@@ -1057,6 +1085,7 @@ impl Renderer {
         let mut resources = self.resources.write().expect("the resource lock is never poisoned");
         if let Some(r) = resources.get_mut(&handle) {
             r.attached.clear();
+            self.traces.stream.resource(crate::trace::ResEvent::Unref(handle));
         }
         resources.remove(&handle);
     }
@@ -1393,6 +1422,7 @@ impl Renderer {
                 }
                 let words: Vec<u32> =
                     buf.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+                self.traces.stream.submit(ctx.id(), buf.len());
                 let table = self.resources.read().expect("the resource lock is never poisoned");
                 let v = self.vrend.as_mut().ok_or(Error::RendererAbsent)?;
                 match v.submit(ctx, &words, &*table) {
@@ -1995,7 +2025,7 @@ impl Renderer {
         stride: usize,
         height: u32,
     ) -> Option<u32> {
-        let traces = self.traces;
+        let traces = self.traces.clone();
         if let Some(surface) = self.classic_surface(handle) {
             if !surface.readable() {
                 // The minting host has nowhere else to go: an IOSurface that will not map is the
@@ -2008,12 +2038,12 @@ impl Renderer {
                     // Read while the surface is borrowed; the round trip below needs `&mut self`.
                     let id = surface.id().0;
                     let rows = self.read_classic_through_export(handle, dst, stride, height)?;
-                    trace_blank_readback(traces, "exported", handle, id, dst, stride, rows);
+                    trace_blank_readback(&traces, "exported", handle, id, dst, stride, rows);
                     return Some(rows);
                 }
             }
             let rows = surface.read_rows(dst, stride, height);
-            trace_blank_readback(traces, "classic", handle, surface.id().0, dst, stride, rows);
+            trace_blank_readback(&traces, "classic", handle, surface.id().0, dst, stride, rows);
             return Some(rows);
         }
         let storage = self.resource_storage(handle)?;
@@ -2022,7 +2052,7 @@ impl Renderer {
             return None;
         }
         let rows = surface.read_rows(dst, stride, height);
-        trace_blank_readback(traces, "shared", handle, surface.id().0, dst, stride, rows);
+        trace_blank_readback(&traces, "shared", handle, surface.id().0, dst, stride, rows);
         Some(rows)
     }
 
@@ -2288,7 +2318,7 @@ impl Renderer {
 /// that match are therefore not proof that two surfaces are the same one, and nothing here may
 /// grow into a lookup by id.
 fn trace_blank_readback(
-    traces: vrend::debug::Traces,
+    traces: &vrend::debug::Traces,
     kind: &str,
     handle: ResourceHandle,
     surface_id: u32,

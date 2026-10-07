@@ -589,7 +589,7 @@ impl Vrend {
         } = self;
         let host = Host {
             batch: *batch,
-            traces: *traces,
+            traces,
             debug: *debug,
             tally,
             staging,
@@ -1114,6 +1114,7 @@ impl Vrend {
         guest: &dyn Guest,
     ) {
         let ctx = ctx.id();
+        self.traces.stream.fence(Some(ctx), id.0);
         // With no waiter there is no queue to retire behind, so the fence is answered inline --
         // the way this renderer did before there was one. Taking a sync and dropping it unwaited
         // would retire the fence early, which is the whole hazard this path exists to prevent.
@@ -1174,6 +1175,9 @@ impl Vrend {
     /// the waiter's queue instead; see [`Self::take_fence`].
     pub fn fence_global(&mut self, on: Option<ClassicCtx>, id: ClientFenceId, guest: &dyn Guest) {
         let on = on.map(ClassicCtx::id);
+        // Recorded under no context, as it retires: a global fence is the VMM's, whichever
+        // context's work it waits for.
+        self.traces.stream.fence(None, id.0 as u64);
         let pictures = self.decodes_in_flight(on);
         if self.waiter.is_none() {
             pictures.iter().for_each(|p| p.wait());
@@ -1614,6 +1618,12 @@ impl Vrend {
             .get_mut(&handle)
             .and_then(resource::Slot::resource_mut)
             .ok_or(transfer::Error::NoPages)?;
+        let recorded = match &pages {
+            transfer::Through::ToHost(pages) => Some(pages),
+            transfer::Through::ToGuest(_) => None,
+        };
+        let ctx = ctx.map(ClassicCtx::id);
+        transfer::record(&self.traces.stream, ctx, handle, res, info, recorded);
         let bytes = transfer::box_bytes(res, info);
         let r = match pages {
             transfer::Through::ToHost(pages) => transfer::write(

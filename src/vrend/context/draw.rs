@@ -1963,6 +1963,9 @@ impl Context {
                 need(Feature::indirect_params)?;
             }
         }
+        if host.traces.stream.armed() {
+            self.record_draw_target(host);
+        }
         // GL takes every count as a signed 32-bit value. Past that, GL would raise an error the
         // batch turns into a fault at its end; saying so here names the draw that asked.
         let sized = |v: u32, what: &'static str| -> Result<GLsizei, Fault> {
@@ -2336,6 +2339,21 @@ impl Context {
             sub.streamouts[i].xfb = Xfb::Paused;
         }
         Ok(())
+    }
+
+    /// Tell the recorder what a draw renders into: the first colour buffer's resource size and
+    /// texture name, and how many colour buffers are bound. Read from what is bound, never asked
+    /// of GL, which would sync.
+    fn record_draw_target(&self, host: &Host<'_>) {
+        let sub = self.sub();
+        let first = sub.cbufs.first().and_then(Option::as_ref);
+        let res = first.and_then(|s| host.resources.get(&s.resource)).and_then(|s| s.resource());
+        let (width, height) = res.map_or((0, 0), |r| (r.args.width, r.args.height));
+        let name = match res.map(|r| &r.storage) {
+            Some(Storage::Texture(t)) => t.name.raw(),
+            _ => 0,
+        };
+        host.traces.stream.draw_fb(host.ctx, width, height, sub.cbufs.len() as u32, name);
     }
 
     /// An indexed draw served as arrays, on a host that refuses it as it is: see `deindex`.

@@ -57,15 +57,17 @@ impl Switches {
     }
 }
 
-/// limina's two trace knobs, read once when the renderer is built and carried by it from there.
+/// limina's trace knobs, read once when the renderer is built and carried by it from there.
 ///
 /// `LIMINA_READBACK_TRACE` names the scanout surfaces a readback found blank and the writes that
 /// reached them; `LIMINA_GL_TRACE` drains GL errors after the sampler-view calls so a failing one
-/// is named. Neither is a switch in [`Switch`]'s list: limina sets them by these names.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// is named; `LIMINA_VREND_TRACE` arms the command recorder, `stream`. None is a switch in
+/// [`Switch`]'s list: limina sets them by these names.
+#[derive(Clone, Debug, Default)]
 pub struct Traces {
     pub readback: bool,
     pub gl: bool,
+    pub stream: crate::trace::Recorder,
 }
 
 impl Traces {
@@ -73,6 +75,7 @@ impl Traces {
         let traces = Traces {
             readback: std::env::var_os("LIMINA_READBACK_TRACE").is_some(),
             gl: std::env::var_os("LIMINA_GL_TRACE").is_some(),
+            stream: crate::trace::Recorder::from_env(),
         };
         // Said at startup, not left to the first hit: a diagnostic that only ever speaks when it
         // finds something cannot be told, from its silence, from one that was never compiled
