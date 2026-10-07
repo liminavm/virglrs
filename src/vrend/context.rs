@@ -2913,7 +2913,6 @@ impl Context {
         let features = host.features;
         let formats = host.formats;
         let res = host.resource(cmd, v.resource)?;
-        let entry = formats.get(v.format).ok_or(Fault::IllegalFormat { cmd, format: v.format })?;
         let (is_buffer, tex_target, immutable) = match &res.storage {
             Storage::Buffer { .. } => (true, GL_TEXTURE_BUFFER, None),
             Storage::Texture(t) => (false, t.target, t.immutable),
@@ -2921,6 +2920,12 @@ impl Context {
                 return Err(Fault::IllegalResource { cmd, handle: v.resource });
             }
         };
+        // A buffer view needs no entry: binding it samples an A/L/I format the host has no
+        // texture for as its R/RG twin (`arb_format`), and the shader key carries the swizzle.
+        let entry = formats.get(v.format);
+        if entry.is_none() && !is_buffer {
+            return Err(Fault::IllegalFormat { cmd, format: v.format });
+        }
         // The view's format decides whether a rectangle view is one: `vrend_create_sampler_view`
         // asks it, not the resource's.
         let rect_ok = host.formats.get(v.format).is_some_and(|e| e.can_target_rectangle);
@@ -2963,7 +2968,7 @@ impl Context {
                 }
             }
         }
-        if let Some(table) = entry.gl.swizzle {
+        if let Some(table) = entry.and_then(|e| e.gl.swizzle) {
             for s in swizzle.iter_mut() {
                 if (*s as u32) <= Swizzle::W as u32 {
                     *s = table[*s as usize];

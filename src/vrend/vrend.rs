@@ -7972,6 +7972,92 @@ mod tests {
         }
     }
 
+    /// A buffer view of an alpha format samples its texels as alpha, as `vrend_get_arb_format`
+    /// and the shader's swizzle make it, where the host has no texture of the format to look up:
+    /// the core profile has no `GL_ALPHA16F`. Creating such a view was refused, which cost the
+    /// guest its context.
+    #[test]
+    fn a_buffer_view_of_a_format_the_host_has_no_texture_of_samples() {
+        use crate::vrend::pipe::Swizzle;
+        use crate::vrend::proto::{Box3, Command, Object, SamplerView, Transfer};
+        const FS: &str = "FRAG\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SVIEW[0], BUFFER, FLOAT\n\
+                          DCL TEMP[0]\nIMM[0] INT32 { 0, 0, 0, 0 }\n  \
+                          0: TXF TEMP[0], IMM[0], SAMP[0], BUFFER\n  1: MOV OUT[0], TEMP[0]\n  \
+                          2: END\n";
+        let a16f = (0..crate::vrend::proto::FORMAT_MAX)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.name() == "A16_FLOAT")
+            .expect("a wire format");
+        let texels = ResourceHandle::new(10).expect("a resource handle is non-zero");
+        // Two texels of half-float 0.5.
+        let half = [0x3800_3800u32];
+        let more = More {
+            resources: vec![(texels, buffer_args(resource::Bind::SAMPLER_VIEW, 4))],
+            before: vec![
+                Command::ResourceInlineWrite {
+                    transfer: Transfer {
+                        resource: texels,
+                        level: 0,
+                        usage: 0,
+                        stride: 0,
+                        layer_stride: 0,
+                        region: Box3 { x: 0, y: 0, z: 0, width: 4, height: 1, depth: 1 },
+                    },
+                    data: &half,
+                },
+                Command::CreateObject {
+                    handle: ObjectHandle::new(20).expect("non-zero"),
+                    object: Object::SamplerView(SamplerView {
+                        resource: texels,
+                        format: a16f,
+                        target: TextureTarget::Buffer,
+                        first_element_or_layers: 0,
+                        last_element_or_levels: 1,
+                        swizzle: [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+                    }),
+                },
+                Command::SetSamplerViews {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    views: vec![Some(ObjectHandle::new(20).expect("non-zero"))],
+                },
+            ],
+            ..Default::default()
+        };
+        let mut untabled = 0;
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            if !host_has(host_gl, Feature::arb_or_gles_ext_texture_buffer) {
+                eprintln!("{host_gl:?}: no texture buffers");
+                continue;
+            }
+            untabled += usize::from(!offered(host_gl, a16f));
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                vs: None,
+                fs: Some(FS),
+                consts: &[],
+                clear: [0.0; 4],
+                logicop: None,
+                tess: None,
+                pipeline: None,
+                more: Some(&more),
+            })
+            .unwrap_or_else(|e| panic!("{host_gl:?}: an A16_FLOAT buffer view: {e:?}"))
+            .expect("no tessellation asked for");
+            assert!(
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|p| p[..3] == [0, 0, 0] && p[3].abs_diff(128) <= 1),
+                "{host_gl:?}: the buffer's texel was sampled as alpha: {:?}",
+                &pixels[..4]
+            );
+        }
+        assert!(untabled > 0, "the premise: some host has no A16_FLOAT texture");
+    }
+
     /// A format is offered to the guest only where the driver stores every value of it exactly.
     /// A driver may hold a sized format at another depth -- zink on KosmicKrisp holds 3-3-2 as
     /// 5-6-5 -- and a guest told the host holds it packs values the host then rounds. Each format

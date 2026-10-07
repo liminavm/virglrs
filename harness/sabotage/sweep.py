@@ -3679,6 +3679,13 @@ SABOTAGES = [
         'a_draw_counted_from_a_stream_out_target_draws_what_was_captured',
     ),
     (
+        'a buffer view of a format with no texture entry is refused',
+        'src/vrend/context.rs',
+        """        if entry.is_none() && !is_buffer {""",
+        """        if entry.is_none() {""",
+        'a_buffer_view_of_a_format_the_host_has_no_texture_of_samples',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",
