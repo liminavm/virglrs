@@ -816,6 +816,9 @@ fn can_emit_generic_geom(io: &Io) -> bool {
 
 /// `emit_ios_vs`.
 fn emit_ios_vs(ctx: &mut Context<'_>) {
+    if ctx.key.vs.vertex_id_from_input {
+        hdr!(ctx.bufs, "in int {};\n", crate::vrend::shader::VERTEX_ID_INPUT);
+    }
     for i in 0..ctx.inputs.len() {
         let input = ctx.inputs[i].clone();
         if !input.glsl_predefined_no_emit {

@@ -5721,7 +5721,12 @@ mod tests {
         let corners = [[-1.0f32, -1.0, 0.0, 1.0], [3.0, -1.0, 0.0, 1.0], [-1.0, 3.0, 0.0, 1.0]];
         // `index_list` is U32 indices written into the index buffer; `unwritten` instead draws
         // that many U8 indices out of a buffer left as made, and `stride` is the vertex buffer's.
-        let run = |mode, index_list: &[u32], restart, unwritten: Option<u32>, stride: u32| {
+        let run = |vs: Option<&str>,
+                   mode,
+                   index_list: &[u32],
+                   restart,
+                   unwritten: Option<u32>,
+                   stride: u32| {
             let (index_type, count, index_bytes) = match unwritten {
                 Some(n) => (IndexType::U8, n, n),
                 None => (IndexType::U32, index_list.len() as u32, 4 * index_list.len() as u32),
@@ -5799,7 +5804,7 @@ mod tests {
                 format: "R8G8B8A8_UNORM",
                 clear: [0.0; 4],
                 fs: Some(RED_FS),
-                vs: None,
+                vs,
                 consts: &[],
                 pipeline: None,
                 more: Some(&more),
@@ -5821,15 +5826,24 @@ mod tests {
                 .collect()
         };
         let (a, b, c) = (corners[0], corners[1], corners[2]);
-        let got = run(PrimType::Triangles, &[2, 0, 1, 1, 2, 0], false, None, 16)
+        let got = run(None, PrimType::Triangles, &[2, 0, 1, 1, 2, 0], false, None, 16)
             .expect("the draw is served");
         assert_eq!(floats(&got), [c, a, b, b, c, a], "in index order");
         // A strip cut in two by a restart is two triangles, each from its own run.
-        let got = run(PrimType::TriangleStrip, &[0, 1, 2, u32::MAX, 2, 1, 0], true, None, 16)
+        let got = run(None, PrimType::TriangleStrip, &[0, 1, 2, u32::MAX, 2, 1, 0], true, None, 16)
             .expect("the draw is served");
         assert_eq!(floats(&got), [a, b, c, c, b, a], "one triangle per run");
         // One vertex past the count bound; and, at a count inside it, a stride that takes one
         // binding's gathered vertices past theirs.
+        // Arrays number `gl_VertexID` from zero; the vertex stage reads the index it was drawn at.
+        const VERTEX_ID_VS: &str = "VERT\nDCL IN[0]\nDCL SV[0], VERTEXID\nDCL OUT[0], POSITION\n\
+                                    DCL TEMP[0]\nIMM[0] FLT32 { 0.0, 0.0, 0.0, 1.0 }\n  \
+                                    0: MOV TEMP[0], IMM[0]\n  1: I2F TEMP[0].x, SV[0].xxxx\n  \
+                                    2: MOV OUT[0], TEMP[0]\n  3: END\n";
+        let got = run(Some(VERTEX_ID_VS), PrimType::Points, &[2, 0, 1], false, None, 16)
+            .expect("the draw is served");
+        let ids: Vec<f32> = floats(&got)[..3].iter().map(|v| v[0]).collect();
+        assert_eq!(ids, [2.0, 0.0, 1.0], "each vertex's ID is the index it was drawn at");
         let past_count = deindex::MAX_VERTICES + 1;
         let wide = 32;
         let past_bytes = (deindex::MAX_GATHERED / wide) as u32 + 1;
@@ -5838,7 +5852,7 @@ mod tests {
             (past_count, 16, "a de-indexed draw's vertex count"),
             (past_bytes, wide as u32, "a de-indexed draw's gathered vertices"),
         ] {
-            let ran = run(PrimType::Points, &[], false, Some(count), stride);
+            let ran = run(None, PrimType::Points, &[], false, Some(count), stride);
             assert!(
                 matches!(ran, Err(Fault::OutOfRange { what: w, .. }) if w == what),
                 "{count} vertices of stride {stride}: {ran:?}"

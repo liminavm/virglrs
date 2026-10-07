@@ -994,6 +994,12 @@ pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Res
                 return fail(format!("Unsupported system value {}", decl.semantic.name as u8));
             };
             ctx.shader_req_bits |= required_ext;
+            let glsl_name = match decl.semantic.name {
+                Semantic::VertexId if ctx.key.vs.vertex_id_from_input => {
+                    crate::vrend::shader::VERTEX_ID_INPUT
+                }
+                _ => glsl_name,
+            };
             ctx.system_values.push(Io {
                 name: decl.semantic.name,
                 sid: sindex,

@@ -3551,6 +3551,13 @@ SABOTAGES = [
         'an_image_loaded_and_stored_in_one_shader_is_read_and_written',
     ),
     (
+        'a de-indexed draw numbers its vertex IDs from zero',
+        'src/vrend/context/select.rs',
+        """        key.vs.vertex_id_from_input = stage == Vertex && self.deindexing;""",
+        """        key.vs.vertex_id_from_input = false && stage == Vertex && self.deindexing;""",
+        'an_indexed_draw_under_transform_feedback_captures_its_indexed_vertices',
+    ),
+    (
         'a GLES vertex stage leaves the point size to the driver as the C does',
         'src/vrend/context/select.rs',
         """        key.fixed_point_size = host.features.api().is_gles()""",

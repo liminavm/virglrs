@@ -273,6 +273,20 @@ pub struct FsKey {
 pub struct VsKey {
     pub attrib_zyxw_bitmask: u32,
     pub fog_fixup_mask: u32,
+    /// The draw is served as arrays over gathered vertices, which number `gl_VertexID` from
+    /// zero; the vertex ID is read from the `virgl_vertex_id` input the draw fills instead.
+    pub vertex_id_from_input: bool,
+}
+
+/// The name of the input a de-indexed draw passes each vertex's own ID through.
+pub const VERTEX_ID_INPUT: &str = "virgl_vertex_id";
+
+/// The location `VERTEX_ID_INPUT` is bound to: the lowest one the vertex shader's own inputs,
+/// `attrib_input_mask`, leave free. Fixed at link time and found again at the draw from the same
+/// mask, so the two cannot disagree. `None` when the shader uses every location.
+pub fn vertex_id_location(attrib_input_mask: u32, max_attribs: u32) -> Option<u32> {
+    let free = (!attrib_input_mask).trailing_zeros();
+    (free < max_attribs).then_some(free)
 }
 
 /// The geometry stage's part of the key (`vrend_shader_key.gs`).

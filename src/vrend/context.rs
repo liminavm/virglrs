@@ -522,6 +522,26 @@ pub struct Element {
     pub pure_integer: bool,
 }
 
+impl Element {
+    /// Set attribute `i` of the bound vertex array up as this element.
+    pub fn configure(&self, gl: &Gl, i: GLuint) {
+        if self.pure_integer {
+            gl.vertex_attrib_i_format(i, self.size, self.gl_type, self.base.src_offset);
+        } else {
+            gl.vertex_attrib_format(
+                i,
+                self.size,
+                self.gl_type,
+                self.normalized,
+                self.base.src_offset,
+            );
+        }
+        gl.vertex_attrib_binding(i, self.base.vertex_buffer_index);
+        gl.vertex_binding_divisor(i, self.base.instance_divisor);
+        gl.enable_vertex_attrib_array(i);
+    }
+}
+
 pub struct VertexElements {
     pub elements: Vec<Element>,
     /// The elements whose format is stored blue first and that the vertex shader must read
@@ -980,6 +1000,9 @@ pub struct SubContext {
     /// The last draw's primitive mode, which the fragment shader's key reads; the C's is zero
     /// until a draw, and zero is points.
     prim_mode: PrimType,
+    /// The last draw was served as arrays over gathered vertices (`deindex`), so its vertex
+    /// stage is the variant reading `gl_VertexID` from an input.
+    deindexing: bool,
     /// Every program linked for this sub-context, and the one the draws run.
     programs: Vec<LinkedProgram>,
     prog: Option<ProgramSlot>,
@@ -1058,6 +1081,7 @@ impl SubContext {
             tess_factors: [0.0; 6],
             shader_dirty: false,
             prim_mode: PrimType::Points,
+            deindexing: false,
             programs: Vec::new(),
             prog: None,
             next_program_serial: Cell::new(0),
@@ -2711,15 +2735,7 @@ impl Context {
             let vao = gl.gen_vertex_array();
             gl.bind_vertex_array(Some(vao));
             for (i, e) in v.elements.iter().enumerate() {
-                let i = i as GLuint;
-                if e.pure_integer {
-                    gl.vertex_attrib_i_format(i, e.size, e.gl_type, e.base.src_offset);
-                } else {
-                    gl.vertex_attrib_format(i, e.size, e.gl_type, e.normalized, e.base.src_offset);
-                }
-                gl.vertex_attrib_binding(i, e.base.vertex_buffer_index);
-                gl.vertex_binding_divisor(i, e.base.instance_divisor);
-                gl.enable_vertex_attrib_array(i);
+                e.configure(gl, i as GLuint);
             }
             v.vao = Some(vao);
         }

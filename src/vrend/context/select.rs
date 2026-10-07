@@ -518,6 +518,7 @@ impl SubContext {
         {
             key.vs.attrib_zyxw_bitmask = ve.zyxw_bitmask;
         }
+        key.vs.vertex_id_from_input = stage == Vertex && self.deindexing;
         key.gs_present = self.shaders[Geometry.index()].is_some() || stage == Geometry;
         key.tcs_present = self.has_stage(TessCtrl) || stage == TessCtrl;
         key.tes_present = self.shaders[TessEval.index()].is_some() || stage == TessEval;

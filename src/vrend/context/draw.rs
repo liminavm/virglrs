@@ -1033,14 +1033,19 @@ fn bind_fragment_outputs(
 }
 
 /// The vertex inputs' locations, told to `program` before its link, where the host binds
-/// attributes by location.
-fn bind_attrib_locations(gl: &Gl, features: &Features, program: ProgramName, vs: &shader::Info) {
-    if features.has(Feature::gles31_vertex_attrib_binding) {
+/// attributes by location -- with the vertex ID a de-indexed draw passes in at the first location
+/// they leave free, which a program without that input ignores.
+fn bind_attrib_locations(gl: &Gl, host: &Host<'_>, program: ProgramName, vs: &shader::Info) {
+    if host.features.has(Feature::gles31_vertex_attrib_binding) {
         let mut mask = vs.attrib_input_mask;
         while mask != 0 {
             let i = mask.trailing_zeros();
             mask &= mask - 1;
             gl.bind_attrib_location(program, i, &format!("in_{i}"));
+        }
+        let max = host.limits.max_vertex_attributes;
+        if let Some(at) = shader::vertex_id_location(vs.attrib_input_mask, max) {
+            gl.bind_attrib_location(program, at, shader::VERTEX_ID_INPUT);
         }
     }
 }
@@ -1069,7 +1074,7 @@ pub(super) fn link_separable(
         ShaderStage::Vertex | ShaderStage::Geometry | ShaderStage::TessEval => {
             set_stream_out_varyings(gl, program, info);
             if stage == ShaderStage::Vertex {
-                bind_attrib_locations(gl, features, program, info);
+                bind_attrib_locations(gl, host, program, info);
             }
             Ok(false)
         }
@@ -1140,7 +1145,7 @@ fn add_shader_program(
                 return Err(e);
             }
         };
-        bind_attrib_locations(gl, features, id, vs.info);
+        bind_attrib_locations(gl, host, id, vs.info);
         if let Err(log) = gl.link_program(id) {
             gl.delete_program(host.current.program(), id);
             eprintln!("[virglrs] vrend: error linking program:\n{log}");
@@ -2006,6 +2011,20 @@ impl Context {
         {
             sub.shader_dirty = true;
         }
+        // GLES before 3.2 refuses every indexed draw while transform feedback is active; see
+        // `deindex`. `geometry_shader` is that version or the extension that lifts the rule. A
+        // de-indexed draw's vertex stage reads its vertex ID from an input, another variant.
+        // The draw begins or resumes a current stream-out object's capture before it draws, so
+        // any current one is capturing by then.
+        let capturing = sub.current_so.is_some();
+        let deindexed = draw.indexed
+            && capturing
+            && features.api().is_gles()
+            && !features.has(Feature::geometry_shader);
+        if sub.deindexing != deindexed {
+            sub.deindexing = deindexed;
+            sub.shader_dirty = true;
+        }
         if sub.prim_mode != draw.mode {
             // Only a switch in or out of points changes the shader variants.
             if sub.prim_mode == PrimType::Points || draw.mode == PrimType::Points {
@@ -2162,14 +2181,7 @@ impl Context {
         }
 
         let mode = prim_mode(draw.mode);
-        // GLES before 3.2 refuses every indexed draw while transform feedback is active; see
-        // `deindex`. `geometry_shader` is that version or the extension that lifts the rule.
-        let sub = self.sub();
-        let capturing = sub.current_so.is_some_and(|i| sub.streamouts[i].xfb == Xfb::Started);
-        let deindexed = draw.indexed
-            && capturing
-            && features.api().is_gles()
-            && !features.has(Feature::geometry_shader);
+        let deindexed = self.sub().deindexing;
         if deindexed {
             if indirect.is_some() {
                 return Err(Fault::Unimplemented {
@@ -2427,6 +2439,30 @@ impl Context {
             gl.bind_vertex_buffer(slot as GLuint, Some(buf), 0, width as u32);
             made.push(buf);
         }
+        // Arrays number `gl_VertexID` from the run's first vertex, where the guest's draw numbered
+        // it by index: each gathered vertex's own ID goes in through the vertex stage's input, at
+        // the location it was linked at. Its binding is one no element reads and none sets a
+        // divisor on -- elements set theirs on the binding of their own number.
+        let sub = self.sub();
+        let inputs =
+            sub.bound_program(ShaderStage::Vertex).map_or(0, |vs| vs.info.attrib_input_mask);
+        let max = host.limits.max_vertex_attributes;
+        let at = shader::vertex_id_location(inputs, max);
+        let binding = (elements.len() as u32..max)
+            .find(|&b| elements.iter().all(|e| e.base.vertex_buffer_index != b));
+        let (Some(at), Some(binding)) = (at, binding) else {
+            return Err(Fault::OutOfRange { cmd, what: "a de-indexed draw's vertex ID attribute" });
+        };
+        let ids: Vec<u8> =
+            resolved.vertices.iter().flat_map(|&v| (v as i32).to_ne_bytes()).collect();
+        let buf = gl.gen_buffer();
+        gl.bind_buffer(GL_ARRAY_BUFFER, Some(buf));
+        gl.buffer_data(GL_ARRAY_BUFFER, &ids, GL_STREAM_DRAW);
+        gl.vertex_attrib_i_format(at, 1, GL_INT, 0);
+        gl.vertex_attrib_binding(at, binding);
+        gl.bind_vertex_buffer(binding, Some(buf), 0, 4);
+        gl.enable_vertex_attrib_array(at);
+        made.push(buf);
         gl.bind_buffer(GL_ARRAY_BUFFER, None);
 
         for run in &resolved.runs {
@@ -2451,11 +2487,26 @@ impl Context {
         for buf in made {
             gl.delete_buffer(buf);
         }
+        // The vertex ID's attribute is the guest's element of that number again, or nothing, and
+        // its binding holds nothing.
+        gl.bind_vertex_buffer(binding, None, 0, 0);
+        match elements_at(self.sub(), at) {
+            Some(e) => e.configure(gl, at),
+            None => gl.disable_vertex_attrib_array(at),
+        }
         // The guest's own buffers go back into the slots now, not at the next draw that finds
         // them dirty: the gathered ones are deleted, and a slot left naming one draws nothing.
         self.sub_mut().vbo_dirty = true;
         self.draw_bind_vertex_binding(host);
         Ok(())
+    }
+}
+
+/// The bound vertex elements' element `i`, which sets up attribute `i`.
+fn elements_at(sub: &SubContext, i: GLuint) -> Option<&Element> {
+    match sub.ve.and_then(|h| sub.objects.get(&h)) {
+        Some(Object::VertexElements(v)) => v.elements.get(i as usize),
+        _ => None,
     }
 }
 

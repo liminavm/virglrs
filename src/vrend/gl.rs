@@ -2188,6 +2188,11 @@ impl Gl {
         unsafe { self.t.glEnableVertexAttribArray()(index) };
     }
 
+    pub fn disable_vertex_attrib_array(&self, index: GLuint) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glDisableVertexAttribArray()(index) };
+    }
+
     // ---- samplers ----
 
     pub fn gen_sampler(&self) -> SamplerName {
