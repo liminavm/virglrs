@@ -3642,6 +3642,13 @@ SABOTAGES = [
         'a_texture_buffer_past_the_texel_limit_is_sized_as_the_limit',
     ),
     (
+        'a host with one vertex stream keeps transform_feedback3',
+        'src/vrend/features.rs',
+        """            if streams < 4 {""",
+        """            if streams < 1 {""",
+        'pipeline_statistics_and_overflow_queries_count_where_the_host_has_them',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",

@@ -356,6 +356,19 @@ impl Features {
                 );
             }
         }
+        // `VIRGL_CAP_TRANSFORM_FEEDBACK3` tells a guest it has four vertex streams, the GL 4.0
+        // minimum, but a driver may advertise the version with fewer. A guest told four then
+        // asks for a stream the host refuses.
+        if self.have.contains(Feature::transform_feedback3) {
+            let streams = gl.get_integer(super::gl::gles::GL_MAX_VERTEX_STREAMS);
+            if streams < 4 {
+                self.have.remove(Feature::transform_feedback3);
+                eprintln!(
+                    "[virglrs] vrend: transform_feedback3 advertised with {streams} vertex \
+                     streams, where the guest is told four: withdrawn"
+                );
+            }
+        }
     }
 
     pub fn has_extension(&self, name: &str) -> bool {
