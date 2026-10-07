@@ -3658,6 +3658,13 @@ SABOTAGES = [
         'an_indirect_draw_restarts_at_the_guest_s_restart_index',
     ),
     (
+        'the trace ring leaves a sliver smaller than a header at its end',
+        'src/trace.rs',
+        """        if tail_room >= need && tail_room - need < HEADER {""",
+        """        if false && tail_room >= need && tail_room - need < HEADER {""",
+        'a_256_byte_ring_stays_walkable',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",

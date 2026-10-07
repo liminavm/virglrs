@@ -355,6 +355,7 @@ struct Ring {
 }
 
 #[cfg_attr(not(feature = "trace"), allow(dead_code))]
+#[cfg_attr(test, derive(Clone))]
 struct State {
     buf: Vec<u8>,
     /// Where the next record goes, the oldest live record, and the bytes between them. A record
@@ -795,5 +796,116 @@ mod tests {
         });
         assert!(!called, "the bytes are not even copied");
         assert!(r.ring().is_none());
+    }
+}
+
+/// Every sequence of record sizes to a fixed depth, put into rings small enough that the
+/// sequences wrap, pad, absorb a sliver, evict and refuse. After every step the ring is walked
+/// from its oldest record and checked against a tally kept outside it: the walk covers exactly
+/// the bytes in use and ends where the next record goes, no record is split across the end, the
+/// records left are the newest ones accepted with their own payloads, and every record accepted
+/// is either there or counted as evicted. Record sizes are chosen by the guest, so a sequence
+/// that breaks the walk is one a guest could use to abort an armed renderer.
+#[cfg(test)]
+mod every_sequence {
+    use super::*;
+
+    /// What the ring has been asked to keep, kept apart from the ring.
+    #[derive(Clone, Default)]
+    struct Tally {
+        /// The payload length of every accepted record, by sequence.
+        accepted: Vec<usize>,
+        refused: u64,
+    }
+
+    /// Which of the cases the walk exists for it reached.
+    #[derive(Default)]
+    struct Reached {
+        pads: bool,
+        absorbed: bool,
+        evicted: bool,
+        refused: bool,
+        full: bool,
+    }
+
+    /// Walk `s` from its oldest record and check it against `t`.
+    fn check(s: &State, t: &Tally, reached: &mut Reached) {
+        let cap = s.buf.len();
+        let w = |at: usize| u32::from_le_bytes(s.buf[at..at + 4].try_into().unwrap()) as usize;
+        let q = |at: usize| u64::from_le_bytes(s.buf[at..at + 8].try_into().unwrap());
+        let (mut pos, mut walked, mut live) = (s.tail, 0, Vec::new());
+        while walked < s.used {
+            let total = w(pos);
+            assert!(total >= HEADER && total % 8 == 0, "a record at {pos} is {total} bytes");
+            assert!(total <= cap - pos, "the record at {pos} runs past the end");
+            if s.buf[pos + 4] == Kind::Pad as u8 {
+                assert_eq!(pos + total, cap, "a pad fills the end and nothing else");
+                reached.pads = true;
+            } else {
+                let (seq, plen) = (q(pos + 8), w(pos + 24));
+                assert_eq!(plen, t.accepted[seq as usize], "record {seq} keeps its length");
+                let payload = &s.buf[pos + HEADER..pos + HEADER + plen];
+                assert!(payload.iter().all(|&b| b == seq as u8), "record {seq} keeps its bytes");
+                let rounded = (HEADER + plen).next_multiple_of(8);
+                assert!(total == rounded || total - rounded < HEADER, "record {seq}'s slack");
+                reached.absorbed |= total != rounded;
+                live.push(seq);
+            }
+            walked += total;
+            pos = (pos + total) % cap;
+        }
+        assert_eq!(walked, s.used, "the walk covers exactly the bytes in use");
+        assert_eq!(pos, s.head, "the walk ends where the next record goes");
+        let accepted = t.accepted.len() as u64;
+        assert_eq!(s.seq, accepted);
+        assert_eq!(s.refused, t.refused);
+        assert_eq!(s.evicted + live.len() as u64, accepted, "kept or counted as evicted");
+        let newest: Vec<u64> = (accepted - live.len() as u64..accepted).collect();
+        assert_eq!(live, newest, "the records left are the newest accepted, in order");
+        reached.evicted |= s.evicted != 0;
+        reached.refused |= s.refused != 0;
+        reached.full |= s.used == cap;
+    }
+
+    /// Put each of `payloads` after `s` and recurse, `depth` more levels.
+    fn walk(s: &State, t: &Tally, payloads: &[usize], depth: usize, reached: &mut Reached) {
+        if depth == 0 {
+            return;
+        }
+        for &plen in payloads {
+            let (mut s, mut t) = (s.clone(), t.clone());
+            let seq = t.accepted.len();
+            if (HEADER + plen).next_multiple_of(8) > s.buf.len() / 2 {
+                t.refused += 1;
+            } else {
+                t.accepted.push(plen);
+            }
+            s.put(Kind::Command, 0, None, &[], &vec![seq as u8; plen]);
+            check(&s, &t, reached);
+            walk(&s, &t, payloads, depth - 1, reached);
+        }
+    }
+
+    fn sweep(cap: usize, depth: usize) {
+        let s = Ring::new(cap, None, 1).lock().clone();
+        // Every record size up to half the ring, one past it, and a payload that rounds up.
+        let mut payloads: Vec<usize> = (0..=cap / 2 - HEADER).step_by(8).collect();
+        payloads.extend([cap / 2 - HEADER + 8, 1]);
+        let mut reached = Reached::default();
+        walk(&s, &Tally::default(), &payloads, depth, &mut reached);
+        let Reached { pads, absorbed, evicted, refused, full } = reached;
+        assert!(pads && absorbed && evicted && refused && full, "cap {cap}: a case went unreached");
+    }
+
+    #[test]
+    fn a_256_byte_ring_stays_walkable() {
+        sweep(256, 6);
+    }
+
+    /// A capacity that is not a power of two puts the end of the ring where no power of two
+    /// would.
+    #[test]
+    fn a_200_byte_ring_stays_walkable() {
+        sweep(200, 6);
     }
 }
