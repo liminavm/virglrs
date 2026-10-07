@@ -75,6 +75,14 @@ pub enum Error {
     BoxOutOfRange,
     /// The pages do not hold the bytes the box and strides describe.
     IovOutOfRange,
+    /// The guest's row pitch is shorter than one row of the box.
+    StrideShort { stride: u64, row: u64 },
+    /// The guest's layer pitch is shorter than the box's rows at its row pitch.
+    LayerStrideShort { layer_stride: u64, layer: u64 },
+    /// The offset plus the bytes the box spans does not fit in 64 bits.
+    SpanOverflows { offset: u64, span: u64 },
+    /// The box ends past the pages.
+    PastPages { end: u64, pages: u64 },
     /// The resource has no pages attached and none were given.
     NoPages,
     /// A shape the host cannot serve: a format with no GL triple, a multisample upload.
@@ -94,6 +102,19 @@ impl fmt::Display for Error {
         match self {
             Error::BoxOutOfRange => f.write_str("the box is outside the resource"),
             Error::IovOutOfRange => f.write_str("the pages do not hold the transfer"),
+            Error::StrideShort { stride, row } => {
+                write!(f, "the stride {stride} is shorter than a row of the box ({row} bytes)")
+            }
+            Error::LayerStrideShort { layer_stride, layer } => write!(
+                f,
+                "the layer stride {layer_stride} is shorter than a layer of the box ({layer} bytes)"
+            ),
+            Error::SpanOverflows { offset, span } => {
+                write!(f, "the offset {offset} plus the box's {span} bytes overflows")
+            }
+            Error::PastPages { end, pages } => {
+                write!(f, "the box ends at byte {end}, past the pages' {pages}")
+            }
             Error::NoPages => f.write_str("the resource has no pages attached"),
             Error::Unsupported => f.write_str("the host cannot serve that transfer"),
             Error::NotReadable => f.write_str("the format cannot be read back"),
@@ -199,16 +220,18 @@ fn layout(res: &Resource, info: &Info, size: u64) -> Result<Layout, Error> {
     let blocks_wide = desc.blocks_wide(w) as u64;
     let blocks_high = desc.blocks_high(h) as u64;
     let stride = if info.stride != 0 {
-        if (info.stride as u64) < blocks_wide * block {
-            return Err(Error::IovOutOfRange);
+        let row = blocks_wide * block;
+        if (info.stride as u64) < row {
+            return Err(Error::StrideShort { stride: info.stride as u64, row });
         }
         info.stride as u64
     } else {
         desc.stride(res.width_at(info.level))
     };
     let layer_stride = if info.layer_stride != 0 {
-        if (info.layer_stride as u64) < blocks_high * stride {
-            return Err(Error::IovOutOfRange);
+        let layer = blocks_high * stride;
+        if (info.layer_stride as u64) < layer {
+            return Err(Error::LayerStrideShort { layer_stride: info.layer_stride as u64, layer });
         }
         info.layer_stride as u64
     } else {
@@ -223,9 +246,11 @@ fn layout(res: &Resource, info: &Info, size: u64) -> Result<Layout, Error> {
         layer_stride,
         compressed: desc.is_compressed(),
     };
-    let end = info.offset.checked_add(l.span()).ok_or(Error::IovOutOfRange)?;
+    let span = l.span();
+    let end =
+        info.offset.checked_add(span).ok_or(Error::SpanOverflows { offset: info.offset, span })?;
     if end > size {
-        return Err(Error::IovOutOfRange);
+        return Err(Error::PastPages { end, pages: size });
     }
     Ok(l)
 }
@@ -1595,5 +1620,69 @@ mod tests {
         };
         assert_eq!(l.span(), 2 * 1024 + 3 * 64 + 40);
         assert_eq!(l.total(), 40 * 4 * 3);
+    }
+
+    /// A 64x48 RGBA8 texture: 256-byte rows, 48 of them.
+    fn rgba_64x48() -> Resource {
+        use super::super::pipe::TextureTarget;
+        use super::super::resource::{Args, Bind, ResourceFlags};
+        Resource::unbacked(Args {
+            target: TextureTarget::Texture2d,
+            format: Format::from_wire(67).expect("R8G8B8A8_UNORM"),
+            bind: Bind::SAMPLER_VIEW,
+            width: 64,
+            height: 48,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: ResourceFlags::default(),
+        })
+    }
+
+    fn whole_box(stride: u32, layer_stride: u32, offset: u64) -> Info {
+        Info {
+            level: 0,
+            stride,
+            layer_stride,
+            offset,
+            region: Box3 { x: 0, y: 0, z: 0, width: 64, height: 48, depth: 1 },
+            synchronized: false,
+        }
+    }
+
+    /// Each bound the layout checks refuses with its own error, naming the two quantities it
+    /// compared, so a refused transfer in a log says which one failed and by how much.
+    #[test]
+    fn each_layout_bound_names_what_it_compared() {
+        let res = rgba_64x48();
+        let tight = 256 * 48;
+        assert!(layout(&res, &whole_box(0, 0, 0), tight).is_ok(), "the tight box fits");
+
+        assert_eq!(
+            layout(&res, &whole_box(255, 0, 0), u64::MAX).err(),
+            Some(Error::StrideShort { stride: 255, row: 256 })
+        );
+        assert_eq!(
+            layout(&res, &whole_box(256, 256 * 47, 0), u64::MAX).err(),
+            Some(Error::LayerStrideShort { layer_stride: 256 * 47, layer: 256 * 48 })
+        );
+        assert_eq!(
+            layout(&res, &whole_box(0, 0, u64::MAX - 10), u64::MAX).err(),
+            Some(Error::SpanOverflows { offset: u64::MAX - 10, span: tight })
+        );
+        assert_eq!(
+            layout(&res, &whole_box(0, 0, 16), tight).err(),
+            Some(Error::PastPages { end: tight + 16, pages: tight })
+        );
+    }
+
+    /// The messages carry the numbers; a bare "out of range" is what this replaced.
+    #[test]
+    fn a_layout_refusal_prints_both_quantities() {
+        let shown = Error::PastPages { end: 12304, pages: 12288 }.to_string();
+        assert!(shown.contains("12304") && shown.contains("12288"), "{shown}");
+        let shown = Error::StrideShort { stride: 255, row: 256 }.to_string();
+        assert!(shown.contains("255") && shown.contains("256"), "{shown}");
     }
 }
