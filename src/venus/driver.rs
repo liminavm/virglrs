@@ -86,6 +86,7 @@ use super::proto::types::{
     VkVertexInputAttributeDescription2EXT, VkVertexInputBindingDescription2EXT, VkViewport,
     VkWriteDescriptorSet,
 };
+use super::proto::types::{VkBufferImageCopy2, VkResolveImageModeInfoKHR, VkResolveModeFlagBits};
 use super::proto::types::{
     VkComputePipelineCreateInfo, VkDeferredOperationKHR, VkGraphicsPipelineCreateInfo,
     VkPhysicalDeviceProperties2, VkPhysicalDeviceRayTracingPipelinePropertiesKHR,
@@ -3545,7 +3546,7 @@ impl Driver {
         let d = &self.devices.get(&device).ok_or(NoHostCopy::Device)?.fns;
         let span = self.host_copy_span(
             info.srcImage,
-            &HostCopyRegion {
+            &MemoryRegion {
                 subresource: info.imageSubresource,
                 offset: info.imageOffset,
                 extent: info.imageExtent,
@@ -3616,7 +3617,7 @@ impl Driver {
         for r in regions {
             let span = self.host_copy_span(
                 info.dstImage,
-                &HostCopyRegion {
+                &MemoryRegion {
                     subresource: r.imageSubresource,
                     offset: r.imageOffset,
                     extent: r.imageExtent,
@@ -3668,100 +3669,16 @@ impl Driver {
     /// must also lie inside the image, because the driver does not check that either. An image
     /// this driver has no record of, a format vk.xml gives no block for, and an aspect the
     /// format does not have are each refused rather than guessed at.
-    fn host_copy_span(&self, image: VkImage, r: &HostCopyRegion) -> Result<u64, NoHostCopy> {
-        use crate::venus::proto::formats;
-        const DEPTH: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT.0 as u32;
-        const STENCIL: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_STENCIL_BIT.0 as u32;
-        const PLANES: [u32; 3] = [
-            VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_0_BIT.0 as u32,
-            VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_1_BIT.0 as u32,
-            VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_2_BIT.0 as u32,
-        ];
-        let bad = |why| Err(NoHostCopy::Region(why));
-        let Some(facts) = self.images.get(&image) else {
-            return bad("a host copy of an image this device never made");
-        };
-
-        // The block the copy lays out, and the size of the plane it walks, as the driver picks
-        // them: a lone depth or stencil aspect is copied as that aspect alone, a plane as its
-        // own format at its own size, and anything else as the whole format.
-        let aspect = r.subresource.aspectMask.0;
-        let (block, plane_w, plane_h) = if aspect == DEPTH {
-            let Some(bytes) = formats::depth_texel_bytes(facts.format) else {
-                return bad("a host copy of the depth of a format with none");
-            };
-            (formats::TexelBlock { bytes, width: 1, height: 1 }, facts.width, facts.height)
-        } else if aspect == STENCIL {
-            if !formats::has_stencil(facts.format) {
-                return bad("a host copy of the stencil of a format with none");
-            }
-            (formats::TexelBlock { bytes: 1, width: 1, height: 1 }, facts.width, facts.height)
-        } else if let Some(i) = PLANES.iter().position(|&p| p == aspect) {
-            let Some((format, w, h)) = formats::plane_of(facts.format, i as u32) else {
-                return bad("a host copy of a plane the format does not have");
-            };
-            let Some(block) = formats::texel_block(format) else {
-                return bad("a host copy of a plane whose format has no block");
-            };
-            (block, facts.width / w, facts.height / h)
-        } else {
-            let Some(block) = formats::texel_block(facts.format) else {
-                return bad("a host copy of a format with no block");
-            };
-            (block, facts.width, facts.height)
-        };
-
-        let level = r.subresource.mipLevel;
-        if level >= facts.mip_levels {
-            return bad("a host copy of a mip level the image does not have");
-        }
-        let base = r.subresource.baseArrayLayer;
-        let layers = if r.subresource.layerCount == u32::MAX {
-            facts.array_layers.saturating_sub(base)
-        } else {
-            r.subresource.layerCount
-        };
-        if layers == 0 || base.checked_add(layers).is_none_or(|end| end > facts.array_layers) {
-            return bad("a host copy of layers the image does not have");
-        }
-
-        // The region against the level it names, in each dimension.
-        let at_level = |size: u32| (size >> level).max(1);
-        let inside = |offset: i32, extent: u32, size: u32| {
-            u32::try_from(offset)
-                .ok()
-                .and_then(|o| o.checked_add(extent))
-                .is_some_and(|end| extent > 0 && end <= at_level(size))
-        };
-        let e = r.extent;
-        if !inside(r.offset.x, e.width, plane_w)
-            || !inside(r.offset.y, e.height, plane_h)
-            || !inside(r.offset.z, e.depth, facts.depth)
-        {
-            return bad("a host copy region outside the image");
-        }
-        let row_length = if r.row_length == 0 { e.width } else { r.row_length };
-        let image_height = if r.image_height == 0 { e.height } else { r.image_height };
-        if row_length < e.width || image_height < e.height {
-            return bad("a host copy whose memory rows are shorter than its region");
-        }
-
-        // The guest's own measure: whole rows, slices and layers up to the last, then the last
-        // row's own width. In u64, where none of it can wrap from u32 inputs.
-        let (bw, bh, bs) =
-            (u64::from(block.width), u64::from(block.height), u64::from(block.bytes));
-        let row = u64::from(row_length).div_ceil(bw) * bs;
-        let slice = u64::from(image_height).div_ceil(bh) * row;
-        let layer = u64::from(e.depth) * slice;
-        Ok((u64::from(layers) - 1) * layer
-            + (u64::from(e.depth) - 1) * slice
-            + (u64::from(e.height).div_ceil(bh) - 1) * row
-            + u64::from(e.width).div_ceil(bw) * bs)
+    fn host_copy_span(&self, image: VkImage, r: &MemoryRegion) -> Result<u64, NoHostCopy> {
+        let facts = self.facts();
+        let placed = facts.place(image, &r.subresource, Aspects::One)?;
+        placed.holds(r.offset, r.extent, 1)?;
+        Ok(placed.memory_span(r.extent, r.row_length, r.image_height)?)
     }
 
     /// What a [`cs::Validate`] check reads. See [`Facts`].
     pub fn facts(&self) -> Facts<'_> {
-        Facts { semaphores: &self.semaphores }
+        Facts { semaphores: &self.semaphores, images: &self.images, buffers: &self.buffers }
     }
 
     /// [`Driver::facts`] for the device `cb` records for, or `None` for a command buffer with no
@@ -4675,6 +4592,12 @@ impl Driver {
                 query_types: enabled_query_types(&[], true),
             },
         );
+    }
+
+    /// Record an image as `vkCreateImage` would have, without a driver to make it.
+    #[cfg(test)]
+    pub(super) fn plant_image(&mut self, image: VkImage, info: &VkImageCreateInfo) {
+        self.note_image(image, info);
     }
 
     /// Give a planted device the query types `vkCreateDevice` would have read off what the guest
@@ -6566,9 +6489,16 @@ impl Driver {
         dst: VkImage,
         layout: VkImageLayout,
         regions: &[VkBufferImageCopy],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above; the count is the slice's own length.
+    ) -> Result<(), RecordRefused> {
+        let facts = self.facts();
+        for r in regions {
+            facts
+                .buffer_image_region(src, dst, r.bufferOffset, &MemoryRegion::of_buffer_copy(r))
+                .map_err(RecordRefused::Invalid)?;
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, and every region is held to
+        // the image and the buffer above.
         unsafe {
             (d.vkCmdCopyBufferToImage())(
                 cb,
@@ -6579,7 +6509,7 @@ impl Driver {
                 regions.as_ptr(),
             )
         };
-        Some(())
+        Ok(())
     }
 
     /// The mirror of [`Self::cmd_copy_buffer_to_image`]: the image is the source, so it is the
@@ -6591,9 +6521,16 @@ impl Driver {
         layout: VkImageLayout,
         dst: VkBuffer,
         regions: &[VkBufferImageCopy],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above; the count is the slice's own length.
+    ) -> Result<(), RecordRefused> {
+        let facts = self.facts();
+        for r in regions {
+            facts
+                .buffer_image_region(dst, src, r.bufferOffset, &MemoryRegion::of_buffer_copy(r))
+                .map_err(RecordRefused::Invalid)?;
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, and every region is held to
+        // the image and the buffer above.
         unsafe {
             (d.vkCmdCopyImageToBuffer())(
                 cb,
@@ -6604,7 +6541,7 @@ impl Driver {
                 regions.as_ptr(),
             )
         };
-        Some(())
+        Ok(())
     }
 
     /// The unscaled sibling of [`Self::cmd_blit_image`]: the regions name one extent, not a
@@ -6617,9 +6554,25 @@ impl Driver {
         dst: VkImage,
         dst_layout: VkImageLayout,
         regions: &[VkImageCopy],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above; the count is the slice's own length.
+    ) -> Result<(), RecordRefused> {
+        let facts = self.facts();
+        for r in regions {
+            facts
+                .image_region(
+                    Aspects::DepthStencil,
+                    src,
+                    &r.srcSubresource,
+                    r.srcOffset,
+                    dst,
+                    &r.dstSubresource,
+                    r.dstOffset,
+                    r.extent,
+                )
+                .map_err(RecordRefused::Invalid)?;
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, and every region is held to
+        // both images above.
         unsafe {
             (d.vkCmdCopyImage())(
                 cb,
@@ -6631,7 +6584,7 @@ impl Driver {
                 regions.as_ptr(),
             )
         };
-        Some(())
+        Ok(())
     }
 
     // Vulkan's own signature: the two images each carry a layout, and the filter is a
@@ -6646,9 +6599,23 @@ impl Driver {
         dst_layout: VkImageLayout,
         regions: &[VkImageBlit],
         filter: VkFilter,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above; the count is the slice's own length.
+    ) -> Result<(), RecordRefused> {
+        let facts = self.facts();
+        for r in regions {
+            facts
+                .blit_region(
+                    src,
+                    &r.srcSubresource,
+                    &r.srcOffsets,
+                    dst,
+                    &r.dstSubresource,
+                    &r.dstOffsets,
+                )
+                .map_err(RecordRefused::Invalid)?;
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, and every region is held to
+        // both images above.
         unsafe {
             (d.vkCmdBlitImage())(
                 cb,
@@ -6661,7 +6628,7 @@ impl Driver {
                 filter,
             )
         };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_clear_color_image(
@@ -6706,7 +6673,7 @@ impl Driver {
     pub fn cmd_copy_image2(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkCopyImageInfo2>,
+        info: cs::Decoded<'_, VkCopyImageInfo2, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdCopyImage2()?;
         // SAFETY: as above; `info` and every array it points at are arena allocations live for
@@ -6719,7 +6686,7 @@ impl Driver {
     pub fn cmd_copy_buffer_to_image2(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkCopyBufferToImageInfo2>,
+        info: cs::Decoded<'_, VkCopyBufferToImageInfo2, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdCopyBufferToImage2()?;
         // SAFETY: as above; `info` and every array it points at are arena allocations live for
@@ -6732,7 +6699,7 @@ impl Driver {
     pub fn cmd_copy_image_to_buffer2(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkCopyImageToBufferInfo2>,
+        info: cs::Decoded<'_, VkCopyImageToBufferInfo2, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdCopyImageToBuffer2()?;
         // SAFETY: as above; `info` and every array it points at are arena allocations live for
@@ -6745,7 +6712,7 @@ impl Driver {
     pub fn cmd_blit_image2(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkBlitImageInfo2>,
+        info: cs::Decoded<'_, VkBlitImageInfo2, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdBlitImage2()?;
         // SAFETY: as above; `info` and every array it points at are arena allocations live for
@@ -6758,7 +6725,7 @@ impl Driver {
     pub fn cmd_resolve_image2(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkResolveImageInfo2>,
+        info: cs::Decoded<'_, VkResolveImageInfo2, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdResolveImage2()?;
         // SAFETY: as above; `info` and every array it points at are arena allocations live for
@@ -7328,9 +7295,25 @@ impl Driver {
         dst: VkImage,
         dst_layout: VkImageLayout,
         regions: &[VkImageResolve],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above; the count is the slice's own length.
+    ) -> Result<(), RecordRefused> {
+        let facts = self.facts();
+        for r in regions {
+            facts
+                .image_region(
+                    Aspects::One,
+                    src,
+                    &r.srcSubresource,
+                    r.srcOffset,
+                    dst,
+                    &r.dstSubresource,
+                    r.dstOffset,
+                    r.extent,
+                )
+                .map_err(RecordRefused::Invalid)?;
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, and every region is held to
+        // both images above.
         unsafe {
             (d.vkCmdResolveImage())(
                 cb,
@@ -7342,7 +7325,7 @@ impl Driver {
                 regions.as_ptr(),
             )
         };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdUpdateBuffer`, whose `dataSize` is the length of the bytes and nothing else -- the
@@ -8853,6 +8836,7 @@ impl Driver {
         self.images.insert(
             image,
             ImageFacts {
+                image_type: info.imageType,
                 width: info.extent.width,
                 height: info.extent.height,
                 depth: info.extent.depth,
@@ -9416,6 +9400,9 @@ enum Scanout {
 /// What an image was created as, for a scanout surface that has to match it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ImageFacts {
+    /// 3D or not decides whether a region's depth is slices or layers; depth alone cannot say,
+    /// since a 3D image may be one slice deep.
+    image_type: VkImageType,
     width: u32,
     height: u32,
     depth: u32,
@@ -10392,8 +10379,9 @@ pub enum NotATimeline {
     Malformed,
 }
 
-/// One region of a host image copy, in the shape both directions share.
-struct HostCopyRegion {
+/// One region of an image copied to or from memory -- a buffer, or the bytes of a host image copy
+/// -- in the shape every direction shares.
+struct MemoryRegion {
     subresource: VkImageSubresourceLayers,
     offset: VkOffset3D,
     extent: VkExtent3D,
@@ -10414,11 +10402,440 @@ pub enum NoHostCopy {
     Region(&'static str),
 }
 
+impl MemoryRegion {
+    fn of_buffer_copy(r: &VkBufferImageCopy) -> Self {
+        MemoryRegion {
+            subresource: r.imageSubresource,
+            offset: r.imageOffset,
+            extent: r.imageExtent,
+            row_length: r.bufferRowLength,
+            image_height: r.bufferImageHeight,
+        }
+    }
+
+    fn of_buffer_copy2(r: &VkBufferImageCopy2) -> Self {
+        MemoryRegion {
+            subresource: r.imageSubresource,
+            offset: r.imageOffset,
+            extent: r.imageExtent,
+            row_length: r.bufferRowLength,
+            image_height: r.bufferImageHeight,
+        }
+    }
+}
+
+/// The regions of a `VK_KHR_copy_commands2` info, as the decoder built them.
+fn regions_of<'a, T, R>(_info: &cs::Decoded<'a, T>, count: u32, regions: *const R) -> &'a [R] {
+    // SAFETY: `_info` is `Decoded`, so the decoder allocated its region array from the batch
+    // arena sized to the count beside it (see `Decoded::vouch`), and the arena outlives `'a`.
+    // `wire_array` is the same reconciliation the generated accessors use.
+    unsafe { cs::wire_array(count as usize, regions) }.unwrap_or_default()
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkCopyBufferToImageInfo2 {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        regions_of(&this, this.regionCount, this.pRegions).iter().try_for_each(|r| {
+            let region = MemoryRegion::of_buffer_copy2(r);
+            facts.facts.buffer_image_region(this.srcBuffer, this.dstImage, r.bufferOffset, &region)
+        })
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkCopyImageToBufferInfo2 {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        regions_of(&this, this.regionCount, this.pRegions).iter().try_for_each(|r| {
+            let region = MemoryRegion::of_buffer_copy2(r);
+            facts.facts.buffer_image_region(this.dstBuffer, this.srcImage, r.bufferOffset, &region)
+        })
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkCopyImageInfo2 {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        regions_of(&this, this.regionCount, this.pRegions).iter().try_for_each(|r| {
+            facts.facts.image_region(
+                Aspects::DepthStencil,
+                this.srcImage,
+                &r.srcSubresource,
+                r.srcOffset,
+                this.dstImage,
+                &r.dstSubresource,
+                r.dstOffset,
+                r.extent,
+            )
+        })
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkResolveImageInfo2 {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        regions_of(&this, this.regionCount, this.pRegions).iter().try_for_each(|r| {
+            facts.facts.image_region(
+                Aspects::One,
+                this.srcImage,
+                &r.srcSubresource,
+                r.srcOffset,
+                this.dstImage,
+                &r.dstSubresource,
+                r.dstOffset,
+                r.extent,
+            )
+        })
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkBlitImageInfo2 {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        regions_of(&this, this.regionCount, this.pRegions).iter().try_for_each(|r| {
+            facts.facts.blit_region(
+                this.srcImage,
+                &r.srcSubresource,
+                &r.srcOffsets,
+                this.dstImage,
+                &r.dstSubresource,
+                &r.dstOffsets,
+            )
+        })
+    }
+}
+
+/// The Mesa runtime's meta resolve builds its shader by switching on these modes, and any it does
+/// not list is `UNREACHABLE`: so each is one of the four it does, or none.
+impl<F: ?Sized> cs::Validate<cs::Chained<'_, VkResolveImageInfo2, F>>
+    for VkResolveImageModeInfoKHR
+{
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _on: &cs::Chained<'_, VkResolveImageInfo2, F>,
+    ) -> Result<(), &'static str> {
+        const SERVED: [VkResolveModeFlagBits; 5] = [
+            VkResolveModeFlagBits::VK_RESOLVE_MODE_NONE,
+            VkResolveModeFlagBits::VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+            VkResolveModeFlagBits::VK_RESOLVE_MODE_AVERAGE_BIT,
+            VkResolveModeFlagBits::VK_RESOLVE_MODE_MIN_BIT,
+            VkResolveModeFlagBits::VK_RESOLVE_MODE_MAX_BIT,
+        ];
+        if !SERVED.contains(&this.resolveMode) || !SERVED.contains(&this.stencilResolveMode) {
+            return Err("resolved by a mode the runtime has no shader for");
+        }
+        Ok(())
+    }
+}
+
+impl From<&'static str> for NoHostCopy {
+    fn from(why: &'static str) -> Self {
+        NoHostCopy::Region(why)
+    }
+}
+
+/// Which aspects one side of a region may name at once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Aspects {
+    /// Exactly one: a buffer or host copy, a blit, a resolve.
+    One,
+    /// One, or depth and stencil together: an image-to-image copy.
+    DepthStencil,
+}
+
+/// One side of a region, placed in the image it names: the image's record, the texel block the
+/// region is counted in and the size of the plane it walks at level 0, and the level and layers
+/// it covers. Only [`Facts::place`] makes one, so every one has been held to its image.
+struct Placed<'d> {
+    image: &'d ImageFacts,
+    block: crate::venus::proto::formats::TexelBlock,
+    width: u32,
+    height: u32,
+    level: u32,
+    layers: u32,
+}
+
+/// The block `aspect` of an image is counted in, and the size of the plane it walks at level 0.
+///
+/// The aspect must be one the format has. KosmicKrisp turns an aspect into an index into the
+/// image's planes and only asserts that the image has it, so `PLANE_1` on a single-plane image
+/// reads past the end of that array on the CPU.
+fn aspect_block(
+    image: &ImageFacts,
+    aspect: u32,
+    aspects: Aspects,
+) -> Result<(crate::venus::proto::formats::TexelBlock, u32, u32), &'static str> {
+    use crate::venus::proto::formats::{self, TexelBlock};
+    const COLOR: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32;
+    const DEPTH: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT.0 as u32;
+    const STENCIL: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_STENCIL_BIT.0 as u32;
+    const PLANES: [u32; 3] = [
+        VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_0_BIT.0 as u32,
+        VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_1_BIT.0 as u32,
+        VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_2_BIT.0 as u32,
+    ];
+    let (w, h) = (image.width, image.height);
+    let depth = formats::depth_texel_bytes(image.format);
+    let stencil = formats::has_stencil(image.format);
+    let planar = formats::plane_of(image.format, 0).is_some();
+    let whole = || formats::texel_block(image.format).ok_or("named a format with no texel block");
+    let texel = |bytes| TexelBlock { bytes, width: 1, height: 1 };
+    match aspect {
+        DEPTH => Ok((texel(depth.ok_or("named the depth of a format with none")?), w, h)),
+        STENCIL if stencil => Ok((texel(1), w, h)),
+        STENCIL => Err("named the stencil of a format with none"),
+        both if both == DEPTH | STENCIL && aspects == Aspects::DepthStencil => {
+            if depth.is_none() || !stencil {
+                return Err("named depth and stencil of a format without both");
+            }
+            Ok((whole()?, w, h))
+        }
+        COLOR if depth.is_none() && !stencil && !planar => Ok((whole()?, w, h)),
+        COLOR => Err("named the color of a depth, stencil or planar format"),
+        plane => {
+            let Some(i) = PLANES.iter().position(|&p| p == plane) else {
+                return Err("named aspects a region cannot name");
+            };
+            let (format, across, down) = formats::plane_of(image.format, i as u32)
+                .ok_or("named a plane the format does not have")?;
+            let block = formats::texel_block(format).ok_or("named a plane with no texel block")?;
+            Ok((block, w / across, h / down))
+        }
+    }
+}
+
+impl Placed<'_> {
+    fn is_3d(&self) -> bool {
+        self.image.image_type == VkImageType::VK_IMAGE_TYPE_3D
+    }
+
+    /// The level's size along each axis, rounded up to whole blocks: a region may end at the
+    /// edge of a level whose size is not a block multiple, and is counted in blocks there. A flat
+    /// image is one slice deep.
+    fn level_size(&self) -> (u32, u32, u32) {
+        let at = |size: u32| (size >> self.level).max(1);
+        let depth = if self.is_3d() { at(self.image.depth) } else { 1 };
+        (
+            at(self.width).next_multiple_of(self.block.width),
+            at(self.height).next_multiple_of(self.block.height),
+            depth,
+        )
+    }
+
+    /// Whether `offset` .. `offset + extent` lies inside the level, starting on a block.
+    ///
+    /// A flat image's region is `flat_depth` deep at depth zero: one, or -- in a copy whose other
+    /// side is 3D -- as many as the layers it stands for. The driver walks a 3D image's region in
+    /// slices and a flat one's in layers, and checks neither.
+    fn holds(
+        &self,
+        offset: VkOffset3D,
+        extent: VkExtent3D,
+        flat_depth: u32,
+    ) -> Result<(), &'static str> {
+        let (w, h, d) = self.level_size();
+        let inside = |o: i32, e: u32, size: u32| {
+            u32::try_from(o)
+                .ok()
+                .and_then(|o| o.checked_add(e))
+                .is_some_and(|end| e > 0 && end <= size)
+        };
+        if !inside(offset.x, extent.width, w) || !inside(offset.y, extent.height, h) {
+            return Err("named a region outside the image");
+        }
+        if !(offset.x as u32).is_multiple_of(self.block.width)
+            || !(offset.y as u32).is_multiple_of(self.block.height)
+        {
+            return Err("named a region that starts inside a texel block");
+        }
+        if self.is_3d() {
+            if !inside(offset.z, extent.depth, d) {
+                return Err("named a region outside the image");
+            }
+        } else if offset.z != 0 || extent.depth != flat_depth {
+            return Err("named a depth a flat image does not have");
+        }
+        Ok(())
+    }
+
+    /// Whether every coordinate of a blit's corner lies inside the level: a blit names its region
+    /// by two corners in either order, each an inclusive end, and a flat image's lie at depth zero
+    /// and one.
+    fn holds_corner(&self, corner: VkOffset3D) -> Result<(), &'static str> {
+        let (w, h, d) = self.level_size();
+        let within = |c: i32, size: u32| u32::try_from(c).is_ok_and(|c| c <= size);
+        if within(corner.x, w) && within(corner.y, h) && within(corner.z, d) {
+            Ok(())
+        } else {
+            Err("blitted a corner outside the image")
+        }
+    }
+
+    /// The bytes of memory a region spans, laid out as the guest's rows and slices say -- the
+    /// guest's own measure: whole rows, slices and layers up to the last, then the last row's own
+    /// width. In u64, where none of it can wrap from u32 inputs.
+    fn memory_span(
+        &self,
+        extent: VkExtent3D,
+        row_length: u32,
+        image_height: u32,
+    ) -> Result<u64, &'static str> {
+        let row_length = if row_length == 0 { extent.width } else { row_length };
+        let image_height = if image_height == 0 { extent.height } else { image_height };
+        if row_length < extent.width || image_height < extent.height {
+            return Err("copied through memory rows shorter than its region");
+        }
+        let (bw, bh, bs) = (
+            u64::from(self.block.width),
+            u64::from(self.block.height),
+            u64::from(self.block.bytes),
+        );
+        let row = u64::from(row_length).div_ceil(bw) * bs;
+        let slice = u64::from(image_height).div_ceil(bh) * row;
+        let layer = u64::from(extent.depth) * slice;
+        Ok((u64::from(self.layers) - 1) * layer
+            + (u64::from(extent.depth) - 1) * slice
+            + (u64::from(extent.height).div_ceil(bh) - 1) * row
+            + u64::from(extent.width).div_ceil(bw) * bs)
+    }
+}
+
+/// Every region check in one place. A region is the guest's coordinates in an image the driver
+/// hands to Metal or a meta shader as they are -- a level, layers, an origin and a size -- and
+/// KosmicKrisp checks none of them, nor the buffer range a buffer side walks.
+impl Facts<'_> {
+    /// Place `sub` in `image`: a record of the image, an aspect it has, a level and layers it has.
+    fn place(
+        &self,
+        image: VkImage,
+        sub: &VkImageSubresourceLayers,
+        aspects: Aspects,
+    ) -> Result<Placed<'_>, &'static str> {
+        let Some(facts) = self.images.get(&image) else {
+            return Err("named an image this renderer has no record of");
+        };
+        let (block, width, height) = aspect_block(facts, sub.aspectMask.0, aspects)?;
+        if sub.mipLevel >= facts.mip_levels {
+            return Err("named a mip level the image does not have");
+        }
+        // `VK_REMAINING_ARRAY_LAYERS`, which maintenance5 lets a region name.
+        let layers = if sub.layerCount == u32::MAX {
+            facts.array_layers.saturating_sub(sub.baseArrayLayer)
+        } else {
+            sub.layerCount
+        };
+        if layers == 0
+            || sub.baseArrayLayer.checked_add(layers).is_none_or(|e| e > facts.array_layers)
+        {
+            return Err("named layers the image does not have");
+        }
+        Ok(Placed { image: facts, block, width, height, level: sub.mipLevel, layers })
+    }
+
+    /// A buffer-image copy region: inside the image, and the bytes it spans inside the buffer.
+    fn buffer_image_region(
+        &self,
+        buffer: VkBuffer,
+        image: VkImage,
+        buffer_offset: VkDeviceSize,
+        r: &MemoryRegion,
+    ) -> Result<(), &'static str> {
+        let placed = self.place(image, &r.subresource, Aspects::One)?;
+        placed.holds(r.offset, r.extent, 1)?;
+        let span = placed.memory_span(r.extent, r.row_length, r.image_height)?;
+        let Some(&len) = self.buffers.get(&buffer) else {
+            return Err("copied through a buffer this renderer has no record of");
+        };
+        if buffer_offset.0.checked_add(span).is_none_or(|end| end > len) {
+            return Err("copied past the end of a buffer");
+        }
+        Ok(())
+    }
+
+    /// An image-to-image region: each side inside its image. The extent is in the source's
+    /// texels, and covers as many of the destination's blocks as of the source's, so a copy
+    /// between a compressed format and an uncompressed one of the same block size is scaled. A
+    /// flat side facing a 3D one stands its layers for the other's slices; two flat sides copy as
+    /// many layers each.
+    #[allow(clippy::too_many_arguments)]
+    fn image_region(
+        &self,
+        aspects: Aspects,
+        src: VkImage,
+        src_sub: &VkImageSubresourceLayers,
+        src_offset: VkOffset3D,
+        dst: VkImage,
+        dst_sub: &VkImageSubresourceLayers,
+        dst_offset: VkOffset3D,
+        extent: VkExtent3D,
+    ) -> Result<(), &'static str> {
+        let s = self.place(src, src_sub, aspects)?;
+        let d = self.place(dst, dst_sub, aspects)?;
+        let scale = |e: u32, from: u32, to: u32| e.div_ceil(from).checked_mul(to);
+        let dst_extent = VkExtent3D {
+            width: scale(extent.width, s.block.width, d.block.width)
+                .ok_or("copied a region outside the image")?,
+            height: scale(extent.height, s.block.height, d.block.height)
+                .ok_or("copied a region outside the image")?,
+            depth: extent.depth,
+        };
+        s.holds(src_offset, extent, if d.is_3d() { s.layers } else { 1 })?;
+        d.holds(dst_offset, dst_extent, if s.is_3d() { d.layers } else { 1 })?;
+        if !s.is_3d() && !d.is_3d() && s.layers != d.layers {
+            return Err("copied between different numbers of layers");
+        }
+        Ok(())
+    }
+
+    /// A blit region: each side's two corners inside its image, as many layers each, and neither
+    /// image compressed or planar -- the meta path samples texels, and has no block to read.
+    fn blit_region(
+        &self,
+        src: VkImage,
+        src_sub: &VkImageSubresourceLayers,
+        src_corners: &[VkOffset3D; 2],
+        dst: VkImage,
+        dst_sub: &VkImageSubresourceLayers,
+        dst_corners: &[VkOffset3D; 2],
+    ) -> Result<(), &'static str> {
+        use crate::venus::proto::formats;
+        let mut layers = [0; 2];
+        for (side, (image, sub, corners)) in
+            [(src, src_sub, src_corners), (dst, dst_sub, dst_corners)].into_iter().enumerate()
+        {
+            let p = self.place(image, sub, Aspects::One)?;
+            if p.block.width != 1
+                || p.block.height != 1
+                || formats::plane_of(p.image.format, 0).is_some()
+            {
+                return Err("blitted a compressed or planar image");
+            }
+            corners.iter().try_for_each(|&c| p.holds_corner(c))?;
+            layers[side] = p.layers;
+        }
+        if layers[0] != layers[1] {
+            return Err("blitted between different numbers of layers");
+        }
+        Ok(())
+    }
+}
+
 /// The driver's records a [`cs::Validate`] check reads: what each object was made as, and what
 /// each device allows. Read-only, and nothing in it reaches Vulkan, so a check cannot do more than
 /// answer.
 pub struct Facts<'d> {
     semaphores: &'d BTreeMap<VkSemaphore, SemaphoreFacts>,
+    images: &'d BTreeMap<VkImage, ImageFacts>,
+    buffers: &'d BTreeMap<VkBuffer, u64>,
 }
 
 /// [`Facts`], with the limits of the one device a command records or runs on. A check that holds
@@ -11452,6 +11869,347 @@ mod tests {
             arrayLayers: 2,
             ..Default::default()
         }
+    }
+
+    /// A region is held to the image it names -- an aspect the format has, a level and layers
+    /// the image has, a box inside the level that starts on a block -- and a buffer side to the
+    /// bytes the buffer holds. The shapes real guests send pass: a whole level, an edge copy of a
+    /// compressed mip whose size is no block multiple, depth and stencil together in an image
+    /// copy, a 2D array's layers copied into a 3D image's slices, a blit's corners in either order.
+    #[test]
+    fn regions_are_held_inside_their_images_and_buffers() {
+        use crate::venus::proto::types::{VkExtent3D, VkImageCreateInfo, VkImageSubresourceLayers};
+        const DEVICE: VkDevice = VkDevice::forged(0x94);
+        const RGBA: VkImage = VkImage::forged(0xa1);
+        const CUBE: VkImage = VkImage::forged(0xa2);
+        const BC1: VkImage = VkImage::forged(0xa3);
+        const DS: VkImage = VkImage::forged(0xa4);
+        const NV12: VkImage = VkImage::forged(0xa5);
+        const RGBA16: VkImage = VkImage::forged(0xa6);
+        const BUF: VkBuffer = VkBuffer::forged(0xb1);
+        type F = VkFormat;
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        let image =
+            |ty: VkImageType, format: F, (width, height, depth), mips, layers| VkImageCreateInfo {
+                imageType: ty,
+                format,
+                extent: VkExtent3D { width, height, depth },
+                mipLevels: mips,
+                arrayLayers: layers,
+                ..Default::default()
+            };
+        let flat = VkImageType::VK_IMAGE_TYPE_2D;
+        d.plant_image(RGBA, &image(flat, F::VK_FORMAT_R8G8B8A8_UNORM, (64, 64, 1), 3, 4));
+        let deep = VkImageType::VK_IMAGE_TYPE_3D;
+        d.plant_image(CUBE, &image(deep, F::VK_FORMAT_R8G8B8A8_UNORM, (16, 16, 8), 1, 1));
+        d.plant_image(BC1, &image(flat, F::VK_FORMAT_BC1_RGBA_UNORM_BLOCK, (10, 10, 1), 2, 1));
+        d.plant_image(DS, &image(flat, F::VK_FORMAT_D24_UNORM_S8_UINT, (32, 32, 1), 1, 1));
+        let nv12 = F::VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+        d.plant_image(NV12, &image(flat, nv12, (64, 64, 1), 1, 1));
+        d.plant_image(RGBA16, &image(flat, F::VK_FORMAT_R16G16B16A16_UNORM, (16, 16, 1), 1, 1));
+        d.plant_buffer(BUF, 1 << 20);
+
+        let aspect = |bits: u32| VkImageAspectFlags(bits);
+        const COLOR: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32;
+        const DEPTH: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT.0 as u32;
+        const STENCIL: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_STENCIL_BIT.0 as u32;
+        const PLANE_1: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_1_BIT.0 as u32;
+        let sub = |bits, level, base, layers| VkImageSubresourceLayers {
+            aspectMask: aspect(bits),
+            mipLevel: level,
+            baseArrayLayer: base,
+            layerCount: layers,
+        };
+        let at = |x, y, z| VkOffset3D { x, y, z };
+        let size = |width, height, depth| VkExtent3D { width, height, depth };
+        let facts = d.facts();
+        let to_buffer = |image, s, offset, extent, buffer_offset: u64| {
+            let r = MemoryRegion { subresource: s, offset, extent, row_length: 0, image_height: 0 };
+            facts.buffer_image_region(BUF, image, VkDeviceSize(buffer_offset), &r)
+        };
+        let whole = sub(COLOR, 0, 0, 1);
+        assert_eq!(to_buffer(RGBA, whole, at(0, 0, 0), size(64, 64, 1), 0), Ok(()), "a level");
+        assert!(to_buffer(RGBA, whole, at(0, 0, 0), size(64, 64, 1), (1 << 20) - 1).is_err());
+        assert!(to_buffer(RGBA, whole, at(60, 0, 0), size(8, 1, 1), 0).is_err(), "past x");
+        assert!(to_buffer(RGBA, whole, at(-1, 0, 0), size(1, 1, 1), 0).is_err(), "before x");
+        assert!(to_buffer(RGBA, whole, at(0, 0, 0), size(0, 1, 1), 0).is_err(), "empty");
+        assert!(to_buffer(RGBA, whole, at(0, 0, 0), size(1, 1, 2), 0).is_err(), "deep, flat");
+        assert!(to_buffer(RGBA, whole, at(0, 0, 1), size(1, 1, 1), 0).is_err(), "z, flat");
+        assert_eq!(to_buffer(RGBA, sub(COLOR, 1, 0, 1), at(0, 0, 0), size(32, 32, 1), 0), Ok(()));
+        assert!(to_buffer(RGBA, sub(COLOR, 1, 0, 1), at(0, 0, 0), size(33, 1, 1), 0).is_err());
+        assert!(to_buffer(RGBA, sub(COLOR, 3, 0, 1), at(0, 0, 0), size(1, 1, 1), 0).is_err());
+        assert!(to_buffer(RGBA, sub(COLOR, 0, 3, 2), at(0, 0, 0), size(1, 1, 1), 0).is_err());
+        assert_eq!(
+            to_buffer(RGBA, sub(COLOR, 0, 2, u32::MAX), at(0, 0, 0), size(1, 1, 1), 0),
+            Ok(())
+        );
+        assert!(
+            to_buffer(RGBA, sub(COLOR, 0, 4, u32::MAX), at(0, 0, 0), size(1, 1, 1), 0).is_err()
+        );
+        assert!(to_buffer(RGBA, sub(PLANE_1, 0, 0, 1), at(0, 0, 0), size(1, 1, 1), 0).is_err());
+        assert!(to_buffer(RGBA, sub(0, 0, 0, 1), at(0, 0, 0), size(1, 1, 1), 0).is_err());
+        assert!(to_buffer(DS, sub(COLOR, 0, 0, 1), at(0, 0, 0), size(1, 1, 1), 0).is_err());
+        assert_eq!(to_buffer(DS, sub(DEPTH, 0, 0, 1), at(0, 0, 0), size(32, 32, 1), 0), Ok(()));
+        assert_eq!(to_buffer(DS, sub(STENCIL, 0, 0, 1), at(0, 0, 0), size(32, 32, 1), 0), Ok(()));
+        assert!(
+            to_buffer(DS, sub(DEPTH | STENCIL, 0, 0, 1), at(0, 0, 0), size(1, 1, 1), 0).is_err(),
+            "one aspect at a time through a buffer"
+        );
+        // Level 1 of a 10-wide BC1 image is 5 texels: two blocks, and a copy ends at the edge.
+        let bc = sub(COLOR, 1, 0, 1);
+        assert_eq!(to_buffer(BC1, bc, at(0, 0, 0), size(5, 5, 1), 0), Ok(()), "edge copy");
+        assert_eq!(to_buffer(BC1, bc, at(4, 4, 0), size(1, 1, 1), 0), Ok(()), "last block");
+        assert!(to_buffer(BC1, bc, at(2, 0, 0), size(1, 1, 1), 0).is_err(), "mid-block");
+        assert!(to_buffer(BC1, bc, at(0, 0, 0), size(12, 4, 1), 0).is_err(), "a block past");
+        assert_eq!(to_buffer(NV12, sub(PLANE_1, 0, 0, 1), at(0, 0, 0), size(32, 32, 1), 0), Ok(()));
+        assert!(to_buffer(NV12, sub(PLANE_1, 0, 0, 1), at(0, 0, 0), size(33, 1, 1), 0).is_err());
+        assert!(to_buffer(NV12, sub(COLOR, 0, 0, 1), at(0, 0, 0), size(1, 1, 1), 0).is_err());
+        let unknown = MemoryRegion {
+            subresource: whole,
+            offset: at(0, 0, 0),
+            extent: size(1, 1, 1),
+            row_length: 0,
+            image_height: 0,
+        };
+        assert!(
+            facts
+                .buffer_image_region(VkBuffer::forged(0xb2), RGBA, VkDeviceSize(0), &unknown)
+                .is_err()
+        );
+        assert!(
+            facts
+                .buffer_image_region(BUF, VkImage::forged(0xa9), VkDeviceSize(0), &unknown)
+                .is_err()
+        );
+
+        let copy = |aspects, src, s, so, dst, ds, dso, extent| {
+            facts.image_region(aspects, src, &s, so, dst, &ds, dso, extent)
+        };
+        let o = at(0, 0, 0);
+        let both = sub(DEPTH | STENCIL, 0, 0, 1);
+        assert_eq!(copy(Aspects::DepthStencil, DS, both, o, DS, both, o, size(32, 32, 1)), Ok(()));
+        assert!(copy(Aspects::One, DS, both, o, DS, both, o, size(1, 1, 1)).is_err(), "resolve");
+        // Four layers of a 2D array into four slices of a 3D image, and back.
+        let four = sub(COLOR, 0, 0, 4);
+        let slice = sub(COLOR, 0, 0, 1);
+        assert_eq!(copy(Aspects::One, RGBA, four, o, CUBE, slice, o, size(16, 16, 4)), Ok(()));
+        assert_eq!(
+            copy(Aspects::One, CUBE, slice, at(0, 0, 4), RGBA, four, o, size(16, 16, 4)),
+            Ok(())
+        );
+        assert!(
+            copy(Aspects::One, RGBA, four, o, CUBE, slice, at(0, 0, 6), size(16, 16, 4)).is_err()
+        );
+        assert!(copy(Aspects::One, RGBA, four, o, CUBE, slice, o, size(16, 16, 3)).is_err());
+        assert!(
+            copy(Aspects::One, RGBA, four, o, RGBA, slice, o, size(1, 1, 1)).is_err(),
+            "layers"
+        );
+        // BC1 and RGBA16 are both 8 bytes a block: two by two blocks are two by two texels.
+        let bc0 = sub(COLOR, 0, 0, 1);
+        assert_eq!(copy(Aspects::One, BC1, bc0, o, RGBA16, slice, o, size(8, 8, 1)), Ok(()));
+        assert_eq!(copy(Aspects::One, RGBA16, slice, o, BC1, bc0, o, size(3, 3, 1)), Ok(()));
+        assert!(copy(Aspects::One, RGBA16, slice, o, BC1, bc0, o, size(4, 1, 1)).is_err());
+
+        let blit = |src, s, sc: [VkOffset3D; 2], dst, ds, dc: [VkOffset3D; 2]| {
+            facts.blit_region(src, &s, &sc, dst, &ds, &dc)
+        };
+        let full = [at(0, 0, 0), at(64, 64, 1)];
+        let flipped = [at(64, 64, 1), at(0, 0, 0)];
+        assert_eq!(blit(RGBA, whole, full, RGBA, whole, flipped), Ok(()));
+        assert!(blit(RGBA, whole, [at(0, 0, 0), at(65, 64, 1)], RGBA, whole, full).is_err());
+        assert!(blit(RGBA, whole, [at(0, 0, 0), at(64, 64, 2)], RGBA, whole, full).is_err());
+        assert!(blit(BC1, bc0, [o, at(4, 4, 1)], RGBA, whole, full).is_err(), "compressed");
+        assert!(blit(NV12, sub(PLANE_1, 0, 0, 1), [o, at(1, 1, 1)], RGBA, whole, full).is_err());
+        assert!(blit(RGBA, four, full, RGBA, whole, full).is_err(), "layers");
+        assert_eq!(blit(CUBE, slice, [o, at(16, 16, 8)], RGBA, whole, full), Ok(()));
+
+        // A resolve mode the runtime has no shader for, chained on the `*2` form.
+        let mode = VkResolveImageModeInfoKHR {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_RESOLVE_IMAGE_MODE_INFO_KHR,
+            resolveMode:
+                VkResolveModeFlagBits::VK_RESOLVE_MODE_EXTERNAL_FORMAT_DOWNSAMPLE_BIT_ANDROID,
+            ..Default::default()
+        };
+        let info = VkResolveImageInfo2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_RESOLVE_IMAGE_INFO_2,
+            pNext: (&mode as *const VkResolveImageModeInfoKHR).cast(),
+            ..Default::default()
+        };
+        let device = d.device_facts(DEVICE).expect("a planted device");
+        assert!(cs::Decoded::planted(&info).validate(&device).is_err(), "no shader for it");
+        let average = VkResolveImageModeInfoKHR {
+            resolveMode: VkResolveModeFlagBits::VK_RESOLVE_MODE_AVERAGE_BIT,
+            ..mode
+        };
+        let info = VkResolveImageInfo2 {
+            pNext: (&average as *const VkResolveImageModeInfoKHR).cast(),
+            ..info
+        };
+        assert!(cs::Decoded::planted(&info).validate(&device).is_ok(), "average");
+
+        d.abandon_planted();
+    }
+
+    /// The five 1.0 region commands hold every region before the driver sees any: one bad
+    /// region among good ones refuses the command, and the driver is not called.
+    #[test]
+    fn a_bad_region_stops_the_command_before_the_driver() {
+        use crate::venus::proto::types::{
+            VkBufferImageCopy, VkExtent3D, VkImageBlit, VkImageCopy, VkImageCreateInfo,
+            VkImageResolve, VkImageSubresourceLayers,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const DEVICE: VkDevice = VkDevice::forged(0x95);
+        const CB: VkCommandBuffer = VkCommandBuffer::forged(0x96);
+        const IMG: VkImage = VkImage::forged(0xc1);
+        const BUF: VkBuffer = VkBuffer::forged(0xc2);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        type L = VkImageLayout;
+        unsafe extern "C" fn b2i(
+            _: VkCommandBuffer,
+            _: VkBuffer,
+            _: VkImage,
+            _: L,
+            _: u32,
+            _: *const VkBufferImageCopy,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn i2b(
+            _: VkCommandBuffer,
+            _: VkImage,
+            _: L,
+            _: VkBuffer,
+            _: u32,
+            _: *const VkBufferImageCopy,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn i2i(
+            _: VkCommandBuffer,
+            _: VkImage,
+            _: L,
+            _: VkImage,
+            _: L,
+            _: u32,
+            _: *const VkImageCopy,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn blit(
+            _: VkCommandBuffer,
+            _: VkImage,
+            _: L,
+            _: VkImage,
+            _: L,
+            _: u32,
+            _: *const VkImageBlit,
+            _: VkFilter,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn resolve(
+            _: VkCommandBuffer,
+            _: VkImage,
+            _: L,
+            _: VkImage,
+            _: L,
+            _: u32,
+            _: *const VkImageResolve,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdCopyBufferToImage(b2i);
+        fns.plant_vkCmdCopyImageToBuffer(i2b);
+        fns.plant_vkCmdCopyImage(i2i);
+        fns.plant_vkCmdBlitImage(blit);
+        fns.plant_vkCmdResolveImage(resolve);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x97), &[(CB, ObjectId(98))]);
+        let info = VkImageCreateInfo {
+            imageType: VkImageType::VK_IMAGE_TYPE_2D,
+            format: VkFormat::VK_FORMAT_R8G8B8A8_UNORM,
+            extent: VkExtent3D { width: 8, height: 8, depth: 1 },
+            mipLevels: 1,
+            arrayLayers: 1,
+            ..Default::default()
+        };
+        d.plant_image(IMG, &info);
+        d.plant_buffer(BUF, 256);
+        let color = VkImageSubresourceLayers {
+            aspectMask: VkImageAspectFlags(
+                VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32,
+            ),
+            mipLevel: 0,
+            baseArrayLayer: 0,
+            layerCount: 1,
+        };
+        let texel = VkExtent3D { width: 1, height: 1, depth: 1 };
+        let past = VkOffset3D { x: 8, y: 0, z: 0 };
+        let calls = |f: &dyn Fn() -> Result<(), RecordRefused>| {
+            let before = CALLS.load(Ordering::SeqCst);
+            (f(), CALLS.load(Ordering::SeqCst) - before)
+        };
+        let refused = |r: (Result<(), RecordRefused>, usize)| {
+            matches!(r, (Err(RecordRefused::Invalid(_)), 0))
+        };
+        let src = L::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        let dst = L::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
+        let good =
+            VkBufferImageCopy { imageSubresource: color, imageExtent: texel, ..Default::default() };
+        let bad = VkBufferImageCopy { imageOffset: past, ..good };
+        assert_eq!(
+            calls(&|| d.cmd_copy_buffer_to_image(CB, BUF, IMG, dst, &[good, good])),
+            (Ok(()), 1)
+        );
+        assert!(refused(calls(&|| d.cmd_copy_buffer_to_image(CB, BUF, IMG, dst, &[good, bad]))));
+        assert_eq!(calls(&|| d.cmd_copy_image_to_buffer(CB, IMG, src, BUF, &[good])), (Ok(()), 1));
+        assert!(refused(calls(&|| d.cmd_copy_image_to_buffer(CB, IMG, src, BUF, &[bad, good]))));
+
+        let good = VkImageCopy {
+            srcSubresource: color,
+            dstSubresource: color,
+            extent: texel,
+            ..Default::default()
+        };
+        let bad = VkImageCopy { dstOffset: past, ..good };
+        assert_eq!(calls(&|| d.cmd_copy_image(CB, IMG, src, IMG, dst, &[good])), (Ok(()), 1));
+        assert!(refused(calls(&|| d.cmd_copy_image(CB, IMG, src, IMG, dst, &[good, bad]))));
+
+        let good = VkImageResolve {
+            srcSubresource: color,
+            dstSubresource: color,
+            extent: texel,
+            ..Default::default()
+        };
+        let bad = VkImageResolve { srcOffset: past, ..good };
+        assert_eq!(calls(&|| d.cmd_resolve_image(CB, IMG, src, IMG, dst, &[good])), (Ok(()), 1));
+        assert!(refused(calls(&|| d.cmd_resolve_image(CB, IMG, src, IMG, dst, &[bad]))));
+
+        let corners = [VkOffset3D::default(), VkOffset3D { x: 8, y: 8, z: 1 }];
+        let good = VkImageBlit {
+            srcSubresource: color,
+            srcOffsets: corners,
+            dstSubresource: color,
+            dstOffsets: corners,
+        };
+        let bad = VkImageBlit {
+            dstOffsets: [VkOffset3D::default(), VkOffset3D { x: 9, y: 8, z: 1 }],
+            ..good
+        };
+        let linear = VkFilter::VK_FILTER_LINEAR;
+        assert_eq!(
+            calls(&|| d.cmd_blit_image(CB, IMG, src, IMG, dst, &[good], linear)),
+            (Ok(()), 1)
+        );
+        assert!(refused(calls(&|| d.cmd_blit_image(CB, IMG, src, IMG, dst, &[good, bad], linear))));
+
+        d.abandon_planted();
     }
 
     /// A query pool of no queries, or of a type the device was not created with, does not
@@ -13410,6 +14168,7 @@ mod tests {
         const X_TILED: u64 = 0x0100_0000_0000_0001;
         let planes = |pitch| PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch }]).unwrap();
         let facts = |claim| ImageFacts {
+            image_type: VkImageType::VK_IMAGE_TYPE_2D,
             width: 64,
             height: 64,
             depth: 1,

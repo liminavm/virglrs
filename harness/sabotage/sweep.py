@@ -1103,7 +1103,7 @@ SABOTAGES = [
             args.dstImageLayout,
             regions,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
 """,
@@ -1123,7 +1123,7 @@ SABOTAGES = [
             args.dstImageLayout,
             regions,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
 """,
@@ -1137,7 +1137,7 @@ SABOTAGES = [
             args.srcImageLayout,
             regions,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
 """,
@@ -3770,29 +3770,29 @@ SABOTAGES = [
     (
         'a host copy region is not held inside the image',
         'src/venus/driver.rs',
-        """                .is_some_and(|end| extent > 0 && end <= at_level(size))""",
+        """                .is_some_and(|end| e > 0 && end <= size)""",
         """                .is_some_and(|_| true)""",
         'a_host_copy_that_does_not_fit_is_refused_before_the_driver',
     ),
     (
         'a host copy may name layers the image does not have',
         'src/venus/driver.rs',
-        """        if layers == 0 || base.checked_add(layers).is_none_or(|end| end > facts.array_layers) {""",
-        """        if layers == 0 {""",
+        """            || sub.baseArrayLayer.checked_add(layers).is_none_or(|e| e > facts.array_layers)""",
+        """            || sub.baseArrayLayer == u32::MAX""",
         'a_host_copy_that_does_not_fit_is_refused_before_the_driver',
     ),
     (
         'a host copy may name a mip level the image does not have',
         'src/venus/driver.rs',
-        """        if level >= facts.mip_levels {""",
-        """        if false && level >= facts.mip_levels {""",
+        """        if sub.mipLevel >= facts.mip_levels {""",
+        """        if false && sub.mipLevel >= facts.mip_levels {""",
         'a_host_copy_that_does_not_fit_is_refused_before_the_driver',
     ),
     (
         'a host copy may lay rows out shorter than its region',
         'src/venus/driver.rs',
-        """        if row_length < e.width || image_height < e.height {""",
-        """        if false {""",
+        """        if row_length < extent.width || image_height < extent.height {""",
+        """        if false && row_length < extent.width {""",
         'a_host_copy_that_does_not_fit_is_refused_before_the_driver',
     ),
     (
@@ -4007,6 +4007,110 @@ SABOTAGES = [
         """    let chained = chained::<VkPhysicalDeviceFeatures2>(info).map(|f| f.get().features);""",
         """    let chained = chained::<VkPhysicalDeviceFeatures2>(info).map(|_| Default::default());""",
         'query_pools_and_timestamps_are_held_to_what_the_device_enabled',
+    ),
+    (
+        'a region may name a color aspect on a depth or planar format',
+        'src/venus/driver.rs',
+        """        COLOR if depth.is_none() && !stencil && !planar => Ok((whole()?, w, h)),""",
+        """        COLOR => Ok((whole()?, w, h)),""",
+        'regions_are_held_inside_their_images_and_buffers',
+    ),
+    (
+        'a region may name layers the image does not have',
+        'src/venus/driver.rs',
+        """            || sub.baseArrayLayer.checked_add(layers).is_none_or(|e| e > facts.array_layers)""",
+        """            || sub.baseArrayLayer.checked_add(layers).is_none()""",
+        'regions_are_held_inside_their_images_and_buffers',
+    ),
+    (
+        'a region may name a mip level the image does not have',
+        'src/venus/driver.rs',
+        """        if sub.mipLevel >= facts.mip_levels {""",
+        """        if sub.mipLevel == u32::MAX {""",
+        'regions_are_held_inside_their_images_and_buffers',
+    ),
+    (
+        'a region may lie outside its image',
+        'src/venus/driver.rs',
+        """        if !inside(offset.x, extent.width, w) || !inside(offset.y, extent.height, h) {""",
+        """        if extent.width == 0 || extent.height == 0 {""",
+        'regions_are_held_inside_their_images_and_buffers',
+    ),
+    (
+        'a region may start inside a texel block',
+        'src/venus/driver.rs',
+        """        if !(offset.x as u32).is_multiple_of(self.block.width)
+            || !(offset.y as u32).is_multiple_of(self.block.height)
+        {""",
+        """        if offset.x < 0 {""",
+        'regions_are_held_inside_their_images_and_buffers',
+    ),
+    (
+        'a flat image region may be deeper than one slice',
+        'src/venus/driver.rs',
+        """        } else if offset.z != 0 || extent.depth != flat_depth {""",
+        """        } else if offset.z != 0 || extent.depth == 0 {""",
+        'regions_are_held_inside_their_images_and_buffers',
+    ),
+    (
+        'a buffer copy may run past the end of its buffer',
+        'src/venus/driver.rs',
+        """        if buffer_offset.0.checked_add(span).is_none_or(|end| end > len) {""",
+        """        if buffer_offset.0 > len {""",
+        'regions_are_held_inside_their_images_and_buffers',
+    ),
+    (
+        'an image copy may name different layer counts',
+        'src/venus/driver.rs',
+        """        if !s.is_3d() && !d.is_3d() && s.layers != d.layers {""",
+        """        if !s.is_3d() && !d.is_3d() && s.layers == u32::MAX {""",
+        'regions_are_held_inside_their_images_and_buffers',
+    ),
+    (
+        'a blit corner may lie outside its image',
+        'src/venus/driver.rs',
+        """        if within(corner.x, w) && within(corner.y, h) && within(corner.z, d) {""",
+        """        if within(corner.x, u32::MAX) {""",
+        'regions_are_held_inside_their_images_and_buffers',
+    ),
+    (
+        'a blit may sample a compressed image',
+        'src/venus/driver.rs',
+        """            if p.block.width != 1
+                || p.block.height != 1
+                || formats::plane_of(p.image.format, 0).is_some()""",
+        """            if formats::plane_of(p.image.format, 0).is_some()""",
+        'regions_are_held_inside_their_images_and_buffers',
+    ),
+    (
+        'a resolve may name a mode the runtime has no shader for',
+        'src/venus/driver.rs',
+        """        if !SERVED.contains(&this.resolveMode) || !SERVED.contains(&this.stencilResolveMode) {""",
+        """        if this.resolveMode.0 == i32::MAX {""",
+        'regions_are_held_inside_their_images_and_buffers',
+    ),
+    (
+        'a copy image region reaches the driver unchecked',
+        'src/venus/driver.rs',
+        """                    r.extent,
+                )
+                .map_err(RecordRefused::Invalid)?;
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, and every region is held to
+        // both images above.
+        unsafe {
+            (d.vkCmdCopyImage())(""",
+        """                    r.extent,
+                )
+                .ok();
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, and every region is held to
+        // both images above.
+        unsafe {
+            (d.vkCmdCopyImage())(""",
+        'a_bad_region_stops_the_command_before_the_driver',
     ),
     (
         'a submit chained array is trusted by its count alone',

@@ -5915,7 +5915,7 @@ impl Commands for Handlers<'_> {
             args.dstImageLayout,
             regions,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdCopyImageToBuffer(&mut self, args: &mut vn_command_vkCmdCopyImageToBuffer<'_>) {
@@ -5927,7 +5927,7 @@ impl Commands for Handlers<'_> {
             args.dstBuffer,
             regions,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdCopyImage(&mut self, args: &mut vn_command_vkCmdCopyImage<'_>) {
@@ -5940,7 +5940,7 @@ impl Commands for Handlers<'_> {
             args.dstImageLayout,
             regions,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     // ---- VK_EXT_host_image_copy ----
@@ -6007,7 +6007,7 @@ impl Commands for Handlers<'_> {
             regions,
             args.filter,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdClearColorImage(&mut self, args: &mut vn_command_vkCmdClearColorImage<'_>) {
@@ -6033,30 +6033,35 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdCopyImage2(&mut self, args: &mut vn_command_vkCmdCopyImage2<'_>) {
         let Some(info) = self.names(args.pCopyImageInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_copy_image2(args.commandBuffer, info);
         self.recorded(done);
     }
 
     fn vkCmdCopyBufferToImage2(&mut self, args: &mut vn_command_vkCmdCopyBufferToImage2<'_>) {
         let Some(info) = self.names(args.pCopyBufferToImageInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_copy_buffer_to_image2(args.commandBuffer, info);
         self.recorded(done);
     }
 
     fn vkCmdCopyImageToBuffer2(&mut self, args: &mut vn_command_vkCmdCopyImageToBuffer2<'_>) {
         let Some(info) = self.names(args.pCopyImageToBufferInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_copy_image_to_buffer2(args.commandBuffer, info);
         self.recorded(done);
     }
 
     fn vkCmdBlitImage2(&mut self, args: &mut vn_command_vkCmdBlitImage2<'_>) {
         let Some(info) = self.names(args.pBlitImageInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_blit_image2(args.commandBuffer, info);
         self.recorded(done);
     }
 
     fn vkCmdResolveImage2(&mut self, args: &mut vn_command_vkCmdResolveImage2<'_>) {
         let Some(info) = self.names(args.pResolveImageInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_resolve_image2(args.commandBuffer, info);
         self.recorded(done);
     }
@@ -6445,7 +6450,7 @@ impl Commands for Handlers<'_> {
             args.dstImageLayout,
             regions,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdUpdateBuffer(&mut self, args: &mut vn_command_vkCmdUpdateBuffer<'_>) {
@@ -17068,6 +17073,38 @@ mod tests {
     ///
     /// Absent from three of the four corpora and present once in the fourth, which is what a
     /// live desktop asked for and this build refused.
+    /// A 64-by-64 RGBA8 2D image of one level and one layer, recorded under `image`: what a
+    /// recording test names when its point is not the region.
+    fn plant_rgba_image(driver: &mut Driver, image: super::super::proto::types::VkImage) {
+        use super::super::proto::types::{VkExtent3D, VkFormat, VkImageCreateInfo, VkImageType};
+        let info = VkImageCreateInfo {
+            imageType: VkImageType::VK_IMAGE_TYPE_2D,
+            format: VkFormat::VK_FORMAT_R8G8B8A8_UNORM,
+            extent: VkExtent3D { width: 64, height: 64, depth: 1 },
+            mipLevels: 1,
+            arrayLayers: 1,
+            ..Default::default()
+        };
+        driver.plant_image(image, &info);
+    }
+
+    /// The colour of one layer at level 0: the least a region can name.
+    fn one_color_layer() -> super::super::proto::types::VkImageSubresourceLayers {
+        use super::super::proto::types::{VkImageAspectFlagBits, VkImageAspectFlags};
+        super::super::proto::types::VkImageSubresourceLayers {
+            aspectMask: VkImageAspectFlags(
+                VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32,
+            ),
+            mipLevel: 0,
+            baseArrayLayer: 0,
+            layerCount: 1,
+        }
+    }
+
+    /// One texel.
+    const ONE_TEXEL: super::super::proto::types::VkExtent3D =
+        super::super::proto::types::VkExtent3D { width: 1, height: 1, depth: 1 };
+
     #[test]
     fn copying_an_image_to_a_buffer_hands_the_layout_to_the_image() {
         use super::super::proto::types::{
@@ -17137,7 +17174,14 @@ mod tests {
             journal: &mut jrnl,
         };
 
-        let regions = [VkBufferImageCopy::default(); 3];
+        plant_rgba_image(h.driver, VkImage::forged(0x44));
+        h.driver.plant_buffer(VkBuffer::forged(0x55), 4096);
+        let region = VkBufferImageCopy {
+            imageSubresource: one_color_layer(),
+            imageExtent: ONE_TEXEL,
+            ..Default::default()
+        };
+        let regions = [region; 3];
         let mut args = vn_command_vkCmdCopyImageToBuffer::default();
         args.commandBuffer = VkCommandBuffer::forged(CB.0);
         args.srcImage = VkImage::forged(0x44);
@@ -18993,7 +19037,15 @@ mod tests {
         assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
 
         // Two layouts that differ, so a wrapper mirroring one side into the other is caught.
-        let regions = [VkImageResolve::default(); 3];
+        plant_rgba_image(h.driver, VkImage::forged(0x22));
+        plant_rgba_image(h.driver, VkImage::forged(0x33));
+        let region = VkImageResolve {
+            srcSubresource: one_color_layer(),
+            dstSubresource: one_color_layer(),
+            extent: ONE_TEXEL,
+            ..Default::default()
+        };
+        let regions = [region; 3];
         let mut args = vn_command_vkCmdResolveImage::default();
         args.commandBuffer = cb;
         args.srcImage = VkImage::forged(0x22);
@@ -21696,7 +21748,17 @@ mod tests {
 
         // A counted array with a scalar behind it: the filter follows the pointer, so a wrapper
         // that passes the count and pointer in the wrong order still compiles and lands here.
-        let regions = [VkImageBlit::default(); 2];
+        plant_rgba_image(h.driver, VkImage::forged(0x11));
+        plant_rgba_image(h.driver, VkImage::forged(0x22));
+        let corners =
+            [Default::default(), super::super::proto::types::VkOffset3D { x: 1, y: 1, z: 1 }];
+        let region = VkImageBlit {
+            srcSubresource: one_color_layer(),
+            srcOffsets: corners,
+            dstSubresource: one_color_layer(),
+            dstOffsets: corners,
+        };
+        let regions = [region; 2];
         let mut args = vn_command_vkCmdBlitImage::default();
         args.commandBuffer = cb;
         args.srcImage = VkImage::forged(0x11);
@@ -21718,7 +21780,15 @@ mod tests {
         // filter. That makes them the pair a handler is most likely to mirror into each other,
         // and the two layouts are what catches it -- a blit's stub ignores them, so only asking
         // for them separately here shows they arrived on the sides the guest put them on.
-        let regions = [VkImageCopy::default(); 3];
+        plant_rgba_image(h.driver, VkImage::forged(0x66));
+        plant_rgba_image(h.driver, VkImage::forged(0x77));
+        let region = VkImageCopy {
+            srcSubresource: one_color_layer(),
+            dstSubresource: one_color_layer(),
+            extent: ONE_TEXEL,
+            ..Default::default()
+        };
+        let regions = [region; 3];
         let mut args = vn_command_vkCmdCopyImage::default();
         args.commandBuffer = cb;
         args.srcImage = VkImage::forged(0x66);
