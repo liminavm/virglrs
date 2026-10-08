@@ -22,6 +22,7 @@
 //!   handler, do not encode a reply". An id the guest simply invented is *hard*, not soft.
 
 use std::cell::{Cell, RefCell};
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bumpalo::Bump;
@@ -173,22 +174,70 @@ impl<T: Handle> Guest<T> {
 ///
 /// `repr(transparent)` over the reference, so a command member of type `Option<Decoded<..>>` keeps
 /// the one pointer word C's struct has there.
+///
+/// `S` says what else is known of it. The decoder mints [`Unchecked`]: wire-sound, and nothing
+/// more. [`Decoded::validate`] is the only way to [`Checked`], which a driver entry point that
+/// hands the struct to a driver which indexes or copies by its values takes instead. See
+/// [`Validate`].
 #[repr(transparent)]
-pub struct Decoded<'a, T: ?Sized>(&'a T);
+pub struct Decoded<'a, T: ?Sized, S = Unchecked>(&'a T, PhantomData<S>);
 
-impl<T: ?Sized> Clone for Decoded<'_, T> {
+/// A [`Decoded`] the decoder vouches for and nothing else has looked at: its pointers are sound,
+/// and its values are the guest's.
+#[derive(Debug)]
+pub struct Unchecked;
+
+/// A [`Decoded`] whose values were held to what the driver will do with them. Only
+/// [`Decoded::validate`] makes one.
+#[derive(Debug)]
+pub struct Checked;
+
+/// What a struct's values must satisfy before a driver is handed it, against `F`, the facts the
+/// check needs -- the device's limits, the objects the struct names.
+///
+/// A host driver checks nothing. The decoder already refuses what vk.xml alone can say is wrong;
+/// an implementation of this refuses what only the device and its objects can: an index past a
+/// limit, a count that disagrees with an object the struct names. It answers why, for the log
+/// the context is poisoned with.
+///
+/// It is handed the struct as the decoder vouched for it, never a bare reference: a check reads
+/// the arrays the struct points at, and only the decoder's word makes those pointers safe to
+/// follow. A struct anyone built cannot be checked, so it cannot become [`Checked`] either.
+pub trait Validate<F: ?Sized> {
+    fn validate(this: Decoded<'_, Self, Unchecked>, facts: &F) -> Result<(), &'static str>;
+}
+
+/// An array is valid when each element is.
+impl<F: ?Sized, T: Validate<F>> Validate<F> for [T] {
+    fn validate(this: Decoded<'_, Self, Unchecked>, facts: &F) -> Result<(), &'static str> {
+        this.iter().try_for_each(|e| T::validate(e, facts))
+    }
+}
+
+impl<T: ?Sized, S> Clone for Decoded<'_, T, S> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T: ?Sized> Copy for Decoded<'_, T> {}
+impl<T: ?Sized, S> Copy for Decoded<'_, T, S> {}
 
-impl<T: ?Sized> core::ops::Deref for Decoded<'_, T> {
+impl<T: ?Sized, S> core::ops::Deref for Decoded<'_, T, S> {
     type Target = T;
 
     fn deref(&self) -> &T {
         self.0
+    }
+}
+
+impl<'a, T: ?Sized> Decoded<'a, T, Unchecked> {
+    /// Hold the guest's values to `facts`, and say so in the type.
+    pub fn validate<F: ?Sized>(self, facts: &F) -> Result<Decoded<'a, T, Checked>, &'static str>
+    where
+        T: Validate<F>,
+    {
+        T::validate(self, facts)?;
+        Ok(Decoded(self.0, PhantomData))
     }
 }
 
@@ -202,30 +251,33 @@ impl<'a, T: ?Sized> Decoded<'a, T> {
     /// elements as the count beside it says. The decoder meets that by construction: it allocated
     /// every one of them from the arena `'a` borrows, sized by the count it decoded beside it.
     pub(crate) unsafe fn vouch(r: &'a T) -> Self {
-        Decoded(r)
+        Decoded(r, PhantomData)
     }
 
     /// Plant a struct a test built, as though the decoder had.
     #[cfg(test)]
     pub fn planted(r: &'a T) -> Self {
-        Decoded(r)
+        Decoded(r, PhantomData)
     }
+}
 
+impl<'a, T: ?Sized, S> Decoded<'a, T, S> {
     /// The reference, for reading. Reading is not what needs vouching for; handing a struct on is.
     pub fn get(self) -> &'a T {
         self.0
     }
 }
 
-impl<'a, T> Decoded<'a, [T]> {
-    /// Each element, vouched for as the array was: an element of a decoded array is decoded.
-    pub fn iter(self) -> impl ExactSizeIterator<Item = Decoded<'a, T>> + Clone {
-        self.0.iter().map(Decoded)
+impl<'a, T, S> Decoded<'a, [T], S> {
+    /// Each element, vouched for as the array was: an element of a decoded array is decoded, and
+    /// an element of a checked one was checked.
+    pub fn iter(self) -> impl ExactSizeIterator<Item = Decoded<'a, T, S>> + Clone {
+        self.0.iter().map(|e| Decoded(e, PhantomData))
     }
 
     /// The element at `i`, if there is one.
-    pub fn at(self, i: usize) -> Option<Decoded<'a, T>> {
-        self.0.get(i).map(Decoded)
+    pub fn at(self, i: usize) -> Option<Decoded<'a, T, S>> {
+        self.0.get(i).map(|e| Decoded(e, PhantomData))
     }
 }
 
@@ -310,24 +362,24 @@ unsafe impl Plain for f32 {}
 
 impl<'a, T: Plain> From<&'a T> for Decoded<'a, T> {
     fn from(r: &'a T) -> Self {
-        Decoded(r)
+        Decoded(r, PhantomData)
     }
 }
 
 impl<'a, T: Plain> From<&'a [T]> for Decoded<'a, [T]> {
     fn from(r: &'a [T]) -> Self {
-        Decoded(r)
+        Decoded(r, PhantomData)
     }
 }
 
 impl<T> Default for Decoded<'_, [T]> {
     /// No elements, so no pointers to vouch for.
     fn default() -> Self {
-        Decoded(&[])
+        Decoded(&[], PhantomData)
     }
 }
 
-impl<T: ?Sized + core::fmt::Debug> core::fmt::Debug for Decoded<'_, T> {
+impl<T: ?Sized + core::fmt::Debug, S> core::fmt::Debug for Decoded<'_, T, S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.0.fmt(f)
     }
@@ -1536,7 +1588,6 @@ mod tests {
     /// two, each lending the same memory.
     #[test]
     fn a_command_cannot_be_duplicated() {
-        use core::marker::PhantomData;
         struct Probe<T>(PhantomData<T>);
         // Autoref specialisation: the by-value candidates are tried first, and only apply where
         // the bound holds; otherwise resolution falls through to the impls on `&Probe`.
@@ -1583,7 +1634,7 @@ mod tests {
             VkAllocationCallbacks, VkAttachmentSampleLocationsEXT, VkBufferCreateInfo, VkExtent3D,
             VkImageSubresource,
         };
-        use core::marker::PhantomData;
+
         struct Probe<T>(PhantomData<T>);
         trait IsPlain {
             fn plain(&self) -> bool {

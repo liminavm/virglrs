@@ -317,8 +317,8 @@ SABOTAGES = [
     (
         'an empty submit is turned away instead of signalling its fence',
         'src/venus/context.rs',
-        '        let submits = args.pSubmits();\n        match self.driver.queue_submit(args.queue, submits, args.fence) {',
-        '        let submits = args.pSubmits();\n        if submits.is_empty() {\n            return;\n        }\n        match self.driver.queue_submit(args.queue, submits, args.fence) {',
+        '        let submits = match args.pSubmits().validate(&self.driver.facts()) {',
+        '        if args.pSubmits().is_empty() {\n            return;\n        }\n        let submits = match args.pSubmits().validate(&self.driver.facts()) {',
         '',
     ),
     (
@@ -3830,8 +3830,8 @@ SABOTAGES = [
     (
         'a binary semaphore is owed a timeline value',
         'src/venus/driver.rs',
-        """self.semaphores.get(sem).is_none_or(|f| f.kind == SemaphoreKind::Timeline)""",
-        """self.semaphores.get(sem).is_none_or(|_| true)""",
+        """facts.semaphores.get(sem).is_none_or(|f| f.kind == SemaphoreKind::Timeline)""",
+        """facts.semaphores.get(sem).is_none_or(|_| true)""",
         'a_submit_whose_chained_counts_disagree_is_refused_before_the_driver',
     ),
     (

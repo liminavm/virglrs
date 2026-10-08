@@ -3617,6 +3617,24 @@ impl Driver {
             + u64::from(e.width).div_ceil(bw) * bs)
     }
 
+    /// What a [`cs::Validate`] check reads. See [`Facts`].
+    pub fn facts(&self) -> Facts<'_> {
+        Facts { semaphores: &self.semaphores }
+    }
+
+    /// [`Driver::facts`] for the device `cb` records for, or `None` for a command buffer with no
+    /// device here -- which the caller refuses as it refuses recording into one.
+    pub fn recorder_facts(&self, cb: VkCommandBuffer) -> Option<DeviceFacts<'_>> {
+        let limits = self.recorder_limits(cb)?;
+        Some(DeviceFacts { facts: self.facts(), limits })
+    }
+
+    /// [`Driver::facts`] for `device`, or `None` for a device this context does not have.
+    pub fn device_facts(&self, device: VkDevice) -> Option<DeviceFacts<'_>> {
+        let limits = &self.devices.get(&device)?.limits;
+        Some(DeviceFacts { facts: self.facts(), limits })
+    }
+
     /// Fold `srcs` into `dst`. The handles are the guest's names already resolved to the
     /// driver's, and the count Vulkan is given is the slice's own length.
     pub fn merge_pipeline_caches(
@@ -7300,18 +7318,15 @@ impl Driver {
     /// the command buffers -- was resolved by the decoder as it read them, so what arrives here is
     /// already the driver's own.
     ///
-    /// A submit whose chained counts disagree with its own is refused before the driver sees it:
-    /// see [`Driver::submit_counts_agree`].
+    /// The submits are [`cs::Checked`]: a submit whose chained arrays do not cover its own is
+    /// refused before it gets here. See the `Validate` impl for `VkSubmitInfo`.
     pub fn queue_submit(
         &mut self,
         queue: VkQueue,
-        submits: cs::Decoded<'_, [VkSubmitInfo]>,
+        submits: cs::Decoded<'_, [VkSubmitInfo], cs::Checked>,
         fence: VkFence,
-    ) -> Result<VkResult, NoSubmit> {
-        for s in submits.get() {
-            self.submit_counts_agree(s).map_err(NoSubmit::Disagrees)?;
-        }
-        let q = self.submitter(queue).ok_or(NoSubmit::Queue)?;
+    ) -> Option<VkResult> {
+        let q = self.submitter(queue)?;
         let ret = {
             let _vk = q.held();
             // Submitting no work to signal a fence is a normal thing for a guest to do, and Vulkan
@@ -7325,77 +7340,7 @@ impl Driver {
         if ret == VkResult::VK_SUCCESS {
             self.note_submit(submits.get(), fence);
         }
-        Ok(ret)
-    }
-
-    /// Whether the counts a submit's `pNext` chain carries agree with the submit's own.
-    ///
-    /// The wire carries each array beside its own count, so the decoder reconciles every pair it
-    /// reads; what it cannot see is that `VkDeviceGroupSubmitInfo` and
-    /// `VkTimelineSemaphoreSubmitInfo` restate the submit's counts, and that the driver walks their
-    /// arrays by the submit's. Mesa's `vk_common_QueueSubmit` reads a device index for every
-    /// semaphore and command buffer the submit names, and a timeline value for every timeline
-    /// semaphore -- so a guest sending fewer reads through a null pointer, which aborts the whole
-    /// VMM, or past the arena array into host memory. Vulkan requires the device-group counts to
-    /// be equal (VUID-VkDeviceGroupSubmitInfo-*-00082/00083/00084), and a timeline value count to
-    /// be equal where that side names a timeline semaphore (VUID-VkSubmitInfo-pNext-03240/03241).
-    /// A semaphore this driver has no record of may be a timeline, so it counts as one.
-    fn submit_counts_agree(&self, s: &VkSubmitInfo) -> Result<(), &'static str> {
-        // Whether a chained array holds one entry for each of the `wanted` the submit names. The
-        // decoder turns an array the guest sent empty into a null pointer whatever count it sent
-        // beside it, so a count that agrees is not enough: the array must be there too.
-        let covers = |wanted: u32, count: u32, array: *const core::ffi::c_void| {
-            count == wanted && (wanted == 0 || !array.is_null())
-        };
-        if let Some(g) = chained_at::<VkDeviceGroupSubmitInfo>(&s.pNext) {
-            if !covers(
-                s.waitSemaphoreCount,
-                g.waitSemaphoreCount,
-                g.pWaitSemaphoreDeviceIndices.cast(),
-            ) {
-                return Err("a device-group wait array that does not cover its submit's waits");
-            }
-            if !covers(
-                s.commandBufferCount,
-                g.commandBufferCount,
-                g.pCommandBufferDeviceMasks.cast(),
-            ) {
-                return Err("a device-group command buffer array that does not cover its submit's");
-            }
-            if !covers(
-                s.signalSemaphoreCount,
-                g.signalSemaphoreCount,
-                g.pSignalSemaphoreDeviceIndices.cast(),
-            ) {
-                return Err("a device-group signal array that does not cover its submit's signals");
-            }
-        }
-        let Some(t) = chained_at::<VkTimelineSemaphoreSubmitInfo>(&s.pNext) else {
-            return Ok(());
-        };
-        let names_a_timeline = |count: u32, sems: *const VkSemaphore| {
-            // SAFETY: the decoder allocated the array from the batch arena, sized to the count
-            // beside it, and it outlives this call. `wire_array` is the same reconciliation the
-            // generated accessors use.
-            let sems = unsafe { crate::venus::cs::wire_array::<VkSemaphore>(count as usize, sems) };
-            sems.unwrap_or_default().iter().any(|sem| {
-                self.semaphores.get(sem).is_none_or(|f| f.kind == SemaphoreKind::Timeline)
-            })
-        };
-        if !covers(s.waitSemaphoreCount, t.waitSemaphoreValueCount, t.pWaitSemaphoreValues.cast())
-            && names_a_timeline(s.waitSemaphoreCount, s.pWaitSemaphores)
-        {
-            return Err("a timeline wait value array that does not cover its submit's waits");
-        }
-        if !covers(
-            s.signalSemaphoreCount,
-            t.signalSemaphoreValueCount,
-            t.pSignalSemaphoreValues.cast(),
-        ) && names_a_timeline(s.signalSemaphoreCount, s.pSignalSemaphores)
-        {
-            return Err("a timeline signal value array that does not cover its submit's signals");
-        }
-        Ok(())
+        Some(ret)
     }
 
     /// `vkQueueSubmit2`, the synchronization2 form of the submit above.
@@ -10155,15 +10100,94 @@ pub enum NoHostCopy {
     Region(&'static str),
 }
 
-/// Why a `vkQueueSubmit` was refused without being forwarded. The guest's own doing and not a
-/// `VkResult`, so the caller poisons the context rather than answering.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum NoSubmit {
-    /// A queue this context never retrieved.
-    Queue,
-    /// A count in the submit's `pNext` chain disagrees with the submit's own; the reason says
-    /// which.
-    Disagrees(&'static str),
+/// The driver's records a [`cs::Validate`] check reads: what each object was made as, and what
+/// each device allows. Read-only, and nothing in it reaches Vulkan, so a check cannot do more than
+/// answer.
+pub struct Facts<'d> {
+    semaphores: &'d BTreeMap<VkSemaphore, SemaphoreFacts>,
+}
+
+/// [`Facts`], with the limits of the one device a command records or runs on. A check that holds
+/// a value to a limit validates against this, so there is no way to ask it without a device.
+pub struct DeviceFacts<'d> {
+    pub facts: Facts<'d>,
+    pub limits: &'d VkPhysicalDeviceLimits,
+}
+
+/// Whether the counts a submit's `pNext` chain carries agree with the submit's own.
+///
+/// The wire carries each array beside its own count, so the decoder reconciles every pair it
+/// reads; what it cannot see is that `VkDeviceGroupSubmitInfo` and
+/// `VkTimelineSemaphoreSubmitInfo` restate the submit's counts, and that the driver walks their
+/// arrays by the submit's. Mesa's `vk_common_QueueSubmit` reads a device index for every
+/// semaphore and command buffer the submit names, and a timeline value for every timeline
+/// semaphore -- so a guest sending fewer reads through a null pointer, which aborts the whole
+/// VMM, or past the arena array into host memory. Vulkan requires the device-group counts to
+/// be equal (VUID-VkDeviceGroupSubmitInfo-*-00082/00083/00084), and a timeline value count to
+/// be equal where that side names a timeline semaphore (VUID-VkSubmitInfo-pNext-03240/03241).
+/// A semaphore this driver has no record of may be a timeline, so it counts as one.
+impl cs::Validate<Facts<'_>> for VkSubmitInfo {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &Facts<'_>,
+    ) -> Result<(), &'static str> {
+        let s = this.get();
+        // Whether a chained array holds one entry for each of the `wanted` the submit names. The
+        // decoder turns an array the guest sent empty into a null pointer whatever count it sent
+        // beside it, so a count that agrees is not enough: the array must be there too.
+        let covers = |wanted: u32, count: u32, array: *const core::ffi::c_void| {
+            count == wanted && (wanted == 0 || !array.is_null())
+        };
+        if let Some(g) = chained_at::<VkDeviceGroupSubmitInfo>(&s.pNext) {
+            if !covers(
+                s.waitSemaphoreCount,
+                g.waitSemaphoreCount,
+                g.pWaitSemaphoreDeviceIndices.cast(),
+            ) {
+                return Err("a device-group wait array that does not cover its submit's waits");
+            }
+            if !covers(
+                s.commandBufferCount,
+                g.commandBufferCount,
+                g.pCommandBufferDeviceMasks.cast(),
+            ) {
+                return Err("a device-group command buffer array that does not cover its submit's");
+            }
+            if !covers(
+                s.signalSemaphoreCount,
+                g.signalSemaphoreCount,
+                g.pSignalSemaphoreDeviceIndices.cast(),
+            ) {
+                return Err("a device-group signal array that does not cover its submit's signals");
+            }
+        }
+        let Some(t) = chained_at::<VkTimelineSemaphoreSubmitInfo>(&s.pNext) else {
+            return Ok(());
+        };
+        let names_a_timeline = |count: u32, sems: *const VkSemaphore| {
+            // SAFETY: `this` is `Decoded`, so the decoder allocated this array from the batch arena
+            // sized to the count beside it (see `Decoded::vouch`), and the arena outlives this
+            // call. `wire_array` is the same reconciliation the generated accessors use.
+            let sems = unsafe { crate::venus::cs::wire_array::<VkSemaphore>(count as usize, sems) };
+            sems.unwrap_or_default().iter().any(|sem| {
+                facts.semaphores.get(sem).is_none_or(|f| f.kind == SemaphoreKind::Timeline)
+            })
+        };
+        if !covers(s.waitSemaphoreCount, t.waitSemaphoreValueCount, t.pWaitSemaphoreValues.cast())
+            && names_a_timeline(s.waitSemaphoreCount, s.pWaitSemaphores)
+        {
+            return Err("a timeline wait value array that does not cover its submit's waits");
+        }
+        if !covers(
+            s.signalSemaphoreCount,
+            t.signalSemaphoreValueCount,
+            t.pSignalSemaphoreValues.cast(),
+        ) && names_a_timeline(s.signalSemaphoreCount, s.pSignalSemaphores)
+        {
+            return Err("a timeline signal value array that does not cover its submit's signals");
+        }
+        Ok(())
+    }
 }
 
 /// Why a `vkQueueSubmit2` was refused without being forwarded.
@@ -13907,11 +13931,11 @@ mod tests {
                 ..Default::default()
             }];
             let before = CALLS.load(Ordering::SeqCst);
-            let got = d.queue_submit(
-                VkQueue::forged(QUEUE),
-                cs::Decoded::planted(&infos as &[_]),
-                VkFence::NULL,
-            );
+            // What the handler does: validate, and hand the driver only what passed.
+            let checked = cs::Decoded::planted(&infos as &[_]).validate(&d.facts());
+            let got = checked.map(|c| {
+                d.queue_submit(VkQueue::forged(QUEUE), c, VkFence::NULL).expect("a planted queue")
+            });
             (got, CALLS.load(Ordering::SeqCst) - before)
         };
 
@@ -13921,7 +13945,7 @@ mod tests {
             ..Default::default()
         };
         let (got, calls) = submit_with((&raw const short_group).cast(), &binary);
-        assert!(matches!(got, Err(NoSubmit::Disagrees(_))), "a short device group: {got:?}");
+        assert!(got.is_err(), "a short device group: {got:?}");
         assert_eq!(calls, 0, "and the driver never sees it");
 
         let group = VkDeviceGroupSubmitInfo {
@@ -13940,7 +13964,7 @@ mod tests {
             ..Default::default()
         };
         let (got, calls) = submit_with((&raw const group_without_indices).cast(), &binary);
-        assert!(matches!(got, Err(NoSubmit::Disagrees(_))), "a counted null array: {got:?}");
+        assert!(got.is_err(), "a counted null array: {got:?}");
         assert_eq!(calls, 0, "and the driver never sees it");
 
         // A timeline signalled with no value for it.
@@ -13949,7 +13973,7 @@ mod tests {
             ..Default::default()
         };
         let (got, calls) = submit_with((&raw const no_values).cast(), &timeline);
-        assert!(matches!(got, Err(NoSubmit::Disagrees(_))), "a short timeline: {got:?}");
+        assert!(got.is_err(), "a short timeline: {got:?}");
         assert_eq!(calls, 0, "and the driver never sees it");
 
         let values_without_array = VkTimelineSemaphoreSubmitInfo {
@@ -13958,7 +13982,7 @@ mod tests {
             ..Default::default()
         };
         let (got, calls) = submit_with((&raw const values_without_array).cast(), &timeline);
-        assert!(matches!(got, Err(NoSubmit::Disagrees(_))), "counted, but null: {got:?}");
+        assert!(got.is_err(), "counted, but null: {got:?}");
         assert_eq!(calls, 0, "and the driver never sees it");
 
         // The same short array over a binary semaphore is valid Vulkan.
@@ -14031,13 +14055,10 @@ mod tests {
             pSignalSemaphores: sems.as_ptr(),
             ..Default::default()
         }];
+        let checked = cs::Decoded::planted(&v1 as &[_]).validate(&d.facts()).expect("valid");
         assert_eq!(
-            d.queue_submit(
-                VkQueue::forged(QUEUE),
-                cs::Decoded::planted(&v1 as &[_]),
-                VkFence::forged(FENCE)
-            ),
-            Ok(VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY),
+            d.queue_submit(VkQueue::forged(QUEUE), checked, VkFence::forged(FENCE)),
+            Some(VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY),
             "the driver's refusal is the guest's answer"
         );
         assert!(
