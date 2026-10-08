@@ -19,7 +19,7 @@ use crate::ids::{ContextId, ResourceHandle, RingId};
 
 use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
-use super::cs::{Decoded, Guest, HostHandle, ObjectId, guest_face};
+use super::cs::{Checked, Decoded, Guest, HostHandle, ObjectId, Validate, guest_face};
 use super::driver::{
     self, Answered, Driver, DriverWait, ExportError, Exported, InFlight, Level, MemoryError,
     NoHostCopy, NoSubmit2, NoSyncFd, NotATimeline, XfbCounters,
@@ -30,10 +30,10 @@ use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{COMMAND_TYPES, Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkAccelerationStructureBuildGeometryInfoKHR, VkClearRect, VkCommandBufferLevel,
-    VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDeferredOperationKHR, VkDepthClampModeEXT,
-    VkDevice, VkDeviceMemory, VkDeviceSize, VkFence, VkFlags, VkMemoryHeapFlagBits,
-    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType,
+    VkAccelerationStructureBuildGeometryInfoKHR, VkClearRect, VkCommandBuffer,
+    VkCommandBufferLevel, VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDeferredOperationKHR,
+    VkDepthClampModeEXT, VkDevice, VkDeviceMemory, VkDeviceSize, VkFence, VkFlags,
+    VkMemoryHeapFlagBits, VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType,
     VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkResult, VkRingCreateInfoMESA,
     VkRingMonitorInfoMESA, VkSemaphore, VkStridedDeviceAddressRegionKHR,
     vn_command_vkAllocateCommandBuffers, vn_command_vkAllocateDescriptorSets,
@@ -2353,6 +2353,31 @@ impl Handlers<'_> {
 
     fn no_recorder(&mut self) {
         self.reject("recorded into a command buffer with no device behind it");
+    }
+
+    /// `info` held to the limits of the device `cb` records for, or `None` with the context
+    /// poisoned: by the reason the check gives, or as recording into nothing when `cb` has no
+    /// device here. See [`Validate`].
+    fn checked_for<'a, T>(
+        &mut self,
+        cb: VkCommandBuffer,
+        info: Decoded<'a, T>,
+    ) -> Option<Decoded<'a, T, Checked>>
+    where
+        T: for<'d> Validate<driver::DeviceFacts<'d>>,
+    {
+        let verdict = self.driver.recorder_facts(cb).map(|facts| info.validate(&facts));
+        match verdict {
+            Some(Ok(info)) => Some(info),
+            Some(Err(why)) => {
+                self.reject(why);
+                None
+            }
+            None => {
+                self.no_recorder();
+                None
+            }
+        }
     }
 
     /// The verdict on a command held to its device's limits: see [`driver::RecordRefused`].
@@ -5716,6 +5741,7 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdBeginRendering(&mut self, args: &mut vn_command_vkCmdBeginRendering<'_>) {
         let Some(info) = self.names(args.pRenderingInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_begin_rendering(args.commandBuffer, info);
         self.recorded(done);
     }
@@ -6061,6 +6087,7 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkCmdSetRenderingAttachmentLocations<'_>,
     ) {
         let Some(info) = self.names(args.pLocationInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_set_rendering_attachment_locations(args.commandBuffer, info);
         self.recorded(done);
     }
@@ -6070,6 +6097,7 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkCmdSetRenderingInputAttachmentIndices<'_>,
     ) {
         let Some(info) = self.names(args.pInputAttachmentIndexInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_set_rendering_input_attachment_indices(args.commandBuffer, info);
         self.recorded(done);
     }

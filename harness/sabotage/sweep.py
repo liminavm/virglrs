@@ -3856,6 +3856,13 @@ SABOTAGES = [
         'attachment_state_and_vertex_bindings_past_the_last_are_refused_before_the_driver',
     ),
     (
+        'a color attachment count is not held to the device',
+        'src/venus/driver.rs',
+        """    if count > facts.limits.maxColorAttachments {""",
+        """    if count > u32::MAX {""",
+        'color_attachment_counts_past_the_device_do_not_validate',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

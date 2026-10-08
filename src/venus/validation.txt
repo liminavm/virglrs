@@ -35,7 +35,7 @@ vkCmdBeginQuery                                  reviewed
 vkCmdBeginQueryIndexedEXT                        reviewed
 vkCmdBeginRenderPass                             pending:render-passes
 vkCmdBeginRenderPass2                            pending:render-passes
-vkCmdBeginRendering                              pending:limits
+vkCmdBeginRendering                              validated
 vkCmdBeginTransformFeedbackEXT                   reviewed
 vkCmdBindDescriptorSets                          pending:descriptors
 vkCmdBindDescriptorSets2                         pending:descriptors
@@ -146,8 +146,8 @@ vkCmdSetRasterizationSamplesEXT                  reviewed
 vkCmdSetRasterizationStreamEXT                   reviewed
 vkCmdSetRasterizerDiscardEnable                  reviewed
 vkCmdSetRayTracingPipelineStackSizeKHR           reviewed
-vkCmdSetRenderingAttachmentLocations             pending:limits
-vkCmdSetRenderingInputAttachmentIndices          pending:limits
+vkCmdSetRenderingAttachmentLocations             validated
+vkCmdSetRenderingInputAttachmentIndices          validated
 vkCmdSetSampleLocationsEXT                       pending:limits
 vkCmdSetSampleLocationsEnableEXT                 reviewed
 vkCmdSetSampleMaskEXT                            reviewed

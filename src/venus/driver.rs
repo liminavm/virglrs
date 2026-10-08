@@ -6183,7 +6183,7 @@ impl Driver {
     pub fn cmd_begin_rendering(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkRenderingInfo>,
+        info: cs::Decoded<'_, VkRenderingInfo, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdBeginRendering()?;
         // SAFETY: as above.
@@ -6589,7 +6589,7 @@ impl Driver {
     pub fn cmd_set_rendering_attachment_locations(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkRenderingAttachmentLocationInfo>,
+        info: cs::Decoded<'_, VkRenderingAttachmentLocationInfo, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdSetRenderingAttachmentLocations()?;
         // SAFETY: as above; `info` is a struct the decoder built, live for the call.
@@ -6601,7 +6601,7 @@ impl Driver {
     pub fn cmd_set_rendering_input_attachment_indices(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkRenderingInputAttachmentIndexInfo>,
+        info: cs::Decoded<'_, VkRenderingInputAttachmentIndexInfo, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdSetRenderingInputAttachmentIndices()?;
         // SAFETY: as above; `info` is a struct the decoder built, live for the call.
@@ -10208,6 +10208,43 @@ pub struct DeviceFacts<'d> {
 /// be equal (VUID-VkDeviceGroupSubmitInfo-*-00082/00083/00084), and a timeline value count to
 /// be equal where that side names a timeline semaphore (VUID-VkSubmitInfo-pNext-03240/03241).
 /// A semaphore this driver has no record of may be a timeline, so it counts as one.
+/// Whether `count` color attachments fit the device: KosmicKrisp begins rendering into an array
+/// of `maxColorAttachments`, and the Mesa runtime keeps each attachment map in one that long, and
+/// all of them index by the guest's count unchecked.
+fn color_attachments_fit(facts: &DeviceFacts<'_>, count: u32) -> Result<(), &'static str> {
+    if count > facts.limits.maxColorAttachments {
+        return Err("named more color attachments than the device has");
+    }
+    Ok(())
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkRenderingInfo {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        color_attachments_fit(facts, this.colorAttachmentCount)
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkRenderingAttachmentLocationInfo {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        color_attachments_fit(facts, this.colorAttachmentCount)
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkRenderingInputAttachmentIndexInfo {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        color_attachments_fit(facts, this.colorAttachmentCount)
+    }
+}
+
 impl cs::Validate<Facts<'_>> for VkSubmitInfo {
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
@@ -10935,6 +10972,55 @@ mod tests {
             arrayLayers: 2,
             ..Default::default()
         }
+    }
+
+    /// A rendering struct naming more color attachments than the device has does not validate.
+    /// KosmicKrisp begins rendering into `color_att[maxColorAttachments]`, and the Mesa runtime
+    /// sets each attachment map in an array that long, both by the guest's count unchecked; the
+    /// driver entry points take only [`cs::Checked`], so the count cannot reach them unheld.
+    #[test]
+    fn color_attachment_counts_past_the_device_do_not_validate() {
+        const DEVICE: VkDevice = VkDevice::forged(0x37);
+        const CB: VkCommandBuffer = VkCommandBuffer::forged(0x38);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        d.plant_limits(
+            DEVICE,
+            VkPhysicalDeviceLimits { maxColorAttachments: 8, ..Default::default() },
+        );
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x39), &[(CB, ObjectId(40))]);
+        let facts = d.recorder_facts(CB).expect("a planted recorder");
+
+        let attachments = [super::super::proto::types::VkRenderingAttachmentInfo::default(); 9];
+        let rendering = |n: usize| VkRenderingInfo {
+            colorAttachmentCount: n as u32,
+            pColorAttachments: attachments.as_ptr(),
+            ..Default::default()
+        };
+        let (eight, nine) = (rendering(8), rendering(9));
+        assert!(cs::Decoded::planted(&eight).validate(&facts).is_ok(), "every attachment");
+        assert!(cs::Decoded::planted(&nine).validate(&facts).is_err(), "one past the last");
+
+        let locations = [0u32; 9];
+        let located = |n: usize| VkRenderingAttachmentLocationInfo {
+            colorAttachmentCount: n as u32,
+            pColorAttachmentLocations: locations.as_ptr(),
+            ..Default::default()
+        };
+        let (eight, nine) = (located(8), located(9));
+        assert!(cs::Decoded::planted(&eight).validate(&facts).is_ok());
+        assert!(cs::Decoded::planted(&nine).validate(&facts).is_err());
+
+        let indexed = |n: usize| VkRenderingInputAttachmentIndexInfo {
+            colorAttachmentCount: n as u32,
+            pColorAttachmentInputIndices: locations.as_ptr(),
+            ..Default::default()
+        };
+        let (eight, nine) = (indexed(8), indexed(9));
+        assert!(cs::Decoded::planted(&eight).validate(&facts).is_ok());
+        assert!(cs::Decoded::planted(&nine).validate(&facts).is_err());
+
+        d.abandon_planted();
     }
 
     /// Color attachment state and vertex bindings past the device's last are refused before the
