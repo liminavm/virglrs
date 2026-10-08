@@ -11778,6 +11778,10 @@ pub struct Facts<'d> {
 
 /// [`Facts`], with the limits of the one device a command records or runs on. A check that holds
 /// a value to a limit validates against this, so there is no way to ask it without a device.
+///
+/// Unlike [`Facts`], this reaches the driver: [`FormatQueries`] asks the physical device about a
+/// format while a check runs. Only queries -- nothing a check can do through it changes any
+/// state, in the driver or here.
 pub struct DeviceFacts<'d> {
     pub facts: Facts<'d>,
     pub limits: &'d VkPhysicalDeviceLimits,
@@ -13342,6 +13346,66 @@ mod tests {
         assert!(host(&[region(0), region(57)]).is_err(), "one texel past");
 
         d.abandon_planted();
+    }
+
+    /// The format queries a check asks mid-validation, against the host's real driver: a device
+    /// created with drm modifiers lays a linear BGRA image out in one plane, and makes uniform
+    /// texel buffers of RGBA8. No corpus creates an image by an explicit modifier, so this is the
+    /// only place the two-call modifier list is ever asked of a driver.
+    #[test]
+    fn the_format_queries_ask_the_real_driver() {
+        use crate::venus::proto::types::{
+            VkApplicationInfo, VkDeviceCreateInfo, VkDeviceQueueCreateInfo, VkInstanceCreateInfo,
+        };
+        let global = crate::vulkan::global();
+        let mut d = Driver::new(Account::for_test(None));
+        let app = VkApplicationInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_APPLICATION_INFO,
+            apiVersion: (1 << 22) | (3 << 12),
+            ..Default::default()
+        };
+        let info = VkInstanceCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            pApplicationInfo: &app,
+            ..Default::default()
+        };
+        let instance =
+            d.create_instance(&global, cs::Decoded::planted(&info), None).expect("an instance");
+        let mut pds = [VkPhysicalDevice::NULL; 1];
+        assert_eq!(d.physical_devices(instance, &mut pds), Ok(1), "one physical device");
+        d.learn_extensions(pds[0]).expect("its extensions");
+
+        let priority = 1.0f32;
+        let queue = VkDeviceQueueCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            queueCount: 1,
+            pQueuePriorities: &priority,
+            ..Default::default()
+        };
+        let name = c"VK_EXT_image_drm_format_modifier";
+        let names = [name.as_ptr()];
+        let info = VkDeviceCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            queueCreateInfoCount: 1,
+            pQueueCreateInfos: &queue,
+            enabledExtensionCount: 1,
+            ppEnabledExtensionNames: names.as_ptr(),
+            ..Default::default()
+        };
+        let device = d.create_device(pds[0], cs::Decoded::planted(&info), None).expect("a device");
+
+        let facts = d.device_facts(device).expect("the device just made");
+        assert!(facts.formats.takes_modifiers());
+        assert_eq!(
+            facts.formats.modifier_planes(VkFormat::VK_FORMAT_B8G8R8A8_UNORM, 0),
+            Some(1),
+            "linear BGRA, one plane"
+        );
+        assert_eq!(facts.formats.modifier_planes(VkFormat::VK_FORMAT_B8G8R8A8_UNORM, 0x77), None);
+        let uniform = VkFormatFeatureFlagBits::VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT.0 as u32;
+        assert_ne!(facts.formats.buffer_features(VkFormat::VK_FORMAT_R8G8B8A8_UNORM) & uniform, 0);
+        assert_eq!(facts.formats.buffer_features(VkFormat::VK_FORMAT_D32_SFLOAT) & uniform, 0);
+        d.teardown(&[]);
     }
 
     /// A texel view lies inside its buffer, holds whole texels, is in a format the device makes

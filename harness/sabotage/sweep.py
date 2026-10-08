@@ -4455,6 +4455,14 @@ SABOTAGES = [
         'a_buffer_view_lies_inside_its_buffer_in_a_texel_format',
     ),
     (
+        'the modifier list is read without asking for its entries',
+        'src/venus/driver.rs',
+        """        list.pDrmFormatModifierProperties = all.as_mut_ptr();
+""",
+        '',
+        'the_format_queries_ask_the_real_driver',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",
