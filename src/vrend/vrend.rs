@@ -2456,6 +2456,18 @@ mod tests {
         let region = Box3 { x: 0, y: 0, z: 0, width: 16, height: 1, depth: 1 };
         let transfer =
             Transfer { resource: args, level: 0, usage: 0, stride: 0, layer_stride: 0, region };
+        // The 2x1 grid leaves the lower half of `top` alone, and a new texture's contents are
+        // undefined: zeroed first, so the lower half has a value to keep. Left as it came, it
+        // read back another test's texels now and then.
+        let zeros = [0u32; (SIDE * SIDE) as usize];
+        let clear_top = Transfer {
+            resource: top,
+            level: 0,
+            usage: 0,
+            stride: 0,
+            layer_stride: 0,
+            region: Box3 { x: 0, y: 0, z: 0, width: SIDE as i32, height: SIDE as i32, depth: 1 },
+        };
         let mut wire = Vec::new();
         for cmd in [
             Command::CreateObject {
@@ -2470,6 +2482,7 @@ mod tests {
             },
             Command::BindShader { stage: ShaderStage::Compute, handle: Some(shader) },
             Command::ResourceInlineWrite { transfer, data: &grid },
+            Command::ResourceInlineWrite { transfer: clear_top, data: &zeros },
             image(whole),
             Command::LaunchGrid {
                 block: [8, 8, 1],
