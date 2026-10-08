@@ -214,6 +214,33 @@ impl<F: ?Sized, T: Validate<F>> Validate<F> for [T] {
     }
 }
 
+/// What a struct's `pNext` chain must satisfy: each link its own [`Validate`], against the struct
+/// it hangs from.
+///
+/// The decoder admits into a chain only the structs vk.xml lets extend its root, so which links
+/// can arrive is known; what is in them is not. A link's count may have to agree with its root's,
+/// an index in it may have to fit the device. The generator implements this for every struct,
+/// bounded on [`Validate`] against [`Chained`] for every link the decoder admits, and
+/// [`Decoded::validate`] runs it: so a root cannot be checked at all until each of its links has
+/// a check of its own or is listed as needing none.
+pub trait ValidateChain<F: ?Sized> {
+    fn validate_chain(this: Decoded<'_, Self, Unchecked>, facts: &F) -> Result<(), &'static str>;
+}
+
+/// An array's chains are valid when each element's is.
+impl<F: ?Sized, T: ValidateChain<F>> ValidateChain<F> for [T] {
+    fn validate_chain(this: Decoded<'_, Self, Unchecked>, facts: &F) -> Result<(), &'static str> {
+        this.iter().try_for_each(|e| T::validate_chain(e, facts))
+    }
+}
+
+/// The facts a chained struct is checked against: the root it hangs from, as the decoder vouched
+/// for it, and the facts the root is checked against.
+pub struct Chained<'r, R, F: ?Sized> {
+    pub root: Decoded<'r, R>,
+    pub facts: &'r F,
+}
+
 impl<T: ?Sized, S> Clone for Decoded<'_, T, S> {
     fn clone(&self) -> Self {
         *self
@@ -234,8 +261,9 @@ impl<'a, T: ?Sized> Decoded<'a, T, Unchecked> {
     /// Hold the guest's values to `facts`, and say so in the type.
     pub fn validate<F: ?Sized>(self, facts: &F) -> Result<Decoded<'a, T, Checked>, &'static str>
     where
-        T: Validate<F>,
+        T: Validate<F> + ValidateChain<F>,
     {
+        T::validate_chain(self, facts)?;
         T::validate(self, facts)?;
         Ok(Decoded(self.0, PhantomData))
     }

@@ -2332,6 +2332,8 @@ class RustGen:
                     out += self._chain_fns(ty, gaps, v)
                 else:
                     out += self._plain_struct_fns(ty, gaps, v)
+        for ty in self.gen.supported_types[VkType.STRUCT]:
+            out += self._validate_chain_impl(ty)
         commands = [c for c in self.gen.supported_types[VkType.COMMAND]
                     if self.gen.is_serializable(c)]
         for ty in commands:
@@ -3389,6 +3391,59 @@ class RustGen:
             '}',
             '',
         ]
+        return out
+
+    def _validate_chain_impl(self, ty):
+        """`cs::ValidateChain` for one struct: every link of its chain, held to its own check.
+
+        The bounds name every struct the decoder admits into this chain, so a root cannot be
+        validated until each of them has a check against it or is listed as needing none. `F`
+        stays free, so a bound is only proved where a root is validated, and the roots no one
+        validates yet ask nothing of their links.
+        """
+        n = ty.name
+        next_types = self.gen.get_chain(ty)[0] if ty.s_type else []
+        if not next_types:
+            return ['impl<F: ?Sized> cs::ValidateChain<F> for %s {' % n,
+                    '    fn validate_chain(',
+                    '        _this: cs::Decoded<\'_, Self, cs::Unchecked>,',
+                    '        _facts: &F,',
+                    '    ) -> Result<(), &\'static str> {',
+                    '        Ok(())',
+                    '    }',
+                    '}', '']
+        out = ['impl<F: ?Sized> cs::ValidateChain<F> for %s' % n, 'where']
+        for nt in next_types:
+            out.append('    for<\'r> %s: cs::Validate<cs::Chained<\'r, %s, F>>,' % (nt.name, n))
+        out += ['{',
+                '    fn validate_chain(',
+                '        this: cs::Decoded<\'_, Self, cs::Unchecked>,',
+                '        facts: &F,',
+                '    ) -> Result<(), &\'static str> {',
+                '        let chained = cs::Chained { root: this, facts };',
+                '        let mut node = this.get().pNext as *const VkBaseInStructure;',
+                '        while !node.is_null() {',
+                '            // SAFETY: `this` is the decoder\'s, so every link of its chain is a struct it',
+                '            // allocated in the arena `this` borrows, and each begins with the `sType`/`pNext`',
+                '            // header `VkBaseInStructure` names.',
+                '            let base = unsafe { &*node };',
+                '            match base.sType {']
+        for nt in next_types:
+            out += ['                VkStructureType::%s => {' % nt.s_type,
+                    '                    // SAFETY: the decoder allocated a `%s` for exactly this tag, and' % nt.name,
+                    '                    // its pointers are the decoder\'s as `this`\'s are (`Decoded::vouch`).',
+                    '                    let link = unsafe { cs::Decoded::vouch(&*(node as *const %s)) };' % nt.name,
+                    '                    <%s as cs::Validate<_>>::validate(link, &chained)?;' % nt.name,
+                    '                }']
+        out += ['                other => unreachable!(',
+                '                    "%s chains {other:?}, which its decoder refuses"' % n,
+                '                ),',
+                '            }',
+                '            node = base.pNext;',
+                '        }',
+                '        Ok(())',
+                '    }',
+                '}', '']
         return out
 
     def _chain_pnext_sizeof(self, ty, next_types, v=''):

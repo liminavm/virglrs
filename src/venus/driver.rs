@@ -42,9 +42,10 @@ use super::proto::types::{
     VkDescriptorPool, VkDescriptorPoolCreateInfo, VkDescriptorSet, VkDescriptorSetLayout,
     VkDescriptorSetLayoutCreateInfo, VkDescriptorUpdateTemplate,
     VkDescriptorUpdateTemplateCreateInfo, VkDevice, VkDeviceAddress, VkDeviceCreateInfo,
-    VkDeviceGroupSubmitInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA,
-    VkDeviceSize, VkEvent, VkEventCreateInfo, VkExportMemoryAllocateInfo, VkExtensionProperties,
-    VkExtent2D, VkExtent3D, VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
+    VkDeviceGroupRenderPassBeginInfo, VkDeviceGroupSubmitInfo, VkDeviceMemory, VkDeviceQueueInfo2,
+    VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent, VkEventCreateInfo,
+    VkExportMemoryAllocateInfo, VkExtensionProperties, VkExtent2D, VkExtent3D,
+    VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
     VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
@@ -60,18 +61,19 @@ use super::proto::types::{
     VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags,
     VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA,
     VkMemoryToImageCopy, VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT,
-    VkMultisamplePropertiesEXT, VkObjectType, VkOffset3D, VkPhysicalDevice,
-    VkPhysicalDeviceExternalImageFormatInfo, VkPhysicalDeviceImageFormatInfo2,
-    VkPhysicalDeviceLimits, VkPhysicalDeviceMemoryBudgetPropertiesEXT,
-    VkPhysicalDeviceMemoryProperties, VkPhysicalDeviceProperties,
-    VkPhysicalDeviceSampleLocationsPropertiesEXT, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
-    VkPipelineCacheCreateInfo, VkPipelineLayout, VkPipelineLayoutCreateInfo,
-    VkPipelineStageFlagBits, VkPipelineStageFlags, VkPipelineStageFlags2, VkPolygonMode,
-    VkPrimitiveTopology, VkProvokingVertexModeEXT, VkPushConstantRange, VkPushConstantsInfo,
-    VkPushDescriptorSetInfo, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
-    VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
-    VkRenderPassBeginInfo, VkRenderPassCreateInfo, VkRenderPassCreateInfo2,
-    VkRenderingAttachmentLocationInfo, VkRenderingEndInfoKHR, VkRenderingInfo,
+    VkMultisamplePropertiesEXT, VkMultisampledRenderToSingleSampledInfoEXT, VkObjectType,
+    VkOffset3D, VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo,
+    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceLimits,
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties,
+    VkPhysicalDeviceProperties, VkPhysicalDeviceSampleLocationsPropertiesEXT, VkPipeline,
+    VkPipelineBindPoint, VkPipelineCache, VkPipelineCacheCreateInfo, VkPipelineLayout,
+    VkPipelineLayoutCreateInfo, VkPipelineStageFlagBits, VkPipelineStageFlags,
+    VkPipelineStageFlags2, VkPolygonMode, VkPrimitiveTopology, VkProtectedSubmitInfo,
+    VkProvokingVertexModeEXT, VkPushConstantRange, VkPushConstantsInfo, VkPushDescriptorSetInfo,
+    VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits,
+    VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo,
+    VkRenderPassCreateInfo, VkRenderPassCreateInfo2, VkRenderingAttachmentLocationInfo,
+    VkRenderingEndInfoKHR, VkRenderingFragmentShadingRateAttachmentInfoKHR, VkRenderingInfo,
     VkRenderingInputAttachmentIndexInfo, VkResolveImageInfo2, VkResult, VkRingMonitorInfoMESA,
     VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampleMask, VkSampler, VkSamplerCreateInfo,
     VkSamplerYcbcrConversion, VkSamplerYcbcrConversionCreateInfo, VkSemaphore,
@@ -10572,50 +10574,60 @@ impl cs::Validate<DeviceFacts<'_>> for VkSampleLocationsInfoEXT {
 }
 
 impl cs::Validate<Facts<'_>> for VkSubmitInfo {
+    /// The submit's own arrays are the decoder's, each its own count long; what can disagree
+    /// with them is in its chain.
+    fn validate(
+        _this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _facts: &Facts<'_>,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+}
+
+/// Whether a chained array holds one entry for each of the `wanted` its root names. The decoder
+/// turns an array the guest sent empty into a null pointer whatever count it sent beside it, so a
+/// count that agrees is not enough: the array must be there too.
+fn covers(wanted: u32, count: u32, array: *const core::ffi::c_void) -> bool {
+    count == wanted && (wanted == 0 || !array.is_null())
+}
+
+impl<F: ?Sized> cs::Validate<cs::Chained<'_, VkSubmitInfo, F>> for VkDeviceGroupSubmitInfo {
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
-        facts: &Facts<'_>,
+        on: &cs::Chained<'_, VkSubmitInfo, F>,
     ) -> Result<(), &'static str> {
-        let s = this.get();
-        // Whether a chained array holds one entry for each of the `wanted` the submit names. The
-        // decoder turns an array the guest sent empty into a null pointer whatever count it sent
-        // beside it, so a count that agrees is not enough: the array must be there too.
-        let covers = |wanted: u32, count: u32, array: *const core::ffi::c_void| {
-            count == wanted && (wanted == 0 || !array.is_null())
-        };
-        if let Some(g) = chained_at::<VkDeviceGroupSubmitInfo>(&s.pNext) {
-            if !covers(
-                s.waitSemaphoreCount,
-                g.waitSemaphoreCount,
-                g.pWaitSemaphoreDeviceIndices.cast(),
-            ) {
-                return Err("a device-group wait array that does not cover its submit's waits");
-            }
-            if !covers(
-                s.commandBufferCount,
-                g.commandBufferCount,
-                g.pCommandBufferDeviceMasks.cast(),
-            ) {
-                return Err("a device-group command buffer array that does not cover its submit's");
-            }
-            if !covers(
-                s.signalSemaphoreCount,
-                g.signalSemaphoreCount,
-                g.pSignalSemaphoreDeviceIndices.cast(),
-            ) {
-                return Err("a device-group signal array that does not cover its submit's signals");
-            }
+        let (s, g) = (on.root.get(), this.get());
+        if !covers(s.waitSemaphoreCount, g.waitSemaphoreCount, g.pWaitSemaphoreDeviceIndices.cast())
+        {
+            return Err("a device-group wait array that does not cover its submit's waits");
         }
-        let Some(t) = chained_at::<VkTimelineSemaphoreSubmitInfo>(&s.pNext) else {
-            return Ok(());
-        };
+        if !covers(s.commandBufferCount, g.commandBufferCount, g.pCommandBufferDeviceMasks.cast()) {
+            return Err("a device-group command buffer array that does not cover its submit's");
+        }
+        if !covers(
+            s.signalSemaphoreCount,
+            g.signalSemaphoreCount,
+            g.pSignalSemaphoreDeviceIndices.cast(),
+        ) {
+            return Err("a device-group signal array that does not cover its submit's signals");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkSubmitInfo, Facts<'_>>> for VkTimelineSemaphoreSubmitInfo {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkSubmitInfo, Facts<'_>>,
+    ) -> Result<(), &'static str> {
+        let (s, t) = (on.root.get(), this.get());
         let names_a_timeline = |count: u32, sems: *const VkSemaphore| {
-            // SAFETY: `this` is `Decoded`, so the decoder allocated this array from the batch arena
-            // sized to the count beside it (see `Decoded::vouch`), and the arena outlives this
-            // call. `wire_array` is the same reconciliation the generated accessors use.
+            // SAFETY: `on.root` is `Decoded`, so the decoder allocated this array from the batch
+            // arena sized to the count beside it (see `Decoded::vouch`), and the arena outlives
+            // this call. `wire_array` is the same reconciliation the generated accessors use.
             let sems = unsafe { crate::venus::cs::wire_array::<VkSemaphore>(count as usize, sems) };
             sems.unwrap_or_default().iter().any(|sem| {
-                facts.semaphores.get(sem).is_none_or(|f| f.kind == SemaphoreKind::Timeline)
+                on.facts.semaphores.get(sem).is_none_or(|f| f.kind == SemaphoreKind::Timeline)
             })
         };
         if !covers(s.waitSemaphoreCount, t.waitSemaphoreValueCount, t.pWaitSemaphoreValues.cast())
@@ -10634,6 +10646,39 @@ impl cs::Validate<Facts<'_>> for VkSubmitInfo {
         Ok(())
     }
 }
+
+/// Chained structs that carry nothing a host driver indexes, copies by or sizes anything from:
+/// flags, booleans, enums the decoder already bounded, and opaque values the driver hands on.
+/// Each is valid against any root, so listing one is the whole of its check.
+///
+/// A struct belongs here only when that is true of every member. One with a count, an index or a
+/// value bounded by a limit has a `Validate` of its own against each root it extends.
+macro_rules! needs_no_check {
+    ($($t:ty),* $(,)?) => {$(
+        impl<R, F: ?Sized> cs::Validate<cs::Chained<'_, R, F>> for $t {
+            fn validate(
+                _this: cs::Decoded<'_, Self, cs::Unchecked>,
+                _on: &cs::Chained<'_, R, F>,
+            ) -> Result<(), &'static str> {
+                Ok(())
+            }
+        }
+    )*};
+}
+
+needs_no_check!(
+    // `protectedSubmit`, a boolean.
+    VkProtectedSubmitInfo,
+    // A device mask and per-device render areas, which neither KosmicKrisp nor anv nor the Mesa
+    // runtime reads; the areas are the decoder's array, as long as their count.
+    VkDeviceGroupRenderPassBeginInfo,
+    // A boolean and a sample count the decoder bounded to the enum; under `VkRenderingInfo` no
+    // driver reads it, and the runtime's read is of the one chained under a subpass.
+    VkMultisampledRenderToSingleSampledInfoEXT,
+    // A view the decoder resolved, which KosmicKrisp and anv bind; anv ignores the layout and the
+    // texel size, and KosmicKrisp never reads them.
+    VkRenderingFragmentShadingRateAttachmentInfoKHR,
+);
 
 /// Why a `vkQueueSubmit2` was refused without being forwarded.
 ///

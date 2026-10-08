@@ -19,7 +19,9 @@ use crate::ids::{ContextId, ResourceHandle, RingId};
 
 use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
-use super::cs::{Checked, Decoded, Guest, HostHandle, ObjectId, Validate, guest_face};
+use super::cs::{
+    Checked, Decoded, Guest, HostHandle, ObjectId, Validate, ValidateChain, guest_face,
+};
 use super::driver::{
     self, Answered, Driver, DriverWait, ExportError, Exported, InFlight, Level, MemoryError,
     NoHostCopy, NoSubmit2, NoSyncFd, NotATimeline, XfbCounters,
@@ -2364,7 +2366,9 @@ impl Handlers<'_> {
         info: Decoded<'a, T>,
     ) -> Option<Decoded<'a, T, Checked>>
     where
-        T: ?Sized + for<'d> Validate<driver::DeviceFacts<'d>>,
+        T: ?Sized
+            + for<'d> Validate<driver::DeviceFacts<'d>>
+            + for<'d> ValidateChain<driver::DeviceFacts<'d>>,
     {
         let verdict = self.driver.recorder_facts(cb).map(|facts| info.validate(&facts));
         match verdict {

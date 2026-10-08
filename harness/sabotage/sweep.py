@@ -3735,17 +3735,22 @@ SABOTAGES = [
     (
         'a submit device-group count is passed to the driver unchecked',
         'src/venus/driver.rs',
-        """        if let Some(g) = chained_at::<VkDeviceGroupSubmitInfo>(&s.pNext) {""",
-        """        if let Some(g) = None::<&VkDeviceGroupSubmitInfo> {""",
+        """        let (s, g) = (on.root.get(), this.get());""",
+        """        let (s, g) = (on.root.get(), this.get());
+        if s.waitSemaphoreCount != u32::MAX {
+            return Ok(());
+        }""",
         'a_submit_whose_chained_counts_disagree_is_refused_before_the_driver',
     ),
     (
         'a submit timeline signal value count is passed to the driver unchecked',
         'src/venus/driver.rs',
         """        if !covers(
-            s.signalSemaphoreCount,""",
+            s.signalSemaphoreCount,
+            t.signalSemaphoreValueCount,""",
         """        if false && !covers(
-            s.signalSemaphoreCount,""",
+            s.signalSemaphoreCount,
+            t.signalSemaphoreValueCount,""",
         'a_submit_whose_chained_counts_disagree_is_refused_before_the_driver',
     ),
     (
@@ -3959,6 +3964,21 @@ SABOTAGES = [
             }""",
         """            VkObjectType::VK_OBJECT_TYPE_BUFFER => {}""",
         'buffers_bound_past_their_end_are_refused_before_the_driver',
+    ),
+    (
+        'a chained struct refusal is dropped by the generated walk',
+        'venus-gen/rustgen.py',
+        """                    '                    <%s as cs::Validate<_>>::validate(link, &chained)?;' % nt.name,""",
+        """                    '                    let _ = <%s as cs::Validate<_>>::validate(link, &chained);' % nt.name,""",
+        'a_submit_whose_chained_counts_disagree_is_refused_before_the_driver',
+    ),
+    (
+        'a validated struct skips its chain',
+        'src/venus/cs.rs',
+        """        T::validate_chain(self, facts)?;
+""",
+        """""",
+        'a_submit_whose_chained_counts_disagree_is_refused_before_the_driver',
     ),
     (
         'a submit chained array is trusted by its count alone',
