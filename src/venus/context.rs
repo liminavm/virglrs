@@ -3051,13 +3051,19 @@ impl Commands for Handlers<'_> {
 
     simple_destroy!(vkDestroyImage, vn_command_vkDestroyImage, image);
 
-    simple_create!(
-        vkCreateImageView,
-        vn_command_vkCreateImageView,
-        pCreateInfo,
-        pView,
-        handle_pView_mut
-    );
+    fn vkCreateImageView(&mut self, args: &mut vn_command_vkCreateImageView<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        // As `vkCreatePipelineLayout`: a device this context does not have answers as
+        // `create_object` would, and one it has holds the view to its image.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => self.driver.create_image_view(args.device, info, args.pAllocator),
+        };
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateImageView", args.pView(), args.handle_pView_mut(), host);
+    }
     simple_destroy!(vkDestroyImageView, vn_command_vkDestroyImageView, imageView);
 
     simple_create!(
@@ -5965,6 +5971,11 @@ impl Commands for Handlers<'_> {
 
     fn vkCopyImageToImage(&mut self, args: &mut vn_command_vkCopyImageToImage<'_>) {
         let Some(info) = self.names(args.pCopyImageToImageInfo) else { return };
+        let info = match self.driver.device_facts(args.device).map(|f| info.validate(&f)) {
+            Some(Ok(info)) => info,
+            Some(Err(why)) => return self.reject(why),
+            None => return self.reject("copied between images on a device it does not have"),
+        };
         let Some(ret) = self.driver.copy_image_to_image(args.device, info) else {
             self.reject("copied between images on a device it does not have");
             return;
@@ -6022,7 +6033,7 @@ impl Commands for Handlers<'_> {
             color,
             ranges,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdCopyBuffer2(&mut self, args: &mut vn_command_vkCmdCopyBuffer2<'_>) {
@@ -6437,7 +6448,7 @@ impl Commands for Handlers<'_> {
             value,
             ranges,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdResolveImage(&mut self, args: &mut vn_command_vkCmdResolveImage<'_>) {
@@ -17076,16 +17087,42 @@ mod tests {
     /// A 64-by-64 RGBA8 2D image of one level and one layer, recorded under `image`: what a
     /// recording test names when its point is not the region.
     fn plant_rgba_image(driver: &mut Driver, image: super::super::proto::types::VkImage) {
-        use super::super::proto::types::{VkExtent3D, VkFormat, VkImageCreateInfo, VkImageType};
+        plant_2d_image(
+            driver,
+            image,
+            super::super::proto::types::VkFormat::VK_FORMAT_R8G8B8A8_UNORM,
+            1,
+        );
+    }
+
+    /// A 64-by-64 2D image of `format` with `levels` mip levels and one layer.
+    fn plant_2d_image(
+        driver: &mut Driver,
+        image: super::super::proto::types::VkImage,
+        format: super::super::proto::types::VkFormat,
+        levels: u32,
+    ) {
+        use super::super::proto::types::{VkExtent3D, VkImageCreateInfo, VkImageType};
         let info = VkImageCreateInfo {
             imageType: VkImageType::VK_IMAGE_TYPE_2D,
-            format: VkFormat::VK_FORMAT_R8G8B8A8_UNORM,
+            format,
             extent: VkExtent3D { width: 64, height: 64, depth: 1 },
-            mipLevels: 1,
+            mipLevels: levels,
             arrayLayers: 1,
             ..Default::default()
         };
         driver.plant_image(image, &info);
+    }
+
+    /// One level of `aspect` at `level`, one layer: a range a clear can name.
+    fn one_level(aspect: u32, level: u32) -> super::super::proto::types::VkImageSubresourceRange {
+        super::super::proto::types::VkImageSubresourceRange {
+            aspectMask: super::super::proto::types::VkImageAspectFlags(aspect),
+            baseMipLevel: level,
+            levelCount: 1,
+            baseArrayLayer: 0,
+            layerCount: 1,
+        }
     }
 
     /// The colour of one layer at level 0: the least a region can name.
@@ -19023,10 +19060,15 @@ mod tests {
         let cb = VkCommandBuffer::forged(CB.0);
 
         let value = VkClearDepthStencilValue { depth: 0.25, stencil: 0x5a };
-        let ranges = [
-            VkImageSubresourceRange { baseMipLevel: 2, ..Default::default() },
-            VkImageSubresourceRange { baseMipLevel: 3, ..Default::default() },
-        ];
+        let depth =
+            super::super::proto::types::VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT.0 as u32;
+        plant_2d_image(
+            h.driver,
+            VkImage::forged(0x11),
+            super::super::proto::types::VkFormat::VK_FORMAT_D24_UNORM_S8_UINT,
+            4,
+        );
+        let ranges = [one_level(depth, 2), one_level(depth, 3)];
         let mut args = vn_command_vkCmdClearDepthStencilImage::default();
         args.commandBuffer = cb;
         args.image = VkImage::forged(0x11);
@@ -21819,7 +21861,15 @@ mod tests {
         // A by-ref value beside a counted array. The colour is the whole point of the command,
         // so it has to arrive as the guest set it and not as a default.
         let color = VkClearColorValue { uint32: [0xabcd_ef01, 0, 0, 0] };
-        let ranges = [VkImageSubresourceRange { baseMipLevel: 4, ..Default::default() }];
+        let color_aspect =
+            super::super::proto::types::VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32;
+        plant_2d_image(
+            h.driver,
+            VkImage::forged(0x33),
+            super::super::proto::types::VkFormat::VK_FORMAT_R8G8B8A8_UNORM,
+            5,
+        );
+        let ranges = [one_level(color_aspect, 4)];
         let mut args = vn_command_vkCmdClearColorImage::default();
         args.commandBuffer = cb;
         args.image = VkImage::forged(0x33);

@@ -50,8 +50,8 @@ vkCmdBlitImage2                                  validated
 vkCmdBuildAccelerationStructuresIndirectKHR      reviewed
 vkCmdBuildAccelerationStructuresKHR              reviewed
 vkCmdClearAttachments                            reviewed
-vkCmdClearColorImage                             pending:images
-vkCmdClearDepthStencilImage                      pending:images
+vkCmdClearColorImage                             validated
+vkCmdClearDepthStencilImage                      validated
 vkCmdCopyAccelerationStructureKHR                reviewed
 vkCmdCopyAccelerationStructureToMemoryKHR        reviewed
 vkCmdCopyBuffer                                  reviewed
@@ -171,7 +171,7 @@ vkCmdWaitEvents2                                 reviewed
 vkCmdWriteAccelerationStructuresPropertiesKHR    reviewed
 vkCmdWriteTimestamp                              reviewed
 vkCmdWriteTimestamp2                             reviewed
-vkCopyImageToImage                               pending:images
+vkCopyImageToImage                               validated
 vkCopyImageToMemoryMESA                          validated
 vkCopyMemoryToImageMESA                          validated
 vkCreateAccelerationStructureKHR                 reviewed
@@ -188,7 +188,7 @@ vkCreateFence                                    reviewed
 vkCreateFramebuffer                              pending:render-passes
 vkCreateGraphicsPipelines                        pending:pipelines
 vkCreateImage                                    pending:images
-vkCreateImageView                                pending:images
+vkCreateImageView                                validated
 vkCreateInstance                                 reviewed
 vkCreatePipelineCache                            reviewed
 vkCreatePipelineLayout                           validated

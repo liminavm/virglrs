@@ -86,7 +86,11 @@ use super::proto::types::{
     VkVertexInputAttributeDescription2EXT, VkVertexInputBindingDescription2EXT, VkViewport,
     VkWriteDescriptorSet,
 };
-use super::proto::types::{VkBufferImageCopy2, VkResolveImageModeInfoKHR, VkResolveModeFlagBits};
+use super::proto::types::{
+    VkBufferImageCopy2, VkImageCreateFlagBits, VkImageViewMinLodCreateInfoEXT,
+    VkImageViewSlicedCreateInfoEXT, VkImageViewType, VkImageViewUsageCreateInfo,
+    VkResolveImageModeInfoKHR, VkResolveModeFlagBits, VkSamplerYcbcrConversionInfo,
+};
 use super::proto::types::{
     VkComputePipelineCreateInfo, VkDeferredOperationKHR, VkGraphicsPipelineCreateInfo,
     VkPhysicalDeviceProperties2, VkPhysicalDeviceRayTracingPipelinePropertiesKHR,
@@ -3518,7 +3522,7 @@ impl Driver {
     pub fn copy_image_to_image(
         &self,
         device: VkDevice,
-        info: cs::Decoded<'_, VkCopyImageToImageInfo>,
+        info: cs::Decoded<'_, VkCopyImageToImageInfo, cs::Checked>,
     ) -> Option<VkResult> {
         let d = &self.devices.get(&device)?.fns;
         // SAFETY: a device in this table, and `info` is an arena allocation live for the call --
@@ -4977,6 +4981,17 @@ impl Driver {
 
     /// `vkCreatePipelineLayout`, whose info must be held to the device first: see the `Validate`
     /// impl for `VkPipelineLayoutCreateInfo`.
+    /// `vkCreateImageView`, of a view held to its image. See [`VkImageViewCreateInfo`]'s
+    /// [`cs::Validate`].
+    pub fn create_image_view(
+        &self,
+        device: VkDevice,
+        info: cs::Decoded<'_, VkImageViewCreateInfo, cs::Checked>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+    ) -> Result<VkImageView, VkResult> {
+        self.create_object(device, |d| Some(d.vkCreateImageView()), info, alloc)
+    }
+
     pub fn create_pipeline_layout(
         &self,
         device: VkDevice,
@@ -6638,8 +6653,12 @@ impl Driver {
         layout: VkImageLayout,
         color: &VkClearColorValue,
         ranges: &[VkImageSubresourceRange],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), RecordRefused> {
+        let facts = self.facts();
+        for r in ranges {
+            facts.clear_range(image, r, Clear::Color).map_err(RecordRefused::Invalid)?;
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above; the count is the slice's own length, and the colour is a reference.
         unsafe {
             (d.vkCmdClearColorImage())(
@@ -6651,7 +6670,7 @@ impl Driver {
                 ranges.as_ptr(),
             )
         };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdCopyBuffer2` and the five other `VK_KHR_copy_commands2` forms, core in 1.3: each
@@ -7269,8 +7288,12 @@ impl Driver {
         layout: VkImageLayout,
         value: &VkClearDepthStencilValue,
         ranges: &[VkImageSubresourceRange],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), RecordRefused> {
+        let facts = self.facts();
+        for r in ranges {
+            facts.clear_range(image, r, Clear::DepthStencil).map_err(RecordRefused::Invalid)?;
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above; the count is the slice's own length, and the value is a reference.
         unsafe {
             (d.vkCmdClearDepthStencilImage())(
@@ -7282,7 +7305,7 @@ impl Driver {
                 ranges.as_ptr(),
             )
         };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdResolveImage`: a multisampled image averaged down into a single-sampled one. The
@@ -8837,6 +8860,7 @@ impl Driver {
             image,
             ImageFacts {
                 image_type: info.imageType,
+                flags: info.flags,
                 width: info.extent.width,
                 height: info.extent.height,
                 depth: info.extent.depth,
@@ -9403,6 +9427,8 @@ struct ImageFacts {
     /// 3D or not decides whether a region's depth is slices or layers; depth alone cannot say,
     /// since a 3D image may be one slice deep.
     image_type: VkImageType,
+    /// What views of it may be: another format, a cube, a 2D slice of a 3D image.
+    flags: VkImageCreateFlags,
     width: u32,
     height: u32,
     depth: u32,
@@ -10709,6 +10735,289 @@ impl Placed<'_> {
     }
 }
 
+/// What a clear may name: a colour image's colour, or a depth and stencil image's aspects.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Clear {
+    Color,
+    DepthStencil,
+}
+
+/// The aspects `format` has, as Vulkan spells them: colour for anything without depth or stencil
+/// (planar formats included), and each plane of a planar one.
+fn format_aspects(format: VkFormat) -> u32 {
+    use crate::venus::proto::formats;
+    const COLOR: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32;
+    const DEPTH: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT.0 as u32;
+    const STENCIL: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_STENCIL_BIT.0 as u32;
+    const PLANE_0: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_0_BIT.0 as u32;
+    let depth = formats::depth_texel_bytes(format).is_some();
+    let stencil = formats::has_stencil(format);
+    let mut aspects = 0;
+    if depth {
+        aspects |= DEPTH;
+    }
+    if stencil {
+        aspects |= STENCIL;
+    }
+    if !depth && !stencil {
+        aspects |= COLOR;
+    }
+    for i in 0..3 {
+        if formats::plane_of(format, i).is_some() {
+            aspects |= PLANE_0 << i;
+        }
+    }
+    aspects
+}
+
+/// How many of `limit` a range starting at `base` covers: `count`, or every one from `base` on
+/// for Vulkan's `VK_REMAINING_*` (all ones). `None` for a range that is empty or runs past.
+fn range_count(base: u32, count: u32, limit: u32) -> Option<u32> {
+    let count = if count == u32::MAX { limit.checked_sub(base)? } else { count };
+    (count > 0 && base.checked_add(count)? <= limit).then_some(count)
+}
+
+impl Facts<'_> {
+    /// A clear's range: colour alone on an uncompressed colour image, or depth and stencil the
+    /// format has; levels and layers the image has. KosmicKrisp clears each level and layer of
+    /// the range through a render pass on a view it builds from these numbers.
+    fn clear_range(
+        &self,
+        image: VkImage,
+        r: &VkImageSubresourceRange,
+        clear: Clear,
+    ) -> Result<(), &'static str> {
+        use crate::venus::proto::formats;
+        const COLOR: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32;
+        const DEPTH_STENCIL: u32 = (VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT.0
+            | VkImageAspectFlagBits::VK_IMAGE_ASPECT_STENCIL_BIT.0)
+            as u32;
+        let Some(facts) = self.images.get(&image) else {
+            return Err("cleared an image this renderer has no record of");
+        };
+        let has = format_aspects(facts.format);
+        let aspect = r.aspectMask.0;
+        let fits = match clear {
+            Clear::Color => {
+                aspect == COLOR
+                    && has == COLOR
+                    && formats::texel_block(facts.format)
+                        .is_some_and(|b| b.width == 1 && b.height == 1)
+            }
+            Clear::DepthStencil => aspect != 0 && aspect & !(has & DEPTH_STENCIL) == 0,
+        };
+        if !fits {
+            return Err("cleared aspects the image cannot be cleared by");
+        }
+        range_count(r.baseMipLevel, r.levelCount, facts.mip_levels)
+            .ok_or("cleared mip levels the image does not have")?;
+        range_count(r.baseArrayLayer, r.layerCount, facts.array_layers)
+            .ok_or("cleared layers the image does not have")?;
+        Ok(())
+    }
+}
+
+/// The level count a view covers, its range resolved against its image.
+fn view_levels(info: &VkImageViewCreateInfo, image: &ImageFacts) -> Option<u32> {
+    let r = &info.subresourceRange;
+    range_count(r.baseMipLevel, r.levelCount, image.mip_levels)
+}
+
+/// A 3D image seen through a 2D or 2D-array view, whose layers are the level's slices.
+fn views_slices(info: &VkImageViewCreateInfo, image: &ImageFacts) -> bool {
+    image.image_type == VkImageType::VK_IMAGE_TYPE_3D
+        && matches!(
+            info.viewType,
+            VkImageViewType::VK_IMAGE_VIEW_TYPE_2D | VkImageViewType::VK_IMAGE_VIEW_TYPE_2D_ARRAY
+        )
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkImageViewCreateInfo {
+    /// A view's type, format and range against its image. The Mesa runtime and KosmicKrisp assert
+    /// all of it and check none, then build a Metal texture view from the numbers, which Metal
+    /// answers with an exception -- an abort -- or a view of memory the image does not own.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        use crate::venus::proto::formats;
+        type T = VkImageViewType;
+        // The bits vk.xml defines. Mesa's runtime reserves the top one for its own views, and a
+        // view created with it skips every check the runtime makes.
+        const VIEW_FLAGS: u32 = 0x7;
+        if this.flags.0 & !VIEW_FLAGS != 0 {
+            return Err("created an image view with flags Vulkan does not define");
+        }
+        let Some(image) = facts.facts.images.get(&this.image) else {
+            return Err("viewed an image this renderer has no record of");
+        };
+        let flag = |bit: VkImageCreateFlagBits| image.flags.0 & bit.0 as u32 != 0;
+        let ty = image.image_type;
+        let typed = match this.viewType {
+            T::VK_IMAGE_VIEW_TYPE_1D | T::VK_IMAGE_VIEW_TYPE_1D_ARRAY => {
+                ty == VkImageType::VK_IMAGE_TYPE_1D
+            }
+            T::VK_IMAGE_VIEW_TYPE_2D | T::VK_IMAGE_VIEW_TYPE_2D_ARRAY => {
+                ty == VkImageType::VK_IMAGE_TYPE_2D
+                    || (ty == VkImageType::VK_IMAGE_TYPE_3D
+                        && (flag(VkImageCreateFlagBits::VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)
+                            || flag(
+                                VkImageCreateFlagBits::VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT,
+                            )))
+            }
+            T::VK_IMAGE_VIEW_TYPE_3D => ty == VkImageType::VK_IMAGE_TYPE_3D,
+            T::VK_IMAGE_VIEW_TYPE_CUBE | T::VK_IMAGE_VIEW_TYPE_CUBE_ARRAY => {
+                ty == VkImageType::VK_IMAGE_TYPE_2D
+                    && flag(VkImageCreateFlagBits::VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
+            }
+            _ => false,
+        };
+        if !typed {
+            return Err("viewed an image as a type it cannot be seen as");
+        }
+
+        let r = &this.subresourceRange;
+        let has = format_aspects(image.format);
+        if r.aspectMask.0 == 0 || r.aspectMask.0 & !has != 0 {
+            return Err("viewed aspects the image does not have");
+        }
+        let levels =
+            view_levels(&this, image).ok_or("viewed mip levels the image does not have")?;
+        let space = if views_slices(&this, image) {
+            (image.depth >> r.baseMipLevel).max(1)
+        } else {
+            image.array_layers
+        };
+        let layers = range_count(r.baseArrayLayer, r.layerCount, space)
+            .ok_or("viewed layers the image does not have")?;
+        let layered = match this.viewType {
+            T::VK_IMAGE_VIEW_TYPE_1D | T::VK_IMAGE_VIEW_TYPE_2D | T::VK_IMAGE_VIEW_TYPE_3D => {
+                layers == 1
+            }
+            T::VK_IMAGE_VIEW_TYPE_CUBE => layers == 6,
+            T::VK_IMAGE_VIEW_TYPE_CUBE_ARRAY => layers % 6 == 0,
+            _ => true,
+        };
+        if !layered {
+            return Err("viewed a number of layers its view type does not hold");
+        }
+
+        // The format: the image's, or -- on an image made mutable -- one Metal can view the same
+        // texels as. Depth and stencil formats are each compatible only with themselves.
+        let format =
+            if this.format == VkFormat::VK_FORMAT_UNDEFINED { image.format } else { this.format };
+        if format != image.format {
+            const DEPTH_STENCIL: u32 = (VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT.0
+                | VkImageAspectFlagBits::VK_IMAGE_ASPECT_STENCIL_BIT.0)
+                as u32;
+            if !flag(VkImageCreateFlagBits::VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)
+                || has & DEPTH_STENCIL != 0
+            {
+                return Err("viewed an image as a format it was not made mutable to");
+            }
+            let view =
+                formats::texel_block(format).ok_or("viewed an image as a format with no block")?;
+            let plane = (0..3).find(|&i| {
+                r.aspectMask.0 == (VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_0_BIT.0 as u32) << i
+            });
+            let of_image = match plane {
+                Some(i) => {
+                    formats::plane_of(image.format, i).and_then(|(f, _, _)| formats::texel_block(f))
+                }
+                None => formats::texel_block(image.format),
+            }
+            .ok_or("viewed an image whose format has no block")?;
+            let compatible = if view == of_image {
+                true
+            } else if of_image.width > 1 && view.width == 1 && view.height == 1 {
+                // An uncompressed view of a compressed image: one texel a block, one level.
+                flag(VkImageCreateFlagBits::VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT)
+                    && view.bytes == of_image.bytes
+                    && levels == 1
+            } else {
+                plane.is_some()
+                    && view.bytes == of_image.bytes
+                    && view.width == 1
+                    && view.height == 1
+            };
+            if !compatible {
+                return Err("viewed an image as a format its texels are not");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The Mesa runtime stores `minLod`, and KosmicKrisp converts it less the base level to a 16-bit
+/// integer for its descriptors -- a conversion C leaves undefined outside that integer's range.
+/// So it is held to what Vulkan allows: finite, and no deeper than the view's last level.
+impl cs::Validate<cs::Chained<'_, VkImageViewCreateInfo, DeviceFacts<'_>>>
+    for VkImageViewMinLodCreateInfoEXT
+{
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkImageViewCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let view = on.root.get();
+        let Some(image) = on.facts.facts.images.get(&view.image) else {
+            return Err("viewed an image this renderer has no record of");
+        };
+        let levels = view_levels(view, image).ok_or("viewed mip levels the image does not have")?;
+        let last = view.subresourceRange.baseMipLevel + levels - 1;
+        let lod = this.minLod;
+        if !lod.is_finite() || lod < 0.0 || lod > last as f32 {
+            return Err("clamped a view to a level it does not have");
+        }
+        Ok(())
+    }
+}
+
+/// The runtime reads a sliced view of a 3D image whatever the device advertises, takes its slices
+/// as the storage view's, and only asserts they fit. Under any other view it is ignored.
+impl cs::Validate<cs::Chained<'_, VkImageViewCreateInfo, DeviceFacts<'_>>>
+    for VkImageViewSlicedCreateInfoEXT
+{
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkImageViewCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let view = on.root.get();
+        let Some(image) = on.facts.facts.images.get(&view.image) else {
+            return Err("viewed an image this renderer has no record of");
+        };
+        if image.image_type != VkImageType::VK_IMAGE_TYPE_3D
+            || view.viewType != VkImageViewType::VK_IMAGE_VIEW_TYPE_3D
+        {
+            return Ok(());
+        }
+        let depth = (image.depth >> view.subresourceRange.baseMipLevel).max(1);
+        range_count(this.sliceOffset, this.sliceCount, depth)
+            .ok_or("viewed slices the image does not have")?;
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkCopyImageToImageInfo {
+    /// A host copy between two images: the regions of a device copy, and the same check.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        regions_of(&this, this.regionCount, this.pRegions).iter().try_for_each(|r| {
+            facts.facts.image_region(
+                Aspects::DepthStencil,
+                this.srcImage,
+                &r.srcSubresource,
+                r.srcOffset,
+                this.dstImage,
+                &r.dstSubresource,
+                r.dstOffset,
+                r.extent,
+            )
+        })
+    }
+}
+
 /// Every region check in one place. A region is the guest's coordinates in an image the driver
 /// hands to Metal or a meta shader as they are -- a level, layers, an origin and a size -- and
 /// KosmicKrisp checks none of them, nor the buffer range a buffer side walks.
@@ -10968,7 +11277,6 @@ forwarded_unchecked!(
     VkFenceCreateInfo,
     VkFramebufferCreateInfo,
     VkImageCreateInfo,
-    VkImageViewCreateInfo,
     VkPipelineCacheCreateInfo,
     VkRenderPassCreateInfo,
     VkRenderPassCreateInfo2,
@@ -11198,6 +11506,10 @@ needs_no_check!(
     // A view the decoder resolved, which KosmicKrisp and anv bind; anv ignores the layout and the
     // texel size, and KosmicKrisp never reads them.
     VkRenderingFragmentShadingRateAttachmentInfoKHR,
+    // Usage flags, which the runtime only asserts against the image's.
+    VkImageViewUsageCreateInfo,
+    // A conversion the decoder resolved to one this device made.
+    VkSamplerYcbcrConversionInfo,
 );
 
 /// Why a `vkQueueSubmit2` was refused without being forwarded.
@@ -12052,6 +12364,310 @@ mod tests {
         d.abandon_planted();
     }
 
+    /// A view is held to its image -- a type it can be seen as, aspects, levels and layers it has,
+    /// a format its texels are -- and so are a clear's ranges and a host copy's regions. The
+    /// legal shapes pass: cube arrays, a 2D array over a 3D image's slices, an uncompressed view
+    /// of one compressed level, a plane of a planar image, a `minLod` at the view's last level.
+    #[test]
+    fn views_clears_and_host_copies_are_held_to_their_image() {
+        use crate::venus::proto::types::{
+            VkCopyImageToImageInfo, VkExtent3D, VkImageCopy2, VkImageCreateInfo,
+            VkImageSubresourceLayers,
+        };
+        const DEVICE: VkDevice = VkDevice::forged(0x98);
+        const RGBA: VkImage = VkImage::forged(0xd1);
+        const MUT: VkImage = VkImage::forged(0xd2);
+        const CUBE: VkImage = VkImage::forged(0xd3);
+        const VOL: VkImage = VkImage::forged(0xd4);
+        const VOL_FIXED: VkImage = VkImage::forged(0xd5);
+        const BC1: VkImage = VkImage::forged(0xd6);
+        const DS: VkImage = VkImage::forged(0xd7);
+        const NV12: VkImage = VkImage::forged(0xd8);
+        type F = VkFormat;
+        type B = VkImageCreateFlagBits;
+        type T = VkImageViewType;
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        let flat = VkImageType::VK_IMAGE_TYPE_2D;
+        let deep = VkImageType::VK_IMAGE_TYPE_3D;
+        let image =
+            |ty, format, (width, height, depth), mips, layers, flags: &[B]| VkImageCreateInfo {
+                imageType: ty,
+                format,
+                extent: VkExtent3D { width, height, depth },
+                mipLevels: mips,
+                arrayLayers: layers,
+                flags: VkImageCreateFlags(flags.iter().fold(0, |a, b| a | b.0 as u32)),
+                ..Default::default()
+            };
+        let rgba = F::VK_FORMAT_R8G8B8A8_UNORM;
+        d.plant_image(RGBA, &image(flat, rgba, (64, 64, 1), 3, 4, &[]));
+        d.plant_image(
+            MUT,
+            &image(flat, rgba, (64, 64, 1), 1, 1, &[B::VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT]),
+        );
+        d.plant_image(
+            CUBE,
+            &image(flat, rgba, (64, 64, 1), 1, 12, &[B::VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT]),
+        );
+        d.plant_image(
+            VOL,
+            &image(deep, rgba, (16, 16, 8), 2, 1, &[B::VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT]),
+        );
+        d.plant_image(VOL_FIXED, &image(deep, rgba, (16, 16, 8), 1, 1, &[]));
+        let texel_view = [
+            B::VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+            B::VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT,
+        ];
+        d.plant_image(
+            BC1,
+            &image(flat, F::VK_FORMAT_BC1_RGBA_UNORM_BLOCK, (16, 16, 1), 2, 1, &texel_view),
+        );
+        d.plant_image(DS, &image(flat, F::VK_FORMAT_D24_UNORM_S8_UINT, (32, 32, 1), 1, 1, &[]));
+        let nv12 = F::VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+        d.plant_image(
+            NV12,
+            &image(flat, nv12, (64, 64, 1), 1, 1, &[B::VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT]),
+        );
+
+        const COLOR: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32;
+        const DEPTH: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT.0 as u32;
+        const STENCIL: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_STENCIL_BIT.0 as u32;
+        const PLANE_1: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_1_BIT.0 as u32;
+        const ALL: u32 = u32::MAX;
+        let range = |aspect, base_level, levels, base_layer, layers| VkImageSubresourceRange {
+            aspectMask: VkImageAspectFlags(aspect),
+            baseMipLevel: base_level,
+            levelCount: levels,
+            baseArrayLayer: base_layer,
+            layerCount: layers,
+        };
+        let view = |img, ty, format, r| VkImageViewCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            image: img,
+            viewType: ty,
+            format,
+            subresourceRange: r,
+            ..Default::default()
+        };
+        let device = d.device_facts(DEVICE).expect("a planted device");
+        let check =
+            |info: &VkImageViewCreateInfo| cs::Decoded::planted(info).validate(&device).map(|_| ());
+        let ok = |info: VkImageViewCreateInfo| {
+            assert_eq!(check(&info), Ok(()), "{:?}", info.subresourceRange.aspectMask)
+        };
+        let no = |info: VkImageViewCreateInfo, why: &str| assert!(check(&info).is_err(), "{why}");
+        let u = F::VK_FORMAT_UNDEFINED;
+
+        ok(view(RGBA, T::VK_IMAGE_VIEW_TYPE_2D, rgba, range(COLOR, 0, ALL, 0, 1)));
+        ok(view(RGBA, T::VK_IMAGE_VIEW_TYPE_2D_ARRAY, u, range(COLOR, 1, 2, 0, ALL)));
+        no(
+            view(RGBA, T::VK_IMAGE_VIEW_TYPE_2D, rgba, range(COLOR, 0, 1, 0, 2)),
+            "two layers, one view",
+        );
+        no(view(RGBA, T::VK_IMAGE_VIEW_TYPE_2D, rgba, range(COLOR, 3, 1, 0, 1)), "a level past");
+        no(
+            view(RGBA, T::VK_IMAGE_VIEW_TYPE_2D_ARRAY, rgba, range(COLOR, 0, 1, 3, 2)),
+            "a layer past",
+        );
+        no(view(RGBA, T::VK_IMAGE_VIEW_TYPE_2D_ARRAY, rgba, range(COLOR, 0, 0, 0, 1)), "no levels");
+        no(view(RGBA, T::VK_IMAGE_VIEW_TYPE_3D, rgba, range(COLOR, 0, 1, 0, 1)), "3D of 2D");
+        no(
+            view(RGBA, T::VK_IMAGE_VIEW_TYPE_CUBE, rgba, range(COLOR, 0, 1, 0, 6)),
+            "not cube-compatible",
+        );
+        no(view(RGBA, T::VK_IMAGE_VIEW_TYPE_2D, rgba, range(DEPTH, 0, 1, 0, 1)), "no depth");
+        no(view(RGBA, VkImageViewType(99), rgba, range(COLOR, 0, 1, 0, 1)), "no such type");
+        no(
+            view(
+                RGBA,
+                T::VK_IMAGE_VIEW_TYPE_2D,
+                F::VK_FORMAT_R8G8B8A8_SRGB,
+                range(COLOR, 0, 1, 0, 1),
+            ),
+            "immutable",
+        );
+        no(
+            VkImageViewCreateInfo {
+                flags: crate::venus::proto::types::VkImageViewCreateFlags(0x8000_0000),
+                ..view(RGBA, T::VK_IMAGE_VIEW_TYPE_2D, rgba, range(COLOR, 0, 1, 0, 1))
+            },
+            "the runtime's own bit",
+        );
+        no(
+            view(VkImage::forged(0xdf), T::VK_IMAGE_VIEW_TYPE_2D, rgba, range(COLOR, 0, 1, 0, 1)),
+            "no record",
+        );
+
+        ok(view(
+            MUT,
+            T::VK_IMAGE_VIEW_TYPE_2D,
+            F::VK_FORMAT_R8G8B8A8_SRGB,
+            range(COLOR, 0, 1, 0, 1),
+        ));
+        ok(view(MUT, T::VK_IMAGE_VIEW_TYPE_2D, F::VK_FORMAT_R32_UINT, range(COLOR, 0, 1, 0, 1)));
+        no(
+            view(
+                MUT,
+                T::VK_IMAGE_VIEW_TYPE_2D,
+                F::VK_FORMAT_R16G16B16A16_UNORM,
+                range(COLOR, 0, 1, 0, 1),
+            ),
+            "8 bytes",
+        );
+
+        ok(view(CUBE, T::VK_IMAGE_VIEW_TYPE_CUBE, rgba, range(COLOR, 0, 1, 6, 6)));
+        ok(view(CUBE, T::VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, rgba, range(COLOR, 0, 1, 0, ALL)));
+        no(
+            view(CUBE, T::VK_IMAGE_VIEW_TYPE_CUBE, rgba, range(COLOR, 0, 1, 0, ALL)),
+            "twelve faces",
+        );
+        no(
+            view(CUBE, T::VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, rgba, range(COLOR, 0, 1, 0, 7)),
+            "seven faces",
+        );
+
+        ok(view(VOL, T::VK_IMAGE_VIEW_TYPE_2D_ARRAY, rgba, range(COLOR, 0, 1, 0, 8)));
+        ok(view(VOL, T::VK_IMAGE_VIEW_TYPE_2D_ARRAY, rgba, range(COLOR, 1, 1, 0, 4)));
+        no(
+            view(VOL, T::VK_IMAGE_VIEW_TYPE_2D_ARRAY, rgba, range(COLOR, 1, 1, 0, 5)),
+            "level 1 is 4 deep",
+        );
+        no(view(VOL, T::VK_IMAGE_VIEW_TYPE_2D, rgba, range(COLOR, 0, 1, 8, 1)), "slice 8 of 8");
+        ok(view(VOL, T::VK_IMAGE_VIEW_TYPE_3D, rgba, range(COLOR, 0, ALL, 0, 1)));
+        no(
+            view(VOL_FIXED, T::VK_IMAGE_VIEW_TYPE_2D, rgba, range(COLOR, 0, 1, 0, 1)),
+            "not 2D-compatible",
+        );
+
+        let bc_texels = F::VK_FORMAT_R32G32_UINT;
+        ok(view(BC1, T::VK_IMAGE_VIEW_TYPE_2D, bc_texels, range(COLOR, 1, 1, 0, 1)));
+        no(
+            view(BC1, T::VK_IMAGE_VIEW_TYPE_2D, bc_texels, range(COLOR, 0, 2, 0, 1)),
+            "two levels of texels",
+        );
+        no(
+            view(BC1, T::VK_IMAGE_VIEW_TYPE_2D, F::VK_FORMAT_R32_UINT, range(COLOR, 0, 1, 0, 1)),
+            "4 of 8",
+        );
+
+        ok(view(DS, T::VK_IMAGE_VIEW_TYPE_2D, u, range(DEPTH, 0, 1, 0, 1)));
+        ok(view(DS, T::VK_IMAGE_VIEW_TYPE_2D, u, range(DEPTH | STENCIL, 0, 1, 0, 1)));
+        no(view(DS, T::VK_IMAGE_VIEW_TYPE_2D, u, range(COLOR, 0, 1, 0, 1)), "no colour");
+        no(
+            view(
+                DS,
+                T::VK_IMAGE_VIEW_TYPE_2D,
+                F::VK_FORMAT_D32_SFLOAT_S8_UINT,
+                range(DEPTH, 0, 1, 0, 1),
+            ),
+            "itself only",
+        );
+
+        ok(view(NV12, T::VK_IMAGE_VIEW_TYPE_2D, u, range(COLOR, 0, 1, 0, 1)));
+        ok(view(
+            NV12,
+            T::VK_IMAGE_VIEW_TYPE_2D,
+            F::VK_FORMAT_R8G8_UNORM,
+            range(PLANE_1, 0, 1, 0, 1),
+        ));
+        no(
+            view(NV12, T::VK_IMAGE_VIEW_TYPE_2D, F::VK_FORMAT_R8_UNORM, range(PLANE_1, 0, 1, 0, 1)),
+            "plane 1 is RG",
+        );
+
+        // `minLod`, chained: no deeper than the view's last level, and a number.
+        let lod = |r, min_lod: f32| {
+            let link = VkImageViewMinLodCreateInfoEXT {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT,
+                minLod: min_lod,
+                ..Default::default()
+            };
+            let info = VkImageViewCreateInfo {
+                pNext: (&link as *const VkImageViewMinLodCreateInfoEXT).cast(),
+                ..view(RGBA, T::VK_IMAGE_VIEW_TYPE_2D, rgba, r)
+            };
+            check(&info)
+        };
+        assert_eq!(lod(range(COLOR, 0, ALL, 0, 1), 2.0), Ok(()));
+        assert!(lod(range(COLOR, 0, ALL, 0, 1), 2.5).is_err());
+        assert!(lod(range(COLOR, 0, ALL, 0, 1), -1.0).is_err());
+        assert!(lod(range(COLOR, 0, ALL, 0, 1), f32::NAN).is_err());
+        assert!(lod(range(COLOR, 0, ALL, 0, 1), f32::INFINITY).is_err());
+        assert_eq!(lod(range(COLOR, 1, 1, 0, 1), 1.0), Ok(()));
+        assert!(lod(range(COLOR, 1, 1, 0, 1), 1.5).is_err());
+
+        // A sliced 3D view, chained: slices the level has; ignored under any other view.
+        let sliced = |img, ty, r, offset, count| {
+            let link = VkImageViewSlicedCreateInfoEXT {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT,
+                sliceOffset: offset,
+                sliceCount: count,
+                ..Default::default()
+            };
+            let info = VkImageViewCreateInfo {
+                pNext: (&link as *const VkImageViewSlicedCreateInfoEXT).cast(),
+                ..view(img, ty, rgba, r)
+            };
+            check(&info)
+        };
+        let whole3d = range(COLOR, 0, 1, 0, 1);
+        assert_eq!(sliced(VOL, T::VK_IMAGE_VIEW_TYPE_3D, whole3d, 7, 1), Ok(()));
+        assert_eq!(sliced(VOL, T::VK_IMAGE_VIEW_TYPE_3D, whole3d, 3, u32::MAX), Ok(()));
+        assert!(sliced(VOL, T::VK_IMAGE_VIEW_TYPE_3D, whole3d, 8, 1).is_err());
+        assert!(sliced(VOL, T::VK_IMAGE_VIEW_TYPE_3D, whole3d, 4, 5).is_err());
+        assert!(
+            sliced(VOL, T::VK_IMAGE_VIEW_TYPE_3D, range(COLOR, 1, 1, 0, 1), 4, 1).is_err(),
+            "level 1"
+        );
+        assert_eq!(sliced(RGBA, T::VK_IMAGE_VIEW_TYPE_2D, whole3d, 99, 99), Ok(()), "ignored");
+
+        // Clears.
+        let facts = d.facts();
+        let clear = |img, r, kind| facts.clear_range(img, &r, kind);
+        assert_eq!(clear(RGBA, range(COLOR, 1, ALL, 0, ALL), Clear::Color), Ok(()));
+        assert!(clear(RGBA, range(COLOR, 3, 1, 0, 1), Clear::Color).is_err(), "a level past");
+        assert!(clear(RGBA, range(COLOR, 0, 1, 0, 0), Clear::Color).is_err(), "no layers");
+        assert!(clear(RGBA, range(COLOR, 0, 1, 2, 3), Clear::Color).is_err(), "a layer past");
+        assert!(clear(DS, range(COLOR, 0, 1, 0, 1), Clear::Color).is_err(), "depth by colour");
+        assert!(clear(BC1, range(COLOR, 0, 1, 0, 1), Clear::Color).is_err(), "compressed");
+        assert!(clear(NV12, range(COLOR, 0, 1, 0, 1), Clear::Color).is_err(), "planar");
+        assert_eq!(clear(DS, range(DEPTH, 0, 1, 0, 1), Clear::DepthStencil), Ok(()));
+        assert_eq!(clear(DS, range(DEPTH | STENCIL, 0, 1, 0, 1), Clear::DepthStencil), Ok(()));
+        assert!(clear(DS, range(COLOR, 0, 1, 0, 1), Clear::DepthStencil).is_err());
+        assert!(clear(RGBA, range(DEPTH, 0, 1, 0, 1), Clear::DepthStencil).is_err());
+        assert!(clear(VkImage::forged(0xdf), range(COLOR, 0, 1, 0, 1), Clear::Color).is_err());
+
+        // A host copy between images holds its regions as a device copy does.
+        let layer = VkImageSubresourceLayers {
+            aspectMask: VkImageAspectFlags(COLOR),
+            mipLevel: 0,
+            baseArrayLayer: 0,
+            layerCount: 1,
+        };
+        let region = |x| VkImageCopy2 {
+            srcSubresource: layer,
+            dstSubresource: layer,
+            dstOffset: VkOffset3D { x, y: 0, z: 0 },
+            extent: VkExtent3D { width: 8, height: 8, depth: 1 },
+            ..Default::default()
+        };
+        let host = |regions: &[VkImageCopy2]| {
+            let info = VkCopyImageToImageInfo {
+                srcImage: RGBA,
+                dstImage: MUT,
+                regionCount: regions.len() as u32,
+                pRegions: regions.as_ptr(),
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(&device).map(|_| ())
+        };
+        assert_eq!(host(&[region(0), region(56)]), Ok(()));
+        assert!(host(&[region(0), region(57)]).is_err(), "one texel past");
+
+        d.abandon_planted();
+    }
+
     /// The five 1.0 region commands hold every region before the driver sees any: one bad
     /// region among good ones refuses the command, and the driver is not called.
     #[test]
@@ -12121,12 +12737,34 @@ mod tests {
         ) {
             CALLS.fetch_add(1, Ordering::SeqCst);
         }
+        unsafe extern "C" fn clear_color(
+            _: VkCommandBuffer,
+            _: VkImage,
+            _: L,
+            _: *const VkClearColorValue,
+            _: u32,
+            _: *const VkImageSubresourceRange,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn clear_ds(
+            _: VkCommandBuffer,
+            _: VkImage,
+            _: L,
+            _: *const VkClearDepthStencilValue,
+            _: u32,
+            _: *const VkImageSubresourceRange,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkCmdCopyBufferToImage(b2i);
         fns.plant_vkCmdCopyImageToBuffer(i2b);
         fns.plant_vkCmdCopyImage(i2i);
         fns.plant_vkCmdBlitImage(blit);
         fns.plant_vkCmdResolveImage(resolve);
+        fns.plant_vkCmdClearColorImage(clear_color);
+        fns.plant_vkCmdClearDepthStencilImage(clear_ds);
         let mut d = Driver::new(Account::for_test(None));
         d.plant_device(DEVICE, fns);
         d.plant_pool(DEVICE, VkCommandPool::forged(0x97), &[(CB, ObjectId(98))]);
@@ -12208,6 +12846,29 @@ mod tests {
             (Ok(()), 1)
         );
         assert!(refused(calls(&|| d.cmd_blit_image(CB, IMG, src, IMG, dst, &[good, bad], linear))));
+
+        let range = |aspect: VkImageAspectFlagBits, level| VkImageSubresourceRange {
+            aspectMask: VkImageAspectFlags(aspect.0 as u32),
+            baseMipLevel: level,
+            levelCount: 1,
+            baseArrayLayer: 0,
+            layerCount: 1,
+        };
+        let color = VkClearColorValue::default();
+        let good = range(VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT, 0);
+        let bad = range(VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT, 1);
+        assert_eq!(calls(&|| d.cmd_clear_color_image(CB, IMG, dst, &color, &[good])), (Ok(()), 1));
+        assert!(refused(calls(&|| d.cmd_clear_color_image(CB, IMG, dst, &color, &[good, bad]))));
+        // The image is colour, so no depth range of it clears.
+        let value = VkClearDepthStencilValue::default();
+        let depth = range(VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT, 0);
+        assert!(refused(calls(&|| d.cmd_clear_depth_stencil_image(
+            CB,
+            IMG,
+            dst,
+            &value,
+            &[depth]
+        ))));
 
         d.abandon_planted();
     }
@@ -14169,6 +14830,7 @@ mod tests {
         let planes = |pitch| PlaneLayouts::new(&[PlaneLayout { offset: 0, pitch }]).unwrap();
         let facts = |claim| ImageFacts {
             image_type: VkImageType::VK_IMAGE_TYPE_2D,
+            flags: VkImageCreateFlags(0),
             width: 64,
             height: 64,
             depth: 1,
