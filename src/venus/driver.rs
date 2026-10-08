@@ -22,6 +22,7 @@ use crate::ids::{ContextId, FenceId, RingIdx};
 use super::cs::{self, Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
 use super::ledger;
 use super::objects::Doomed;
+use super::proto::types::VkOpaqueCaptureDataCreateInfoEXT;
 use super::proto::types::{
     VkAccelerationStructureBuildGeometryInfoKHR, VkAccelerationStructureBuildRangeInfoKHR,
     VkAccelerationStructureBuildSizesInfoKHR, VkAccelerationStructureBuildTypeKHR,
@@ -101,6 +102,11 @@ use super::proto::types::{
     VkPhysicalDeviceProperties2, VkPhysicalDeviceRayTracingPipelinePropertiesKHR,
     VkPipelineCreateFlags2CreateInfo, VkRayTracingPipelineCreateInfoKHR, VkShaderGroupShaderKHR,
     VkStridedDeviceAddressRegionKHR,
+};
+use super::proto::types::{
+    VkDrmFormatModifierPropertiesEXT, VkDrmFormatModifierPropertiesListEXT, VkFormatProperties2,
+    VkImageDrmFormatModifierListCreateInfoEXT, VkImageFormatListCreateInfo,
+    VkImageStencilUsageCreateInfo,
 };
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
@@ -575,6 +581,11 @@ fn planted_limits() -> VkPhysicalDeviceLimits {
         maxVertexInputBindingStride: 2048,
         maxVertexInputAttributeOffset: 2047,
         maxBoundDescriptorSets: 32,
+        maxImageDimension1D: 16384,
+        maxImageDimension2D: 16384,
+        maxImageDimension3D: 2048,
+        maxImageDimensionCube: 16384,
+        maxImageArrayLayers: 2048,
         ..Default::default()
     }
 }
@@ -2070,6 +2081,76 @@ struct DeviceState {
     /// The query types the device was created able to make. Read once at creation from what the
     /// guest enabled; see [`enabled_query_types`].
     query_types: Vec<VkQueryType>,
+    /// Where the device's drm format modifiers are read from, if it was created to take them.
+    modifiers: Modifiers,
+}
+
+/// Where a device's drm format modifiers come from.
+enum Modifiers {
+    /// The device was not created with `VK_EXT_image_drm_format_modifier`, so no image of it may
+    /// be laid out by one.
+    Absent,
+    /// Its driver, asked through the physical device it was created on.
+    Driver(VkPhysicalDevice),
+    /// A test's: the format, the modifier and its plane count.
+    #[cfg(test)]
+    Planted(Vec<(VkFormat, u64, u32)>),
+}
+
+/// The drm format modifiers a device takes, as [`DeviceFacts`] carries them.
+pub struct ModifierPlanes<'d> {
+    source: &'d Modifiers,
+    instance: Option<&'d InstanceFns>,
+}
+
+impl ModifierPlanes<'_> {
+    fn taken(&self) -> bool {
+        !matches!(self.source, Modifiers::Absent)
+    }
+
+    /// How many memory planes the driver lays `format` out in under `modifier`, or `None` for a
+    /// modifier it does not offer for that format. Asked each time: an image laid out by an
+    /// explicit modifier is an import, rare enough that a cache would be a second owner of a
+    /// fact for nothing.
+    fn planes(&self, format: VkFormat, modifier: u64) -> Option<u32> {
+        let offered = match self.source {
+            Modifiers::Absent => return None,
+            Modifiers::Driver(pd) => {
+                let inst = self.instance?;
+                let ask = |list: &mut VkDrmFormatModifierPropertiesListEXT| {
+                    let mut props = VkFormatProperties2 {
+                        sType: VkStructureType::VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+                        pNext: (list as *mut VkDrmFormatModifierPropertiesListEXT).cast(),
+                        ..Default::default()
+                    };
+                    // SAFETY: `pd` is a handle this instance returned, and the chain is a local
+                    // list whose array, when there is one, holds the count the list states.
+                    unsafe {
+                        (inst.vkGetPhysicalDeviceFormatProperties2())(*pd, format, &mut props)
+                    };
+                };
+                let mut list = VkDrmFormatModifierPropertiesListEXT {
+                    sType:
+                        VkStructureType::VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+                    ..Default::default()
+                };
+                ask(&mut list);
+                let mut all = vec![
+                    VkDrmFormatModifierPropertiesEXT::default();
+                    list.drmFormatModifierCount as usize
+                ];
+                list.pDrmFormatModifierProperties = all.as_mut_ptr();
+                ask(&mut list);
+                all.truncate(list.drmFormatModifierCount as usize);
+                all.iter()
+                    .map(|m| (format, m.drmFormatModifier, m.drmFormatModifierPlaneCount))
+                    .collect::<Vec<_>>()
+            }
+            #[cfg(test)]
+            Modifiers::Planted(t) => t.clone(),
+        };
+        offered.iter().find(|&&(f, m, _)| f == format && m == modifier).map(|&(_, _, n)| n)
+    }
 }
 
 /// The query types a device created with `extensions` and, if `statistics`, the
@@ -2745,9 +2826,22 @@ impl Driver {
             .any(|n| n == "VK_EXT_sample_locations")
             .then(|| sample_location_grids(inst, pd));
         let query_types = enabled_query_types(&wanted, enables_pipeline_statistics(info_decoded));
+        let modifiers = if wanted.iter().any(|n| n == "VK_EXT_image_drm_format_modifier") {
+            Modifiers::Driver(pd)
+        } else {
+            Modifiers::Absent
+        };
         self.devices.insert(
             out,
-            DeviceState { fns, memory_types, group_handles, limits, sample_locations, query_types },
+            DeviceState {
+                fns,
+                memory_types,
+                group_handles,
+                limits,
+                sample_locations,
+                query_types,
+                modifiers,
+            },
         );
         Ok(out)
     }
@@ -3704,6 +3798,7 @@ impl Driver {
             limits: &d.limits,
             sample_locations: d.sample_locations.as_ref(),
             query_types: &d.query_types,
+            modifiers: ModifierPlanes { source: &d.modifiers, instance: self.instance() },
         })
     }
 
@@ -4599,8 +4694,18 @@ impl Driver {
                 limits: planted_limits(),
                 sample_locations: None,
                 query_types: enabled_query_types(&[], true),
+                modifiers: Modifiers::Absent,
             },
         );
+    }
+
+    /// Give a planted device the drm format modifiers a driver would have listed, as the format,
+    /// the modifier and its plane count, as if it was created with
+    /// `VK_EXT_image_drm_format_modifier`.
+    #[cfg(test)]
+    pub(super) fn plant_modifiers(&mut self, handle: VkDevice, offered: &[(VkFormat, u64, u32)]) {
+        self.devices.get_mut(&handle).expect("a planted device").modifiers =
+            Modifiers::Planted(offered.to_vec());
     }
 
     /// Record an image as `vkCreateImage` would have, without a driver to make it.
@@ -8841,7 +8946,7 @@ impl Driver {
     pub fn create_image(
         &mut self,
         device: VkDevice,
-        info: cs::Decoded<'_, VkImageCreateInfo>,
+        info: cs::Decoded<'_, VkImageCreateInfo, cs::Checked>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkImage, VkResult> {
         let linear = external_images_are_linear(info.get());
@@ -10822,6 +10927,123 @@ impl Facts<'_> {
     }
 }
 
+impl cs::Validate<DeviceFacts<'_>> for VkImageCreateInfo {
+    /// An image Vulkan has a shape for and the device can make: an extent of at least one texel
+    /// that fits its type and the device's limits, layers and levels it can hold, and one sample
+    /// count. A driver sizes the image's storage from these, and anv does it unchecked; only
+    /// limina's KosmicKrisp refuses one outside its limits itself.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        type T = VkImageType;
+        type F = VkImageCreateFlagBits;
+        let flag = |f: F| this.flags.0 & f.0 as u32 != 0;
+        let (l, e) = (facts.limits, this.extent);
+        if this.format == VkFormat::VK_FORMAT_UNDEFINED {
+            return Err("made an image of no format");
+        }
+        if e.width == 0 || e.height == 0 || e.depth == 0 {
+            return Err("made an empty image");
+        }
+        let cube = flag(F::VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT);
+        let largest = e.width.max(e.height).max(e.depth);
+        let max = match this.imageType {
+            T::VK_IMAGE_TYPE_1D if e.height == 1 && e.depth == 1 && !cube => l.maxImageDimension1D,
+            T::VK_IMAGE_TYPE_2D if e.depth == 1 && !cube => l.maxImageDimension2D,
+            T::VK_IMAGE_TYPE_2D if e.depth == 1 && e.width == e.height && this.arrayLayers >= 6 => {
+                l.maxImageDimensionCube
+            }
+            T::VK_IMAGE_TYPE_3D if this.arrayLayers == 1 && !cube => l.maxImageDimension3D,
+            _ => return Err("made an image whose extent or layers do not fit its type"),
+        };
+        if largest > max {
+            return Err("made an image larger than the device does");
+        }
+        let as_2d = flag(F::VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)
+            || flag(F::VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT);
+        if as_2d && this.imageType != T::VK_IMAGE_TYPE_3D {
+            return Err("made an image to be seen as 2D slices that has none");
+        }
+        if this.arrayLayers == 0 || this.arrayLayers > l.maxImageArrayLayers {
+            return Err("made an image of more layers than the device does");
+        }
+        if this.mipLevels == 0 || this.mipLevels > u32::BITS - largest.leading_zeros() {
+            return Err("made an image of more levels than its extent has");
+        }
+        let samples = this.samples.0 as u32;
+        if !samples.is_power_of_two() || samples > 64 {
+            return Err("made an image of no sample count");
+        }
+        let multisampled = samples > 1;
+        if multisampled
+            && (this.imageType != T::VK_IMAGE_TYPE_2D
+                || cube
+                || this.mipLevels != 1
+                || this.tiling != VkImageTiling::VK_IMAGE_TILING_OPTIMAL)
+        {
+            return Err("made a multisampled image Vulkan has no shape for");
+        }
+        if this.tiling == VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT {
+            if !facts.modifiers.taken() {
+                return Err("laid an image out by a modifier on a device that takes none");
+            }
+            let listed = chained::<VkImageDrmFormatModifierListCreateInfoEXT>(this).is_some();
+            let explicit = chained::<VkImageDrmFormatModifierExplicitCreateInfoEXT>(this).is_some();
+            if listed == explicit {
+                return Err("laid an image out by a modifier without one way to choose it");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkImageCreateInfo, DeviceFacts<'_>>>
+    for VkImageDrmFormatModifierExplicitCreateInfoEXT
+{
+    /// anv reads a plane layout for every plane the modifier has, aux planes included, from the
+    /// array the guest sized: so the count is the driver's own for that format and modifier.
+    /// Ignored, as a driver ignores it, on an image not laid out by a modifier.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkImageCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        if on.root.tiling != VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT {
+            return Ok(());
+        }
+        if on.root.format == VkFormat::VK_FORMAT_UNDEFINED {
+            return Err("made an image of no format");
+        }
+        match on.facts.modifiers.planes(on.root.format, this.drmFormatModifier) {
+            None => Err("named a modifier the device does not offer for the format"),
+            Some(n) if n != this.drmFormatModifierPlaneCount => {
+                Err("laid out a different number of planes than the modifier has")
+            }
+            Some(_) => Ok(()),
+        }
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkImageCreateInfo, DeviceFacts<'_>>>
+    for VkOpaqueCaptureDataCreateInfoEXT
+{
+    /// Data a driver once handed out to replay an image at the address it had, which anv reads as
+    /// a struct of its own from however many bytes the guest sent -- following a null `pData`
+    /// too. No command that hands that data out is served, so no guest holds any to replay. Read
+    /// only under the capture-replay flag, and ignored, as a driver ignores it, without.
+    fn validate(
+        _this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkImageCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        const REPLAY: u32 =
+            VkImageCreateFlagBits::VK_IMAGE_CREATE_DESCRIPTOR_HEAP_CAPTURE_REPLAY_BIT_EXT.0 as u32;
+        if on.root.flags.0 & REPLAY != 0 {
+            return Err("replayed an image from capture data this renderer never handed out");
+        }
+        Ok(())
+    }
+}
+
 /// What a plane or subresource question needs of an image: its format, levels, layers and
 /// tiling, and whether its planes are bound apart. Read off the record of an image, or off the
 /// create info of one a device query describes without making.
@@ -10902,14 +11124,19 @@ impl Facts<'_> {
     }
 }
 
-/// The create info a device-image query describes, as the decoder built it.
+/// The create info a device-image query describes, held to what `vkCreateImage` holds one to:
+/// the driver builds the image it describes from it.
 fn described<'a, T>(
     _info: &cs::Decoded<'a, T>,
     create: *const VkImageCreateInfo,
+    facts: &DeviceFacts<'_>,
 ) -> Result<&'a VkImageCreateInfo, &'static str> {
-    // SAFETY: `_info` is `Decoded`, so `create` is null or a struct the decoder allocated in the
-    // arena `'a` borrows (see `Decoded::vouch`).
-    unsafe { create.as_ref() }.ok_or("described no image")
+    // SAFETY: `_info` is `Decoded`, so `create` is null or a struct the decoder allocated, with
+    // its chain, in the arena `'a` borrows (see `Decoded::vouch`).
+    let create = unsafe { create.as_ref() }.ok_or("described no image")?;
+    // SAFETY: as above.
+    unsafe { cs::Decoded::vouch(create) }.validate(facts)?;
+    Ok(create)
 }
 
 impl cs::Validate<DeviceFacts<'_>> for VkImageMemoryRequirementsInfo2 {
@@ -10970,9 +11197,9 @@ impl cs::Validate<DeviceFacts<'_>> for VkDeviceImageMemoryRequirements {
     /// beside it.
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
-        _facts: &DeviceFacts<'_>,
+        facts: &DeviceFacts<'_>,
     ) -> Result<(), &'static str> {
-        let shape = Shape::of_info(described(&this, this.pCreateInfo)?);
+        let shape = Shape::of_info(described(&this, this.pCreateInfo, facts)?);
         if shape.disjoint { shape.plane(this.planeAspect.0 as u32) } else { Ok(()) }
     }
 }
@@ -10980,9 +11207,9 @@ impl cs::Validate<DeviceFacts<'_>> for VkDeviceImageMemoryRequirements {
 impl cs::Validate<DeviceFacts<'_>> for VkDeviceImageSubresourceInfo {
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
-        _facts: &DeviceFacts<'_>,
+        facts: &DeviceFacts<'_>,
     ) -> Result<(), &'static str> {
-        let shape = Shape::of_info(described(&this, this.pCreateInfo)?);
+        let shape = Shape::of_info(described(&this, this.pCreateInfo, facts)?);
         // SAFETY: as `described`: the decoder allocated the subresource beside the create info.
         let sub = unsafe { this.pSubresource.as_ref() }.ok_or("asked about no subresource")?;
         shape.subresource(&sub.imageSubresource)
@@ -11357,6 +11584,8 @@ pub struct DeviceFacts<'d> {
     pub sample_locations: Option<&'d SampleLocationGrids>,
     /// The query types the device was created able to make.
     pub query_types: &'d [VkQueryType],
+    /// The drm format modifiers it takes.
+    pub modifiers: ModifierPlanes<'d>,
 }
 
 /// Whether the counts a submit's `pNext` chain carries agree with the submit's own.
@@ -11477,6 +11706,8 @@ forwarded_unchecked!(
     VkEventCreateInfo,
     VkFenceCreateInfo,
     VkFramebufferCreateInfo,
+    // Checked at `create_image`, which forwards the host's rewrite of it: see
+    // `external_images_are_linear`.
     VkImageCreateInfo,
     VkPipelineCacheCreateInfo,
     VkRenderPassCreateInfo,
@@ -11716,6 +11947,16 @@ needs_no_check!(
     VkBindImageMemoryDeviceGroupInfo,
     // A result the driver writes into a slot the decoder allocated for it.
     VkBindMemoryStatus,
+    // External handle types: bits the image's creation reads, as the root's own flags are.
+    VkExternalMemoryImageCreateInfo,
+    // Formats the decoder found defined, from an array it sized to their count, which drivers
+    // only compare.
+    VkImageFormatListCreateInfo,
+    // Usage bits for the stencil aspect.
+    VkImageStencilUsageCreateInfo,
+    // Modifiers a driver compares against its own, from an array the decoder sized to their
+    // count; the root requires exactly one way of choosing a modifier.
+    VkImageDrmFormatModifierListCreateInfoEXT,
 );
 
 /// Why a `vkQueueSubmit2` was refused without being forwarded.
@@ -11771,6 +12012,20 @@ unsafe impl InStruct for VkImagePlaneMemoryRequirementsInfo {
 // same vk.xml with Vulkan's `sType`/`pNext` header first.
 unsafe impl InStruct for VkBindImagePlaneMemoryInfo {
     const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkImageDrmFormatModifierListCreateInfoEXT {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkImageDrmFormatModifierExplicitCreateInfoEXT {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -12887,6 +13142,190 @@ mod tests {
         d.abandon_planted();
     }
 
+    /// An image is made only in a shape Vulkan has and the device makes: an extent, layers and
+    /// levels that fit its type and the limits, one sample count, and a modifier only on a device
+    /// that takes them, chosen one way, with the plane count the driver has for it. A device-image
+    /// query is held to the same, since the driver builds the image it describes.
+    #[test]
+    fn an_image_is_made_only_in_a_shape_the_device_has() {
+        use crate::venus::proto::types::{VkExtent3D, VkSampleCountFlagBits, VkSubresourceLayout};
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const BARE: VkDevice = VkDevice::forged(0x9a);
+        const LINEAR: u64 = 0;
+        const CCS: u64 = 0x0100_0000_0000_0004;
+        let rgba = VkFormat::VK_FORMAT_R8G8B8A8_UNORM;
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        d.plant_device(BARE, crate::vulkan::Device::default());
+        d.plant_modifiers(DEVICE, &[(rgba, LINEAR, 1), (rgba, CCS, 2)]);
+        type T = VkImageType;
+        type F = VkImageCreateFlagBits;
+        let image = |ty, (w, h, z), layers, levels| VkImageCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            imageType: ty,
+            format: rgba,
+            extent: VkExtent3D { width: w, height: h, depth: z },
+            mipLevels: levels,
+            arrayLayers: layers,
+            samples: VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT,
+            tiling: VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
+            ..Default::default()
+        };
+        let with = |mut i: VkImageCreateInfo, f: F| {
+            i.flags.0 |= f.0 as u32;
+            i
+        };
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let made = |i: &VkImageCreateInfo| cs::Decoded::planted(i).validate(&facts).map(|_| ());
+        let flat = image(T::VK_IMAGE_TYPE_2D, (64, 64, 1), 1, 7);
+        let mut msaa = image(T::VK_IMAGE_TYPE_2D, (64, 64, 1), 2, 1);
+        msaa.samples = VkSampleCountFlagBits::VK_SAMPLE_COUNT_4_BIT;
+        let legal = [
+            flat,
+            image(T::VK_IMAGE_TYPE_1D, (16384, 1, 1), 2048, 15),
+            with(
+                image(T::VK_IMAGE_TYPE_2D, (64, 64, 1), 12, 1),
+                F::VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
+            ),
+            image(T::VK_IMAGE_TYPE_3D, (2048, 4, 2048), 1, 12),
+            with(
+                image(T::VK_IMAGE_TYPE_3D, (8, 8, 8), 1, 1),
+                F::VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT,
+            ),
+            msaa,
+        ];
+        for (n, i) in legal.iter().enumerate() {
+            assert_eq!(made(i), Ok(()), "legal shape {n}");
+        }
+
+        let mut undefined = flat;
+        undefined.format = VkFormat::VK_FORMAT_UNDEFINED;
+        let mut three = msaa;
+        three.samples = VkSampleCountFlagBits(3);
+        let mut msaa_levels = msaa;
+        msaa_levels.mipLevels = 2;
+        let mut msaa_linear = msaa;
+        msaa_linear.tiling = VkImageTiling::VK_IMAGE_TILING_LINEAR;
+        let refused = [
+            ("no format", undefined),
+            ("empty", image(T::VK_IMAGE_TYPE_2D, (0, 64, 1), 1, 1)),
+            ("1D with rows", image(T::VK_IMAGE_TYPE_1D, (64, 2, 1), 1, 1)),
+            ("2D with slices", image(T::VK_IMAGE_TYPE_2D, (64, 64, 2), 1, 1)),
+            ("3D with layers", image(T::VK_IMAGE_TYPE_3D, (8, 8, 8), 2, 1)),
+            ("no type", image(VkImageType(7), (8, 8, 1), 1, 1)),
+            (
+                "cube not square",
+                with(
+                    image(T::VK_IMAGE_TYPE_2D, (64, 32, 1), 6, 1),
+                    F::VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
+                ),
+            ),
+            (
+                "cube of five",
+                with(
+                    image(T::VK_IMAGE_TYPE_2D, (64, 64, 1), 5, 1),
+                    F::VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
+                ),
+            ),
+            (
+                "cube in 3D",
+                with(
+                    image(T::VK_IMAGE_TYPE_3D, (8, 8, 8), 1, 1),
+                    F::VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
+                ),
+            ),
+            ("2D past the limit", image(T::VK_IMAGE_TYPE_2D, (16385, 1, 1), 1, 1)),
+            ("3D past the limit", image(T::VK_IMAGE_TYPE_3D, (8, 8, 2049), 1, 1)),
+            ("2D slices of 2D", with(flat, F::VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)),
+            ("2D views of 2D", with(flat, F::VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT)),
+            ("no layers", image(T::VK_IMAGE_TYPE_2D, (64, 64, 1), 0, 1)),
+            ("layers past the limit", image(T::VK_IMAGE_TYPE_2D, (64, 64, 1), 2049, 1)),
+            ("no levels", image(T::VK_IMAGE_TYPE_2D, (64, 64, 1), 1, 0)),
+            ("a level past its chain", image(T::VK_IMAGE_TYPE_2D, (64, 64, 1), 1, 8)),
+            ("three samples", three),
+            ("multisampled levels", msaa_levels),
+            ("multisampled rows", msaa_linear),
+        ];
+        for (why, i) in refused {
+            assert!(made(&i).is_err(), "{why}");
+        }
+
+        let mut by_modifier = flat;
+        by_modifier.tiling = VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+        by_modifier.mipLevels = 1;
+        let modifiers = [LINEAR, CCS];
+        let list = VkImageDrmFormatModifierListCreateInfoEXT {
+            sType:
+                VkStructureType::VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+            drmFormatModifierCount: 2,
+            pDrmFormatModifiers: modifiers.as_ptr(),
+            ..Default::default()
+        };
+        let layouts = [VkSubresourceLayout::default(); 2];
+        let explicit = |modifier, planes: u32| {
+            VkImageDrmFormatModifierExplicitCreateInfoEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+            drmFormatModifier: modifier,
+            drmFormatModifierPlaneCount: planes,
+            pPlaneLayouts: layouts.as_ptr(),
+            ..Default::default()
+        }
+        };
+        let chained_to = |i: VkImageCreateInfo, link: *const core::ffi::c_void| {
+            let mut i = i;
+            i.pNext = link;
+            i
+        };
+        let as_link = |e: &VkImageDrmFormatModifierExplicitCreateInfoEXT| {
+            (e as *const VkImageDrmFormatModifierExplicitCreateInfoEXT).cast()
+        };
+        let listed = chained_to(
+            by_modifier,
+            (&list as *const VkImageDrmFormatModifierListCreateInfoEXT).cast(),
+        );
+        assert_eq!(made(&listed), Ok(()), "a list");
+        let (one, two) = (explicit(LINEAR, 1), explicit(CCS, 2));
+        assert_eq!(made(&chained_to(by_modifier, as_link(&one))), Ok(()), "linear, one plane");
+        assert_eq!(made(&chained_to(by_modifier, as_link(&two))), Ok(()), "aux, two planes");
+        let (short, unknown) = (explicit(CCS, 1), explicit(0x77, 1));
+        assert!(made(&chained_to(by_modifier, as_link(&short))).is_err(), "aux, one plane");
+        assert!(made(&chained_to(by_modifier, as_link(&unknown))).is_err(), "not offered");
+        assert!(made(&by_modifier).is_err(), "neither");
+        let mut both = one;
+        both.pNext = (&list as *const VkImageDrmFormatModifierListCreateInfoEXT).cast();
+        assert!(made(&chained_to(by_modifier, as_link(&both))).is_err(), "both");
+        assert_eq!(made(&chained_to(flat, as_link(&short))), Ok(()), "ignored without the tiling");
+        let bare = d.device_facts(BARE).expect("a planted device");
+        assert!(
+            cs::Decoded::planted(&listed).validate(&bare).is_err(),
+            "a device that takes no modifiers"
+        );
+
+        let capture = VkOpaqueCaptureDataCreateInfoEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT,
+            ..Default::default()
+        };
+        let captured =
+            chained_to(flat, (&capture as *const VkOpaqueCaptureDataCreateInfoEXT).cast());
+        assert_eq!(made(&captured), Ok(()), "capture data, ignored");
+        let replayed = with(captured, F::VK_IMAGE_CREATE_DESCRIPTOR_HEAP_CAPTURE_REPLAY_BIT_EXT);
+        assert!(made(&replayed).is_err(), "capture data, replayed");
+
+        let asked = |i: &VkImageCreateInfo| {
+            let req = VkDeviceImageMemoryRequirements {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS,
+                pCreateInfo: i,
+                ..Default::default()
+            };
+            cs::Decoded::planted(&req).validate(&facts).map(|_| ())
+        };
+        assert_eq!(asked(&flat), Ok(()));
+        assert!(asked(&image(T::VK_IMAGE_TYPE_2D, (64, 64, 1), 1, 8)).is_err(), "described");
+        assert!(asked(&chained_to(by_modifier, as_link(&short))).is_err(), "its chain");
+
+        d.abandon_planted();
+    }
+
     /// A disjoint planar image is sized and bound a plane at a time, and KosmicKrisp follows the
     /// plane struct it expects chained without checking it is there: so the 1.0 forms, which
     /// carry no chain, refuse one, and the `2` forms require the plane and hold it to the format.
@@ -12909,6 +13348,7 @@ mod tests {
             arrayLayers: 3,
             flags: VkImageCreateFlags(flags),
             tiling,
+            samples: crate::venus::proto::types::VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT,
             ..Default::default()
         };
         let nv12 = VkFormat::VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;

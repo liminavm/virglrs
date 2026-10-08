@@ -187,7 +187,7 @@ vkCreateEvent                                    reviewed
 vkCreateFence                                    reviewed
 vkCreateFramebuffer                              pending:render-passes
 vkCreateGraphicsPipelines                        pending:pipelines
-vkCreateImage                                    pending:images
+vkCreateImage                                    validated
 vkCreateImageView                                validated
 vkCreateInstance                                 reviewed
 vkCreatePipelineCache                            reviewed

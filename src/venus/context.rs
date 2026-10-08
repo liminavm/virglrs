@@ -3062,7 +3062,14 @@ impl Commands for Handlers<'_> {
     /// scanout surface has to be minted at exactly them.
     fn vkCreateImage(&mut self, args: &mut vn_command_vkCreateImage<'_>) {
         let Some(info) = self.names(args.pCreateInfo) else { return };
-        let host = self.driver.create_image(args.device, info, args.pAllocator);
+        // As `vkCreatePipelineLayout`: a device this context does not have answers as
+        // `create_object` would, and one it has holds the image to its limits.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => self.driver.create_image(args.device, info, args.pAllocator),
+        };
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkCreateImage", args.pImage(), args.handle_pImage_mut(), host);
     }
