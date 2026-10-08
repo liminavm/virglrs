@@ -3800,6 +3800,13 @@ SABOTAGES = [
         'constants_pushed_past_the_push_block_are_refused_before_the_driver',
     ),
     (
+        'a null handle reaches the driver where vk.xml requires an object',
+        'venus-gen/rustgen.py',
+        """                    required = not var.is_optional() and var.can_validate()""",
+        """                    required = False""",
+        'a_null_handle_where_an_object_is_required_poisons_the_stream',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

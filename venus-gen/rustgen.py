@@ -886,7 +886,10 @@ class RustGen:
         elif base.category == VkType.HANDLE:
             if kind == 'decode':
                 if validity == Gen_VALID:
-                    name += '_lookup'
+                    # A handle vk.xml neither lets be null nor exempts from validation must name
+                    # an object: the driver dereferences it. See `vn_decode_*_required`.
+                    required = not var.is_optional() and var.can_validate()
+                    name += '_required' if required else '_lookup'
                 elif alloc and base.dispatchable:
                     name += '_temp'
         else:
@@ -1948,7 +1951,7 @@ class RustGen:
         body += ["",
                  "    let mut wire = Vec::new();",
                  "    {",
-                 "        let mut enc = Encoder::growing(&mut wire, &AllOfIt);",
+                 "        let mut enc = Encoder::growing(&mut wire, &AllOfIt).naming_null_handles();",
                  "        vn_encode_%s_args(&mut enc, VkFlags(0), &val);" % n,
                  "        assert!(!enc.fatal(), \"the encoder ran out of room it grows itself\");",
                  "    }",
@@ -2775,7 +2778,7 @@ class RustGen:
             '}',
             '',
             'pub fn vn_encode_%s(enc: &mut Encoder<\'_>, val: &%s) {' % (n, n),
-            '    enc.encode_scalar::<u64>(val.raw());',
+            '    enc.encode_handle(val.raw(), <%s as cs::Handle>::OBJECT_TYPE);' % n,
             '}',
             '',
             '/// Read the guest\'s word into a slot the decoder does not resolve.',
@@ -2813,6 +2816,17 @@ class RustGen:
             'pub fn vn_decode_%s_lookup(dec: &mut Decoder<\'_>, val: &mut %s) -> ObjectId {' % (n, n),
             '    let id = ObjectId(dec.decode_scalar::<u64>());',
             '    *val = <%s as cs::Handle>::from_host(dec.lookup_object(id, <%s as cs::Handle>::OBJECT_TYPE));' % (n, n),
+            '    id',
+            '}',
+            '',
+            '/// [`vn_decode_%s_lookup`] for a slot vk.xml requires to name an object, which poisons the' % n,
+            '/// stream when the guest sends `VK_NULL_HANDLE` there. The driver dereferences the',
+            '/// handle without checking it, so a null one reaching it is a host null dereference.',
+            'pub fn vn_decode_%s_required(dec: &mut Decoder<\'_>, val: &mut %s) -> ObjectId {' % (n, n),
+            '    let id = vn_decode_%s_lookup(dec, val);' % n,
+            '    if id.0 == 0 {',
+            '        dec.set_fatal();',
+            '    }',
             '    id',
             '}',
             '',

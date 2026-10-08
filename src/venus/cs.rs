@@ -1053,12 +1053,26 @@ pub struct Encoder<'a> {
     /// into a guest. Knowing exactly which bytes those are is what keeps the comparison exact
     /// instead of merely lenient.
     padding: Option<Vec<core::ops::Range<usize>>>,
+    /// Whether a null handle is written as its type's [`Encoder::stand_in_id`]. Test scaffolding:
+    /// a test that builds a command from `Default` has a null in every handle slot, which the
+    /// decoder refuses wherever vk.xml requires an object, and what such a test is about is never
+    /// the handle. One id per type, so a test can register each in an object table.
+    #[cfg(test)]
+    name_null_handles: bool,
 }
 
 impl<'a> Encoder<'a> {
     /// An encoder that must fit what it is given. Overflowing is `fatal`.
     pub fn new(buf: &'a mut [u8], protocol: &'a dyn Protocol) -> Self {
-        Encoder { buf: Buffer::Fixed(buf), pos: 0, fatal: false, protocol, padding: None }
+        Encoder {
+            buf: Buffer::Fixed(buf),
+            pos: 0,
+            fatal: false,
+            protocol,
+            padding: None,
+            #[cfg(test)]
+            name_null_handles: false,
+        }
     }
 
     /// An encoder that takes as much room as it needs from `buf`, which it empties first.
@@ -1069,7 +1083,38 @@ impl<'a> Encoder<'a> {
     /// the previous reply into this one, silently and only sometimes.
     pub fn growing(buf: &'a mut Vec<u8>, protocol: &'a dyn Protocol) -> Self {
         buf.clear();
-        Encoder { buf: Buffer::Grow(buf), pos: 0, fatal: false, protocol, padding: None }
+        Encoder {
+            buf: Buffer::Grow(buf),
+            pos: 0,
+            fatal: false,
+            protocol,
+            padding: None,
+            #[cfg(test)]
+            name_null_handles: false,
+        }
+    }
+
+    /// Write every null handle as its type's stand-in id. See the field.
+    #[cfg(test)]
+    pub fn naming_null_handles(mut self) -> Self {
+        self.name_null_handles = true;
+        self
+    }
+
+    /// The id [`Encoder::naming_null_handles`] writes for a null handle of `object_type`.
+    #[cfg(test)]
+    pub fn stand_in_id(object_type: i32) -> u64 {
+        0x5_0000_0000 | u64::from(object_type as u32)
+    }
+
+    /// Write a handle's id. `object_type` is the handle's `VkObjectType`, which only a test's
+    /// stand-in ids need.
+    #[cfg_attr(not(test), allow(unused_variables))]
+    pub fn encode_handle(&mut self, raw: u64, object_type: i32) {
+        #[cfg(test)]
+        let raw =
+            if raw == 0 && self.name_null_handles { Self::stand_in_id(object_type) } else { raw };
+        self.encode_scalar::<u64>(raw);
     }
 
     /// The next `advance` bytes to write into, growing the buffer if it is allowed to.
@@ -1685,7 +1730,7 @@ mod tests {
         sent.plant_pSemaphore(&mut id);
         let mut wire = Vec::new();
         vn_encode_vkCreateSemaphore_args(
-            &mut Encoder::growing(&mut wire, &AllOfIt),
+            &mut Encoder::growing(&mut wire, &AllOfIt).naming_null_handles(),
             VkFlags(0),
             &sent,
         );
@@ -1801,6 +1846,61 @@ mod tests {
             assert!(dec.decode_blob(size).is_none(), "{size:#x} must not be read");
             assert!(dec.hard_fatal(), "{size:#x} must poison the stream");
         }
+    }
+
+    /// `VK_NULL_HANDLE` where vk.xml requires an object poisons the stream at the decode. The
+    /// driver dereferences such a handle without checking it, so a null one reaching it was a
+    /// host null dereference -- a submit's semaphore, a copy's buffer, a descriptor write's set.
+    /// A slot vk.xml lets be null still decodes one, and a destroy of nothing is still a no-op.
+    #[test]
+    fn a_null_handle_where_an_object_is_required_poisons_the_stream() {
+        use crate::venus::proto::serialize::{
+            vn_decode_vkCmdCopyBuffer_args_temp, vn_decode_vkDestroyBuffer_args_temp,
+            vn_encode_vkCmdCopyBuffer_args, vn_encode_vkDestroyBuffer_args,
+        };
+        use crate::venus::proto::types::{
+            VkBuffer, VkCommandBuffer, VkCommandTypeEXT, VkDevice, VkFlags,
+            vn_command_vkCmdCopyBuffer, vn_command_vkDestroyBuffer,
+        };
+        let decodes = |wire: &[u8], decode: &dyn Fn(&mut Decoder<'_>)| {
+            let (temp, hard) = (Bump::new(), AtomicBool::new(false));
+            let mut dec = Decoder::new(wire, &temp, &IdentityObjects, &hard);
+            let _ = dec.decode_scalar::<VkCommandTypeEXT>();
+            let _ = dec.decode_scalar::<VkFlags>();
+            decode(&mut dec);
+            !dec.fatal()
+        };
+        let copy = |dst: VkBuffer| {
+            let mut sent = vn_command_vkCmdCopyBuffer::default();
+            sent.commandBuffer = VkCommandBuffer::forged(1);
+            sent.srcBuffer = VkBuffer::forged(2);
+            sent.dstBuffer = dst;
+            let mut wire = Vec::new();
+            vn_encode_vkCmdCopyBuffer_args(
+                &mut Encoder::growing(&mut wire, &AllOfIt),
+                VkFlags(0),
+                &sent,
+            );
+            decodes(&wire, &|dec| {
+                vn_decode_vkCmdCopyBuffer_args_temp(dec, &mut vn_command_vkCmdCopyBuffer::default())
+            })
+        };
+        assert!(copy(VkBuffer::forged(3)), "every handle named");
+        assert!(!copy(VkBuffer::NULL), "a copy into no buffer");
+
+        let sent = vn_command_vkDestroyBuffer { device: VkDevice::forged(1), ..Default::default() };
+        let mut wire = Vec::new();
+        vn_encode_vkDestroyBuffer_args(
+            &mut Encoder::growing(&mut wire, &AllOfIt),
+            VkFlags(0),
+            &sent,
+        );
+        assert!(
+            decodes(&wire, &|dec| {
+                vn_decode_vkDestroyBuffer_args_temp(dec, &mut vn_command_vkDestroyBuffer::default())
+            }),
+            "destroying no buffer is legal, and vk.xml marks the slot optional"
+        );
     }
 
     #[test]

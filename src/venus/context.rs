@@ -7249,6 +7249,9 @@ mod tests {
         let mut size = 0usize;
         let mut args = Args::default();
         args.device = VkDevice::forged(device);
+        // The cache is a required handle too, and a null one is fatal at the decode whatever the
+        // device is; naming the same ghost keeps this about the ghost.
+        args.pipelineCache = super::super::proto::types::VkPipelineCache::forged(device);
         args.plant_pDataSize(&mut size);
         let proto = crate::venus::cs::AllOfIt;
         let mut buf = vec![0u8; vn_sizeof_vkGetPipelineCacheData_args(&proto, &args)];
@@ -7660,7 +7663,7 @@ mod tests {
             let args = $args;
             let proto = crate::venus::cs::AllOfIt;
             let mut buf = vec![0u8; $size(&proto, &args)];
-            let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+            let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto).naming_null_handles();
             $encode(&mut enc, VkFlags($flags), &args);
             buf
         }};
@@ -7688,6 +7691,17 @@ mod tests {
         use super::super::proto::types as ty;
 
         const WINDOW: usize = 0x21000;
+        const STAND_INS: [ty::VkObjectType; 9] = [
+            ty::VkObjectType::VK_OBJECT_TYPE_DEVICE,
+            ty::VkObjectType::VK_OBJECT_TYPE_EVENT,
+            ty::VkObjectType::VK_OBJECT_TYPE_FENCE,
+            ty::VkObjectType::VK_OBJECT_TYPE_COMMAND_POOL,
+            ty::VkObjectType::VK_OBJECT_TYPE_DESCRIPTOR_POOL,
+            ty::VkObjectType::VK_OBJECT_TYPE_BUFFER,
+            ty::VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY,
+            ty::VkObjectType::VK_OBJECT_TYPE_IMAGE,
+            ty::VkObjectType::VK_OBJECT_TYPE_SEMAPHORE,
+        ];
         // Both timeline structs are required, so they have to be real: a null one is fatal at the
         // decode and would never reach the device lookup this test is about.
         let wait_info = ty::VkSemaphoreWaitInfo {
@@ -7834,6 +7848,16 @@ mod tests {
                 &Budget::with_cap(None, false),
                 String::new(),
             );
+            // Every handle the commands name is the encoder's stand-in for its type, and each is
+            // an object this context's table knows -- so each decodes, and the only thing missing
+            // is the device in the driver's table, which is what this is about.
+            for ty in STAND_INS {
+                let id = crate::venus::cs::Encoder::stand_in_id(ty.0);
+                ctx.objects
+                    .borrow_mut()
+                    .add(ObjectId(id), ty, HostHandle::forged(id), None)
+                    .expect("a fresh id");
+            }
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
             batch.extend_from_slice(&cmd);
@@ -10214,12 +10238,12 @@ mod tests {
         };
         use super::super::proto::types::vn_command_vkGetDeferredOperationResultKHR as Args;
 
-        // Null handles throughout: `VK_NULL_HANDLE` is an ordinary value on the wire, so this
-        // decodes cleanly and reaches the trait default, which is the whole point here.
+        // Stand-in handles throughout, which the caller registers: both are required, so a null
+        // one is fatal at the decode and never reaches the trait default this is about.
         let args = Args::default();
         let proto = crate::venus::cs::AllOfIt;
         let mut buf = vec![0u8; vn_sizeof_vkGetDeferredOperationResultKHR_args(&proto, &args)];
-        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto).naming_null_handles();
         vn_encode_vkGetDeferredOperationResultKHR_args(&mut enc, VkFlags(flags), &args);
         buf
     }
@@ -10247,6 +10271,16 @@ mod tests {
                 &Budget::with_cap(None, false),
                 String::new(),
             );
+            for ty in [
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                VkObjectType::VK_OBJECT_TYPE_DEFERRED_OPERATION_KHR,
+            ] {
+                let id = crate::venus::cs::Encoder::stand_in_id(ty.0);
+                ctx.objects
+                    .borrow_mut()
+                    .add(ObjectId(id), ty, HostHandle::forged(id), None)
+                    .expect("a fresh id");
+            }
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
             batch.extend_from_slice(&wire_unserved(if reply_wanted { GENERATE_REPLY } else { 0 }));
