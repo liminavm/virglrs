@@ -3821,6 +3821,27 @@ SABOTAGES = [
         'every_served_command_is_classified_for_validation',
     ),
     (
+        'dynamic state windows may run past the device limit',
+        'src/venus/driver.rs',
+        """    u64::from(first) + count as u64 <= u64::from(limit)""",
+        """    u64::from(first) + count as u64 <= u64::MAX""",
+        'viewports_and_scissors_past_the_last_viewport_are_refused_before_the_driver',
+    ),
+    (
+        'scissors are not held to the viewport limit',
+        'src/venus/driver.rs',
+        """        if !window_fits(limits.maxViewports, first, scissors.len()) {""",
+        """        if false && !window_fits(limits.maxViewports, first, scissors.len()) {""",
+        'viewports_and_scissors_past_the_last_viewport_are_refused_before_the_driver',
+    ),
+    (
+        'a counted viewport set is not held to the viewport limit',
+        'src/venus/driver.rs',
+        """        if !window_fits(limits.maxViewports, 0, viewports.len()) {""",
+        """        if false && !window_fits(limits.maxViewports, 0, viewports.len()) {""",
+        'viewports_and_scissors_past_the_last_viewport_are_refused_before_the_driver',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

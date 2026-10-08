@@ -5526,7 +5526,7 @@ impl Commands for Handlers<'_> {
     fn vkCmdSetViewport(&mut self, args: &mut vn_command_vkCmdSetViewport<'_>) {
         let viewports = args.pViewports();
         let done = self.driver.cmd_set_viewport(args.commandBuffer, args.firstViewport, viewports);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdBindIndexBuffer(&mut self, args: &mut vn_command_vkCmdBindIndexBuffer<'_>) {
@@ -5751,12 +5751,12 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdSetViewportWithCount(&mut self, args: &mut vn_command_vkCmdSetViewportWithCount<'_>) {
         let done = self.driver.cmd_set_viewport_with_count(args.commandBuffer, args.pViewports());
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdSetScissorWithCount(&mut self, args: &mut vn_command_vkCmdSetScissorWithCount<'_>) {
         let done = self.driver.cmd_set_scissor_with_count(args.commandBuffer, args.pScissors());
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdBindVertexBuffers2(&mut self, args: &mut vn_command_vkCmdBindVertexBuffers2<'_>) {
@@ -5845,7 +5845,7 @@ impl Commands for Handlers<'_> {
     fn vkCmdSetScissor(&mut self, args: &mut vn_command_vkCmdSetScissor<'_>) {
         let scissors = args.pScissors();
         let done = self.driver.cmd_set_scissor(args.commandBuffer, args.firstScissor, scissors);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdBindVertexBuffers(&mut self, args: &mut vn_command_vkCmdBindVertexBuffers<'_>) {

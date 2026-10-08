@@ -541,6 +541,20 @@ pub enum RecordRefused {
     Invalid(&'static str),
 }
 
+/// The limits a planted device starts with: KosmicKrisp's, for the ones a check holds a command
+/// to, so a test that is not about a limit records what a real device would accept. A test that is
+/// about one plants its own with [`Driver::plant_limits`].
+#[cfg(test)]
+fn planted_limits() -> VkPhysicalDeviceLimits {
+    VkPhysicalDeviceLimits { maxPushConstantsSize: 256, maxViewports: 16, ..Default::default() }
+}
+
+/// Whether `count` entries written from `first` lie inside an array of `limit`, the shape of every
+/// windowed dynamic-state command: the driver copies them to `first` in an array that long.
+fn window_fits(limit: u32, first: u32, count: usize) -> bool {
+    u64::from(first) + count as u64 <= u64::from(limit)
+}
+
 /// Whether `bytes` pushed at `offset` lie inside the device's push-constant block.
 fn push_fits(limits: &VkPhysicalDeviceLimits, offset: u32, bytes: usize) -> bool {
     u64::from(offset) + bytes as u64 <= u64::from(limits.maxPushConstantsSize)
@@ -4509,7 +4523,7 @@ impl Driver {
                 fns,
                 memory_types: Vec::new(),
                 group_handles: None,
-                limits: VkPhysicalDeviceLimits::default(),
+                limits: planted_limits(),
             },
         );
     }
@@ -5651,28 +5665,41 @@ impl Driver {
         Ok(())
     }
 
+    /// `vkCmdSetViewport`, held to the device's `maxViewports`: the driver copies the viewports
+    /// to `first` in an array of that many and checks neither. See [`window_fits`].
     pub fn cmd_set_viewport(
         &self,
         cb: VkCommandBuffer,
         first: u32,
         viewports: &[VkViewport],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above; the count is the slice's own length.
+    ) -> Result<(), RecordRefused> {
+        let limits = self.recorder_limits(cb).ok_or(RecordRefused::NoDevice)?;
+        if !window_fits(limits.maxViewports, first, viewports.len()) {
+            return Err(RecordRefused::Invalid("set viewports past the device's last"));
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, and the window was held to the
+        // device's limit above.
         unsafe { (d.vkCmdSetViewport())(cb, first, viewports.len() as u32, viewports.as_ptr()) };
-        Some(())
+        Ok(())
     }
 
+    /// `vkCmdSetScissor`, held to `maxViewports` as [`Driver::cmd_set_viewport`] is: Vulkan has
+    /// one limit for both, and the driver's scissor array is that long too.
     pub fn cmd_set_scissor(
         &self,
         cb: VkCommandBuffer,
         first: u32,
         scissors: &[VkRect2D],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above; the count is the slice's own length.
+    ) -> Result<(), RecordRefused> {
+        let limits = self.recorder_limits(cb).ok_or(RecordRefused::NoDevice)?;
+        if !window_fits(limits.maxViewports, first, scissors.len()) {
+            return Err(RecordRefused::Invalid("set scissors past the device's last viewport"));
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, held to the limit above.
         unsafe { (d.vkCmdSetScissor())(cb, first, scissors.len() as u32, scissors.as_ptr()) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdSetAttachmentFeedbackLoopEnableEXT`: say which aspects the next draws may sample
@@ -5728,27 +5755,46 @@ impl Driver {
         Some(())
     }
 
+    /// `vkCmdSetViewportWithCount`, held to `maxViewports`. KosmicKrisp copies the viewports
+    /// into the command buffer's array of that many and later into a stack array of the same
+    /// length at every draw, checking neither.
     pub fn cmd_set_viewport_with_count(
         &self,
         cb: VkCommandBuffer,
         viewports: &[VkViewport],
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdSetViewportWithCount()?;
-        // SAFETY: as above; the count is the slice's own length. No first index here -- the
-        // count-bearing form replaces the whole state rather than a window into it.
+    ) -> Result<(), RecordRefused> {
+        let limits = self.recorder_limits(cb).ok_or(RecordRefused::NoDevice)?;
+        if !window_fits(limits.maxViewports, 0, viewports.len()) {
+            return Err(RecordRefused::Invalid("set more viewports than the device has"));
+        }
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdSetViewportWithCount())
+            .ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, held to the limit above. No first
+        // index here -- the count-bearing form replaces the whole state rather than a window into
+        // it.
         unsafe { f(cb, viewports.len() as u32, viewports.as_ptr()) };
-        Some(())
+        Ok(())
     }
 
+    /// `vkCmdSetScissorWithCount`, held to `maxViewports` as the viewport form is.
     pub fn cmd_set_scissor_with_count(
         &self,
         cb: VkCommandBuffer,
         scissors: &[VkRect2D],
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdSetScissorWithCount()?;
-        // SAFETY: as above; the count is the slice's own length.
+    ) -> Result<(), RecordRefused> {
+        let limits = self.recorder_limits(cb).ok_or(RecordRefused::NoDevice)?;
+        if !window_fits(limits.maxViewports, 0, scissors.len()) {
+            return Err(RecordRefused::Invalid("set more scissors than the device has viewports"));
+        }
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdSetScissorWithCount())
+            .ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, held to the limit above.
         unsafe { f(cb, scissors.len() as u32, scissors.as_ptr()) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdBindVertexBuffers2`: `vkCmdBindVertexBuffers` with two more arrays, either of which
@@ -10853,6 +10899,69 @@ mod tests {
             arrayLayers: 2,
             ..Default::default()
         }
+    }
+
+    /// Viewports and scissors past the device's last viewport are refused before the driver
+    /// sees them. The driver copies them into arrays of `maxViewports` and checks neither the
+    /// first index nor the count; KosmicKrisp then copies the count-bearing forms into stack
+    /// arrays of the same length at every draw, so a count of seventeen was a stack overrun.
+    #[test]
+    fn viewports_and_scissors_past_the_last_viewport_are_refused_before_the_driver() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const DEVICE: VkDevice = VkDevice::forged(0x17);
+        const CB: VkCommandBuffer = VkCommandBuffer::forged(0x18);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn viewport(
+            _c: VkCommandBuffer,
+            _f: u32,
+            _n: u32,
+            _v: *const VkViewport,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn scissor(_c: VkCommandBuffer, _f: u32, _n: u32, _r: *const VkRect2D) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn viewports(_c: VkCommandBuffer, _n: u32, _v: *const VkViewport) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn scissors(_c: VkCommandBuffer, _n: u32, _r: *const VkRect2D) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetViewport(viewport);
+        fns.plant_vkCmdSetScissor(scissor);
+        fns.plant_vkCmdSetViewportWithCount(viewports);
+        fns.plant_vkCmdSetScissorWithCount(scissors);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.plant_limits(DEVICE, VkPhysicalDeviceLimits { maxViewports: 16, ..Default::default() });
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x19), &[(CB, ObjectId(20))]);
+
+        let vps = [VkViewport::default(); 17];
+        let rects = [VkRect2D::default(); 17];
+        let calls = |f: &dyn Fn() -> Result<(), RecordRefused>| {
+            let before = CALLS.load(Ordering::SeqCst);
+            let got = f();
+            (got, CALLS.load(Ordering::SeqCst) - before)
+        };
+        let refused = |r: (Result<(), RecordRefused>, usize)| {
+            matches!(r, (Err(RecordRefused::Invalid(_)), 0))
+        };
+
+        assert_eq!(calls(&|| d.cmd_set_viewport(CB, 15, &vps[..1])), (Ok(()), 1), "the last one");
+        assert!(refused(calls(&|| d.cmd_set_viewport(CB, 15, &vps[..2]))), "one past it");
+        assert!(refused(calls(&|| d.cmd_set_viewport(CB, u32::MAX, &vps[..1]))), "far past it");
+        assert_eq!(calls(&|| d.cmd_set_scissor(CB, 0, &rects[..16])), (Ok(()), 1), "all sixteen");
+        assert!(refused(calls(&|| d.cmd_set_scissor(CB, 1, &rects[..16]))), "shifted one past");
+        assert_eq!(calls(&|| d.cmd_set_viewport_with_count(CB, &vps[..16])), (Ok(()), 1));
+        assert!(refused(calls(&|| d.cmd_set_viewport_with_count(CB, &vps))), "seventeen viewports");
+        assert_eq!(calls(&|| d.cmd_set_scissor_with_count(CB, &rects[..16])), (Ok(()), 1));
+        assert!(refused(calls(&|| d.cmd_set_scissor_with_count(CB, &rects))), "seventeen scissors");
+
+        d.abandon_planted();
     }
 
     /// Constants pushed past the device's push block are refused before the driver sees them.

@@ -150,8 +150,8 @@ vkCmdSetRenderingInputAttachmentIndices          pending:limits
 vkCmdSetSampleLocationsEXT                       pending:limits
 vkCmdSetSampleLocationsEnableEXT                 reviewed
 vkCmdSetSampleMaskEXT                            reviewed
-vkCmdSetScissor                                  pending:limits
-vkCmdSetScissorWithCount                         pending:limits
+vkCmdSetScissor                                  validated
+vkCmdSetScissorWithCount                         validated
 vkCmdSetStencilCompareMask                       reviewed
 vkCmdSetStencilOp                                reviewed
 vkCmdSetStencilReference                         reviewed
@@ -159,8 +159,8 @@ vkCmdSetStencilTestEnable                        reviewed
 vkCmdSetStencilWriteMask                         reviewed
 vkCmdSetTessellationDomainOriginEXT              reviewed
 vkCmdSetVertexInputEXT                           pending:limits
-vkCmdSetViewport                                 pending:limits
-vkCmdSetViewportWithCount                        pending:limits
+vkCmdSetViewport                                 validated
+vkCmdSetViewportWithCount                        validated
 vkCmdTraceRaysIndirect2KHR                       reviewed
 vkCmdTraceRaysIndirectKHR                        reviewed
 vkCmdTraceRaysKHR                                reviewed
