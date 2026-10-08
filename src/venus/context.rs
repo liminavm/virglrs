@@ -22,7 +22,7 @@ use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Decoded, Guest, HostHandle, ObjectId, guest_face};
 use super::driver::{
     self, Answered, Driver, DriverWait, ExportError, Exported, InFlight, Level, MemoryError,
-    NoSubmit2, NoSyncFd, NotATimeline, XfbCounters,
+    NoSubmit, NoSubmit2, NoSyncFd, NotATimeline, XfbCounters,
 };
 use super::driver::{GroupHandle, ShaderBindingTables};
 use super::journal::{self, Journal, Owner, Recording, Seq};
@@ -6582,11 +6582,11 @@ impl Commands for Handlers<'_> {
         // Submitting nothing is legal -- it is how a guest signals a fence with no work -- so the
         // empty slice goes through rather than being turned away.
         let submits = args.pSubmits();
-        let Some(ret) = self.driver.queue_submit(args.queue, submits, args.fence) else {
-            self.reject("submitted to a queue with no device behind it");
-            return;
-        };
-        args.ret = ret;
+        match self.driver.queue_submit(args.queue, submits, args.fence) {
+            Ok(ret) => args.ret = ret,
+            Err(NoSubmit::Queue) => self.reject("submitted to a queue with no device behind it"),
+            Err(NoSubmit::Disagrees(why)) => self.reject(why),
+        }
     }
 
     /// `vkQueueSubmit2`, the synchronization2 form of the submit above. Submitting nothing is
@@ -8636,11 +8636,14 @@ mod tests {
             pSignalSemaphores: sems.as_ptr(),
             ..Default::default()
         };
-        captured_from.driver_mut().queue_submit(
-            VkQueue::forged(QUEUE),
-            Decoded::planted(&[work] as &[_]),
-            VkFence::forged(FENCE_UP),
-        );
+        captured_from
+            .driver_mut()
+            .queue_submit(
+                VkQueue::forged(QUEUE),
+                Decoded::planted(&[work] as &[_]),
+                VkFence::forged(FENCE_UP),
+            )
+            .expect("a well-formed submit to a planted queue");
 
         let blob = captured_from.sync_export();
         let entries = sync::decode(&blob).expect("what the export wrote is a blob");

@@ -39,10 +39,11 @@ use super::proto::types::{
     VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags,
     VkDependencyInfo, VkDepthBiasInfoEXT, VkDepthClampModeEXT, VkDepthClampRangeEXT,
     VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
-    VkDeviceAddress, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
-    VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo,
-    VkExtensionProperties, VkExtent2D, VkExternalFenceHandleTypeFlagBits,
-    VkExternalImageFormatProperties, VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
+    VkDeviceAddress, VkDeviceCreateInfo, VkDeviceGroupSubmitInfo, VkDeviceMemory,
+    VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent,
+    VkExportMemoryAllocateInfo, VkExtensionProperties, VkExtent2D,
+    VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
+    VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
     VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceCreateFlags, VkFenceCreateInfo,
@@ -7098,13 +7099,19 @@ impl Driver {
     /// `vkQueueSubmit`. Every handle inside a `VkSubmitInfo` -- the wait and signal semaphores,
     /// the command buffers -- was resolved by the decoder as it read them, so what arrives here is
     /// already the driver's own.
+    ///
+    /// A submit whose chained counts disagree with its own is refused before the driver sees it:
+    /// see [`Driver::submit_counts_agree`].
     pub fn queue_submit(
         &mut self,
         queue: VkQueue,
         submits: cs::Decoded<'_, [VkSubmitInfo]>,
         fence: VkFence,
-    ) -> Option<VkResult> {
-        let q = self.submitter(queue)?;
+    ) -> Result<VkResult, NoSubmit> {
+        for s in submits.get() {
+            self.submit_counts_agree(s).map_err(NoSubmit::Disagrees)?;
+        }
+        let q = self.submitter(queue).ok_or(NoSubmit::Queue)?;
         let ret = {
             let _vk = q.held();
             // Submitting no work to signal a fence is a normal thing for a guest to do, and Vulkan
@@ -7118,7 +7125,56 @@ impl Driver {
         if ret == VkResult::VK_SUCCESS {
             self.note_submit(submits.get(), fence);
         }
-        Some(ret)
+        Ok(ret)
+    }
+
+    /// Whether the counts a submit's `pNext` chain carries agree with the submit's own.
+    ///
+    /// The wire carries each array beside its own count, so the decoder reconciles every pair it
+    /// reads; what it cannot see is that `VkDeviceGroupSubmitInfo` and
+    /// `VkTimelineSemaphoreSubmitInfo` restate the submit's counts, and that the driver walks their
+    /// arrays by the submit's. Mesa's `vk_common_QueueSubmit` reads a device index for every
+    /// semaphore and command buffer the submit names, and a timeline value for every timeline
+    /// semaphore -- so a guest sending fewer reads through a null pointer, which aborts the whole
+    /// VMM, or past the arena array into host memory. Vulkan requires the device-group counts to
+    /// be equal (VUID-VkDeviceGroupSubmitInfo-*-00082/00083/00084), and a timeline value count to
+    /// be equal where that side names a timeline semaphore (VUID-VkSubmitInfo-pNext-03240/03241).
+    /// A semaphore this driver has no record of may be a timeline, so it counts as one.
+    fn submit_counts_agree(&self, s: &VkSubmitInfo) -> Result<(), &'static str> {
+        if let Some(g) = chained_at::<VkDeviceGroupSubmitInfo>(&s.pNext) {
+            if g.waitSemaphoreCount != s.waitSemaphoreCount {
+                return Err("a device-group wait count that disagrees with its submit's");
+            }
+            if g.commandBufferCount != s.commandBufferCount {
+                return Err("a device-group command buffer count that disagrees with its submit's");
+            }
+            if g.signalSemaphoreCount != s.signalSemaphoreCount {
+                return Err("a device-group signal count that disagrees with its submit's");
+            }
+        }
+        let Some(t) = chained_at::<VkTimelineSemaphoreSubmitInfo>(&s.pNext) else {
+            return Ok(());
+        };
+        let names_a_timeline = |count: u32, sems: *const VkSemaphore| {
+            // SAFETY: the decoder allocated the array from the batch arena, sized to the count
+            // beside it, and it outlives this call. `wire_array` is the same reconciliation the
+            // generated accessors use.
+            let sems = unsafe { crate::venus::cs::wire_array::<VkSemaphore>(count as usize, sems) };
+            sems.unwrap_or_default().iter().any(|sem| {
+                self.semaphores.get(sem).is_none_or(|f| f.kind == SemaphoreKind::Timeline)
+            })
+        };
+        if t.waitSemaphoreValueCount != s.waitSemaphoreCount
+            && names_a_timeline(s.waitSemaphoreCount, s.pWaitSemaphores)
+        {
+            return Err("a timeline wait value count that disagrees with its submit's");
+        }
+        if t.signalSemaphoreValueCount != s.signalSemaphoreCount
+            && names_a_timeline(s.signalSemaphoreCount, s.pSignalSemaphores)
+        {
+            return Err("a timeline signal value count that disagrees with its submit's");
+        }
+        Ok(())
     }
 
     /// `vkQueueSubmit2`, the synchronization2 form of the submit above.
@@ -9850,6 +9906,17 @@ pub enum NotATimeline {
     Malformed,
 }
 
+/// Why a `vkQueueSubmit` was refused without being forwarded. The guest's own doing and not a
+/// `VkResult`, so the caller poisons the context rather than answering.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NoSubmit {
+    /// A queue this context never retrieved.
+    Queue,
+    /// A count in the submit's `pNext` chain disagrees with the submit's own; the reason says
+    /// which.
+    Disagrees(&'static str),
+}
+
 /// Why a `vkQueueSubmit2` was refused without being forwarded.
 ///
 /// Both are the guest's own doing and neither is a `VkResult`, so the caller poisons the context
@@ -9896,6 +9963,12 @@ unsafe impl InStruct for VkTimelineSemaphoreSubmitInfo {
 // same vk.xml with Vulkan's `sType`/`pNext` header first.
 unsafe impl InStruct for VkSemaphoreTypeCreateInfo {
     const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkDeviceGroupSubmitInfo {
+    const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -13301,6 +13374,103 @@ mod tests {
         }
     }
 
+    /// A submit whose `pNext` chain restates its counts differently is refused before the driver
+    /// sees it. Mesa's `vk_common_QueueSubmit` walks the chained arrays by the submit's counts: a
+    /// device-group struct counting fewer signals than the submit has hands it a null array to
+    /// index, which aborted the whole VMM, and a short timeline value array is read past its end.
+    /// A short value array whose side names only binary semaphores is valid Vulkan, and goes
+    /// through.
+    #[test]
+    fn a_submit_whose_chained_counts_disagree_is_refused_before_the_driver() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const DEVICE: u64 = 0xd3;
+        const QUEUE: u64 = 0x93;
+        const TIMELINE: u64 = 0x45;
+        const BINARY: u64 = 0x46;
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn submit(
+            _q: VkQueue,
+            _n: u32,
+            _s: *const VkSubmitInfo,
+            _f: VkFence,
+        ) -> VkResult {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            VkResult::VK_SUCCESS
+        }
+
+        let mut d = Driver::new(Account::for_test(None));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkQueueSubmit(submit);
+        d.plant_device(VkDevice::forged(DEVICE), fns);
+        d.plant_queue(VkDevice::forged(DEVICE), VkQueue::forged(QUEUE));
+        d.plant_semaphore(VkSemaphore::forged(TIMELINE), SemaphoreKind::Timeline);
+        d.plant_semaphore(VkSemaphore::forged(BINARY), SemaphoreKind::Binary);
+
+        let timeline = [VkSemaphore::forged(TIMELINE)];
+        let binary = [VkSemaphore::forged(BINARY)];
+        let one_index = [0u32];
+        let one_value = [7u64];
+        let mut submit_with = |pnext: *const core::ffi::c_void, sems: &[VkSemaphore]| {
+            let infos = [VkSubmitInfo {
+                pNext: pnext,
+                waitSemaphoreCount: 0,
+                signalSemaphoreCount: sems.len() as u32,
+                pSignalSemaphores: sems.as_ptr(),
+                ..Default::default()
+            }];
+            let before = CALLS.load(Ordering::SeqCst);
+            let got = d.queue_submit(
+                VkQueue::forged(QUEUE),
+                cs::Decoded::planted(&infos as &[_]),
+                VkFence::NULL,
+            );
+            (got, CALLS.load(Ordering::SeqCst) - before)
+        };
+
+        // The reported case: one signal semaphore, a device-group struct counting none.
+        let short_group = VkDeviceGroupSubmitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO,
+            ..Default::default()
+        };
+        let (got, calls) = submit_with((&raw const short_group).cast(), &binary);
+        assert!(matches!(got, Err(NoSubmit::Disagrees(_))), "a short device group: {got:?}");
+        assert_eq!(calls, 0, "and the driver never sees it");
+
+        let group = VkDeviceGroupSubmitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO,
+            signalSemaphoreCount: 1,
+            pSignalSemaphoreDeviceIndices: one_index.as_ptr(),
+            ..Default::default()
+        };
+        let (got, calls) = submit_with((&raw const group).cast(), &binary);
+        assert_eq!((got, calls), (Ok(VkResult::VK_SUCCESS), 1), "a device group that agrees");
+
+        // A timeline signalled with no value for it.
+        let no_values = VkTimelineSemaphoreSubmitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+            ..Default::default()
+        };
+        let (got, calls) = submit_with((&raw const no_values).cast(), &timeline);
+        assert!(matches!(got, Err(NoSubmit::Disagrees(_))), "a short timeline: {got:?}");
+        assert_eq!(calls, 0, "and the driver never sees it");
+
+        // The same short array over a binary semaphore is valid Vulkan.
+        let (got, calls) = submit_with((&raw const no_values).cast(), &binary);
+        assert_eq!((got, calls), (Ok(VkResult::VK_SUCCESS), 1), "no value owed to a binary");
+
+        let values = VkTimelineSemaphoreSubmitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+            signalSemaphoreValueCount: 1,
+            pSignalSemaphoreValues: one_value.as_ptr(),
+            ..Default::default()
+        };
+        let (got, calls) = submit_with((&raw const values).cast(), &timeline);
+        assert_eq!((got, calls), (Ok(VkResult::VK_SUCCESS), 1), "a timeline with its value");
+
+        d.abandon_planted();
+    }
+
     /// A submit the driver refused promises nothing: its fence is not pending and its timeline
     /// signals are not requested.
     ///
@@ -13361,7 +13531,7 @@ mod tests {
                 cs::Decoded::planted(&v1 as &[_]),
                 VkFence::forged(FENCE)
             ),
-            Some(VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY),
+            Ok(VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY),
             "the driver's refusal is the guest's answer"
         );
         assert!(

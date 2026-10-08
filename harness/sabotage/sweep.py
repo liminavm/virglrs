@@ -317,8 +317,8 @@ SABOTAGES = [
     (
         'an empty submit is turned away instead of signalling its fence',
         'src/venus/context.rs',
-        '        let submits = args.pSubmits();\n        let Some(ret) = self.driver.queue_submit(args.queue, submits, args.fence) else {',
-        '        let submits = args.pSubmits();\n        if submits.is_empty() {\n            return;\n        }\n        let Some(ret) = self.driver.queue_submit(args.queue, submits, args.fence) else {',
+        '        let submits = args.pSubmits();\n        match self.driver.queue_submit(args.queue, submits, args.fence) {',
+        '        let submits = args.pSubmits();\n        if submits.is_empty() {\n            return;\n        }\n        match self.driver.queue_submit(args.queue, submits, args.fence) {',
         '',
     ),
     (
@@ -3726,6 +3726,27 @@ SABOTAGES = [
         """            if self.have.contains(feature) && gl.get_integer(limit) <= 0 {""",
         """            if self.have.contains(feature) && gl.get_integer(limit) < 0 {""",
         'a_geometry_stage_is_offered_only_where_the_host_draws_through_one',
+    ),
+    (
+        'a submit device-group count is passed to the driver unchecked',
+        'src/venus/driver.rs',
+        """        if let Some(g) = chained_at::<VkDeviceGroupSubmitInfo>(&s.pNext) {""",
+        """        if let Some(g) = None::<&VkDeviceGroupSubmitInfo> {""",
+        'a_submit_whose_chained_counts_disagree_is_refused_before_the_driver',
+    ),
+    (
+        'a submit timeline signal value count is passed to the driver unchecked',
+        'src/venus/driver.rs',
+        """        if t.signalSemaphoreValueCount != s.signalSemaphoreCount""",
+        """        if false && t.signalSemaphoreValueCount != s.signalSemaphoreCount""",
+        'a_submit_whose_chained_counts_disagree_is_refused_before_the_driver',
+    ),
+    (
+        'a binary semaphore is owed a timeline value',
+        'src/venus/driver.rs',
+        """self.semaphores.get(sem).is_none_or(|f| f.kind == SemaphoreKind::Timeline)""",
+        """self.semaphores.get(sem).is_none_or(|_| true)""",
+        'a_submit_whose_chained_counts_disagree_is_refused_before_the_driver',
     ),
     (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
