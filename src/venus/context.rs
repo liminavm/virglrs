@@ -6092,6 +6092,7 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdSetSampleLocationsEXT(&mut self, args: &mut vn_command_vkCmdSetSampleLocationsEXT<'_>) {
         let Some(info) = self.names(args.pSampleLocationsInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_set_sample_locations(args.commandBuffer, info);
         self.recorded(done);
     }
@@ -19934,12 +19935,13 @@ mod tests {
         h.driver.abandon_planted();
     }
 
-    /// `vkCmdSetSampleLocationsEXT` hands the driver the struct the guest sent.
+    /// `vkCmdSetSampleLocationsEXT` hands the driver the struct the guest sent, once it holds to
+    /// the device's sample location grids.
     #[test]
     fn sample_locations_hand_the_driver_the_guests_struct() {
         use super::super::proto::types::{
-            VkCommandBuffer, VkCommandPool, VkDevice, VkSampleLocationsInfoEXT,
-            vn_command_vkCmdSetSampleLocationsEXT,
+            VkCommandBuffer, VkCommandPool, VkDevice, VkExtent2D, VkSampleCountFlagBits,
+            VkSampleLocationEXT, VkSampleLocationsInfoEXT, vn_command_vkCmdSetSampleLocationsEXT,
         };
         use std::cell::RefCell;
 
@@ -19965,6 +19967,8 @@ mod tests {
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice::forged(DEVICE), fns);
+        let one = VkExtent2D { width: 1, height: 1 };
+        driver.plant_sample_locations(VkDevice::forged(DEVICE), &[(1, one)]);
         driver.plant_pool(
             VkDevice::forged(DEVICE),
             VkCommandPool::forged(POOL),
@@ -19998,7 +20002,14 @@ mod tests {
         };
         let cb = VkCommandBuffer::forged(CB.0);
 
-        let cmd_set_sample_locations_e_x_t_info = VkSampleLocationsInfoEXT::default();
+        let location = [VkSampleLocationEXT { x: 0.5, y: 0.5 }];
+        let cmd_set_sample_locations_e_x_t_info = VkSampleLocationsInfoEXT {
+            sampleLocationsPerPixel: VkSampleCountFlagBits(1),
+            sampleLocationGridSize: one,
+            sampleLocationsCount: 1,
+            pSampleLocations: location.as_ptr(),
+            ..Default::default()
+        };
 
         h.vkCmdSetSampleLocationsEXT(&mut vn_command_vkCmdSetSampleLocationsEXT {
             commandBuffer: cb,

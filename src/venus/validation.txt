@@ -148,7 +148,7 @@ vkCmdSetRasterizerDiscardEnable                  reviewed
 vkCmdSetRayTracingPipelineStackSizeKHR           reviewed
 vkCmdSetRenderingAttachmentLocations             validated
 vkCmdSetRenderingInputAttachmentIndices          validated
-vkCmdSetSampleLocationsEXT                       pending:limits
+vkCmdSetSampleLocationsEXT                       validated
 vkCmdSetSampleLocationsEnableEXT                 reviewed
 vkCmdSetSampleMaskEXT                            reviewed
 vkCmdSetScissor                                  validated

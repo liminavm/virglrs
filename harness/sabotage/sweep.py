@@ -3912,6 +3912,20 @@ SABOTAGES = [
         'a_byte_count_draw_with_no_stride_is_refused_before_the_driver',
     ),
     (
+        'a sample location count is not held to its grid',
+        'src/venus/driver.rs',
+        """        if u64::from(this.sampleLocationsCount) != wanted {""",
+        """        if u64::from(this.sampleLocationsCount) == u64::MAX {""",
+        'sample_locations_the_device_does_not_take_do_not_validate',
+    ),
+    (
+        'a sample location grid is not held to the device',
+        'src/venus/driver.rs',
+        """        if grid.width > largest.width || grid.height > largest.height {""",
+        """        if grid.width > u32::MAX {""",
+        'sample_locations_the_device_does_not_take_do_not_validate',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

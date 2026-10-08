@@ -60,10 +60,11 @@ use super::proto::types::{
     VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags,
     VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA,
     VkMemoryToImageCopy, VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT,
-    VkObjectType, VkOffset3D, VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo,
-    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceLimits,
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties,
-    VkPhysicalDeviceProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
+    VkMultisamplePropertiesEXT, VkObjectType, VkOffset3D, VkPhysicalDevice,
+    VkPhysicalDeviceExternalImageFormatInfo, VkPhysicalDeviceImageFormatInfo2,
+    VkPhysicalDeviceLimits, VkPhysicalDeviceMemoryBudgetPropertiesEXT,
+    VkPhysicalDeviceMemoryProperties, VkPhysicalDeviceProperties,
+    VkPhysicalDeviceSampleLocationsPropertiesEXT, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
     VkPipelineCacheCreateInfo, VkPipelineLayout, VkPipelineLayoutCreateInfo,
     VkPipelineStageFlagBits, VkPipelineStageFlags, VkPipelineStageFlags2, VkPolygonMode,
     VkPrimitiveTopology, VkProvokingVertexModeEXT, VkPushConstantRange, VkPushConstantsInfo,
@@ -2047,6 +2048,67 @@ struct DeviceState {
     /// these bound -- the push-constant block is `maxPushConstantsSize` bytes in KosmicKrisp --
     /// and checks none of them, so a command whose values exceed one is refused here.
     limits: VkPhysicalDeviceLimits,
+    /// The sample location grids the device takes, if it enabled `VK_EXT_sample_locations`.
+    sample_locations: Option<SampleLocationGrids>,
+}
+
+/// What [`SampleLocationGrids`] says of `pd`: the sample counts its properties offer locations
+/// at, and the grid `vkGetPhysicalDeviceMultisamplePropertiesEXT` answers for each. Called only
+/// for a device created with `VK_EXT_sample_locations`, so both queries are ones it answers.
+fn sample_location_grids(inst: &vulkan::Instance, pd: VkPhysicalDevice) -> SampleLocationGrids {
+    let mut sl = VkPhysicalDeviceSampleLocationsPropertiesEXT {
+        sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT,
+        ..Default::default()
+    };
+    let mut props = VkPhysicalDeviceProperties2 {
+        sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        pNext: (&mut sl as *mut VkPhysicalDeviceSampleLocationsPropertiesEXT).cast(),
+        ..Default::default()
+    };
+    // SAFETY: `pd` is a handle this instance returned, and the chain is two locals, the second
+    // an extension the device was just created with.
+    unsafe { (inst.vkGetPhysicalDeviceProperties2())(pd, &mut props) };
+    let mut out = SampleLocationGrids::default();
+    let Some(query) = inst.try_vkGetPhysicalDeviceMultisamplePropertiesEXT() else {
+        return out;
+    };
+    for (i, grid) in out.grids.iter_mut().enumerate() {
+        let samples = 1u32 << i;
+        if sl.sampleLocationSampleCounts.0 & samples == 0 {
+            continue;
+        }
+        let mut ms = VkMultisamplePropertiesEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT,
+            ..Default::default()
+        };
+        // SAFETY: `pd` is a handle this instance returned, `samples` one bit the device names,
+        // and `ms` a local.
+        unsafe { query(pd, VkSampleCountFlagBits(samples as i32), &mut ms) };
+        *grid = ms.maxSampleLocationGridSize;
+    }
+    out
+}
+
+/// The largest sample location grid a device takes at each sample count, read once at device
+/// creation from `vkGetPhysicalDeviceMultisamplePropertiesEXT`. The Mesa runtime copies a
+/// guest's locations into an array of thirty-two by the guest's count, checked only by an assert;
+/// Vulkan bounds the count by the grid at the struct's own sample count, which this holds.
+#[derive(Clone, Copy, Default)]
+pub struct SampleLocationGrids {
+    /// Indexed by the sample count's bit position, 1 through 64; a zero extent is a count the
+    /// device takes no locations at.
+    grids: [VkExtent2D; 7],
+}
+
+impl SampleLocationGrids {
+    /// The largest grid at `samples`, or `None` for a count the device takes no locations at.
+    fn at(&self, samples: u32) -> Option<VkExtent2D> {
+        if !samples.is_power_of_two() {
+            return None;
+        }
+        let grid = *self.grids.get(samples.trailing_zeros() as usize)?;
+        (grid.width != 0 && grid.height != 0).then_some(grid)
+    }
 }
 
 /// A device's shader group handle sizes, in bytes.
@@ -2610,7 +2672,14 @@ impl Driver {
                     capture_replay: rt.shaderGroupHandleCaptureReplaySize,
                 }
             });
-        self.devices.insert(out, DeviceState { fns, memory_types, group_handles, limits });
+        let sample_locations = wanted
+            .iter()
+            .any(|n| n == "VK_EXT_sample_locations")
+            .then(|| sample_location_grids(inst, pd));
+        self.devices.insert(
+            out,
+            DeviceState { fns, memory_types, group_handles, limits, sample_locations },
+        );
         Ok(out)
     }
 
@@ -3656,14 +3725,17 @@ impl Driver {
     /// [`Driver::facts`] for the device `cb` records for, or `None` for a command buffer with no
     /// device here -- which the caller refuses as it refuses recording into one.
     pub fn recorder_facts(&self, cb: VkCommandBuffer) -> Option<DeviceFacts<'_>> {
-        let limits = self.recorder_limits(cb)?;
-        Some(DeviceFacts { facts: self.facts(), limits })
+        self.device_facts(self.pools.device_of(cb)?)
     }
 
     /// [`Driver::facts`] for `device`, or `None` for a device this context does not have.
     pub fn device_facts(&self, device: VkDevice) -> Option<DeviceFacts<'_>> {
-        let limits = &self.devices.get(&device)?.limits;
-        Some(DeviceFacts { facts: self.facts(), limits })
+        let d = self.devices.get(&device)?;
+        Some(DeviceFacts {
+            facts: self.facts(),
+            limits: &d.limits,
+            sample_locations: d.sample_locations.as_ref(),
+        })
     }
 
     /// Fold `srcs` into `dst`. The handles are the guest's names already resolved to the
@@ -4541,6 +4613,7 @@ impl Driver {
                 memory_types: Vec::new(),
                 group_handles: None,
                 limits: planted_limits(),
+                sample_locations: None,
             },
         );
     }
@@ -4796,6 +4869,17 @@ impl Driver {
     ) {
         self.pools.open(device, pool);
         self.pools.adopt(pool, level, children.iter().copied());
+    }
+
+    /// Give a planted device the sample location grids it would have read at creation, as
+    /// `(sample count, largest grid)` pairs.
+    #[cfg(test)]
+    pub(super) fn plant_sample_locations(&mut self, device: VkDevice, grids: &[(u32, VkExtent2D)]) {
+        let mut out = SampleLocationGrids::default();
+        for &(samples, grid) in grids {
+            out.grids[samples.trailing_zeros() as usize] = grid;
+        }
+        self.devices.get_mut(&device).expect("a planted device").sample_locations = Some(out);
     }
 
     /// Bind a planted command buffer to a pipeline of `point`'s kind, as a served
@@ -6597,7 +6681,7 @@ impl Driver {
     pub fn cmd_set_sample_locations(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkSampleLocationsInfoEXT>,
+        info: cs::Decoded<'_, VkSampleLocationsInfoEXT, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdSetSampleLocationsEXT()?;
         // SAFETY: as above; `info` is a struct the decoder built, live for the call.
@@ -10222,6 +10306,8 @@ pub struct Facts<'d> {
 pub struct DeviceFacts<'d> {
     pub facts: Facts<'d>,
     pub limits: &'d VkPhysicalDeviceLimits,
+    /// `None` for a device that did not enable `VK_EXT_sample_locations`.
+    pub sample_locations: Option<&'d SampleLocationGrids>,
 }
 
 /// Whether the counts a submit's `pNext` chain carries agree with the submit's own.
@@ -10397,6 +10483,31 @@ impl cs::Validate<DeviceFacts<'_>> for VkPipelineLayoutCreateInfo {
             if u64::from(r.offset) + u64::from(r.size) > u64::from(limits.maxPushConstantsSize) {
                 return Err("laid out a push constant range past the device's push block");
             }
+        }
+        Ok(())
+    }
+}
+
+/// Sample locations the device takes: as many as the struct's sample count times its grid, and
+/// a grid within the largest the device takes at that count. See [`SampleLocationGrids`].
+impl cs::Validate<DeviceFacts<'_>> for VkSampleLocationsInfoEXT {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let grids = facts
+            .sample_locations
+            .ok_or("set sample locations on a device that did not enable them")?;
+        let samples = this.sampleLocationsPerPixel.0 as u32;
+        let largest =
+            grids.at(samples).ok_or("set sample locations at a sample count without them")?;
+        let grid = this.sampleLocationGridSize;
+        if grid.width > largest.width || grid.height > largest.height {
+            return Err("set a sample location grid larger than the device takes");
+        }
+        let wanted = u64::from(samples) * u64::from(grid.width) * u64::from(grid.height);
+        if u64::from(this.sampleLocationsCount) != wanted {
+            return Err("sent sample locations other than one per sample in the grid");
         }
         Ok(())
     }
@@ -11129,6 +11240,44 @@ mod tests {
             arrayLayers: 2,
             ..Default::default()
         }
+    }
+
+    /// Sample locations the device does not take do not validate. The Mesa runtime copies them
+    /// into an array of thirty-two by the guest's count, checked only by an assert; Vulkan holds
+    /// the count to the sample count times a grid no larger than the device takes at that count.
+    #[test]
+    fn sample_locations_the_device_does_not_take_do_not_validate() {
+        const DEVICE: VkDevice = VkDevice::forged(0x77);
+        const BARE: VkDevice = VkDevice::forged(0x78);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        d.plant_device(BARE, crate::vulkan::Device::default());
+        let one = VkExtent2D { width: 1, height: 1 };
+        let two = VkExtent2D { width: 2, height: 2 };
+        d.plant_sample_locations(DEVICE, &[(4, two), (16, one)]);
+
+        let locations = [super::super::proto::types::VkSampleLocationEXT::default(); 64];
+        let info = |samples: i32, grid: VkExtent2D, count: u32| VkSampleLocationsInfoEXT {
+            sampleLocationsPerPixel: VkSampleCountFlagBits(samples),
+            sampleLocationGridSize: grid,
+            sampleLocationsCount: count,
+            pSampleLocations: locations.as_ptr(),
+            ..Default::default()
+        };
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let holds = |i: VkSampleLocationsInfoEXT| cs::Decoded::planted(&i).validate(&facts).is_ok();
+        assert!(holds(info(4, two, 16)), "four samples on the largest grid at four");
+        assert!(holds(info(16, one, 16)), "sixteen samples on one pixel");
+        assert!(!holds(info(16, two, 64)), "a grid larger than sixteen samples take");
+        assert!(!holds(info(4, two, 64)), "more locations than the grid holds");
+        assert!(!holds(info(4, one, 0)), "fewer");
+        assert!(!holds(info(8, one, 8)), "a sample count without locations");
+
+        let bare = d.device_facts(BARE).expect("a planted device");
+        let i = info(4, one, 4);
+        assert!(cs::Decoded::planted(&i).validate(&bare).is_err(), "a device without them");
+
+        d.abandon_planted();
     }
 
     /// A draw from a transform feedback count with a zero stride is refused before the driver:
