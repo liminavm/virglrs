@@ -315,7 +315,7 @@ vkSignalSemaphore                                reviewed
 vkSubmitVirtqueueSeqnoMESA                       reviewed
 vkTransitionImageLayout                          reviewed
 vkTrimCommandPool                                reviewed
-vkUpdateDescriptorSets                           pending:descriptors
+vkUpdateDescriptorSets                           validated
 vkWaitForFences                                  reviewed
 vkWaitRingSeqnoMESA                              reviewed
 vkWaitSemaphoreResourceMESA                      reviewed

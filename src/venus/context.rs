@@ -3188,13 +3188,25 @@ impl Commands for Handlers<'_> {
     );
     simple_destroy!(vkDestroyFramebuffer, vn_command_vkDestroyFramebuffer, framebuffer);
 
-    simple_create!(
-        vkCreateDescriptorSetLayout,
-        vn_command_vkCreateDescriptorSetLayout,
-        pCreateInfo,
-        pSetLayout,
-        handle_pSetLayout_mut
-    );
+    /// Not [`simple_create`]: what a layout lays out is recorded for the updates of its sets.
+    fn vkCreateDescriptorSetLayout(
+        &mut self,
+        args: &mut vn_command_vkCreateDescriptorSetLayout<'_>,
+    ) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        let host =
+            match self.driver.create_descriptor_set_layout(args.device, info, args.pAllocator) {
+                Ok(host) => host,
+                Err(why) => return self.reject(why),
+            };
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant(
+            "vkCreateDescriptorSetLayout",
+            args.pSetLayout(),
+            args.handle_pSetLayout_mut(),
+            host,
+        );
+    }
     simple_destroy!(
         vkDestroyDescriptorSetLayout,
         vn_command_vkDestroyDescriptorSetLayout,
@@ -3446,6 +3458,10 @@ impl Commands for Handlers<'_> {
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
         let named: Vec<ObjectId> = ids.iter().map(|h| h.id()).collect();
+        let sets = match self.driver.descriptor_sets_for(info) {
+            Ok(sets) => sets,
+            Err(why) => return self.reject(why),
+        };
         let out = args.handle_pDescriptorSets_mut();
         let host = self.driver.allocate_objects(
             device,
@@ -3456,6 +3472,9 @@ impl Commands for Handlers<'_> {
             &named,
             Level::Unleveled,
         );
+        if host.is_ok() {
+            self.driver.describe_sets(out, sets);
+        }
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
             // Running a descriptor pool dry is a normal thing for a guest to do -- it is how a
@@ -5125,7 +5144,15 @@ impl Commands for Handlers<'_> {
     fn vkUpdateDescriptorSets(&mut self, args: &mut vn_command_vkUpdateDescriptorSets<'_>) {
         let writes = args.pDescriptorWrites();
         let copies = args.pDescriptorCopies();
-        self.driver.update_descriptor_sets(args.device, writes, copies);
+        // A device this context does not have updates nothing, as the driver call would not.
+        let checked = match self.driver.device_facts(args.device) {
+            None => return,
+            Some(facts) => writes.validate(&facts).and_then(|w| Ok((w, copies.validate(&facts)?))),
+        };
+        match checked {
+            Ok((writes, copies)) => self.driver.update_descriptor_sets(args.device, writes, copies),
+            Err(why) => self.reject(why),
+        }
     }
 
     // ---------------------------------------------------------------------- recording
@@ -14108,6 +14135,23 @@ mod tests {
             &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
         driver.plant_queue(VkDevice::forged(DEVICE), VkQueue::forged(QUEUE));
+        // The set the updates below name: binding 0, holding one sampler.
+        let binding = super::super::proto::types::VkDescriptorSetLayoutBinding {
+            descriptorCount: 1,
+            ..Default::default()
+        };
+        let layout = super::super::proto::types::VkDescriptorSetLayoutCreateInfo {
+            bindingCount: 1,
+            pBindings: &binding,
+            ..Default::default()
+        };
+        driver.plant_sets(
+            VkDevice::forged(DEVICE),
+            super::super::proto::types::VkDescriptorPool::forged(0x30),
+            &[(VkDescriptorSet::forged(0x300), ObjectId(0x31))],
+            &layout,
+            0,
+        );
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -14152,8 +14196,14 @@ mod tests {
         });
 
         // Three writes, one copy.
-        let writes = [VkWriteDescriptorSet::default(); 3];
-        let copies = [VkCopyDescriptorSet::default(); 1];
+        let write =
+            VkWriteDescriptorSet { dstSet: VkDescriptorSet::forged(0x300), ..Default::default() };
+        let writes = [write; 3];
+        let copies = [VkCopyDescriptorSet {
+            srcSet: VkDescriptorSet::forged(0x300),
+            dstSet: VkDescriptorSet::forged(0x300),
+            ..Default::default()
+        }];
         let mut args = vn_command_vkUpdateDescriptorSets::default();
         args.device = VkDevice::forged(DEVICE);
         args.plant_pDescriptorWrites(&writes);

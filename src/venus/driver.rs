@@ -107,6 +107,13 @@ use super::proto::types::{
     VkStridedDeviceAddressRegionKHR,
 };
 use super::proto::types::{
+    VkDescriptorBindingFlagBits, VkDescriptorSetAllocateInfo,
+    VkDescriptorSetLayoutBindingFlagsCreateInfo,
+    VkDescriptorSetVariableDescriptorCountAllocateInfo, VkDescriptorType,
+    VkMutableDescriptorTypeCreateInfoEXT, VkWriteDescriptorSetAccelerationStructureKHR,
+    VkWriteDescriptorSetInlineUniformBlock,
+};
+use super::proto::types::{
     VkDrmFormatModifierPropertiesEXT, VkDrmFormatModifierPropertiesListEXT, VkFormatProperties2,
     VkImageDrmFormatModifierListCreateInfoEXT, VkImageFormatListCreateInfo,
     VkImageStencilUsageCreateInfo,
@@ -219,11 +226,140 @@ pub enum Level {
 /// already the thing that lives exactly as long as the buffer does: a freed buffer, a destroyed
 /// pool and a destroyed device all take it, and a record kept anywhere else would need each of
 /// those to remember it. Every other pool child carries it empty, as it carries `Unleveled`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Child {
     id: ObjectId,
     level: Level,
     bound: Bound,
+    /// For a descriptor set, what it was allocated as: kept here for the reason `bound` is.
+    set: Option<SetFacts>,
+}
+
+/// One binding of a descriptor set layout, as an update of a set of it is held to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BindingFacts {
+    ty: VkDescriptorType,
+    count: u32,
+    stages: u32,
+    flags: u32,
+    /// Whether it carries immutable samplers.
+    immutable: bool,
+    /// For a mutable binding, the types it may hold.
+    mutable: Vec<VkDescriptorType>,
+}
+
+impl BindingFacts {
+    fn variable(&self) -> bool {
+        const VARIABLE: u32 =
+            VkDescriptorBindingFlagBits::VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT.0
+                as u32;
+        self.flags & VARIABLE != 0
+    }
+
+    /// Whether a descriptor of type `ty` may be written into it.
+    fn holds(&self, ty: VkDescriptorType) -> bool {
+        self.ty == ty
+            || (self.ty == VkDescriptorType::VK_DESCRIPTOR_TYPE_MUTABLE_EXT
+                && self.mutable.contains(&ty))
+    }
+
+    /// Whether an update that runs past the end of this binding may carry on into `next`: Vulkan
+    /// lets it when the two are alike in everything but their numbers and sizes.
+    fn runs_into(&self, next: &Self) -> bool {
+        self.ty == next.ty
+            && self.stages == next.stages
+            && self.flags == next.flags
+            && self.immutable == next.immutable
+            && self.mutable == next.mutable
+    }
+}
+
+/// What a descriptor set layout lays out: each of its bindings, by number.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LayoutFacts {
+    bindings: BTreeMap<u32, BindingFacts>,
+}
+
+impl LayoutFacts {
+    /// What a layout made from `info` holds, or why no layout can hold it.
+    fn of(info: cs::Decoded<'_, VkDescriptorSetLayoutCreateInfo>) -> Result<Self, &'static str> {
+        type D = VkDescriptorType;
+        let flags = chained::<VkDescriptorSetLayoutBindingFlagsCreateInfo>(info)
+            .map_or(&[][..], |f| regions_of(&f, f.bindingCount, f.pBindingFlags));
+        let lists = chained::<VkMutableDescriptorTypeCreateInfoEXT>(info).map_or(&[][..], |m| {
+            regions_of(&m, m.mutableDescriptorTypeListCount, m.pMutableDescriptorTypeLists)
+        });
+        let mut bindings = BTreeMap::new();
+        for (i, b) in regions_of(&info, info.bindingCount, info.pBindings).iter().enumerate() {
+            let mutable = lists
+                .get(i)
+                .map_or(&[][..], |l| regions_of(&info, l.descriptorTypeCount, l.pDescriptorTypes));
+            let samplers = matches!(
+                b.descriptorType,
+                D::VK_DESCRIPTOR_TYPE_SAMPLER | D::VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+            );
+            let fact = BindingFacts {
+                ty: b.descriptorType,
+                count: b.descriptorCount,
+                stages: b.stageFlags.0,
+                flags: flags.get(i).map_or(0, |f| f.0),
+                immutable: samplers && !b.pImmutableSamplers.is_null(),
+                mutable: mutable.to_vec(),
+            };
+            if bindings.insert(b.binding, fact).is_some() {
+                return Err("laid out one binding twice");
+            }
+        }
+        Ok(LayoutFacts { bindings })
+    }
+}
+
+/// What a descriptor set was allocated as: its layout, shared with every other set of it and
+/// with nothing that can outlive it -- a layout may be destroyed while its sets live -- and how
+/// many descriptors its variable binding, if it has one, was given.
+#[derive(Clone, Debug)]
+pub struct SetFacts {
+    layout: Arc<LayoutFacts>,
+    variable: u32,
+}
+
+impl SetFacts {
+    /// The bindings an update of `count` descriptors from element `elem` of `binding` covers, and
+    /// how many of each. Vulkan lets an update run past the end of a binding into the next ones,
+    /// as long as they are alike; a binding of no descriptors is skipped over. Counted in bytes
+    /// for an inline uniform block, as the update is.
+    fn span(
+        &self,
+        binding: u32,
+        elem: u32,
+        count: u32,
+    ) -> Result<Vec<(&BindingFacts, u32)>, &'static str> {
+        let bindings = &self.layout.bindings;
+        let first = bindings.get(&binding).ok_or("named a binding its set does not have")?;
+        let (mut b, mut e, mut left, mut out) = (binding, elem, count, Vec::new());
+        loop {
+            let here = bindings.get(&b).ok_or("ran on past the last binding of its set")?;
+            let size = if here.variable() { self.variable } else { here.count };
+            if size > 0 || b == binding {
+                if b != binding && !first.runs_into(here) {
+                    return Err("ran on into a binding of another kind");
+                }
+                if e > size {
+                    return Err("started past the end of its binding");
+                }
+                let take = (size - e).min(left);
+                if take > 0 {
+                    out.push((here, take));
+                }
+                left -= take;
+            }
+            if left == 0 {
+                return Ok(out);
+            }
+            b = b.checked_add(1).ok_or("ran on past the last binding of its set")?;
+            e = 0;
+        }
+    }
 }
 
 /// Where a pipeline is bound, and so which draws, dispatches or traces it serves.
@@ -347,10 +483,26 @@ impl Pools {
             return;
         };
         for (handle, id) in children {
-            p.children
-                .insert(TypedHandle::of(handle), Child { id, level, bound: Bound::default() });
+            p.children.insert(
+                TypedHandle::of(handle),
+                Child { id, level, bound: Bound::default(), set: None },
+            );
             self.owner.insert(TypedHandle::of(handle), pool);
         }
+    }
+
+    /// Record what an allocated descriptor set is, on its pool's record of it.
+    fn describe(&mut self, set: VkDescriptorSet, facts: SetFacts) {
+        let handle = TypedHandle::of(set);
+        let child =
+            self.owner.get(&handle).and_then(|p| self.open.get_mut(p)?.children.get_mut(&handle));
+        child.expect("a set its pool just adopted").set = Some(facts);
+    }
+
+    /// What a live descriptor set was allocated as.
+    fn set(&self, set: VkDescriptorSet) -> Option<&SetFacts> {
+        let handle = TypedHandle::of(set);
+        self.open.get(self.owner.get(&handle)?)?.children.get(&handle)?.set.as_ref()
     }
 
     /// Whether every one of `children` was allocated from `pool`, and is still held by it.
@@ -686,6 +838,9 @@ pub struct Driver {
     /// [`Driver::scanout_surface`] refuses on. A stale record cannot produce a wrong surface, only
     /// no surface.
     images: BTreeMap<VkImage, ImageFacts>,
+    /// What each descriptor set layout lays out, keyed by host handle as `images` is. A share:
+    /// each set of a layout holds one too, so a set outlives the layout's own record.
+    set_layouts: BTreeMap<VkDescriptorSetLayout, Arc<LayoutFacts>>,
     /// What each query pool answers with, for the read-back that has to fit the room the guest
     /// offered. Keyed by host handle for the same reason as `images`, and kept honest the same
     /// way: the record dies at both places the pool does, so a recycled handle finds no record
@@ -2477,6 +2632,7 @@ impl Driver {
             withheld: ledger::withheld(),
             memory: BTreeMap::new(),
             images: BTreeMap::new(),
+            set_layouts: BTreeMap::new(),
             query_pools: BTreeMap::new(),
             buffers: BTreeMap::new(),
             semaphores: BTreeMap::new(),
@@ -3811,7 +3967,12 @@ impl Driver {
 
     /// What a [`cs::Validate`] check reads. See [`Facts`].
     pub fn facts(&self) -> Facts<'_> {
-        Facts { semaphores: &self.semaphores, images: &self.images, buffers: &self.buffers }
+        Facts {
+            semaphores: &self.semaphores,
+            images: &self.images,
+            buffers: &self.buffers,
+            pools: &self.pools,
+        }
     }
 
     /// [`Driver::facts`] for the device `cb` records for, or `None` for a command buffer with no
@@ -4252,6 +4413,9 @@ impl Driver {
             }
             VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {
                 self.query_pools.remove(&VkQueryPool::from_host(handle));
+            }
+            VkObjectType::VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT => {
+                self.set_layouts.remove(&VkDescriptorSetLayout::from_host(handle));
             }
             VkObjectType::VK_OBJECT_TYPE_BUFFER => {
                 self.buffers.remove(&VkBuffer::from_host(handle));
@@ -5013,6 +5177,25 @@ impl Driver {
         self.pools.adopt(pool, level, children.iter().copied());
     }
 
+    /// Stand a descriptor pool up holding `sets`, each allocated of a layout made from `layout`
+    /// and given `variable` descriptors in its variable binding, as a run of
+    /// `vkCreateDescriptorSetLayout` and `vkAllocateDescriptorSets` would have left them.
+    #[cfg(test)]
+    pub(super) fn plant_sets(
+        &mut self,
+        device: VkDevice,
+        pool: VkDescriptorPool,
+        sets: &[(VkDescriptorSet, ObjectId)],
+        layout: &VkDescriptorSetLayoutCreateInfo,
+        variable: u32,
+    ) {
+        let layout = Arc::new(LayoutFacts::of(cs::Decoded::planted(layout)).expect("a layout"));
+        self.plant_pool_at(device, pool, Level::Unleveled, sets);
+        for &(set, _) in sets {
+            self.pools.describe(set, SetFacts { layout: Arc::clone(&layout), variable });
+        }
+    }
+
     /// Record a buffer of `size` bytes, as [`Driver::create_buffer`] would have.
     #[cfg(test)]
     pub(super) fn plant_buffer(&mut self, buffer: VkBuffer, size: u64) {
@@ -5139,6 +5322,65 @@ impl Driver {
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkImageView, VkResult> {
         self.create_object(device, |d| Some(d.vkCreateImageView()), info, alloc)
+    }
+
+    /// Create a descriptor set layout, and record what it lays out for the updates of its sets.
+    /// `Err(why)` for one no layout can hold, before the driver is asked.
+    pub fn create_descriptor_set_layout(
+        &mut self,
+        device: VkDevice,
+        info: cs::Decoded<'_, VkDescriptorSetLayoutCreateInfo>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+    ) -> Result<Result<VkDescriptorSetLayout, VkResult>, &'static str> {
+        let facts = LayoutFacts::of(info)?;
+        let host =
+            self.create_object(device, |d| Some(d.vkCreateDescriptorSetLayout()), info, alloc);
+        if let Ok(layout) = host {
+            self.set_layouts.insert(layout, Arc::new(facts));
+        }
+        Ok(host)
+    }
+
+    /// What each set an allocation asks for will be, or why it cannot be allocated: a layout this
+    /// renderer recorded, and a variable count its variable binding holds.
+    pub fn descriptor_sets_for(
+        &self,
+        info: cs::Decoded<'_, VkDescriptorSetAllocateInfo>,
+    ) -> Result<Vec<SetFacts>, &'static str> {
+        let layouts = regions_of(&info, info.descriptorSetCount, info.pSetLayouts);
+        let counts = match chained::<VkDescriptorSetVariableDescriptorCountAllocateInfo>(info) {
+            Some(v) if v.descriptorSetCount == 0 => &[][..],
+            Some(v) if v.descriptorSetCount as usize == layouts.len() => {
+                regions_of(&v, v.descriptorSetCount, v.pDescriptorCounts)
+            }
+            Some(_) => return Err("gave variable counts for a different number of sets"),
+            None => &[][..],
+        };
+        layouts
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let layout = self
+                    .set_layouts
+                    .get(l)
+                    .ok_or("allocated a set of a layout this renderer has no record of")?;
+                let variable = counts.get(i).copied().unwrap_or(0);
+                let room = layout.bindings.values().find(|b| b.variable()).map_or(0, |b| b.count);
+                if variable > room {
+                    return Err("asked for more variable descriptors than its binding holds");
+                }
+                Ok(SetFacts { layout: Arc::clone(layout), variable })
+            })
+            .collect()
+    }
+
+    /// Record what each of a just-allocated run of sets is, in the order
+    /// [`Self::descriptor_sets_for`] answered.
+    pub fn describe_sets(&mut self, sets: &[VkDescriptorSet], facts: Vec<SetFacts>) {
+        assert_eq!(sets.len(), facts.len(), "one record for each set the driver made");
+        for (&set, facts) in sets.iter().zip(facts) {
+            self.pools.describe(set, facts);
+        }
     }
 
     pub fn create_buffer_view(
@@ -8330,8 +8572,8 @@ impl Driver {
     pub fn update_descriptor_sets(
         &self,
         device: VkDevice,
-        writes: cs::Decoded<'_, [VkWriteDescriptorSet]>,
-        copies: cs::Decoded<'_, [VkCopyDescriptorSet]>,
+        writes: cs::Decoded<'_, [VkWriteDescriptorSet], cs::Checked>,
+        copies: cs::Decoded<'_, [VkCopyDescriptorSet], cs::Checked>,
     ) {
         let Some(d) = self.devices.get(&device) else {
             return;
@@ -11136,6 +11378,165 @@ impl cs::Validate<DeviceFacts<'_>> for VkBufferViewCreateInfo {
     }
 }
 
+impl Facts<'_> {
+    fn set(&self, set: VkDescriptorSet) -> Result<&SetFacts, &'static str> {
+        self.pools.set(set).ok_or("named a descriptor set this renderer has no record of")
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkWriteDescriptorSet {
+    /// A write into bindings its set has, of a type they hold, carrying the descriptors it says it
+    /// writes. A driver writes into the set's memory at the slots it names, and reads each
+    /// descriptor out of the array its type takes, which the wire may leave out whatever the
+    /// count says: KosmicKrisp follows it without looking.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        type D = VkDescriptorType;
+        let set = facts.facts.set(this.dstSet)?;
+        let (ty, n) = (this.descriptorType, this.descriptorCount);
+        let carried = match ty {
+            D::VK_DESCRIPTOR_TYPE_SAMPLER
+            | D::VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+            | D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+            | D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+            | D::VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT => !this.pImageInfo.is_null(),
+            D::VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
+            | D::VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER => !this.pTexelBufferView.is_null(),
+            D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+            | D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+            | D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+            | D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC => !this.pBufferInfo.is_null(),
+            D::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK => {
+                if !this.dstArrayElement.is_multiple_of(4) || !n.is_multiple_of(4) {
+                    return Err("wrote an inline block in pieces smaller than a word");
+                }
+                chained::<VkWriteDescriptorSetInlineUniformBlock>(this).is_some()
+            }
+            D::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR => {
+                chained::<VkWriteDescriptorSetAccelerationStructureKHR>(this).is_some()
+            }
+            _ => return Err("wrote a descriptor type this renderer does not serve"),
+        };
+        if n > 0 && !carried {
+            return Err("wrote descriptors without saying what they are");
+        }
+        for (binding, _) in set.span(this.dstBinding, this.dstArrayElement, n)? {
+            if !binding.holds(ty) {
+                return Err("wrote a descriptor its binding does not hold");
+            }
+        }
+        if this.pBufferInfo.is_null() || !carried {
+            return Ok(());
+        }
+        let buffer_typed = matches!(
+            ty,
+            D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                | D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                | D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                | D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+        );
+        if !buffer_typed {
+            return Ok(());
+        }
+        regions_of(&this, n, this.pBufferInfo).iter().try_for_each(|info| {
+            // A null buffer is a null descriptor, which the device either takes or refuses.
+            if info.buffer.host().raw() == 0 {
+                return Ok(());
+            }
+            let size = *facts
+                .facts
+                .buffers
+                .get(&info.buffer)
+                .ok_or("described a buffer this renderer has no record of")?;
+            let (offset, range) = (info.offset.0, info.range.0);
+            let inside =
+                offset < size && (range == u64::MAX || (range > 0 && range <= size - offset));
+            if !inside {
+                return Err("described a range of a buffer it does not hold");
+            }
+            Ok(())
+        })
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkWriteDescriptorSet, DeviceFacts<'_>>>
+    for VkWriteDescriptorSetInlineUniformBlock
+{
+    /// The bytes a driver copies are the link's own count, the room it was held to the write's:
+    /// the two must be one.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkWriteDescriptorSet, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let inline =
+            on.root.descriptorType == VkDescriptorType::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+        if inline && this.dataSize != on.root.descriptorCount {
+            return Err("wrote an inline block of another size than it said");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkWriteDescriptorSet, DeviceFacts<'_>>>
+    for VkWriteDescriptorSetAccelerationStructureKHR
+{
+    /// A driver reads one structure for each descriptor the write counts.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkWriteDescriptorSet, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let structures = on.root.descriptorType
+            == VkDescriptorType::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        if structures && this.accelerationStructureCount != on.root.descriptorCount {
+            return Err("wrote another number of structures than it said");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkCopyDescriptorSet {
+    /// A copy between bindings both sets have, of the same kind slot for slot. A driver copies
+    /// the slots it names, out of one set's memory and into the other's.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let (src, dst) = (facts.facts.set(this.srcSet)?, facts.facts.set(this.dstSet)?);
+        let n = this.descriptorCount;
+        let from = src.span(this.srcBinding, this.srcArrayElement, n)?;
+        let to = dst.span(this.dstBinding, this.dstArrayElement, n)?;
+        let (mut a, mut b) = (from.into_iter().peekable(), to.into_iter().peekable());
+        let (mut used_a, mut used_b) = (0u32, 0u32);
+        while let (Some(&(x, len_x)), Some(&(y, len_y))) = (a.peek(), b.peek()) {
+            if x.ty != y.ty || x.mutable != y.mutable {
+                return Err("copied descriptors into a binding of another kind");
+            }
+            let inline = x.ty == VkDescriptorType::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+            if inline
+                && ![this.srcArrayElement, this.dstArrayElement, n]
+                    .iter()
+                    .all(|v| v.is_multiple_of(4))
+            {
+                return Err("copied an inline block in pieces smaller than a word");
+            }
+            let step = (len_x - used_a).min(len_y - used_b);
+            used_a += step;
+            used_b += step;
+            if used_a == len_x {
+                a.next();
+                used_a = 0;
+            }
+            if used_b == len_y {
+                b.next();
+                used_b = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What a plane or subresource question needs of an image: its format, levels, layers and
 /// tiling, and whether its planes are bound apart. Read off the record of an image, or off the
 /// create info of one a device query describes without making.
@@ -11774,6 +12175,7 @@ pub struct Facts<'d> {
     semaphores: &'d BTreeMap<VkSemaphore, SemaphoreFacts>,
     images: &'d BTreeMap<VkImage, ImageFacts>,
     buffers: &'d BTreeMap<VkBuffer, u64>,
+    pools: &'d Pools,
 }
 
 /// [`Facts`], with the limits of the one device a command records or runs on. A check that holds
@@ -12232,6 +12634,41 @@ unsafe impl InStruct for VkImageDrmFormatModifierListCreateInfoEXT {
 unsafe impl InStruct for VkImageDrmFormatModifierExplicitCreateInfoEXT {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkDescriptorSetLayoutBindingFlagsCreateInfo {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkMutableDescriptorTypeCreateInfoEXT {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkDescriptorSetVariableDescriptorCountAllocateInfo {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkWriteDescriptorSetInlineUniformBlock {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkWriteDescriptorSetAccelerationStructureKHR {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -13457,6 +13894,217 @@ mod tests {
             "compressed"
         );
         assert!(view(VkBuffer::forged(0x601), rgba, 0, 64).is_err(), "no record");
+        d.abandon_planted();
+    }
+
+    /// An update is held to the set it names: bindings the set has, of a type they hold, run on
+    /// only into bindings alike, inside the variable count the set was given, with the
+    /// descriptors it says it writes and buffer ranges inside their buffers. A copy is held to
+    /// both sets, slot for slot.
+    #[test]
+    fn a_descriptor_update_is_held_to_its_set() {
+        use crate::venus::proto::types::{
+            VkCopyDescriptorSet, VkDescriptorBufferInfo, VkDescriptorImageInfo, VkDescriptorPool,
+            VkDescriptorSetLayoutBinding, VkShaderStageFlags, VkWriteDescriptorSet,
+        };
+        type D = VkDescriptorType;
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const A: VkDescriptorSet = VkDescriptorSet::forged(0x300);
+        const B: VkDescriptorSet = VkDescriptorSet::forged(0x301);
+        const BUFFER: VkBuffer = VkBuffer::forged(0x600);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        d.plant_buffer(BUFFER, 256);
+        let at = |binding, ty, count, stages| VkDescriptorSetLayoutBinding {
+            binding,
+            descriptorType: ty,
+            descriptorCount: count,
+            stageFlags: VkShaderStageFlags(stages),
+            ..Default::default()
+        };
+        let bindings = [
+            at(0, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2, 1),
+            at(1, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 1),
+            at(2, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, 16),
+            at(3, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4, 16),
+            at(4, D::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK, 16, 16),
+            at(5, D::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2, 16),
+            at(6, D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8, 16),
+        ];
+        let variable =
+            VkDescriptorBindingFlagBits::VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT.0
+                as u32;
+        let flags =
+            [0, 0, 0, 0, 0, 0, variable].map(crate::venus::proto::types::VkDescriptorBindingFlags);
+        let flagged = VkDescriptorSetLayoutBindingFlagsCreateInfo {
+            sType:
+                VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+            bindingCount: 7,
+            pBindingFlags: flags.as_ptr(),
+            ..Default::default()
+        };
+        let layout = VkDescriptorSetLayoutCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            pNext: (&flagged as *const VkDescriptorSetLayoutBindingFlagsCreateInfo).cast(),
+            bindingCount: 7,
+            pBindings: bindings.as_ptr(),
+            ..Default::default()
+        };
+        d.plant_sets(DEVICE, VkDescriptorPool::forged(0x30), &[(A, ObjectId(1))], &layout, 3);
+        d.plant_sets(DEVICE, VkDescriptorPool::forged(0x31), &[(B, ObjectId(2))], &layout, 8);
+        d.set_layouts.insert(
+            VkDescriptorSetLayout::forged(0x500),
+            Arc::new(LayoutFacts::of(cs::Decoded::planted(&layout)).expect("a layout")),
+        );
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+
+        let buffers = [VkDescriptorBufferInfo {
+            buffer: BUFFER,
+            range: VkDeviceSize(64),
+            ..Default::default()
+        }; 8];
+        let images = [VkDescriptorImageInfo::default(); 8];
+        let write = |set, binding, elem, count, ty| VkWriteDescriptorSet {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet: set,
+            dstBinding: binding,
+            dstArrayElement: elem,
+            descriptorCount: count,
+            descriptorType: ty,
+            pBufferInfo: buffers.as_ptr(),
+            pImageInfo: images.as_ptr(),
+            ..Default::default()
+        };
+        let wrote = |w: VkWriteDescriptorSet| cs::Decoded::planted(&w).validate(&facts).map(|_| ());
+        let ub = D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        assert_eq!(wrote(write(A, 0, 0, 2, ub)), Ok(()), "the whole binding");
+        assert_eq!(wrote(write(A, 0, 1, 2, ub)), Ok(()), "on into the next, alike");
+        assert_eq!(wrote(write(A, 0, 2, 1, ub)), Ok(()), "from its end, all into the next");
+        assert!(wrote(write(A, 0, 0, 4, ub)).is_err(), "past a binding of none into another kind");
+        assert!(wrote(write(A, 0, 3, 1, ub)).is_err(), "from past its end");
+        assert!(wrote(write(A, 7, 0, 1, ub)).is_err(), "a binding the set lacks");
+        assert!(wrote(write(A, 3, 0, 1, ub)).is_err(), "a type its binding does not hold");
+        assert!(wrote(write(VkDescriptorSet::forged(0x3ff), 0, 0, 1, ub)).is_err(), "no record");
+        let sb = D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        assert_eq!(wrote(write(A, 6, 0, 3, sb)), Ok(()), "its variable count");
+        assert!(wrote(write(A, 6, 0, 4, sb)).is_err(), "past its variable count");
+        assert_eq!(wrote(write(B, 6, 0, 8, sb)), Ok(()), "another set's variable count");
+        assert_eq!(wrote(write(A, 3, 0, 4, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)), Ok(()));
+
+        let mut bare = write(A, 3, 0, 1, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
+        bare.pImageInfo = core::ptr::null();
+        assert!(wrote(bare).is_err(), "images it does not carry");
+        let mut bare = write(A, 0, 0, 1, ub);
+        bare.pBufferInfo = core::ptr::null();
+        assert!(wrote(bare).is_err(), "buffers it does not carry");
+        let texel = write(A, 0, 0, 1, D::VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER);
+        assert!(wrote(texel).is_err(), "texel views it does not carry");
+
+        let range = |offset, range| {
+            let info = [VkDescriptorBufferInfo {
+                buffer: BUFFER,
+                offset: VkDeviceSize(offset),
+                range: VkDeviceSize(range),
+            }];
+            let mut w = write(A, 1, 0, 1, ub);
+            w.pBufferInfo = info.as_ptr();
+            wrote(w)
+        };
+        assert_eq!(range(192, 64), Ok(()), "to the end");
+        assert_eq!(range(128, u64::MAX), Ok(()), "the rest");
+        assert!(range(192, 128).is_err(), "past the end");
+        assert!(range(256, u64::MAX).is_err(), "from past the end");
+        assert!(range(0, 0).is_err(), "nothing");
+
+        let block = |elem, count, size: u32| {
+            let data = [0u8; 16];
+            let inline = VkWriteDescriptorSetInlineUniformBlock {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK,
+                dataSize: size,
+                pData: data.as_ptr().cast(),
+                ..Default::default()
+            };
+            let mut w = write(A, 4, elem, count, D::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK);
+            w.pNext = (&inline as *const VkWriteDescriptorSetInlineUniformBlock).cast();
+            wrote(w)
+        };
+        assert_eq!(block(4, 8, 8), Ok(()), "words inside the block");
+        assert!(block(2, 4, 4).is_err(), "half a word in");
+        assert!(block(4, 8, 4).is_err(), "another size than it said");
+        assert!(block(8, 12, 12).is_err(), "past the block");
+        assert!(
+            wrote(write(A, 4, 0, 4, D::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)).is_err(),
+            "no data"
+        );
+
+        let structures = |count: u32| {
+            let handles = [crate::venus::proto::types::VkAccelerationStructureKHR::NULL; 2];
+            let link = VkWriteDescriptorSetAccelerationStructureKHR {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+                accelerationStructureCount: count,
+                pAccelerationStructures: handles.as_ptr(),
+                ..Default::default()
+            };
+            let mut w = write(A, 5, 0, 2, D::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+            w.pNext = (&link as *const VkWriteDescriptorSetAccelerationStructureKHR).cast();
+            wrote(w)
+        };
+        assert_eq!(structures(2), Ok(()), "a structure for each descriptor");
+        assert!(structures(1).is_err(), "fewer structures than descriptors");
+
+        let twice = [at(0, ub, 1, 1), at(0, ub, 1, 1)];
+        let doubled = VkDescriptorSetLayoutCreateInfo {
+            bindingCount: 2,
+            pBindings: twice.as_ptr(),
+            ..Default::default()
+        };
+        assert!(
+            LayoutFacts::of(cs::Decoded::planted(&doubled)).is_err(),
+            "one binding laid out twice"
+        );
+
+        let copy = |(src, sb, se), (dst, db, de), count| {
+            let c = VkCopyDescriptorSet {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET,
+                srcSet: src,
+                srcBinding: sb,
+                srcArrayElement: se,
+                dstSet: dst,
+                dstBinding: db,
+                dstArrayElement: de,
+                descriptorCount: count,
+                ..Default::default()
+            };
+            cs::Decoded::planted(&c).validate(&facts).map(|_| ())
+        };
+        assert_eq!(copy((A, 0, 0), (B, 0, 1), 2), Ok(()), "into the next binding, alike");
+        assert!(copy((A, 0, 0), (B, 3, 0), 1).is_err(), "into another kind");
+        assert!(copy((A, 6, 0), (B, 6, 0), 4).is_err(), "past the source's variable count");
+        assert!(copy((A, 0, 0), (VkDescriptorSet::forged(0x3ff), 0, 0), 1).is_err(), "no record");
+
+        let alloc = |counts: &[u32], sets: usize| {
+            let layouts = [VkDescriptorSetLayout::forged(0x500); 2];
+            let v = VkDescriptorSetVariableDescriptorCountAllocateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO,
+                descriptorSetCount: counts.len() as u32,
+                pDescriptorCounts: counts.as_ptr(),
+                ..Default::default()
+            };
+            let info = VkDescriptorSetAllocateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                pNext: (&v as *const VkDescriptorSetVariableDescriptorCountAllocateInfo).cast(),
+                descriptorSetCount: sets as u32,
+                pSetLayouts: layouts.as_ptr(),
+                ..Default::default()
+            };
+            d.descriptor_sets_for(cs::Decoded::planted(&info))
+                .map(|f| f.iter().map(|s| s.variable).collect::<Vec<_>>())
+        };
+        assert_eq!(alloc(&[8, 2], 2), Ok(vec![8, 2]));
+        assert_eq!(alloc(&[], 2), Ok(vec![0, 0]), "no counts, none");
+        assert!(alloc(&[9, 2], 2).is_err(), "more than its binding holds");
+        assert!(alloc(&[1], 2).is_err(), "counts for another number of sets");
+
         d.abandon_planted();
     }
 
