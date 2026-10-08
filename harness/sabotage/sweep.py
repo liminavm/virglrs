@@ -3884,6 +3884,27 @@ SABOTAGES = [
         'vertex_input_past_the_device_does_not_validate',
     ),
     (
+        'a pipeline layout set count is not held to the device',
+        'src/venus/driver.rs',
+        """        if this.setLayoutCount > limits.maxBoundDescriptorSets {""",
+        """        if this.setLayoutCount > u32::MAX {""",
+        'a_pipeline_layout_past_the_device_does_not_validate',
+    ),
+    (
+        'push constant ranges may share or invent stages',
+        'src/venus/driver.rs',
+        """            if named == 0 || named & !PUSH_RANGE_STAGES != 0 || named & stages != 0 {""",
+        """            if named == 0 {""",
+        'a_pipeline_layout_past_the_device_does_not_validate',
+    ),
+    (
+        'a push constant range is not held to the push block',
+        'src/venus/driver.rs',
+        """            if u64::from(r.offset) + u64::from(r.size) > u64::from(limits.maxPushConstantsSize) {""",
+        """            if u64::from(r.offset) + u64::from(r.size) > u64::MAX {""",
+        'a_pipeline_layout_past_the_device_does_not_validate',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

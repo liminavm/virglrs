@@ -25,12 +25,13 @@ use super::objects::Doomed;
 use super::proto::types::{
     VkAccelerationStructureBuildGeometryInfoKHR, VkAccelerationStructureBuildRangeInfoKHR,
     VkAccelerationStructureBuildSizesInfoKHR, VkAccelerationStructureBuildTypeKHR,
-    VkAccelerationStructureKHR, VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure,
-    VkBindDescriptorSetsInfo, VkBlitImageInfo2, VkBool32, VkBuffer, VkBufferCopy,
-    VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView, VkCalibratedTimestampInfoKHR,
-    VkClearAttachment, VkClearColorValue, VkClearDepthStencilValue, VkClearRect,
-    VkColorBlendAdvancedEXT, VkColorBlendEquationEXT, VkColorComponentFlags, VkCommandBuffer,
-    VkCommandBufferBeginInfo, VkCommandBufferResetFlags, VkCommandPool, VkCommandPoolTrimFlags,
+    VkAccelerationStructureCreateInfoKHR, VkAccelerationStructureKHR, VkAllocationCallbacks,
+    VkBaseInStructure, VkBaseOutStructure, VkBindDescriptorSetsInfo, VkBlitImageInfo2, VkBool32,
+    VkBuffer, VkBufferCopy, VkBufferCreateInfo, VkBufferImageCopy, VkBufferMemoryBarrier,
+    VkBufferView, VkBufferViewCreateInfo, VkCalibratedTimestampInfoKHR, VkClearAttachment,
+    VkClearColorValue, VkClearDepthStencilValue, VkClearRect, VkColorBlendAdvancedEXT,
+    VkColorBlendEquationEXT, VkColorComponentFlags, VkCommandBuffer, VkCommandBufferBeginInfo,
+    VkCommandBufferResetFlags, VkCommandPool, VkCommandPoolCreateInfo, VkCommandPoolTrimFlags,
     VkCompareOp, VkConditionalRenderingBeginInfoEXT, VkConservativeRasterizationModeEXT,
     VkCopyAccelerationStructureInfoKHR, VkCopyAccelerationStructureToMemoryInfoKHR,
     VkCopyBufferInfo2, VkCopyBufferToImageInfo2, VkCopyDescriptorSet, VkCopyImageInfo2,
@@ -38,40 +39,44 @@ use super::proto::types::{
     VkCopyImageToMemoryInfoMESA, VkCopyMemoryToAccelerationStructureInfoKHR,
     VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags,
     VkDependencyInfo, VkDepthBiasInfoEXT, VkDepthClampModeEXT, VkDepthClampRangeEXT,
-    VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
-    VkDeviceAddress, VkDeviceCreateInfo, VkDeviceGroupSubmitInfo, VkDeviceMemory,
-    VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent,
-    VkExportMemoryAllocateInfo, VkExtensionProperties, VkExtent2D, VkExtent3D,
-    VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
+    VkDescriptorPool, VkDescriptorPoolCreateInfo, VkDescriptorSet, VkDescriptorSetLayout,
+    VkDescriptorSetLayoutCreateInfo, VkDescriptorUpdateTemplate,
+    VkDescriptorUpdateTemplateCreateInfo, VkDevice, VkDeviceAddress, VkDeviceCreateInfo,
+    VkDeviceGroupSubmitInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA,
+    VkDeviceSize, VkEvent, VkEventCreateInfo, VkExportMemoryAllocateInfo, VkExtensionProperties,
+    VkExtent2D, VkExtent3D, VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
     VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
     VkExternalMemoryImageCreateInfo, VkExternalMemoryProperties,
     VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFenceCreateFlags, VkFenceCreateInfo,
     VkFenceGetFdInfoKHR, VkFilter, VkFormat, VkFragmentShadingRateCombinerOpKHR, VkFramebuffer,
-    VkFrontFace, VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlags, VkImageBlit,
-    VkImageCopy, VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties,
-    VkImageFormatProperties2, VkImageLayout, VkImageMemoryBarrier, VkImageResolve,
-    VkImageSubresourceLayers, VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy,
-    VkImageType, VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
-    VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance,
-    VkInstanceCreateInfo, VkLineRasterizationMode, VkLogicOp, VkMemoryAllocateInfo,
-    VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags, VkMemoryPropertyFlagBits,
-    VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy,
-    VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType,
-    VkOffset3D, VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo,
+    VkFramebufferCreateInfo, VkFrontFace, VkHostImageLayoutTransitionInfo, VkImage,
+    VkImageAspectFlags, VkImageBlit, VkImageCopy, VkImageCreateFlags, VkImageCreateInfo,
+    VkImageFormatProperties, VkImageFormatProperties2, VkImageLayout, VkImageMemoryBarrier,
+    VkImageResolve, VkImageSubresourceLayers, VkImageSubresourceRange, VkImageTiling,
+    VkImageToMemoryCopy, VkImageType, VkImageUsageFlags, VkImageView, VkImageViewCreateInfo,
+    VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR,
+    VkIndexType, VkInstance, VkInstanceCreateInfo, VkLineRasterizationMode, VkLogicOp,
+    VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags,
+    VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA,
+    VkMemoryToImageCopy, VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT,
+    VkObjectType, VkOffset3D, VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo,
     VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceLimits,
     VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties,
-    VkPhysicalDeviceProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout,
+    VkPhysicalDeviceProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
+    VkPipelineCacheCreateInfo, VkPipelineLayout, VkPipelineLayoutCreateInfo,
     VkPipelineStageFlagBits, VkPipelineStageFlags, VkPipelineStageFlags2, VkPolygonMode,
-    VkPrimitiveTopology, VkProvokingVertexModeEXT, VkPushConstantsInfo, VkPushDescriptorSetInfo,
-    VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits,
-    VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo,
+    VkPrimitiveTopology, VkProvokingVertexModeEXT, VkPushConstantRange, VkPushConstantsInfo,
+    VkPushDescriptorSetInfo, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
+    VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
+    VkRenderPassBeginInfo, VkRenderPassCreateInfo, VkRenderPassCreateInfo2,
     VkRenderingAttachmentLocationInfo, VkRenderingEndInfoKHR, VkRenderingInfo,
     VkRenderingInputAttachmentIndexInfo, VkResolveImageInfo2, VkResult, VkRingMonitorInfoMESA,
-    VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampleMask, VkSampler,
-    VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR,
-    VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType,
-    VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule,
+    VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampleMask, VkSampler, VkSamplerCreateInfo,
+    VkSamplerYcbcrConversion, VkSamplerYcbcrConversionCreateInfo, VkSemaphore,
+    VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
+    VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
+    VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule, VkShaderModuleCreateInfo,
     VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo,
     VkSubmitInfo2, VkSubpassBeginInfo, VkSubpassContents, VkSubpassEndInfo,
     VkTessellationDomainOrigin, VkTimelineSemaphoreSubmitInfo,
@@ -554,6 +559,7 @@ fn planted_limits() -> VkPhysicalDeviceLimits {
         maxVertexInputAttributes: 32,
         maxVertexInputBindingStride: 2048,
         maxVertexInputAttributeOffset: 2047,
+        maxBoundDescriptorSets: 32,
         ..Default::default()
     }
 }
@@ -4109,7 +4115,7 @@ impl Driver {
     /// object table resolved is not evidence the driver still has the device: a guest that
     /// destroys a device and then creates against it gets a rejection, not a call on a dead
     /// handle.
-    pub fn create_object<T: Handle, I>(
+    pub fn create_object<T: Handle, I: Forward<S>, S>(
         &self,
         device: VkDevice,
         proc: impl FnOnce(
@@ -4122,7 +4128,7 @@ impl Driver {
                 *mut T,
             ) -> VkResult,
         >,
-        info: cs::Decoded<'_, I>,
+        info: cs::Decoded<'_, I, S>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<T, VkResult> {
         let Some(d) = self.devices.get(&device) else {
@@ -4845,8 +4851,19 @@ impl Driver {
         self.queues.insert(queue, Arc::new(HostQueue::new(queue, device, 0, fns)));
     }
 
+    /// `vkCreatePipelineLayout`, whose info must be held to the device first: see the `Validate`
+    /// impl for `VkPipelineLayoutCreateInfo`.
+    pub fn create_pipeline_layout(
+        &self,
+        device: VkDevice,
+        info: cs::Decoded<'_, VkPipelineLayoutCreateInfo, cs::Checked>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+    ) -> Result<VkPipelineLayout, VkResult> {
+        self.create_object(device, |d| Some(d.vkCreatePipelineLayout()), info, alloc)
+    }
+
     /// Create a pool, and start tracking what will be allocated from it.
-    pub fn create_pool<T: PoolOf, I>(
+    pub fn create_pool<T: PoolOf, I: Forward<S>, S>(
         &mut self,
         device: VkDevice,
         proc: impl FnOnce(
@@ -4859,7 +4876,7 @@ impl Driver {
                 *mut T,
             ) -> VkResult,
         >,
-        info: cs::Decoded<'_, I>,
+        info: cs::Decoded<'_, I, S>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<T, VkResult> {
         let handle = self.create_object(device, proc, info, alloc)?;
@@ -10288,6 +10305,93 @@ impl cs::Validate<DeviceFacts<'_>> for VkVertexInputAttributeDescription2EXT {
     }
 }
 
+/// Whether a create info may reach the driver in state `S`: [`Driver::create_object`] takes one
+/// only where this holds.
+///
+/// Every info may go [`cs::Checked`]. Going [`cs::Unchecked`] is a decision made per type, here,
+/// and a type off this list does not compile into an unchecked create: a create info that needs a
+/// check is taken off the list when its [`cs::Validate`] lands, and from then on the handler that
+/// skips the check is a build error. `src/venus/validation.txt` says which of these are still
+/// owed one.
+pub trait Forward<S> {}
+
+impl<I: ?Sized> Forward<cs::Checked> for I {}
+
+macro_rules! forwarded_unchecked {
+    ($($info:ty),* $(,)?) => {
+        $(impl Forward<cs::Unchecked> for $info {})*
+    };
+}
+
+forwarded_unchecked!(
+    VkAccelerationStructureCreateInfoKHR,
+    VkBufferCreateInfo,
+    VkBufferViewCreateInfo,
+    VkCommandPoolCreateInfo,
+    VkDescriptorPoolCreateInfo,
+    VkDescriptorSetLayoutCreateInfo,
+    VkDescriptorUpdateTemplateCreateInfo,
+    VkEventCreateInfo,
+    VkFenceCreateInfo,
+    VkFramebufferCreateInfo,
+    VkImageCreateInfo,
+    VkImageViewCreateInfo,
+    VkPipelineCacheCreateInfo,
+    VkQueryPoolCreateInfo,
+    VkRenderPassCreateInfo,
+    VkRenderPassCreateInfo2,
+    VkSamplerCreateInfo,
+    VkSamplerYcbcrConversionCreateInfo,
+    VkSemaphoreCreateInfo,
+    VkShaderModuleCreateInfo,
+);
+
+/// The shader stages a push constant range may name: every stage bit core Vulkan and the
+/// mesh and ray-tracing extensions define, `VERTEX` through `CALLABLE`. The vendor stages above
+/// them belong to extensions this host does not expose.
+const PUSH_RANGE_STAGES: u32 = 0x3fff;
+
+/// A pipeline layout the device can hold. The Mesa runtime copies the set layouts into an array
+/// of `maxBoundDescriptorSets` and the push constant ranges into one of fourteen, the number of
+/// stages a range may name, checking both counts only with asserts a release build compiles out.
+/// Ranges whose stages are non-empty, inside [`PUSH_RANGE_STAGES`] and disjoint from every other
+/// range's, as Vulkan requires, cannot outnumber those stages; and a range is held inside the
+/// device's push block, which the driver sizes the pipeline's constants by.
+impl cs::Validate<DeviceFacts<'_>> for VkPipelineLayoutCreateInfo {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let limits = facts.limits;
+        if this.setLayoutCount > limits.maxBoundDescriptorSets {
+            return Err("laid out more descriptor sets than the device binds");
+        }
+        // SAFETY: `this` is `Decoded`, so the decoder allocated this array from the batch arena
+        // sized to the count beside it (see `Decoded::vouch`), and the arena outlives this call.
+        let ranges = unsafe {
+            crate::venus::cs::wire_array::<VkPushConstantRange>(
+                this.pushConstantRangeCount as usize,
+                this.pPushConstantRanges,
+            )
+        };
+        let mut stages = 0u32;
+        for r in ranges.unwrap_or_default() {
+            let named = r.stageFlags.0;
+            if named == 0 || named & !PUSH_RANGE_STAGES != 0 || named & stages != 0 {
+                return Err("pushed constants to stages no other range has and Vulkan defines");
+            }
+            stages |= named;
+            if r.offset % 4 != 0 || r.size % 4 != 0 || r.size == 0 {
+                return Err("laid out a push constant range not in whole words");
+            }
+            if u64::from(r.offset) + u64::from(r.size) > u64::from(limits.maxPushConstantsSize) {
+                return Err("laid out a push constant range past the device's push block");
+            }
+        }
+        Ok(())
+    }
+}
+
 impl cs::Validate<Facts<'_>> for VkSubmitInfo {
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
@@ -11015,6 +11119,55 @@ mod tests {
             arrayLayers: 2,
             ..Default::default()
         }
+    }
+
+    /// A pipeline layout the device cannot hold does not validate. The Mesa runtime copies its set
+    /// layouts into an array of `maxBoundDescriptorSets` and its push constant ranges into one of
+    /// fourteen, checking neither count in a release build.
+    #[test]
+    fn a_pipeline_layout_past_the_device_does_not_validate() {
+        const DEVICE: VkDevice = VkDevice::forged(0x57);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        let limits = VkPhysicalDeviceLimits {
+            maxBoundDescriptorSets: 32,
+            maxPushConstantsSize: 256,
+            ..Default::default()
+        };
+        d.plant_limits(DEVICE, limits);
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+
+        let layouts = [VkDescriptorSetLayout::NULL; 33];
+        let holds = |sets: usize, ranges: &[VkPushConstantRange]| {
+            let info = VkPipelineLayoutCreateInfo {
+                setLayoutCount: sets as u32,
+                pSetLayouts: layouts.as_ptr(),
+                pushConstantRangeCount: ranges.len() as u32,
+                pPushConstantRanges: ranges.as_ptr(),
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(&facts).is_ok()
+        };
+        let range = |stages: u32, offset: u32, size: u32| VkPushConstantRange {
+            stageFlags: VkShaderStageFlags(stages),
+            offset,
+            size,
+        };
+
+        assert!(holds(32, &[]), "every set the device binds");
+        assert!(!holds(33, &[]), "one set past them");
+        let fourteen: Vec<_> = (0..14).map(|b| range(1 << b, 0, 4)).collect();
+        assert!(holds(0, &fourteen), "a range for each stage");
+        assert!(holds(0, &[range(0x11, 0, 128), range(0x20, 128, 128)]), "the whole block");
+        assert!(!holds(0, &[range(0x1, 0, 4), range(0x11, 4, 4)]), "a stage in two ranges");
+        assert!(!holds(0, &[range(0, 0, 4)]), "a range for no stage");
+        assert!(!holds(0, &[range(0x4000, 0, 4)]), "a stage this host does not expose");
+        assert!(!holds(0, &[range(0x1, 252, 8)]), "past the push block");
+        assert!(!holds(0, &[range(0x1, u32::MAX - 3, 8)]), "an offset that would wrap");
+        assert!(!holds(0, &[range(0x1, 2, 4)]), "an offset off a word");
+        assert!(!holds(0, &[range(0x1, 0, 0)]), "an empty range");
+
+        d.abandon_planted();
     }
 
     /// A vertex binding or attribute past the device's limits does not validate. The Mesa runtime

@@ -3179,13 +3179,26 @@ impl Commands for Handlers<'_> {
     );
     pool_destroy!(vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorPool, descriptorPool);
 
-    simple_create!(
-        vkCreatePipelineLayout,
-        vn_command_vkCreatePipelineLayout,
-        pCreateInfo,
-        pPipelineLayout,
-        handle_pPipelineLayout_mut
-    );
+    fn vkCreatePipelineLayout(&mut self, args: &mut vn_command_vkCreatePipelineLayout<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        // A device this context does not have answers as `create_object` answers it; one it has
+        // holds the layout to its limits first.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => {
+                self.driver.create_pipeline_layout(args.device, info, args.pAllocator)
+            }
+        };
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant(
+            "vkCreatePipelineLayout",
+            args.pPipelineLayout(),
+            args.handle_pPipelineLayout_mut(),
+            host,
+        );
+    }
     simple_destroy!(vkDestroyPipelineLayout, vn_command_vkDestroyPipelineLayout, pipelineLayout);
 
     simple_create!(

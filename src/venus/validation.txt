@@ -191,7 +191,7 @@ vkCreateImage                                    pending:images
 vkCreateImageView                                pending:images
 vkCreateInstance                                 reviewed
 vkCreatePipelineCache                            reviewed
-vkCreatePipelineLayout                           pending:limits
+vkCreatePipelineLayout                           validated
 vkCreateQueryPool                                pending:queries
 vkCreateRayTracingPipelinesKHR                   pending:pipelines
 vkCreateRenderPass                               pending:render-passes
