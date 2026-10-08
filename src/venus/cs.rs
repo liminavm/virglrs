@@ -1823,7 +1823,7 @@ mod tests {
         assert!(!dec.fatal());
 
         let decoded = got.pCreateInfo.expect("the guest sent a create info");
-        let link = chained::<VkSemaphoreTypeCreateInfo>(decoded).expect("the type link decoded");
+        let link = chained::<VkSemaphoreTypeCreateInfo, _>(decoded).expect("the type link decoded");
         assert_eq!(link.initialValue, 17);
         assert_eq!(link.semaphoreType, VkSemaphoreType::VK_SEMAPHORE_TYPE_TIMELINE);
     }

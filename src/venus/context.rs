@@ -1228,7 +1228,7 @@ impl Drop for Context {
 /// malformed request into a silently unmonitored ring, and the guest would abort itself seconds
 /// later with nothing said about why.
 fn monitor_period(info: Decoded<'_, VkRingCreateInfoMESA>) -> Option<Option<u32>> {
-    let m = driver::chained::<VkRingMonitorInfoMESA>(info)?;
+    let m = driver::chained::<VkRingMonitorInfoMESA, _>(info)?;
     Some(Some(m.maxReportingPeriodMicroseconds).filter(|&us| us != 0))
 }
 
@@ -2590,7 +2590,7 @@ derives!(
 fn bases_in_run<I: Derives>(infos: Decoded<'_, [I]>) -> bool {
     const DERIVATIVE: u64 = VkPipelineCreateFlagBits::VK_PIPELINE_CREATE_DERIVATIVE_BIT.0 as u64;
     infos.iter().enumerate().all(|(i, info)| {
-        let flags = match driver::chained::<VkPipelineCreateFlags2CreateInfo>(info) {
+        let flags = match driver::chained::<VkPipelineCreateFlags2CreateInfo, _>(info) {
             Some(two) => two.flags.0,
             None => info.flags(),
         };
@@ -3194,11 +3194,20 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkCreateDescriptorSetLayout<'_>,
     ) {
         let Some(info) = self.names(args.pCreateInfo) else { return };
-        let host =
-            match self.driver.create_descriptor_set_layout(args.device, info, args.pAllocator) {
-                Ok(host) => host,
-                Err(why) => return self.reject(why),
-            };
+        // As `vkCreatePipelineLayout`: a device this context does not have answers as
+        // `create_object` would.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let made = match checked {
+            None => Ok(Err(VkResult::VK_ERROR_INITIALIZATION_FAILED)),
+            Some(Err(why)) => Err(why),
+            Some(Ok(info)) => {
+                self.driver.create_descriptor_set_layout(args.device, info, args.pAllocator)
+            }
+        };
+        let host = match made {
+            Ok(host) => host,
+            Err(why) => return self.reject(why),
+        };
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant(
             "vkCreateDescriptorSetLayout",
@@ -3213,13 +3222,29 @@ impl Commands for Handlers<'_> {
         descriptorSetLayout
     );
 
-    pool_create!(
-        vkCreateDescriptorPool,
-        vn_command_vkCreateDescriptorPool,
-        pCreateInfo,
-        pDescriptorPool,
-        handle_pDescriptorPool_mut
-    );
+    /// Not [`pool_create`]: the pool is held to the types it may hold first.
+    fn vkCreateDescriptorPool(&mut self, args: &mut vn_command_vkCreateDescriptorPool<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        // As `vkCreatePipelineLayout`.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => self.driver.create_pool(
+                args.device,
+                |d| Some(d.vkCreateDescriptorPool()),
+                info,
+                args.pAllocator,
+            ),
+        };
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant(
+            "vkCreateDescriptorPool",
+            args.pDescriptorPool(),
+            args.handle_pDescriptorPool_mut(),
+            host,
+        );
+    }
     pool_destroy!(vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorPool, descriptorPool);
 
     fn vkCreatePipelineLayout(&mut self, args: &mut vn_command_vkCreatePipelineLayout<'_>) {
@@ -4394,6 +4419,9 @@ impl Commands for Handlers<'_> {
     ) {
         let device = args.device;
         let Some(info) = self.names(args.pCreateInfo) else { return };
+        if self.refused_on(device, info) {
+            return;
+        }
         let Some(out) = self.fills(args.pSupport_mut()) else { return };
         let r = self
             .driver

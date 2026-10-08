@@ -115,6 +115,9 @@ use super::proto::types::{
     VkWriteDescriptorSetInlineUniformBlock,
 };
 use super::proto::types::{
+    VkDescriptorPoolInlineUniformBlockCreateInfo, VkDescriptorSetLayoutSupport,
+};
+use super::proto::types::{
     VkDrmFormatModifierPropertiesEXT, VkDrmFormatModifierPropertiesListEXT, VkFormatProperties2,
     VkImageDrmFormatModifierListCreateInfoEXT, VkImageFormatListCreateInfo,
     VkImageStencilUsageCreateInfo,
@@ -285,11 +288,13 @@ pub struct LayoutFacts {
 
 impl LayoutFacts {
     /// What a layout made from `info` holds, or why no layout can hold it.
-    fn of(info: cs::Decoded<'_, VkDescriptorSetLayoutCreateInfo>) -> Result<Self, &'static str> {
+    fn of<S>(
+        info: cs::Decoded<'_, VkDescriptorSetLayoutCreateInfo, S>,
+    ) -> Result<Self, &'static str> {
         type D = VkDescriptorType;
-        let flags = chained::<VkDescriptorSetLayoutBindingFlagsCreateInfo>(info)
+        let flags = chained::<VkDescriptorSetLayoutBindingFlagsCreateInfo, _>(info)
             .map_or(&[][..], |f| regions_of(&f, f.bindingCount, f.pBindingFlags));
-        let lists = chained::<VkMutableDescriptorTypeCreateInfoEXT>(info).map_or(&[][..], |m| {
+        let lists = chained::<VkMutableDescriptorTypeCreateInfoEXT, _>(info).map_or(&[][..], |m| {
             regions_of(&m, m.mutableDescriptorTypeListCount, m.pMutableDescriptorTypeLists)
         });
         let mut bindings = BTreeMap::new();
@@ -5447,10 +5452,27 @@ impl Driver {
     pub fn create_descriptor_set_layout(
         &mut self,
         device: VkDevice,
-        info: cs::Decoded<'_, VkDescriptorSetLayoutCreateInfo>,
+        info: cs::Decoded<'_, VkDescriptorSetLayoutCreateInfo, cs::Checked>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<Result<VkDescriptorSetLayout, VkResult>, &'static str> {
-        let facts = LayoutFacts::of(info)?;
+        let facts = LayoutFacts::of(info).expect("its check laid out every binding once");
+        // How big a set of it is, and whether that fits, is the driver's to say -- anv sizes a
+        // set from its counts without asking whether the sum fits -- and a layout it says it
+        // cannot make is not one to make.
+        let support =
+            self.devices.get(&device).and_then(|d| d.fns.try_vkGetDescriptorSetLayoutSupport());
+        if let Some(f) = support {
+            let mut answer = VkDescriptorSetLayoutSupport {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT,
+                ..Default::default()
+            };
+            // SAFETY: `device` is a handle in this table, `info` is the decoder's and checked, and
+            // the answer is a local.
+            unsafe { f(device, info.get(), &mut answer) };
+            if answer.supported.0 == 0 {
+                return Err("laid out a set the device says it cannot");
+            }
+        }
         let host =
             self.create_object(device, |d| Some(d.vkCreateDescriptorSetLayout()), info, alloc);
         if let Ok(layout) = host {
@@ -5466,7 +5488,7 @@ impl Driver {
         info: cs::Decoded<'_, VkDescriptorSetAllocateInfo>,
     ) -> Result<Vec<SetFacts>, &'static str> {
         let layouts = regions_of(&info, info.descriptorSetCount, info.pSetLayouts);
-        let counts = match chained::<VkDescriptorSetVariableDescriptorCountAllocateInfo>(info) {
+        let counts = match chained::<VkDescriptorSetVariableDescriptorCountAllocateInfo, _>(info) {
             Some(v) if v.descriptorSetCount == 0 => &[][..],
             Some(v) if v.descriptorSetCount as usize == layouts.len() => {
                 regions_of(&v, v.descriptorSetCount, v.pDescriptorCounts)
@@ -5482,6 +5504,9 @@ impl Driver {
                     .set_layouts
                     .get(l)
                     .ok_or("allocated a set of a layout this renderer has no record of")?;
+                if layout.push {
+                    return Err("allocated a set of a layout for pushing");
+                }
                 let variable = counts.get(i).copied().unwrap_or(0);
                 let room = layout.bindings.values().find(|b| b.variable()).map_or(0, |b| b.count);
                 if variable > room {
@@ -10839,8 +10864,8 @@ pub unsafe trait InStruct {
 /// wants what the guest hung off a `pNext` gets it without unsafe. It takes the struct decoded, so
 /// the chain it walks is the decoder's and not a pointer the caller chose, and hands the link back
 /// decoded, so it can be passed on in turn.
-pub fn chained<'a, T: InStruct>(
-    head: cs::Decoded<'a, impl cs::Links>,
+pub fn chained<'a, T: InStruct, S>(
+    head: cs::Decoded<'a, impl cs::Links, S>,
 ) -> Option<cs::Decoded<'a, T>> {
     // SAFETY: `head` is the decoder's, so every link of its chain is an arena struct that lives
     // for `'a`, and `chained_at` hands back a reference into exactly that; the link's own pointers
@@ -11421,8 +11446,9 @@ impl cs::Validate<DeviceFacts<'_>> for VkImageCreateInfo {
             if !facts.formats.takes_modifiers() {
                 return Err("laid an image out by a modifier on a device that takes none");
             }
-            let listed = chained::<VkImageDrmFormatModifierListCreateInfoEXT>(this).is_some();
-            let explicit = chained::<VkImageDrmFormatModifierExplicitCreateInfoEXT>(this).is_some();
+            let listed = chained::<VkImageDrmFormatModifierListCreateInfoEXT, _>(this).is_some();
+            let explicit =
+                chained::<VkImageDrmFormatModifierExplicitCreateInfoEXT, _>(this).is_some();
             if listed == explicit {
                 return Err("laid an image out by a modifier without one way to choose it");
             }
@@ -11600,10 +11626,10 @@ fn write_into(
                 if !this.dstArrayElement.is_multiple_of(4) || !n.is_multiple_of(4) {
                     return Err("wrote an inline block in pieces smaller than a word");
                 }
-                chained::<VkWriteDescriptorSetInlineUniformBlock>(this).is_some()
+                chained::<VkWriteDescriptorSetInlineUniformBlock, _>(this).is_some()
             }
             D::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR => {
-                chained::<VkWriteDescriptorSetAccelerationStructureKHR>(this).is_some()
+                chained::<VkWriteDescriptorSetAccelerationStructureKHR, _>(this).is_some()
             }
             _ => return Err("wrote a descriptor type this renderer does not serve"),
         };
@@ -11763,6 +11789,130 @@ impl<R> cs::Validate<cs::Chained<'_, R, DeviceFacts<'_>>> for VkPipelineLayoutCr
     }
 }
 
+/// Whether a layout or a pool may hold descriptors of type `ty`: one this renderer serves.
+fn served_descriptor(ty: VkDescriptorType) -> bool {
+    type D = VkDescriptorType;
+    matches!(
+        ty,
+        D::VK_DESCRIPTOR_TYPE_SAMPLER
+            | D::VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+            | D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+            | D::VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+            | D::VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
+            | D::VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
+            | D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+            | D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+            | D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+            | D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+            | D::VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT
+            | D::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK
+            | D::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+            | D::VK_DESCRIPTOR_TYPE_MUTABLE_EXT
+    )
+}
+
+/// Whether a mutable binding or pool size may hold descriptors of type `ty`: a served type
+/// that is neither dynamic, nor inline, nor mutable itself. A driver sizes a mutable slot by the
+/// largest type it may hold.
+fn mutable_may_hold(ty: VkDescriptorType) -> bool {
+    type D = VkDescriptorType;
+    served_descriptor(ty)
+        && !matches!(
+            ty,
+            D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                | D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+                | D::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK
+                | D::VK_DESCRIPTOR_TYPE_MUTABLE_EXT
+        )
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkDescriptorSetLayoutCreateInfo {
+    /// A layout a driver can lay out: each binding once, of a type this renderer serves, inline
+    /// blocks in whole words, a variable count only on the last binding and never a dynamic one,
+    /// a push layout of neither, and each mutable binding -- and only a mutable one -- holding a
+    /// list of the types it may. KosmicKrisp reads a mutable binding's list without checking the
+    /// guest sent one. Whether the whole fits is asked of the driver when it is made.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        type D = VkDescriptorType;
+        let layout = LayoutFacts::of(this)?;
+        let last = layout.bindings.keys().next_back().copied();
+        for (&n, b) in &layout.bindings {
+            if !served_descriptor(b.ty) {
+                return Err("laid out a descriptor type this renderer does not serve");
+            }
+            if b.ty == D::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK && !b.count.is_multiple_of(4) {
+                return Err("laid out an inline block not in whole words");
+            }
+            let dynamic = matches!(
+                b.ty,
+                D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                    | D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+            );
+            if b.variable() && (Some(n) != last || dynamic) {
+                return Err("gave a variable count to a binding that cannot have one");
+            }
+            let inline = b.ty == D::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+            if layout.push && (dynamic || inline || b.variable()) {
+                return Err("laid out a push set with what a push cannot carry");
+            }
+            let mutable = b.ty == D::VK_DESCRIPTOR_TYPE_MUTABLE_EXT;
+            if mutable == b.mutable.is_empty() {
+                return Err(
+                    "listed mutable types for a binding that is not mutable, or none for one that is",
+                );
+            }
+            if !b.mutable.iter().all(|&t| mutable_may_hold(t)) {
+                return Err("let a mutable binding hold a type it cannot");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkDescriptorSetLayoutCreateInfo, DeviceFacts<'_>>>
+    for VkDescriptorSetLayoutBindingFlagsCreateInfo
+{
+    /// KosmicKrisp and anv both read a flag for every binding the root lays out, past the end of
+    /// a shorter array: so it is none, or one for each.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkDescriptorSetLayoutCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        if this.bindingCount != 0 && this.bindingCount != on.root.bindingCount {
+            return Err("flagged another number of bindings than it laid out");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkDescriptorPoolCreateInfo {
+    /// A pool sized by descriptors of types this renderer serves, a mutable size listing types a
+    /// mutable slot may hold.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let lists = chained::<VkMutableDescriptorTypeCreateInfoEXT, _>(this).map_or(&[][..], |m| {
+            regions_of(&m, m.mutableDescriptorTypeListCount, m.pMutableDescriptorTypeLists)
+        });
+        for (i, size) in regions_of(&this, this.poolSizeCount, this.pPoolSizes).iter().enumerate() {
+            if !served_descriptor(size.r#type) {
+                return Err("sized a pool by a descriptor type this renderer does not serve");
+            }
+            let list = lists
+                .get(i)
+                .map_or(&[][..], |l| regions_of(&this, l.descriptorTypeCount, l.pDescriptorTypes));
+            if !list.iter().all(|&t| mutable_may_hold(t)) {
+                return Err("let a mutable pool size hold a type it cannot");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What a plane or subresource question needs of an image: its format, levels, layers and
 /// tiling, and whether its planes are bound apart. Read off the record of an image, or off the
 /// create info of one a device query describes without making.
@@ -11866,7 +12016,7 @@ impl cs::Validate<DeviceFacts<'_>> for VkImageMemoryRequirementsInfo2 {
         facts: &DeviceFacts<'_>,
     ) -> Result<(), &'static str> {
         let shape = facts.facts.shape(this.image)?;
-        if shape.disjoint && chained::<VkImagePlaneMemoryRequirementsInfo>(this).is_none() {
+        if shape.disjoint && chained::<VkImagePlaneMemoryRequirementsInfo, _>(this).is_none() {
             return Err("sized a disjoint image without naming a plane");
         }
         Ok(())
@@ -11892,7 +12042,7 @@ impl cs::Validate<DeviceFacts<'_>> for VkBindImageMemoryInfo {
         facts: &DeviceFacts<'_>,
     ) -> Result<(), &'static str> {
         let shape = facts.facts.shape(this.image)?;
-        if shape.disjoint && chained::<VkBindImagePlaneMemoryInfo>(this).is_none() {
+        if shape.disjoint && chained::<VkBindImagePlaneMemoryInfo, _>(this).is_none() {
             return Err("bound a disjoint image without naming a plane");
         }
         Ok(())
@@ -12051,7 +12201,7 @@ impl Driver {
     ) -> Result<(), &'static str> {
         infos.iter().try_for_each(|i| {
             let disjoint = self.facts().shape(i.image)?.disjoint;
-            let plane = chained::<VkBindImagePlaneMemoryInfo>(i)
+            let plane = chained::<VkBindImagePlaneMemoryInfo, _>(i)
                 .filter(|_| disjoint)
                 .map(|p| p.planeAspect);
             self.image_bind_fits(device, i.image, plane, i.memory, i.memoryOffset)
@@ -12534,8 +12684,6 @@ forwarded_unchecked!(
     VkAccelerationStructureCreateInfoKHR,
     VkBufferCreateInfo,
     VkCommandPoolCreateInfo,
-    VkDescriptorPoolCreateInfo,
-    VkDescriptorSetLayoutCreateInfo,
     VkDescriptorUpdateTemplateCreateInfo,
     VkEventCreateInfo,
     VkFenceCreateInfo,
@@ -12706,7 +12854,7 @@ fn enables_pipeline_statistics(info: cs::Decoded<'_, VkDeviceCreateInfo>) -> boo
     // SAFETY: `info` is the decoder's, so `pEnabledFeatures` is null or a struct it allocated in
     // the arena `info` borrows (see `Decoded::vouch`).
     let flat = unsafe { info.get().pEnabledFeatures.as_ref() };
-    let chained = chained::<VkPhysicalDeviceFeatures2>(info).map(|f| f.get().features);
+    let chained = chained::<VkPhysicalDeviceFeatures2, _>(info).map(|f| f.get().features);
     [flat.copied(), chained].iter().flatten().any(|f| f.pipelineStatisticsQuery.0 != 0)
 }
 
@@ -12782,6 +12930,10 @@ needs_no_check!(
     VkBindImageMemoryDeviceGroupInfo,
     // A result the driver writes into a slot the decoder allocated for it.
     VkBindMemoryStatus,
+    // Mutable type lists, held with the bindings or pool sizes they belong to.
+    VkMutableDescriptorTypeCreateInfoEXT,
+    // How many inline blocks a pool holds, a count.
+    VkDescriptorPoolInlineUniformBlockCreateInfo,
     // Usage bits for a buffer or a view of one.
     VkBufferUsageFlags2CreateInfo,
     // External handle types: bits the image's creation reads, as the root's own flags are.
@@ -14354,6 +14506,195 @@ mod tests {
         assert_eq!(alloc(&[], 2), Ok(vec![0, 0]), "no counts, none");
         assert!(alloc(&[9, 2], 2).is_err(), "more than its binding holds");
         assert!(alloc(&[1], 2).is_err(), "counts for another number of sets");
+
+        d.abandon_planted();
+    }
+
+    /// A set layout is one a driver can lay out, flags and mutable lists sized by its bindings,
+    /// and made only when the driver says it can; a pool is sized by served types; a push layout
+    /// is never allocated from.
+    #[test]
+    fn a_set_layout_is_one_the_driver_can_lay_out() {
+        use crate::venus::proto::types::{
+            VkDescriptorBindingFlags, VkDescriptorPool, VkDescriptorPoolSize,
+            VkDescriptorSetAllocateInfo, VkDescriptorSetLayoutBinding,
+            VkDescriptorSetLayoutBindingFlagsCreateInfo, VkDescriptorSetLayoutCreateFlags,
+            VkMutableDescriptorTypeCreateInfoEXT, VkMutableDescriptorTypeListEXT,
+        };
+        type D = VkDescriptorType;
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const MADE: VkDescriptorSetLayout = VkDescriptorSetLayout::forged(0x800);
+        unsafe extern "C" fn support(
+            _d: VkDevice,
+            info: *const VkDescriptorSetLayoutCreateInfo,
+            out: *mut VkDescriptorSetLayoutSupport,
+        ) {
+            // SAFETY: the caller passes a struct and a local of its own. More than three
+            // bindings is what this driver cannot lay out.
+            unsafe { (*out).supported = VkBool32(u32::from((*info).bindingCount <= 3)) };
+        }
+        unsafe extern "C" fn create(
+            _d: VkDevice,
+            _info: *const VkDescriptorSetLayoutCreateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkDescriptorSetLayout,
+        ) -> VkResult {
+            // SAFETY: the caller passes a local of its own.
+            unsafe { *out = MADE };
+            VkResult::VK_SUCCESS
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkGetDescriptorSetLayoutSupport(support);
+        fns.plant_vkCreateDescriptorSetLayout(create);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        let binding = |n, ty, count| VkDescriptorSetLayoutBinding {
+            binding: n,
+            descriptorType: ty,
+            descriptorCount: count,
+            ..Default::default()
+        };
+        let layout = |b: &[VkDescriptorSetLayoutBinding]| VkDescriptorSetLayoutCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            bindingCount: b.len() as u32,
+            pBindings: b.as_ptr(),
+            ..Default::default()
+        };
+        let ub = |n| binding(n, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1);
+        let dynamic = |n| binding(n, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1);
+        let inline = |n, size| binding(n, D::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK, size);
+        let mutable = |n| binding(n, D::VK_DESCRIPTOR_TYPE_MUTABLE_EXT, 1);
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let laid = |info: &VkDescriptorSetLayoutCreateInfo| {
+            cs::Decoded::planted(info).validate(&facts).map(|_| ())
+        };
+        let (two, inl, odd) = ([ub(0), dynamic(1)], [inline(0, 16)], [inline(0, 6)]);
+        assert_eq!(laid(&layout(&two)), Ok(()));
+        assert_eq!(laid(&layout(&inl)), Ok(()), "an inline block in whole words");
+        assert!(laid(&layout(&odd)).is_err(), "an inline block in pieces of one");
+        let unserved = [binding(0, VkDescriptorType(1_000_440_000), 1)];
+        assert!(laid(&layout(&unserved)).is_err(), "a type this renderer does not serve");
+
+        let flag = |f: u32| VkDescriptorBindingFlags(f);
+        let variable =
+            VkDescriptorBindingFlagBits::VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT.0
+                as u32;
+        let flagged = |b: &[VkDescriptorSetLayoutBinding], f: &[VkDescriptorBindingFlags]| {
+            let chain = VkDescriptorSetLayoutBindingFlagsCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+                bindingCount: f.len() as u32,
+                pBindingFlags: f.as_ptr(),
+                ..Default::default()
+            };
+            let mut info = layout(b);
+            info.pNext = (&raw const chain).cast();
+            laid(&info)
+        };
+        let last_ub = [dynamic(0), ub(1)];
+        assert_eq!(flagged(&last_ub, &[flag(0), flag(variable)]), Ok(()), "variable last");
+        assert_eq!(flagged(&last_ub, &[]), Ok(()), "flags for none");
+        assert!(flagged(&last_ub, &[flag(0)]).is_err(), "flags for fewer than it lays out");
+        assert!(flagged(&last_ub, &[flag(variable), flag(0)]).is_err(), "variable not last");
+        assert!(flagged(&two, &[flag(0), flag(variable)]).is_err(), "variable and dynamic");
+
+        let pushed = |b: &[VkDescriptorSetLayoutBinding]| {
+            let mut info = layout(b);
+            info.flags = VkDescriptorSetLayoutCreateFlags(1);
+            laid(&info)
+        };
+        assert_eq!(pushed(&[ub(0)]), Ok(()));
+        assert!(pushed(&[dynamic(0)]).is_err(), "a dynamic buffer pushed");
+        assert!(pushed(&[inline(0, 16)]).is_err(), "an inline block pushed");
+
+        let samplers = [D::VK_DESCRIPTOR_TYPE_SAMPLER, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE];
+        let dynamics = [D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC];
+        let list = |t: &[VkDescriptorType]| VkMutableDescriptorTypeListEXT {
+            descriptorTypeCount: t.len() as u32,
+            pDescriptorTypes: t.as_ptr(),
+        };
+        let listed = |b: &[VkDescriptorSetLayoutBinding], l: &[VkMutableDescriptorTypeListEXT]| {
+            let chain = VkMutableDescriptorTypeCreateInfoEXT {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT,
+                mutableDescriptorTypeListCount: l.len() as u32,
+                pMutableDescriptorTypeLists: l.as_ptr(),
+                ..Default::default()
+            };
+            let mut info = layout(b);
+            info.pNext = (&raw const chain).cast();
+            laid(&info)
+        };
+        let (none, some) = (list(&[]), list(&samplers));
+        assert_eq!(listed(&[ub(0), mutable(1)], &[none, some]), Ok(()), "listed by position");
+        assert!(listed(&[ub(0), mutable(1)], &[none]).is_err(), "a mutable binding listed past");
+        assert!(laid(&layout(&[mutable(0)])).is_err(), "a mutable binding with no list");
+        assert!(listed(&[ub(0)], &[some]).is_err(), "a list for a binding that is not mutable");
+        assert!(listed(&[mutable(0)], &[list(&dynamics)]).is_err(), "a dynamic buffer listed");
+
+        let sized = |sizes: &[VkDescriptorPoolSize]| {
+            let info = VkDescriptorPoolCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                maxSets: 1,
+                poolSizeCount: sizes.len() as u32,
+                pPoolSizes: sizes.as_ptr(),
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+        };
+        let size = |ty| VkDescriptorPoolSize { r#type: ty, descriptorCount: 4 };
+        assert_eq!(sized(&[size(D::VK_DESCRIPTOR_TYPE_SAMPLER)]), Ok(()));
+        assert!(sized(&[size(VkDescriptorType(1_000_440_000))]).is_err(), "an unserved type");
+        let pool_listed = |l: &VkMutableDescriptorTypeListEXT| {
+            let chain = VkMutableDescriptorTypeCreateInfoEXT {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT,
+                mutableDescriptorTypeListCount: 1,
+                pMutableDescriptorTypeLists: l,
+                ..Default::default()
+            };
+            let sizes = [size(D::VK_DESCRIPTOR_TYPE_MUTABLE_EXT)];
+            let info = VkDescriptorPoolCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                pNext: (&raw const chain).cast(),
+                maxSets: 1,
+                poolSizeCount: 1,
+                pPoolSizes: sizes.as_ptr(),
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+        };
+        assert_eq!(pool_listed(&list(&samplers)), Ok(()), "a mutable size");
+        assert!(pool_listed(&list(&dynamics)).is_err(), "a mutable size holding a dynamic buffer");
+
+        let four = [ub(0), ub(1), ub(2), ub(3)];
+        let (fits, too_big, push) = (layout(&[ub(0)]), layout(&four), {
+            let mut info = layout(&[ub(0)]);
+            info.flags = VkDescriptorSetLayoutCreateFlags(1);
+            info
+        });
+        fn checked<'a>(
+            info: &'a VkDescriptorSetLayoutCreateInfo,
+            facts: &DeviceFacts<'_>,
+        ) -> cs::Decoded<'a, VkDescriptorSetLayoutCreateInfo, cs::Checked> {
+            cs::Decoded::planted(info).validate(facts).expect("a layout")
+        }
+        let (fits, too_big, push) =
+            (checked(&fits, &facts), checked(&too_big, &facts), checked(&push, &facts));
+        assert_eq!(d.create_descriptor_set_layout(DEVICE, fits, None), Ok(Ok(MADE)));
+        assert!(d.create_descriptor_set_layout(DEVICE, too_big, None).is_err(), "unsupported");
+        let pushes = VkDescriptorSetLayout::forged(0x801);
+        d.set_layouts.insert(pushes, Arc::new(LayoutFacts::of(push).expect("a layout")));
+        let allocate = |l: &[VkDescriptorSetLayout]| VkDescriptorSetAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            descriptorPool: VkDescriptorPool::forged(0x40),
+            descriptorSetCount: l.len() as u32,
+            pSetLayouts: l.as_ptr(),
+            ..Default::default()
+        };
+        let (made, pushing) = ([MADE], [pushes]);
+        assert!(d.descriptor_sets_for(cs::Decoded::planted(&allocate(&made))).is_ok());
+        assert!(
+            d.descriptor_sets_for(cs::Decoded::planted(&allocate(&pushing))).is_err(),
+            "a set of a push layout"
+        );
 
         d.abandon_planted();
     }

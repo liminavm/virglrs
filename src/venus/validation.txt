@@ -23,7 +23,7 @@
 # Validating a command moves its line to `validated`; this section empties as that work lands.
 
 vkAllocateCommandBuffers                         reviewed
-vkAllocateDescriptorSets                         pending:descriptors
+vkAllocateDescriptorSets                         validated
 vkAllocateMemory                                 reviewed
 vkBeginCommandBuffer                             reviewed
 vkBindBufferMemory                               validated
@@ -179,8 +179,8 @@ vkCreateBuffer                                   reviewed
 vkCreateBufferView                               validated
 vkCreateCommandPool                              reviewed
 vkCreateComputePipelines                         pending:pipelines
-vkCreateDescriptorPool                           pending:descriptors
-vkCreateDescriptorSetLayout                      pending:descriptors
+vkCreateDescriptorPool                           validated
+vkCreateDescriptorSetLayout                      validated
 vkCreateDescriptorUpdateTemplate                 reviewed
 vkCreateDevice                                   reviewed
 vkCreateEvent                                    reviewed
@@ -244,7 +244,7 @@ vkGetBufferMemoryRequirements                    reviewed
 vkGetBufferMemoryRequirements2                   reviewed
 vkGetBufferOpaqueCaptureAddress                  reviewed
 vkGetCalibratedTimestampsKHR                     validated
-vkGetDescriptorSetLayoutSupport                  pending:descriptors
+vkGetDescriptorSetLayoutSupport                  validated
 vkGetDeviceAccelerationStructureCompatibilityKHR reviewed
 vkGetDeviceBufferMemoryRequirements              reviewed
 vkGetDeviceGroupPeerMemoryFeatures               reviewed
