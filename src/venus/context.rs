@@ -2357,9 +2357,6 @@ impl Handlers<'_> {
         self.reject("recorded into a command buffer with no device behind it");
     }
 
-    /// `info` held to the limits of the device `cb` records for, or `None` with the context
-    /// poisoned: by the reason the check gives, or as recording into nothing when `cb` has no
-    /// device here. See [`Validate`].
     /// Hold `info` to the facts of `device` before a query or a bind forwards it, and answer
     /// whether it was refused -- and the context poisoned. A device this context does not have
     /// is not refused here: the forward that follows answers it as it answers any other.
@@ -2378,6 +2375,9 @@ impl Handlers<'_> {
         }
     }
 
+    /// `info` held to the limits of the device `cb` records for, or `None` with the context
+    /// poisoned: by the reason the check gives, or as recording into nothing when `cb` has no
+    /// device here. See [`Validate`].
     fn checked_for<'a, T>(
         &mut self,
         cb: VkCommandBuffer,
@@ -5290,7 +5290,7 @@ impl Commands for Handlers<'_> {
             sets,
             offsets,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdDraw(&mut self, args: &mut vn_command_vkCmdDraw<'_>) {
@@ -5911,17 +5911,19 @@ impl Commands for Handlers<'_> {
             args.set,
             args.pDescriptorWrites(),
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdPushDescriptorSet2(&mut self, args: &mut vn_command_vkCmdPushDescriptorSet2<'_>) {
         let Some(info) = self.names(args.pPushDescriptorSetInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_push_descriptor_set2(args.commandBuffer, info);
         self.recorded(done);
     }
 
     fn vkCmdBindDescriptorSets2(&mut self, args: &mut vn_command_vkCmdBindDescriptorSets2<'_>) {
         let Some(info) = self.names(args.pBindDescriptorSetsInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_bind_descriptor_sets2(args.commandBuffer, info);
         self.recorded(done);
     }
@@ -14152,6 +14154,30 @@ mod tests {
             &layout,
             0,
         );
+        // The second set the bind names holds the three dynamic buffers it gives offsets for,
+        // and both are bound at 5 and 6 of a pipeline layout laying them out there.
+        let dynamic = super::super::proto::types::VkDescriptorSetLayoutBinding {
+            descriptorType:
+                super::super::proto::types::VkDescriptorType::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+            descriptorCount: 3,
+            ..Default::default()
+        };
+        let holds_three = super::super::proto::types::VkDescriptorSetLayoutCreateInfo {
+            bindingCount: 1,
+            pBindings: &dynamic,
+            ..Default::default()
+        };
+        driver.plant_sets(
+            VkDevice::forged(DEVICE),
+            super::super::proto::types::VkDescriptorPool::forged(0x40),
+            &[(VkDescriptorSet::forged(0x400), ObjectId(0x41))],
+            &holds_three,
+            0,
+        );
+        driver.plant_pipeline_layout(
+            VkPipelineLayout::forged(0x50),
+            &[None, None, None, None, None, Some(&layout), Some(&holds_three)],
+        );
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -14187,6 +14213,7 @@ mod tests {
         let mut args = vn_command_vkCmdBindDescriptorSets::default();
         args.commandBuffer = cb;
         args.firstSet = 5;
+        args.layout = VkPipelineLayout::forged(0x50);
         args.plant_pDescriptorSets(&sets);
         args.plant_pDynamicOffsets(&offsets);
         h.vkCmdBindDescriptorSets(&mut args);
@@ -17617,6 +17644,44 @@ mod tests {
                 ..Default::default()
             },
         );
+        // The layouts the commands below go through: a push set at 3 in the first, and in the
+        // second two sets holding the three dynamic buffers the bind gives offsets for.
+        use super::super::proto::types::{
+            VkDescriptorPool, VkDescriptorSetLayoutBinding, VkDescriptorSetLayoutCreateFlags,
+            VkDescriptorSetLayoutCreateInfo, VkDescriptorType,
+        };
+        let binding = |ty, count| VkDescriptorSetLayoutBinding {
+            descriptorType: ty,
+            descriptorCount: count,
+            ..Default::default()
+        };
+        let sampler = [binding(VkDescriptorType::VK_DESCRIPTOR_TYPE_SAMPLER, 1)];
+        let pushed = VkDescriptorSetLayoutCreateInfo {
+            flags: VkDescriptorSetLayoutCreateFlags(1),
+            bindingCount: 1,
+            pBindings: sampler.as_ptr(),
+            ..Default::default()
+        };
+        let dynamic = |n| [binding(VkDescriptorType::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, n)];
+        let (two, one) = (dynamic(2), dynamic(1));
+        let layout = |b: &[VkDescriptorSetLayoutBinding; 1]| VkDescriptorSetLayoutCreateInfo {
+            bindingCount: 1,
+            pBindings: b.as_ptr(),
+            ..Default::default()
+        };
+        let (holds_two, holds_one) = (layout(&two), layout(&one));
+        driver.plant_pipeline_layout(
+            VkPipelineLayout::forged(0x21),
+            &[None, None, None, Some(&pushed)],
+        );
+        driver.plant_pipeline_layout(
+            VkPipelineLayout::forged(0x22),
+            &[None, Some(&holds_two), Some(&holds_one)],
+        );
+        let device = VkDevice::forged(DEVICE);
+        let set = |n: u64| (VkDescriptorSet::forged(n), ObjectId(n));
+        driver.plant_sets(device, VkDescriptorPool::forged(0x41), &[set(0x31)], &holds_two, 0);
+        driver.plant_sets(device, VkDescriptorPool::forged(0x42), &[set(0x32)], &holds_one, 0);
         driver.plant_pool(
             VkDevice::forged(DEVICE),
             VkCommandPool::forged(POOL),

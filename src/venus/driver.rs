@@ -22,6 +22,7 @@ use crate::ids::{ContextId, FenceId, RingIdx};
 use super::cs::{self, Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
 use super::ledger;
 use super::objects::Doomed;
+use super::proto::types::VkDescriptorSetLayoutCreateFlagBits;
 use super::proto::types::VkFormatProperties;
 use super::proto::types::VkOpaqueCaptureDataCreateInfoEXT;
 use super::proto::types::{
@@ -278,6 +279,8 @@ impl BindingFacts {
 #[derive(Debug, PartialEq, Eq)]
 pub struct LayoutFacts {
     bindings: BTreeMap<u32, BindingFacts>,
+    /// Whether its sets are pushed rather than allocated.
+    push: bool,
 }
 
 impl LayoutFacts {
@@ -310,7 +313,101 @@ impl LayoutFacts {
                 return Err("laid out one binding twice");
             }
         }
-        Ok(LayoutFacts { bindings })
+        const PUSH: u32 =
+            VkDescriptorSetLayoutCreateFlagBits::VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT
+                .0 as u32;
+        Ok(LayoutFacts { bindings, push: info.flags.0 & PUSH != 0 })
+    }
+
+    /// How many dynamic offsets a set of it is bound with: one for each of its dynamic buffers.
+    fn dynamic_offsets(&self) -> u64 {
+        type D = VkDescriptorType;
+        self.bindings
+            .values()
+            .filter(|b| {
+                matches!(
+                    b.ty,
+                    D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                        | D::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+                )
+            })
+            .map(|b| u64::from(b.count))
+            .sum()
+    }
+}
+
+/// What a pipeline layout lays out: the layout of each set it binds, in order -- `None` for one
+/// it leaves to a pipeline library -- each a share, as a set's is.
+#[derive(Debug)]
+pub struct PipelineLayoutFacts {
+    sets: Vec<Option<Arc<LayoutFacts>>>,
+}
+
+impl PipelineLayoutFacts {
+    /// What a pipeline layout made from `info` lays out.
+    fn of<S>(
+        info: cs::Decoded<'_, VkPipelineLayoutCreateInfo, S>,
+        layouts: &BTreeMap<VkDescriptorSetLayout, Arc<LayoutFacts>>,
+    ) -> Result<Self, &'static str> {
+        let sets = regions_of(&info, info.setLayoutCount, info.pSetLayouts)
+            .iter()
+            .map(|l| {
+                if l.host().raw() == 0 {
+                    return Ok(None);
+                }
+                let layout = layouts
+                    .get(l)
+                    .ok_or("laid out a set of a layout this renderer has no record of")?;
+                Ok(Some(Arc::clone(layout)))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(PipelineLayoutFacts { sets })
+    }
+
+    /// Whether `sets`, bound from `first`, are sets of the layouts it lays out there, with as many
+    /// dynamic offsets as they hold. A driver keeps the bound sets in an array as long as the
+    /// most it binds, and reads one offset for each dynamic buffer of each set.
+    fn binds(
+        &self,
+        facts: &Facts<'_>,
+        first: u32,
+        sets: &[VkDescriptorSet],
+        offsets: usize,
+    ) -> Result<(), &'static str> {
+        let end = u64::from(first) + sets.len() as u64;
+        if end > self.sets.len() as u64 {
+            return Err("bound sets past the last its pipeline layout lays out");
+        }
+        let mut dynamic = 0u64;
+        for (set, want) in sets.iter().zip(&self.sets[first as usize..]) {
+            // A null set binds nothing, leaving the slot to a pipeline library's layout.
+            if set.host().raw() == 0 {
+                continue;
+            }
+            let have = facts.set(*set)?;
+            let want = want.as_ref().ok_or("bound a set where its pipeline layout has none")?;
+            if *have.layout != **want {
+                return Err("bound a set of another layout than its pipeline layout's");
+            }
+            dynamic += have.layout.dynamic_offsets();
+        }
+        if dynamic != offsets as u64 {
+            return Err("bound sets with another number of dynamic offsets than they hold");
+        }
+        Ok(())
+    }
+
+    /// The layout of the set it pushes at `set`, as a set to hold the push's writes to.
+    fn pushed(&self, set: u32) -> Result<SetFacts, &'static str> {
+        let layout = self
+            .sets
+            .get(set as usize)
+            .and_then(Option::as_ref)
+            .ok_or("pushed a set its pipeline layout does not lay out")?;
+        if !layout.push {
+            return Err("pushed a set whose layout is not for pushing");
+        }
+        Ok(SetFacts { layout: Arc::clone(layout), variable: 0 })
     }
 }
 
@@ -841,6 +938,8 @@ pub struct Driver {
     /// What each descriptor set layout lays out, keyed by host handle as `images` is. A share:
     /// each set of a layout holds one too, so a set outlives the layout's own record.
     set_layouts: BTreeMap<VkDescriptorSetLayout, Arc<LayoutFacts>>,
+    /// What each pipeline layout lays out, keyed and kept as `set_layouts` is.
+    pipeline_layouts: BTreeMap<VkPipelineLayout, Arc<PipelineLayoutFacts>>,
     /// What each query pool answers with, for the read-back that has to fit the room the guest
     /// offered. Keyed by host handle for the same reason as `images`, and kept honest the same
     /// way: the record dies at both places the pool does, so a recycled handle finds no record
@@ -2633,6 +2732,7 @@ impl Driver {
             memory: BTreeMap::new(),
             images: BTreeMap::new(),
             set_layouts: BTreeMap::new(),
+            pipeline_layouts: BTreeMap::new(),
             query_pools: BTreeMap::new(),
             buffers: BTreeMap::new(),
             semaphores: BTreeMap::new(),
@@ -3972,6 +4072,8 @@ impl Driver {
             images: &self.images,
             buffers: &self.buffers,
             pools: &self.pools,
+            set_layouts: &self.set_layouts,
+            pipeline_layouts: &self.pipeline_layouts,
         }
     }
 
@@ -4416,6 +4518,9 @@ impl Driver {
             }
             VkObjectType::VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT => {
                 self.set_layouts.remove(&VkDescriptorSetLayout::from_host(handle));
+            }
+            VkObjectType::VK_OBJECT_TYPE_PIPELINE_LAYOUT => {
+                self.pipeline_layouts.remove(&VkPipelineLayout::from_host(handle));
             }
             VkObjectType::VK_OBJECT_TYPE_BUFFER => {
                 self.buffers.remove(&VkBuffer::from_host(handle));
@@ -5196,6 +5301,19 @@ impl Driver {
         }
     }
 
+    /// Record a pipeline layout of the set layouts `sets` describe, as
+    /// [`Driver::create_pipeline_layout`] would have; `None` is a set it leaves to a library.
+    #[cfg(test)]
+    pub(super) fn plant_pipeline_layout(
+        &mut self,
+        layout: VkPipelineLayout,
+        sets: &[Option<&VkDescriptorSetLayoutCreateInfo>],
+    ) {
+        let of = |i| Arc::new(LayoutFacts::of(cs::Decoded::planted(i)).expect("a layout"));
+        let sets = sets.iter().map(|s| s.map(of)).collect();
+        self.pipeline_layouts.insert(layout, Arc::new(PipelineLayoutFacts { sets }));
+    }
+
     /// Record a buffer of `size` bytes, as [`Driver::create_buffer`] would have.
     #[cfg(test)]
     pub(super) fn plant_buffer(&mut self, buffer: VkBuffer, size: u64) {
@@ -5392,13 +5510,21 @@ impl Driver {
         self.create_object(device, |d| Some(d.vkCreateBufferView()), info, alloc)
     }
 
+    /// Create a pipeline layout, and record what it lays out for the binds and pushes made
+    /// through it. Its check has already found a record of each set layout it names.
     pub fn create_pipeline_layout(
-        &self,
+        &mut self,
         device: VkDevice,
         info: cs::Decoded<'_, VkPipelineLayoutCreateInfo, cs::Checked>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkPipelineLayout, VkResult> {
-        self.create_object(device, |d| Some(d.vkCreatePipelineLayout()), info, alloc)
+        let facts = PipelineLayoutFacts::of(info, &self.set_layouts)
+            .expect("its check found every set layout");
+        let host = self.create_object(device, |d| Some(d.vkCreatePipelineLayout()), info, alloc);
+        if let Ok(layout) = host {
+            self.pipeline_layouts.insert(layout, Arc::new(facts));
+        }
+        host
     }
 
     /// Create a pool, and start tracking what will be allocated from it.
@@ -5817,8 +5943,14 @@ impl Driver {
         first_set: u32,
         sets: &[VkDescriptorSet],
         dynamic_offsets: &[u32],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), RecordRefused> {
+        let facts = self.recorder_facts(cb).ok_or(RecordRefused::NoDevice)?;
+        facts
+            .facts
+            .pipeline_layout(layout, None)
+            .and_then(|l| l.binds(&facts.facts, first_set, sets, dynamic_offsets.len()))
+            .map_err(RecordRefused::Invalid)?;
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above; both counts are their own slice's length.
         unsafe {
             (d.vkCmdBindDescriptorSets())(
@@ -5832,7 +5964,7 @@ impl Driver {
                 dynamic_offsets.as_ptr(),
             )
         };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_draw(
@@ -6426,12 +6558,19 @@ impl Driver {
         layout: VkPipelineLayout,
         set: u32,
         writes: cs::Decoded<'_, [VkWriteDescriptorSet]>,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdPushDescriptorSet()?;
+    ) -> Result<(), RecordRefused> {
+        let facts = self.recorder_facts(cb).ok_or(RecordRefused::NoDevice)?;
+        let pushed = facts.facts.pipeline_layout(layout, None).and_then(|l| l.pushed(set));
+        let push = PushFacts { device: &facts, set: pushed.map_err(RecordRefused::Invalid)? };
+        let writes = writes.validate(&push).map_err(RecordRefused::Invalid)?;
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdPushDescriptorSet())
+            .ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above; the count is the slice's own length, and every pointer inside a
         // write addresses the same arena the slice came from.
         unsafe { f(cb, bind_point, layout, set, writes.len() as u32, writes.as_ptr()) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdPushDescriptorSet2`, `vkCmdBindDescriptorSets2` and `vkCmdPushConstants2`: the
@@ -6444,7 +6583,7 @@ impl Driver {
     pub fn cmd_push_descriptor_set2(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkPushDescriptorSetInfo>,
+        info: cs::Decoded<'_, VkPushDescriptorSetInfo, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdPushDescriptorSet2()?;
         // SAFETY: as above; `info` is a struct the decoder built, so every pointer in it and in
@@ -6457,7 +6596,7 @@ impl Driver {
     pub fn cmd_bind_descriptor_sets2(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkBindDescriptorSetsInfo>,
+        info: cs::Decoded<'_, VkBindDescriptorSetsInfo, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdBindDescriptorSets2()?;
         // SAFETY: as `cmd_push_descriptor_set2`.
@@ -10851,7 +10990,11 @@ impl MemoryRegion {
 }
 
 /// The regions of a `VK_KHR_copy_commands2` info, as the decoder built them.
-fn regions_of<'a, T, R>(_info: &cs::Decoded<'a, T>, count: u32, regions: *const R) -> &'a [R] {
+fn regions_of<'a, T, S, R>(
+    _info: &cs::Decoded<'a, T, S>,
+    count: u32,
+    regions: *const R,
+) -> &'a [R] {
     // SAFETY: `_info` is `Decoded`, so the decoder allocated its region array from the batch
     // arena sized to the count beside it (see `Decoded::vouch`), and the arena outlives `'a`.
     // `wire_array` is the same reconciliation the generated accessors use.
@@ -11382,6 +11525,31 @@ impl Facts<'_> {
     fn set(&self, set: VkDescriptorSet) -> Result<&SetFacts, &'static str> {
         self.pools.set(set).ok_or("named a descriptor set this renderer has no record of")
     }
+
+    /// The pipeline layout a bind or a push goes through: the one `layout` names, or -- in the
+    /// maintenance6 forms, which may name none -- the one `chained` describes.
+    fn pipeline_layout(
+        &self,
+        layout: VkPipelineLayout,
+        chained: Option<cs::Decoded<'_, VkPipelineLayoutCreateInfo>>,
+    ) -> Result<Arc<PipelineLayoutFacts>, &'static str> {
+        if layout.host().raw() != 0 {
+            return self
+                .pipeline_layouts
+                .get(&layout)
+                .cloned()
+                .ok_or("went through a pipeline layout this renderer has no record of");
+        }
+        let info = chained.ok_or("went through no pipeline layout")?;
+        PipelineLayoutFacts::of(info, self.set_layouts).map(Arc::new)
+    }
+}
+
+/// [`DeviceFacts`], with the set a push writes into: the push's writes are held to it as an
+/// update's are to the set it names.
+pub struct PushFacts<'d> {
+    device: &'d DeviceFacts<'d>,
+    set: SetFacts,
 }
 
 impl cs::Validate<DeviceFacts<'_>> for VkWriteDescriptorSet {
@@ -11393,8 +11561,28 @@ impl cs::Validate<DeviceFacts<'_>> for VkWriteDescriptorSet {
         this: cs::Decoded<'_, Self, cs::Unchecked>,
         facts: &DeviceFacts<'_>,
     ) -> Result<(), &'static str> {
+        write_into(this, facts.facts.set(this.dstSet)?, facts)
+    }
+}
+
+impl cs::Validate<PushFacts<'_>> for VkWriteDescriptorSet {
+    /// A pushed write, held to the set it pushes into as an update is to the set it names.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &PushFacts<'_>,
+    ) -> Result<(), &'static str> {
+        write_into(this, &facts.set, facts.device)
+    }
+}
+
+/// [`VkWriteDescriptorSet`]'s check, into `set`.
+fn write_into(
+    this: cs::Decoded<'_, VkWriteDescriptorSet>,
+    set: &SetFacts,
+    facts: &DeviceFacts<'_>,
+) -> Result<(), &'static str> {
+    {
         type D = VkDescriptorType;
-        let set = facts.facts.set(this.dstSet)?;
         let (ty, n) = (this.descriptorType, this.descriptorCount);
         let carried = match ty {
             D::VK_DESCRIPTOR_TYPE_SAMPLER
@@ -11461,14 +11649,14 @@ impl cs::Validate<DeviceFacts<'_>> for VkWriteDescriptorSet {
     }
 }
 
-impl cs::Validate<cs::Chained<'_, VkWriteDescriptorSet, DeviceFacts<'_>>>
+impl<F: ?Sized> cs::Validate<cs::Chained<'_, VkWriteDescriptorSet, F>>
     for VkWriteDescriptorSetInlineUniformBlock
 {
     /// The bytes a driver copies are the link's own count, the room it was held to the write's:
     /// the two must be one.
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
-        on: &cs::Chained<'_, VkWriteDescriptorSet, DeviceFacts<'_>>,
+        on: &cs::Chained<'_, VkWriteDescriptorSet, F>,
     ) -> Result<(), &'static str> {
         let inline =
             on.root.descriptorType == VkDescriptorType::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
@@ -11479,13 +11667,13 @@ impl cs::Validate<cs::Chained<'_, VkWriteDescriptorSet, DeviceFacts<'_>>>
     }
 }
 
-impl cs::Validate<cs::Chained<'_, VkWriteDescriptorSet, DeviceFacts<'_>>>
+impl<F: ?Sized> cs::Validate<cs::Chained<'_, VkWriteDescriptorSet, F>>
     for VkWriteDescriptorSetAccelerationStructureKHR
 {
     /// A driver reads one structure for each descriptor the write counts.
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
-        on: &cs::Chained<'_, VkWriteDescriptorSet, DeviceFacts<'_>>,
+        on: &cs::Chained<'_, VkWriteDescriptorSet, F>,
     ) -> Result<(), &'static str> {
         let structures = on.root.descriptorType
             == VkDescriptorType::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -11534,6 +11722,44 @@ impl cs::Validate<DeviceFacts<'_>> for VkCopyDescriptorSet {
             }
         }
         Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkBindDescriptorSetsInfo {
+    /// As `vkCmdBindDescriptorSets`: see [`PipelineLayoutFacts::binds`].
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let layout = facts.facts.pipeline_layout(this.layout, chained(this))?;
+        let sets = regions_of(&this, this.descriptorSetCount, this.pDescriptorSets);
+        layout.binds(&facts.facts, this.firstSet, sets, this.dynamicOffsetCount as usize)
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkPushDescriptorSetInfo {
+    /// As `vkCmdPushDescriptorSet`: a push set of the pipeline layout, and writes held to it.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let layout = facts.facts.pipeline_layout(this.layout, chained(this))?;
+        let push = PushFacts { device: facts, set: layout.pushed(this.set)? };
+        let writes = regions_of(&this, this.descriptorWriteCount, this.pDescriptorWrites);
+        // SAFETY: the decoder allocated the writes, and all they point at, in the arena `this`
+        // borrows (see `Decoded::vouch`).
+        unsafe { cs::Decoded::vouch(writes) }.validate(&push).map(|_| ())
+    }
+}
+
+/// The pipeline layout a maintenance6 bind or push describes in place of naming one: held to
+/// what `vkCreatePipelineLayout` holds one to.
+impl<R> cs::Validate<cs::Chained<'_, R, DeviceFacts<'_>>> for VkPipelineLayoutCreateInfo {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, R, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        <Self as cs::Validate<DeviceFacts<'_>>>::validate(this, on.facts)
     }
 }
 
@@ -12176,6 +12402,8 @@ pub struct Facts<'d> {
     images: &'d BTreeMap<VkImage, ImageFacts>,
     buffers: &'d BTreeMap<VkBuffer, u64>,
     pools: &'d Pools,
+    set_layouts: &'d BTreeMap<VkDescriptorSetLayout, Arc<LayoutFacts>>,
+    pipeline_layouts: &'d BTreeMap<VkPipelineLayout, Arc<PipelineLayoutFacts>>,
 }
 
 /// [`Facts`], with the limits of the one device a command records or runs on. A check that holds
@@ -12346,6 +12574,7 @@ impl cs::Validate<DeviceFacts<'_>> for VkPipelineLayoutCreateInfo {
         if this.setLayoutCount > limits.maxBoundDescriptorSets {
             return Err("laid out more descriptor sets than the device binds");
         }
+        PipelineLayoutFacts::of(this, facts.facts.set_layouts)?;
         // SAFETY: `this` is `Decoded`, so the decoder allocated this array from the batch arena
         // sized to the count beside it (see `Decoded::vouch`), and the arena outlives this call.
         let ranges = unsafe {
@@ -12669,6 +12898,12 @@ unsafe impl InStruct for VkWriteDescriptorSetInlineUniformBlock {
 unsafe impl InStruct for VkWriteDescriptorSetAccelerationStructureKHR {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkPipelineLayoutCreateInfo {
+    const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -13925,7 +14160,7 @@ mod tests {
         let bindings = [
             at(0, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2, 1),
             at(1, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 1),
-            at(2, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, 16),
+            at(2, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 16),
             at(3, D::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4, 16),
             at(4, D::VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK, 16, 16),
             at(5, D::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2, 16),
@@ -13956,6 +14191,20 @@ mod tests {
             VkDescriptorSetLayout::forged(0x500),
             Arc::new(LayoutFacts::of(cs::Decoded::planted(&layout)).expect("a layout")),
         );
+        // A binding of no descriptors between two alike, which a run skips over whatever it is.
+        let skipped = [
+            at(0, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 1),
+            at(1, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, 16),
+            at(2, D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 1),
+        ];
+        let around = VkDescriptorSetLayoutCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            bindingCount: 3,
+            pBindings: skipped.as_ptr(),
+            ..Default::default()
+        };
+        const C: VkDescriptorSet = VkDescriptorSet::forged(0x302);
+        d.plant_sets(DEVICE, VkDescriptorPool::forged(0x32), &[(C, ObjectId(3))], &around, 0);
         let facts = d.device_facts(DEVICE).expect("a planted device");
 
         let buffers = [VkDescriptorBufferInfo {
@@ -13980,8 +14229,9 @@ mod tests {
         assert_eq!(wrote(write(A, 0, 0, 2, ub)), Ok(()), "the whole binding");
         assert_eq!(wrote(write(A, 0, 1, 2, ub)), Ok(()), "on into the next, alike");
         assert_eq!(wrote(write(A, 0, 2, 1, ub)), Ok(()), "from its end, all into the next");
-        assert!(wrote(write(A, 0, 0, 4, ub)).is_err(), "past a binding of none into another kind");
+        assert!(wrote(write(A, 0, 0, 4, ub)).is_err(), "on into a binding of other stages");
         assert!(wrote(write(A, 0, 3, 1, ub)).is_err(), "from past its end");
+        assert_eq!(wrote(write(C, 0, 0, 2, ub)), Ok(()), "over a binding of none");
         assert!(wrote(write(A, 7, 0, 1, ub)).is_err(), "a binding the set lacks");
         assert!(wrote(write(A, 3, 0, 1, ub)).is_err(), "a type its binding does not hold");
         assert!(wrote(write(VkDescriptorSet::forged(0x3ff), 0, 0, 1, ub)).is_err(), "no record");
@@ -14104,6 +14354,102 @@ mod tests {
         assert_eq!(alloc(&[], 2), Ok(vec![0, 0]), "no counts, none");
         assert!(alloc(&[9, 2], 2).is_err(), "more than its binding holds");
         assert!(alloc(&[1], 2).is_err(), "counts for another number of sets");
+
+        d.abandon_planted();
+    }
+
+    /// Sets are bound through a pipeline layout that lays out their layouts where they are bound,
+    /// with as many dynamic offsets as they hold, and pushed only into a push set of it; a
+    /// maintenance6 command may describe the layout in place of naming one.
+    #[test]
+    fn sets_are_bound_and_pushed_through_their_pipeline_layout() {
+        use crate::venus::proto::types::{
+            VkDescriptorPool, VkDescriptorSetLayoutBinding, VkDescriptorSetLayoutCreateFlags,
+            VkWriteDescriptorSet,
+        };
+        type D = VkDescriptorType;
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const PL: VkPipelineLayout = VkPipelineLayout::forged(0x700);
+        const HOLED: VkPipelineLayout = VkPipelineLayout::forged(0x701);
+        const X: VkDescriptorSetLayout = VkDescriptorSetLayout::forged(0x800);
+        let (sx, sy) = (VkDescriptorSet::forged(0x300), VkDescriptorSet::forged(0x301));
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        let binding = |ty, count| VkDescriptorSetLayoutBinding {
+            descriptorType: ty,
+            descriptorCount: count,
+            ..Default::default()
+        };
+        let (dynamic, sampler) = (
+            [binding(D::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2)],
+            [binding(D::VK_DESCRIPTOR_TYPE_SAMPLER, 1)],
+        );
+        let layout =
+            |b: &[VkDescriptorSetLayoutBinding; 1], flags| VkDescriptorSetLayoutCreateInfo {
+                flags: VkDescriptorSetLayoutCreateFlags(flags),
+                bindingCount: 1,
+                pBindings: b.as_ptr(),
+                ..Default::default()
+            };
+        let (x, y, pushed) = (layout(&dynamic, 0), layout(&sampler, 0), layout(&sampler, 1));
+        d.plant_pipeline_layout(PL, &[Some(&x), Some(&y), Some(&pushed)]);
+        d.plant_pipeline_layout(HOLED, &[None, Some(&y)]);
+        d.plant_sets(DEVICE, VkDescriptorPool::forged(0x40), &[(sx, ObjectId(1))], &x, 0);
+        d.plant_sets(DEVICE, VkDescriptorPool::forged(0x41), &[(sy, ObjectId(2))], &y, 0);
+        d.set_layouts
+            .insert(X, Arc::new(LayoutFacts::of(cs::Decoded::planted(&x)).expect("a layout")));
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let bound = |pl, first, sets: &[VkDescriptorSet], offsets| {
+            facts.facts.pipeline_layout(pl, None)?.binds(&facts.facts, first, sets, offsets)
+        };
+        let null = VkDescriptorSet::NULL;
+        assert_eq!(bound(PL, 0, &[sx, sy], 2), Ok(()), "each where it is laid out");
+        assert_eq!(bound(PL, 1, &[sy], 0), Ok(()), "from a later set");
+        assert_eq!(bound(PL, 0, &[null, sy], 0), Ok(()), "a null set binds nothing");
+        assert!(bound(PL, 0, &[sx, sy], 1).is_err(), "too few dynamic offsets");
+        assert!(bound(PL, 0, &[sx, sy], 3).is_err(), "too many");
+        assert!(bound(PL, 0, &[sy], 0).is_err(), "a set of another layout");
+        assert!(bound(PL, 2, &[sy, sy], 0).is_err(), "past its last set");
+        assert!(bound(PL, u32::MAX, &[sy], 0).is_err(), "far past it");
+        assert!(bound(HOLED, 0, &[sy], 0).is_err(), "where it lays out none");
+        assert!(bound(PL, 0, &[VkDescriptorSet::forged(0x3ff)], 0).is_err(), "no record");
+        assert!(bound(VkPipelineLayout::forged(0x7ff), 0, &[sx], 2).is_err(), "no layout record");
+        assert!(bound(VkPipelineLayout::NULL, 0, &[sx], 2).is_err(), "no layout at all");
+
+        let named = [X];
+        let described = VkPipelineLayoutCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            setLayoutCount: 1,
+            pSetLayouts: named.as_ptr(),
+            ..Default::default()
+        };
+        let in_place = facts
+            .facts
+            .pipeline_layout(VkPipelineLayout::NULL, Some(cs::Decoded::planted(&described)))
+            .expect("a layout described in place");
+        assert_eq!(in_place.binds(&facts.facts, 0, &[sx], 2), Ok(()));
+        let unknown = [VkDescriptorSetLayout::forged(0x8ff)];
+        let mut stray = described;
+        stray.pSetLayouts = unknown.as_ptr();
+        assert!(
+            cs::Decoded::planted(&stray).validate(&facts).is_err(),
+            "a set layout with no record"
+        );
+
+        let pl = facts.facts.pipeline_layout(PL, None).expect("a layout");
+        assert!(pl.pushed(1).is_err(), "a set that is not for pushing");
+        assert!(pl.pushed(3).is_err(), "a set it does not lay out");
+        let push = PushFacts { device: &facts, set: pl.pushed(2).expect("its push set") };
+        let images = [crate::venus::proto::types::VkDescriptorImageInfo::default(); 2];
+        let write = |count| VkWriteDescriptorSet {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            descriptorCount: count,
+            descriptorType: D::VK_DESCRIPTOR_TYPE_SAMPLER,
+            pImageInfo: images.as_ptr(),
+            ..Default::default()
+        };
+        assert_eq!(cs::Decoded::planted(&write(1)).validate(&push).map(|_| ()), Ok(()));
+        assert!(cs::Decoded::planted(&write(2)).validate(&push).is_err(), "past its binding");
 
         d.abandon_planted();
     }

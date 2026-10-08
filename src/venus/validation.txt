@@ -37,8 +37,8 @@ vkCmdBeginRenderPass                             pending:render-passes
 vkCmdBeginRenderPass2                            pending:render-passes
 vkCmdBeginRendering                              validated
 vkCmdBeginTransformFeedbackEXT                   reviewed
-vkCmdBindDescriptorSets                          pending:descriptors
-vkCmdBindDescriptorSets2                         pending:descriptors
+vkCmdBindDescriptorSets                          validated
+vkCmdBindDescriptorSets2                         validated
 vkCmdBindIndexBuffer                             validated
 vkCmdBindIndexBuffer2                            validated
 vkCmdBindPipeline                                reviewed
@@ -95,8 +95,8 @@ vkCmdPipelineBarrier                             reviewed
 vkCmdPipelineBarrier2                            reviewed
 vkCmdPushConstants                               validated
 vkCmdPushConstants2                              validated
-vkCmdPushDescriptorSet                           pending:descriptors
-vkCmdPushDescriptorSet2                          pending:descriptors
+vkCmdPushDescriptorSet                           validated
+vkCmdPushDescriptorSet2                          validated
 vkCmdResetEvent                                  reviewed
 vkCmdResetEvent2                                 reviewed
 vkCmdResetQueryPool                              reviewed

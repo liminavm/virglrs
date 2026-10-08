@@ -327,8 +327,8 @@ SABOTAGES = [
     (
         "a bind sends the dynamic offsets' count with the descriptor sets",
         'src/venus/context.rs',
-        '            sets,\n            offsets,\n        );\n        self.recorded(done);',
-        '            sets,\n            &offsets[..offsets.len().min(sets.len())],\n        );\n        self.recorded(done);',
+        '            sets,\n            offsets,\n        );\n        self.held(done);',
+        '            sets,\n            &offsets[..offsets.len().min(sets.len())],\n        );\n        self.held(done);',
         '',
     ),
     (
@@ -4555,6 +4555,49 @@ SABOTAGES = [
         """            if bindings.insert(b.binding, fact).is_some() {""",
         """            if bindings.insert(b.binding, fact).is_some() && false {""",
         'a_descriptor_update_is_held_to_its_set',
+    ),
+    (
+        'an update may not skip over a binding of no descriptors',
+        'src/venus/driver.rs',
+        """            if size > 0 || b == binding {""",
+        """            if true {""",
+        'a_descriptor_update_is_held_to_its_set',
+    ),
+    (
+        'sets may be bound past the last their pipeline layout lays out',
+        'src/venus/driver.rs',
+        """        if end > self.sets.len() as u64 {""",
+        """        if end > u64::MAX - 1 {""",
+        'sets_are_bound_and_pushed_through_their_pipeline_layout',
+    ),
+    (
+        'a set may be bound where its pipeline layout lays out another',
+        'src/venus/driver.rs',
+        """            if *have.layout != **want {""",
+        """            if false {""",
+        'sets_are_bound_and_pushed_through_their_pipeline_layout',
+    ),
+    (
+        'a bind may carry any number of dynamic offsets',
+        'src/venus/driver.rs',
+        """        if dynamic != offsets as u64 {""",
+        """        if false {""",
+        'sets_are_bound_and_pushed_through_their_pipeline_layout',
+    ),
+    (
+        'a set may be pushed into a layout not for pushing',
+        'src/venus/driver.rs',
+        """        if !layout.push {""",
+        """        if false {""",
+        'sets_are_bound_and_pushed_through_their_pipeline_layout',
+    ),
+    (
+        'a pipeline layout may name a set layout with no record',
+        'src/venus/driver.rs',
+        """        PipelineLayoutFacts::of(this, facts.facts.set_layouts)?;
+""",
+        """""",
+        'sets_are_bound_and_pushed_through_their_pipeline_layout',
     ),
     (
         'a submit chained array is trusted by its count alone',
