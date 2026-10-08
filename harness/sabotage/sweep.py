@@ -3863,6 +3863,27 @@ SABOTAGES = [
         'color_attachment_counts_past_the_device_do_not_validate',
     ),
     (
+        'a vertex binding index is not held to the device',
+        'src/venus/driver.rs',
+        """        if this.binding >= facts.limits.maxVertexInputBindings {""",
+        """        if this.binding >= u32::MAX {""",
+        'vertex_input_past_the_device_does_not_validate',
+    ),
+    (
+        'a vertex attribute location is not held to the device',
+        'src/venus/driver.rs',
+        """        if this.location >= limits.maxVertexInputAttributes {""",
+        """        if this.location >= u32::MAX {""",
+        'vertex_input_past_the_device_does_not_validate',
+    ),
+    (
+        'a vertex attribute binding is not held to the device',
+        'src/venus/driver.rs',
+        """        if this.binding >= limits.maxVertexInputBindings {""",
+        """        if this.binding >= u32::MAX {""",
+        'vertex_input_past_the_device_does_not_validate',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

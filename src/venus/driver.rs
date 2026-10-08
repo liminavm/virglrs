@@ -551,6 +551,9 @@ fn planted_limits() -> VkPhysicalDeviceLimits {
         maxViewports: 16,
         maxColorAttachments: 8,
         maxVertexInputBindings: 32,
+        maxVertexInputAttributes: 32,
+        maxVertexInputBindingStride: 2048,
+        maxVertexInputAttributeOffset: 2047,
         ..Default::default()
     }
 }
@@ -6639,8 +6642,8 @@ impl Driver {
     pub fn cmd_set_vertex_input(
         &self,
         cb: VkCommandBuffer,
-        bindings: cs::Decoded<'_, [VkVertexInputBindingDescription2EXT]>,
-        attributes: cs::Decoded<'_, [VkVertexInputAttributeDescription2EXT]>,
+        bindings: cs::Decoded<'_, [VkVertexInputBindingDescription2EXT], cs::Checked>,
+        attributes: cs::Decoded<'_, [VkVertexInputAttributeDescription2EXT], cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdSetVertexInputEXT()?;
         // SAFETY: as above; each count is its own slice's length.
@@ -10245,6 +10248,46 @@ impl cs::Validate<DeviceFacts<'_>> for VkRenderingInputAttachmentIndexInfo {
     }
 }
 
+/// A vertex binding the device has. The Mesa runtime stores its stride and rate at
+/// `bindings[binding]` and `vi_binding_strides[binding]`, arrays of `maxVertexInputBindings`, and
+/// the stride in sixteen bits; it checks the index and the stride only with asserts.
+impl cs::Validate<DeviceFacts<'_>> for VkVertexInputBindingDescription2EXT {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        if this.binding >= facts.limits.maxVertexInputBindings {
+            return Err("described a vertex binding past the device's last");
+        }
+        if this.stride > facts.limits.maxVertexInputBindingStride {
+            return Err("described a vertex binding stride past the device's limit");
+        }
+        Ok(())
+    }
+}
+
+/// A vertex attribute the device has, read from a binding it has. The Mesa runtime stores it at
+/// `attributes[location]`, an array of `maxVertexInputAttributes`, and later reads the binding it
+/// names out of the bindings array; it checks both indices only with asserts.
+impl cs::Validate<DeviceFacts<'_>> for VkVertexInputAttributeDescription2EXT {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let limits = facts.limits;
+        if this.location >= limits.maxVertexInputAttributes {
+            return Err("described a vertex attribute past the device's last");
+        }
+        if this.binding >= limits.maxVertexInputBindings {
+            return Err("read a vertex attribute from a binding past the device's last");
+        }
+        if this.offset > limits.maxVertexInputAttributeOffset {
+            return Err("read a vertex attribute past the device's offset limit");
+        }
+        Ok(())
+    }
+}
+
 impl cs::Validate<Facts<'_>> for VkSubmitInfo {
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
@@ -10972,6 +11015,57 @@ mod tests {
             arrayLayers: 2,
             ..Default::default()
         }
+    }
+
+    /// A vertex binding or attribute past the device's limits does not validate. The Mesa runtime
+    /// stores each at the index the guest gives, in arrays of `maxVertexInputBindings` and
+    /// `maxVertexInputAttributes`, checked only by asserts a release build compiles out.
+    #[test]
+    fn vertex_input_past_the_device_does_not_validate() {
+        const DEVICE: VkDevice = VkDevice::forged(0x47);
+        const CB: VkCommandBuffer = VkCommandBuffer::forged(0x48);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        let limits = VkPhysicalDeviceLimits {
+            maxVertexInputBindings: 32,
+            maxVertexInputAttributes: 32,
+            maxVertexInputBindingStride: 2048,
+            maxVertexInputAttributeOffset: 2047,
+            ..Default::default()
+        };
+        d.plant_limits(DEVICE, limits);
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x49), &[(CB, ObjectId(50))]);
+        let facts = d.recorder_facts(CB).expect("a planted recorder");
+
+        let binding = |binding: u32, stride: u32| VkVertexInputBindingDescription2EXT {
+            binding,
+            stride,
+            ..Default::default()
+        };
+        let holds = |b: &[VkVertexInputBindingDescription2EXT]| {
+            cs::Decoded::planted(b).validate(&facts).is_ok()
+        };
+        assert!(holds(&[binding(0, 16), binding(31, 2048)]), "the last binding, the widest stride");
+        assert!(!holds(&[binding(0, 16), binding(32, 16)]), "one binding past the last");
+        assert!(!holds(&[binding(u32::MAX, 16)]), "far past it");
+        assert!(!holds(&[binding(0, 2049)]), "a stride past the limit");
+
+        let attribute =
+            |location: u32, binding: u32, offset: u32| VkVertexInputAttributeDescription2EXT {
+                location,
+                binding,
+                offset,
+                ..Default::default()
+            };
+        let holds = |a: &[VkVertexInputAttributeDescription2EXT]| {
+            cs::Decoded::planted(a).validate(&facts).is_ok()
+        };
+        assert!(holds(&[attribute(31, 31, 2047)]), "the last location, binding and offset");
+        assert!(!holds(&[attribute(0, 0, 0), attribute(32, 0, 0)]), "a location past the last");
+        assert!(!holds(&[attribute(0, 32, 0)]), "read from a binding past the last");
+        assert!(!holds(&[attribute(0, 0, 2048)]), "an offset past the limit");
+
+        d.abandon_planted();
     }
 
     /// A rendering struct naming more color attachments than the device has does not validate.

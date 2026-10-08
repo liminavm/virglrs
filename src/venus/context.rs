@@ -2364,7 +2364,7 @@ impl Handlers<'_> {
         info: Decoded<'a, T>,
     ) -> Option<Decoded<'a, T, Checked>>
     where
-        T: for<'d> Validate<driver::DeviceFacts<'d>>,
+        T: ?Sized + for<'d> Validate<driver::DeviceFacts<'d>>,
     {
         let verdict = self.driver.recorder_facts(cb).map(|facts| info.validate(&facts));
         match verdict {
@@ -6121,11 +6121,14 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdSetVertexInputEXT(&mut self, args: &mut vn_command_vkCmdSetVertexInputEXT<'_>) {
         // Two arrays under two counts, as in `vkCmdClearAttachments`; each slice carries its own.
-        let done = self.driver.cmd_set_vertex_input(
-            args.commandBuffer,
-            args.pVertexBindingDescriptions(),
-            args.pVertexAttributeDescriptions(),
-        );
+        let cb = args.commandBuffer;
+        let Some(bindings) = self.checked_for(cb, args.pVertexBindingDescriptions()) else {
+            return;
+        };
+        let Some(attributes) = self.checked_for(cb, args.pVertexAttributeDescriptions()) else {
+            return;
+        };
+        let done = self.driver.cmd_set_vertex_input(cb, bindings, attributes);
         self.recorded(done);
     }
 

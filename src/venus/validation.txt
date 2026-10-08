@@ -159,7 +159,7 @@ vkCmdSetStencilReference                         reviewed
 vkCmdSetStencilTestEnable                        reviewed
 vkCmdSetStencilWriteMask                         reviewed
 vkCmdSetTessellationDomainOriginEXT              reviewed
-vkCmdSetVertexInputEXT                           pending:limits
+vkCmdSetVertexInputEXT                           validated
 vkCmdSetViewport                                 validated
 vkCmdSetViewportWithCount                        validated
 vkCmdTraceRaysIndirect2KHR                       reviewed
