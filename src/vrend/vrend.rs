@@ -7812,6 +7812,75 @@ mod tests {
         }
     }
 
+    /// A geometry stage is offered only where the host draws through one. A desktop context
+    /// reports its version whether or not the driver has the stage: zink on KosmicKrisp without
+    /// `geometryShader` reports GL 4.6 core, compiles a geometry shader, and draws the vertex
+    /// stage's output as though it were not there. Where the stage is offered, a geometry shader
+    /// halving x pulls the harness's full-screen triangle off the left edge; where it is not, the
+    /// shader is refused.
+    #[test]
+    fn a_geometry_stage_is_offered_only_where_the_host_draws_through_one() {
+        use crate::vrend::proto::{Command, Object, ShaderChunk, ShaderCreate, ShaderKind};
+        const GS: &str = "GEOM\nPROPERTY GS_INPUT_PRIMITIVE TRIANGLES\n\
+                          PROPERTY GS_OUTPUT_PRIMITIVE TRIANGLE_STRIP\n\
+                          PROPERTY GS_MAX_OUTPUT_VERTICES 3\nPROPERTY GS_INVOCATIONS 1\n\
+                          DCL IN[][0], POSITION\nDCL OUT[0], POSITION\n\
+                          IMM[0] INT32 { 0, 0, 0, 0 }\nIMM[1] FLT32 { 0.5, 1.0, 1.0, 1.0 }\n  \
+                          0: MUL OUT[0], IN[0][0], IMM[1]\n  1: EMIT IMM[0].xxxx\n  \
+                          2: MUL OUT[0], IN[1][0], IMM[1]\n  3: EMIT IMM[0].xxxx\n  \
+                          4: MUL OUT[0], IN[2][0], IMM[1]\n  5: EMIT IMM[0].xxxx\n  6: END\n";
+        let words = tgsi_words(GS);
+        let gs = ObjectHandle::new(40).expect("non-zero");
+        let more = More {
+            before: vec![
+                Command::CreateObject {
+                    handle: gs,
+                    object: Object::Shader(ShaderCreate {
+                        stage: ShaderStage::Geometry,
+                        chunk: ShaderChunk::New { total_bytes: words.len() as u32 * 4 },
+                        num_tokens: 300,
+                        kind: ShaderKind::Graphics { stream_output: Default::default() },
+                        text: &words,
+                    }),
+                },
+                Command::BindShader { stage: ShaderStage::Geometry, handle: Some(gs) },
+            ],
+            ..Default::default()
+        };
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            let drawn = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(RED_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            });
+            if !host_has(host_gl, Feature::geometry_shader) {
+                assert!(drawn.is_err(), "{host_gl:?}: a geometry shader with no stage: {drawn:?}");
+                eprintln!("{host_gl:?}: no geometry stage offered");
+                continue;
+            }
+            let pixels = drawn
+                .unwrap_or_else(|e| panic!("{host_gl:?}: the geometry stage is offered: {e:?}"))
+                .expect("the target is read back");
+            // The triangle now starts at x = -0.5: the first column of the 16x16 target is
+            // clear, and the triangle covers most of the rest.
+            let texels = pixels.as_chunks::<4>().0;
+            let left_clear = texels.iter().step_by(16).all(|p| p[0] == 0);
+            let red = texels.iter().filter(|p| p[0] == 0xff).count();
+            assert!(
+                left_clear && red >= 128,
+                "{host_gl:?}: the geometry stage is offered, and draws through it: left edge \
+                 clear {left_clear}, {red} red"
+            );
+        }
+    }
+
     /// A texture buffer larger than the host's texel limit is legal GL, and is sized as the limit.
     /// Under a limit of 4, a view of 8 texels -- through a sampler and through an image -- reads
     /// back 4 texels from the shader, where it was refused and the context poisoned.

@@ -372,6 +372,31 @@ impl Features {
                 );
             }
         }
+        self.reconcile_stages(gl);
+    }
+
+    /// A desktop context reports its version whether or not the driver has every stage that
+    /// version names: zink on a Vulkan device without `geometryShader` reports GL 4.6 core,
+    /// compiles a geometry shader, and draws nothing through it. A stage is withdrawn where the
+    /// driver gives it no texture units -- GL 3.2 asks sixteen of a geometry stage, and a stage
+    /// the driver lacks reads zero, where its version-wide limits such as output vertices still
+    /// read their defaults -- so the guest is never offered a stage the host cannot run.
+    fn reconcile_stages(&mut self, gl: &super::gl::Gl) {
+        use super::gl::gles::{
+            GL_MAX_GEOMETRY_TEXTURE_IMAGE_UNITS, GL_MAX_TESS_CONTROL_TEXTURE_IMAGE_UNITS,
+        };
+        for (feature, limit, name) in [
+            (Feature::geometry_shader, GL_MAX_GEOMETRY_TEXTURE_IMAGE_UNITS, "texture units"),
+            (Feature::tessellation, GL_MAX_TESS_CONTROL_TEXTURE_IMAGE_UNITS, "texture units"),
+        ] {
+            if self.have.contains(feature) && gl.get_integer(limit) <= 0 {
+                self.have.remove(feature);
+                eprintln!(
+                    "[virglrs] vrend: {} advertised with no {name}: withdrawn",
+                    feature.name()
+                );
+            }
+        }
     }
 
     pub fn has_extension(&self, name: &str) -> bool {

@@ -3721,6 +3721,13 @@ SABOTAGES = [
         'an_advanced_blend_equation_blends_the_draw',
     ),
     (
+        'a shader stage the driver has no limits for is offered',
+        'src/vrend/features.rs',
+        """            if self.have.contains(feature) && gl.get_integer(limit) <= 0 {""",
+        """            if self.have.contains(feature) && gl.get_integer(limit) < 0 {""",
+        'a_geometry_stage_is_offered_only_where_the_host_draws_through_one',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",
