@@ -59,21 +59,22 @@ use super::proto::types::{
     VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy,
     VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType,
     VkOffset3D, VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo,
-    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceMemoryBudgetPropertiesEXT,
-    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
-    VkPipelineLayout, VkPipelineStageFlagBits, VkPipelineStageFlags, VkPipelineStageFlags2,
-    VkPolygonMode, VkPrimitiveTopology, VkProvokingVertexModeEXT, VkPushConstantsInfo,
-    VkPushDescriptorSetInfo, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
-    VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
-    VkRenderPassBeginInfo, VkRenderingAttachmentLocationInfo, VkRenderingEndInfoKHR,
-    VkRenderingInfo, VkRenderingInputAttachmentIndexInfo, VkResolveImageInfo2, VkResult,
-    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampleMask,
-    VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo,
-    VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo,
-    VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags,
-    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
-    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassBeginInfo, VkSubpassContents,
-    VkSubpassEndInfo, VkTessellationDomainOrigin, VkTimelineSemaphoreSubmitInfo,
+    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceLimits,
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties,
+    VkPhysicalDeviceProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout,
+    VkPipelineStageFlagBits, VkPipelineStageFlags, VkPipelineStageFlags2, VkPolygonMode,
+    VkPrimitiveTopology, VkProvokingVertexModeEXT, VkPushConstantsInfo, VkPushDescriptorSetInfo,
+    VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits,
+    VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo,
+    VkRenderingAttachmentLocationInfo, VkRenderingEndInfoKHR, VkRenderingInfo,
+    VkRenderingInputAttachmentIndexInfo, VkResolveImageInfo2, VkResult, VkRingMonitorInfoMESA,
+    VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampleMask, VkSampler,
+    VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR,
+    VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType,
+    VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule,
+    VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo,
+    VkSubmitInfo2, VkSubpassBeginInfo, VkSubpassContents, VkSubpassEndInfo,
+    VkTessellationDomainOrigin, VkTimelineSemaphoreSubmitInfo,
     VkVertexInputAttributeDescription2EXT, VkVertexInputBindingDescription2EXT, VkViewport,
     VkWriteDescriptorSet,
 };
@@ -528,6 +529,21 @@ pub enum Unrecorded {
     /// The pipeline bound at that point has been destroyed since. Vulkan leaves the command
     /// buffer invalid; the driver would read the freed pipeline's shaders.
     Destroyed,
+}
+
+/// Why a recorded command was refused before the driver saw it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecordRefused {
+    /// The command buffer has no pool record here, or its device does not export the command.
+    NoDevice,
+    /// A value the driver would index or copy by without checking exceeds what the device or
+    /// the objects it names allow; the reason says which.
+    Invalid(&'static str),
+}
+
+/// Whether `bytes` pushed at `offset` lie inside the device's push-constant block.
+fn push_fits(limits: &VkPhysicalDeviceLimits, offset: u32, bytes: usize) -> bool {
+    u64::from(offset) + bytes as u64 <= u64::from(limits.maxPushConstantsSize)
 }
 
 /// Why a run of pool objects was not freed. Neither reached the driver.
@@ -1996,6 +2012,10 @@ struct DeviceState {
     /// Read once at creation for the reason `memory_types` is; the handle queries hold the
     /// guest's room to it.
     group_handles: Option<GroupHandleSizes>,
+    /// The device's limits, read once at creation. A driver indexes fixed arrays by guest values
+    /// these bound -- the push-constant block is `maxPushConstantsSize` bytes in KosmicKrisp --
+    /// and checks none of them, so a command whose values exceed one is refused here.
+    limits: VkPhysicalDeviceLimits,
 }
 
 /// A device's shader group handle sizes, in bytes.
@@ -2529,6 +2549,10 @@ impl Driver {
             .iter()
             .map(|t| t.propertyFlags)
             .collect();
+        let mut properties = VkPhysicalDeviceProperties::default();
+        // SAFETY: `pd` is a handle this instance returned, and `properties` is a local.
+        unsafe { (inst.vkGetPhysicalDeviceProperties())(pd, &mut properties) };
+        let limits = properties.limits;
         let fns = Arc::new(LiveDevice {
             handle: out,
             fns: vulkan::device(inst, out),
@@ -2555,7 +2579,7 @@ impl Driver {
                     capture_replay: rt.shaderGroupHandleCaptureReplaySize,
                 }
             });
-        self.devices.insert(out, DeviceState { fns, memory_types, group_handles });
+        self.devices.insert(out, DeviceState { fns, memory_types, group_handles, limits });
         Ok(out)
     }
 
@@ -4461,8 +4485,21 @@ impl Driver {
         // planted table holds only the entry points its own test needed, and destroying it would
         // call through whichever was left null.
         let fns = Arc::new(LiveDevice { handle, fns, instance: None });
-        self.devices
-            .insert(handle, DeviceState { fns, memory_types: Vec::new(), group_handles: None });
+        self.devices.insert(
+            handle,
+            DeviceState {
+                fns,
+                memory_types: Vec::new(),
+                group_handles: None,
+                limits: VkPhysicalDeviceLimits::default(),
+            },
+        );
+    }
+
+    /// Give a planted device the limits `vkCreateDevice` would have read off the driver.
+    #[cfg(test)]
+    pub(super) fn plant_limits(&mut self, handle: VkDevice, limits: VkPhysicalDeviceLimits) {
+        self.devices.get_mut(&handle).expect("a planted device").limits = limits;
     }
 
     /// Give a planted device the shader group handle sizes `vkCreateDevice` would have read off a
@@ -4885,6 +4922,11 @@ impl Driver {
     /// answer for the case where the two disagree -- so it is a rejection and never an assert.
     fn recorder(&self, cb: VkCommandBuffer) -> Option<&DeviceFns> {
         self.devices.get(&self.pools.device_of(cb)?).map(|d| &d.fns.fns)
+    }
+
+    /// The limits of the device `cb` records for, for the commands that are held to them.
+    fn recorder_limits(&self, cb: VkCommandBuffer) -> Option<&VkPhysicalDeviceLimits> {
+        self.devices.get(&self.pools.device_of(cb)?).map(|d| &d.limits)
     }
 
     /// [`Driver::recorder`] for a draw, dispatch or trace: the entry points only if the
@@ -5772,15 +5814,30 @@ impl Driver {
     }
 
     /// See [`Driver::cmd_push_descriptor_set2`].
+    ///
+    /// Held to the device's push block as [`Driver::cmd_push_constants`] is.
     pub fn cmd_push_constants2(
         &self,
         cb: VkCommandBuffer,
         info: cs::Decoded<'_, VkPushConstantsInfo>,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdPushConstants2()?;
-        // SAFETY: as `cmd_push_descriptor_set2`.
+    ) -> Result<(), RecordRefused> {
+        let limits = self.recorder_limits(cb).ok_or(RecordRefused::NoDevice)?;
+        // The decoder sized `pValues` by `size`, or left it null when the guest sent no bytes.
+        let carried = if info.pValues.is_null() { 0 } else { info.size as usize };
+        if carried != info.size as usize {
+            return Err(RecordRefused::Invalid("pushed constants without saying what they are"));
+        }
+        if !push_fits(limits, info.offset, carried) {
+            return Err(RecordRefused::Invalid("pushed constants past the device's push block"));
+        }
+        let f = self
+            .recorder(cb)
+            .ok_or(RecordRefused::NoDevice)?
+            .try_vkCmdPushConstants2()
+            .ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as `cmd_push_descriptor_set2`; the range was held to the push block above.
         unsafe { f(cb, info.get()) };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_bind_index_buffer(
@@ -7013,6 +7070,9 @@ impl Driver {
     /// The guest sends both, and the decoder has already lengthened the slice from the guest's
     /// `size`. Taking the slice and re-deriving the count from it is what keeps a later edit from
     /// reintroducing a size that disagrees with the buffer it measures.
+    ///
+    /// Held to the device's `maxPushConstantsSize`: the driver copies the bytes to `offset` in a
+    /// block of that many bytes and checks neither. See [`push_fits`].
     pub fn cmd_push_constants(
         &self,
         cb: VkCommandBuffer,
@@ -7020,8 +7080,12 @@ impl Driver {
         stages: VkShaderStageFlags,
         offset: u32,
         values: &[u8],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), RecordRefused> {
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        let limits = self.recorder_limits(cb).ok_or(RecordRefused::NoDevice)?;
+        if !push_fits(limits, offset, values.len()) {
+            return Err(RecordRefused::Invalid("pushed constants past the device's push block"));
+        }
         // SAFETY: as above; the size is the slice's own length in bytes.
         unsafe {
             (d.vkCmdPushConstants())(
@@ -7033,7 +7097,7 @@ impl Driver {
                 values.as_ptr().cast(),
             )
         };
-        Some(())
+        Ok(())
     }
 
     // The query commands. Each names queries by index, and each is held to the pool's record
@@ -10765,6 +10829,81 @@ mod tests {
             arrayLayers: 2,
             ..Default::default()
         }
+    }
+
+    /// Constants pushed past the device's push block are refused before the driver sees them.
+    /// KosmicKrisp copies the bytes to the guest's offset in a block of `maxPushConstantsSize`
+    /// bytes inside the command buffer's state and checks neither, so an offset was a write
+    /// anywhere after that block, of bytes the guest chose.
+    #[test]
+    fn constants_pushed_past_the_push_block_are_refused_before_the_driver() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const DEVICE: VkDevice = VkDevice::forged(0x14);
+        const CB: VkCommandBuffer = VkCommandBuffer::forged(0x15);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn push(
+            _cb: VkCommandBuffer,
+            _layout: VkPipelineLayout,
+            _stages: VkShaderStageFlags,
+            _offset: u32,
+            _size: u32,
+            _values: *const core::ffi::c_void,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn push2(_cb: VkCommandBuffer, _info: *const VkPushConstantsInfo) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdPushConstants(push);
+        fns.plant_vkCmdPushConstants2(push2);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.plant_limits(
+            DEVICE,
+            VkPhysicalDeviceLimits { maxPushConstantsSize: 256, ..Default::default() },
+        );
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x16), &[(CB, ObjectId(17))]);
+
+        let bytes = [0u8; 32];
+        let calls = |f: &dyn Fn() -> Result<(), RecordRefused>| {
+            let before = CALLS.load(Ordering::SeqCst);
+            let got = f();
+            (got, CALLS.load(Ordering::SeqCst) - before)
+        };
+        let v1 = |offset, size: usize| {
+            calls(&|| {
+                d.cmd_push_constants(
+                    CB,
+                    VkPipelineLayout::NULL,
+                    VkShaderStageFlags(0),
+                    offset,
+                    &bytes[..size],
+                )
+            })
+        };
+        assert_eq!(v1(240, 16), (Ok(()), 1), "the last sixteen bytes of the block");
+        assert!(matches!(v1(240, 17), (Err(RecordRefused::Invalid(_)), 0)), "one byte past it");
+        assert!(
+            matches!(v1(u32::MAX, 1), (Err(RecordRefused::Invalid(_)), 0)),
+            "an offset far past"
+        );
+
+        let v2 = |offset, size: u32, values: *const core::ffi::c_void| {
+            let info = VkPushConstantsInfo { offset, size, pValues: values, ..Default::default() };
+            calls(&|| d.cmd_push_constants2(CB, cs::Decoded::planted(&info)))
+        };
+        let values = bytes.as_ptr().cast();
+        assert_eq!(v2(0, 32, values), (Ok(()), 1), "the synchronization2-era form, inside");
+        assert!(matches!(v2(250, 8, values), (Err(RecordRefused::Invalid(_)), 0)), "and past");
+        assert!(
+            matches!(v2(0, 8, core::ptr::null()), (Err(RecordRefused::Invalid(_)), 0)),
+            "a size with no bytes behind it"
+        );
+
+        d.abandon_planted();
     }
 
     /// A host image copy is measured before the driver sees it. KosmicKrisp copies the guest's

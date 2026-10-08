@@ -2355,6 +2355,15 @@ impl Handlers<'_> {
         self.reject("recorded into a command buffer with no device behind it");
     }
 
+    /// The verdict on a command held to its device's limits: see [`driver::RecordRefused`].
+    fn held(&mut self, done: Result<(), driver::RecordRefused>) {
+        match done {
+            Ok(()) => {}
+            Err(driver::RecordRefused::NoDevice) => self.no_recorder(),
+            Err(driver::RecordRefused::Invalid(why)) => self.reject(why),
+        }
+    }
+
     /// The verdict on a draw, dispatch or trace: see [`driver::Unrecorded`].
     fn drawn(&mut self, done: Result<(), driver::Unrecorded>) {
         match done {
@@ -5790,7 +5799,7 @@ impl Commands for Handlers<'_> {
     fn vkCmdPushConstants2(&mut self, args: &mut vn_command_vkCmdPushConstants2<'_>) {
         let Some(info) = self.names(args.pPushConstantsInfo) else { return };
         let done = self.driver.cmd_push_constants2(args.commandBuffer, info);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdDrawMultiEXT(&mut self, args: &mut vn_command_vkCmdDrawMultiEXT<'_>) {
@@ -6457,7 +6466,7 @@ impl Commands for Handlers<'_> {
             args.offset,
             values,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdBeginQuery(&mut self, args: &mut vn_command_vkCmdBeginQuery<'_>) {
@@ -13363,6 +13372,13 @@ mod tests {
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_limits(
+            VkDevice::forged(DEVICE),
+            super::super::proto::types::VkPhysicalDeviceLimits {
+                maxPushConstantsSize: 256,
+                ..Default::default()
+            },
+        );
         driver.plant_pool(
             VkDevice::forged(DEVICE),
             VkCommandPool::forged(POOL),
@@ -13890,6 +13906,13 @@ mod tests {
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_limits(
+            VkDevice::forged(DEVICE),
+            super::super::proto::types::VkPhysicalDeviceLimits {
+                maxPushConstantsSize: 256,
+                ..Default::default()
+            },
+        );
         driver.plant_pool(
             VkDevice::forged(DEVICE),
             VkCommandPool::forged(POOL),
@@ -17082,6 +17105,13 @@ mod tests {
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_limits(
+            VkDevice::forged(DEVICE),
+            super::super::proto::types::VkPhysicalDeviceLimits {
+                maxPushConstantsSize: 256,
+                ..Default::default()
+            },
+        );
         driver.plant_pool(
             VkDevice::forged(DEVICE),
             VkCommandPool::forged(POOL),
@@ -21480,6 +21510,13 @@ mod tests {
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_limits(
+            VkDevice::forged(DEVICE),
+            super::super::proto::types::VkPhysicalDeviceLimits {
+                maxPushConstantsSize: 256,
+                ..Default::default()
+            },
+        );
         driver.plant_pool(
             VkDevice::forged(DEVICE),
             VkCommandPool::forged(POOL),

@@ -3786,6 +3786,20 @@ SABOTAGES = [
         'a_host_copy_that_does_not_fit_is_refused_before_the_driver',
     ),
     (
+        'constants may be pushed past the device push block',
+        'src/venus/driver.rs',
+        """    u64::from(offset) + bytes as u64 <= u64::from(limits.maxPushConstantsSize)""",
+        """    u64::from(offset) + bytes as u64 <= u64::MAX""",
+        'constants_pushed_past_the_push_block_are_refused_before_the_driver',
+    ),
+    (
+        'a push2 size is trusted with no bytes behind it',
+        'src/venus/driver.rs',
+        """        if carried != info.size as usize {""",
+        """        if false && carried != info.size as usize {""",
+        'constants_pushed_past_the_push_block_are_refused_before_the_driver',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",
