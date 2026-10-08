@@ -22,7 +22,7 @@ use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Decoded, Guest, HostHandle, ObjectId, guest_face};
 use super::driver::{
     self, Answered, Driver, DriverWait, ExportError, Exported, InFlight, Level, MemoryError,
-    NoSubmit, NoSubmit2, NoSyncFd, NotATimeline, XfbCounters,
+    NoHostCopy, NoSubmit, NoSubmit2, NoSyncFd, NotATimeline, XfbCounters,
 };
 use super::driver::{GroupHandle, ShaderBindingTables};
 use super::journal::{self, Journal, Owner, Recording, Seq};
@@ -5951,20 +5951,18 @@ impl Commands for Handlers<'_> {
             self.reject("read an image out without room for the bytes");
             return;
         };
-        let Some(ret) = self.driver.copy_image_to_memory(device, info, out) else {
-            self.reject("read an image out on a device it does not have");
-            return;
-        };
-        args.ret = ret;
+        match self.driver.copy_image_to_memory(device, info, out) {
+            Ok(ret) => args.ret = ret,
+            Err(no) => self.reject(host_copy_refusal(no)),
+        }
     }
 
     fn vkCopyMemoryToImageMESA(&mut self, args: &mut vn_command_vkCopyMemoryToImageMESA<'_>) {
         let Some(info) = self.names(args.pCopyMemoryToImageInfo) else { return };
-        let Some(ret) = self.driver.copy_memory_to_image(args.device, info) else {
-            self.reject("wrote into an image on a device it does not have");
-            return;
-        };
-        args.ret = ret;
+        match self.driver.copy_memory_to_image(args.device, info) {
+            Ok(ret) => args.ret = ret,
+            Err(no) => self.reject(host_copy_refusal(no)),
+        }
     }
 
     fn vkCmdBlitImage(&mut self, args: &mut vn_command_vkCmdBlitImage<'_>) {
@@ -6935,6 +6933,15 @@ impl Commands for Handlers<'_> {
         }
         let done = self.driver.import_signaled_semaphore(args.device, info.semaphore);
         self.synced("vkImportSemaphoreResourceMESA", done);
+    }
+}
+
+/// Why a host image copy the driver refused to forward poisons the context.
+fn host_copy_refusal(no: NoHostCopy) -> &'static str {
+    match no {
+        NoHostCopy::Device => "a host image copy on a device it does not have",
+        NoHostCopy::EntryPoint => "a host image copy on a device that exports none",
+        NoHostCopy::Region(why) => why,
     }
 }
 

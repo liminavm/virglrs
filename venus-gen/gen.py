@@ -156,6 +156,65 @@ def check_template_engine(Template):
             % (mako.__version__, probe, got))
 
 
+def texel_blocks(vk_xml):
+    """`formats.rs`: each format's texel block as a host image copy lays it out in memory.
+
+    Read from the registry's `<formats>` rather than kept as a table here, so the sizes are the
+    pinned vk.xml's and cannot drift from the `VkFormat` values the wire carries. A format with a
+    three-dimensional block extent is left out, so a copy of one is refused rather than sized
+    wrong.
+    """
+    root = ET.parse(vk_xml).getroot()
+    colour, depth, stencil, planes = [], [], [], []
+    for f in root.iter('format'):
+        name = f.get('name')
+        extent = [int(x) for x in (f.get('blockExtent') or '1,1,1').split(',')]
+        if extent[2] == 1:
+            colour.append((name, int(f.get('blockSize')), extent[0], extent[1]))
+        for c in f.iter('component'):
+            # The Depth/Stencil Aspect Copy table: a depth aspect is copied as four bytes
+            # unless it is sixteen bits, and a stencil aspect as one.
+            if c.get('name') == 'D':
+                depth.append((name, 2 if c.get('bits') == '16' else 4))
+            if c.get('name') == 'S':
+                stencil.append(name)
+        for pl in f.iter('plane'):
+            planes.append((name, int(pl.get('index')), pl.get('compatible'),
+                           int(pl.get('widthDivisor')), int(pl.get('heightDivisor'))))
+    assert colour and depth and stencil and planes, 'no <formats> in %s' % vk_xml
+
+    out = ['use super::types::VkFormat;', '',
+           '/// One texel block of a format, as a host image copy lays it out in memory.',
+           '#[derive(Clone, Copy, PartialEq, Eq, Debug)]',
+           'pub struct TexelBlock {',
+           '    pub bytes: u32,',
+           '    pub width: u32,',
+           '    pub height: u32,',
+           '}', '',
+           '/// The block of `format` copied whole, or `None` for a format vk.xml does not list.',
+           'pub fn texel_block(format: VkFormat) -> Option<TexelBlock> {',
+           '    let (bytes, width, height) = match format {']
+    out += ['        VkFormat::%s => (%d, %d, %d),' % c for c in colour]
+    out += ['        _ => return None,', '    };',
+            '    Some(TexelBlock { bytes, width, height })', '}', '',
+            '/// The bytes of one texel of `format`\'s depth aspect alone, if it has one.',
+            'pub fn depth_texel_bytes(format: VkFormat) -> Option<u32> {',
+            '    match format {']
+    out += ['        VkFormat::%s => Some(%d),' % d for d in depth]
+    out += ['        _ => None,', '    }', '}', '',
+            '/// Whether `format` has a stencil aspect, which a copy lays out as one byte a texel.',
+            'pub fn has_stencil(format: VkFormat) -> bool {',
+            '    matches!(format, %s)' % ' | '.join('VkFormat::%s' % n for n in stencil),
+            '}', '',
+            '/// A plane of a multi-planar `format`: the format it is copied as, and how many of the',
+            '/// image\'s texels each of its texels spans across and down.',
+            'pub fn plane_of(format: VkFormat, plane: u32) -> Option<(VkFormat, u32, u32)> {',
+            '    match (format, plane) {']
+    out += ['        (VkFormat::%s, %d) => Some((VkFormat::%s, %d, %d)),' % p for p in planes]
+    out += ['        _ => None,', '    }', '}', '']
+    return '\n'.join(out)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--outdir', required=True, help='Where to write the .rs files.')
@@ -198,6 +257,8 @@ def main():
                             output_encoding='utf-8')
         body = template.render(GEN=gen, RUST=rust, VkType=VkType)
         (outdir / name).write_bytes(banner.encode() + body)
+
+    (outdir / 'formats.rs').write_bytes(banner.encode() + texel_blocks(vk_xml).encode())
 
     (outdir / 'info.rs').write_bytes(
         banner.encode() + rust.render_info(vn_protocol).encode())

@@ -42,6 +42,12 @@ pub mod serialize {
     include!(concat!(env!("OUT_DIR"), "/venus/serialize.rs"));
 }
 
+/// Each format's texel block as a host image copy lays it out, from the same vk.xml.
+#[allow(dead_code)]
+pub mod formats {
+    include!(concat!(env!("OUT_DIR"), "/venus/formats.rs"));
+}
+
 /// What this build tells a guest it speaks: the wire format version, the vk.xml it was generated
 /// from, and the extension table the venus capset's bitmask is built out of.
 pub mod info {

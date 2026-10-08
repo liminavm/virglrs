@@ -41,7 +41,7 @@ use super::proto::types::{
     VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
     VkDeviceAddress, VkDeviceCreateInfo, VkDeviceGroupSubmitInfo, VkDeviceMemory,
     VkDeviceQueueInfo2, VkDeviceQueueTimelineInfoMESA, VkDeviceSize, VkEvent,
-    VkExportMemoryAllocateInfo, VkExtensionProperties, VkExtent2D,
+    VkExportMemoryAllocateInfo, VkExtensionProperties, VkExtent2D, VkExtent3D,
     VkExternalFenceHandleTypeFlagBits, VkExternalImageFormatProperties,
     VkExternalMemoryFeatureFlagBits, VkExternalMemoryFeatureFlags,
     VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryHandleTypeFlags,
@@ -51,30 +51,31 @@ use super::proto::types::{
     VkFrontFace, VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlags, VkImageBlit,
     VkImageCopy, VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties,
     VkImageFormatProperties2, VkImageLayout, VkImageMemoryBarrier, VkImageResolve,
-    VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy, VkImageType, VkImageUsageFlags,
-    VkImageView, VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA,
-    VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance, VkInstanceCreateInfo,
-    VkLineRasterizationMode, VkLogicOp, VkMemoryAllocateInfo, VkMemoryBarrier,
-    VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags, VkMemoryPropertyFlagBits,
+    VkImageSubresourceLayers, VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy,
+    VkImageType, VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
+    VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance,
+    VkInstanceCreateInfo, VkLineRasterizationMode, VkLogicOp, VkMemoryAllocateInfo,
+    VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags, VkMemoryPropertyFlagBits,
     VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy,
     VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType,
-    VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo, VkPhysicalDeviceImageFormatInfo2,
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties, VkPipeline,
-    VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
-    VkPipelineStageFlags, VkPipelineStageFlags2, VkPolygonMode, VkPrimitiveTopology,
-    VkProvokingVertexModeEXT, VkPushConstantsInfo, VkPushDescriptorSetInfo, VkQueryControlFlags,
-    VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType,
-    VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingAttachmentLocationInfo,
-    VkRenderingEndInfoKHR, VkRenderingInfo, VkRenderingInputAttachmentIndexInfo,
-    VkResolveImageInfo2, VkResult, VkRingMonitorInfoMESA, VkSampleCountFlagBits,
-    VkSampleLocationsInfoEXT, VkSampleMask, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
-    VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
-    VkSemaphoreSignalInfo, VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
-    VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags,
-    VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo, VkSubmitInfo2,
-    VkSubpassBeginInfo, VkSubpassContents, VkSubpassEndInfo, VkTessellationDomainOrigin,
-    VkTimelineSemaphoreSubmitInfo, VkVertexInputAttributeDescription2EXT,
-    VkVertexInputBindingDescription2EXT, VkViewport, VkWriteDescriptorSet,
+    VkOffset3D, VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo,
+    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceMemoryBudgetPropertiesEXT,
+    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
+    VkPipelineLayout, VkPipelineStageFlagBits, VkPipelineStageFlags, VkPipelineStageFlags2,
+    VkPolygonMode, VkPrimitiveTopology, VkProvokingVertexModeEXT, VkPushConstantsInfo,
+    VkPushDescriptorSetInfo, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
+    VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
+    VkRenderPassBeginInfo, VkRenderingAttachmentLocationInfo, VkRenderingEndInfoKHR,
+    VkRenderingInfo, VkRenderingInputAttachmentIndexInfo, VkResolveImageInfo2, VkResult,
+    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampleLocationsInfoEXT, VkSampleMask,
+    VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo,
+    VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo,
+    VkSemaphoreSubmitInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitFlags,
+    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
+    VkStructureType, VkSubmitInfo, VkSubmitInfo2, VkSubpassBeginInfo, VkSubpassContents,
+    VkSubpassEndInfo, VkTessellationDomainOrigin, VkTimelineSemaphoreSubmitInfo,
+    VkVertexInputAttributeDescription2EXT, VkVertexInputBindingDescription2EXT, VkViewport,
+    VkWriteDescriptorSet,
 };
 use super::proto::types::{
     VkComputePipelineCreateInfo, VkDeferredOperationKHR, VkGraphicsPipelineCreateInfo,
@@ -3365,13 +3366,30 @@ impl Driver {
     /// a multi-region copy would need the guest to say how the regions divide it. `out` is the
     /// reply's own storage, and its length -- not a number the guest sent beside it -- is what
     /// bounds what the driver writes.
+    ///
+    /// The driver writes every byte the region spans, and bounds none of them: so the span is
+    /// measured here, against `out` and against the image, before the driver is called. See
+    /// [`Driver::host_copy_span`].
     pub fn copy_image_to_memory(
         &self,
         device: VkDevice,
         info: cs::Decoded<'_, VkCopyImageToMemoryInfoMESA>,
         out: &mut [u8],
-    ) -> Option<VkResult> {
-        let d = &self.devices.get(&device)?.fns;
+    ) -> Result<VkResult, NoHostCopy> {
+        let d = &self.devices.get(&device).ok_or(NoHostCopy::Device)?.fns;
+        let span = self.host_copy_span(
+            info.srcImage,
+            &HostCopyRegion {
+                subresource: info.imageSubresource,
+                offset: info.imageOffset,
+                extent: info.imageExtent,
+                row_length: info.memoryRowLength,
+                image_height: info.memoryImageHeight,
+            },
+        )?;
+        if span > out.len() as u64 {
+            return Err(NoHostCopy::Region("an image read out larger than the room for it"));
+        }
         let region = VkImageToMemoryCopy {
             sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY,
             pNext: core::ptr::null(),
@@ -3392,12 +3410,11 @@ impl Driver {
             pRegions: &region,
         };
         // SAFETY: a device in this table; `region` and `local` live to the end of this call, and
-        // `pHostPointer` addresses `out`, which the caller owns for the same span. The extent the
-        // driver writes is the guest's, and it is the guest's own reply blob it writes into --
-        // an extent larger than the blob is the guest overrunning its own buffer, which the
-        // driver rejects against the image rather than us guessing at a byte count.
-        let f = d.try_vkCopyImageToMemory()?;
-        Some(unsafe { f(device, &local) })
+        // `pHostPointer` addresses `out`, which the caller owns for the same span. The driver
+        // writes the region's span from there and checks it against nothing, so the span was
+        // measured against `out` and the region against the image above.
+        let f = d.try_vkCopyImageToMemory().ok_or(NoHostCopy::EntryPoint)?;
+        Ok(unsafe { f(device, &local) })
     }
 
     /// `vkCopyMemoryToImageMESA`: write the regions the guest sent into an image.
@@ -3411,12 +3428,15 @@ impl Driver {
     /// *struct* member, only over a command's. Walking it here keeps the handler free of the
     /// pointer, which is the rule; the decoder is what reconciled `regionCount` with it, and it
     /// is the only thing that could.
+    ///
+    /// Each region's span is measured against the bytes it carried and against the image, as
+    /// the read's is: the driver reads the span and checks it against nothing.
     pub fn copy_memory_to_image(
         &self,
         device: VkDevice,
         info: cs::Decoded<'_, VkCopyMemoryToImageInfoMESA>,
-    ) -> Option<VkResult> {
-        let d = &self.devices.get(&device)?.fns;
+    ) -> Result<VkResult, NoHostCopy> {
+        let d = &self.devices.get(&device).ok_or(NoHostCopy::Device)?.fns;
         // SAFETY: the decoder allocated `regionCount` regions from the batch arena and wrote
         // `pRegions` from that allocation, so the pair agrees by construction and the arena
         // outlives this call. A null pointer with a nonzero count cannot reach here -- the
@@ -3426,22 +3446,36 @@ impl Driver {
         } else {
             unsafe { core::slice::from_raw_parts(info.pRegions, info.regionCount as usize) }
         };
-        let local: Vec<VkMemoryToImageCopy> = regions
-            .iter()
-            .map(|r| VkMemoryToImageCopy {
+        let mut local: Vec<VkMemoryToImageCopy> = Vec::with_capacity(regions.len());
+        for r in regions {
+            let span = self.host_copy_span(
+                info.dstImage,
+                &HostCopyRegion {
+                    subresource: r.imageSubresource,
+                    offset: r.imageOffset,
+                    extent: r.imageExtent,
+                    row_length: r.memoryRowLength,
+                    image_height: r.memoryImageHeight,
+                },
+            )?;
+            // `dataSize` is the decoder's own count for the bytes the region carried, and a
+            // region that carried none has nothing behind `pData` whatever the count says.
+            let carried = if r.pData.is_null() { 0 } else { r.dataSize as u64 };
+            if span > carried {
+                return Err(NoHostCopy::Region("an image written from fewer bytes than it spans"));
+            }
+            local.push(VkMemoryToImageCopy {
                 sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY,
                 pNext: core::ptr::null(),
                 // The bytes the region carried on the wire, at the address the decoder put them.
-                // `dataSize` is the decoder's own count for that allocation, not a second number
-                // the guest sent, so there is nothing here for the two to disagree about.
                 pHostPointer: r.pData,
                 memoryRowLength: r.memoryRowLength,
                 memoryImageHeight: r.memoryImageHeight,
                 imageSubresource: r.imageSubresource,
                 imageOffset: r.imageOffset,
                 imageExtent: r.imageExtent,
-            })
-            .collect();
+            });
+        }
         let local_info = VkCopyMemoryToImageInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO,
             pNext: core::ptr::null(),
@@ -3452,9 +3486,111 @@ impl Driver {
             pRegions: local.as_ptr(),
         };
         // SAFETY: a device in this table; `local` and every arena allocation it points into
-        // outlive the call, and the count the driver is told is `local`'s own length.
-        let f = d.try_vkCopyMemoryToImage()?;
-        Some(unsafe { f(device, &local_info) })
+        // outlive the call, and the count the driver is told is `local`'s own length. Each
+        // region's span was measured against the bytes it carried and the image above.
+        let f = d.try_vkCopyMemoryToImage().ok_or(NoHostCopy::EntryPoint)?;
+        Ok(unsafe { f(device, &local_info) })
+    }
+
+    /// The bytes of host memory a host image copy region spans, once the region is checked
+    /// against the image it names.
+    ///
+    /// The driver walks the region slice by slice and row by row through host memory and bounds
+    /// none of it -- KosmicKrisp copies the guest's extent into whatever pointer it is handed --
+    /// so the span is measured here, the way the guest's venus driver measures it to size the
+    /// blob: the last row of the last slice of the last layer, and nothing past it. The region
+    /// must also lie inside the image, because the driver does not check that either. An image
+    /// this driver has no record of, a format vk.xml gives no block for, and an aspect the
+    /// format does not have are each refused rather than guessed at.
+    fn host_copy_span(&self, image: VkImage, r: &HostCopyRegion) -> Result<u64, NoHostCopy> {
+        use crate::venus::proto::formats;
+        const DEPTH: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT.0 as u32;
+        const STENCIL: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_STENCIL_BIT.0 as u32;
+        const PLANES: [u32; 3] = [
+            VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_0_BIT.0 as u32,
+            VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_1_BIT.0 as u32,
+            VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_2_BIT.0 as u32,
+        ];
+        let bad = |why| Err(NoHostCopy::Region(why));
+        let Some(facts) = self.images.get(&image) else {
+            return bad("a host copy of an image this device never made");
+        };
+
+        // The block the copy lays out, and the size of the plane it walks, as the driver picks
+        // them: a lone depth or stencil aspect is copied as that aspect alone, a plane as its
+        // own format at its own size, and anything else as the whole format.
+        let aspect = r.subresource.aspectMask.0;
+        let (block, plane_w, plane_h) = if aspect == DEPTH {
+            let Some(bytes) = formats::depth_texel_bytes(facts.format) else {
+                return bad("a host copy of the depth of a format with none");
+            };
+            (formats::TexelBlock { bytes, width: 1, height: 1 }, facts.width, facts.height)
+        } else if aspect == STENCIL {
+            if !formats::has_stencil(facts.format) {
+                return bad("a host copy of the stencil of a format with none");
+            }
+            (formats::TexelBlock { bytes: 1, width: 1, height: 1 }, facts.width, facts.height)
+        } else if let Some(i) = PLANES.iter().position(|&p| p == aspect) {
+            let Some((format, w, h)) = formats::plane_of(facts.format, i as u32) else {
+                return bad("a host copy of a plane the format does not have");
+            };
+            let Some(block) = formats::texel_block(format) else {
+                return bad("a host copy of a plane whose format has no block");
+            };
+            (block, facts.width / w, facts.height / h)
+        } else {
+            let Some(block) = formats::texel_block(facts.format) else {
+                return bad("a host copy of a format with no block");
+            };
+            (block, facts.width, facts.height)
+        };
+
+        let level = r.subresource.mipLevel;
+        if level >= facts.mip_levels {
+            return bad("a host copy of a mip level the image does not have");
+        }
+        let base = r.subresource.baseArrayLayer;
+        let layers = if r.subresource.layerCount == u32::MAX {
+            facts.array_layers.saturating_sub(base)
+        } else {
+            r.subresource.layerCount
+        };
+        if layers == 0 || base.checked_add(layers).is_none_or(|end| end > facts.array_layers) {
+            return bad("a host copy of layers the image does not have");
+        }
+
+        // The region against the level it names, in each dimension.
+        let at_level = |size: u32| (size >> level).max(1);
+        let inside = |offset: i32, extent: u32, size: u32| {
+            u32::try_from(offset)
+                .ok()
+                .and_then(|o| o.checked_add(extent))
+                .is_some_and(|end| extent > 0 && end <= at_level(size))
+        };
+        let e = r.extent;
+        if !inside(r.offset.x, e.width, plane_w)
+            || !inside(r.offset.y, e.height, plane_h)
+            || !inside(r.offset.z, e.depth, facts.depth)
+        {
+            return bad("a host copy region outside the image");
+        }
+        let row_length = if r.row_length == 0 { e.width } else { r.row_length };
+        let image_height = if r.image_height == 0 { e.height } else { r.image_height };
+        if row_length < e.width || image_height < e.height {
+            return bad("a host copy whose memory rows are shorter than its region");
+        }
+
+        // The guest's own measure: whole rows, slices and layers up to the last, then the last
+        // row's own width. In u64, where none of it can wrap from u32 inputs.
+        let (bw, bh, bs) =
+            (u64::from(block.width), u64::from(block.height), u64::from(block.bytes));
+        let row = u64::from(row_length).div_ceil(bw) * bs;
+        let slice = u64::from(image_height).div_ceil(bh) * row;
+        let layer = u64::from(e.depth) * slice;
+        Ok((u64::from(layers) - 1) * layer
+            + (u64::from(e.depth) - 1) * slice
+            + (u64::from(e.height).div_ceil(bh) - 1) * row
+            + u64::from(e.width).div_ceil(bw) * bs)
     }
 
     /// Fold `srcs` into `dst`. The handles are the guest's names already resolved to the
@@ -8390,6 +8526,9 @@ impl Driver {
             ImageFacts {
                 width: info.extent.width,
                 height: info.extent.height,
+                depth: info.extent.depth,
+                mip_levels: info.mipLevels,
+                array_layers: info.arrayLayers,
                 format: info.format,
                 tiling: info.tiling,
                 claim: claim_of(info),
@@ -8956,6 +9095,9 @@ enum Scanout {
 struct ImageFacts {
     width: u32,
     height: u32,
+    depth: u32,
+    mip_levels: u32,
+    array_layers: u32,
     format: VkFormat,
     /// As the driver was told to lay it out -- after [`external_images_are_linear`], not before.
     tiling: VkImageTiling,
@@ -9927,6 +10069,28 @@ pub enum NotATimeline {
     Malformed,
 }
 
+/// One region of a host image copy, in the shape both directions share.
+struct HostCopyRegion {
+    subresource: VkImageSubresourceLayers,
+    offset: VkOffset3D,
+    extent: VkExtent3D,
+    row_length: u32,
+    image_height: u32,
+}
+
+/// Why a host image copy was refused without being forwarded. The guest's own doing and not a
+/// `VkResult`, so the caller poisons the context rather than answering.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NoHostCopy {
+    /// A device this context does not have.
+    Device,
+    /// The device exports no host image copy entry point.
+    EntryPoint,
+    /// The region does not fit the image it names, or the memory it is copied through; the
+    /// reason says which.
+    Region(&'static str),
+}
+
 /// Why a `vkQueueSubmit` was refused without being forwarded. The guest's own doing and not a
 /// `VkResult`, so the caller poisons the context rather than answering.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -10590,6 +10754,152 @@ mod tests {
             .collect()
     }
 
+    /// The image the host-copy tests copy through: 64 by 64 texels of one byte, with two mip
+    /// levels and two layers.
+    fn host_copy_image() -> VkImageCreateInfo {
+        VkImageCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            format: VkFormat::VK_FORMAT_R8_UNORM,
+            extent: VkExtent3D { width: 64, height: 64, depth: 1 },
+            mipLevels: 2,
+            arrayLayers: 2,
+            ..Default::default()
+        }
+    }
+
+    /// A host image copy is measured before the driver sees it. KosmicKrisp copies the guest's
+    /// region into the pointer it is handed and bounds nothing, and for a read that pointer is
+    /// this renderer's own reply buffer: a region larger than the buffer wrote past it, and a
+    /// write's region larger than the bytes it carried read past them into a guest-visible
+    /// image. So is a region outside the image, which the driver does not check either.
+    #[test]
+    fn a_host_copy_that_does_not_fit_is_refused_before_the_driver() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const DEVICE: VkDevice = VkDevice::forged(0x13);
+        const IMAGE: VkImage = VkImage::forged(0x24);
+        const UNKNOWN: VkImage = VkImage::forged(0x25);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn to_memory(
+            _d: VkDevice,
+            _i: *const VkCopyImageToMemoryInfo,
+        ) -> VkResult {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn to_image(
+            _d: VkDevice,
+            _i: *const VkCopyMemoryToImageInfo,
+        ) -> VkResult {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn wait_idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCopyImageToMemory(to_memory);
+        fns.plant_vkCopyMemoryToImage(to_image);
+        fns.plant_vkDeviceWaitIdle(wait_idle);
+        fns.plant_vkDestroyDevice(destroy_device);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.note_image(IMAGE, &host_copy_image());
+
+        let layers = |base, count| VkImageSubresourceLayers {
+            aspectMask: VkImageAspectFlags(
+                VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32,
+            ),
+            mipLevel: 0,
+            baseArrayLayer: base,
+            layerCount: count,
+        };
+        let read = |image, sub, x, w, h| VkCopyImageToMemoryInfoMESA {
+            srcImage: image,
+            imageSubresource: sub,
+            imageOffset: VkOffset3D { x, y: 0, z: 0 },
+            imageExtent: VkExtent3D { width: w, height: h, depth: 1 },
+            ..Default::default()
+        };
+        let mut out = [0u8; 4096];
+        let mut read_into = |info: &VkCopyImageToMemoryInfoMESA, room: usize| {
+            let before = CALLS.load(Ordering::SeqCst);
+            let got = d.copy_image_to_memory(DEVICE, cs::Decoded::planted(info), &mut out[..room]);
+            (got, CALLS.load(Ordering::SeqCst) - before)
+        };
+
+        // 16 by 16 of one byte is 256 bytes, and with that much room it goes through.
+        let fits = read(IMAGE, layers(0, 1), 0, 16, 16);
+        assert_eq!(read_into(&fits, 256), (Ok(VkResult::VK_SUCCESS), 1), "a region that fits");
+        // The reported shape: the room is the guest's number, the region asks for more.
+        assert!(matches!(read_into(&fits, 255), (Err(NoHostCopy::Region(_)), 0)), "one byte short");
+        // Two layers are two slices.
+        let both = read(IMAGE, layers(0, u32::MAX), 0, 16, 16);
+        assert_eq!(read_into(&both, 512), (Ok(VkResult::VK_SUCCESS), 1), "every remaining layer");
+        assert!(
+            matches!(read_into(&both, 511), (Err(NoHostCopy::Region(_)), 0)),
+            "the second slice"
+        );
+
+        // Outside the image, whatever room there is.
+        for (why, info) in [
+            ("past the right edge", read(IMAGE, layers(0, 1), 60, 8, 1)),
+            ("a negative offset", read(IMAGE, layers(0, 1), -1, 8, 1)),
+            ("a layer it does not have", read(IMAGE, layers(1, 2), 0, 1, 1)),
+            ("no layers at all", read(IMAGE, layers(2, u32::MAX), 0, 1, 1)),
+            ("an empty region", read(IMAGE, layers(0, 1), 0, 0, 1)),
+            ("an image it never made", read(UNKNOWN, layers(0, 1), 0, 1, 1)),
+        ] {
+            assert!(matches!(read_into(&info, 4096), (Err(NoHostCopy::Region(_)), 0)), "{why}");
+        }
+        let mut level = read(IMAGE, layers(0, 1), 0, 33, 1);
+        level.imageSubresource.mipLevel = 1;
+        assert!(
+            matches!(read_into(&level, 4096), (Err(NoHostCopy::Region(_)), 0)),
+            "wider than the level it names"
+        );
+        level.imageSubresource.mipLevel = 2;
+        level.imageExtent.width = 1;
+        assert!(
+            matches!(read_into(&level, 4096), (Err(NoHostCopy::Region(_)), 0)),
+            "no such level"
+        );
+
+        let mut short_rows = read(IMAGE, layers(0, 1), 0, 8, 2);
+        short_rows.memoryRowLength = 4;
+        assert!(
+            matches!(read_into(&short_rows, 4096), (Err(NoHostCopy::Region(_)), 0)),
+            "memory rows shorter than the region's"
+        );
+
+        // A write is held to the bytes each region carried.
+        let bytes = [0u8; 256];
+        let write = |carried: usize| {
+            let region = [VkMemoryToImageCopyMESA {
+                dataSize: carried,
+                pData: bytes.as_ptr().cast(),
+                imageSubresource: layers(0, 1),
+                imageExtent: VkExtent3D { width: 16, height: 16, depth: 1 },
+                ..Default::default()
+            }];
+            let info = VkCopyMemoryToImageInfoMESA {
+                dstImage: IMAGE,
+                regionCount: 1,
+                pRegions: region.as_ptr(),
+                ..Default::default()
+            };
+            let before = CALLS.load(Ordering::SeqCst);
+            let got = d.copy_memory_to_image(DEVICE, cs::Decoded::planted(&info));
+            (got, CALLS.load(Ordering::SeqCst) - before)
+        };
+        assert_eq!(write(256), (Ok(VkResult::VK_SUCCESS), 1), "a write that carried its bytes");
+        assert!(matches!(write(255), (Err(NoHostCopy::Region(_)), 0)), "a write one byte short");
+
+        d.abandon_planted();
+    }
+
     /// The two extensions the Metal path emulates are advertised together, and only where the
     /// emulation exists.
     ///
@@ -10609,8 +10919,6 @@ mod tests {
     #[test]
     fn the_host_copy_reshape_hands_the_driver_the_copy_the_guest_sent() {
         use std::cell::RefCell;
-
-        use crate::venus::proto::types::VkExtent3D;
 
         const DEVICE: VkDevice = VkDevice::forged(0x11);
         const IMAGE: VkImage = VkImage::forged(0x22);
@@ -10686,21 +10994,33 @@ mod tests {
         fns.plant_vkDestroyDevice(destroy_device);
         let mut d = Driver::new(Account::for_test(None));
         d.plant_device(DEVICE, fns);
+        d.note_image(IMAGE, &host_copy_image());
+
+        let colour = VkImageSubresourceLayers {
+            aspectMask: VkImageAspectFlags(
+                VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32,
+            ),
+            mipLevel: 0,
+            baseArrayLayer: 0,
+            layerCount: 1,
+        };
 
         // Reading an image out: one region, and its bytes go where the reply's blob is -- not to
-        // a copy this renderer would then have to move again.
-        let mut out = [0u8; 64];
+        // a copy this renderer would then have to move again. Five rows of 37 and a sixth of
+        // five texels span 190 bytes.
+        let mut out = [0u8; 190];
         let want = out.as_mut_ptr() as usize;
         let read = VkCopyImageToMemoryInfoMESA {
             srcImage: IMAGE,
             memoryRowLength: 37,
             memoryImageHeight: 11,
+            imageSubresource: colour,
             imageExtent: VkExtent3D { width: 5, height: 6, depth: 1 },
             ..Default::default()
         };
         assert_eq!(
             d.copy_image_to_memory(DEVICE, cs::Decoded::planted(&read), &mut out),
-            Some(VkResult::VK_SUCCESS)
+            Ok(VkResult::VK_SUCCESS)
         );
         assert_eq!(
             SAW.with_borrow(|v| v.clone()),
@@ -10712,22 +11032,24 @@ mod tests {
         // Writing into one: many regions, each carrying its own bytes, and each keeping the
         // layout it was sent with. Transposing two here writes one region's pixels with the
         // other's stride.
-        let a = [1u8; 8];
+        let a = [1u8; 9];
         let b = [2u8; 8];
         let regions = [
             VkMemoryToImageCopyMESA {
                 dataSize: a.len(),
                 pData: a.as_ptr().cast(),
-                memoryRowLength: 3,
+                memoryRowLength: 9,
                 memoryImageHeight: 4,
+                imageSubresource: colour,
                 imageExtent: VkExtent3D { width: 9, height: 1, depth: 1 },
                 ..Default::default()
             },
             VkMemoryToImageCopyMESA {
                 dataSize: b.len(),
                 pData: b.as_ptr().cast(),
-                memoryRowLength: 5,
+                memoryRowLength: 10,
                 memoryImageHeight: 6,
+                imageSubresource: colour,
                 imageExtent: VkExtent3D { width: 8, height: 1, depth: 1 },
                 ..Default::default()
             },
@@ -10740,11 +11062,11 @@ mod tests {
         };
         assert_eq!(
             d.copy_memory_to_image(DEVICE, cs::Decoded::planted(&write)),
-            Some(VkResult::VK_SUCCESS)
+            Ok(VkResult::VK_SUCCESS)
         );
         assert_eq!(
             SAW.with_borrow(|v| v.clone()),
-            vec![(3, 4, a.as_ptr() as usize, 9), (5, 6, b.as_ptr() as usize, 8)],
+            vec![(9, 4, a.as_ptr() as usize, 9), (10, 6, b.as_ptr() as usize, 8)],
             "each region keeps its own bytes and its own layout, in the order it was sent"
         );
 
@@ -10768,12 +11090,13 @@ mod tests {
         assert_eq!(LAYOUTS.with_borrow(|v| v.clone()), vec![7, 2]);
 
         // A device this renderer does not have is a refusal, not a copy reported as done.
-        assert!(
-            d.copy_image_to_memory(VkDevice::forged(0x99), cs::Decoded::planted(&read), &mut out)
-                .is_none()
+        assert_eq!(
+            d.copy_image_to_memory(VkDevice::forged(0x99), cs::Decoded::planted(&read), &mut out),
+            Err(NoHostCopy::Device)
         );
-        assert!(
-            d.copy_memory_to_image(VkDevice::forged(0x99), cs::Decoded::planted(&write)).is_none()
+        assert_eq!(
+            d.copy_memory_to_image(VkDevice::forged(0x99), cs::Decoded::planted(&write)),
+            Err(NoHostCopy::Device)
         );
         assert!(
             d.transition_image_layout(VkDevice::forged(0x99), cs::Decoded::planted(&t as &[_]))
@@ -11758,6 +12081,9 @@ mod tests {
         let facts = |claim| ImageFacts {
             width: 64,
             height: 64,
+            depth: 1,
+            mip_levels: 1,
+            array_layers: 1,
             format: VkFormat::VK_FORMAT_B8G8R8A8_UNORM,
             tiling: VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
             claim,
