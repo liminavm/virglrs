@@ -7141,15 +7141,33 @@ impl Driver {
     /// be equal where that side names a timeline semaphore (VUID-VkSubmitInfo-pNext-03240/03241).
     /// A semaphore this driver has no record of may be a timeline, so it counts as one.
     fn submit_counts_agree(&self, s: &VkSubmitInfo) -> Result<(), &'static str> {
+        // Whether a chained array holds one entry for each of the `wanted` the submit names. The
+        // decoder turns an array the guest sent empty into a null pointer whatever count it sent
+        // beside it, so a count that agrees is not enough: the array must be there too.
+        let covers = |wanted: u32, count: u32, array: *const core::ffi::c_void| {
+            count == wanted && (wanted == 0 || !array.is_null())
+        };
         if let Some(g) = chained_at::<VkDeviceGroupSubmitInfo>(&s.pNext) {
-            if g.waitSemaphoreCount != s.waitSemaphoreCount {
-                return Err("a device-group wait count that disagrees with its submit's");
+            if !covers(
+                s.waitSemaphoreCount,
+                g.waitSemaphoreCount,
+                g.pWaitSemaphoreDeviceIndices.cast(),
+            ) {
+                return Err("a device-group wait array that does not cover its submit's waits");
             }
-            if g.commandBufferCount != s.commandBufferCount {
-                return Err("a device-group command buffer count that disagrees with its submit's");
+            if !covers(
+                s.commandBufferCount,
+                g.commandBufferCount,
+                g.pCommandBufferDeviceMasks.cast(),
+            ) {
+                return Err("a device-group command buffer array that does not cover its submit's");
             }
-            if g.signalSemaphoreCount != s.signalSemaphoreCount {
-                return Err("a device-group signal count that disagrees with its submit's");
+            if !covers(
+                s.signalSemaphoreCount,
+                g.signalSemaphoreCount,
+                g.pSignalSemaphoreDeviceIndices.cast(),
+            ) {
+                return Err("a device-group signal array that does not cover its submit's signals");
             }
         }
         let Some(t) = chained_at::<VkTimelineSemaphoreSubmitInfo>(&s.pNext) else {
@@ -7164,15 +7182,18 @@ impl Driver {
                 self.semaphores.get(sem).is_none_or(|f| f.kind == SemaphoreKind::Timeline)
             })
         };
-        if t.waitSemaphoreValueCount != s.waitSemaphoreCount
+        if !covers(s.waitSemaphoreCount, t.waitSemaphoreValueCount, t.pWaitSemaphoreValues.cast())
             && names_a_timeline(s.waitSemaphoreCount, s.pWaitSemaphores)
         {
-            return Err("a timeline wait value count that disagrees with its submit's");
+            return Err("a timeline wait value array that does not cover its submit's waits");
         }
-        if t.signalSemaphoreValueCount != s.signalSemaphoreCount
-            && names_a_timeline(s.signalSemaphoreCount, s.pSignalSemaphores)
+        if !covers(
+            s.signalSemaphoreCount,
+            t.signalSemaphoreValueCount,
+            t.pSignalSemaphoreValues.cast(),
+        ) && names_a_timeline(s.signalSemaphoreCount, s.pSignalSemaphores)
         {
-            return Err("a timeline signal value count that disagrees with its submit's");
+            return Err("a timeline signal value array that does not cover its submit's signals");
         }
         Ok(())
     }
@@ -13378,8 +13399,9 @@ mod tests {
     /// sees it. Mesa's `vk_common_QueueSubmit` walks the chained arrays by the submit's counts: a
     /// device-group struct counting fewer signals than the submit has hands it a null array to
     /// index, which aborted the whole VMM, and a short timeline value array is read past its end.
-    /// A short value array whose side names only binary semaphores is valid Vulkan, and goes
-    /// through.
+    /// A chained array whose count agrees but which the guest sent empty decodes to null, and is
+    /// refused the same way. A short value array whose side names only binary semaphores is valid
+    /// Vulkan, and goes through.
     #[test]
     fn a_submit_whose_chained_counts_disagree_is_refused_before_the_driver() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13446,6 +13468,16 @@ mod tests {
         let (got, calls) = submit_with((&raw const group).cast(), &binary);
         assert_eq!((got, calls), (Ok(VkResult::VK_SUCCESS), 1), "a device group that agrees");
 
+        // The count agrees, but the guest sent the array empty, which decodes to null.
+        let group_without_indices = VkDeviceGroupSubmitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO,
+            signalSemaphoreCount: 1,
+            ..Default::default()
+        };
+        let (got, calls) = submit_with((&raw const group_without_indices).cast(), &binary);
+        assert!(matches!(got, Err(NoSubmit::Disagrees(_))), "a counted null array: {got:?}");
+        assert_eq!(calls, 0, "and the driver never sees it");
+
         // A timeline signalled with no value for it.
         let no_values = VkTimelineSemaphoreSubmitInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
@@ -13453,6 +13485,15 @@ mod tests {
         };
         let (got, calls) = submit_with((&raw const no_values).cast(), &timeline);
         assert!(matches!(got, Err(NoSubmit::Disagrees(_))), "a short timeline: {got:?}");
+        assert_eq!(calls, 0, "and the driver never sees it");
+
+        let values_without_array = VkTimelineSemaphoreSubmitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+            signalSemaphoreValueCount: 1,
+            ..Default::default()
+        };
+        let (got, calls) = submit_with((&raw const values_without_array).cast(), &timeline);
+        assert!(matches!(got, Err(NoSubmit::Disagrees(_))), "counted, but null: {got:?}");
         assert_eq!(calls, 0, "and the driver never sees it");
 
         // The same short array over a binary semaphore is valid Vulkan.

@@ -3737,8 +3737,17 @@ SABOTAGES = [
     (
         'a submit timeline signal value count is passed to the driver unchecked',
         'src/venus/driver.rs',
-        """        if t.signalSemaphoreValueCount != s.signalSemaphoreCount""",
-        """        if false && t.signalSemaphoreValueCount != s.signalSemaphoreCount""",
+        """        if !covers(
+            s.signalSemaphoreCount,""",
+        """        if false && !covers(
+            s.signalSemaphoreCount,""",
+        'a_submit_whose_chained_counts_disagree_is_refused_before_the_driver',
+    ),
+    (
+        'a submit chained array is trusted by its count alone',
+        'src/venus/driver.rs',
+        """count == wanted && (wanted == 0 || !array.is_null())""",
+        """count == wanted && (wanted == 0 || !array.is_null() || true)""",
         'a_submit_whose_chained_counts_disagree_is_refused_before_the_driver',
     ),
     (
