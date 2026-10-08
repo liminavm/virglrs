@@ -192,19 +192,22 @@ SABOTAGES = [
     ),
     (
         'a destroyed query pool keeps its record, so a recycled handle is measured against a previous life',
-        'src/venus/context.rs',
-        """        self.driver.forget_query_pool(args.queryPool);
-        self.driver.destroy_object(""",
-        """        self.driver.destroy_object(""",
+        'src/venus/driver.rs',
+        """            VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {
+                self.query_pools.remove(&VkQueryPool::from_host(handle));
+            }""",
+        """            VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {}""",
         'query_results',
     ),
     (
         "a query pool the device's teardown took keeps its record",
         'src/venus/driver.rs',
-        """                VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {
-                    self.forget_query_pool(VkQueryPool::from_host(handle));
-                }""",
-        """                VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {}""",
+        """        for (ty, handle) in recorded {
+            self.forget(ty, handle);
+        }""",
+        """        for (ty, handle) in recorded {
+            let _ = (ty, handle);
+        }""",
         'query',
     ),
     (
@@ -3319,9 +3322,11 @@ SABOTAGES = [
     ),
     (
         'a destroyed pipeline keeps its ray-tracing record',
-        'src/venus/context.rs',
-        """        self.driver.forget_pipeline(args.pipeline);""",
-        """""",
+        'src/venus/driver.rs',
+        """            VkObjectType::VK_OBJECT_TYPE_PIPELINE => {
+                self.pipelines.remove(&VkPipeline::from_host(handle));
+            }""",
+        """            VkObjectType::VK_OBJECT_TYPE_PIPELINE => {}""",
         'ray_tracing_pipelines_are_created_traced_and_forgotten_through_the_handlers',
     ),
     (
