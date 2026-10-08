@@ -255,6 +255,33 @@ instead of a bare fd close at exit.
 `--out` is what keeps the two apart. Without it every synoik capture writes `synoik.vkrc` and
 replaces the corpus a pinned score was recorded from.
 
+## The vkd3d corpus: a client that is not Mesa
+
+Every other venus corpus comes from a GNOME or Mesa client, so it can only show that a host-side
+check accepts the way Mesa uses Vulkan. `vkd3d.vkrc` is Wine's upstream vkd3d (D3D12 on Vulkan)
+running its own conformance tests, whose binding model puts different shapes on the wire: push
+constant ranges and pushes with `VK_SHADER_STAGE_ALL`, root signatures as pipeline layouts, large
+descriptor heaps, null descriptors. A check that refuses a valid shape Mesa never sends fails here:
+with push constant ranges refused for naming `ALL`, the replay stops at 9,208 of 26,803 commands.
+
+It scores acceptance only, like `synoik-lifecycle`: every test process frees its memory, so the
+census is empty. `vkd3d.score` was recorded on the C leg, and the Rust leg's score matched it line
+for line.
+
+**What is in it.** 38 `d3d12` tests and 4 `shader_runner` files, chosen for descriptors, root
+signatures and constants, built from vkd3d 2.1 in the guest. Not the whole suite: the C recorder
+holds 64 contexts and every vkd3d device is a new one, so the full suite overflows it, and the dump
+header reports that as "hit the cap" like a byte overflow. Two tests are left out because
+KosmicKrisp fails to create their pipelines and the C leg then poisons the context on the bind:
+`test_clip_distance` (a vertex shader with a return value and rasterization off) and
+`hlsl/rt-format-mismatch`.
+
+**Recording it.** `./capture.sh venus --out vkd3d`, run the tests in the guest under the venus ICD,
+then `./dump.sh vkd3d`. Delete `captures/vkd3d.vkrc` first: `dump.sh` waits for the file to exist,
+and reads a stale one at once. The vkd3d build, its unpacked build dependencies, an exact-name test
+filter patched into `include/private/vkd3d_test.h`, and the `run-corpus.sh` that runs a list of
+tests live in `/home/claude` on the enhanced rig disk, not in this repository.
+
 ## Profiling a workload: the sampling cycle
 
 The loop is: run the workload, sample the host renderer, read where the **gpu worker** thread's
