@@ -7894,6 +7894,109 @@ mod tests {
         }
     }
 
+    /// A geometry shader's outputs are what transform feedback captures when one is bound: the
+    /// stream-output layout comes with the geometry shader, and the triangle it emits -- the
+    /// harness's, x halved -- lands in the buffer.
+    #[test]
+    fn transform_feedback_captures_a_geometry_shader_s_output() {
+        use crate::vrend::proto::{
+            Command, Object, ShaderChunk, ShaderCreate, ShaderKind, SoBuffer, SoOutput,
+            StreamOutput, StreamoutTarget,
+        };
+        const GS: &str = "GEOM\nPROPERTY GS_INPUT_PRIMITIVE TRIANGLES\n\
+                          PROPERTY GS_OUTPUT_PRIMITIVE TRIANGLE_STRIP\n\
+                          PROPERTY GS_MAX_OUTPUT_VERTICES 3\nPROPERTY GS_INVOCATIONS 1\n\
+                          DCL IN[][0], POSITION\nDCL OUT[0], POSITION\n\
+                          IMM[0] INT32 { 0, 0, 0, 0 }\nIMM[1] FLT32 { 0.5, 1.0, 1.0, 1.0 }\n  \
+                          0: MUL OUT[0], IN[0][0], IMM[1]\n  1: EMIT IMM[0].xxxx\n  \
+                          2: MUL OUT[0], IN[1][0], IMM[1]\n  3: EMIT IMM[0].xxxx\n  \
+                          4: MUL OUT[0], IN[2][0], IMM[1]\n  5: EMIT IMM[0].xxxx\n  6: END\n";
+        let words = tgsi_words(GS);
+        let gs = ObjectHandle::new(40).expect("non-zero");
+        let captured = ResourceHandle::new(10).expect("non-zero");
+        let target = ObjectHandle::new(41).expect("non-zero");
+        let bytes = 3 * 16;
+        let read = std::cell::RefCell::new(Vec::new());
+        let more = More {
+            resources: vec![(captured, buffer_args(resource::Bind::STREAM_OUTPUT, bytes))],
+            before: vec![
+                inline_write(captured, &[0u32; 12]),
+                Command::CreateObject {
+                    handle: gs,
+                    object: Object::Shader(ShaderCreate {
+                        stage: ShaderStage::Geometry,
+                        chunk: ShaderChunk::New { total_bytes: words.len() as u32 * 4 },
+                        num_tokens: 300,
+                        kind: ShaderKind::Graphics {
+                            stream_output: StreamOutput {
+                                stride: [4, 0, 0, 0],
+                                outputs: vec![SoOutput {
+                                    register_index: 0,
+                                    start_component: 0,
+                                    num_components: 4,
+                                    output_buffer: SoBuffer::from_wire(0).expect("buffer 0"),
+                                    dst_offset: 0,
+                                    stream: 0,
+                                }],
+                            },
+                        },
+                        text: &words,
+                    }),
+                },
+                Command::BindShader { stage: ShaderStage::Geometry, handle: Some(gs) },
+                Command::CreateObject {
+                    handle: target,
+                    object: Object::StreamoutTarget(StreamoutTarget {
+                        resource: captured,
+                        buffer_offset: 0,
+                        buffer_size: bytes,
+                    }),
+                },
+                Command::SetStreamoutTargets { append_bitmask: 0, targets: vec![Some(target)] },
+            ],
+            after: vec![Command::SetStreamoutTargets { append_bitmask: 0, targets: vec![] }],
+            read_back: vec![(captured, bytes)],
+            read: Some(&read),
+            ..Default::default()
+        };
+        let mut served = 0;
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            if !host_has(host_gl, Feature::geometry_shader)
+                || !host_has(host_gl, Feature::transform_feedback)
+            {
+                eprintln!("{host_gl:?}: no geometry stage to capture from");
+                continue;
+            }
+            served += 1;
+            read.borrow_mut().clear();
+            draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.0; 4],
+                fs: Some(RED_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            })
+            .unwrap_or_else(|e| panic!("{host_gl:?}: {e:?}"));
+            let floats: Vec<f32> = read.borrow()[0]
+                .chunks(4)
+                .map(|b| f32::from_ne_bytes(b.try_into().expect("4")))
+                .collect();
+            assert_eq!(
+                floats,
+                [-0.5, -1.0, 0.0, 1.0, 1.5, -1.0, 0.0, 1.0, -0.5, 3.0, 0.0, 1.0],
+                "{host_gl:?}: the geometry shader's triangle is captured"
+            );
+        }
+        if served == 0 {
+            eprintln!("no host here has a geometry stage: nothing scored");
+        }
+    }
+
     /// A texture buffer larger than the host's texel limit is legal GL, and is sized as the limit.
     /// Under a limit of 4, a view of 8 texels -- through a sampler and through an image -- reads
     /// back 4 texels from the shader, where it was refused and the context poisoned.
