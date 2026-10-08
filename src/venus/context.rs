@@ -16285,6 +16285,85 @@ mod tests {
         h.driver.abandon_planted();
     }
 
+    /// The commands `impl Commands for Handlers` overrides: written-out `fn vkFoo`, and the
+    /// first argument of each `create`/`destroy` macro, which is the command it stands for.
+    fn served() -> std::collections::BTreeSet<&'static str> {
+        const SRC: &str = include_str!("context.rs");
+        let start = SRC.find("\nimpl Commands for Handlers").expect("the handler impl");
+        let body = &SRC[start + 1..];
+        let body = &body[..body.find("\n}\n").expect("the impl ends")];
+
+        let mut names = std::collections::BTreeSet::new();
+        let mut lines = body.lines().peekable();
+        while let Some(line) = lines.next() {
+            let Some(rest) = line.strip_prefix("    ") else { continue };
+            if let Some(f) = rest.strip_prefix("fn vk") {
+                names.insert(&line[7..7 + f.find('(').expect("a signature") + 2]);
+                continue;
+            }
+            // A macro invocation, whose first argument is the command. It is on the same
+            // line when it fits and on the next when it does not.
+            let Some(args) = rest.split_once("!(").map(|(_, a)| a) else { continue };
+            let mut here = args.trim_start();
+            if here.is_empty() {
+                here = lines.peek().map_or("", |l| l.trim_start());
+            }
+            if let Some(name) = here.strip_prefix("vk") {
+                let end = name.find([',', ')']).unwrap_or(name.len());
+                names.insert(&here[..end + 2]);
+            }
+        }
+        names
+    }
+
+    /// Every served command says how it is held to the guest's input: `validation.txt`.
+    ///
+    /// The file is the decision the decoder cannot make. A host driver checks nothing, so each
+    /// command either has a check in front of the driver, was reviewed and found to need none, or
+    /// is a known hazard still open -- and a command served without a line here is one nobody
+    /// asked that question of. Serving a command means answering it.
+    #[test]
+    fn every_served_command_is_classified_for_validation() {
+        use std::collections::BTreeSet;
+
+        const FILE: &str = include_str!("validation.txt");
+        const GROUPS: [&str; 7] =
+            ["limits", "pipelines", "render-passes", "descriptors", "images", "regions", "queries"];
+        let lines: Vec<(&str, &str)> = FILE
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let (command, status) = l.split_once(char::is_whitespace).unwrap_or_else(|| {
+                    panic!("a line with no status says nothing about the command: {l:?}")
+                });
+                (command, status.trim())
+            })
+            .collect();
+        for (command, status) in &lines {
+            let known = match status.split_once(':') {
+                None => matches!(*status, "validated" | "reviewed"),
+                Some(("pending", group)) => GROUPS.contains(&group),
+                Some(_) => false,
+            };
+            assert!(known, "{command}: {status:?} is not a status the file's header defines");
+        }
+        let listed: Vec<&str> = lines.iter().map(|(c, _)| *c).collect();
+        assert!(listed.windows(2).all(|w| w[0] < w[1]), "sorted and unique, so a diff is one line");
+
+        let listed: BTreeSet<&str> = listed.into_iter().collect();
+        let served = served();
+        let unclassified: Vec<&&str> = served.difference(&listed).collect();
+        assert!(
+            unclassified.is_empty(),
+            "{} served command(s) say nothing about how the guest's input is held -- add each to \
+             src/venus/validation.txt: {unclassified:?}",
+            unclassified.len()
+        );
+        let stale: Vec<&&str> = listed.difference(&served).collect();
+        assert!(stale.is_empty(), "validation.txt names unserved command(s): {stale:?}");
+    }
+
     /// Every command the protocol defines is either served or written down as not served.
     ///
     /// A guest may send any of them -- what it is offered is built from what the pinned vk.xml can
@@ -16308,37 +16387,6 @@ mod tests {
         /// numbers are dense and small, and a bound well past the end costs nothing.
         fn protocol() -> BTreeSet<&'static str> {
             (0..4096).filter_map(|n| vn_command_name(VkCommandTypeEXT(n))).collect()
-        }
-
-        /// The commands `impl Commands for Handlers` overrides: written-out `fn vkFoo`, and the
-        /// first argument of each `create`/`destroy` macro, which is the command it stands for.
-        fn served() -> BTreeSet<&'static str> {
-            const SRC: &str = include_str!("context.rs");
-            let start = SRC.find("\nimpl Commands for Handlers").expect("the handler impl");
-            let body = &SRC[start + 1..];
-            let body = &body[..body.find("\n}\n").expect("the impl ends")];
-
-            let mut names = BTreeSet::new();
-            let mut lines = body.lines().peekable();
-            while let Some(line) = lines.next() {
-                let Some(rest) = line.strip_prefix("    ") else { continue };
-                if let Some(f) = rest.strip_prefix("fn vk") {
-                    names.insert(&line[7..7 + f.find('(').expect("a signature") + 2]);
-                    continue;
-                }
-                // A macro invocation, whose first argument is the command. It is on the same
-                // line when it fits and on the next when it does not.
-                let Some(args) = rest.split_once("!(").map(|(_, a)| a) else { continue };
-                let mut here = args.trim_start();
-                if here.is_empty() {
-                    here = lines.peek().map_or("", |l| l.trim_start());
-                }
-                if let Some(name) = here.strip_prefix("vk") {
-                    let end = name.find([',', ')']).unwrap_or(name.len());
-                    names.insert(&here[..end + 2]);
-                }
-            }
-            names
         }
 
         // Each line is a command and a `status:group`. The status is what makes the file a

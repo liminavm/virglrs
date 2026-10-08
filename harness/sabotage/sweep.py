@@ -517,8 +517,8 @@ SABOTAGES = [
     (
         'a command served through a macro is read as unserved',
         'src/venus/context.rs',
-        '                    here = lines.peek().map_or("", |l| l.trim_start());',
-        '                    here = "";',
+        '                here = lines.peek().map_or("", |l| l.trim_start());',
+        '                here = "";',
         'venus::context::tests::every_command_the_protocol_defines_is_served_or_on_the_ledger',
     ),
     # A strided array. vk.xml's `stride` describes the guest's own memory and never reaches the
@@ -3812,6 +3812,13 @@ SABOTAGES = [
         """        if (var.ty.base.category != VkType.ENUM or validity == Gen_INVALID""",
         """        if (True or var.ty.base.category != VkType.ENUM or validity == Gen_INVALID""",
         'an_enum_value_the_registry_does_not_define_poisons_the_stream',
+    ),
+    (
+        'a served command goes unclassified for validation',
+        'src/venus/validation.txt',
+        '\nvkCmdDraw                                        reviewed\n',
+        '\n',
+        'every_served_command_is_classified_for_validation',
     ),
     (
         'a submit chained array is trusted by its count alone',
