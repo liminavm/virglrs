@@ -3245,7 +3245,14 @@ impl Commands for Handlers<'_> {
     /// measured against it -- see [`driver::QueryRefused`].
     fn vkCreateQueryPool(&mut self, args: &mut vn_command_vkCreateQueryPool<'_>) {
         let Some(info) = self.names(args.pCreateInfo) else { return };
-        let host = self.driver.create_query_pool(args.device, info, args.pAllocator);
+        // As `vkCreatePipelineLayout`: a device this context does not have answers as
+        // `create_object` would, and one it has holds the pool to what it was created with.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => self.driver.create_query_pool(args.device, info, args.pAllocator),
+        };
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkCreateQueryPool", args.pQueryPool(), args.handle_pQueryPool_mut(), host);
     }
@@ -6570,6 +6577,14 @@ impl Commands for Handlers<'_> {
         // Borrowed from the decoder's arena, not from `args`, so the out-slice below can be
         // taken mutably without copying the infos anywhere.
         let infos = args.pTimestampInfos();
+        let infos = match self.driver.device_facts(device).map(|f| infos.validate(&f)) {
+            Some(Ok(infos)) => infos,
+            Some(Err(why)) => return self.reject(why),
+            None => {
+                args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
+                return;
+            }
+        };
         let mut deviation = 0u64;
         let got = self.driver.calibrated_timestamps(
             device,
@@ -18352,11 +18367,12 @@ mod tests {
             queryCount: 4,
             ..Default::default()
         };
-        let made = driver.create_query_pool(
-            VkDevice::forged(DEVICE),
-            super::super::cs::Decoded::planted(&pool_info),
-            None,
-        );
+        driver.plant_query_types(VkDevice::forged(DEVICE), &[pool_info.queryType]);
+        let facts = driver.device_facts(VkDevice::forged(DEVICE)).expect("a planted device");
+        let pool_info = super::super::cs::Decoded::planted(&pool_info)
+            .validate(&facts)
+            .expect("a type the device was planted with");
+        let made = driver.create_query_pool(VkDevice::forged(DEVICE), pool_info, None);
         assert_eq!(made, Ok(VkQueryPool::forged(QUERIES)));
 
         let todo = Unimplemented::default();

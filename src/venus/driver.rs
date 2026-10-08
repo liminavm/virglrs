@@ -63,7 +63,7 @@ use super::proto::types::{
     VkMemoryToImageCopy, VkMemoryToImageCopyMESA, VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT,
     VkMultisamplePropertiesEXT, VkMultisampledRenderToSingleSampledInfoEXT, VkObjectType,
     VkOffset3D, VkPhysicalDevice, VkPhysicalDeviceExternalImageFormatInfo,
-    VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceLimits,
+    VkPhysicalDeviceFeatures2, VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceLimits,
     VkPhysicalDeviceMemoryBudgetPropertiesEXT, VkPhysicalDeviceMemoryProperties,
     VkPhysicalDeviceProperties, VkPhysicalDeviceSampleLocationsPropertiesEXT, VkPipeline,
     VkPipelineBindPoint, VkPipelineCache, VkPipelineCacheCreateInfo, VkPipelineLayout,
@@ -82,7 +82,7 @@ use super::proto::types::{
     VkSemaphoreWaitFlags, VkSemaphoreWaitInfo, VkShaderModule, VkShaderModuleCreateInfo,
     VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp, VkStructureType, VkSubmitInfo,
     VkSubmitInfo2, VkSubpassBeginInfo, VkSubpassContents, VkSubpassEndInfo,
-    VkTessellationDomainOrigin, VkTimelineSemaphoreSubmitInfo,
+    VkTessellationDomainOrigin, VkTimeDomainKHR, VkTimelineSemaphoreSubmitInfo,
     VkVertexInputAttributeDescription2EXT, VkVertexInputBindingDescription2EXT, VkViewport,
     VkWriteDescriptorSet,
 };
@@ -2057,6 +2057,55 @@ struct DeviceState {
     limits: VkPhysicalDeviceLimits,
     /// The sample location grids the device takes, if it enabled `VK_EXT_sample_locations`.
     sample_locations: Option<SampleLocationGrids>,
+    /// The query types the device was created able to make. Read once at creation from what the
+    /// guest enabled; see [`enabled_query_types`].
+    query_types: Vec<VkQueryType>,
+}
+
+/// The query types a device created with `extensions` and, if `statistics`, the
+/// `pipelineStatisticsQuery` feature can make: occlusion and timestamp always, and each other
+/// type only with the feature or extension that defines it.
+///
+/// A driver sizes a pool's storage by its type and is entitled to treat a type it never offered as
+/// impossible: KosmicKrisp's `kk_reports_per_query` is `UNREACHABLE` for anything but occlusion and
+/// timestamp. The device was created with only what it offered, so a type it was not created with
+/// is one no guest may ask for.
+fn enabled_query_types(extensions: &[String], statistics: bool) -> Vec<VkQueryType> {
+    type Q = VkQueryType;
+    const BY_EXTENSION: &[(&str, VkQueryType)] = &[
+        ("VK_KHR_video_queue", Q::VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR),
+        ("VK_EXT_transform_feedback", Q::VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT),
+        ("VK_KHR_performance_query", Q::VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR),
+        (
+            "VK_KHR_acceleration_structure",
+            Q::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+        ),
+        (
+            "VK_KHR_acceleration_structure",
+            Q::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR,
+        ),
+        ("VK_NV_ray_tracing", Q::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_NV),
+        ("VK_QCOM_elapsed_timer_query", Q::VK_QUERY_TYPE_TIME_ELAPSED_QCOM),
+        ("VK_INTEL_performance_query", Q::VK_QUERY_TYPE_PERFORMANCE_QUERY_INTEL),
+        ("VK_KHR_video_encode_queue", Q::VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR),
+        ("VK_EXT_mesh_shader", Q::VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT),
+        ("VK_EXT_primitives_generated_query", Q::VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT),
+        (
+            "VK_KHR_ray_tracing_maintenance1",
+            Q::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR,
+        ),
+        ("VK_KHR_ray_tracing_maintenance1", Q::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR),
+        ("VK_EXT_opacity_micromap", Q::VK_QUERY_TYPE_MICROMAP_SERIALIZATION_SIZE_EXT),
+        ("VK_EXT_opacity_micromap", Q::VK_QUERY_TYPE_MICROMAP_COMPACTED_SIZE_EXT),
+    ];
+    let mut out = vec![Q::VK_QUERY_TYPE_OCCLUSION, Q::VK_QUERY_TYPE_TIMESTAMP];
+    if statistics {
+        out.push(Q::VK_QUERY_TYPE_PIPELINE_STATISTICS);
+    }
+    out.extend(
+        BY_EXTENSION.iter().filter(|(e, _)| extensions.iter().any(|w| w == e)).map(|(_, t)| *t),
+    );
+    out
 }
 
 /// What [`SampleLocationGrids`] says of `pd`: the sample counts its properties offer locations
@@ -2599,6 +2648,7 @@ impl Driver {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         }
 
+        let info_decoded = info;
         let guest_info = *info;
         // The extension list's size was checked against this count as it decoded, so the pair
         // cannot arrive split; a guest that asked for none simply gets an empty list.
@@ -2684,9 +2734,10 @@ impl Driver {
             .iter()
             .any(|n| n == "VK_EXT_sample_locations")
             .then(|| sample_location_grids(inst, pd));
+        let query_types = enabled_query_types(&wanted, enables_pipeline_statistics(info_decoded));
         self.devices.insert(
             out,
-            DeviceState { fns, memory_types, group_handles, limits, sample_locations },
+            DeviceState { fns, memory_types, group_handles, limits, sample_locations, query_types },
         );
         Ok(out)
     }
@@ -3366,7 +3417,7 @@ impl Driver {
     pub fn create_query_pool(
         &mut self,
         device: VkDevice,
-        info: cs::Decoded<'_, VkQueryPoolCreateInfo>,
+        info: cs::Decoded<'_, VkQueryPoolCreateInfo, cs::Checked>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkQueryPool, VkResult> {
         let pool = self.create_object(device, |d| Some(d.vkCreateQueryPool()), info, alloc)?;
@@ -3726,6 +3777,7 @@ impl Driver {
             facts: self.facts(),
             limits: &d.limits,
             sample_locations: d.sample_locations.as_ref(),
+            query_types: &d.query_types,
         })
     }
 
@@ -4620,8 +4672,16 @@ impl Driver {
                 group_handles: None,
                 limits: planted_limits(),
                 sample_locations: None,
+                query_types: enabled_query_types(&[], true),
             },
         );
+    }
+
+    /// Give a planted device the query types `vkCreateDevice` would have read off what the guest
+    /// enabled. A planted device starts with the core three.
+    #[cfg(test)]
+    pub(super) fn plant_query_types(&mut self, handle: VkDevice, types: &[VkQueryType]) {
+        self.devices.get_mut(&handle).expect("a planted device").query_types = types.to_vec();
     }
 
     /// Give a planted device the limits `vkCreateDevice` would have read off the driver.
@@ -7511,7 +7571,7 @@ impl Driver {
     pub fn calibrated_timestamps(
         &self,
         device: VkDevice,
-        infos: cs::Decoded<'_, [VkCalibratedTimestampInfoKHR]>,
+        infos: cs::Decoded<'_, [VkCalibratedTimestampInfoKHR], cs::Checked>,
         stamps: &mut [u64],
         deviation: &mut u64,
     ) -> Result<VkResult, VkResult> {
@@ -10368,6 +10428,8 @@ pub struct DeviceFacts<'d> {
     pub limits: &'d VkPhysicalDeviceLimits,
     /// `None` for a device that did not enable `VK_EXT_sample_locations`.
     pub sample_locations: Option<&'d SampleLocationGrids>,
+    /// The query types the device was created able to make.
+    pub query_types: &'d [VkQueryType],
 }
 
 /// Whether the counts a submit's `pNext` chain carries agree with the submit's own.
@@ -10491,7 +10553,6 @@ forwarded_unchecked!(
     VkImageCreateInfo,
     VkImageViewCreateInfo,
     VkPipelineCacheCreateInfo,
-    VkQueryPoolCreateInfo,
     VkRenderPassCreateInfo,
     VkRenderPassCreateInfo2,
     VkSamplerCreateInfo,
@@ -10647,6 +10708,48 @@ impl cs::Validate<cs::Chained<'_, VkSubmitInfo, Facts<'_>>> for VkTimelineSemaph
     }
 }
 
+/// Whether the guest's device create info enables `pipelineStatisticsQuery`, in either of the two
+/// places Vulkan lets it: `pEnabledFeatures`, or a `VkPhysicalDeviceFeatures2` in its chain.
+fn enables_pipeline_statistics(info: cs::Decoded<'_, VkDeviceCreateInfo>) -> bool {
+    // SAFETY: `info` is the decoder's, so `pEnabledFeatures` is null or a struct it allocated in
+    // the arena `info` borrows (see `Decoded::vouch`).
+    let flat = unsafe { info.get().pEnabledFeatures.as_ref() };
+    let chained = chained::<VkPhysicalDeviceFeatures2>(info).map(|f| f.get().features);
+    [flat.copied(), chained].iter().flatten().any(|f| f.pipelineStatisticsQuery.0 != 0)
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkQueryPoolCreateInfo {
+    /// A pool of no queries is one KosmicKrisp only asserts against, and a type the device was not
+    /// created with is one it has no storage layout for.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        if this.queryCount == 0 {
+            return Err("created a query pool of no queries");
+        }
+        if !facts.query_types.contains(&this.queryType) {
+            return Err("created a query pool of a type the device was not created with");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkCalibratedTimestampInfoKHR {
+    /// The Mesa runtime reads a present-stage timestamp through a swapchain struct it expects
+    /// chained, and follows it unchecked. No venus device has a swapchain on this side, and the
+    /// decoder admits no such struct, so the domain is one no guest here can ask for.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        if this.timeDomain == VkTimeDomainKHR::VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT {
+            return Err("asked for a present-stage timestamp, which needs a swapchain");
+        }
+        Ok(())
+    }
+}
+
 /// Chained structs that carry nothing a host driver indexes, copies by or sizes anything from:
 /// flags, booleans, enums the decoder already bounded, and opaque values the driver hands on.
 /// Each is valid against any root, so listing one is the whole of its check.
@@ -10720,6 +10823,12 @@ pub enum SemaphoreKind {
 // same vk.xml with Vulkan's `sType`/`pNext` header first.
 unsafe impl InStruct for VkTimelineSemaphoreSubmitInfo {
     const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkPhysicalDeviceFeatures2 {
+    const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -11343,6 +11452,64 @@ mod tests {
             arrayLayers: 2,
             ..Default::default()
         }
+    }
+
+    /// A query pool of no queries, or of a type the device was not created with, does not
+    /// validate; nor does a present-stage timestamp. The types a device can make are what its
+    /// guest enabled: the core two always, statistics with the feature, the rest by extension.
+    #[test]
+    fn query_pools_and_timestamps_are_held_to_what_the_device_enabled() {
+        const DEVICE: VkDevice = VkDevice::forged(0x93);
+        type Q = VkQueryType;
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        d.plant_query_types(DEVICE, &enabled_query_types(&[], false));
+        let pool = |d: &Driver, kind: Q, count: u32| {
+            let info =
+                VkQueryPoolCreateInfo { queryType: kind, queryCount: count, ..Default::default() };
+            let facts = d.device_facts(DEVICE).expect("a planted device");
+            cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+        };
+        assert_eq!(pool(&d, Q::VK_QUERY_TYPE_OCCLUSION, 1), Ok(()));
+        assert_eq!(pool(&d, Q::VK_QUERY_TYPE_TIMESTAMP, 64), Ok(()));
+        assert!(pool(&d, Q::VK_QUERY_TYPE_OCCLUSION, 0).is_err(), "no queries");
+        assert!(pool(&d, Q::VK_QUERY_TYPE_PIPELINE_STATISTICS, 1).is_err(), "no feature");
+        assert!(pool(&d, Q::VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, 1).is_err());
+
+        let enabled = ["VK_EXT_transform_feedback".to_string()];
+        d.plant_query_types(DEVICE, &enabled_query_types(&enabled, true));
+        assert_eq!(pool(&d, Q::VK_QUERY_TYPE_PIPELINE_STATISTICS, 1), Ok(()));
+        assert_eq!(pool(&d, Q::VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, 1), Ok(()));
+        assert!(pool(&d, Q::VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT, 1).is_err());
+
+        // The feature reads from either place Vulkan puts it, and from neither when it is off.
+        let on = super::super::proto::types::VkPhysicalDeviceFeatures {
+            pipelineStatisticsQuery: VkBool32(1),
+            ..Default::default()
+        };
+        let flat = VkDeviceCreateInfo { pEnabledFeatures: &on, ..Default::default() };
+        assert!(enables_pipeline_statistics(cs::Decoded::planted(&flat)));
+        let f2 = VkPhysicalDeviceFeatures2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            features: on,
+            ..Default::default()
+        };
+        let chained = VkDeviceCreateInfo {
+            pNext: (&f2 as *const VkPhysicalDeviceFeatures2).cast(),
+            ..Default::default()
+        };
+        assert!(enables_pipeline_statistics(cs::Decoded::planted(&chained)));
+        assert!(!enables_pipeline_statistics(cs::Decoded::planted(&VkDeviceCreateInfo::default())));
+
+        let stamp = |domain: VkTimeDomainKHR| {
+            let info = [VkCalibratedTimestampInfoKHR { timeDomain: domain, ..Default::default() }];
+            let facts = d.device_facts(DEVICE).expect("a planted device");
+            cs::Decoded::planted(&info[..]).validate(&facts).map(|_| ())
+        };
+        assert_eq!(stamp(VkTimeDomainKHR::VK_TIME_DOMAIN_DEVICE_KHR), Ok(()));
+        assert!(stamp(VkTimeDomainKHR::VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT).is_err());
+
+        d.abandon_planted();
     }
 
     /// A buffer bound at an offset past its end, or for a range past it, is refused before the
@@ -16304,13 +16471,31 @@ mod tests {
             queryCount: 4,
             ..Default::default()
         };
-        assert_eq!(d.create_query_pool(DEVICE, cs::Decoded::planted(&info), None), Ok(POOL));
+        assert_eq!(
+            d.create_query_pool(
+                DEVICE,
+                cs::Decoded::planted(&info)
+                    .validate(&d.device_facts(DEVICE).expect("a planted device"))
+                    .expect("a valid pool"),
+                None
+            ),
+            Ok(POOL)
+        );
         let info = VkQueryPoolCreateInfo {
             queryType: VkQueryType::VK_QUERY_TYPE_OCCLUSION,
             queryCount: 4,
             ..Default::default()
         };
-        assert_eq!(d.create_query_pool(DEVICE, cs::Decoded::planted(&info), None), Ok(OCCLUSION));
+        assert_eq!(
+            d.create_query_pool(
+                DEVICE,
+                cs::Decoded::planted(&info)
+                    .validate(&d.device_facts(DEVICE).expect("a planted device"))
+                    .expect("a valid pool"),
+                None
+            ),
+            Ok(OCCLUSION)
+        );
 
         const NONE: VkQueryResultFlags = VkQueryResultFlags(0);
         const WIDE: VkQueryResultFlags =
@@ -16474,7 +16659,16 @@ mod tests {
             pipelineStatistics: VkQueryPipelineStatisticFlags(0b1011),
             ..Default::default()
         };
-        assert_eq!(d.create_query_pool(DEVICE, cs::Decoded::planted(&info), None), Ok(STATS));
+        assert_eq!(
+            d.create_query_pool(
+                DEVICE,
+                cs::Decoded::planted(&info)
+                    .validate(&d.device_facts(DEVICE).expect("a planted device"))
+                    .expect("a valid pool"),
+                None
+            ),
+            Ok(STATS)
+        );
         let r = d.query_pool_results(DEVICE, STATS, 0, 1, &mut buf[..12], VkDeviceSize(12), NONE);
         assert_eq!(r, Ok(VkResult::VK_NOT_READY), "three statistics, three words");
         let r = d.query_pool_results(DEVICE, STATS, 0, 1, &mut buf[..8], VkDeviceSize(8), NONE);
@@ -16482,13 +16676,20 @@ mod tests {
 
         // A kind whose result this renderer cannot size is still a pool the driver decides on,
         // and is still indexed; only its read-back into guest room is refused.
+        d.plant_query_types(DEVICE, &[VkQueryType::VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR]);
         let info = VkQueryPoolCreateInfo {
             queryType: VkQueryType::VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR,
             queryCount: 2,
             ..Default::default()
         };
         assert_eq!(
-            d.create_query_pool(DEVICE, cs::Decoded::planted(&info), None),
+            d.create_query_pool(
+                DEVICE,
+                cs::Decoded::planted(&info)
+                    .validate(&d.device_facts(DEVICE).expect("a planted device"))
+                    .expect("a valid pool"),
+                None
+            ),
             Ok(PERF),
             "the driver's call, not ours"
         );

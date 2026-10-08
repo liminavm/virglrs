@@ -192,7 +192,7 @@ vkCreateImageView                                pending:images
 vkCreateInstance                                 reviewed
 vkCreatePipelineCache                            reviewed
 vkCreatePipelineLayout                           validated
-vkCreateQueryPool                                pending:queries
+vkCreateQueryPool                                validated
 vkCreateRayTracingPipelinesKHR                   pending:pipelines
 vkCreateRenderPass                               pending:render-passes
 vkCreateRenderPass2                              pending:render-passes
@@ -243,7 +243,7 @@ vkGetBufferDeviceAddress                         reviewed
 vkGetBufferMemoryRequirements                    reviewed
 vkGetBufferMemoryRequirements2                   reviewed
 vkGetBufferOpaqueCaptureAddress                  reviewed
-vkGetCalibratedTimestampsKHR                     pending:queries
+vkGetCalibratedTimestampsKHR                     validated
 vkGetDescriptorSetLayoutSupport                  pending:descriptors
 vkGetDeviceAccelerationStructureCompatibilityKHR reviewed
 vkGetDeviceBufferMemoryRequirements              reviewed
