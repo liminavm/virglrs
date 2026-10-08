@@ -3015,13 +3015,13 @@ impl Commands for Handlers<'_> {
     );
     pool_destroy!(vkDestroyCommandPool, vn_command_vkDestroyCommandPool, commandPool);
 
-    simple_create!(
-        vkCreateBuffer,
-        vn_command_vkCreateBuffer,
-        pCreateInfo,
-        pBuffer,
-        handle_pBuffer_mut
-    );
+    /// Not [`simple_create`]: the buffer's size is recorded for the binds held to it.
+    fn vkCreateBuffer(&mut self, args: &mut vn_command_vkCreateBuffer<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        let host = self.driver.create_buffer(args.device, info, args.pAllocator);
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateBuffer", args.pBuffer(), args.handle_pBuffer_mut(), host);
+    }
     simple_destroy!(vkDestroyBuffer, vn_command_vkDestroyBuffer, buffer);
 
     // A texel view of a buffer. Same shape as an image view -- the decoder resolves the `buffer`
@@ -5530,7 +5530,7 @@ impl Commands for Handlers<'_> {
             args.size,
             args.indexType,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdSetViewport(&mut self, args: &mut vn_command_vkCmdSetViewport<'_>) {
@@ -5546,7 +5546,7 @@ impl Commands for Handlers<'_> {
             args.offset,
             args.indexType,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdSetDepthBias(&mut self, args: &mut vn_command_vkCmdSetDepthBias<'_>) {
@@ -16255,6 +16255,8 @@ mod tests {
 
         // Two arrays under one count: they have to arrive the same length and stay paired.
         let buffers = [VkBuffer::forged(0x100), VkBuffer::forged(0x200)];
+        h.driver.plant_buffer(buffers[0], 4096);
+        h.driver.plant_buffer(buffers[1], 4096);
         let offsets = [VkDeviceSize(64), VkDeviceSize(128)];
         let mut args = vn_command_vkCmdBindVertexBuffers::default();
         args.commandBuffer = cb;
@@ -16719,6 +16721,8 @@ mod tests {
         // empty slice: Vulkan reads null as "not supplied" and an empty one is a count of zero
         // the guest never sent.
         let buffers = [VkBuffer::forged(0x100), VkBuffer::forged(0x200)];
+        h.driver.plant_buffer(buffers[0], 4096);
+        h.driver.plant_buffer(buffers[1], 4096);
         let offsets = [VkDeviceSize(8), VkDeviceSize(16)];
         let sizes = [VkDeviceSize(32), VkDeviceSize(64)];
         let strides = [VkDeviceSize(128), VkDeviceSize(256)];
@@ -18805,6 +18809,7 @@ mod tests {
             groupCountZ: 0x76,
             ..Default::default()
         });
+        h.driver.plant_buffer(VkBuffer::forged(0x81), 0x1000);
         h.vkCmdBindIndexBuffer2(&mut vn_command_vkCmdBindIndexBuffer2 {
             commandBuffer: cb,
             buffer: VkBuffer::forged(0x81),

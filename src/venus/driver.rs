@@ -665,6 +665,11 @@ pub struct Driver {
     /// way: the record dies at both places the pool does, so a recycled handle finds no record
     /// from a previous life.
     query_pools: BTreeMap<VkQueryPool, QueryFacts>,
+    /// Each live buffer's size in bytes, for a bind whose offset and range the driver would
+    /// otherwise trust: the Mesa runtime computes a whole-size range as `size - offset`, which
+    /// wraps for an offset past the end. Keyed by host handle and dropped in [`Driver::forget`],
+    /// as `images` is.
+    buffers: BTreeMap<VkBuffer, u64>,
     /// What each live pipeline is and which device made it.
     ///
     /// A bind is held to it, because Vulkan's bind takes the bind point and the pipeline as two
@@ -2300,6 +2305,7 @@ impl Driver {
             memory: BTreeMap::new(),
             images: BTreeMap::new(),
             query_pools: BTreeMap::new(),
+            buffers: BTreeMap::new(),
             semaphores: BTreeMap::new(),
             pending_fences: std::collections::BTreeSet::new(),
             pools: Pools::default(),
@@ -4142,6 +4148,9 @@ impl Driver {
             VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {
                 self.query_pools.remove(&VkQueryPool::from_host(handle));
             }
+            VkObjectType::VK_OBJECT_TYPE_BUFFER => {
+                self.buffers.remove(&VkBuffer::from_host(handle));
+            }
             VkObjectType::VK_OBJECT_TYPE_PIPELINE => {
                 self.pipelines.remove(&VkPipeline::from_host(handle));
             }
@@ -4866,6 +4875,12 @@ impl Driver {
         self.pools.adopt(pool, level, children.iter().copied());
     }
 
+    /// Record a buffer of `size` bytes, as [`Driver::create_buffer`] would have.
+    #[cfg(test)]
+    pub(super) fn plant_buffer(&mut self, buffer: VkBuffer, size: u64) {
+        self.buffers.insert(buffer, size);
+    }
+
     /// Give a planted device the sample location grids it would have read at creation, as
     /// `(sample count, largest grid)` pairs.
     #[cfg(test)]
@@ -4930,6 +4945,49 @@ impl Driver {
     pub(super) fn plant_queue(&mut self, device: VkDevice, queue: VkQueue) {
         let fns = Arc::clone(&self.devices.get(&device).expect("a planted device").fns);
         self.queues.insert(queue, Arc::new(HostQueue::new(queue, device, 0, fns)));
+    }
+
+    /// `vkCreateBuffer`, recording the buffer's size: Vulkan will not answer for it later, and a
+    /// bind is held to it. See `buffers`.
+    pub fn create_buffer(
+        &mut self,
+        device: VkDevice,
+        info: cs::Decoded<'_, VkBufferCreateInfo>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+    ) -> Result<VkBuffer, VkResult> {
+        let size = info.size.0;
+        let buffer = self.create_object(device, |d| Some(d.vkCreateBuffer()), info, alloc)?;
+        self.buffers.insert(buffer, size);
+        Ok(buffer)
+    }
+
+    /// Whether `buffer` bound at `offset`, for `size` bytes or to its end, lies inside the buffer.
+    ///
+    /// Vulkan requires the offset to be inside the buffer and a given size to end inside it, and
+    /// the driver trusts both: a whole-size range is computed as the buffer's size less the
+    /// offset, so an offset past the end wraps to a range of nearly every address there is, which
+    /// the GPU then reads. A null buffer binds nothing and is Vulkan's to allow.
+    fn buffer_range_fits(
+        &self,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        size: Option<VkDeviceSize>,
+    ) -> Result<(), RecordRefused> {
+        if buffer.is_null() {
+            return Ok(());
+        }
+        let Some(&len) = self.buffers.get(&buffer) else {
+            return Err(RecordRefused::Invalid("bound a buffer this renderer has no record of"));
+        };
+        if offset.0 >= len {
+            return Err(RecordRefused::Invalid("bound a buffer at an offset past its end"));
+        }
+        match size {
+            Some(size) if size != VK_WHOLE_SIZE && offset.0.saturating_add(size.0) > len => {
+                Err(RecordRefused::Invalid("bound a range past the end of its buffer"))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// `vkCreatePipelineLayout`, whose info must be held to the device first: see the `Validate`
@@ -5926,6 +5984,9 @@ impl Driver {
         assert!(sizes.is_none_or(|s| s.len() == n), "one count governs every array");
         assert!(strides.is_none_or(|s| s.len() == n), "one count governs every array");
         self.vertex_bindings_fit(cb, first, n)?;
+        for (i, (&buffer, &offset)) in buffers.iter().zip(offsets).enumerate() {
+            self.buffer_range_fits(buffer, offset, sizes.map(|s| s[i]))?;
+        }
         let f = self
             .recorder(cb)
             .and_then(|d| d.try_vkCmdBindVertexBuffers2())
@@ -6037,11 +6098,12 @@ impl Driver {
         buffer: VkBuffer,
         offset: VkDeviceSize,
         index_type: VkIndexType,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above.
+    ) -> Result<(), RecordRefused> {
+        self.buffer_range_fits(buffer, offset, None)?;
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the offset is held inside the buffer above.
         unsafe { (d.vkCmdBindIndexBuffer())(cb, buffer, offset, index_type) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdBindIndexBuffer2`: the index buffer bind with a size, so the driver can bound its
@@ -6054,11 +6116,15 @@ impl Driver {
         offset: VkDeviceSize,
         size: VkDeviceSize,
         index_type: VkIndexType,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdBindIndexBuffer2()?;
-        // SAFETY: as above.
+    ) -> Result<(), RecordRefused> {
+        self.buffer_range_fits(buffer, offset, Some(size))?;
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdBindIndexBuffer2())
+            .ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the range is held inside the buffer above.
         unsafe { f(cb, buffer, offset, size, index_type) };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_set_depth_bias(
@@ -6387,6 +6453,9 @@ impl Driver {
     ) -> Result<(), RecordRefused> {
         assert_eq!(buffers.len(), offsets.len(), "one count governs both arrays");
         self.vertex_bindings_fit(cb, first, buffers.len())?;
+        for (&buffer, &offset) in buffers.iter().zip(offsets) {
+            self.buffer_range_fits(buffer, offset, None)?;
+        }
         let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above; the count is the length both slices share, held to the limit above.
         unsafe {
@@ -11229,6 +11298,111 @@ mod tests {
             arrayLayers: 2,
             ..Default::default()
         }
+    }
+
+    /// A buffer bound at an offset past its end, or for a range past it, is refused before the
+    /// driver: the runtime computes a whole-size range as `size - offset`, which wraps. A null
+    /// buffer is Vulkan's to allow, and a buffer the renderer has no record of -- one destroyed,
+    /// whose handle the driver may hand out again -- is refused.
+    #[test]
+    fn buffers_bound_past_their_end_are_refused_before_the_driver() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const DEVICE: VkDevice = VkDevice::forged(0x87);
+        const CB: VkCommandBuffer = VkCommandBuffer::forged(0x88);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn index(
+            _c: VkCommandBuffer,
+            _b: VkBuffer,
+            _o: VkDeviceSize,
+            _t: VkIndexType,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn index2(
+            _c: VkCommandBuffer,
+            _b: VkBuffer,
+            _o: VkDeviceSize,
+            _s: VkDeviceSize,
+            _t: VkIndexType,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn vertex(
+            _c: VkCommandBuffer,
+            _f: u32,
+            _n: u32,
+            _b: *const VkBuffer,
+            _o: *const VkDeviceSize,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn vertex2(
+            _c: VkCommandBuffer,
+            _f: u32,
+            _n: u32,
+            _b: *const VkBuffer,
+            _o: *const VkDeviceSize,
+            _s: *const VkDeviceSize,
+            _t: *const VkDeviceSize,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdBindIndexBuffer(index);
+        fns.plant_vkCmdBindIndexBuffer2(index2);
+        fns.plant_vkCmdBindVertexBuffers(vertex);
+        fns.plant_vkCmdBindVertexBuffers2(vertex2);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x89), &[(CB, ObjectId(90))]);
+        const BUF: VkBuffer = VkBuffer::forged(0x91);
+        d.plant_buffer(BUF, 256);
+
+        let calls = |f: &dyn Fn() -> Result<(), RecordRefused>| {
+            let before = CALLS.load(Ordering::SeqCst);
+            let got = f();
+            (got, CALLS.load(Ordering::SeqCst) - before)
+        };
+        let refused = |r: (Result<(), RecordRefused>, usize)| {
+            matches!(r, (Err(RecordRefused::Invalid(_)), 0))
+        };
+        let ok = (Ok(()), 1);
+        let at = VkDeviceSize;
+        let u16 = VkIndexType::VK_INDEX_TYPE_UINT16;
+
+        assert_eq!(calls(&|| d.cmd_bind_index_buffer(CB, BUF, at(254), u16)), ok, "the last index");
+        assert!(refused(calls(&|| d.cmd_bind_index_buffer(CB, BUF, at(256), u16))), "at the end");
+        assert!(refused(calls(&|| d.cmd_bind_index_buffer(CB, BUF, at(u64::MAX), u16))));
+        assert_eq!(calls(&|| d.cmd_bind_index_buffer(CB, VkBuffer::NULL, at(4096), u16)), ok);
+        assert_eq!(calls(&|| d.cmd_bind_index_buffer2(CB, BUF, at(128), at(128), u16)), ok);
+        assert_eq!(calls(&|| d.cmd_bind_index_buffer2(CB, BUF, at(128), VK_WHOLE_SIZE, u16)), ok);
+        assert!(refused(calls(&|| d.cmd_bind_index_buffer2(CB, BUF, at(128), at(132), u16))));
+        assert!(refused(calls(&|| d.cmd_bind_index_buffer2(
+            CB,
+            BUF,
+            at(4),
+            at(u64::MAX - 1),
+            u16
+        ))));
+
+        let b = |buffer: VkBuffer, offset: u64| {
+            d.cmd_bind_vertex_buffers(CB, 0, &[BUF, buffer], &[at(0), at(offset)])
+        };
+        assert_eq!(calls(&|| b(BUF, 255)), ok, "the last byte");
+        assert!(refused(calls(&|| b(BUF, 256))), "the second binding at the end");
+        assert!(refused(calls(&|| b(VkBuffer::forged(0x92), 0))), "a buffer with no record");
+        let b2 = |size: VkDeviceSize| {
+            d.cmd_bind_vertex_buffers2(CB, 0, &[BUF], &[at(64)], Some(&[size]), None)
+        };
+        assert_eq!(calls(&|| b2(at(192))), ok, "to the end");
+        assert_eq!(calls(&|| b2(VK_WHOLE_SIZE)), ok);
+        assert!(refused(calls(&|| b2(at(193)))), "one byte past it");
+
+        // The guest's destroy takes the record with it, and a recycled handle finds none.
+        d.destroy_object(DEVICE, |d| d.try_vkDestroyBuffer(), BUF, None);
+        assert!(refused(calls(&|| d.cmd_bind_index_buffer(CB, BUF, at(0), u16))), "destroyed");
+
+        d.abandon_planted();
     }
 
     /// Sample locations the device does not take do not validate. The Mesa runtime copies them

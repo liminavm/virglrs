@@ -3938,6 +3938,29 @@ SABOTAGES = [
         'every_query_index_is_held_to_the_pool',
     ),
     (
+        'a buffer may be bound at an offset past its end',
+        'src/venus/driver.rs',
+        """        if offset.0 >= len {""",
+        """        if offset.0 == u64::MAX {""",
+        'buffers_bound_past_their_end_are_refused_before_the_driver',
+    ),
+    (
+        'a buffer range may run past its end',
+        'src/venus/driver.rs',
+        """            Some(size) if size != VK_WHOLE_SIZE && offset.0.saturating_add(size.0) > len => {""",
+        """            Some(size) if size != VK_WHOLE_SIZE && offset.0 > u64::MAX - 1 && size.0 > len => {""",
+        'buffers_bound_past_their_end_are_refused_before_the_driver',
+    ),
+    (
+        'a destroyed buffer keeps its size record',
+        'src/venus/driver.rs',
+        """            VkObjectType::VK_OBJECT_TYPE_BUFFER => {
+                self.buffers.remove(&VkBuffer::from_host(handle));
+            }""",
+        """            VkObjectType::VK_OBJECT_TYPE_BUFFER => {}""",
+        'buffers_bound_past_their_end_are_refused_before_the_driver',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

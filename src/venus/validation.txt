@@ -39,12 +39,12 @@ vkCmdBeginRendering                              validated
 vkCmdBeginTransformFeedbackEXT                   reviewed
 vkCmdBindDescriptorSets                          pending:descriptors
 vkCmdBindDescriptorSets2                         pending:descriptors
-vkCmdBindIndexBuffer                             pending:buffers
-vkCmdBindIndexBuffer2                            pending:buffers
+vkCmdBindIndexBuffer                             validated
+vkCmdBindIndexBuffer2                            validated
 vkCmdBindPipeline                                reviewed
 vkCmdBindTransformFeedbackBuffersEXT             reviewed
-vkCmdBindVertexBuffers                           pending:buffers
-vkCmdBindVertexBuffers2                          pending:buffers
+vkCmdBindVertexBuffers                           validated
+vkCmdBindVertexBuffers2                          validated
 vkCmdBlitImage                                   pending:regions
 vkCmdBlitImage2                                  pending:regions
 vkCmdBuildAccelerationStructuresIndirectKHR      reviewed
