@@ -87,6 +87,7 @@ use super::proto::types::{
     VkVertexInputAttributeDescription2EXT, VkVertexInputBindingDescription2EXT, VkViewport,
     VkWriteDescriptorSet,
 };
+use super::proto::types::{VkBindBufferMemoryInfo, VkMemoryRequirements2};
 use super::proto::types::{
     VkBindImageMemoryDeviceGroupInfo, VkBindImageMemoryInfo, VkBindImagePlaneMemoryInfo,
     VkBindMemoryStatus, VkDeviceImageMemoryRequirements, VkDeviceImageSubresourceInfo,
@@ -11230,6 +11231,115 @@ impl Driver {
         Ok(())
     }
 
+    /// The size of the allocation `memory` names, as the driver made it.
+    fn memory_size(&self, memory: VkDeviceMemory) -> Option<u64> {
+        self.memory.values().find(|a| a.memory.memory == memory).map(|a| a.size)
+    }
+
+    /// Whether `size` bytes at `offset` lie inside `memory`.
+    fn holds_binding(
+        &self,
+        memory: VkDeviceMemory,
+        offset: u64,
+        size: u64,
+    ) -> Result<(), &'static str> {
+        let have = self.memory_size(memory).ok_or("bound memory this renderer has no record of")?;
+        if offset >= have || size > have - offset {
+            return Err("bound past the end of its memory");
+        }
+        Ok(())
+    }
+
+    /// Whether a buffer bound at `offset` in `memory` lies inside it. A driver addresses the
+    /// buffer from there unchecked, so one bound past the end reaches past its allocation. See
+    /// [`Self::image_is_whole`] for a device this context does not have.
+    pub fn buffer_bind_fits(
+        &self,
+        device: VkDevice,
+        buffer: VkBuffer,
+        memory: VkDeviceMemory,
+        offset: VkDeviceSize,
+    ) -> Result<(), &'static str> {
+        if !self.devices.contains_key(&device) {
+            return Ok(());
+        }
+        let size =
+            *self.buffers.get(&buffer).ok_or("bound a buffer this renderer has no record of")?;
+        self.holds_binding(memory, offset.0, size)
+    }
+
+    /// [`Self::buffer_bind_fits`] for each bind of a `vkBindBufferMemory2`.
+    pub fn buffer_binds_fit(
+        &self,
+        device: VkDevice,
+        infos: cs::Decoded<'_, [VkBindBufferMemoryInfo]>,
+    ) -> Result<(), &'static str> {
+        infos
+            .iter()
+            .try_for_each(|i| self.buffer_bind_fits(device, i.buffer, i.memory, i.memoryOffset))
+    }
+
+    /// Whether an image, or the plane of a disjoint one, bound at `offset` in `memory` starts
+    /// where the driver allows and lies inside it. KosmicKrisp textures a linear plane straight
+    /// out of the memory at that offset, and how much it covers is the driver's to say, so the
+    /// driver is asked.
+    pub fn image_bind_fits(
+        &self,
+        device: VkDevice,
+        image: VkImage,
+        plane: Option<VkImageAspectFlagBits>,
+        memory: VkDeviceMemory,
+        offset: VkDeviceSize,
+    ) -> Result<(), &'static str> {
+        let Some(d) = self.devices.get(&device) else { return Ok(()) };
+        let f = d
+            .fns
+            .fns
+            .try_vkGetImageMemoryRequirements2()
+            .ok_or("bound an image on a device that cannot size one")?;
+        let link = VkImagePlaneMemoryRequirementsInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO,
+            planeAspect: plane.unwrap_or(VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_0_BIT),
+            ..Default::default()
+        };
+        let info = VkImageMemoryRequirementsInfo2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+            pNext: plane.map_or(core::ptr::null(), |_| {
+                (&link as *const VkImagePlaneMemoryRequirementsInfo).cast()
+            }),
+            image,
+        };
+        let mut reqs = VkMemoryRequirements2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+            ..Default::default()
+        };
+        // SAFETY: `image` is a handle the decoder resolved on this device, and the info, its one
+        // link and the answer are locals live for the call. A disjoint image is asked about the
+        // plane its caller already held to the format.
+        unsafe { f(device, &info, &mut reqs) };
+        let r = reqs.memoryRequirements;
+        if r.alignment.0 != 0 && !offset.0.is_multiple_of(r.alignment.0) {
+            return Err("bound an image at an offset it may not start at");
+        }
+        self.holds_binding(memory, offset.0, r.size.0)
+    }
+
+    /// [`Self::image_bind_fits`] for each bind of a `vkBindImageMemory2`, which has passed its
+    /// [`cs::Validate`]: a disjoint image names its plane.
+    pub fn image_binds_fit(
+        &self,
+        device: VkDevice,
+        infos: cs::Decoded<'_, [VkBindImageMemoryInfo]>,
+    ) -> Result<(), &'static str> {
+        infos.iter().try_for_each(|i| {
+            let disjoint = self.facts().shape(i.image)?.disjoint;
+            let plane = chained::<VkBindImagePlaneMemoryInfo>(i)
+                .filter(|_| disjoint)
+                .map(|p| p.planeAspect);
+            self.image_bind_fits(device, i.image, plane, i.memory, i.memoryOffset)
+        })
+    }
+
     /// Whether `sub` is a subresource `image` has, on a device this context has. See
     /// [`Self::image_is_whole`] for the one it does not.
     pub fn image_has_subresource(
@@ -13138,6 +13248,87 @@ mod tests {
         };
         assert_eq!(host(&[region(0), region(56)]), Ok(()));
         assert!(host(&[region(0), region(57)]).is_err(), "one texel past");
+
+        d.abandon_planted();
+    }
+
+    /// A bind lies inside its memory: a buffer by its own size, an image by the size and
+    /// alignment the driver gives it -- a disjoint image's by the plane it binds.
+    #[test]
+    fn a_bind_lies_inside_its_memory() {
+        use crate::venus::proto::types::{
+            VkBindImageMemoryInfo, VkDeviceMemory, VkExtent3D, VkMemoryRequirements2,
+            VkSampleCountFlagBits,
+        };
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const MEMORY: VkDeviceMemory = VkDeviceMemory::forged(0x500);
+        const BUFFER: VkBuffer = VkBuffer::forged(0x600);
+        const IMAGE: VkImage = VkImage::forged(0x700);
+        const APART: VkImage = VkImage::forged(0x701);
+        unsafe extern "C" fn reqs(
+            _: VkDevice,
+            info: *const VkImageMemoryRequirementsInfo2,
+            out: *mut VkMemoryRequirements2,
+        ) {
+            // SAFETY: the bind check's own locals, live for the call.
+            let plane = unsafe { !(*info).pNext.is_null() };
+            // SAFETY: as above.
+            let r = unsafe { &mut (*out).memoryRequirements };
+            r.size = VkDeviceSize(if plane { 1024 } else { 4096 });
+            r.alignment = VkDeviceSize(256);
+        }
+        unsafe extern "C" fn free(_: VkDevice, _: VkDeviceMemory, _: *const VkAllocationCallbacks) {
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkGetImageMemoryRequirements2(reqs);
+        fns.plant_vkFreeMemory(free);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.plant_driver_allocation(DEVICE, ObjectId(1), MEMORY, 8192);
+        d.plant_buffer(BUFFER, 4096);
+        let image = |format, flags| VkImageCreateInfo {
+            imageType: VkImageType::VK_IMAGE_TYPE_2D,
+            format,
+            extent: VkExtent3D { width: 64, height: 64, depth: 1 },
+            mipLevels: 1,
+            arrayLayers: 1,
+            samples: VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT,
+            flags: VkImageCreateFlags(flags),
+            ..Default::default()
+        };
+        d.plant_image(IMAGE, &image(VkFormat::VK_FORMAT_R8G8B8A8_UNORM, 0));
+        let disjoint = VkImageCreateFlagBits::VK_IMAGE_CREATE_DISJOINT_BIT.0 as u32;
+        d.plant_image(APART, &image(VkFormat::VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, disjoint));
+
+        let at = VkDeviceSize;
+        assert_eq!(d.buffer_bind_fits(DEVICE, BUFFER, MEMORY, at(4096)), Ok(()), "to the end");
+        assert!(d.buffer_bind_fits(DEVICE, BUFFER, MEMORY, at(4097)).is_err(), "past the end");
+        assert!(d.buffer_bind_fits(DEVICE, BUFFER, MEMORY, at(u64::MAX)).is_err(), "overflowing");
+        assert!(d.buffer_bind_fits(DEVICE, BUFFER, VkDeviceMemory::forged(0x501), at(0)).is_err());
+        assert!(d.buffer_bind_fits(DEVICE, VkBuffer::forged(0x601), MEMORY, at(0)).is_err());
+        assert_eq!(d.buffer_bind_fits(VkDevice::forged(0x9a), BUFFER, MEMORY, at(1 << 40)), Ok(()));
+
+        assert_eq!(d.image_bind_fits(DEVICE, IMAGE, None, MEMORY, at(4096)), Ok(()));
+        assert!(d.image_bind_fits(DEVICE, IMAGE, None, MEMORY, at(4352)).is_err(), "past the end");
+        assert!(d.image_bind_fits(DEVICE, IMAGE, None, MEMORY, at(128)).is_err(), "misaligned");
+
+        let plane = VkBindImagePlaneMemoryInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO,
+            planeAspect: VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_1_BIT,
+            ..Default::default()
+        };
+        let bind = |image, offset| VkBindImageMemoryInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+            pNext: (&plane as *const VkBindImagePlaneMemoryInfo).cast(),
+            image,
+            memory: MEMORY,
+            memoryOffset: at(offset),
+        };
+        let binds =
+            |b: &[VkBindImageMemoryInfo]| d.image_binds_fit(DEVICE, cs::Decoded::planted(b));
+        assert_eq!(binds(&[bind(APART, 7168)]), Ok(()), "a plane is sized as a plane");
+        assert!(binds(&[bind(IMAGE, 7168)]).is_err(), "an image that is not disjoint, whole");
+        assert!(binds(&[bind(IMAGE, 0), bind(APART, 7424)]).is_err(), "any one of them");
 
         d.abandon_planted();
     }

@@ -5043,6 +5043,9 @@ impl Commands for Handlers<'_> {
 
     fn vkBindBufferMemory2(&mut self, args: &mut vn_command_vkBindBufferMemory2<'_>) {
         let infos = args.pBindInfos();
+        if let Err(why) = self.driver.buffer_binds_fit(args.device, infos) {
+            return self.reject(why);
+        }
         args.ret = self.driver.counted_op(args.device, |d| d.vkBindBufferMemory2(), infos);
     }
 
@@ -5051,10 +5054,18 @@ impl Commands for Handlers<'_> {
         if self.refused_on(args.device, infos) {
             return;
         }
+        if let Err(why) = self.driver.image_binds_fit(args.device, infos) {
+            return self.reject(why);
+        }
         args.ret = self.driver.counted_op(args.device, |d| d.vkBindImageMemory2(), infos);
     }
 
     fn vkBindBufferMemory(&mut self, args: &mut vn_command_vkBindBufferMemory<'_>) {
+        let fits =
+            self.driver.buffer_bind_fits(args.device, args.buffer, args.memory, args.memoryOffset);
+        if let Err(why) = fits {
+            return self.reject(why);
+        }
         args.ret = self.driver.bind_one(
             args.device,
             |d| d.vkBindBufferMemory(),
@@ -5066,6 +5077,16 @@ impl Commands for Handlers<'_> {
 
     fn vkBindImageMemory(&mut self, args: &mut vn_command_vkBindImageMemory<'_>) {
         if let Err(why) = self.driver.image_is_whole(args.device, args.image) {
+            return self.reject(why);
+        }
+        let fits = self.driver.image_bind_fits(
+            args.device,
+            args.image,
+            None,
+            args.memory,
+            args.memoryOffset,
+        );
+        if let Err(why) = fits {
             return self.reject(why);
         }
         args.ret = self.driver.bind_one(
@@ -8057,10 +8078,25 @@ mod tests {
         fns.plant_vkResetCommandPool(reset_pool);
         fns.plant_vkBindBufferMemory(bind_buffer);
         fns.plant_vkFlushMappedMemoryRanges(flush);
+        unsafe extern "C" fn free(
+            _: VkDevice,
+            _: VkDeviceMemory,
+            _: *const super::super::proto::types::VkAllocationCallbacks,
+        ) {
+        }
+        fns.plant_vkFreeMemory(free);
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice::forged(DEVICE), fns);
+        // The buffer and memory the bind below names, the buffer inside the memory at its offset.
+        driver.plant_buffer(VkBuffer::forged(0x333), 0x100);
+        driver.plant_driver_allocation(
+            VkDevice::forged(DEVICE),
+            ObjectId(0x44),
+            VkDeviceMemory::forged(0x444),
+            0x1000,
+        );
         // The pool the reset below names, open under the device it names.
         driver.plant_pool::<VkCommandPool>(
             VkDevice::forged(DEVICE),
@@ -17173,6 +17209,22 @@ mod tests {
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkGetImageMemoryRequirements(reqs);
         fns.plant_vkBindImageMemory(bind);
+        unsafe extern "C" fn sized(
+            _: VkDevice,
+            _: *const super::super::proto::types::VkImageMemoryRequirementsInfo2,
+            out: *mut super::super::proto::types::VkMemoryRequirements2,
+        ) {
+            // SAFETY: the bind check's own local, live for the call.
+            unsafe { (*out).memoryRequirements.size = VkDeviceSize(4096) };
+        }
+        unsafe extern "C" fn free(
+            _: VkDevice,
+            _: VkDeviceMemory,
+            _: *const super::super::proto::types::VkAllocationCallbacks,
+        ) {
+        }
+        fns.plant_vkGetImageMemoryRequirements2(sized);
+        fns.plant_vkFreeMemory(free);
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
@@ -17189,6 +17241,12 @@ mod tests {
         let disjoint = VkImageCreateFlagBits::VK_IMAGE_CREATE_DISJOINT_BIT.0 as u32;
         driver.plant_image(VkImage::forged(0x61), &planar(disjoint));
         driver.plant_image(VkImage::forged(0x62), &planar(0));
+        driver.plant_driver_allocation(
+            VkDevice::forged(DEVICE),
+            ObjectId(9),
+            VkDeviceMemory::forged(0x70),
+            4096,
+        );
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -17235,6 +17293,7 @@ mod tests {
             let mut args = vn_command_vkBindImageMemory {
                 device: VkDevice::forged(DEVICE),
                 image: VkImage::forged(image),
+                memory: VkDeviceMemory::forged(0x70),
                 ..Default::default()
             };
             let before = CALLS.load(Ordering::SeqCst);
@@ -17247,6 +17306,18 @@ mod tests {
             );
             h.ask = None;
         }
+        // A whole image bound past the end of its memory is refused before the driver too.
+        let mut args = vn_command_vkBindImageMemory {
+            device: VkDevice::forged(DEVICE),
+            image: VkImage::forged(0x62),
+            memory: VkDeviceMemory::forged(0x70),
+            memoryOffset: VkDeviceSize(4096),
+            ..Default::default()
+        };
+        let before = CALLS.load(Ordering::SeqCst);
+        h.vkBindImageMemory(&mut args);
+        assert!(h.rejected().is_some(), "bound past the end");
+        assert_eq!(CALLS.load(Ordering::SeqCst), before, "and the driver never saw it");
         driver.abandon_planted();
     }
 

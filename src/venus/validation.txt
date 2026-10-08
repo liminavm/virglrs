@@ -26,8 +26,8 @@ vkAllocateCommandBuffers                         reviewed
 vkAllocateDescriptorSets                         pending:descriptors
 vkAllocateMemory                                 reviewed
 vkBeginCommandBuffer                             reviewed
-vkBindBufferMemory                               reviewed
-vkBindBufferMemory2                              reviewed
+vkBindBufferMemory                               validated
+vkBindBufferMemory2                              validated
 vkBindImageMemory                                validated
 vkBindImageMemory2                               validated
 vkCmdBeginConditionalRenderingEXT                reviewed

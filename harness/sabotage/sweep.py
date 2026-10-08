@@ -4383,6 +4383,39 @@ SABOTAGES = [
         'an_image_is_made_only_in_a_shape_the_device_has',
     ),
     (
+        'a bind may run past the end of its memory',
+        'src/venus/driver.rs',
+        """        if offset >= have || size > have - offset {""",
+        """        if offset > have {""",
+        'a_bind_lies_inside_its_memory',
+    ),
+    (
+        'an image may be bound at any offset',
+        'src/venus/driver.rs',
+        """        if r.alignment.0 != 0 && !offset.0.is_multiple_of(r.alignment.0) {""",
+        """        if r.alignment.0 == u64::MAX {""",
+        'a_bind_lies_inside_its_memory',
+    ),
+    (
+        'an image bind is sized as a plane when it is whole',
+        'src/venus/driver.rs',
+        """                .filter(|_| disjoint)
+""",
+        """                .filter(|_| disjoint || true)
+""",
+        'a_bind_lies_inside_its_memory',
+    ),
+    (
+        'the 1.0 image bind forwards past the end of its memory',
+        'src/venus/context.rs',
+        """        let fits = self.driver.image_bind_fits(
+""",
+        """        let fits = Ok::<(), &str>(());
+        let _ = self.driver.image_bind_fits(
+""",
+        'a_disjoint_image_is_never_sized_or_bound_whole',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",
