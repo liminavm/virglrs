@@ -534,6 +534,8 @@ pub enum Unrecorded {
     /// The pipeline bound at that point has been destroyed since. Vulkan leaves the command
     /// buffer invalid; the driver would read the freed pipeline's shaders.
     Destroyed,
+    /// An argument the draw cannot be recorded with; the reason says which.
+    Invalid(&'static str),
 }
 
 /// Why a recorded command was refused before the driver saw it.
@@ -6745,6 +6747,9 @@ impl Driver {
 
     /// `vkCmdDrawIndirectByteCountEXT`: a draw whose vertex count is the byte count a transform
     /// feedback pass left in `counter`, divided by `stride`.
+    ///
+    /// A zero stride is refused: Vulkan requires one above zero, and KosmicKrisp divides by it on
+    /// the CPU when it knows the counter, which is a trap on a host whose division by zero traps.
     #[allow(clippy::too_many_arguments)]
     pub fn cmd_draw_indirect_byte_count(
         &self,
@@ -6756,6 +6761,9 @@ impl Driver {
         vertex_offset: u32,
         stride: u32,
     ) -> Result<(), Unrecorded> {
+        if stride == 0 {
+            return Err(Unrecorded::Invalid("drew from a transform feedback count with no stride"));
+        }
         let f = self
             .drawer(cb, BindPoint::Graphics)?
             .try_vkCmdDrawIndirectByteCountEXT()
@@ -11119,6 +11127,43 @@ mod tests {
             arrayLayers: 2,
             ..Default::default()
         }
+    }
+
+    /// A draw from a transform feedback count with a zero stride is refused before the driver:
+    /// KosmicKrisp divides the count by it on the CPU.
+    #[test]
+    fn a_byte_count_draw_with_no_stride_is_refused_before_the_driver() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const DEVICE: VkDevice = VkDevice::forged(0x67);
+        const CB: VkCommandBuffer = VkCommandBuffer::forged(0x68);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn draw(
+            _c: VkCommandBuffer,
+            _n: u32,
+            _f: u32,
+            _b: VkBuffer,
+            _o: VkDeviceSize,
+            _co: u32,
+            _s: u32,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdDrawIndirectByteCountEXT(draw);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x69), &[(CB, ObjectId(70))]);
+        d.plant_bound(CB, BindPoint::Graphics);
+
+        let counter = VkBuffer::forged(0x71);
+        let at = VkDeviceSize::default();
+        assert_eq!(d.cmd_draw_indirect_byte_count(CB, 1, 0, counter, at, 0, 16), Ok(()));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        let got = d.cmd_draw_indirect_byte_count(CB, 1, 0, counter, at, 0, 0);
+        assert!(matches!(got, Err(Unrecorded::Invalid(_))), "no stride: {got:?}");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "the driver never saw it");
+
+        d.abandon_planted();
     }
 
     /// A pipeline layout the device cannot hold does not validate. The Mesa runtime copies its set

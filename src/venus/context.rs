@@ -2396,6 +2396,7 @@ impl Handlers<'_> {
             Err(driver::Unrecorded::NoDevice) => self.no_recorder(),
             Err(driver::Unrecorded::Unbound) => self.reject(UNBOUND),
             Err(driver::Unrecorded::Destroyed) => self.reject(UNBOUND_DESTROYED),
+            Err(driver::Unrecorded::Invalid(why)) => self.reject(why),
         }
     }
 

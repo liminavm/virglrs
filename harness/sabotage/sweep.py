@@ -3905,6 +3905,13 @@ SABOTAGES = [
         'a_pipeline_layout_past_the_device_does_not_validate',
     ),
     (
+        'a byte count draw may divide by a zero stride',
+        'src/venus/driver.rs',
+        '        if stride == 0 {\n            return Err(Unrecorded::Invalid(',
+        '        if stride == u32::MAX {\n            return Err(Unrecorded::Invalid(',
+        'a_byte_count_draw_with_no_stride_is_refused_before_the_driver',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

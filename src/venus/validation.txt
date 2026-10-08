@@ -72,7 +72,7 @@ vkCmdDrawIndexed                                 reviewed
 vkCmdDrawIndexedIndirect                         reviewed
 vkCmdDrawIndexedIndirectCount                    reviewed
 vkCmdDrawIndirect                                reviewed
-vkCmdDrawIndirectByteCountEXT                    pending:limits
+vkCmdDrawIndirectByteCountEXT                    validated
 vkCmdDrawIndirectCount                           reviewed
 vkCmdDrawMeshTasksEXT                            reviewed
 vkCmdDrawMeshTasksIndirectCountEXT               reviewed
