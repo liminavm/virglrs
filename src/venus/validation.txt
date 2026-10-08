@@ -13,8 +13,9 @@
 #                     what the decoder already refuses. Reviewed against KosmicKrisp and the Mesa
 #                     runtime: a host driver that trusts more is a reason to look again.
 #   pending:<group>   A known hazard with no check yet. `group` is the kind of check it needs:
-#                     limits (the device's limits), pipelines, render-passes, descriptors, images
-#                     (the image's own extent, levels and layers), regions (copy, blit and resolve
+#                     limits (the device's limits), buffers (an offset or range against the
+#                     buffer's own size), pipelines, render-passes, descriptors, images (the
+#                     image's own extent, levels and layers), regions (copy, blit and resolve
 #                     regions against their images), queries.
 #
 # `every_served_command_is_classified_for_validation` holds this file to the handlers: a command
@@ -38,12 +39,12 @@ vkCmdBeginRendering                              pending:limits
 vkCmdBeginTransformFeedbackEXT                   reviewed
 vkCmdBindDescriptorSets                          pending:descriptors
 vkCmdBindDescriptorSets2                         pending:descriptors
-vkCmdBindIndexBuffer                             pending:limits
-vkCmdBindIndexBuffer2                            pending:limits
+vkCmdBindIndexBuffer                             pending:buffers
+vkCmdBindIndexBuffer2                            pending:buffers
 vkCmdBindPipeline                                reviewed
 vkCmdBindTransformFeedbackBuffersEXT             reviewed
-vkCmdBindVertexBuffers                           pending:limits
-vkCmdBindVertexBuffers2                          pending:limits
+vkCmdBindVertexBuffers                           pending:buffers
+vkCmdBindVertexBuffers2                          pending:buffers
 vkCmdBlitImage                                   pending:regions
 vkCmdBlitImage2                                  pending:regions
 vkCmdBuildAccelerationStructuresIndirectKHR      reviewed
@@ -105,11 +106,11 @@ vkCmdSetAlphaToCoverageEnableEXT                 reviewed
 vkCmdSetAlphaToOneEnableEXT                      reviewed
 vkCmdSetAttachmentFeedbackLoopEnableEXT          reviewed
 vkCmdSetBlendConstants                           reviewed
-vkCmdSetColorBlendAdvancedEXT                    pending:limits
-vkCmdSetColorBlendEnableEXT                      pending:limits
-vkCmdSetColorBlendEquationEXT                    pending:limits
+vkCmdSetColorBlendAdvancedEXT                    validated
+vkCmdSetColorBlendEnableEXT                      validated
+vkCmdSetColorBlendEquationEXT                    validated
 vkCmdSetColorWriteEnableEXT                      reviewed
-vkCmdSetColorWriteMaskEXT                        pending:limits
+vkCmdSetColorWriteMaskEXT                        validated
 vkCmdSetConservativeRasterizationModeEXT         reviewed
 vkCmdSetCullMode                                 reviewed
 vkCmdSetDepthBias                                reviewed

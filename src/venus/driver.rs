@@ -546,7 +546,13 @@ pub enum RecordRefused {
 /// about one plants its own with [`Driver::plant_limits`].
 #[cfg(test)]
 fn planted_limits() -> VkPhysicalDeviceLimits {
-    VkPhysicalDeviceLimits { maxPushConstantsSize: 256, maxViewports: 16, ..Default::default() }
+    VkPhysicalDeviceLimits {
+        maxPushConstantsSize: 256,
+        maxViewports: 16,
+        maxColorAttachments: 8,
+        maxVertexInputBindings: 32,
+        ..Default::default()
+    }
 }
 
 /// Whether `count` entries written from `first` lie inside an array of `limit`, the shape of every
@@ -5813,17 +5819,37 @@ impl Driver {
         offsets: &[VkDeviceSize],
         sizes: Option<&[VkDeviceSize]>,
         strides: Option<&[VkDeviceSize]>,
-    ) -> Option<()> {
+    ) -> Result<(), RecordRefused> {
         let n = buffers.len();
         assert_eq!(offsets.len(), n, "one count governs every array");
         assert!(sizes.is_none_or(|s| s.len() == n), "one count governs every array");
         assert!(strides.is_none_or(|s| s.len() == n), "one count governs every array");
-        let f = self.recorder(cb)?.try_vkCmdBindVertexBuffers2()?;
+        self.vertex_bindings_fit(cb, first, n)?;
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdBindVertexBuffers2())
+            .ok_or(RecordRefused::NoDevice)?;
         let (sizes, strides) = (optional(sizes), optional(strides));
-        // SAFETY: as above; the count is the length every array present shares, and an absent
-        // one is the null the driver reads as "not supplied".
+        // SAFETY: as above; the count is the length every array present shares, held to the
+        // limit above, and an absent one is the null the driver reads as "not supplied".
         unsafe { f(cb, first, n as u32, buffers.as_ptr(), offsets.as_ptr(), sizes, strides) };
-        Some(())
+        Ok(())
+    }
+
+    /// Whether `count` vertex bindings from `first` lie inside the device's
+    /// `maxVertexInputBindings`. KosmicKrisp stores each binding's buffer and the Mesa runtime
+    /// its stride at `first + i` in arrays that long, and neither checks.
+    fn vertex_bindings_fit(
+        &self,
+        cb: VkCommandBuffer,
+        first: u32,
+        count: usize,
+    ) -> Result<(), RecordRefused> {
+        let limits = self.recorder_limits(cb).ok_or(RecordRefused::NoDevice)?;
+        if !window_fits(limits.maxVertexInputBindings, first, count) {
+            return Err(RecordRefused::Invalid("bound vertex buffers past the last binding"));
+        }
+        Ok(())
     }
 
     /// `vkCmdPushDescriptorSet`: descriptor writes recorded into the command buffer rather than
@@ -6257,10 +6283,11 @@ impl Driver {
         first: u32,
         buffers: &[VkBuffer],
         offsets: &[VkDeviceSize],
-    ) -> Option<()> {
+    ) -> Result<(), RecordRefused> {
         assert_eq!(buffers.len(), offsets.len(), "one count governs both arrays");
-        let d = self.recorder(cb)?;
-        // SAFETY: as above; the count is the length both slices share.
+        self.vertex_bindings_fit(cb, first, buffers.len())?;
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the length both slices share, held to the limit above.
         unsafe {
             (d.vkCmdBindVertexBuffers())(
                 cb,
@@ -6270,7 +6297,7 @@ impl Driver {
                 offsets.as_ptr(),
             )
         };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_fill_buffer(
@@ -6915,6 +6942,9 @@ impl Driver {
     /// The four setters of `VK_EXT_extended_dynamic_state3` that take one value per color
     /// attachment, from `first` on. The count is the slice's own length; none of the element
     /// types holds a pointer, so a slice of them is all the driver reads.
+    ///
+    /// Held to the device's `maxColorAttachments`: the Mesa runtime copies the values to `first`
+    /// in its array of that many attachments and checks neither. See [`window_fits`].
     fn cmd_set_per_attachment<T>(
         &self,
         cb: VkCommandBuffer,
@@ -6923,11 +6953,17 @@ impl Driver {
         pick: impl FnOnce(
             &DeviceFns,
         ) -> Option<unsafe extern "C" fn(VkCommandBuffer, u32, u32, *const T)>,
-    ) -> Option<()> {
-        let f = self.recorder(cb).and_then(pick)?;
-        // SAFETY: as above; the count is the slice's own length.
+    ) -> Result<(), RecordRefused> {
+        let limits = self.recorder_limits(cb).ok_or(RecordRefused::NoDevice)?;
+        if !window_fits(limits.maxColorAttachments, first, values.len()) {
+            return Err(RecordRefused::Invalid(
+                "set color attachment state past the last attachment",
+            ));
+        }
+        let f = self.recorder(cb).and_then(pick).ok_or(RecordRefused::NoDevice)?;
+        // SAFETY: as above; the count is the slice's own length, held to the limit above.
         unsafe { f(cb, first, values.len() as u32, values.as_ptr()) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdSetColorBlendEnableEXT`: blending on or off, per attachment. See [`Self::cmd_set_per_attachment`].
@@ -6936,7 +6972,7 @@ impl Driver {
         cb: VkCommandBuffer,
         first: u32,
         enables: &[VkBool32],
-    ) -> Option<()> {
+    ) -> Result<(), RecordRefused> {
         self.cmd_set_per_attachment(cb, first, enables, |d| d.try_vkCmdSetColorBlendEnableEXT())
     }
 
@@ -6946,7 +6982,7 @@ impl Driver {
         cb: VkCommandBuffer,
         first: u32,
         equations: &[VkColorBlendEquationEXT],
-    ) -> Option<()> {
+    ) -> Result<(), RecordRefused> {
         self.cmd_set_per_attachment(cb, first, equations, |d| d.try_vkCmdSetColorBlendEquationEXT())
     }
 
@@ -6956,7 +6992,7 @@ impl Driver {
         cb: VkCommandBuffer,
         first: u32,
         masks: &[VkColorComponentFlags],
-    ) -> Option<()> {
+    ) -> Result<(), RecordRefused> {
         self.cmd_set_per_attachment(cb, first, masks, |d| d.try_vkCmdSetColorWriteMaskEXT())
     }
 
@@ -6966,7 +7002,7 @@ impl Driver {
         cb: VkCommandBuffer,
         first: u32,
         advanced: &[VkColorBlendAdvancedEXT],
-    ) -> Option<()> {
+    ) -> Result<(), RecordRefused> {
         self.cmd_set_per_attachment(cb, first, advanced, |d| d.try_vkCmdSetColorBlendAdvancedEXT())
     }
 
@@ -10899,6 +10935,122 @@ mod tests {
             arrayLayers: 2,
             ..Default::default()
         }
+    }
+
+    /// Color attachment state and vertex bindings past the device's last are refused before the
+    /// driver sees them. The Mesa runtime copies per-attachment blend state to `first` in an
+    /// array of `maxColorAttachments`, and KosmicKrisp and the runtime store each vertex binding
+    /// at `first + i` in arrays of `maxVertexInputBindings`; none of them checks.
+    #[test]
+    fn attachment_state_and_vertex_bindings_past_the_last_are_refused_before_the_driver() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const DEVICE: VkDevice = VkDevice::forged(0x27);
+        const CB: VkCommandBuffer = VkCommandBuffer::forged(0x28);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn enable(_c: VkCommandBuffer, _f: u32, _n: u32, _v: *const VkBool32) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn equation(
+            _c: VkCommandBuffer,
+            _f: u32,
+            _n: u32,
+            _v: *const VkColorBlendEquationEXT,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn mask(
+            _c: VkCommandBuffer,
+            _f: u32,
+            _n: u32,
+            _v: *const VkColorComponentFlags,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn advanced(
+            _c: VkCommandBuffer,
+            _f: u32,
+            _n: u32,
+            _v: *const VkColorBlendAdvancedEXT,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn bind(
+            _c: VkCommandBuffer,
+            _f: u32,
+            _n: u32,
+            _b: *const VkBuffer,
+            _o: *const VkDeviceSize,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn bind2(
+            _c: VkCommandBuffer,
+            _f: u32,
+            _n: u32,
+            _b: *const VkBuffer,
+            _o: *const VkDeviceSize,
+            _s: *const VkDeviceSize,
+            _t: *const VkDeviceSize,
+        ) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetColorBlendEnableEXT(enable);
+        fns.plant_vkCmdSetColorBlendEquationEXT(equation);
+        fns.plant_vkCmdSetColorWriteMaskEXT(mask);
+        fns.plant_vkCmdSetColorBlendAdvancedEXT(advanced);
+        fns.plant_vkCmdBindVertexBuffers(bind);
+        fns.plant_vkCmdBindVertexBuffers2(bind2);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        let limits = VkPhysicalDeviceLimits {
+            maxColorAttachments: 8,
+            maxVertexInputBindings: 32,
+            ..Default::default()
+        };
+        d.plant_limits(DEVICE, limits);
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x29), &[(CB, ObjectId(30))]);
+
+        let calls = |f: &dyn Fn() -> Result<(), RecordRefused>| {
+            let before = CALLS.load(Ordering::SeqCst);
+            let got = f();
+            (got, CALLS.load(Ordering::SeqCst) - before)
+        };
+        let refused = |r: (Result<(), RecordRefused>, usize)| {
+            matches!(r, (Err(RecordRefused::Invalid(_)), 0))
+        };
+        let ok = (Ok(()), 1);
+
+        let enables = [VkBool32::default(); 9];
+        let equations = [VkColorBlendEquationEXT::default(); 9];
+        let masks = [VkColorComponentFlags::default(); 9];
+        let advs = [VkColorBlendAdvancedEXT::default(); 9];
+        assert_eq!(calls(&|| d.cmd_set_color_blend_enable(CB, 7, &enables[..1])), ok, "the last");
+        assert!(refused(calls(&|| d.cmd_set_color_blend_enable(CB, 7, &enables[..2]))));
+        assert_eq!(calls(&|| d.cmd_set_color_blend_equation(CB, 0, &equations[..8])), ok);
+        assert!(refused(calls(&|| d.cmd_set_color_blend_equation(CB, 0, &equations))), "nine");
+        assert_eq!(calls(&|| d.cmd_set_color_write_mask(CB, 4, &masks[..4])), ok);
+        assert!(refused(calls(&|| d.cmd_set_color_write_mask(CB, u32::MAX, &masks[..1]))));
+        assert_eq!(calls(&|| d.cmd_set_color_blend_advanced(CB, 0, &advs[..1])), ok);
+        assert!(refused(calls(&|| d.cmd_set_color_blend_advanced(CB, 8, &advs[..1]))), "the ninth");
+
+        let buffers = [VkBuffer::NULL; 33];
+        let offsets = [VkDeviceSize::default(); 33];
+        let b = |first: u32, n: usize| {
+            d.cmd_bind_vertex_buffers(CB, first, &buffers[..n], &offsets[..n])
+        };
+        assert_eq!(calls(&|| b(31, 1)), ok, "the last binding");
+        assert!(refused(calls(&|| b(31, 2))), "one past it");
+        assert!(refused(calls(&|| b(0, 33))), "thirty-three bindings");
+        let b2 = |first: u32, n: usize| {
+            d.cmd_bind_vertex_buffers2(CB, first, &buffers[..n], &offsets[..n], None, None)
+        };
+        assert_eq!(calls(&|| b2(0, 32)), ok, "every binding");
+        assert!(refused(calls(&|| b2(32, 1))), "the thirty-third");
+
+        d.abandon_planted();
     }
 
     /// Viewports and scissors past the device's last viewport are refused before the driver

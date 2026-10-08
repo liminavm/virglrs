@@ -5770,7 +5770,7 @@ impl Commands for Handlers<'_> {
             args.pSizes(),
             args.pStrides(),
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdPushDescriptorSet(&mut self, args: &mut vn_command_vkCmdPushDescriptorSet<'_>) {
@@ -5859,7 +5859,7 @@ impl Commands for Handlers<'_> {
             buffers,
             offsets,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdFillBuffer(&mut self, args: &mut vn_command_vkCmdFillBuffer<'_>) {
@@ -6339,7 +6339,7 @@ impl Commands for Handlers<'_> {
             args.firstAttachment,
             args.pColorBlendEnables(),
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdSetColorBlendEquationEXT(
@@ -6351,7 +6351,7 @@ impl Commands for Handlers<'_> {
             args.firstAttachment,
             args.pColorBlendEquations(),
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdSetColorWriteMaskEXT(&mut self, args: &mut vn_command_vkCmdSetColorWriteMaskEXT<'_>) {
@@ -6360,7 +6360,7 @@ impl Commands for Handlers<'_> {
             args.firstAttachment,
             args.pColorWriteMasks(),
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdSetColorBlendAdvancedEXT(
@@ -6372,7 +6372,7 @@ impl Commands for Handlers<'_> {
             args.firstAttachment,
             args.pColorBlendAdvanced(),
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdSetSampleMaskEXT(&mut self, args: &mut vn_command_vkCmdSetSampleMaskEXT<'_>) {
@@ -16329,8 +16329,16 @@ mod tests {
         use std::collections::BTreeSet;
 
         const FILE: &str = include_str!("validation.txt");
-        const GROUPS: [&str; 7] =
-            ["limits", "pipelines", "render-passes", "descriptors", "images", "regions", "queries"];
+        const GROUPS: [&str; 8] = [
+            "limits",
+            "buffers",
+            "pipelines",
+            "render-passes",
+            "descriptors",
+            "images",
+            "regions",
+            "queries",
+        ];
         let lines: Vec<(&str, &str)> = FILE
             .lines()
             .map(str::trim)

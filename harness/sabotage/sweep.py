@@ -3842,6 +3842,20 @@ SABOTAGES = [
         'viewports_and_scissors_past_the_last_viewport_are_refused_before_the_driver',
     ),
     (
+        'per-attachment blend state is not held to the attachment limit',
+        'src/venus/driver.rs',
+        """        if !window_fits(limits.maxColorAttachments, first, values.len()) {""",
+        """        if false && !window_fits(limits.maxColorAttachments, first, values.len()) {""",
+        'attachment_state_and_vertex_bindings_past_the_last_are_refused_before_the_driver',
+    ),
+    (
+        'vertex bindings are not held to the binding limit',
+        'src/venus/driver.rs',
+        """        if !window_fits(limits.maxVertexInputBindings, first, count) {""",
+        """        if false && !window_fits(limits.maxVertexInputBindings, first, count) {""",
+        'attachment_state_and_vertex_bindings_past_the_last_are_refused_before_the_driver',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",
