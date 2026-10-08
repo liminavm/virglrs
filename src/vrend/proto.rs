@@ -248,6 +248,9 @@ pub struct BlendState {
     pub alpha_to_one: bool,
     pub logicop_func: LogicOp,
     pub rt: [RtBlend; 8],
+    /// The `KHR_blend_equation_advanced` equation, which replaces every target's. Guest virgl
+    /// sends it in the alpha source factor of a first target whose blending is off.
+    pub advanced: Option<AdvancedBlendMode>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]

@@ -5219,6 +5219,7 @@ mod tests {
                     alpha_to_one: false,
                     logicop_func: d.logicop.unwrap_or(LogicOp::Copy),
                     rt: [writes; 8],
+                    advanced: None,
                 }),
             },
             Command::BindObject { kind: ObjectType::Blend, handle: Some(o(5)) },
@@ -7970,6 +7971,71 @@ mod tests {
                 &pixels[..4]
             );
         }
+    }
+
+    /// An advanced blend equation the guest sends in the blend state is the one the draw blends
+    /// with, on a host that has the equations but no framebuffer fetch: the guest does not lower
+    /// it into the shader there. Red multiplied over a grey target is half red; red written
+    /// over it, as blending off would, is full red. The state carrying the equation was refused
+    /// outright, which cost the guest its context.
+    #[test]
+    fn an_advanced_blend_equation_blends_the_draw() {
+        use crate::vrend::pipe::AdvancedBlendMode;
+        use crate::vrend::proto::{BlendState, Command, Object, ObjectType, RtBlend};
+        // `FS_BLEND_EQUATION_ADVANCED` is a bit per mode; bit 1 is multiply.
+        const MULTIPLY_FS: &str = "FRAG\nPROPERTY FS_BLEND_EQUATION_ADVANCED 2\nDCL OUT[0], COLOR\n\
+                                   IMM[0] FLT32 { 1.0, 0.0, 0.0, 1.0 }\n  \
+                                   0: MOV OUT[0], IMM[0]\n  1: END\n";
+        let blend = ObjectHandle::new(30).expect("non-zero");
+        let more = More {
+            before: vec![
+                Command::CreateObject {
+                    handle: blend,
+                    object: Object::Blend(BlendState {
+                        independent_blend_enable: false,
+                        logicop_enable: false,
+                        dither: false,
+                        alpha_to_coverage: false,
+                        alpha_to_one: false,
+                        logicop_func: crate::vrend::pipe::LogicOp::Clear,
+                        rt: [RtBlend { equation: None, colormask: 0xf }; 8],
+                        advanced: Some(AdvancedBlendMode::Multiply),
+                    }),
+                },
+                Command::BindObject { kind: ObjectType::Blend, handle: Some(blend) },
+            ],
+            ..Default::default()
+        };
+        let mut served = 0;
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            if !host_has(host_gl, Feature::blend_equation_advanced)
+                || host_has(host_gl, Feature::framebuffer_fetch)
+            {
+                eprintln!("{host_gl:?}: not a host the guest hands the equation to");
+                continue;
+            }
+            served += 1;
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                clear: [0.5, 0.5, 0.5, 1.0],
+                fs: Some(MULTIPLY_FS),
+                vs: None,
+                consts: &[],
+                pipeline: None,
+                more: Some(&more),
+                logicop: None,
+                tess: None,
+            })
+            .unwrap_or_else(|e| panic!("{host_gl:?}: {e:?}"))
+            .expect("the target is read back");
+            assert!(
+                pixels.as_chunks::<4>().0.iter().all(|p| p[0].abs_diff(128) <= 2 && p[1] <= 2),
+                "{host_gl:?}: red multiplied over grey: {:?}",
+                &pixels[..4]
+            );
+        }
+        assert!(served > 0, "the premise: some host has the equations and no framebuffer fetch");
     }
 
     /// A draw under a render condition is dropped while the condition's query says so: an

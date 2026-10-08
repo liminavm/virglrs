@@ -563,6 +563,27 @@ fn blend_factor(f: BlendFactor) -> GLenum {
 /// formats, and whether a constant factor reads the blend colour's alpha in red. A target
 /// without alpha reads its destination alpha as one; an emulated-alpha target blends and masks
 /// its alpha in red, the channel that stores it.
+/// `translate_blend_func_advanced`.
+fn advanced_blend_equation(mode: AdvancedBlendMode) -> GLenum {
+    match mode {
+        AdvancedBlendMode::Multiply => GL_MULTIPLY_KHR,
+        AdvancedBlendMode::Screen => GL_SCREEN_KHR,
+        AdvancedBlendMode::Overlay => GL_OVERLAY_KHR,
+        AdvancedBlendMode::Darken => GL_DARKEN_KHR,
+        AdvancedBlendMode::Lighten => GL_LIGHTEN_KHR,
+        AdvancedBlendMode::ColorDodge => GL_COLORDODGE_KHR,
+        AdvancedBlendMode::ColorBurn => GL_COLORBURN_KHR,
+        AdvancedBlendMode::HardLight => GL_HARDLIGHT_KHR,
+        AdvancedBlendMode::SoftLight => GL_SOFTLIGHT_KHR,
+        AdvancedBlendMode::Difference => GL_DIFFERENCE_KHR,
+        AdvancedBlendMode::Exclusion => GL_EXCLUSION_KHR,
+        AdvancedBlendMode::HslHue => GL_HSL_HUE_KHR,
+        AdvancedBlendMode::HslSaturation => GL_HSL_SATURATION_KHR,
+        AdvancedBlendMode::HslColor => GL_HSL_COLOR_KHR,
+        AdvancedBlendMode::HslLuminosity => GL_HSL_LUMINOSITY_KHR,
+    }
+}
+
 fn patch_blend(
     emulated_alpha: impl Fn(Format) -> bool,
     state: &BlendState,
@@ -2181,15 +2202,17 @@ impl Context {
             gl.patch_parameter_i(GL_PATCH_VERTICES, vertices_per_patch);
         }
 
-        // A host with advanced blend equations but no framebuffer fetch takes the equation the
-        // guest sent through the blend state. The wire carries it in the alpha factors of a
-        // target whose blending is off, which the decoder does not keep; the shape is counted
-        // until it does.
+        // A host with advanced blend equations but no framebuffer fetch is handed the equation
+        // through the blend state, and the guest does not lower it into the shader. The bound
+        // state's own emit cannot say it, so the next draw emits the state again over it.
         if fs_blend_advanced != 0
             && !features.has(Feature::framebuffer_fetch)
             && features.has(Feature::blend_equation_advanced)
+            && let Some(mode) = self.sub().blend.and_then(|b| b.advanced)
         {
-            host.todo.note("advanced blend equations");
+            gl.blend_equation(advanced_blend_equation(mode));
+            gl.enable(GL_BLEND);
+            self.sub_mut().blend_dirty = true;
         }
 
         let mode = prim_mode(draw.mode);

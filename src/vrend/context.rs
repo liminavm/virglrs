@@ -69,6 +69,8 @@ const PIPE_CLEAR_DEPTH: u32 = 1 << 0;
 const PIPE_CLEAR_STENCIL: u32 = 1 << 1;
 const PIPE_CLEAR_COLOR0: u32 = 1 << 2;
 const PIPE_CLEAR_COLOR: u32 = 0xff << 2;
+/// `PIPE_TEXTURE_BARRIER_FRAMEBUFFER`: draws read what earlier draws wrote to the framebuffer.
+const PIPE_TEXTURE_BARRIER_FRAMEBUFFER: u32 = 1 << 1;
 
 /// What the guest side of the renderer answers about a resource's pages.
 pub trait Guest {
@@ -1267,6 +1269,7 @@ const ZERO_BLEND: BlendState = BlendState {
     alpha_to_one: false,
     logicop_func: LogicOp::Clear,
     rt: [RtBlend { equation: None, colormask: 0 }; 8],
+    advanced: None,
 };
 
 /// The C's zeroed `pipe_rasterizer_state`.
@@ -2209,9 +2212,13 @@ impl Context {
                 }
                 Ok(())
             }
-            Command::TextureBarrier(_) => {
-                // Neither `glTextureBarrier` nor `glBlendBarrierKHR` is reachable on this host
-                // without its feature; the C emits nothing then either.
+            Command::TextureBarrier(flags) => {
+                // `vrend_texture_barrier`. Each barrier is emitted only where its feature is.
+                if flags & PIPE_TEXTURE_BARRIER_FRAMEBUFFER != 0
+                    && host.has(Feature::blend_equation_advanced)
+                {
+                    host.gl.blend_barrier();
+                }
                 Ok(())
             }
             Command::SetAtomicBuffers { start_slot, buffers } => {

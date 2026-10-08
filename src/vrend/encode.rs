@@ -546,8 +546,15 @@ impl Encoder<'_> {
                     | (u32::from(b.alpha_to_coverage) << 3)
                     | (u32::from(b.alpha_to_one) << 4));
                 self.u(b.logicop_func.wire());
-                for rt in &b.rt {
+                for (i, rt) in b.rt.iter().enumerate() {
                     let mut s2 = u32::from(rt.colormask) << 27;
+                    // Only a first target whose blending is off has a free factor to carry it.
+                    if i == 0
+                        && rt.equation.is_none()
+                        && let Some(mode) = b.advanced
+                    {
+                        s2 |= mode.wire() << 17;
+                    }
                     if let Some(eq) = &rt.equation {
                         s2 |= 1
                             | (eq.rgb.func.wire() << 1)

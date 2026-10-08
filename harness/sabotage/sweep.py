@@ -3707,6 +3707,20 @@ SABOTAGES = [
         'a_format_is_held_exactly_only_at_a_depth_that_holds_its_values',
     ),
     (
+        'an advanced blend equation is never set',
+        'src/vrend/context/draw.rs',
+        """            gl.blend_equation(advanced_blend_equation(mode));""",
+        """            let _ = advanced_blend_equation(mode);""",
+        'an_advanced_blend_equation_blends_the_draw',
+    ),
+    (
+        'a blend state carrying an advanced equation is refused',
+        'src/vrend/decode.rs',
+        """            let rest = if i == 0 { s2 & !(0x1f << 17) } else { s2 };""",
+        """            let rest = s2;""",
+        'an_advanced_blend_equation_blends_the_draw',
+    ),
+    (
         'a GLES 3.1 host tells the guest GLSL 310 as the C does',
         'src/vrend/caps.rs',
         """        Api::Gles(v) if v >= 31 => 330,""",

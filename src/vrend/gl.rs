@@ -373,6 +373,8 @@ mod procs {
         = gles [try_glFramebufferTexture3DOES], gl [try_glFramebufferTexture3D]);
     resolver!(framebuffer_texture_2d_multisample: unsafe extern "C" fn(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei)
         = gles [try_glFramebufferTexture2DMultisampleEXT], gl []);
+    resolver!(blend_barrier: unsafe extern "C" fn()
+        = gles [try_glBlendBarrier, try_glBlendBarrierKHR], gl [try_glBlendBarrierKHR]);
     resolver!(draw_transform_feedback: unsafe extern "C" fn(GLenum, GLuint)
         = gles [], gl [try_glDrawTransformFeedback]);
     resolver!(draw_transform_feedback_instanced: unsafe extern "C" fn(GLenum, GLuint, GLsizei)
@@ -466,6 +468,9 @@ mod procs {
             framebuffer_texture_2d_multisample(t, a).is_some()
         }),
         (Feature::texture_view, "glTextureView", |t, a| texture_view(t, a).is_some()),
+        (Feature::blend_equation_advanced, "glBlendBarrierKHR", |t, a| {
+            blend_barrier(t, a).is_some()
+        }),
         (Feature::transform_feedback_draw, "glDrawTransformFeedback", |t, a| {
             draw_transform_feedback(t, a).is_some()
         }),
@@ -2860,6 +2865,17 @@ impl Gl {
     pub fn blend_equation_separate(&self, rgb: GLenum, alpha: GLenum) {
         // SAFETY: plain scalars.
         unsafe { self.t.glBlendEquationSeparate()(rgb, alpha) };
+    }
+
+    /// `glBlendBarrierKHR`: advanced blending sees what the draws before it wrote.
+    pub fn blend_barrier(&self) {
+        let f = promised(
+            procs::blend_barrier(&self.t, self.api),
+            Feature::blend_equation_advanced,
+            "glBlendBarrierKHR",
+        );
+        // SAFETY: takes nothing.
+        unsafe { f() };
     }
 
     pub fn blend_equation(&self, mode: GLenum) {

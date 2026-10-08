@@ -453,6 +453,27 @@ wire_enum!(
 );
 
 wire_enum!(
+    /// `pipe_advanced_blend_mode`, past `NONE`: a `KHR_blend_equation_advanced` equation.
+    AdvancedBlendMode {
+        Multiply = 1,
+        Screen = 2,
+        Overlay = 3,
+        Darken = 4,
+        Lighten = 5,
+        ColorDodge = 6,
+        ColorBurn = 7,
+        HardLight = 8,
+        SoftLight = 9,
+        Difference = 10,
+        Exclusion = 11,
+        HslHue = 12,
+        HslSaturation = 13,
+        HslColor = 14,
+        HslLuminosity = 15,
+    }
+);
+
+wire_enum!(
     /// `pipe_render_cond_flag`.
     RenderCondMode {
         Wait = 0,

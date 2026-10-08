@@ -945,6 +945,7 @@ fn blend(w: &Words) -> Result<BlendState, Refused> {
         return Err(w.refuse("logic op", s1));
     }
     let mut rt = [RtBlend { equation: None, colormask: 0 }; 8];
+    let mut advanced = None;
     for (i, target) in rt.iter_mut().enumerate() {
         let s2 = w.u(4 + i);
         if s2 >> 31 != 0 {
@@ -961,8 +962,15 @@ fn blend(w: &Words) -> Result<BlendState, Refused> {
             };
             Some(RtBlendEq { rgb: eq(1, 4, 9)?, alpha: eq(14, 17, 22)? })
         } else {
-            if s2 & 0x07ff_fffe != 0 {
+            // Only the first target's alpha source factor may be set: there it is the advanced
+            // equation.
+            let mode = (s2 >> 17) & 0x1f;
+            let rest = if i == 0 { s2 & !(0x1f << 17) } else { s2 };
+            if rest & 0x07ff_fffe != 0 {
                 return Err(w.refuse("disabled render target blend", s2));
+            }
+            if i == 0 && mode != 0 {
+                advanced = Some(w.parse("advanced blend", mode, AdvancedBlendMode::from_wire)?);
             }
             None
         };
@@ -976,6 +984,7 @@ fn blend(w: &Words) -> Result<BlendState, Refused> {
         alpha_to_one: bit(s0, 4),
         logicop_func: w.parse("logic op", s1, LogicOp::from_wire)?,
         rt,
+        advanced,
     })
 }
 
@@ -1252,6 +1261,20 @@ mod tests {
                     alpha_to_one: true,
                     logicop_func: LogicOp::Xor,
                     rt,
+                    advanced: None,
+                }),
+            },
+            Command::CreateObject {
+                handle: o(1),
+                object: Object::Blend(BlendState {
+                    independent_blend_enable: false,
+                    logicop_enable: false,
+                    dither: false,
+                    alpha_to_coverage: false,
+                    alpha_to_one: false,
+                    logicop_func: LogicOp::Clear,
+                    rt: [RtBlend { equation: None, colormask: 0xf }; 8],
+                    advanced: Some(AdvancedBlendMode::Screen),
                 }),
             },
             Command::CreateObject {
