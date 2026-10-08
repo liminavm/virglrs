@@ -3096,17 +3096,6 @@ impl Driver {
         self.pending_fences.contains(&fence)
     }
 
-    /// Drop a semaphore's record, at both places Vulkan destroys one: the guest's own
-    /// `vkDestroySemaphore`, and the teardown that empties a device the guest left full.
-    pub fn forget_semaphore(&mut self, sem: VkSemaphore) {
-        self.semaphores.remove(&sem);
-    }
-
-    /// Drop a fence's record, at the same two places.
-    pub fn forget_fence(&mut self, fence: VkFence) {
-        self.pending_fences.remove(&fence);
-    }
-
     /// A reset unmakes the promise: whatever submit named this fence, the guest has said it is
     /// done with the answer.
     ///
@@ -3380,12 +3369,6 @@ impl Driver {
     /// The record of `pool`, for a command about to name its queries.
     fn query_facts(&self, pool: VkQueryPool) -> Result<&QueryFacts, QueryRefused> {
         self.query_pools.get(&pool).ok_or(QueryRefused::UnknownPool)
-    }
-
-    /// Drop a query pool's record. Called from the two places Vulkan destroys one: the guest's
-    /// own `vkDestroyQueryPool`, and the teardown that empties a device the guest left full.
-    pub fn forget_query_pool(&mut self, pool: VkQueryPool) {
-        self.query_pools.remove(&pool);
     }
 
     /// `vkResetQueryPool`: the host-side reset, a Vulkan 1.2 entry point the guest sends only
@@ -4132,28 +4115,43 @@ impl Driver {
         for id in mine().filter(|o| is_memory(o)).map(|o| o.id).collect::<Vec<_>>() {
             self.memory.remove(&id);
         }
-        // The other place an image or a query pool dies -- the guest left it live and the
-        // teardown took it. Its record goes with it, here rather than in `destroy_tracked`, which
-        // holds the device's entry points borrowed out of `self` and so cannot reach the maps.
+        // The other place an object dies -- the guest left it live and the teardown took it. Its
+        // record goes with it through the funnel the guest's own destroy uses, here rather than in
+        // `destroy_tracked`, which holds the device's entry points borrowed out of `self` and so
+        // cannot reach the maps.
         let recorded: Vec<(VkObjectType, HostHandle)> =
             doomed.iter().filter(|o| o.device == Some(device)).map(|o| (o.ty, o.handle)).collect();
         for (ty, handle) in recorded {
-            match ty {
-                VkObjectType::VK_OBJECT_TYPE_IMAGE => self.forget_image(VkImage::from_host(handle)),
-                VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {
-                    self.forget_query_pool(VkQueryPool::from_host(handle));
-                }
-                VkObjectType::VK_OBJECT_TYPE_PIPELINE => {
-                    self.forget_pipeline(VkPipeline::from_host(handle));
-                }
-                VkObjectType::VK_OBJECT_TYPE_SEMAPHORE => {
-                    self.forget_semaphore(VkSemaphore::from_host(handle));
-                }
-                VkObjectType::VK_OBJECT_TYPE_FENCE => {
-                    self.forget_fence(VkFence::from_host(handle));
-                }
-                _ => {}
+            self.forget(ty, handle);
+        }
+    }
+
+    /// Drop whatever record this driver keeps of the object `handle` of type `ty`, the one
+    /// funnel every destroy goes through: [`Driver::destroy_object`] for the guest's own, and the
+    /// teardown of a device the guest left full.
+    ///
+    /// A record is kept because Vulkan will not answer for what an object was created as. Keyed
+    /// by host handle, it must not outlive the object, or a driver that recycles the handle
+    /// would find the dead object's record under its new one. A map that keeps such records
+    /// is forgotten here and nowhere else, so no destroy path can be the one that misses it.
+    fn forget(&mut self, ty: VkObjectType, handle: HostHandle) {
+        match ty {
+            VkObjectType::VK_OBJECT_TYPE_IMAGE => {
+                self.images.remove(&VkImage::from_host(handle));
             }
+            VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {
+                self.query_pools.remove(&VkQueryPool::from_host(handle));
+            }
+            VkObjectType::VK_OBJECT_TYPE_PIPELINE => {
+                self.pipelines.remove(&VkPipeline::from_host(handle));
+            }
+            VkObjectType::VK_OBJECT_TYPE_SEMAPHORE => {
+                self.semaphores.remove(&VkSemaphore::from_host(handle));
+            }
+            VkObjectType::VK_OBJECT_TYPE_FENCE => {
+                self.pending_fences.remove(&VkFence::from_host(handle));
+            }
+            _ => {}
         }
     }
 
@@ -4230,7 +4228,7 @@ impl Driver {
     /// A destroy naming a device this table does not have is a no-op: the device is already gone,
     /// and everything it owned went with it.
     pub fn destroy_object<T: Handle>(
-        &self,
+        &mut self,
         device: VkDevice,
         proc: impl FnOnce(
             &DeviceFns,
@@ -4239,13 +4237,16 @@ impl Driver {
         object: T,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) {
-        let Some(d) = self.devices.get(&device) else {
-            return;
-        };
         if object.host().raw() == 0 {
             // Vulkan makes destroying a null handle a legal no-op, and guests rely on it.
             return;
         }
+        // First, and whether or not the device is still here: a record of a dead object is
+        // never right to keep. See [`Driver::forget`].
+        self.forget(VkObjectType(T::OBJECT_TYPE), object.host());
+        let Some(d) = self.devices.get(&device) else {
+            return;
+        };
         // No entry point to destroy through is no entry point it could have been created
         // through either, so there is nothing of this kind to destroy.
         let Some(destroy) = proc(&d.fns) else { return };
@@ -4470,12 +4471,6 @@ impl Driver {
         let serial = PipelineSerial(self.next_pipeline);
         self.next_pipeline += 1;
         self.pipelines.insert(pipeline, PipelineFacts { device, kind, serial });
-    }
-
-    /// Drop a pipeline's record. Called from the two places a pipeline dies, as
-    /// [`Driver::forget_query_pool`] is.
-    pub fn forget_pipeline(&mut self, pipeline: VkPipeline) {
-        self.pipelines.remove(&pipeline);
     }
 
     /// `vkGetRayTracingShaderGroupHandlesKHR`, or its capture-replay twin: the handles of
@@ -8722,7 +8717,7 @@ impl Driver {
     /// Record what an image was created as, for a scanout allocation that has to match it.
     ///
     /// Kept because Vulkan will not answer for an image's extent or format after the fact, and
-    /// forgotten in [`Self::forget_image`].
+    /// forgotten in [`Self::forget`].
     fn note_image(&mut self, image: VkImage, info: &VkImageCreateInfo) {
         self.images.insert(
             image,
@@ -8737,12 +8732,6 @@ impl Driver {
                 claim: claim_of(info),
             },
         );
-    }
-
-    /// Drop an image's record. Called from the two places Vulkan destroys an image: the guest's
-    /// own `vkDestroyImage`, and the teardown that empties a device the guest left full.
-    pub fn forget_image(&mut self, image: VkImage) {
-        self.images.remove(&image);
     }
 
     /// Free device memory the guest named.
@@ -16310,7 +16299,7 @@ mod tests {
         // touched -- which is what a destroyed pool becomes: a recycled handle finds no record.
         let r = d.cmd_end_query(CB, VkQueryPool::forged(0x99), 0);
         assert_eq!(r, Err(QueryRefused::UnknownPool));
-        d.forget_query_pool(POOL);
+        d.destroy_object(DEVICE, |d| d.try_vkDestroyQueryPool(), POOL, None);
         let r = d.query_pool_results(DEVICE, POOL, 0, 1, &mut buf, VkDeviceSize(4), NONE);
         assert_eq!(r, Err(QueryRefused::UnknownPool));
         assert_eq!(d.reset_query_pool(DEVICE, POOL, 0, 1), Err(QueryRefused::UnknownPool));
@@ -16553,7 +16542,7 @@ mod tests {
         ASKED.with_borrow(|a| assert_eq!(a.len(), 2, "no refusal reached the driver"));
 
         // The guest's destroy takes the record with it, and so does a device's teardown.
-        d.forget_pipeline(LINKED);
+        d.destroy_object(DEVICE, |d| d.try_vkDestroyPipeline(), LINKED, None);
         assert_eq!(
             d.shader_group_handles(DEVICE, LINKED, 0, 1, &mut room, shader),
             Err(RayTracingRefused::UnknownPipeline)

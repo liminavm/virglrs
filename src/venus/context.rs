@@ -2648,7 +2648,8 @@ macro_rules! pool_destroy {
 }
 
 /// The destroy half of [`simple_create`]. The object table entry is removed by the generated
-/// lifecycle hook, so all this owes is the driver call.
+/// lifecycle hook, and any record the driver kept goes in [`Driver::destroy_object`], so all this
+/// owes is that call.
 macro_rules! simple_destroy {
     ($cmd:ident, $args:ty, $target:ident) => {
         fn $cmd(&mut self, args: &mut $args) {
@@ -2953,9 +2954,9 @@ impl Commands for Handlers<'_> {
     // accident -- `vkCreateShaderModule` below is what that looks like.
 
     simple_create!(vkCreateFence, vn_command_vkCreateFence, pCreateInfo, pFence, handle_pFence_mut);
-    /// Not a [`simple_destroy`] for the reason the create above is not simple: the fence carries
-    /// a record of whether a submit is outstanding on it, and a record that outlived its fence
-    /// would answer for whatever handle Vulkan hands out next.
+    /// Not a [`simple_destroy`]: a fence one of this context's streams is waiting on is refused
+    /// rather than destroyed under the wait. Its record of an outstanding submit goes in
+    /// [`Driver::destroy_object`], as every destroyed object's does.
     fn vkDestroyFence(&mut self, args: &mut vn_command_vkDestroyFence<'_>) {
         if self.waited_fence(args.fence) {
             self.reject("destroyed a fence one of its streams is waiting on");
@@ -2967,7 +2968,6 @@ impl Commands for Handlers<'_> {
             args.fence,
             args.pAllocator,
         );
-        self.driver.forget_fence(args.fence);
     }
 
     /// A semaphore, and the one thing about it Vulkan will not answer later.
@@ -2993,7 +2993,6 @@ impl Commands for Handlers<'_> {
             args.semaphore,
             args.pAllocator,
         );
-        self.driver.forget_semaphore(args.semaphore);
     }
 
     // An event, which is simple in both halves: no host state beyond the object table, and
@@ -3046,16 +3045,7 @@ impl Commands for Handlers<'_> {
         self.plant("vkCreateImage", args.pImage(), args.handle_pImage_mut(), host);
     }
 
-    /// Not [`simple_destroy`]: the record [`Self::vkCreateImage`] made goes with the image.
-    fn vkDestroyImage(&mut self, args: &mut vn_command_vkDestroyImage<'_>) {
-        self.driver.forget_image(args.image);
-        self.driver.destroy_object(
-            args.device,
-            |d| Some(d.vkDestroyImage()),
-            args.image,
-            args.pAllocator,
-        );
-    }
+    simple_destroy!(vkDestroyImage, vn_command_vkDestroyImage, image);
 
     simple_create!(
         vkCreateImageView,
@@ -3256,16 +3246,7 @@ impl Commands for Handlers<'_> {
         self.plant("vkCreateQueryPool", args.pQueryPool(), args.handle_pQueryPool_mut(), host);
     }
 
-    /// Not [`simple_destroy`]: the record [`Self::vkCreateQueryPool`] made goes with the pool.
-    fn vkDestroyQueryPool(&mut self, args: &mut vn_command_vkDestroyQueryPool<'_>) {
-        self.driver.forget_query_pool(args.queryPool);
-        self.driver.destroy_object(
-            args.device,
-            |d| Some(d.vkDestroyQueryPool()),
-            args.queryPool,
-            args.pAllocator,
-        );
-    }
+    simple_destroy!(vkDestroyQueryPool, vn_command_vkDestroyQueryPool, queryPool);
 
     fn vkResetQueryPool(&mut self, args: &mut vn_command_vkResetQueryPool<'_>) {
         let done = self.driver.reset_query_pool(
@@ -4904,17 +4885,7 @@ impl Commands for Handlers<'_> {
         }
     }
 
-    /// Not [`simple_destroy`]: the pipeline's record goes with it. See
-    /// [`Driver::forget_pipeline`].
-    fn vkDestroyPipeline(&mut self, args: &mut vn_command_vkDestroyPipeline<'_>) {
-        self.driver.destroy_object(
-            args.device,
-            |d| Some(d.vkDestroyPipeline()),
-            args.pipeline,
-            args.pAllocator,
-        );
-        self.driver.forget_pipeline(args.pipeline);
-    }
+    simple_destroy!(vkDestroyPipeline, vn_command_vkDestroyPipeline, pipeline);
 
     /// The graphics and compute creates' run, for ray tracing, which records each pipeline's
     /// group count on the way through: see [`Driver::create_ray_tracing_pipelines`].

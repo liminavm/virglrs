@@ -3926,6 +3926,13 @@ SABOTAGES = [
         'sample_locations_the_device_does_not_take_do_not_validate',
     ),
     (
+        'a guest destroy leaves the object record behind',
+        'src/venus/driver.rs',
+        """        self.forget(VkObjectType(T::OBJECT_TYPE), object.host());""",
+        '',
+        'every_query_index_is_held_to_the_pool',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",
