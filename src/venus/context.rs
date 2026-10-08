@@ -2360,6 +2360,24 @@ impl Handlers<'_> {
     /// `info` held to the limits of the device `cb` records for, or `None` with the context
     /// poisoned: by the reason the check gives, or as recording into nothing when `cb` has no
     /// device here. See [`Validate`].
+    /// Hold `info` to the facts of `device` before a query or a bind forwards it, and answer
+    /// whether it was refused -- and the context poisoned. A device this context does not have
+    /// is not refused here: the forward that follows answers it as it answers any other.
+    fn refused_on<T>(&mut self, device: VkDevice, info: Decoded<'_, T>) -> bool
+    where
+        T: ?Sized
+            + for<'d> Validate<driver::DeviceFacts<'d>>
+            + for<'d> ValidateChain<driver::DeviceFacts<'d>>,
+    {
+        match self.driver.device_facts(device).map(|facts| info.validate(&facts).map(|_| ())) {
+            Some(Err(why)) => {
+                self.reject(why);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn checked_for<'a, T>(
         &mut self,
         cb: VkCommandBuffer,
@@ -4152,6 +4170,9 @@ impl Commands for Handlers<'_> {
     ) {
         let device = args.device;
         let Some(info) = self.names(args.pInfo) else { return };
+        if self.refused_on(device, info) {
+            return;
+        }
         let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
         let r = self
             .driver
@@ -4178,6 +4199,9 @@ impl Commands for Handlers<'_> {
     ) {
         let (device, image) = (args.device, args.image);
         let Some(sub) = self.names(args.pSubresource) else { return };
+        if let Err(why) = self.driver.image_has_subresource(device, image, sub) {
+            return self.reject(why);
+        }
         let Some(out) = self.fills(args.pLayout_mut()) else { return };
         let r = self.driver.dev_query_arg_info(device, image, sub.into(), out.into(), |d| {
             d.try_vkGetImageSubresourceLayout()
@@ -4260,6 +4284,9 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkGetImageMemoryRequirements<'_>,
     ) {
         let (device, image) = (args.device, args.image);
+        if let Err(why) = self.driver.image_is_whole(device, image) {
+            return self.reject(why);
+        }
         let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
         let r = self
             .driver
@@ -4320,6 +4347,9 @@ impl Commands for Handlers<'_> {
     ) {
         let device = args.device;
         let Some(info) = self.names(args.pInfo) else { return };
+        if self.refused_on(device, info) {
+            return;
+        }
         let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
         let r = self
             .driver
@@ -4346,6 +4376,9 @@ impl Commands for Handlers<'_> {
     ) {
         let device = args.device;
         let Some(info) = self.names(args.pInfo) else { return };
+        if self.refused_on(device, info) {
+            return;
+        }
         let Some(out) = self.fills(args.pLayout_mut()) else { return };
         let r = self
             .driver
@@ -4359,6 +4392,9 @@ impl Commands for Handlers<'_> {
     ) {
         let (device, image) = (args.device, args.image);
         let Some(sub) = self.names(args.pSubresource) else { return };
+        if let Err(why) = self.driver.image_has_subresource(device, image, &sub.imageSubresource) {
+            return self.reject(why);
+        }
         let Some(out) = self.fills(args.pLayout_mut()) else { return };
         let r = self
             .driver
@@ -5005,6 +5041,9 @@ impl Commands for Handlers<'_> {
 
     fn vkBindImageMemory2(&mut self, args: &mut vn_command_vkBindImageMemory2<'_>) {
         let infos = args.pBindInfos();
+        if self.refused_on(args.device, infos) {
+            return;
+        }
         args.ret = self.driver.counted_op(args.device, |d| d.vkBindImageMemory2(), infos);
     }
 
@@ -5019,6 +5058,9 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkBindImageMemory(&mut self, args: &mut vn_command_vkBindImageMemory<'_>) {
+        if let Err(why) = self.driver.image_is_whole(args.device, args.image) {
+            return self.reject(why);
+        }
         args.ret = self.driver.bind_one(
             args.device,
             |d| d.vkBindImageMemory(),
@@ -9134,6 +9176,16 @@ mod tests {
         fns.plant_vkDeviceWaitIdle(idle);
         fns.plant_vkDestroyDevice(destroy_device);
         ctx.driver.plant_device(VkDevice::forged(DEVICE), fns);
+        // A depth image with the level and layer the query names.
+        let image = super::super::proto::types::VkImageCreateInfo {
+            imageType: super::super::proto::types::VkImageType::VK_IMAGE_TYPE_2D,
+            format: super::super::proto::types::VkFormat::VK_FORMAT_D32_SFLOAT,
+            extent: super::super::proto::types::VkExtent3D { width: 64, height: 64, depth: 1 },
+            mipLevels: 4,
+            arrayLayers: 6,
+            ..Default::default()
+        };
+        ctx.driver.plant_image(VkImage::forged(HOST_IMG), &image);
         {
             let mut table = ctx.objects.borrow_mut();
             for (id, host, ty) in [
@@ -10127,6 +10179,7 @@ mod tests {
         h.vkGetBufferMemoryRequirements(&mut args);
 
         let mut reqs = VkMemoryRequirements::default();
+        plant_rgba_image(h.driver, VkImage::forged(0x222));
         let mut args = vn_command_vkGetImageMemoryRequirements::default();
         args.device = device;
         args.image = VkImage::forged(0x222);
@@ -17084,6 +17137,112 @@ mod tests {
     ///
     /// Absent from three of the four corpora and present once in the fourth, which is what a
     /// live desktop asked for and this build refused.
+    /// The 1.0 forms of sizing and binding an image carry no chain to name a plane in, and
+    /// KosmicKrisp sizes and binds a disjoint image through the plane struct it expects there --
+    /// a null it follows. So both refuse a disjoint image before the driver, and serve a whole one.
+    #[test]
+    fn a_disjoint_image_is_never_sized_or_bound_whole() {
+        use super::super::proto::types::{
+            VkDevice, VkDeviceMemory, VkDeviceSize, VkExtent3D, VkFormat, VkImage,
+            VkImageCreateFlagBits, VkImageCreateFlags, VkImageCreateInfo, VkImageType,
+            VkMemoryRequirements, vn_command_vkBindImageMemory,
+            vn_command_vkGetImageMemoryRequirements,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const DEVICE: u64 = 3;
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn reqs(_: VkDevice, _: VkImage, _: *mut VkMemoryRequirements) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn bind(
+            _: VkDevice,
+            _: VkImage,
+            _: VkDeviceMemory,
+            _: VkDeviceSize,
+        ) -> VkResult {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            VkResult::VK_SUCCESS
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkGetImageMemoryRequirements(reqs);
+        fns.plant_vkBindImageMemory(bind);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        let planar = |flags| VkImageCreateInfo {
+            imageType: VkImageType::VK_IMAGE_TYPE_2D,
+            format: VkFormat::VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
+            extent: VkExtent3D { width: 64, height: 64, depth: 1 },
+            mipLevels: 1,
+            arrayLayers: 1,
+            flags: VkImageCreateFlags(flags),
+            ..Default::default()
+        };
+        let disjoint = VkImageCreateFlagBits::VK_IMAGE_CREATE_DISJOINT_BIT.0 as u32;
+        driver.plant_image(VkImage::forged(0x61), &planar(disjoint));
+        driver.plant_image(VkImage::forged(0x62), &planar(0));
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        for (image, whole) in [(0x62, true), (0x61, false)] {
+            let mut out = VkMemoryRequirements::default();
+            let mut args = vn_command_vkGetImageMemoryRequirements::default();
+            args.device = VkDevice::forged(DEVICE);
+            args.image = VkImage::forged(image);
+            args.plant_pMemoryRequirements(&mut out);
+            let before = CALLS.load(Ordering::SeqCst);
+            h.vkGetImageMemoryRequirements(&mut args);
+            let called = CALLS.load(Ordering::SeqCst) - before;
+            assert_eq!(
+                (h.rejected().is_none(), called),
+                (whole, usize::from(whole)),
+                "sized {image:#x}"
+            );
+            h.ask = None;
+
+            let mut args = vn_command_vkBindImageMemory {
+                device: VkDevice::forged(DEVICE),
+                image: VkImage::forged(image),
+                ..Default::default()
+            };
+            let before = CALLS.load(Ordering::SeqCst);
+            h.vkBindImageMemory(&mut args);
+            let called = CALLS.load(Ordering::SeqCst) - before;
+            assert_eq!(
+                (h.rejected().is_none(), called),
+                (whole, usize::from(whole)),
+                "bound {image:#x}"
+            );
+            h.ask = None;
+        }
+        driver.abandon_planted();
+    }
+
     /// A 64-by-64 RGBA8 2D image of one level and one layer, recorded under `image`: what a
     /// recording test names when its point is not the region.
     fn plant_rgba_image(driver: &mut Driver, image: super::super::proto::types::VkImage) {

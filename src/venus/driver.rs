@@ -87,6 +87,11 @@ use super::proto::types::{
     VkWriteDescriptorSet,
 };
 use super::proto::types::{
+    VkBindImageMemoryDeviceGroupInfo, VkBindImageMemoryInfo, VkBindImagePlaneMemoryInfo,
+    VkBindMemoryStatus, VkDeviceImageMemoryRequirements, VkDeviceImageSubresourceInfo,
+    VkImageMemoryRequirementsInfo2, VkImagePlaneMemoryRequirementsInfo,
+};
+use super::proto::types::{
     VkBufferImageCopy2, VkImageCreateFlagBits, VkImageViewMinLodCreateInfoEXT,
     VkImageViewSlicedCreateInfoEXT, VkImageViewType, VkImageViewUsageCreateInfo,
     VkResolveImageModeInfoKHR, VkResolveModeFlagBits, VkSamplerYcbcrConversionInfo,
@@ -10594,7 +10599,7 @@ struct Placed<'d> {
 ///
 /// The aspect must be one the format has. KosmicKrisp turns an aspect into an index into the
 /// image's planes and only asserts that the image has it, so `PLANE_1` on a single-plane image
-/// reads past the end of that array on the CPU.
+/// names a plane the image never set up, whose Metal texture is null.
 fn aspect_block(
     image: &ImageFacts,
     aspect: u32,
@@ -10814,6 +10819,202 @@ impl Facts<'_> {
         range_count(r.baseArrayLayer, r.layerCount, facts.array_layers)
             .ok_or("cleared layers the image does not have")?;
         Ok(())
+    }
+}
+
+/// What a plane or subresource question needs of an image: its format, levels, layers and
+/// tiling, and whether its planes are bound apart. Read off the record of an image, or off the
+/// create info of one a device query describes without making.
+struct Shape {
+    format: VkFormat,
+    mip_levels: u32,
+    array_layers: u32,
+    tiling: VkImageTiling,
+    disjoint: bool,
+}
+
+impl Shape {
+    fn new(
+        format: VkFormat,
+        flags: VkImageCreateFlags,
+        levels: u32,
+        layers: u32,
+        tiling: VkImageTiling,
+    ) -> Self {
+        use crate::venus::proto::formats;
+        const DISJOINT: u32 = VkImageCreateFlagBits::VK_IMAGE_CREATE_DISJOINT_BIT.0 as u32;
+        Shape {
+            format,
+            mip_levels: levels,
+            array_layers: layers,
+            tiling,
+            disjoint: flags.0 & DISJOINT != 0 && formats::plane_of(format, 1).is_some(),
+        }
+    }
+
+    fn of_record(i: &ImageFacts) -> Self {
+        Shape::new(i.format, i.flags, i.mip_levels, i.array_layers, i.tiling)
+    }
+
+    fn of_info(i: &VkImageCreateInfo) -> Self {
+        Shape::new(i.format, i.flags, i.mipLevels, i.arrayLayers, i.tiling)
+    }
+
+    /// A disjoint image's planes are bound and sized one at a time, and KosmicKrisp reads which
+    /// from a struct it expects chained, unchecked: so a question about one names a plane the
+    /// format has.
+    fn plane(&self, aspect: u32) -> Result<(), &'static str> {
+        use crate::venus::proto::formats;
+        let plane = (0..3).find(|&i| {
+            aspect == (VkImageAspectFlagBits::VK_IMAGE_ASPECT_PLANE_0_BIT.0 as u32) << i
+        });
+        match plane {
+            Some(i) if formats::plane_of(self.format, i).is_some() => Ok(()),
+            _ => Err("named a plane the image does not have"),
+        }
+    }
+
+    /// A subresource of the image: one aspect it has -- or the first memory plane of an image
+    /// laid out by a modifier -- and a level and layer it has.
+    fn subresource(&self, sub: &VkImageSubresource) -> Result<(), &'static str> {
+        const MEMORY_PLANE_0: u32 =
+            VkImageAspectFlagBits::VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT.0 as u32;
+        let aspect = sub.aspectMask.0;
+        let one_of_its_own = aspect.count_ones() == 1 && aspect & !format_aspects(self.format) == 0;
+        let modifier_plane = aspect == MEMORY_PLANE_0
+            && self.tiling == VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+        if !one_of_its_own && !modifier_plane {
+            return Err("asked about an aspect the image does not have");
+        }
+        if sub.mipLevel >= self.mip_levels || sub.arrayLayer >= self.array_layers {
+            return Err("asked about a subresource the image does not have");
+        }
+        Ok(())
+    }
+}
+
+impl Facts<'_> {
+    fn shape(&self, image: VkImage) -> Result<Shape, &'static str> {
+        self.images
+            .get(&image)
+            .map(Shape::of_record)
+            .ok_or("named an image this renderer has no record of")
+    }
+}
+
+/// The create info a device-image query describes, as the decoder built it.
+fn described<'a, T>(
+    _info: &cs::Decoded<'a, T>,
+    create: *const VkImageCreateInfo,
+) -> Result<&'a VkImageCreateInfo, &'static str> {
+    // SAFETY: `_info` is `Decoded`, so `create` is null or a struct the decoder allocated in the
+    // arena `'a` borrows (see `Decoded::vouch`).
+    unsafe { create.as_ref() }.ok_or("described no image")
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkImageMemoryRequirementsInfo2 {
+    /// A disjoint image is sized a plane at a time, and KosmicKrisp follows the plane struct it
+    /// expects chained without checking it is there.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let shape = facts.facts.shape(this.image)?;
+        if shape.disjoint && chained::<VkImagePlaneMemoryRequirementsInfo>(this).is_none() {
+            return Err("sized a disjoint image without naming a plane");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkImageMemoryRequirementsInfo2, DeviceFacts<'_>>>
+    for VkImagePlaneMemoryRequirementsInfo
+{
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkImageMemoryRequirementsInfo2, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let shape = on.facts.facts.shape(on.root.image)?;
+        if shape.disjoint { shape.plane(this.planeAspect.0 as u32) } else { Ok(()) }
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkBindImageMemoryInfo {
+    /// As [`VkImageMemoryRequirementsInfo2`]: a disjoint image binds a plane at a time.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let shape = facts.facts.shape(this.image)?;
+        if shape.disjoint && chained::<VkBindImagePlaneMemoryInfo>(this).is_none() {
+            return Err("bound a disjoint image without naming a plane");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkBindImageMemoryInfo, DeviceFacts<'_>>>
+    for VkBindImagePlaneMemoryInfo
+{
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkBindImageMemoryInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let shape = on.facts.facts.shape(on.root.image)?;
+        if shape.disjoint { shape.plane(this.planeAspect.0 as u32) } else { Ok(()) }
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkDeviceImageMemoryRequirements {
+    /// The image a query describes without making: a disjoint one is sized by the plane named
+    /// beside it.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let shape = Shape::of_info(described(&this, this.pCreateInfo)?);
+        if shape.disjoint { shape.plane(this.planeAspect.0 as u32) } else { Ok(()) }
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkDeviceImageSubresourceInfo {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let shape = Shape::of_info(described(&this, this.pCreateInfo)?);
+        // SAFETY: as `described`: the decoder allocated the subresource beside the create info.
+        let sub = unsafe { this.pSubresource.as_ref() }.ok_or("asked about no subresource")?;
+        shape.subresource(&sub.imageSubresource)
+    }
+}
+
+impl Driver {
+    /// Whether `image` can be sized or bound whole: a recorded image that is not disjoint. The
+    /// 1.0 forms carry no chain to name a plane in. A device this context does not have is not
+    /// refused here: the forward that follows answers it as it answers any other.
+    pub fn image_is_whole(&self, device: VkDevice, image: VkImage) -> Result<(), &'static str> {
+        if !self.devices.contains_key(&device) {
+            return Ok(());
+        }
+        if self.facts().shape(image)?.disjoint {
+            return Err("sized or bound a disjoint image whole");
+        }
+        Ok(())
+    }
+
+    /// Whether `sub` is a subresource `image` has, on a device this context has. See
+    /// [`Self::image_is_whole`] for the one it does not.
+    pub fn image_has_subresource(
+        &self,
+        device: VkDevice,
+        image: VkImage,
+        sub: &VkImageSubresource,
+    ) -> Result<(), &'static str> {
+        if !self.devices.contains_key(&device) {
+            return Ok(());
+        }
+        self.facts().shape(image)?.subresource(sub)
     }
 }
 
@@ -11510,6 +11711,11 @@ needs_no_check!(
     VkImageViewUsageCreateInfo,
     // A conversion the decoder resolved to one this device made.
     VkSamplerYcbcrConversionInfo,
+    // Device indices and split-instance regions for a group this host never has more than one
+    // device in, which neither KosmicKrisp nor anv nor the runtime reads.
+    VkBindImageMemoryDeviceGroupInfo,
+    // A result the driver writes into a slot the decoder allocated for it.
+    VkBindMemoryStatus,
 );
 
 /// Why a `vkQueueSubmit2` was refused without being forwarded.
@@ -11552,6 +11758,19 @@ pub enum SemaphoreKind {
 // same vk.xml with Vulkan's `sType`/`pNext` header first.
 unsafe impl InStruct for VkTimelineSemaphoreSubmitInfo {
     const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkImagePlaneMemoryRequirementsInfo {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkBindImagePlaneMemoryInfo {
+    const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -12664,6 +12883,148 @@ mod tests {
         };
         assert_eq!(host(&[region(0), region(56)]), Ok(()));
         assert!(host(&[region(0), region(57)]).is_err(), "one texel past");
+
+        d.abandon_planted();
+    }
+
+    /// A disjoint planar image is sized and bound a plane at a time, and KosmicKrisp follows the
+    /// plane struct it expects chained without checking it is there: so the 1.0 forms, which
+    /// carry no chain, refuse one, and the `2` forms require the plane and hold it to the format.
+    /// A subresource question is held to an aspect, a level and a layer the image has.
+    #[test]
+    fn a_disjoint_image_is_sized_and_bound_a_plane_at_a_time() {
+        use crate::venus::proto::types::{VkExtent3D, VkImageCreateInfo, VkImageSubresource2};
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const APART: VkImage = VkImage::forged(0xe1);
+        const TOGETHER: VkImage = VkImage::forged(0xe2);
+        const RGBA: VkImage = VkImage::forged(0xe3);
+        const MODIFIED: VkImage = VkImage::forged(0xe4);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        let info = |format, flags: u32, tiling| VkImageCreateInfo {
+            imageType: VkImageType::VK_IMAGE_TYPE_2D,
+            format,
+            extent: VkExtent3D { width: 64, height: 64, depth: 1 },
+            mipLevels: 2,
+            arrayLayers: 3,
+            flags: VkImageCreateFlags(flags),
+            tiling,
+            ..Default::default()
+        };
+        let nv12 = VkFormat::VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+        let rgba = VkFormat::VK_FORMAT_R8G8B8A8_UNORM;
+        let disjoint = VkImageCreateFlagBits::VK_IMAGE_CREATE_DISJOINT_BIT.0 as u32;
+        let optimal = VkImageTiling::VK_IMAGE_TILING_OPTIMAL;
+        let modifier = VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+        d.plant_image(APART, &info(nv12, disjoint, optimal));
+        d.plant_image(TOGETHER, &info(nv12, 0, optimal));
+        d.plant_image(RGBA, &info(rgba, 0, optimal));
+        d.plant_image(MODIFIED, &info(rgba, 0, modifier));
+
+        assert!(d.image_is_whole(DEVICE, APART).is_err(), "disjoint, whole");
+        assert_eq!(d.image_is_whole(DEVICE, TOGETHER), Ok(()));
+        assert_eq!(d.image_is_whole(DEVICE, RGBA), Ok(()));
+        assert!(d.image_is_whole(DEVICE, VkImage::forged(0xef)).is_err(), "no record");
+        assert_eq!(d.image_is_whole(VkDevice::forged(0x9a), APART), Ok(()), "the forward answers");
+
+        type A = VkImageAspectFlagBits;
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let sized = |image, plane: Option<A>| {
+            let link = VkImagePlaneMemoryRequirementsInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO,
+                planeAspect: plane.unwrap_or(A::VK_IMAGE_ASPECT_PLANE_0_BIT),
+                ..Default::default()
+            };
+            let req = VkImageMemoryRequirementsInfo2 {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+                pNext: plane.map_or(core::ptr::null(), |_| {
+                    (&link as *const VkImagePlaneMemoryRequirementsInfo).cast()
+                }),
+                image,
+            };
+            cs::Decoded::planted(&req).validate(&facts).map(|_| ())
+        };
+        assert!(sized(APART, None).is_err(), "no plane named");
+        assert_eq!(sized(APART, Some(A::VK_IMAGE_ASPECT_PLANE_1_BIT)), Ok(()));
+        assert!(sized(APART, Some(A::VK_IMAGE_ASPECT_PLANE_2_BIT)).is_err(), "two planes");
+        assert!(sized(APART, Some(A::VK_IMAGE_ASPECT_COLOR_BIT)).is_err());
+        assert_eq!(sized(TOGETHER, None), Ok(()));
+        assert_eq!(sized(TOGETHER, Some(A::VK_IMAGE_ASPECT_PLANE_2_BIT)), Ok(()), "ignored");
+
+        let bound = |image, plane: Option<A>| {
+            let link = VkBindImagePlaneMemoryInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO,
+                planeAspect: plane.unwrap_or(A::VK_IMAGE_ASPECT_PLANE_0_BIT),
+                ..Default::default()
+            };
+            let bind = [VkBindImageMemoryInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+                pNext: plane.map_or(core::ptr::null(), |_| {
+                    (&link as *const VkBindImagePlaneMemoryInfo).cast()
+                }),
+                image,
+                ..Default::default()
+            }];
+            cs::Decoded::planted(&bind[..]).validate(&facts).map(|_| ())
+        };
+        assert!(bound(APART, None).is_err(), "no plane named");
+        assert_eq!(bound(APART, Some(A::VK_IMAGE_ASPECT_PLANE_0_BIT)), Ok(()));
+        assert!(bound(APART, Some(A::VK_IMAGE_ASPECT_PLANE_2_BIT)).is_err());
+        assert_eq!(bound(RGBA, None), Ok(()));
+
+        let described = |format, flags, plane| {
+            let create = info(format, flags, optimal);
+            let req = VkDeviceImageMemoryRequirements {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS,
+                pCreateInfo: &create,
+                planeAspect: plane,
+                ..Default::default()
+            };
+            cs::Decoded::planted(&req).validate(&facts).map(|_| ())
+        };
+        assert_eq!(described(nv12, disjoint, A::VK_IMAGE_ASPECT_PLANE_1_BIT), Ok(()));
+        assert!(described(nv12, disjoint, A::VK_IMAGE_ASPECT_COLOR_BIT).is_err());
+        assert_eq!(described(nv12, 0, A::VK_IMAGE_ASPECT_COLOR_BIT), Ok(()), "not disjoint");
+
+        let sub = |aspect: A, level, layer| VkImageSubresource {
+            aspectMask: VkImageAspectFlags(aspect.0 as u32),
+            mipLevel: level,
+            arrayLayer: layer,
+        };
+        let has = |image, s| d.image_has_subresource(DEVICE, image, &s);
+        assert_eq!(has(RGBA, sub(A::VK_IMAGE_ASPECT_COLOR_BIT, 1, 2)), Ok(()));
+        assert!(has(RGBA, sub(A::VK_IMAGE_ASPECT_COLOR_BIT, 2, 0)).is_err(), "a level past");
+        assert!(has(RGBA, sub(A::VK_IMAGE_ASPECT_COLOR_BIT, 0, 3)).is_err(), "a layer past");
+        assert!(has(RGBA, sub(A::VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0)).is_err(), "no depth");
+        assert!(has(RGBA, sub(A::VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0)).is_err(), "no planes");
+        assert!(
+            has(RGBA, sub(A::VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT, 0, 0)).is_err(),
+            "no modifier"
+        );
+        assert_eq!(has(MODIFIED, sub(A::VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT, 0, 0)), Ok(()));
+        assert_eq!(has(TOGETHER, sub(A::VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0)), Ok(()));
+        let two = VkImageSubresource {
+            aspectMask: VkImageAspectFlags(
+                (A::VK_IMAGE_ASPECT_COLOR_BIT.0 | A::VK_IMAGE_ASPECT_PLANE_0_BIT.0) as u32,
+            ),
+            mipLevel: 0,
+            arrayLayer: 0,
+        };
+        assert!(has(TOGETHER, two).is_err(), "one aspect at a time");
+
+        let layout = |s| {
+            let create = info(rgba, 0, optimal);
+            let sub = VkImageSubresource2 { imageSubresource: s, ..Default::default() };
+            let q = VkDeviceImageSubresourceInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO,
+                pCreateInfo: &create,
+                pSubresource: &sub,
+                ..Default::default()
+            };
+            cs::Decoded::planted(&q).validate(&facts).map(|_| ())
+        };
+        assert_eq!(layout(sub(A::VK_IMAGE_ASPECT_COLOR_BIT, 1, 2)), Ok(()));
+        assert!(layout(sub(A::VK_IMAGE_ASPECT_COLOR_BIT, 2, 0)).is_err());
 
         d.abandon_planted();
     }
