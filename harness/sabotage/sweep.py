@@ -3891,9 +3891,9 @@ SABOTAGES = [
         'a_pipeline_layout_past_the_device_does_not_validate',
     ),
     (
-        'push constant ranges may share or invent stages',
+        'push constant ranges may share a stage',
         'src/venus/driver.rs',
-        """            if named == 0 || named & !PUSH_RANGE_STAGES != 0 || named & stages != 0 {""",
+        """            if named == 0 || named & stages != 0 {""",
         """            if named == 0 {""",
         'a_pipeline_layout_past_the_device_does_not_validate',
     ),

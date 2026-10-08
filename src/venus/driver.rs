@@ -10354,17 +10354,19 @@ forwarded_unchecked!(
     VkShaderModuleCreateInfo,
 );
 
-/// The shader stages a push constant range may name: every stage bit core Vulkan and the
-/// mesh and ray-tracing extensions define, `VERTEX` through `CALLABLE`. The vendor stages above
-/// them belong to extensions this host does not expose.
+/// The shader stages a push constant range is counted by: every stage bit core Vulkan and the
+/// mesh and ray-tracing extensions define, `VERTEX` through `CALLABLE`. A range may name more --
+/// `VK_SHADER_STAGE_ALL` sets every bit, and is how vkd3d-proton pushes root constants -- but the
+/// bits above these are padding or vendor stages this host does not expose, and no range is
+/// counted by them.
 const PUSH_RANGE_STAGES: u32 = 0x3fff;
 
 /// A pipeline layout the device can hold. The Mesa runtime copies the set layouts into an array
 /// of `maxBoundDescriptorSets` and the push constant ranges into one of fourteen, the number of
 /// stages a range may name, checking both counts only with asserts a release build compiles out.
-/// Ranges whose stages are non-empty, inside [`PUSH_RANGE_STAGES`] and disjoint from every other
-/// range's, as Vulkan requires, cannot outnumber those stages; and a range is held inside the
-/// device's push block, which the driver sizes the pipeline's constants by.
+/// Ranges whose [`PUSH_RANGE_STAGES`] are non-empty and disjoint from every other range's, as
+/// Vulkan requires, cannot outnumber those stages; and a range is held inside the device's push
+/// block, which the driver sizes the pipeline's constants by.
 impl cs::Validate<DeviceFacts<'_>> for VkPipelineLayoutCreateInfo {
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
@@ -10384,9 +10386,9 @@ impl cs::Validate<DeviceFacts<'_>> for VkPipelineLayoutCreateInfo {
         };
         let mut stages = 0u32;
         for r in ranges.unwrap_or_default() {
-            let named = r.stageFlags.0;
-            if named == 0 || named & !PUSH_RANGE_STAGES != 0 || named & stages != 0 {
-                return Err("pushed constants to stages no other range has and Vulkan defines");
+            let named = r.stageFlags.0 & PUSH_RANGE_STAGES;
+            if named == 0 || named & stages != 0 {
+                return Err("pushed constants to no stage, or to one another range has");
             }
             stages |= named;
             if r.offset % 4 != 0 || r.size % 4 != 0 || r.size == 0 {
@@ -11206,7 +11208,10 @@ mod tests {
         assert!(holds(0, &[range(0x11, 0, 128), range(0x20, 128, 128)]), "the whole block");
         assert!(!holds(0, &[range(0x1, 0, 4), range(0x11, 4, 4)]), "a stage in two ranges");
         assert!(!holds(0, &[range(0, 0, 4)]), "a range for no stage");
-        assert!(!holds(0, &[range(0x4000, 0, 4)]), "a stage this host does not expose");
+        assert!(!holds(0, &[range(0x8000, 0, 4)]), "only a stage this host does not expose");
+        assert!(holds(0, &[range(0x7fff_ffff, 0, 256)]), "VK_SHADER_STAGE_ALL, as vkd3d pushes");
+        assert!(holds(0, &[range(0x1f, 0, 128), range(0x20, 128, 128)]), "ALL_GRAPHICS, compute");
+        assert!(!holds(0, &[range(0x7fff_ffff, 0, 4), range(0x20, 4, 4)]), "ALL overlaps compute");
         assert!(!holds(0, &[range(0x1, 252, 8)]), "past the push block");
         assert!(!holds(0, &[range(0x1, u32::MAX - 3, 8)]), "an offset that would wrap");
         assert!(!holds(0, &[range(0x1, 2, 4)]), "an offset off a word");
