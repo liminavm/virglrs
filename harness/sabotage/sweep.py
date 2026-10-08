@@ -4343,7 +4343,7 @@ SABOTAGES = [
     (
         'a modifier image may be made on a device without them',
         'src/venus/driver.rs',
-        """            if !facts.modifiers.taken() {""",
+        """            if !facts.formats.takes_modifiers() {""",
         """            if false {""",
         'an_image_is_made_only_in_a_shape_the_device_has',
     ),
@@ -4414,6 +4414,45 @@ SABOTAGES = [
         let _ = self.driver.image_bind_fits(
 """,
         'a_disjoint_image_is_never_sized_or_bound_whole',
+    ),
+    (
+        'a buffer view may start past the end of its buffer',
+        'src/venus/driver.rs',
+        """        if offset >= size {""",
+        """        if offset > size {""",
+        'a_buffer_view_lies_inside_its_buffer_in_a_texel_format',
+    ),
+    (
+        'a buffer view may run past the end of its buffer',
+        'src/venus/driver.rs',
+        """            || range > size - offset
+""",
+        """            || range == u64::MAX - 1
+""",
+        'a_buffer_view_lies_inside_its_buffer_in_a_texel_format',
+    ),
+    (
+        'a buffer view may hold part of a texel',
+        'src/venus/driver.rs',
+        """            || !range.is_multiple_of(u64::from(block.bytes))
+""",
+        """            || block.bytes == 0
+""",
+        'a_buffer_view_lies_inside_its_buffer_in_a_texel_format',
+    ),
+    (
+        'a buffer view may be in a format with no texel buffer',
+        'src/venus/driver.rs',
+        """        if facts.formats.buffer_features(this.format) & TEXEL == 0 {""",
+        """        if facts.formats.buffer_features(this.format) & TEXEL == u32::MAX {""",
+        'a_buffer_view_lies_inside_its_buffer_in_a_texel_format',
+    ),
+    (
+        'a buffer view may hold more texels than the device does',
+        'src/venus/driver.rs',
+        """        if range / u64::from(block.bytes) > u64::from(facts.limits.maxTexelBufferElements) {""",
+        """        if range == u64::MAX {""",
+        'a_buffer_view_lies_inside_its_buffer_in_a_texel_format',
     ),
     (
         'a submit chained array is trusted by its count alone',

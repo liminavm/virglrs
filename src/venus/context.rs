@@ -3046,16 +3046,21 @@ impl Commands for Handlers<'_> {
     }
     simple_destroy!(vkDestroyBuffer, vn_command_vkDestroyBuffer, buffer);
 
-    // A texel view of a buffer. Same shape as an image view -- the decoder resolves the `buffer`
-    // in the create-info to its host handle before this runs, so there is nothing to translate
-    // here. A stock Fedora 44 desktop asks for these while it is merely running.
-    simple_create!(
-        vkCreateBufferView,
-        vn_command_vkCreateBufferView,
-        pCreateInfo,
-        pView,
-        handle_pView_mut
-    );
+    /// A texel view of a buffer, held to the buffer and the device's texel buffers. A stock
+    /// Fedora 44 desktop asks for these while it is merely running.
+    fn vkCreateBufferView(&mut self, args: &mut vn_command_vkCreateBufferView<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        // As `vkCreatePipelineLayout`: a device this context does not have answers as
+        // `create_object` would.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => self.driver.create_buffer_view(args.device, info, args.pAllocator),
+        };
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateBufferView", args.pView(), args.handle_pView_mut(), host);
+    }
     simple_destroy!(vkDestroyBufferView, vn_command_vkDestroyBufferView, bufferView);
 
     /// Not [`simple_create`]: an image's extent and format cannot be asked for afterwards, and a

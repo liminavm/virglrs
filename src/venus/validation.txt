@@ -176,7 +176,7 @@ vkCopyImageToMemoryMESA                          validated
 vkCopyMemoryToImageMESA                          validated
 vkCreateAccelerationStructureKHR                 reviewed
 vkCreateBuffer                                   reviewed
-vkCreateBufferView                               pending:images
+vkCreateBufferView                               validated
 vkCreateCommandPool                              reviewed
 vkCreateComputePipelines                         pending:pipelines
 vkCreateDescriptorPool                           pending:descriptors

@@ -22,6 +22,7 @@ use crate::ids::{ContextId, FenceId, RingIdx};
 use super::cs::{self, Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
 use super::ledger;
 use super::objects::Doomed;
+use super::proto::types::VkFormatProperties;
 use super::proto::types::VkOpaqueCaptureDataCreateInfoEXT;
 use super::proto::types::{
     VkAccelerationStructureBuildGeometryInfoKHR, VkAccelerationStructureBuildRangeInfoKHR,
@@ -98,6 +99,7 @@ use super::proto::types::{
     VkImageViewSlicedCreateInfoEXT, VkImageViewType, VkImageViewUsageCreateInfo,
     VkResolveImageModeInfoKHR, VkResolveModeFlagBits, VkSamplerYcbcrConversionInfo,
 };
+use super::proto::types::{VkBufferUsageFlags2CreateInfo, VkFormatFeatureFlagBits};
 use super::proto::types::{
     VkComputePipelineCreateInfo, VkDeferredOperationKHR, VkGraphicsPipelineCreateInfo,
     VkPhysicalDeviceProperties2, VkPhysicalDeviceRayTracingPipelinePropertiesKHR,
@@ -2082,75 +2084,103 @@ struct DeviceState {
     /// The query types the device was created able to make. Read once at creation from what the
     /// guest enabled; see [`enabled_query_types`].
     query_types: Vec<VkQueryType>,
-    /// Where the device's drm format modifiers are read from, if it was created to take them.
-    modifiers: Modifiers,
+    /// Where the device's format properties are read from.
+    formats: Formats,
 }
 
-/// Where a device's drm format modifiers come from.
-enum Modifiers {
-    /// The device was not created with `VK_EXT_image_drm_format_modifier`, so no image of it may
-    /// be laid out by one.
-    Absent,
-    /// Its driver, asked through the physical device it was created on.
-    Driver(VkPhysicalDevice),
-    /// A test's: the format, the modifier and its plane count.
+/// Where a device's format properties come from.
+enum Formats {
+    /// Its driver, asked through the physical device it was created on. `modifiers` is whether
+    /// the device was created with `VK_EXT_image_drm_format_modifier`: without it, no image of
+    /// it may be laid out by one.
+    Driver { physical: VkPhysicalDevice, modifiers: bool },
+    /// A test's.
     #[cfg(test)]
-    Planted(Vec<(VkFormat, u64, u32)>),
+    Planted(PlantedFormats),
 }
 
-/// The drm format modifiers a device takes, as [`DeviceFacts`] carries them.
-pub struct ModifierPlanes<'d> {
-    source: &'d Modifiers,
+/// The format properties a test plants on a device.
+#[cfg(test)]
+#[derive(Default)]
+struct PlantedFormats {
+    /// `None` for a device created without modifiers; otherwise the format, the modifier and its
+    /// plane count.
+    modifiers: Option<Vec<(VkFormat, u64, u32)>>,
+    /// Each format's buffer features; a format not listed has none.
+    buffer: Vec<(VkFormat, u32)>,
+}
+
+/// A device's format properties, as [`DeviceFacts`] carries them. Asked of the driver each time:
+/// the commands that ask -- an image laid out by an explicit modifier, a buffer view -- are
+/// rare enough that a cache would be a second owner of a fact for nothing.
+pub struct FormatQueries<'d> {
+    source: &'d Formats,
     instance: Option<&'d InstanceFns>,
 }
 
-impl ModifierPlanes<'_> {
-    fn taken(&self) -> bool {
-        !matches!(self.source, Modifiers::Absent)
+impl FormatQueries<'_> {
+    fn takes_modifiers(&self) -> bool {
+        match self.source {
+            Formats::Driver { modifiers, .. } => *modifiers,
+            #[cfg(test)]
+            Formats::Planted(p) => p.modifiers.is_some(),
+        }
+    }
+
+    /// Ask the driver about `format`, chaining `next` to what it fills; `None` with no instance
+    /// to ask through.
+    fn ask(&self, format: VkFormat, next: *mut core::ffi::c_void) -> Option<VkFormatProperties> {
+        let physical = match self.source {
+            Formats::Driver { physical, .. } => physical,
+            #[cfg(test)]
+            Formats::Planted(_) => return None,
+        };
+        let inst = self.instance?;
+        let mut props = VkFormatProperties2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+            pNext: next,
+            ..Default::default()
+        };
+        // SAFETY: `physical` is a handle this instance returned, and `next` is null or a local of
+        // the caller's whose array, when there is one, holds the count it states.
+        unsafe { (inst.vkGetPhysicalDeviceFormatProperties2())(*physical, format, &mut props) };
+        Some(props.formatProperties)
+    }
+
+    /// The features the device gives `format` in a buffer.
+    fn buffer_features(&self, format: VkFormat) -> u32 {
+        #[cfg(test)]
+        if let Formats::Planted(p) = self.source {
+            return p.buffer.iter().find(|&&(f, _)| f == format).map_or(0, |&(_, b)| b);
+        }
+        self.ask(format, core::ptr::null_mut()).map_or(0, |p| p.bufferFeatures.0)
     }
 
     /// How many memory planes the driver lays `format` out in under `modifier`, or `None` for a
-    /// modifier it does not offer for that format. Asked each time: an image laid out by an
-    /// explicit modifier is an import, rare enough that a cache would be a second owner of a
-    /// fact for nothing.
-    fn planes(&self, format: VkFormat, modifier: u64) -> Option<u32> {
-        let offered = match self.source {
-            Modifiers::Absent => return None,
-            Modifiers::Driver(pd) => {
-                let inst = self.instance?;
-                let ask = |list: &mut VkDrmFormatModifierPropertiesListEXT| {
-                    let mut props = VkFormatProperties2 {
-                        sType: VkStructureType::VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
-                        pNext: (list as *mut VkDrmFormatModifierPropertiesListEXT).cast(),
-                        ..Default::default()
-                    };
-                    // SAFETY: `pd` is a handle this instance returned, and the chain is a local
-                    // list whose array, when there is one, holds the count the list states.
-                    unsafe {
-                        (inst.vkGetPhysicalDeviceFormatProperties2())(*pd, format, &mut props)
-                    };
-                };
-                let mut list = VkDrmFormatModifierPropertiesListEXT {
-                    sType:
-                        VkStructureType::VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
-                    ..Default::default()
-                };
-                ask(&mut list);
-                let mut all = vec![
-                    VkDrmFormatModifierPropertiesEXT::default();
-                    list.drmFormatModifierCount as usize
-                ];
-                list.pDrmFormatModifierProperties = all.as_mut_ptr();
-                ask(&mut list);
-                all.truncate(list.drmFormatModifierCount as usize);
-                all.iter()
-                    .map(|m| (format, m.drmFormatModifier, m.drmFormatModifierPlaneCount))
-                    .collect::<Vec<_>>()
-            }
-            #[cfg(test)]
-            Modifiers::Planted(t) => t.clone(),
+    /// modifier it does not offer for that format, or a device that takes none.
+    fn modifier_planes(&self, format: VkFormat, modifier: u64) -> Option<u32> {
+        if !self.takes_modifiers() {
+            return None;
+        }
+        #[cfg(test)]
+        if let Formats::Planted(p) = self.source {
+            let offered = p.modifiers.as_deref().unwrap_or_default();
+            return offered
+                .iter()
+                .find(|&&(f, m, _)| f == format && m == modifier)
+                .map(|&(_, _, n)| n);
+        }
+        let mut list = VkDrmFormatModifierPropertiesListEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+            ..Default::default()
         };
-        offered.iter().find(|&&(f, m, _)| f == format && m == modifier).map(|&(_, _, n)| n)
+        self.ask(format, (&mut list as *mut VkDrmFormatModifierPropertiesListEXT).cast())?;
+        let mut all =
+            vec![VkDrmFormatModifierPropertiesEXT::default(); list.drmFormatModifierCount as usize];
+        list.pDrmFormatModifierProperties = all.as_mut_ptr();
+        self.ask(format, (&mut list as *mut VkDrmFormatModifierPropertiesListEXT).cast())?;
+        all.truncate(list.drmFormatModifierCount as usize);
+        all.iter().find(|m| m.drmFormatModifier == modifier).map(|m| m.drmFormatModifierPlaneCount)
     }
 }
 
@@ -2827,10 +2857,9 @@ impl Driver {
             .any(|n| n == "VK_EXT_sample_locations")
             .then(|| sample_location_grids(inst, pd));
         let query_types = enabled_query_types(&wanted, enables_pipeline_statistics(info_decoded));
-        let modifiers = if wanted.iter().any(|n| n == "VK_EXT_image_drm_format_modifier") {
-            Modifiers::Driver(pd)
-        } else {
-            Modifiers::Absent
+        let formats = Formats::Driver {
+            physical: pd,
+            modifiers: wanted.iter().any(|n| n == "VK_EXT_image_drm_format_modifier"),
         };
         self.devices.insert(
             out,
@@ -2841,7 +2870,7 @@ impl Driver {
                 limits,
                 sample_locations,
                 query_types,
-                modifiers,
+                formats,
             },
         );
         Ok(out)
@@ -3799,7 +3828,7 @@ impl Driver {
             limits: &d.limits,
             sample_locations: d.sample_locations.as_ref(),
             query_types: &d.query_types,
-            modifiers: ModifierPlanes { source: &d.modifiers, instance: self.instance() },
+            formats: FormatQueries { source: &d.formats, instance: self.instance() },
         })
     }
 
@@ -4695,7 +4724,7 @@ impl Driver {
                 limits: planted_limits(),
                 sample_locations: None,
                 query_types: enabled_query_types(&[], true),
-                modifiers: Modifiers::Absent,
+                formats: Formats::Planted(PlantedFormats::default()),
             },
         );
     }
@@ -4705,8 +4734,17 @@ impl Driver {
     /// `VK_EXT_image_drm_format_modifier`.
     #[cfg(test)]
     pub(super) fn plant_modifiers(&mut self, handle: VkDevice, offered: &[(VkFormat, u64, u32)]) {
-        self.devices.get_mut(&handle).expect("a planted device").modifiers =
-            Modifiers::Planted(offered.to_vec());
+        let d = self.devices.get_mut(&handle).expect("a planted device");
+        let Formats::Planted(p) = &mut d.formats else { panic!("a planted device") };
+        p.modifiers = Some(offered.to_vec());
+    }
+
+    /// Give a planted device the buffer features a driver would have given `formats`.
+    #[cfg(test)]
+    pub(super) fn plant_buffer_features(&mut self, handle: VkDevice, formats: &[(VkFormat, u32)]) {
+        let d = self.devices.get_mut(&handle).expect("a planted device");
+        let Formats::Planted(p) = &mut d.formats else { panic!("a planted device") };
+        p.buffer = formats.to_vec();
     }
 
     /// Record an image as `vkCreateImage` would have, without a driver to make it.
@@ -5101,6 +5139,15 @@ impl Driver {
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkImageView, VkResult> {
         self.create_object(device, |d| Some(d.vkCreateImageView()), info, alloc)
+    }
+
+    pub fn create_buffer_view(
+        &self,
+        device: VkDevice,
+        info: cs::Decoded<'_, VkBufferViewCreateInfo, cs::Checked>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+    ) -> Result<VkBufferView, VkResult> {
+        self.create_object(device, |d| Some(d.vkCreateBufferView()), info, alloc)
     }
 
     pub fn create_pipeline_layout(
@@ -10986,7 +11033,7 @@ impl cs::Validate<DeviceFacts<'_>> for VkImageCreateInfo {
             return Err("made a multisampled image Vulkan has no shape for");
         }
         if this.tiling == VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT {
-            if !facts.modifiers.taken() {
+            if !facts.formats.takes_modifiers() {
                 return Err("laid an image out by a modifier on a device that takes none");
             }
             let listed = chained::<VkImageDrmFormatModifierListCreateInfoEXT>(this).is_some();
@@ -11015,7 +11062,7 @@ impl cs::Validate<cs::Chained<'_, VkImageCreateInfo, DeviceFacts<'_>>>
         if on.root.format == VkFormat::VK_FORMAT_UNDEFINED {
             return Err("made an image of no format");
         }
-        match on.facts.modifiers.planes(on.root.format, this.drmFormatModifier) {
+        match on.facts.formats.modifier_planes(on.root.format, this.drmFormatModifier) {
             None => Err("named a modifier the device does not offer for the format"),
             Some(n) if n != this.drmFormatModifierPlaneCount => {
                 Err("laid out a different number of planes than the modifier has")
@@ -11040,6 +11087,50 @@ impl cs::Validate<cs::Chained<'_, VkImageCreateInfo, DeviceFacts<'_>>>
             VkImageCreateFlagBits::VK_IMAGE_CREATE_DESCRIPTOR_HEAP_CAPTURE_REPLAY_BIT_EXT.0 as u32;
         if on.root.flags.0 & REPLAY != 0 {
             return Err("replayed an image from capture data this renderer never handed out");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkBufferViewCreateInfo {
+    /// A texel view of a buffer it lies inside, in a format the device can make a texel buffer
+    /// of, no longer than the device's texel buffers. KosmicKrisp looks the format up and reads
+    /// through what it finds without checking it found one, and the runtime takes `size -
+    /// offset` for a whole-size view with an offset only asserted to fit.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        use crate::venus::proto::formats;
+        const TEXEL: u32 = VkFormatFeatureFlagBits::VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT.0
+            as u32
+            | VkFormatFeatureFlagBits::VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT.0 as u32;
+        let size = *facts
+            .facts
+            .buffers
+            .get(&this.buffer)
+            .ok_or("viewed a buffer this renderer has no record of")?;
+        let (offset, range) = (this.offset.0, this.range.0);
+        if offset >= size {
+            return Err("viewed a buffer from past its end");
+        }
+        let block = formats::texel_block(this.format)
+            .ok_or("viewed a buffer as a format with no texels to read")?;
+        let range = if range == u64::MAX {
+            size - offset
+        } else if range == 0
+            || range > size - offset
+            || !range.is_multiple_of(u64::from(block.bytes))
+        {
+            return Err("viewed a range of a buffer it does not hold whole");
+        } else {
+            range
+        };
+        if facts.formats.buffer_features(this.format) & TEXEL == 0 {
+            return Err("viewed a buffer as a format the device makes no texel buffer of");
+        }
+        if range / u64::from(block.bytes) > u64::from(facts.limits.maxTexelBufferElements) {
+            return Err("viewed more texels than the device's texel buffers hold");
         }
         Ok(())
     }
@@ -11694,8 +11785,8 @@ pub struct DeviceFacts<'d> {
     pub sample_locations: Option<&'d SampleLocationGrids>,
     /// The query types the device was created able to make.
     pub query_types: &'d [VkQueryType],
-    /// The drm format modifiers it takes.
-    pub modifiers: ModifierPlanes<'d>,
+    /// Its format properties.
+    pub formats: FormatQueries<'d>,
 }
 
 /// Whether the counts a submit's `pNext` chain carries agree with the submit's own.
@@ -11808,7 +11899,6 @@ macro_rules! forwarded_unchecked {
 forwarded_unchecked!(
     VkAccelerationStructureCreateInfoKHR,
     VkBufferCreateInfo,
-    VkBufferViewCreateInfo,
     VkCommandPoolCreateInfo,
     VkDescriptorPoolCreateInfo,
     VkDescriptorSetLayoutCreateInfo,
@@ -12057,6 +12147,8 @@ needs_no_check!(
     VkBindImageMemoryDeviceGroupInfo,
     // A result the driver writes into a slot the decoder allocated for it.
     VkBindMemoryStatus,
+    // Usage bits for a buffer or a view of one.
+    VkBufferUsageFlags2CreateInfo,
     // External handle types: bits the image's creation reads, as the root's own flags are.
     VkExternalMemoryImageCreateInfo,
     // Formats the decoder found defined, from an array it sized to their count, which drivers
@@ -13249,6 +13341,58 @@ mod tests {
         assert_eq!(host(&[region(0), region(56)]), Ok(()));
         assert!(host(&[region(0), region(57)]).is_err(), "one texel past");
 
+        d.abandon_planted();
+    }
+
+    /// A texel view lies inside its buffer, holds whole texels, is in a format the device makes
+    /// texel buffers of, and is no longer than the device's texel buffers.
+    #[test]
+    fn a_buffer_view_lies_inside_its_buffer_in_a_texel_format() {
+        use crate::venus::proto::types::VkBufferViewCreateInfo;
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const BUFFER: VkBuffer = VkBuffer::forged(0x600);
+        const TEXEL: u32 =
+            VkFormatFeatureFlagBits::VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT.0 as u32;
+        let rgba = VkFormat::VK_FORMAT_R8G8B8A8_UNORM;
+        let rgb32 = VkFormat::VK_FORMAT_R32G32B32_SFLOAT;
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        d.plant_buffer(BUFFER, 4096);
+        d.plant_buffer_features(DEVICE, &[(rgba, TEXEL), (rgb32, TEXEL)]);
+        let mut limits = planted_limits();
+        limits.maxTexelBufferElements = 512;
+        d.plant_limits(DEVICE, limits);
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let view = |buffer, format, offset, range| {
+            let info = VkBufferViewCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
+                buffer,
+                format,
+                offset: VkDeviceSize(offset),
+                range: VkDeviceSize(range),
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+        };
+        let whole = u64::MAX;
+        assert_eq!(view(BUFFER, rgba, 0, 2048), Ok(()), "the most texels it holds");
+        assert_eq!(view(BUFFER, rgba, 2048, whole), Ok(()), "the rest of it");
+        assert_eq!(view(BUFFER, rgb32, 0, 1536), Ok(()), "a three-channel texel");
+        assert!(view(BUFFER, rgba, 0, 2052).is_err(), "more texels than a texel buffer holds");
+        assert!(view(BUFFER, rgba, 0, whole).is_err(), "and so the whole of it");
+        assert!(view(BUFFER, rgba, 4096, whole).is_err(), "from past its end");
+        assert!(view(BUFFER, rgba, 4092, 8).is_err(), "running past its end");
+        assert!(view(BUFFER, rgba, 0, 0).is_err(), "empty");
+        assert!(view(BUFFER, rgba, 0, 6).is_err(), "a texel and a half");
+        assert!(
+            view(BUFFER, VkFormat::VK_FORMAT_D32_SFLOAT, 0, 64).is_err(),
+            "no texel buffer of it"
+        );
+        assert!(
+            view(BUFFER, VkFormat::VK_FORMAT_BC1_RGB_UNORM_BLOCK, 0, 64).is_err(),
+            "compressed"
+        );
+        assert!(view(VkBuffer::forged(0x601), rgba, 0, 64).is_err(), "no record");
         d.abandon_planted();
     }
 
