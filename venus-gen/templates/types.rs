@@ -94,6 +94,16 @@ impl ${ty.name} {
 %   for key, val in RUST.enum_values(ty):
     pub const ${key}: Self = Self(${val});
 %   endfor
+
+    /// Whether vk.xml defines this value. A driver switches on an enum and treats every value it
+    /// does not list as unreachable, so the decoder refuses one this registry does not define.
+    pub const fn is_defined(self) -> bool {
+        ${RUST.enum_defined_pattern(ty)}
+    }
+
+    /// The smallest value vk.xml defines, for a test that needs one the decoder will accept.
+    #[cfg(test)]
+    pub const WITNESS: Self = Self(${RUST.enum_witness(ty)});
 }
 
 % endfor
@@ -144,6 +154,25 @@ pub struct ${ty.name} {
 %   for name, rs in RUST.struct_fields(ty):
     pub ${name}: ${rs},
 %   endfor
+}
+
+#[cfg(test)]
+impl ${ty.name} {
+    /// `Default`, with every enum whose zero vk.xml does not define set to one it does, so the
+    /// decoder accepts it. Test scaffolding, for a test about anything but the enum.
+    #[allow(dead_code)]
+    pub fn witness_default() -> Self {
+%   if RUST.witness_overrides(ty):
+        Self {
+%     for name, expr in RUST.witness_overrides(ty):
+            ${name}: ${expr},
+%     endfor
+            ..Default::default()
+        }
+%   else:
+        Self::default()
+%   endif
+    }
 }
 
 %   if not RUST.carries_pointers(ty.name):

@@ -3807,6 +3807,13 @@ SABOTAGES = [
         'a_null_handle_where_an_object_is_required_poisons_the_stream',
     ),
     (
+        'an enum value the registry does not define reaches the driver',
+        'venus-gen/rustgen.py',
+        """        if (var.ty.base.category != VkType.ENUM or validity == Gen_INVALID""",
+        """        if (True or var.ty.base.category != VkType.ENUM or validity == Gen_INVALID""",
+        'an_enum_value_the_registry_does_not_define_poisons_the_stream',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

@@ -9931,8 +9931,8 @@ mod tests {
         let mut q = ty::vn_command_vkGetPhysicalDeviceImageFormatProperties::default();
         q.physicalDevice = VkPhysicalDevice::forged(GUEST_PD);
         q.format = VkFormat(37);
-        q.r#type = VkImageType(1);
-        q.tiling = VkImageTiling(2);
+        q.r#type = VkImageType(2);
+        q.tiling = VkImageTiling(1);
         q.usage = VkImageUsageFlags(0x40);
         q.flags = VkImageCreateFlags(0x800);
         q.plant_pImageFormatProperties(&mut props);
@@ -9951,7 +9951,7 @@ mod tests {
         SAW.with_borrow(|v| {
             assert_eq!(
                 *v,
-                [Probe { pd: HOST_PD, format: 37, ty: 1, tiling: 2, usage: 0x40, flags: 0x800 }],
+                [Probe { pd: HOST_PD, format: 37, ty: 2, tiling: 1, usage: 0x40, flags: 0x800 }],
                 "the physical device, then format, type, tiling, usage, flags, in that order"
             )
         });

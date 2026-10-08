@@ -1848,6 +1848,49 @@ mod tests {
         }
     }
 
+    /// An enum value vk.xml does not define poisons the stream at the decode. A driver switches
+    /// on the enum and treats every value it does not list as unreachable -- KosmicKrisp's image
+    /// type, index type, blend factor and descriptor type are each a `UNREACHABLE` default, which
+    /// a release build compiles to undefined behaviour. Every value vk.xml defines still decodes,
+    /// aliases and extension values included.
+    #[test]
+    fn an_enum_value_the_registry_does_not_define_poisons_the_stream() {
+        use crate::venus::proto::serialize::{
+            vn_decode_vkCmdBindIndexBuffer_args_temp, vn_encode_vkCmdBindIndexBuffer_args,
+        };
+        use crate::venus::proto::types::{
+            VkBuffer, VkCommandBuffer, VkCommandTypeEXT, VkFlags, VkIndexType,
+            vn_command_vkCmdBindIndexBuffer,
+        };
+        let bind = |index_type: VkIndexType| {
+            let sent = vn_command_vkCmdBindIndexBuffer {
+                commandBuffer: VkCommandBuffer::forged(1),
+                buffer: VkBuffer::forged(2),
+                indexType: index_type,
+                ..Default::default()
+            };
+            let mut wire = Vec::new();
+            vn_encode_vkCmdBindIndexBuffer_args(
+                &mut Encoder::growing(&mut wire, &AllOfIt),
+                VkFlags(0),
+                &sent,
+            );
+            let (temp, hard) = (Bump::new(), AtomicBool::new(false));
+            let mut dec = Decoder::new(&wire, &temp, &IdentityObjects, &hard);
+            let _ = dec.decode_scalar::<VkCommandTypeEXT>();
+            let _ = dec.decode_scalar::<VkFlags>();
+            vn_decode_vkCmdBindIndexBuffer_args_temp(
+                &mut dec,
+                &mut vn_command_vkCmdBindIndexBuffer::default(),
+            );
+            !dec.fatal()
+        };
+        assert!(bind(VkIndexType::VK_INDEX_TYPE_UINT32), "a core value");
+        assert!(bind(VkIndexType::VK_INDEX_TYPE_UINT8), "an extension's value");
+        assert!(!bind(VkIndexType(7)), "a value no extension defines");
+        assert!(!bind(VkIndexType(-1)), "nor a negative one");
+    }
+
     /// `VK_NULL_HANDLE` where vk.xml requires an object poisons the stream at the decode. The
     /// driver dereferences such a handle without checking it, so a null one reaching it was a
     /// host null dereference -- a submit's semaphore, a copy's buffer, a descriptor write's set.

@@ -572,6 +572,51 @@ class RustGen:
         """Enumerant name and value. vk.xml's negative error codes stay negative."""
         return list(ty.enums.values.items())
 
+    def enum_defined_pattern(self, ty):
+        """The body of an enum's `is_defined`: a match on every value vk.xml gives it, once each,
+        since an alias repeats its target's value."""
+        values = sorted({int(str(v), 0) for _, v in self.enum_values(ty)})
+        if not values:
+            return 'false'
+        # Consecutive values as one range, which is how clippy wants a run written.
+        runs = []
+        for v in values:
+            if runs and v == runs[-1][1] + 1:
+                runs[-1][1] = v
+            else:
+                runs.append([v, v])
+        pats = [str(a) if a == b else '%d..=%d' % (a, b) for a, b in runs]
+        return 'matches!(self.0, %s)' % ' | '.join(pats)
+
+    def enum_witness(self, ty):
+        """The smallest value vk.xml gives an enum, or zero for one with none."""
+        values = sorted({int(str(v), 0) for _, v in self.enum_values(ty)})
+        return values[0] if values else 0
+
+    def witness_overrides(self, ty):
+        """The members of a struct's `witness_default` that `Default` would leave undecodable:
+        a plain enum whose zero vk.xml does not define, and a plain struct that has one."""
+        out = []
+        for var in ty.variables:
+            if var.ty.is_pointer() or var.ty.is_static_array():
+                continue
+            base = var.ty.base
+            if base.category == VkType.ENUM and var.can_validate():
+                values = {int(str(v), 0) for _, v in self.enum_values(base)}
+                if values and 0 not in values:
+                    out.append((self.field_name(var.name), '%s::WITNESS' % base.name))
+            elif base.category == VkType.STRUCT and self.witness_overrides(base):
+                out.append((self.field_name(var.name), '%s::witness_default()' % base.name))
+        return out
+
+    def _enum_check(self, var, validity, value):
+        """Statements refusing an enum `value` vk.xml does not define, for a member whose
+        validity vk.xml has not left to other fields. Empty for anything else."""
+        if (var.ty.base.category != VkType.ENUM or validity == Gen_INVALID
+                or not var.can_validate()):
+            return []
+        return ['if !%s.is_defined() {' % value, '    dec.set_fatal();', '}']
+
     # ------------------------------------------------------------------
     # Statement emission.
     #
@@ -916,7 +961,8 @@ class RustGen:
             if validity == Gen_INVALID:
                 return ['/* skip %s */' % m]
             if elem_kind == 'scalar':
-                return ['%s = dec.decode_scalar::<%s>();' % (m, elem)]
+                return (['%s = dec.decode_scalar::<%s>();' % (m, elem)]
+                        + self._enum_check(var, validity, m))
             if capture:
                 return ['val.%s = %s(dec, &mut %s);' % (capture, elem, m)]
             return ['%s(dec, &mut %s%s);' % (elem, m, tag)]
@@ -1046,6 +1092,9 @@ class RustGen:
         if validity != Gen_INVALID:
             if elem_kind == 'scalar':
                 hit.append('dec.decode_scalar_array(a);')
+                check = self._enum_check(var, validity, 'e')
+                if check:
+                    hit += ['for e in a.iter() {'] + ['    ' + l for l in check] + ['}']
             elif capture:
                 # The ids and the handles are two arrays of the same length, filled in one pass:
                 # the lookup hands back the id it just overwrote.
@@ -1937,8 +1986,9 @@ class RustGen:
         n = ty.name
         body = ["    let mut val = vn_command_%s::default();" % n]
         for f, elem, _, wr, _ in rows:
-            body += ["    let %s%s: [%s; N] = core::array::from_fn(|_| %s::default());"
-                     % ('mut ' if wr else '', f, elem, elem),
+            body += ["    let %s%s: [%s; N] = core::array::from_fn(|_| %s::%s());"
+                     % ('mut ' if wr else '', f, elem, elem,
+                        'witness_default' if elem in self._struct_names() else 'default'),
                      "    val.plant_%s(&%s%s);" % (f, 'mut ' if wr else '', f)]
         # An array of arrays gets a row per element of the sibling planted above, and a default
         # element asks for rows of none. A row is never null, even empty: the encoder makes a
@@ -1981,6 +2031,10 @@ class RustGen:
         return (["#[test]",
                  "fn %s_accessors_carry_the_wire() {" % n] + body + ["}", ""])
 
+    def _struct_names(self):
+        """The structs this build emits, each with a `witness_default`."""
+        return {t.name for t in self.gen.supported_types[VkType.STRUCT]}
+
     def _witness_required(self, ty):
         """Plant the single-value pointers the decoder refuses to do without.
 
@@ -2000,15 +2054,16 @@ class RustGen:
             if shape[0] != 'pointer' or var.is_optional() or not var.can_validate():
                 continue
             f, base = self.field_name(var.name), self.base_name(var.ty)
+            make = 'witness_default' if base in self._struct_names() else 'default'
             if self.witnessed(ty, var):
-                out += ["    let %s_v = %s::default();" % (f, base),
+                out += ["    let %s_v = %s::%s();" % (f, base, make),
                         "    val.%s = Some(cs::Decoded::planted(&%s_v));" % (f, f)]
             elif self.is_ref_member(ty, var):
-                out += ["    let %s_v = %s::default();" % (f, base),
+                out += ["    let %s_v = %s::%s();" % (f, base, make),
                         "    val.%s = Some(&%s_v);" % (f, f)]
             else:
                 wr = self._member_is_mut(ty, f)
-                out += ["    let %s%s_v = %s::default();" % ('mut ' if wr else '', f, base),
+                out += ["    let %s%s_v = %s::%s();" % ('mut ' if wr else '', f, base, make),
                         "    val.plant_%s(&%s%s_v);" % (f, 'mut ' if wr else '', f)]
         return out
 
