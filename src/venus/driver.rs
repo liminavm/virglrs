@@ -7677,11 +7677,14 @@ impl Driver {
         offset: VkDeviceSize,
         size: VkDeviceSize,
         data: u32,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), RecordRefused> {
+        // A whole-size fill runs to the buffer's end, so only its offset can miss.
+        let span = (size != VK_WHOLE_SIZE).then_some(size.0);
+        self.facts().buffer_span(buffer, offset, span).map_err(RecordRefused::Invalid)?;
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdFillBuffer())(cb, buffer, offset, size, data) };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_copy_buffer(
@@ -7690,11 +7693,16 @@ impl Driver {
         src: VkBuffer,
         dst: VkBuffer,
         regions: &[VkBufferCopy],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), RecordRefused> {
+        let facts = self.facts();
+        for r in regions {
+            facts.buffer_span(src, r.srcOffset, Some(r.size.0)).map_err(RecordRefused::Invalid)?;
+            facts.buffer_span(dst, r.dstOffset, Some(r.size.0)).map_err(RecordRefused::Invalid)?;
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above; the count is the slice's own length.
         unsafe { (d.vkCmdCopyBuffer())(cb, src, dst, regions.len() as u32, regions.as_ptr()) };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_copy_buffer_to_image(
@@ -7879,7 +7887,7 @@ impl Driver {
     pub fn cmd_copy_buffer2(
         &self,
         cb: VkCommandBuffer,
-        info: cs::Decoded<'_, VkCopyBufferInfo2>,
+        info: cs::Decoded<'_, VkCopyBufferInfo2, cs::Checked>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdCopyBuffer2()?;
         // SAFETY: as above; `info` and every array it points at are arena allocations live for
@@ -8631,10 +8639,13 @@ impl Driver {
         dst: VkBuffer,
         offset: VkDeviceSize,
         data: &[u8],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), RecordRefused> {
+        self.facts()
+            .buffer_span(dst, offset, Some(data.len() as u64))
+            .map_err(RecordRefused::Invalid)?;
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
         if data.is_empty() {
-            return Some(());
+            return Ok(());
         }
         // SAFETY: as above; the size is the slice's own length in bytes.
         unsafe {
@@ -8646,7 +8657,7 @@ impl Driver {
                 data.as_ptr().cast(),
             )
         };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdClearAttachments`, whose two arrays are counted separately and mean different things.
@@ -11750,6 +11761,18 @@ fn regions_of<'a, T, S, R>(
     unsafe { cs::wire_array(count as usize, regions) }.unwrap_or_default()
 }
 
+impl cs::Validate<DeviceFacts<'_>> for VkCopyBufferInfo2 {
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        regions_of(&this, this.regionCount, this.pRegions).iter().try_for_each(|r| {
+            facts.facts.buffer_span(this.srcBuffer, r.srcOffset, Some(r.size.0))?;
+            facts.facts.buffer_span(this.dstBuffer, r.dstOffset, Some(r.size.0))
+        })
+    }
+}
+
 impl cs::Validate<DeviceFacts<'_>> for VkCopyBufferToImageInfo2 {
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
@@ -14050,6 +14073,29 @@ impl Facts<'_> {
             return Err("named layers the image does not have");
         }
         Ok(Placed { image: facts, block, width, height, level: sub.mipLevel, layers })
+    }
+
+    /// Whether `buffer` holds `size` bytes from `offset`, or with no size, any byte at `offset`:
+    /// the span a transfer reads or writes. The Mesa runtime holds a span to its buffer only with
+    /// asserts, and KosmicKrisp's buffer copy not at all, so a span past the end has the GPU read
+    /// or write whatever the device has mapped after the buffer.
+    fn buffer_span(
+        &self,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        size: Option<u64>,
+    ) -> Result<(), &'static str> {
+        let Some(&len) = self.buffers.get(&buffer) else {
+            return Err("transferred through a buffer this renderer has no record of");
+        };
+        let fits = match size {
+            Some(size) => offset.0.checked_add(size).is_some_and(|end| end <= len),
+            None => offset.0 < len,
+        };
+        if !fits {
+            return Err("transferred past the end of a buffer");
+        }
+        Ok(())
     }
 
     /// A buffer-image copy region: inside the image, and the bytes it spans inside the buffer.

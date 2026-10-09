@@ -6154,7 +6154,7 @@ impl Commands for Handlers<'_> {
             args.size,
             args.data,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdCopyBuffer(&mut self, args: &mut vn_command_vkCmdCopyBuffer<'_>) {
@@ -6165,7 +6165,7 @@ impl Commands for Handlers<'_> {
             args.dstBuffer,
             regions,
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdCopyBufferToImage(&mut self, args: &mut vn_command_vkCmdCopyBufferToImage<'_>) {
@@ -6294,6 +6294,7 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdCopyBuffer2(&mut self, args: &mut vn_command_vkCmdCopyBuffer2<'_>) {
         let Some(info) = self.names(args.pCopyBufferInfo) else { return };
+        let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_copy_buffer2(args.commandBuffer, info);
         self.recorded(done);
     }
@@ -6729,7 +6730,7 @@ impl Commands for Handlers<'_> {
         };
         let done =
             self.driver.cmd_update_buffer(args.commandBuffer, args.dstBuffer, args.dstOffset, data);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdClearAttachments(&mut self, args: &mut vn_command_vkCmdClearAttachments<'_>) {
@@ -19932,6 +19933,7 @@ mod tests {
 
         // Eight bytes at an offset of 16, so the length cannot pass for the offset.
         let bytes = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        h.driver.plant_buffer(VkBuffer::forged(0x44), 64);
         let mut args = vn_command_vkCmdUpdateBuffer::default();
         args.commandBuffer = cb;
         args.dstBuffer = VkBuffer::forged(0x44);
@@ -21828,6 +21830,192 @@ mod tests {
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
+    }
+
+    /// A buffer copy, fill or update is held to the buffers it names: every span inside its
+    /// buffer, and every buffer one this renderer recorded.
+    #[test]
+    fn a_buffer_transfer_stays_inside_its_buffers() {
+        use super::super::proto::types::{
+            VkBuffer, VkBufferCopy, VkBufferCopy2, VkCommandBuffer, VkCommandPool,
+            VkCopyBufferInfo2, VkDevice, VkDeviceSize, vn_command_vkCmdCopyBuffer,
+            vn_command_vkCmdCopyBuffer2, vn_command_vkCmdFillBuffer, vn_command_vkCmdUpdateBuffer,
+        };
+
+        const DEVICE: u64 = 3;
+        const CB: (u64, u64) = (0x71, 0x17);
+        const SMALL: u64 = 0x40;
+        const BIG: u64 = 0x41;
+
+        unsafe extern "C" fn copy(
+            _: VkCommandBuffer,
+            _: VkBuffer,
+            _: VkBuffer,
+            _: u32,
+            _: *const VkBufferCopy,
+        ) {
+        }
+        unsafe extern "C" fn copy2(_: VkCommandBuffer, _: *const VkCopyBufferInfo2) {}
+        unsafe extern "C" fn fill(
+            _: VkCommandBuffer,
+            _: VkBuffer,
+            _: VkDeviceSize,
+            _: VkDeviceSize,
+            _: u32,
+        ) {
+        }
+        unsafe extern "C" fn update(
+            _: VkCommandBuffer,
+            _: VkBuffer,
+            _: VkDeviceSize,
+            _: VkDeviceSize,
+            _: *const core::ffi::c_void,
+        ) {
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdCopyBuffer(copy);
+        fns.plant_vkCmdCopyBuffer2(copy2);
+        fns.plant_vkCmdFillBuffer(fill);
+        fns.plant_vkCmdUpdateBuffer(update);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(0x70),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+        driver.plant_buffer(VkBuffer::forged(SMALL), 64);
+        driver.plant_buffer(VkBuffer::forged(BIG), 256);
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+
+        macro_rules! run {
+            ($call:expr) => {{
+                let mut rings = BTreeMap::new();
+                let mut ctx_reply = None;
+                let mut monitor = None;
+                let mut jrnl = Journal::new();
+                let mut h = Handlers {
+                    objects: &objects,
+                    todo: &todo,
+                    driver: &mut driver,
+                    global: &global,
+                    ctx: ContextId::new(1).expect("1 is not zero"),
+                    ask: None,
+                    resources: &NO_RESOURCES,
+                    rings: &mut rings,
+                    monitor: &mut monitor,
+                    replaying: false,
+                    depth: 0,
+                    answer: None,
+                    own_wait: None,
+                    current_ring: None,
+                    reply: &mut ctx_reply,
+                    note: None,
+                    journal: &mut jrnl,
+                };
+                #[allow(clippy::redundant_closure_call)]
+                (|h: &mut Handlers| $call(h))(&mut h);
+                h.rejected()
+            }};
+        }
+
+        let cb = VkCommandBuffer::forged(CB.0);
+        const PAST: Option<&str> = Some("transferred past the end of a buffer");
+        const UNKNOWN: Option<&str> =
+            Some("transferred through a buffer this renderer has no record of");
+
+        // From the small buffer into the big one, so each side's own size is what refuses.
+        for (src, dst, size, why) in [
+            (0, 0, 64, None),
+            (32, 192, 32, None),
+            (33, 0, 32, PAST),
+            (0, 193, 64, PAST),
+            (u64::MAX, 0, 2, PAST),
+            (0, 0, u64::MAX, PAST),
+        ] {
+            let regions = [VkBufferCopy {
+                srcOffset: VkDeviceSize(src),
+                dstOffset: VkDeviceSize(dst),
+                size: VkDeviceSize(size),
+            }];
+            let mut args = vn_command_vkCmdCopyBuffer::default();
+            args.commandBuffer = cb;
+            args.srcBuffer = VkBuffer::forged(SMALL);
+            args.dstBuffer = VkBuffer::forged(BIG);
+            args.plant_pRegions(&regions);
+            assert_eq!(
+                run!(|h: &mut Handlers| h.vkCmdCopyBuffer(&mut args)),
+                why,
+                "copy {src} -> {dst}, {size} bytes"
+            );
+
+            let regions = [VkBufferCopy2 {
+                srcOffset: VkDeviceSize(src),
+                dstOffset: VkDeviceSize(dst),
+                size: VkDeviceSize(size),
+                ..Default::default()
+            }];
+            let info = VkCopyBufferInfo2 {
+                srcBuffer: VkBuffer::forged(SMALL),
+                dstBuffer: VkBuffer::forged(BIG),
+                regionCount: 1,
+                pRegions: regions.as_ptr(),
+                ..Default::default()
+            };
+            assert_eq!(
+                run!(|h: &mut Handlers| h.vkCmdCopyBuffer2(&mut vn_command_vkCmdCopyBuffer2 {
+                    commandBuffer: cb,
+                    pCopyBufferInfo: Some(Decoded::planted(&info)),
+                    ..Default::default()
+                })),
+                why,
+                "copy2 {src} -> {dst}, {size} bytes"
+            );
+        }
+
+        for (buffer, offset, size, why) in [
+            (SMALL, 0, u64::MAX, None),
+            (SMALL, 60, u64::MAX, None),
+            (SMALL, 64, u64::MAX, PAST),
+            (SMALL, 32, 32, None),
+            (SMALL, 32, 36, PAST),
+            (SMALL, 4, u64::MAX - 1, PAST),
+            (0x99, 0, 4, UNKNOWN),
+        ] {
+            assert_eq!(
+                run!(|h: &mut Handlers| h.vkCmdFillBuffer(&mut vn_command_vkCmdFillBuffer {
+                    commandBuffer: cb,
+                    dstBuffer: VkBuffer::forged(buffer),
+                    dstOffset: VkDeviceSize(offset),
+                    size: VkDeviceSize(size),
+                    data: 7,
+                    ..Default::default()
+                })),
+                why,
+                "fill {buffer:#x} at {offset}, {size} bytes"
+            );
+        }
+
+        let bytes = [0u8; 8];
+        for (buffer, offset, why) in
+            [(SMALL, 56, None), (SMALL, 57, PAST), (SMALL, u64::MAX - 4, PAST), (0x99, 0, UNKNOWN)]
+        {
+            let mut args = vn_command_vkCmdUpdateBuffer::default();
+            args.commandBuffer = cb;
+            args.dstBuffer = VkBuffer::forged(buffer);
+            args.dstOffset = VkDeviceSize(offset);
+            args.plant_dataSize(VkDeviceSize(bytes.len() as u64));
+            args.plant_pData(&bytes);
+            assert_eq!(
+                run!(|h: &mut Handlers| h.vkCmdUpdateBuffer(&mut args)),
+                why,
+                "update {buffer:#x} at {offset}"
+            );
+        }
+        driver.abandon_planted();
     }
 
     /// Transform feedback is held to the device's buffers and to each buffer it names: binding

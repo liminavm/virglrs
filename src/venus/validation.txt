@@ -55,8 +55,8 @@ vkCmdClearColorImage                             validated
 vkCmdClearDepthStencilImage                      validated
 vkCmdCopyAccelerationStructureKHR                reviewed
 vkCmdCopyAccelerationStructureToMemoryKHR        reviewed
-vkCmdCopyBuffer                                  reviewed
-vkCmdCopyBuffer2                                 reviewed
+vkCmdCopyBuffer                                  validated
+vkCmdCopyBuffer2                                 validated
 vkCmdCopyBufferToImage                           validated
 vkCmdCopyBufferToImage2                          validated
 vkCmdCopyImage                                   validated
@@ -89,7 +89,7 @@ vkCmdEndRendering                                reviewed
 vkCmdEndRendering2KHR                            reviewed
 vkCmdEndTransformFeedbackEXT                     validated
 vkCmdExecuteCommands                             reviewed
-vkCmdFillBuffer                                  reviewed
+vkCmdFillBuffer                                  validated
 vkCmdNextSubpass                                 validated
 vkCmdNextSubpass2                                validated
 vkCmdPipelineBarrier                             reviewed
@@ -166,7 +166,7 @@ vkCmdSetViewportWithCount                        validated
 vkCmdTraceRaysIndirect2KHR                       reviewed
 vkCmdTraceRaysIndirectKHR                        reviewed
 vkCmdTraceRaysKHR                                reviewed
-vkCmdUpdateBuffer                                reviewed
+vkCmdUpdateBuffer                                validated
 vkCmdWaitEvents                                  reviewed
 vkCmdWaitEvents2                                 reviewed
 vkCmdWriteAccelerationStructuresPropertiesKHR    reviewed

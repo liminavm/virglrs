@@ -5651,6 +5651,46 @@ SABOTAGES = [
         'a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
     ),
     (
+        'a buffer transfer may run past its buffer',
+        'src/venus/driver.rs',
+        """        if !fits {
+            return Err("transferred past""",
+        """        if false && !fits {
+            return Err("transferred past""",
+        'a_buffer_transfer_stays_inside_its_buffers',
+    ),
+    (
+        'a buffer copy may skip its regions',
+        'src/venus/driver.rs',
+        """        for r in regions {
+            facts.buffer_span(src""",
+        """        for r in &regions[..0] {
+            facts.buffer_span(src""",
+        'a_buffer_transfer_stays_inside_its_buffers',
+    ),
+    (
+        'a buffer copy2 may read past its source',
+        'src/venus/driver.rs',
+        """            facts.facts.buffer_span(this.srcBuffer, r.srcOffset, Some(r.size.0))?;
+""",
+        """""",
+        'a_buffer_transfer_stays_inside_its_buffers',
+    ),
+    (
+        'a buffer fill may run past its buffer',
+        'src/venus/driver.rs',
+        """        self.facts().buffer_span(buffer, offset, span).map_err(RecordRefused::Invalid)?;""",
+        """        let _ = span;""",
+        'a_buffer_transfer_stays_inside_its_buffers',
+    ),
+    (
+        'a buffer update may run past its buffer',
+        'src/venus/driver.rs',
+        """            .buffer_span(dst, offset, Some(data.len() as u64))""",
+        """            .buffer_span(dst, VkDeviceSize(0), Some(0))""",
+        'a_buffer_transfer_stays_inside_its_buffers',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",
