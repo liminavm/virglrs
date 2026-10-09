@@ -5569,15 +5569,15 @@ SABOTAGES = [
     (
         'pipeline cache data may open without its tag',
         'src/venus/pipeline_cache.rs',
-        """    mac(key, data).verify_slice(tag).ok()?;""",
+        """    mac(key, data).verify_slice(tag).map_err(|_| Unopened::Tag)?;""",
         """    let _ = mac(key, data).verify_slice(tag);""",
         'only_data_this_key_tagged_opens',
     ),
     (
         'tagged pipeline cache data may skip the framing check',
         'src/venus/pipeline_cache.rs',
-        """    framed(data).then_some(data)""",
-        """    Some(data)""",
+        """    if !framed(data) {""",
+        """    if false && !framed(data) {""",
         'tagged_data_must_still_be_mesa_framed',
     ),
     (
@@ -5597,8 +5597,8 @@ SABOTAGES = [
     (
         'a pipeline cache may be created from any initial data',
         'src/venus/driver.rs',
-        """        let data = self.cache_key.as_ref().and_then(|key| pipeline_cache::opened(key, sealed));""",
-        """        let data = Some(sealed).filter(|s| !s.is_empty());""",
+        """                let opened = pipeline_cache::opened(key, sealed);""",
+        """                let opened: Result<&[u8], pipeline_cache::Unopened> = Ok(sealed);""",
         'only_cache_data_this_renderer_handed_out_reaches_the_driver',
     ),
     (
