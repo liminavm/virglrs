@@ -5305,10 +5305,11 @@ impl Commands for Handlers<'_> {
 
     fn vkBeginCommandBuffer(&mut self, args: &mut vn_command_vkBeginCommandBuffer<'_>) {
         let Some(info) = self.names(args.pBeginInfo) else { return };
-        let Some(ret) = self.driver.begin_command_buffer(args.commandBuffer, info) else {
-            return self.no_recorder();
-        };
-        args.ret = ret;
+        match self.driver.begin_command_buffer(args.commandBuffer, info) {
+            Ok(ret) => args.ret = ret,
+            Err(driver::RecordRefused::NoDevice) => self.no_recorder(),
+            Err(driver::RecordRefused::Invalid(why)) => self.reject(why),
+        }
     }
 
     fn vkEndCommandBuffer(&mut self, args: &mut vn_command_vkEndCommandBuffer<'_>) {

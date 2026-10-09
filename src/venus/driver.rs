@@ -6283,14 +6283,49 @@ impl Driver {
         &mut self,
         cb: VkCommandBuffer,
         info: cs::Decoded<'_, VkCommandBufferBeginInfo>,
-    ) -> Option<VkResult> {
+    ) -> Result<VkResult, RecordRefused> {
+        self.inheritance_fits(cb, &info)?;
         // A begin starts the recording over, bindings and all, whether the driver's answer is a
         // success or not: a failed begin leaves nothing a draw may rely on either.
         self.pools.unbind(cb);
-        let d = self.recorder(cb)?;
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
         // SAFETY: a command buffer this context allocated, and `info` is an arena allocation
         // live for the call. The same holds for every call in this section.
-        Some(unsafe { (d.vkBeginCommandBuffer())(cb, info.get()) })
+        Ok(unsafe { (d.vkBeginCommandBuffer())(cb, info.get()) })
+    }
+
+    /// Whether a secondary command buffer begins with an inheritance the driver can follow: one
+    /// there at all, since anv reads it for every secondary, and a render pass it continues
+    /// named with a subpass that pass has. The Mesa runtime looks the subpass up in the pass's
+    /// array, checking it only with an assert. A primary's inheritance is ignored, and so is a
+    /// render pass a secondary does not continue.
+    fn inheritance_fits(
+        &self,
+        cb: VkCommandBuffer,
+        info: &cs::Decoded<'_, VkCommandBufferBeginInfo>,
+    ) -> Result<(), RecordRefused> {
+        const CONTINUE: u32 =
+            super::proto::types::VkCommandBufferUsageFlagBits::VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT.0 as u32;
+        if self.pools.level_of(cb) != Some(Level::Secondary) {
+            return Ok(());
+        }
+        let Some(inheritance) = regions_of(info, 1, info.pInheritanceInfo).first() else {
+            return Err(RecordRefused::Invalid(
+                "began a secondary command buffer inheriting nothing",
+            ));
+        };
+        if info.flags.0 & CONTINUE == 0 || inheritance.renderPass.host().raw() == 0 {
+            return Ok(());
+        }
+        let pass = self.render_passes.get(&inheritance.renderPass).ok_or(
+            RecordRefused::Invalid("continued a render pass this renderer has no record of"),
+        )?;
+        if inheritance.subpass >= pass.subpasses() {
+            return Err(RecordRefused::Invalid(
+                "continued a subpass its render pass does not have",
+            ));
+        }
+        Ok(())
     }
 
     pub fn end_command_buffer(&self, cb: VkCommandBuffer) -> Option<VkResult> {
@@ -23597,6 +23632,87 @@ mod tests {
             assert_eq!(*s, [(3, 0x20, 7)], "only the first reached the driver, with its flags")
         });
 
+        d.abandon_planted();
+    }
+
+    /// A secondary command buffer begins with an inheritance, and one continuing a render pass
+    /// names a subpass the pass has. A primary's inheritance, and a pass a secondary does not
+    /// continue, are not read.
+    #[test]
+    fn a_secondary_begins_inside_the_pass_it_continues() {
+        use super::super::proto::types::{
+            VkCommandBufferInheritanceInfo, VkCommandBufferUsageFlagBits, VkCommandBufferUsageFlags,
+        };
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        const PASS: VkRenderPass = VkRenderPass::forged(0x50);
+        let primary = VkCommandBuffer::forged(0x10);
+        let secondary = VkCommandBuffer::forged(0x11);
+        unsafe extern "C" fn begin(
+            _: VkCommandBuffer,
+            _: *const VkCommandBufferBeginInfo,
+        ) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkBeginCommandBuffer(begin);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x30), &[(primary, ObjectId(1))]);
+        d.plant_pool_at(
+            DEVICE,
+            VkCommandPool::forged(0x31),
+            Level::Secondary,
+            &[(secondary, ObjectId(2))],
+        );
+        let subpass = || SubpassShape { named: Vec::new(), colors: 0 };
+        let pass = RenderPassFacts::held(0, vec![subpass(), subpass()], []).expect("a pass");
+        d.render_passes.insert(PASS, Arc::new(pass));
+
+        const CONTINUE: VkCommandBufferUsageFlags = VkCommandBufferUsageFlags(
+            VkCommandBufferUsageFlagBits::VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT.0 as u32,
+        );
+        const NONE: VkCommandBufferUsageFlags = VkCommandBufferUsageFlags(0);
+        let mut begin_with = |cb, flags, inheritance: Option<(VkRenderPass, u32)>| {
+            let inherited =
+                inheritance.map(|(render_pass, subpass)| VkCommandBufferInheritanceInfo {
+                    renderPass: render_pass,
+                    subpass,
+                    ..Default::default()
+                });
+            let info = VkCommandBufferBeginInfo {
+                flags,
+                pInheritanceInfo: inherited.as_ref().map_or(core::ptr::null(), |i| i),
+                ..Default::default()
+            };
+            d.begin_command_buffer(cb, cs::Decoded::planted(&info)).map(|_| ())
+        };
+        let refused = |why| Err(RecordRefused::Invalid(why));
+        let beyond = refused("continued a subpass its render pass does not have");
+        for (what, cb, flags, inheritance, want) in [
+            ("a primary's inheritance", primary, CONTINUE, Some((PASS, 9)), Ok(())),
+            ("a primary inheriting nothing", primary, NONE, None, Ok(())),
+            (
+                "a secondary inheriting nothing",
+                secondary,
+                NONE,
+                None,
+                refused("began a secondary command buffer inheriting nothing"),
+            ),
+            ("the last subpass", secondary, CONTINUE, Some((PASS, 1)), Ok(())),
+            ("one past it", secondary, CONTINUE, Some((PASS, 2)), beyond),
+            ("far past it", secondary, CONTINUE, Some((PASS, u32::MAX)), beyond),
+            ("a pass not continued", secondary, NONE, Some((PASS, 9)), Ok(())),
+            ("dynamic rendering", secondary, CONTINUE, Some((VkRenderPass::NULL, 9)), Ok(())),
+            (
+                "a pass never recorded",
+                secondary,
+                CONTINUE,
+                Some((VkRenderPass::forged(0x51), 0)),
+                refused("continued a render pass this renderer has no record of"),
+            ),
+        ] {
+            assert_eq!(begin_with(cb, flags, inheritance), want, "{what}");
+        }
         d.abandon_planted();
     }
 

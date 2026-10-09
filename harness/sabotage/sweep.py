@@ -5731,6 +5731,22 @@ SABOTAGES = [
         'a_command_pool_names_a_queue_family_its_device_has',
     ),
     (
+        'a secondary may begin inheriting nothing',
+        'src/venus/driver.rs',
+        """            return Err(RecordRefused::Invalid(
+                "began a secondary command buffer inheriting nothing",
+            ));""",
+        """            return Ok(());""",
+        'a_secondary_begins_inside_the_pass_it_continues',
+    ),
+    (
+        'a secondary may continue a subpass its pass does not have',
+        'src/venus/driver.rs',
+        """        if inheritance.subpass >= pass.subpasses() {""",
+        """        if false && inheritance.subpass >= pass.subpasses() {""",
+        'a_secondary_begins_inside_the_pass_it_continues',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",
