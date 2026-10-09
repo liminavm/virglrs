@@ -197,7 +197,7 @@ vkCreateRayTracingPipelinesKHR                   pending:pipelines
 vkCreateRenderPass                               pending:render-passes
 vkCreateRenderPass2                              pending:render-passes
 vkCreateRingMESA                                 reviewed
-vkCreateSampler                                  reviewed
+vkCreateSampler                                  validated
 vkCreateSamplerYcbcrConversion                   reviewed
 vkCreateSemaphore                                reviewed
 vkCreateShaderModule                             reviewed

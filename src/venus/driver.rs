@@ -96,6 +96,11 @@ use super::proto::types::{
     VkImageMemoryRequirementsInfo2, VkImagePlaneMemoryRequirementsInfo,
 };
 use super::proto::types::{
+    VkBorderColor, VkSamplerBorderColorComponentMappingCreateInfoEXT,
+    VkSamplerCustomBorderColorCreateInfoEXT, VkSamplerCustomBorderColorIndexCreateInfoEXT,
+    VkSamplerReductionModeCreateInfo,
+};
+use super::proto::types::{
     VkBufferImageCopy2, VkImageCreateFlagBits, VkImageViewMinLodCreateInfoEXT,
     VkImageViewSlicedCreateInfoEXT, VkImageViewType, VkImageViewUsageCreateInfo,
     VkResolveImageModeInfoKHR, VkResolveModeFlagBits, VkSamplerYcbcrConversionInfo,
@@ -11503,6 +11508,40 @@ impl cs::Validate<cs::Chained<'_, VkImageCreateInfo, DeviceFacts<'_>>>
     }
 }
 
+impl cs::Validate<DeviceFacts<'_>> for VkSamplerCreateInfo {
+    /// A custom border colour comes with the struct that says what it is: the runtime's
+    /// `vk_sampler_border_color_value`, which panvk calls, follows the struct without checking it
+    /// was sent, and KosmicKrisp samples a border it never set.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        type B = VkBorderColor;
+        let custom = matches!(
+            this.borderColor,
+            B::VK_BORDER_COLOR_FLOAT_CUSTOM_EXT | B::VK_BORDER_COLOR_INT_CUSTOM_EXT
+        );
+        if custom && chained::<VkSamplerCustomBorderColorCreateInfoEXT, _>(this).is_none() {
+            return Err("gave a sampler a custom border colour without saying what it is");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkSamplerCreateInfo, DeviceFacts<'_>>>
+    for VkSamplerCustomBorderColorIndexCreateInfoEXT
+{
+    /// A slot in the device's border palette, which radv indexes its table of used slots by
+    /// unchecked. A slot is handed out by `vkRegisterCustomBorderColorEXT`, which is not served,
+    /// so no guest holds one to name.
+    fn validate(
+        _this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _on: &cs::Chained<'_, VkSamplerCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        Err("named a border palette slot this renderer never handed out")
+    }
+}
+
 impl cs::Validate<DeviceFacts<'_>> for VkBufferViewCreateInfo {
     /// A texel view of a buffer it lies inside, in a format the device can make a texel buffer
     /// of, no longer than the device's texel buffers. KosmicKrisp looks the format up and reads
@@ -12694,7 +12733,6 @@ forwarded_unchecked!(
     VkPipelineCacheCreateInfo,
     VkRenderPassCreateInfo,
     VkRenderPassCreateInfo2,
-    VkSamplerCreateInfo,
     VkSamplerYcbcrConversionCreateInfo,
     VkSemaphoreCreateInfo,
     VkShaderModuleCreateInfo,
@@ -12934,6 +12972,12 @@ needs_no_check!(
     VkMutableDescriptorTypeCreateInfoEXT,
     // How many inline blocks a pool holds, a count.
     VkDescriptorPoolInlineUniformBlockCreateInfo,
+    // A swizzle and an sRGB flag for the border colour, enums and a boolean.
+    VkSamplerBorderColorComponentMappingCreateInfoEXT,
+    // The border colour itself and the format it is in, which the decoder holds to vk.xml.
+    VkSamplerCustomBorderColorCreateInfoEXT,
+    // An enum.
+    VkSamplerReductionModeCreateInfo,
     // Usage bits for a buffer or a view of one.
     VkBufferUsageFlags2CreateInfo,
     // External handle types: bits the image's creation reads, as the root's own flags are.
@@ -13050,6 +13094,13 @@ unsafe impl InStruct for VkWriteDescriptorSetInlineUniformBlock {
 unsafe impl InStruct for VkWriteDescriptorSetAccelerationStructureKHR {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkSamplerCustomBorderColorCreateInfoEXT {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -14507,6 +14558,45 @@ mod tests {
         assert!(alloc(&[9, 2], 2).is_err(), "more than its binding holds");
         assert!(alloc(&[1], 2).is_err(), "counts for another number of sets");
 
+        d.abandon_planted();
+    }
+
+    /// A custom border colour comes with what it is, and a border palette slot is never named.
+    #[test]
+    fn a_custom_border_colour_says_what_it_is() {
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let sampler = |border, next: *const core::ffi::c_void| VkSamplerCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            pNext: next,
+            borderColor: border,
+            ..Default::default()
+        };
+        let made =
+            |info: &VkSamplerCreateInfo| cs::Decoded::planted(info).validate(&facts).map(|_| ());
+        let colour = VkSamplerCustomBorderColorCreateInfoEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT,
+            ..Default::default()
+        };
+        let slot = VkSamplerCustomBorderColorIndexCreateInfoEXT {
+            sType:
+                VkStructureType::VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_INDEX_CREATE_INFO_EXT,
+            index: 7,
+            ..Default::default()
+        };
+        let none = core::ptr::null();
+        let (colour, slot) = ((&raw const colour).cast(), (&raw const slot).cast());
+        type B = VkBorderColor;
+        assert_eq!(made(&sampler(B::VK_BORDER_COLOR_INT_OPAQUE_WHITE, none)), Ok(()));
+        assert_eq!(made(&sampler(B::VK_BORDER_COLOR_FLOAT_CUSTOM_EXT, colour)), Ok(()));
+        assert!(
+            made(&sampler(B::VK_BORDER_COLOR_FLOAT_CUSTOM_EXT, none)).is_err(),
+            "a float colour"
+        );
+        assert!(made(&sampler(B::VK_BORDER_COLOR_INT_CUSTOM_EXT, none)).is_err(), "an int colour");
+        assert!(made(&sampler(B::VK_BORDER_COLOR_INT_OPAQUE_WHITE, slot)).is_err(), "a slot");
         d.abandon_planted();
     }
 

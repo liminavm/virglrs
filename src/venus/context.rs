@@ -3096,13 +3096,23 @@ impl Commands for Handlers<'_> {
     }
     simple_destroy!(vkDestroyImageView, vn_command_vkDestroyImageView, imageView);
 
-    simple_create!(
-        vkCreateSampler,
-        vn_command_vkCreateSampler,
-        pCreateInfo,
-        pSampler,
-        handle_pSampler_mut
-    );
+    fn vkCreateSampler(&mut self, args: &mut vn_command_vkCreateSampler<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        // As `vkCreatePipelineLayout`.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => self.driver.create_object(
+                args.device,
+                |d| Some(d.vkCreateSampler()),
+                info,
+                args.pAllocator,
+            ),
+        };
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateSampler", args.pSampler(), args.handle_pSampler_mut(), host);
+    }
     simple_destroy!(vkDestroySampler, vn_command_vkDestroySampler, sampler);
 
     simple_create!(

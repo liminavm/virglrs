@@ -4679,6 +4679,29 @@ SABOTAGES = [
         'a_set_layout_is_one_the_driver_can_lay_out',
     ),
     (
+        'a custom border colour may come without its struct',
+        'src/venus/driver.rs',
+        """        if custom && chained::<VkSamplerCustomBorderColorCreateInfoEXT, _>(this).is_none() {""",
+        """        if false {""",
+        'a_custom_border_colour_says_what_it_is',
+    ),
+    (
+        'a sampler may name a border palette slot',
+        'src/venus/driver.rs',
+        """        Err("named a border palette slot this renderer never handed out")""",
+        """        Ok(())""",
+        'a_custom_border_colour_says_what_it_is',
+    ),
+    (
+        'an int custom border colour is not custom',
+        'src/venus/driver.rs',
+        """            B::VK_BORDER_COLOR_FLOAT_CUSTOM_EXT | B::VK_BORDER_COLOR_INT_CUSTOM_EXT
+""",
+        """            B::VK_BORDER_COLOR_FLOAT_CUSTOM_EXT
+""",
+        'a_custom_border_colour_says_what_it_is',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",
