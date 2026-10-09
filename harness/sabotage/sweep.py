@@ -2952,9 +2952,9 @@ SABOTAGES = [
     ),
     (
         'vkCreateRenderPass2 goes through the panicking accessor',
-        'src/venus/context.rs',
-        """            |d| d.try_vkCreateRenderPass2(),""",
-        """            |d| Some(d.vkCreateRenderPass2()),""",
+        'src/venus/driver.rs',
+        """|d| d.try_vkCreateRenderPass2(), info, alloc""",
+        """|d| Some(d.vkCreateRenderPass2()), info, alloc""",
         'the_render_pass2_commands_hand_the_driver_the_guests_structs',
     ),
     (
@@ -4700,6 +4700,140 @@ SABOTAGES = [
         """            B::VK_BORDER_COLOR_FLOAT_CUSTOM_EXT
 """,
         'a_custom_border_colour_says_what_it_is',
+    ),
+    (
+        'a render pass may name attachments it does not describe',
+        'src/venus/driver.rs',
+        """            .any(|&a| a != ATTACHMENT_UNUSED && a >= attachments)""",
+        """            .any(|_| false)""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a dependency may name a subpass past its pass',
+        'src/venus/driver.rs',
+        """            if !fits(d.src) || !fits(d.dst) {""",
+        """            if false {""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a view-local dependency may reach outside its pass',
+        'src/venus/driver.rs',
+        """            if local && (!inside(d.src) || !inside(d.dst) || d.view_offset.unsigned_abs() >= 32) {""",
+        """            if local && d.view_offset.unsigned_abs() >= 32 {""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a view-local dependency may shift past every view',
+        'src/venus/driver.rs',
+        """            if local && (!inside(d.src) || !inside(d.dst) || d.view_offset.unsigned_abs() >= 32) {""",
+        """            if local && (!inside(d.src) || !inside(d.dst)) {""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a subpass may write more colour attachments than the device has',
+        'src/venus/driver.rs',
+        """        self.colors.iter().try_for_each(|&n| color_attachments_fit(facts, n))""",
+        """        Ok(())""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a depth-stencil resolve may go without a depth-stencil attachment',
+        'src/venus/driver.rs',
+        """            if resolve != ATTACHMENT_UNUSED && depth.is_none() {""",
+        """            if false {""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a depth-stencil resolve attachment is not counted',
+        'src/venus/driver.rs',
+        """                    .chain([resolve])
+""",
+        """                    .chain([ATTACHMENT_UNUSED])
+""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a shading rate attachment is not counted',
+        'src/venus/driver.rs',
+        """                    .chain(rate)
+""",
+        """                    .chain(None)
+""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a version 2 depth-stencil attachment is not counted',
+        'src/venus/driver.rs',
+        """                    .chain(depth)
+""",
+        """                    .chain(None)
+""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'chained views may cover fewer subpasses than the pass',
+        'src/venus/driver.rs',
+        """        if !covers(this.subpassCount, on.root.subpassCount)
+            || !covers(this.dependencyCount, on.root.dependencyCount)""",
+        """        if !covers(this.dependencyCount, on.root.dependencyCount)""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'chained view offsets may cover more dependencies than the pass',
+        'src/venus/driver.rs',
+        """        if !covers(this.subpassCount, on.root.subpassCount)
+            || !covers(this.dependencyCount, on.root.dependencyCount)""",
+        """        if !covers(this.subpassCount, on.root.subpassCount)""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a version 1 view offset is not read',
+        'src/venus/driver.rs',
+        """                view_offset: offsets.get(i).copied().unwrap_or(0),""",
+        """                view_offset: 0,""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'an input aspect may name any subpass',
+        'src/venus/driver.rs',
+        """        if !named.iter().all(fits) {""",
+        """        if false {""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'an input aspect may name any input attachment of its subpass',
+        'src/venus/driver.rs',
+        """                .is_some_and(|s| r.inputAttachmentIndex < s.inputAttachmentCount)""",
+        """                .is_some()""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a framebuffer may be larger than the device takes',
+        'src/venus/driver.rs',
+        """        if sizes.iter().any(|&(n, most)| n == 0 || n > most) {""",
+        """        if sizes.iter().any(|&(n, _)| n == 0) {""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a framebuffer may be of no size',
+        'src/venus/driver.rs',
+        """        if sizes.iter().any(|&(n, most)| n == 0 || n > most) {""",
+        """        if sizes.iter().any(|&(n, most)| n > most) {""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'an imageless framebuffer may describe other attachments than its pass',
+        'src/venus/driver.rs',
+        """        if this.attachmentCount != pass.attachments || described != pass.attachments {""",
+        """        if this.attachmentCount != pass.attachments {""",
+        'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a framebuffer may count other attachments than its pass',
+        'src/venus/driver.rs',
+        """        if this.attachmentCount != pass.attachments || described != pass.attachments {""",
+        """        if described != pass.attachments {""",
+        'a_render_pass_is_held_to_what_it_describes',
     ),
     (
         'a submit chained array is trusted by its count alone',

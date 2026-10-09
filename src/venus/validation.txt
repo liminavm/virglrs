@@ -185,7 +185,7 @@ vkCreateDescriptorUpdateTemplate                 reviewed
 vkCreateDevice                                   reviewed
 vkCreateEvent                                    reviewed
 vkCreateFence                                    reviewed
-vkCreateFramebuffer                              pending:render-passes
+vkCreateFramebuffer                              validated
 vkCreateGraphicsPipelines                        pending:pipelines
 vkCreateImage                                    validated
 vkCreateImageView                                validated
@@ -194,8 +194,8 @@ vkCreatePipelineCache                            reviewed
 vkCreatePipelineLayout                           validated
 vkCreateQueryPool                                validated
 vkCreateRayTracingPipelinesKHR                   pending:pipelines
-vkCreateRenderPass                               pending:render-passes
-vkCreateRenderPass2                              pending:render-passes
+vkCreateRenderPass                               validated
+vkCreateRenderPass2                              validated
 vkCreateRingMESA                                 reviewed
 vkCreateSampler                                  validated
 vkCreateSamplerYcbcrConversion                   reviewed

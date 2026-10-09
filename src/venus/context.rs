@@ -3128,13 +3128,20 @@ impl Commands for Handlers<'_> {
         ycbcrConversion
     );
 
-    simple_create!(
-        vkCreateRenderPass,
-        vn_command_vkCreateRenderPass,
-        pCreateInfo,
-        pRenderPass,
-        handle_pRenderPass_mut
-    );
+    /// Not [`simple_create`]: the pass is held to what it describes first, and recorded for the
+    /// framebuffers made for it.
+    fn vkCreateRenderPass(&mut self, args: &mut vn_command_vkCreateRenderPass<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        // As `vkCreatePipelineLayout`.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => self.driver.create_render_pass(args.device, info, args.pAllocator),
+        };
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateRenderPass", args.pRenderPass(), args.handle_pRenderPass_mut(), host);
+    }
     simple_destroy!(vkDestroyRenderPass, vn_command_vkDestroyRenderPass, renderPass);
 
     /// A descriptor update template, core in 1.1.
@@ -3174,28 +3181,43 @@ impl Commands for Handlers<'_> {
         );
     }
 
-    /// Not a [`simple_create`]: core in 1.2, so the entry point is the device's to have, and a
-    /// device without it answers a failed create rather than aborting the worker. The pass it
-    /// makes is an ordinary `VkRenderPass`, destroyed by `vkDestroyRenderPass` above.
+    /// [`Self::vkCreateRenderPass`], for the version 2 form. The pass it makes is an ordinary
+    /// `VkRenderPass`, destroyed by `vkDestroyRenderPass` above.
     fn vkCreateRenderPass2(&mut self, args: &mut vn_command_vkCreateRenderPass2<'_>) {
         let Some(info) = self.names(args.pCreateInfo) else { return };
-        let host = self.driver.create_object(
-            args.device,
-            |d| d.try_vkCreateRenderPass2(),
-            info,
-            args.pAllocator,
-        );
+        // As `vkCreatePipelineLayout`.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => self.driver.create_render_pass2(args.device, info, args.pAllocator),
+        };
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkCreateRenderPass2", args.pRenderPass(), args.handle_pRenderPass_mut(), host);
     }
 
-    simple_create!(
-        vkCreateFramebuffer,
-        vn_command_vkCreateFramebuffer,
-        pCreateInfo,
-        pFramebuffer,
-        handle_pFramebuffer_mut
-    );
+    fn vkCreateFramebuffer(&mut self, args: &mut vn_command_vkCreateFramebuffer<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        // As `vkCreatePipelineLayout`.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => self.driver.create_object(
+                args.device,
+                |d| Some(d.vkCreateFramebuffer()),
+                info,
+                args.pAllocator,
+            ),
+        };
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant(
+            "vkCreateFramebuffer",
+            args.pFramebuffer(),
+            args.handle_pFramebuffer_mut(),
+            host,
+        );
+    }
     simple_destroy!(vkDestroyFramebuffer, vn_command_vkDestroyFramebuffer, framebuffer);
 
     /// Not [`simple_create`]: what a layout lays out is recorded for the updates of its sets.

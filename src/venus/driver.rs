@@ -89,6 +89,13 @@ use super::proto::types::{
     VkVertexInputAttributeDescription2EXT, VkVertexInputBindingDescription2EXT, VkViewport,
     VkWriteDescriptorSet,
 };
+use super::proto::types::{
+    VkAttachmentReference, VkAttachmentReference2, VkDependencyFlagBits,
+    VkFragmentShadingRateAttachmentInfoKHR, VkFramebufferAttachmentsCreateInfo,
+    VkFramebufferCreateFlagBits, VkInputAttachmentAspectReference,
+    VkRenderPassInputAttachmentAspectCreateInfo, VkRenderPassMultiviewCreateInfo,
+    VkSubpassDescriptionDepthStencilResolve,
+};
 use super::proto::types::{VkBindBufferMemoryInfo, VkMemoryRequirements2};
 use super::proto::types::{
     VkBindImageMemoryDeviceGroupInfo, VkBindImageMemoryInfo, VkBindImagePlaneMemoryInfo,
@@ -343,6 +350,158 @@ impl LayoutFacts {
             })
             .map(|b| u64::from(b.count))
             .sum()
+    }
+}
+
+/// A reference to no attachment, which every slot of a subpass may hold.
+const ATTACHMENT_UNUSED: u32 = u32::MAX;
+/// The subpass a dependency names for what happens outside its render pass.
+const SUBPASS_EXTERNAL: u32 = u32::MAX;
+
+/// What a render pass is, as what is made with it is held to: how many attachments a framebuffer
+/// for it carries, and how many colour attachments each of its subpasses writes.
+#[derive(Debug)]
+pub struct RenderPassFacts {
+    attachments: u32,
+    colors: Vec<u32>,
+}
+
+/// One subpass of either form of render pass, as its check reads it.
+struct SubpassShape {
+    /// Every attachment it names, in every slot: `ATTACHMENT_UNUSED` for one it leaves empty.
+    named: Vec<u32>,
+    colors: u32,
+}
+
+/// One dependency of either form of render pass, as its check reads it.
+struct DependencyShape {
+    src: u32,
+    dst: u32,
+    flags: u32,
+    view_offset: i32,
+}
+
+impl RenderPassFacts {
+    /// A render pass of `attachments` attachments, `subpasses` and `dependencies` -- or why none
+    /// can be. The Mesa runtime, which KosmicKrisp's render passes are, looks up the attachments a
+    /// version 1 subpass names by index unchecked, and the subpasses a view-local dependency
+    /// names; it shifts a view mask by a view-local dependency's offset, which C leaves undefined
+    /// past the mask's 32 bits.
+    fn held(
+        attachments: u32,
+        subpasses: Vec<SubpassShape>,
+        dependencies: impl IntoIterator<Item = DependencyShape>,
+    ) -> Result<Self, &'static str> {
+        const VIEW_LOCAL: u32 = VkDependencyFlagBits::VK_DEPENDENCY_VIEW_LOCAL_BIT.0 as u32;
+        if subpasses
+            .iter()
+            .flat_map(|s| &s.named)
+            .any(|&a| a != ATTACHMENT_UNUSED && a >= attachments)
+        {
+            return Err("named an attachment its render pass does not describe");
+        }
+        let count = subpasses.len() as u64;
+        let inside = |s: u32| u64::from(s) < count;
+        for d in dependencies {
+            let fits = |s: u32| s == SUBPASS_EXTERNAL || inside(s);
+            if !fits(d.src) || !fits(d.dst) {
+                return Err("made a dependency on a subpass its render pass does not have");
+            }
+            let local = d.flags & VIEW_LOCAL != 0;
+            if local && (!inside(d.src) || !inside(d.dst) || d.view_offset.unsigned_abs() >= 32) {
+                return Err("made a view-local dependency outside its pass, or past every view");
+            }
+        }
+        Ok(RenderPassFacts { attachments, colors: subpasses.iter().map(|s| s.colors).collect() })
+    }
+
+    /// A render pass made from a version 1 create info, whose view offsets are chained.
+    fn of1<S>(info: cs::Decoded<'_, VkRenderPassCreateInfo, S>) -> Result<Self, &'static str> {
+        let offsets = chained::<VkRenderPassMultiviewCreateInfo, _>(info)
+            .map_or(&[][..], |m| regions_of(&m, m.dependencyCount, m.pViewOffsets));
+        let refs =
+            |n, p| regions_of(&info, n, p).iter().map(|r: &VkAttachmentReference| r.attachment);
+        let subpasses = regions_of(&info, info.subpassCount, info.pSubpasses)
+            .iter()
+            .map(|s| SubpassShape {
+                named: refs(s.inputAttachmentCount, s.pInputAttachments)
+                    .chain(refs(s.colorAttachmentCount, s.pColorAttachments))
+                    .chain(refs(s.colorAttachmentCount, s.pResolveAttachments))
+                    .chain(refs(1, s.pDepthStencilAttachment))
+                    .chain(
+                        regions_of(&info, s.preserveAttachmentCount, s.pPreserveAttachments)
+                            .iter()
+                            .copied(),
+                    )
+                    .collect(),
+                colors: s.colorAttachmentCount,
+            })
+            .collect();
+        let dependencies = regions_of(&info, info.dependencyCount, info.pDependencies)
+            .iter()
+            .enumerate()
+            .map(|(i, d)| DependencyShape {
+                src: d.srcSubpass,
+                dst: d.dstSubpass,
+                flags: d.dependencyFlags.0,
+                view_offset: offsets.get(i).copied().unwrap_or(0),
+            });
+        Self::held(info.attachmentCount, subpasses, dependencies)
+    }
+
+    /// A render pass made from a version 2 create info. A subpass's depth-stencil resolve and
+    /// shading rate attachments are chained to it; the runtime resolves into the depth-stencil
+    /// attachment it finds, following a null one when the subpass has none.
+    fn of2<S>(info: cs::Decoded<'_, VkRenderPassCreateInfo2, S>) -> Result<Self, &'static str> {
+        let refs =
+            |n, p| regions_of(&info, n, p).iter().map(|r: &VkAttachmentReference2| r.attachment);
+        let mut subpasses = Vec::new();
+        for s in regions_of(&info, info.subpassCount, info.pSubpasses) {
+            // SAFETY: the decoder allocated the subpasses, and all they point at, in the arena
+            // `info` borrows (see `Decoded::vouch`).
+            let subpass = unsafe { cs::Decoded::vouch(s) };
+            let depth = refs(1, s.pDepthStencilAttachment).find(|&a| a != ATTACHMENT_UNUSED);
+            let resolve = chained::<VkSubpassDescriptionDepthStencilResolve, _>(subpass)
+                .and_then(|r| refs(1, r.pDepthStencilResolveAttachment).next())
+                .unwrap_or(ATTACHMENT_UNUSED);
+            if resolve != ATTACHMENT_UNUSED && depth.is_none() {
+                return Err("resolved a depth-stencil attachment its subpass does not have");
+            }
+            let rate = chained::<VkFragmentShadingRateAttachmentInfoKHR, _>(subpass)
+                .and_then(|r| refs(1, r.pFragmentShadingRateAttachment).next());
+            subpasses.push(SubpassShape {
+                named: refs(s.inputAttachmentCount, s.pInputAttachments)
+                    .chain(refs(s.colorAttachmentCount, s.pColorAttachments))
+                    .chain(refs(s.colorAttachmentCount, s.pResolveAttachments))
+                    .chain(depth)
+                    .chain([resolve])
+                    .chain(rate)
+                    .chain(
+                        regions_of(&info, s.preserveAttachmentCount, s.pPreserveAttachments)
+                            .iter()
+                            .copied(),
+                    )
+                    .collect(),
+                colors: s.colorAttachmentCount,
+            });
+        }
+        let dependencies =
+            regions_of(&info, info.dependencyCount, info.pDependencies).iter().map(|d| {
+                DependencyShape {
+                    src: d.srcSubpass,
+                    dst: d.dstSubpass,
+                    flags: d.dependencyFlags.0,
+                    view_offset: d.viewOffset,
+                }
+            });
+        Self::held(info.attachmentCount, subpasses, dependencies)
+    }
+
+    /// Whether each subpass writes no more colour attachments than the device has: the runtime
+    /// copies a subpass's into an array of eight, and KosmicKrisp begins rendering into one of
+    /// `maxColorAttachments`.
+    fn colors_fit(&self, facts: &DeviceFacts<'_>) -> Result<(), &'static str> {
+        self.colors.iter().try_for_each(|&n| color_attachments_fit(facts, n))
     }
 }
 
@@ -838,6 +997,9 @@ fn planted_limits() -> VkPhysicalDeviceLimits {
         maxPushConstantsSize: 256,
         maxViewports: 16,
         maxColorAttachments: 8,
+        maxFramebufferWidth: 16384,
+        maxFramebufferHeight: 16384,
+        maxFramebufferLayers: 2048,
         maxVertexInputBindings: 32,
         maxVertexInputAttributes: 32,
         maxVertexInputBindingStride: 2048,
@@ -950,6 +1112,8 @@ pub struct Driver {
     set_layouts: BTreeMap<VkDescriptorSetLayout, Arc<LayoutFacts>>,
     /// What each pipeline layout lays out, keyed and kept as `set_layouts` is.
     pipeline_layouts: BTreeMap<VkPipelineLayout, Arc<PipelineLayoutFacts>>,
+    /// What each render pass is, keyed and kept as `set_layouts` is.
+    render_passes: BTreeMap<VkRenderPass, Arc<RenderPassFacts>>,
     /// What each query pool answers with, for the read-back that has to fit the room the guest
     /// offered. Keyed by host handle for the same reason as `images`, and kept honest the same
     /// way: the record dies at both places the pool does, so a recycled handle finds no record
@@ -2743,6 +2907,7 @@ impl Driver {
             images: BTreeMap::new(),
             set_layouts: BTreeMap::new(),
             pipeline_layouts: BTreeMap::new(),
+            render_passes: BTreeMap::new(),
             query_pools: BTreeMap::new(),
             buffers: BTreeMap::new(),
             semaphores: BTreeMap::new(),
@@ -4084,6 +4249,7 @@ impl Driver {
             pools: &self.pools,
             set_layouts: &self.set_layouts,
             pipeline_layouts: &self.pipeline_layouts,
+            render_passes: &self.render_passes,
         }
     }
 
@@ -4531,6 +4697,9 @@ impl Driver {
             }
             VkObjectType::VK_OBJECT_TYPE_PIPELINE_LAYOUT => {
                 self.pipeline_layouts.remove(&VkPipelineLayout::from_host(handle));
+            }
+            VkObjectType::VK_OBJECT_TYPE_RENDER_PASS => {
+                self.render_passes.remove(&VkRenderPass::from_host(handle));
             }
             VkObjectType::VK_OBJECT_TYPE_BUFFER => {
                 self.buffers.remove(&VkBuffer::from_host(handle));
@@ -5538,6 +5707,42 @@ impl Driver {
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkBufferView, VkResult> {
         self.create_object(device, |d| Some(d.vkCreateBufferView()), info, alloc)
+    }
+
+    /// Create a render pass, and record what it is for the framebuffers made for it.
+    pub fn create_render_pass(
+        &mut self,
+        device: VkDevice,
+        info: cs::Decoded<'_, VkRenderPassCreateInfo, cs::Checked>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+    ) -> Result<VkRenderPass, VkResult> {
+        let facts = RenderPassFacts::of1(info).expect("its check held it");
+        let host = self.create_object(device, |d| Some(d.vkCreateRenderPass()), info, alloc);
+        self.record_pass(host, facts)
+    }
+
+    /// [`Driver::create_render_pass`], for the version 2 form. Core in 1.2, so the entry point is
+    /// the device's to have, and a device without it answers a failed create.
+    pub fn create_render_pass2(
+        &mut self,
+        device: VkDevice,
+        info: cs::Decoded<'_, VkRenderPassCreateInfo2, cs::Checked>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+    ) -> Result<VkRenderPass, VkResult> {
+        let facts = RenderPassFacts::of2(info).expect("its check held it");
+        let host = self.create_object(device, |d| d.try_vkCreateRenderPass2(), info, alloc);
+        self.record_pass(host, facts)
+    }
+
+    fn record_pass(
+        &mut self,
+        host: Result<VkRenderPass, VkResult>,
+        facts: RenderPassFacts,
+    ) -> Result<VkRenderPass, VkResult> {
+        if let Ok(pass) = host {
+            self.render_passes.insert(pass, Arc::new(facts));
+        }
+        host
     }
 
     /// Create a pipeline layout, and record what it lays out for the binds and pushes made
@@ -11508,6 +11713,105 @@ impl cs::Validate<cs::Chained<'_, VkImageCreateInfo, DeviceFacts<'_>>>
     }
 }
 
+impl cs::Validate<DeviceFacts<'_>> for VkRenderPassCreateInfo {
+    /// See [`RenderPassFacts::held`].
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        RenderPassFacts::of1(this)?.colors_fit(facts)
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkRenderPassCreateInfo2 {
+    /// See [`RenderPassFacts::held`] and [`RenderPassFacts::of2`].
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        RenderPassFacts::of2(this)?.colors_fit(facts)
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkRenderPassCreateInfo, DeviceFacts<'_>>>
+    for VkRenderPassMultiviewCreateInfo
+{
+    /// The runtime reads a view mask for every subpass and a view offset for every dependency of
+    /// the pass, past the end of a shorter array: so each is none, or one for each.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkRenderPassCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let covers = |n: u32, of: u32| n == 0 || n == of;
+        if !covers(this.subpassCount, on.root.subpassCount)
+            || !covers(this.dependencyCount, on.root.dependencyCount)
+        {
+            return Err("gave views for another number of subpasses or dependencies than its pass");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkRenderPassCreateInfo, DeviceFacts<'_>>>
+    for VkRenderPassInputAttachmentAspectCreateInfo
+{
+    /// The runtime writes each aspect into the input attachment it names, by subpass and index,
+    /// unchecked.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkRenderPassCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let subpasses = regions_of(&on.root, on.root.subpassCount, on.root.pSubpasses);
+        let named = regions_of(&this, this.aspectReferenceCount, this.pAspectReferences);
+        let fits = |r: &VkInputAttachmentAspectReference| {
+            subpasses
+                .get(r.subpass as usize)
+                .is_some_and(|s| r.inputAttachmentIndex < s.inputAttachmentCount)
+        };
+        if !named.iter().all(fits) {
+            return Err("gave an aspect to an input attachment its pass does not have");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkFramebufferCreateInfo {
+    /// A framebuffer of the device's size or less, carrying the attachments its render pass
+    /// describes -- an imageless one describing that many as well.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        const IMAGELESS: u32 =
+            VkFramebufferCreateFlagBits::VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT.0 as u32;
+        let pass = facts
+            .facts
+            .render_passes
+            .get(&this.renderPass)
+            .ok_or("made a framebuffer for a render pass this renderer has no record of")?;
+        let l = facts.limits;
+        let sizes = [
+            (this.width, l.maxFramebufferWidth),
+            (this.height, l.maxFramebufferHeight),
+            (this.layers, l.maxFramebufferLayers),
+        ];
+        if sizes.iter().any(|&(n, most)| n == 0 || n > most) {
+            return Err("made a framebuffer of no size, or larger than the device's");
+        }
+        let described = if this.flags.0 & IMAGELESS != 0 {
+            chained::<VkFramebufferAttachmentsCreateInfo, _>(this)
+                .ok_or("made an imageless framebuffer without describing its attachments")?
+                .attachmentImageInfoCount
+        } else {
+            this.attachmentCount
+        };
+        if this.attachmentCount != pass.attachments || described != pass.attachments {
+            return Err("made a framebuffer with other attachments than its render pass");
+        }
+        Ok(())
+    }
+}
+
 impl cs::Validate<DeviceFacts<'_>> for VkSamplerCreateInfo {
     /// A custom border colour comes with the struct that says what it is: the runtime's
     /// `vk_sampler_border_color_value`, which panvk calls, follows the struct without checking it
@@ -12593,6 +12897,7 @@ pub struct Facts<'d> {
     pools: &'d Pools,
     set_layouts: &'d BTreeMap<VkDescriptorSetLayout, Arc<LayoutFacts>>,
     pipeline_layouts: &'d BTreeMap<VkPipelineLayout, Arc<PipelineLayoutFacts>>,
+    render_passes: &'d BTreeMap<VkRenderPass, Arc<RenderPassFacts>>,
 }
 
 /// [`Facts`], with the limits of the one device a command records or runs on. A check that holds
@@ -12714,13 +13019,10 @@ forwarded_unchecked!(
     VkDescriptorUpdateTemplateCreateInfo,
     VkEventCreateInfo,
     VkFenceCreateInfo,
-    VkFramebufferCreateInfo,
     // Checked at `create_image`, which forwards the host's rewrite of it: see
     // `external_images_are_linear`.
     VkImageCreateInfo,
     VkPipelineCacheCreateInfo,
-    VkRenderPassCreateInfo,
-    VkRenderPassCreateInfo2,
     VkSamplerYcbcrConversionCreateInfo,
     VkSemaphoreCreateInfo,
     VkShaderModuleCreateInfo,
@@ -12968,6 +13270,9 @@ needs_no_check!(
     VkBindImageMemoryDeviceGroupInfo,
     // A result the driver writes into a slot the decoder allocated for it.
     VkBindMemoryStatus,
+    // An imageless framebuffer's attachments, counted against its render pass by the
+    // framebuffer's own check.
+    VkFramebufferAttachmentsCreateInfo,
     // Mutable type lists, held with the bindings or pool sizes they belong to.
     VkMutableDescriptorTypeCreateInfoEXT,
     // How many inline blocks a pool holds, a count.
@@ -13101,6 +13406,34 @@ unsafe impl InStruct for VkWriteDescriptorSetAccelerationStructureKHR {
 unsafe impl InStruct for VkSamplerCustomBorderColorCreateInfoEXT {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkRenderPassMultiviewCreateInfo {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkSubpassDescriptionDepthStencilResolve {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkFragmentShadingRateAttachmentInfoKHR {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkFramebufferAttachmentsCreateInfo {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -14558,6 +14891,205 @@ mod tests {
         assert!(alloc(&[9, 2], 2).is_err(), "more than its binding holds");
         assert!(alloc(&[1], 2).is_err(), "counts for another number of sets");
 
+        d.abandon_planted();
+    }
+
+    /// A render pass names only attachments and subpasses it describes, writes no more colour
+    /// attachments than the device has, and keeps view-local dependencies inside it; its chained
+    /// views and aspects are sized by it; a framebuffer carries what its pass describes.
+    #[test]
+    fn a_render_pass_is_held_to_what_it_describes() {
+        use crate::venus::proto::types::{
+            VkDependencyFlags, VkFramebufferCreateFlags, VkSubpassDependency, VkSubpassDependency2,
+            VkSubpassDescription, VkSubpassDescription2,
+        };
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const PASS: VkRenderPass = VkRenderPass::forged(0x900);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        let unused = ATTACHMENT_UNUSED;
+        let local = VkDependencyFlags(VkDependencyFlagBits::VK_DEPENDENCY_VIEW_LOCAL_BIT.0 as u32);
+        let r1 = |a| VkAttachmentReference { attachment: a, ..Default::default() };
+        let r2 = |a| VkAttachmentReference2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+            attachment: a,
+            ..Default::default()
+        };
+        {
+            let facts = d.device_facts(DEVICE).expect("a planted device");
+            let held1 = |colors: &[VkAttachmentReference],
+                         deps: &[VkSubpassDependency],
+                         next: *const core::ffi::c_void| {
+                let depth = r1(1);
+                let subpasses = [
+                    VkSubpassDescription {
+                        colorAttachmentCount: colors.len() as u32,
+                        pColorAttachments: colors.as_ptr(),
+                        pDepthStencilAttachment: &depth,
+                        ..Default::default()
+                    },
+                    VkSubpassDescription {
+                        inputAttachmentCount: 1,
+                        pInputAttachments: &depth,
+                        ..Default::default()
+                    },
+                ];
+                let info = VkRenderPassCreateInfo {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+                    pNext: next,
+                    attachmentCount: 2,
+                    subpassCount: 2,
+                    pSubpasses: subpasses.as_ptr(),
+                    dependencyCount: deps.len() as u32,
+                    pDependencies: deps.as_ptr(),
+                    ..Default::default()
+                };
+                cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+            };
+            let none = core::ptr::null();
+            let dep = |src, dst, flags| VkSubpassDependency {
+                srcSubpass: src,
+                dstSubpass: dst,
+                dependencyFlags: flags,
+                ..Default::default()
+            };
+            assert_eq!(held1(&[r1(0), r1(unused)], &[dep(0, 1, local)], none), Ok(()));
+            assert!(held1(&[r1(2)], &[], none).is_err(), "an attachment past the pass's");
+            assert!(held1(&[r1(0); 9], &[], none).is_err(), "more colours than the device has");
+            assert_eq!(held1(&[], &[dep(SUBPASS_EXTERNAL, 1, VkDependencyFlags(0))], none), Ok(()));
+            assert!(
+                held1(&[], &[dep(0, 2, VkDependencyFlags(0))], none).is_err(),
+                "a subpass past"
+            );
+            assert!(
+                held1(&[], &[dep(SUBPASS_EXTERNAL, 1, local)], none).is_err(),
+                "view-local out"
+            );
+
+            static MASKS: [u32; 2] = [1, 1];
+            let multiview = |subpasses: u32, offsets: &[i32]| VkRenderPassMultiviewCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO,
+                subpassCount: subpasses,
+                pViewMasks: MASKS.as_ptr(),
+                dependencyCount: offsets.len() as u32,
+                pViewOffsets: offsets.as_ptr(),
+                ..Default::default()
+            };
+            let viewed = |m: &VkRenderPassMultiviewCreateInfo| {
+                held1(&[], &[dep(0, 1, local)], (&raw const *m).cast())
+            };
+            assert_eq!(viewed(&multiview(2, &[1])), Ok(()));
+            assert_eq!(viewed(&multiview(0, &[])), Ok(()), "views for none");
+            assert!(viewed(&multiview(1, &[1])).is_err(), "views for fewer subpasses");
+            assert!(viewed(&multiview(2, &[1, 1])).is_err(), "offsets for more dependencies");
+            assert!(viewed(&multiview(2, &[32])).is_err(), "an offset past every view");
+
+            let aspects = |subpass, index| {
+                let reference = VkInputAttachmentAspectReference {
+                    subpass,
+                    inputAttachmentIndex: index,
+                    ..Default::default()
+                };
+                let chain = VkRenderPassInputAttachmentAspectCreateInfo {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO,
+                    aspectReferenceCount: 1,
+                    pAspectReferences: &reference,
+                    ..Default::default()
+                };
+                held1(&[], &[], (&raw const chain).cast())
+            };
+            assert_eq!(aspects(1, 0), Ok(()));
+            assert!(aspects(0, 0).is_err(), "a subpass with no input attachments");
+            assert!(aspects(2, 0).is_err(), "a subpass past the pass's");
+
+            let held2 = |depth: u32, resolve: u32, rate: u32, offset: i32| {
+                let (depth, resolve, rate) = (r2(depth), r2(resolve), r2(rate));
+                let shading = VkFragmentShadingRateAttachmentInfoKHR {
+                    sType:
+                        VkStructureType::VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR,
+                    pFragmentShadingRateAttachment: &rate,
+                    ..Default::default()
+                };
+                let resolving = VkSubpassDescriptionDepthStencilResolve {
+                    sType:
+                        VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE,
+                    pNext: (&raw const shading).cast(),
+                    pDepthStencilResolveAttachment: &resolve,
+                    ..Default::default()
+                };
+                let subpasses = [VkSubpassDescription2 {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+                    pNext: (&raw const resolving).cast(),
+                    pDepthStencilAttachment: &depth,
+                    ..Default::default()
+                }; 2];
+                let deps = [VkSubpassDependency2 {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+                    srcSubpass: 0,
+                    dstSubpass: 1,
+                    dependencyFlags: local,
+                    viewOffset: offset,
+                    ..Default::default()
+                }];
+                let info = VkRenderPassCreateInfo2 {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,
+                    attachmentCount: 3,
+                    subpassCount: 2,
+                    pSubpasses: subpasses.as_ptr(),
+                    dependencyCount: 1,
+                    pDependencies: deps.as_ptr(),
+                    ..Default::default()
+                };
+                cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+            };
+            assert_eq!(held2(0, 1, 2, -31), Ok(()));
+            assert_eq!(held2(unused, unused, unused, 0), Ok(()), "every slot left empty");
+            assert!(held2(unused, 1, unused, 0).is_err(), "a resolve with no depth-stencil");
+            assert!(held2(0, 3, unused, 0).is_err(), "a resolve past the pass's");
+            assert!(held2(0, unused, 3, 0).is_err(), "a shading rate attachment past it");
+            assert!(held2(3, unused, unused, 0).is_err(), "a depth-stencil past it");
+            assert!(held2(0, unused, unused, -32).is_err(), "an offset past every view");
+        }
+
+        let pass = RenderPassFacts::held(2, Vec::new(), []).expect("a pass");
+        d.render_passes.insert(PASS, Arc::new(pass));
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let views = [VkImageView::forged(0xa00), VkImageView::forged(0xa01)];
+        let framebuffer = |pass, count: u32, width, layers| VkFramebufferCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            renderPass: pass,
+            attachmentCount: count,
+            pAttachments: views.as_ptr(),
+            width,
+            height: 64,
+            layers,
+            ..Default::default()
+        };
+        let made = |info: &VkFramebufferCreateInfo| {
+            cs::Decoded::planted(info).validate(&facts).map(|_| ())
+        };
+        assert_eq!(made(&framebuffer(PASS, 2, 64, 1)), Ok(()));
+        assert!(made(&framebuffer(PASS, 1, 64, 1)).is_err(), "fewer attachments than its pass");
+        assert!(made(&framebuffer(VkRenderPass::forged(0x9ff), 2, 64, 1)).is_err(), "no pass");
+        assert!(made(&framebuffer(PASS, 2, 0, 1)).is_err(), "no width");
+        assert!(made(&framebuffer(PASS, 2, 16385, 1)).is_err(), "wider than the device's");
+        assert!(made(&framebuffer(PASS, 2, 64, 2049)).is_err(), "more layers than the device's");
+        let imageless = |count, carried| {
+            let chain = VkFramebufferAttachmentsCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO,
+                attachmentImageInfoCount: count,
+                ..Default::default()
+            };
+            let mut info = framebuffer(PASS, carried, 64, 1);
+            info.flags = VkFramebufferCreateFlags(
+                VkFramebufferCreateFlagBits::VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT.0 as u32,
+            );
+            info.pNext = (&raw const chain).cast();
+            made(&info)
+        };
+        assert_eq!(imageless(2, 2), Ok(()));
+        assert!(imageless(1, 2).is_err(), "an imageless framebuffer describing fewer");
+        assert!(imageless(2, 1).is_err(), "an imageless framebuffer counting fewer");
         d.abandon_planted();
     }
 
