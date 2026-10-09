@@ -4113,6 +4113,9 @@ impl Commands for Handlers<'_> {
     ) {
         let pd = args.physicalDevice;
         let Some(info) = self.names(args.pImageFormatInfo) else { return };
+        if let Err(why) = driver::names_its_modifier(info) {
+            return self.reject(why);
+        }
         let Some(out) = self.fills(args.pImageFormatProperties_mut()) else { return };
         args.ret = self.driver.image_format_properties2(pd, info, out).unwrap_or_else(|e| e);
     }
@@ -4516,6 +4519,11 @@ impl Commands for Handlers<'_> {
         let pd = args.physicalDevice;
         let (format, ty, tiling) = (args.format, args.r#type, args.tiling);
         let (usage, flags) = (args.usage, args.flags);
+        // This form carries no chain, so it cannot name a modifier, and the Mesa runtime answers it
+        // by asking the second form with none -- which anv then dereferences.
+        if tiling == super::proto::types::VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT {
+            return self.reject("asked about drm modifier tiling in a query that cannot name one");
+        }
         let Some(out) = self.fills(args.pImageFormatProperties_mut()) else { return };
         let r =
             self.driver.image_format_properties(pd, format, ty, tiling, usage, flags, out, |i| {
@@ -4844,6 +4852,11 @@ impl Commands for Handlers<'_> {
         let pd = args.physicalDevice;
         let (format, ty, samples) = (args.format, args.r#type, args.samples);
         let (usage, tiling) = (args.usage, args.tiling);
+        // A sparse image is never DRM-modifier tiled, and anv answers this by asking its image
+        // query with no modifier named, which it then dereferences.
+        if tiling == super::proto::types::VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT {
+            return self.reject("asked about sparse drm modifier tiling");
+        }
         if !self.counted(args.has_pPropertyCount()) {
             return;
         }
@@ -4881,6 +4894,12 @@ impl Commands for Handlers<'_> {
             self.reject("asked which formats are sparse without naming one");
             return;
         };
+        // As the first form.
+        if info.tiling
+            == super::proto::types::VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+        {
+            return self.reject("asked about sparse drm modifier tiling");
+        }
         if !self.counted(args.has_pPropertyCount()) {
             return;
         }
@@ -4967,6 +4986,10 @@ impl Commands for Handlers<'_> {
             self.reject("asked an unbuilt image's sparse requirements without describing it");
             return;
         };
+        // As `vkGetDeviceImageMemoryRequirements`: the image it describes is held to the device.
+        if self.refused_on(device, info) {
+            return;
+        }
         if !self.counted(args.has_pSparseMemoryRequirementCount()) {
             return;
         }
@@ -9761,6 +9784,108 @@ mod tests {
         assert_eq!(
             run!(|h: &mut Handlers| h.vkGetPhysicalDeviceQueueFamilyProperties(&mut args)),
             Some(MISSING)
+        );
+    }
+
+    /// A format query about DRM-modifier tiling names its modifier, and the forms that cannot
+    /// name one, and the sparse forms, are refused before anything is asked.
+    #[test]
+    fn a_drm_modifier_query_names_its_modifier() {
+        use super::super::proto::types::VkStructureType;
+        use super::super::proto::types::{
+            VkImageTiling, VkPhysicalDeviceImageDrmFormatModifierInfoEXT,
+            VkPhysicalDeviceImageFormatInfo2, VkPhysicalDeviceSparseImageFormatInfo2,
+            vn_command_vkGetPhysicalDeviceImageFormatProperties,
+            vn_command_vkGetPhysicalDeviceImageFormatProperties2,
+            vn_command_vkGetPhysicalDeviceSparseImageFormatProperties,
+            vn_command_vkGetPhysicalDeviceSparseImageFormatProperties2,
+        };
+
+        const DRM: VkImageTiling = VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let t = ring_table();
+
+        macro_rules! run {
+            ($call:expr) => {{
+                let mut rings = BTreeMap::new();
+                let mut ctx_reply = None;
+                let mut monitor = None;
+                let mut jrnl = Journal::new();
+                let mut h = Handlers {
+                    objects: &objects,
+                    todo: &todo,
+                    driver: &mut driver,
+                    global: &global,
+                    ctx: ContextId::new(1).expect("1 is not zero"),
+                    ask: None,
+                    resources: &t,
+                    rings: &mut rings,
+                    monitor: &mut monitor,
+                    replaying: false,
+                    depth: 0,
+                    answer: None,
+                    own_wait: None,
+                    current_ring: None,
+                    reply: &mut ctx_reply,
+                    note: None,
+                    journal: &mut jrnl,
+                };
+                #[allow(clippy::redundant_closure_call)]
+                (|h: &mut Handlers| $call(h))(&mut h);
+                h.rejected()
+            }};
+        }
+
+        let bare = VkPhysicalDeviceImageFormatInfo2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+            tiling: DRM,
+            ..Default::default()
+        };
+        let mut args = vn_command_vkGetPhysicalDeviceImageFormatProperties2::default();
+        args.pImageFormatInfo = Some(Decoded::planted(&bare));
+        assert_eq!(
+            run!(|h: &mut Handlers| h.vkGetPhysicalDeviceImageFormatProperties2(&mut args)),
+            Some("asked about drm modifier tiling without naming the modifier")
+        );
+        assert_eq!(args.ret, VkResult::default(), "no verdict for a call never made");
+
+        // Named, the rule lets it through to the driver -- which this one does not have.
+        let modifier = VkPhysicalDeviceImageDrmFormatModifierInfoEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+            ..Default::default()
+        };
+        let named =
+            VkPhysicalDeviceImageFormatInfo2 { pNext: (&raw const modifier).cast(), ..bare };
+        assert!(driver::names_its_modifier(Decoded::planted(&named)).is_ok());
+
+        let mut args = vn_command_vkGetPhysicalDeviceImageFormatProperties::default();
+        args.tiling = DRM;
+        assert_eq!(
+            run!(|h: &mut Handlers| h.vkGetPhysicalDeviceImageFormatProperties(&mut args)),
+            Some("asked about drm modifier tiling in a query that cannot name one")
+        );
+
+        let mut args = vn_command_vkGetPhysicalDeviceSparseImageFormatProperties::default();
+        args.tiling = DRM;
+        assert_eq!(
+            run!(|h: &mut Handlers| h.vkGetPhysicalDeviceSparseImageFormatProperties(&mut args)),
+            Some("asked about sparse drm modifier tiling")
+        );
+
+        let sparse = VkPhysicalDeviceSparseImageFormatInfo2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_INFO_2,
+            tiling: DRM,
+            ..Default::default()
+        };
+        let mut args = vn_command_vkGetPhysicalDeviceSparseImageFormatProperties2::default();
+        args.pFormatInfo = Some(Decoded::planted(&sparse));
+        assert_eq!(
+            run!(|h: &mut Handlers| h.vkGetPhysicalDeviceSparseImageFormatProperties2(&mut args)),
+            Some("asked about sparse drm modifier tiling")
         );
     }
 

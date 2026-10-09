@@ -249,7 +249,7 @@ vkGetDeviceAccelerationStructureCompatibilityKHR reviewed
 vkGetDeviceBufferMemoryRequirements              reviewed
 vkGetDeviceGroupPeerMemoryFeatures               reviewed
 vkGetDeviceImageMemoryRequirements               validated
-vkGetDeviceImageSparseMemoryRequirements         reviewed
+vkGetDeviceImageSparseMemoryRequirements         validated
 vkGetDeviceImageSubresourceLayout                validated
 vkGetDeviceMemoryCommitment                      reviewed
 vkGetDeviceMemoryOpaqueCaptureAddress            reviewed
@@ -274,8 +274,8 @@ vkGetPhysicalDeviceFeatures2                     reviewed
 vkGetPhysicalDeviceFormatProperties              reviewed
 vkGetPhysicalDeviceFormatProperties2             reviewed
 vkGetPhysicalDeviceFragmentShadingRatesKHR       reviewed
-vkGetPhysicalDeviceImageFormatProperties         reviewed
-vkGetPhysicalDeviceImageFormatProperties2        reviewed
+vkGetPhysicalDeviceImageFormatProperties         validated
+vkGetPhysicalDeviceImageFormatProperties2        validated
 vkGetPhysicalDeviceMemoryProperties              reviewed
 vkGetPhysicalDeviceMemoryProperties2             reviewed
 vkGetPhysicalDeviceMultisamplePropertiesEXT      reviewed
@@ -283,8 +283,8 @@ vkGetPhysicalDeviceProperties                    reviewed
 vkGetPhysicalDeviceProperties2                   reviewed
 vkGetPhysicalDeviceQueueFamilyProperties         reviewed
 vkGetPhysicalDeviceQueueFamilyProperties2        reviewed
-vkGetPhysicalDeviceSparseImageFormatProperties   reviewed
-vkGetPhysicalDeviceSparseImageFormatProperties2  reviewed
+vkGetPhysicalDeviceSparseImageFormatProperties   validated
+vkGetPhysicalDeviceSparseImageFormatProperties2  validated
 vkGetPhysicalDeviceToolProperties                reviewed
 vkGetPipelineCacheData                           reviewed
 vkGetQueryPoolResults                            reviewed

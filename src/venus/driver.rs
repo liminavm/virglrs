@@ -145,7 +145,7 @@ use super::proto::types::{
 };
 use super::proto::types::{
     VkDeviceQueueCreateInfo, VkMemoryAllocateFlagsInfo, VkMemoryOpaqueCaptureAddressAllocateInfo,
-    VkQueueFamilyProperties,
+    VkPhysicalDeviceImageDrmFormatModifierInfoEXT, VkQueueFamilyProperties,
 };
 use super::proto::types::{
     VkDrmFormatModifierPropertiesEXT, VkDrmFormatModifierPropertiesListEXT, VkFormatProperties2,
@@ -2572,6 +2572,19 @@ fn queue_requests_fit(
         if std::mem::replace(&mut named[i], true) {
             return Err("created a device naming one queue family twice");
         }
+    }
+    Ok(())
+}
+
+/// Whether a format query asks about DRM-modifier tiling without saying which modifier: anv
+/// reads the modifier out of a chained `VkPhysicalDeviceImageDrmFormatModifierInfoEXT` it never
+/// checks is there.
+pub fn names_its_modifier(
+    info: cs::Decoded<'_, VkPhysicalDeviceImageFormatInfo2>,
+) -> Result<(), &'static str> {
+    let drm = info.tiling == VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+    if drm && chained::<VkPhysicalDeviceImageDrmFormatModifierInfoEXT, _>(info).is_none() {
+        return Err("asked about drm modifier tiling without naming the modifier");
     }
     Ok(())
 }
@@ -14540,6 +14553,13 @@ unsafe impl InStruct for VkShaderModuleCreateInfo {
 unsafe impl InStruct for VkPipelineLibraryCreateInfoKHR {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkPhysicalDeviceImageDrmFormatModifierInfoEXT {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the

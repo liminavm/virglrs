@@ -5492,6 +5492,40 @@ SABOTAGES = [
         'a_device_asks_only_for_queues_it_has',
     ),
     (
+        'a drm modifier format query may name no modifier',
+        'src/venus/driver.rs',
+        """    if drm && chained::<VkPhysicalDeviceImageDrmFormatModifierInfoEXT, _>(info).is_none() {""",
+        """    if drm && false {""",
+        'a_drm_modifier_query_names_its_modifier',
+    ),
+    (
+        'the chainless format query may ask about drm modifier tiling',
+        'src/venus/context.rs',
+        """        if tiling == super::proto::types::VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT {
+            return self.reject("asked about drm modifier tiling in a query that cannot name one");""",
+        """        if false {
+            return self.reject("asked about drm modifier tiling in a query that cannot name one");""",
+        'a_drm_modifier_query_names_its_modifier',
+    ),
+    (
+        'the sparse format query may ask about drm modifier tiling',
+        'src/venus/context.rs',
+        """        if tiling == super::proto::types::VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT {
+            return self.reject("asked about sparse drm modifier tiling");""",
+        """        if false {
+            return self.reject("asked about sparse drm modifier tiling");""",
+        'a_drm_modifier_query_names_its_modifier',
+    ),
+    (
+        'the second sparse format query may ask about drm modifier tiling',
+        'src/venus/context.rs',
+        """        if info.tiling
+            == super::proto::types::VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+        {""",
+        """        if false {""",
+        'a_drm_modifier_query_names_its_modifier',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",
