@@ -12,7 +12,7 @@
 # against. An entry with `generated` is not hosted at all — the script reproduces it byte for
 # byte, so fetching it is running that script.
 
-tag = "corpora-2026-09-08"
+tag = "corpora-2026-10-09"
 base = "https://github.com/liminavm/virglrs/releases/download"
 
 [[corpus]]
@@ -158,3 +158,9 @@ name = "venus.vkrc"
 sha256 = "2a38340924c1d89da52211bfbc81e7e83b0df40eaa17b438c2b1b79961553cf3"
 size = 60874924
 asset = "venus.vkrc.zst"
+
+[[corpus]]
+name = "vkd3d.vkrc"
+sha256 = "184110fa890807352c3cf08c29bb2c0f8704a64612d0a0d1ecefdbba260638af"
+size = 5320596
+asset = "vkd3d.vkrc.zst"
