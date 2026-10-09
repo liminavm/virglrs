@@ -113,6 +113,18 @@ impl ${ty.name} {
     bits = RUST.bits_of(ty)
 %>\
 ${newtype(ty.name, repr)}\
+impl ${ty.name} {
+    /// Whether every bit set is one vk.xml defines for this mask. A driver indexes tables and
+    /// switches by these bits, so the decoder refuses a value with any other bit set.
+    pub const fn is_defined(self) -> bool {
+%   if RUST.bitmask_defined(ty):
+        self.0 & !${'%#x' % RUST.bitmask_defined(ty)} == 0
+%   else:
+        self.0 == 0
+%   endif
+    }
+}
+
 %   if bits:
 <%
     ## The bits of a VkFlags64 mask are already 64-bit, so the cast would be a no-op.

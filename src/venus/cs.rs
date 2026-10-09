@@ -1979,6 +1979,49 @@ mod tests {
         assert!(!bind(VkIndexType(-1)), "nor a negative one");
     }
 
+    /// A bitmask with a bit set that vk.xml does not define poisons the stream at the decode, as
+    /// an undefined enum value does. anv indexes a four-entry table by the cull mode and
+    /// KosmicKrisp switches on it with an `UNREACHABLE` default. A mask reserved for future use
+    /// takes only zero.
+    #[test]
+    fn a_bitmask_bit_the_registry_does_not_define_poisons_the_stream() {
+        use crate::venus::proto::serialize::{
+            vn_decode_vkCmdSetCullMode_args_temp, vn_encode_vkCmdSetCullMode_args,
+        };
+        use crate::venus::proto::types::{
+            VkCommandBuffer, VkCommandTypeEXT, VkCullModeFlags, VkDeviceCreateFlags, VkFlags,
+            vn_command_vkCmdSetCullMode,
+        };
+        let cull = |mode: VkCullModeFlags| {
+            let sent = vn_command_vkCmdSetCullMode {
+                commandBuffer: VkCommandBuffer::forged(1),
+                cullMode: mode,
+                ..Default::default()
+            };
+            let mut wire = Vec::new();
+            vn_encode_vkCmdSetCullMode_args(
+                &mut Encoder::growing(&mut wire, &AllOfIt),
+                VkFlags(0),
+                &sent,
+            );
+            let (temp, hard) = (Bump::new(), AtomicBool::new(false));
+            let mut dec = Decoder::new(&wire, &temp, &IdentityObjects, &hard);
+            let _ = dec.decode_scalar::<VkCommandTypeEXT>();
+            let _ = dec.decode_scalar::<VkFlags>();
+            vn_decode_vkCmdSetCullMode_args_temp(
+                &mut dec,
+                &mut vn_command_vkCmdSetCullMode::default(),
+            );
+            !dec.fatal()
+        };
+        assert!(cull(VkCullModeFlags(0)), "no bits");
+        assert!(cull(VkCullModeFlags(3)), "both defined bits");
+        assert!(!cull(VkCullModeFlags(4)), "a bit no extension defines");
+        assert!(!cull(VkCullModeFlags(0x8000_0001)), "nor a high one beside a defined one");
+        assert!(VkDeviceCreateFlags(0).is_defined(), "a reserved mask takes zero");
+        assert!(!VkDeviceCreateFlags(1).is_defined(), "and nothing else");
+    }
+
     /// `VK_NULL_HANDLE` where vk.xml requires an object poisons the stream at the decode. The
     /// driver dereferences such a handle without checking it, so a null one reaching it was a
     /// host null dereference -- a submit's semaphore, a copy's buffer, a descriptor write's set.

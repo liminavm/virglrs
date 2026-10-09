@@ -3,7 +3,8 @@
 # A host Vulkan driver checks nothing: every valid-usage rule a command breaks is undefined
 # behaviour in this process. The decoder makes a command wire-sound -- arena pointers, each array
 # its own count long, handles resolved, a null handle refused where vk.xml requires an object, an
-# enum refused where vk.xml does not define the value -- and none of that says a command is valid
+# enum refused where vk.xml does not define the value, a bitmask refused where it sets a bit vk.xml
+# does not define -- and none of that says a command is valid
 # Vulkan. This file says, for each served command, whether anything stands between the guest's
 # values and the driver indexing or copying by them.
 #

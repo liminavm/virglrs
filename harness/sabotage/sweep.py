@@ -3811,8 +3811,8 @@ SABOTAGES = [
     (
         'an enum value the registry does not define reaches the driver',
         'venus-gen/rustgen.py',
-        """        if (var.ty.base.category != VkType.ENUM or validity == Gen_INVALID""",
-        """        if (True or var.ty.base.category != VkType.ENUM or validity == Gen_INVALID""",
+        """        if (var.ty.base.category not in (VkType.ENUM, VkType.BITMASK) or validity == Gen_INVALID""",
+        """        if (True or validity == Gen_INVALID""",
         'an_enum_value_the_registry_does_not_define_poisons_the_stream',
     ),
     (
@@ -5547,6 +5547,24 @@ SABOTAGES = [
         """        if self.driver.recorder_facts(args.commandBuffer).is_some_and(|f| !f.indirect_builds) {""",
         """        if false {""",
         'a_build_with_no_destination_or_no_indirect_feature_is_refused',
+    ),
+    (
+        'the decoder may let a bitmask through with undefined bits',
+        'venus-gen/rustgen.py',
+        """        if (var.ty.base.category not in (VkType.ENUM, VkType.BITMASK) or validity == Gen_INVALID""",
+        """        if (var.ty.base.category not in (VkType.ENUM,) or validity == Gen_INVALID""",
+        'a_bitmask_bit_the_registry_does_not_define_poisons_the_stream',
+    ),
+    (
+        'a bitmask may call every bit defined',
+        'venus-gen/templates/types.rs',
+        """        self.0 & !${'%#x' % RUST.bitmask_defined(ty)} == 0
+%   else:
+        self.0 == 0""",
+        """        self.0 | 1 != 0
+%   else:
+        self.0 | 1 != 0""",
+        'a_bitmask_bit_the_registry_does_not_define_poisons_the_stream',
     ),
     (
         'a submit chained array is trusted by its count alone',

@@ -588,6 +588,24 @@ class RustGen:
         pats = [str(a) if a == b else '%d..=%d' % (a, b) for a, b in runs]
         return 'matches!(self.0, %s)' % ' | '.join(pats)
 
+    def bitmask_defined(self, ty):
+        """Every bit vk.xml defines for a bitmask, OR'd: those of the FlagBits enum it names --
+        from the registry, whether or not this build emits that enum -- or none for a mask
+        reserved for future use, which Vulkan requires to be zero."""
+        bits = getattr(ty, 'requires', None)
+        if bits is None:
+            return 0
+        values = dict(self.enum_values(bits))
+        mask = 0
+        for v in values.values():
+            seen = set()
+            while str(v) in values:
+                assert v not in seen, '%s aliases itself' % v
+                seen.add(v)
+                v = values[str(v)]
+            mask |= int(str(v), 0)
+        return mask
+
     def enum_witness(self, ty):
         """The smallest value vk.xml gives an enum, or zero for one with none."""
         values = sorted({int(str(v), 0) for _, v in self.enum_values(ty)})
@@ -610,9 +628,10 @@ class RustGen:
         return out
 
     def _enum_check(self, var, validity, value):
-        """Statements refusing an enum `value` vk.xml does not define, for a member whose
-        validity vk.xml has not left to other fields. Empty for anything else."""
-        if (var.ty.base.category != VkType.ENUM or validity == Gen_INVALID
+        """Statements refusing an enum `value` vk.xml does not define, or a bitmask `value`
+        with a bit set that vk.xml does not define, for a member whose validity vk.xml has not
+        left to other fields. Empty for anything else."""
+        if (var.ty.base.category not in (VkType.ENUM, VkType.BITMASK) or validity == Gen_INVALID
                 or not var.can_validate()):
             return []
         return ['if !%s.is_defined() {' % value, '    dec.set_fatal();', '}']
