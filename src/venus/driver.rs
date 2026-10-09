@@ -15806,6 +15806,19 @@ mod tests {
         let (cb, secondary) = (VkCommandBuffer::forged(0x20), VkCommandBuffer::forged(0x21));
         let mut d = Driver::new(Account::for_test(None));
         d.plant_device(DEVICE, crate::vulkan::Device::default());
+        let pixel = VkExtent2D { width: 1, height: 1 };
+        d.plant_sample_locations(DEVICE, &[(1, pixel)]);
+        // One location for one sample in one pixel: a set the device takes, so a refusal below
+        // is the index's.
+        let location = [crate::venus::proto::types::VkSampleLocationEXT::default()];
+        let set = VkSampleLocationsInfoEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT,
+            sampleLocationsPerPixel: VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT,
+            sampleLocationGridSize: pixel,
+            sampleLocationsCount: 1,
+            pSampleLocations: location.as_ptr(),
+            ..Default::default()
+        };
         d.plant_pool(DEVICE, VkCommandPool::forged(0x30), &[(cb, ObjectId(1))]);
         d.plant_pool_at(
             DEVICE,
@@ -15847,9 +15860,10 @@ mod tests {
         let located = |attachment, subpass| {
             let a = [VkAttachmentSampleLocationsEXT {
                 attachmentIndex: attachment,
-                ..Default::default()
+                sampleLocationsInfo: set,
             }];
-            let s = [VkSubpassSampleLocationsEXT { subpassIndex: subpass, ..Default::default() }];
+            let s =
+                [VkSubpassSampleLocationsEXT { subpassIndex: subpass, sampleLocationsInfo: set }];
             (a, s)
         };
         let locations =
@@ -15864,9 +15878,9 @@ mod tests {
                 ..Default::default()
             }
             };
-        let (past_attachment, past_subpass) = (located(2, 0), located(0, 2));
-        let (past_attachment, past_subpass) =
-            (locations(&past_attachment), locations(&past_subpass));
+        let (inside, past_attachment, past_subpass) = (located(1, 1), located(2, 0), located(0, 2));
+        let (inside, past_attachment, past_subpass) =
+            (locations(&inside), locations(&past_attachment), locations(&past_subpass));
         {
             let facts = d.device_facts(DEVICE).expect("a planted device");
             let begun = |info: &VkRenderPassBeginInfo| {
@@ -15891,6 +15905,7 @@ mod tests {
             let at = |l: &VkRenderPassSampleLocationsBeginInfoEXT| {
                 begun(&begin(FB, 0, 64, (&raw const *l).cast()))
             };
+            assert_eq!(at(&inside), Ok(()), "locations for its last attachment and subpass");
             assert!(at(&past_attachment).is_err(), "locations for an attachment past the pass's");
             assert!(at(&past_subpass).is_err(), "locations for a subpass past the pass's");
         }
