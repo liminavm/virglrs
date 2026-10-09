@@ -6378,7 +6378,7 @@ impl Commands for Handlers<'_> {
     ) {
         let Some(info) = self.names(args.pConditionalRenderingBegin) else { return };
         let done = self.driver.cmd_begin_conditional_rendering(args.commandBuffer, info);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdEndConditionalRenderingEXT(
@@ -15663,6 +15663,7 @@ mod tests {
             ..Default::default()
         };
         h.vkCmdWriteTimestamp(&mut args);
+        h.driver.plant_buffer(VkBuffer::forged(0x60), 0x1000);
         let mut args = vn_command_vkCmdCopyQueryPoolResults {
             commandBuffer: CB,
             queryPool: HOST_POOL,
@@ -18443,6 +18444,10 @@ mod tests {
             journal: &mut jrnl,
         };
         let cb = VkCommandBuffer::forged(CB.0);
+        // Room for every record the indirect forms below read.
+        for buffer in [0x21, 0x31, 0x33] {
+            h.driver.plant_buffer(VkBuffer::forged(buffer), 1 << 20);
+        }
 
         h.vkCmdDrawMeshTasksEXT(&mut vn_command_vkCmdDrawMeshTasksEXT {
             commandBuffer: cb,
@@ -19681,6 +19686,10 @@ mod tests {
             journal: &mut jrnl,
         };
         let cb = VkCommandBuffer::forged(CB.0);
+        // Room for every record the indirect forms below read.
+        for buffer in [0x21, 0x31, 0x41, 0x43, 0x51, 0x53, 0x61] {
+            h.driver.plant_buffer(VkBuffer::forged(buffer), 1 << 20);
+        }
 
         h.vkCmdDrawIndexed(&mut vn_command_vkCmdDrawIndexed {
             commandBuffer: cb,
@@ -21169,8 +21178,12 @@ mod tests {
         };
         let cb = VkCommandBuffer::forged(CB.0);
 
-        let cmd_begin_conditional_rendering_e_x_t_info =
-            VkConditionalRenderingBeginInfoEXT::default();
+        h.driver.plant_buffer(super::super::proto::types::VkBuffer::forged(0x90), 64);
+        let cmd_begin_conditional_rendering_e_x_t_info = VkConditionalRenderingBeginInfoEXT {
+            buffer: super::super::proto::types::VkBuffer::forged(0x90),
+            offset: VkDeviceSize(60),
+            ..Default::default()
+        };
 
         h.vkCmdBeginConditionalRenderingEXT(&mut vn_command_vkCmdBeginConditionalRenderingEXT {
             commandBuffer: cb,
@@ -21830,6 +21843,199 @@ mod tests {
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
+    }
+
+    /// An indirect draw or dispatch, and a conditional rendering begin, is held to the buffers it
+    /// reads on the GPU: every record inside its buffer, a draw count inside the device's
+    /// `maxDrawIndirectCount`, and a count or predicate's four bytes inside theirs.
+    #[test]
+    fn an_indirect_read_stays_inside_its_buffers() {
+        use super::super::proto::types::{
+            VkBuffer, VkCommandBuffer, VkCommandPool, VkConditionalRenderingBeginInfoEXT, VkDevice,
+            VkDeviceSize, vn_command_vkCmdBeginConditionalRenderingEXT,
+            vn_command_vkCmdDispatchIndirect, vn_command_vkCmdDrawIndexedIndirect,
+            vn_command_vkCmdDrawIndirect, vn_command_vkCmdDrawIndirectCount,
+        };
+
+        const DEVICE: u64 = 3;
+        const CB: (u64, u64) = (0x71, 0x17);
+        const ARGS: u64 = 0x40;
+        const COUNT: u64 = 0x41;
+
+        unsafe extern "C" fn draw(
+            _: VkCommandBuffer,
+            _: VkBuffer,
+            _: VkDeviceSize,
+            _: u32,
+            _: u32,
+        ) {
+        }
+        unsafe extern "C" fn counted(
+            _: VkCommandBuffer,
+            _: VkBuffer,
+            _: VkDeviceSize,
+            _: VkBuffer,
+            _: VkDeviceSize,
+            _: u32,
+            _: u32,
+        ) {
+        }
+        unsafe extern "C" fn dispatch(_: VkCommandBuffer, _: VkBuffer, _: VkDeviceSize) {}
+        unsafe extern "C" fn condition(
+            _: VkCommandBuffer,
+            _: *const VkConditionalRenderingBeginInfoEXT,
+        ) {
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdDrawIndirect(draw);
+        fns.plant_vkCmdDrawIndexedIndirect(draw);
+        fns.plant_vkCmdDrawIndirectCount(counted);
+        fns.plant_vkCmdDispatchIndirect(dispatch);
+        fns.plant_vkCmdBeginConditionalRenderingEXT(condition);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(0x70),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+        driver.plant_bound(VkCommandBuffer::forged(CB.0), driver::BindPoint::Graphics);
+        driver.plant_bound(VkCommandBuffer::forged(CB.0), driver::BindPoint::Compute);
+        driver.plant_buffer(VkBuffer::forged(ARGS), 128);
+        driver.plant_buffer(VkBuffer::forged(COUNT), 8);
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+
+        macro_rules! run {
+            ($call:expr) => {{
+                let mut rings = BTreeMap::new();
+                let mut ctx_reply = None;
+                let mut monitor = None;
+                let mut jrnl = Journal::new();
+                let mut h = Handlers {
+                    objects: &objects,
+                    todo: &todo,
+                    driver: &mut driver,
+                    global: &global,
+                    ctx: ContextId::new(1).expect("1 is not zero"),
+                    ask: None,
+                    resources: &NO_RESOURCES,
+                    rings: &mut rings,
+                    monitor: &mut monitor,
+                    replaying: false,
+                    depth: 0,
+                    answer: None,
+                    own_wait: None,
+                    current_ring: None,
+                    reply: &mut ctx_reply,
+                    note: None,
+                    journal: &mut jrnl,
+                };
+                #[allow(clippy::redundant_closure_call)]
+                (|h: &mut Handlers| $call(h))(&mut h);
+                h.rejected()
+            }};
+        }
+
+        let cb = VkCommandBuffer::forged(CB.0);
+        const PAST: Option<&str> = Some("transferred past the end of a buffer");
+        const TOO_MANY: Option<&str> = Some("drew more indirect draws than the device allows");
+
+        // Sixteen-byte records: eight of them laid sixteen apart fill the 128 bytes exactly.
+        for (offset, draws, stride, why) in [
+            (0, 8, 16, None),
+            (112, 1, 9999, None),
+            (113, 1, 16, PAST),
+            (0, 2, 113, PAST),
+            (0, 0, 0, None),
+            (0, 0x10000, 0, TOO_MANY),
+            (u64::MAX, 1, 16, PAST),
+        ] {
+            let mut args = vn_command_vkCmdDrawIndirect {
+                commandBuffer: cb,
+                buffer: VkBuffer::forged(ARGS),
+                offset: VkDeviceSize(offset),
+                drawCount: draws,
+                stride,
+                ..Default::default()
+            };
+            assert_eq!(
+                run!(|h: &mut Handlers| h.vkCmdDrawIndirect(&mut args)),
+                why,
+                "{draws} draws at {offset}, {stride} apart"
+            );
+        }
+        // An indexed record is twenty bytes, so the last one cannot start at 112.
+        for (offset, why) in [(108, None), (109, PAST)] {
+            let mut args = vn_command_vkCmdDrawIndexedIndirect {
+                commandBuffer: cb,
+                buffer: VkBuffer::forged(ARGS),
+                offset: VkDeviceSize(offset),
+                drawCount: 1,
+                stride: 20,
+                ..Default::default()
+            };
+            assert_eq!(
+                run!(|h: &mut Handlers| h.vkCmdDrawIndexedIndirect(&mut args)),
+                why,
+                "an indexed draw at {offset}"
+            );
+        }
+        // The count's four bytes, then the records the maximum allows.
+        for (count_offset, max, why) in
+            [(4, 8, None), (5, 8, PAST), (4, 9, PAST), (4, 0x10000, TOO_MANY)]
+        {
+            let mut args = vn_command_vkCmdDrawIndirectCount {
+                commandBuffer: cb,
+                buffer: VkBuffer::forged(ARGS),
+                offset: VkDeviceSize(0),
+                countBuffer: VkBuffer::forged(COUNT),
+                countBufferOffset: VkDeviceSize(count_offset),
+                maxDrawCount: max,
+                stride: 16,
+                ..Default::default()
+            };
+            assert_eq!(
+                run!(|h: &mut Handlers| h.vkCmdDrawIndirectCount(&mut args)),
+                why,
+                "a count at {count_offset}, at most {max}"
+            );
+        }
+        // A dispatch reads twelve bytes.
+        for (offset, why) in [(116, None), (117, PAST)] {
+            let mut args = vn_command_vkCmdDispatchIndirect {
+                commandBuffer: cb,
+                buffer: VkBuffer::forged(ARGS),
+                offset: VkDeviceSize(offset),
+                ..Default::default()
+            };
+            assert_eq!(
+                run!(|h: &mut Handlers| h.vkCmdDispatchIndirect(&mut args)),
+                why,
+                "a dispatch at {offset}"
+            );
+        }
+        // A predicate is four bytes.
+        for (offset, why) in [(4, None), (5, PAST)] {
+            let info = VkConditionalRenderingBeginInfoEXT {
+                buffer: VkBuffer::forged(COUNT),
+                offset: VkDeviceSize(offset),
+                ..Default::default()
+            };
+            let mut args = vn_command_vkCmdBeginConditionalRenderingEXT {
+                commandBuffer: cb,
+                pConditionalRenderingBegin: Some(Decoded::planted(&info)),
+                ..Default::default()
+            };
+            assert_eq!(
+                run!(|h: &mut Handlers| h.vkCmdBeginConditionalRenderingEXT(&mut args)),
+                why,
+                "a predicate at {offset}"
+            );
+        }
+        driver.abandon_planted();
     }
 
     /// A buffer copy, fill or update is held to the buffers it names: every span inside its

@@ -163,15 +163,11 @@ SABOTAGES = [
     (
         'a recorded query-pool result copy is handed to the driver past the end of the pool',
         'src/venus/driver.rs',
-        """        let (d, facts) = self.query_recorder(cb, pool)?;
-        facts.holds(first, count)?;
-        // SAFETY: as above, and a range of queries the pool holds.
-        unsafe {
-            (d.vkCmdCopyQueryPoolResults())""",
-        """        let (d, _facts) = self.query_recorder(cb, pool)?;
-        // SAFETY: as above, and a range of queries the pool holds.
-        unsafe {
-            (d.vkCmdCopyQueryPoolResults())""",
+        """        facts.holds(first, count)?;
+        if count > 0 {
+            let bytes = facts.bytes_for(count, stride, flags)?;""",
+        """        if count > 0 {
+            let bytes = facts.bytes_for(count, stride, flags)?;""",
         'query',
     ),
     (
@@ -2898,16 +2894,10 @@ SABOTAGES = [
     (
         'vkCmdDrawIndirectCount swaps its draw cap and its stride',
         'src/venus/driver.rs',
-        """        let f = self
-            .drawer(cb, BindPoint::Graphics)?
-            .try_vkCmdDrawIndirectCount()
-            .ok_or(Unrecorded::NoDevice)?;
+        """        self.counted_fits(cb, b, o, cbuf, co, max_draws, stride, DRAW_RECORD)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };""",
-        """        let f = self
-            .drawer(cb, BindPoint::Graphics)?
-            .try_vkCmdDrawIndirectCount()
-            .ok_or(Unrecorded::NoDevice)?;
+        """        self.counted_fits(cb, b, o, cbuf, co, max_draws, stride, DRAW_RECORD)?;
         // SAFETY: sabotage -- two u32s transposed.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, stride, max_draws) };""",
         'the_indexed_and_indirect_draws_hand_the_driver_every_argument_in_place',
@@ -3205,16 +3195,10 @@ SABOTAGES = [
     (
         'vkCmdDrawMeshTasksIndirectCountEXT swaps its two offsets',
         'src/venus/driver.rs',
-        """        let f = self
-            .drawer(cb, BindPoint::Graphics)?
-            .try_vkCmdDrawMeshTasksIndirectCountEXT()
-            .ok_or(Unrecorded::NoDevice)?;
+        """        self.counted_fits(cb, b, o, cbuf, co, max_draws, stride, MESH_RECORD)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };""",
-        """        let f = self
-            .drawer(cb, BindPoint::Graphics)?
-            .try_vkCmdDrawMeshTasksIndirectCountEXT()
-            .ok_or(Unrecorded::NoDevice)?;
+        """        self.counted_fits(cb, b, o, cbuf, co, max_draws, stride, MESH_RECORD)?;
         // SAFETY: sabotage -- the two offsets swapped.
         unsafe { f(cb, buffer, count_offset, count_buffer, offset, max_draws, stride) };""",
         'the_mesh_task_draws_hand_the_driver_every_argument_in_place',
@@ -5689,6 +5673,55 @@ SABOTAGES = [
         """            .buffer_span(dst, offset, Some(data.len() as u64))""",
         """            .buffer_span(dst, VkDeviceSize(0), Some(0))""",
         'a_buffer_transfer_stays_inside_its_buffers',
+    ),
+    (
+        'an indirect draw count may exceed the device limit',
+        'src/venus/driver.rs',
+        """        if count > limits.maxDrawIndirectCount {""",
+        """        if false && count > limits.maxDrawIndirectCount {""",
+        'an_indirect_read_stays_inside_its_buffers',
+    ),
+    (
+        'indirect records may run past their buffer',
+        'src/venus/driver.rs',
+        """        self.facts().buffer_span(buffer, offset, Some(span)).map_err(Unrecorded::Invalid)""",
+        """        { let _ = span; Ok(()) }""",
+        'an_indirect_read_stays_inside_its_buffers',
+    ),
+    (
+        'an indirect count may be read past its buffer',
+        'src/venus/driver.rs',
+        """            .buffer_span(count_buffer, count_offset, Some(4))""",
+        """            .buffer_span(count_buffer, VkDeviceSize(0), Some(0))""",
+        'an_indirect_read_stays_inside_its_buffers',
+    ),
+    (
+        'an indexed indirect record may be measured short',
+        'src/venus/driver.rs',
+        """const INDEXED_RECORD: u64 = 20;""",
+        """const INDEXED_RECORD: u64 = 16;""",
+        'an_indirect_read_stays_inside_its_buffers',
+    ),
+    (
+        'an indirect dispatch may read past its buffer',
+        'src/venus/driver.rs',
+        """            .buffer_span(buffer, offset, Some(DISPATCH_RECORD))""",
+        """            .buffer_span(buffer, VkDeviceSize(0), Some(0))""",
+        'an_indirect_read_stays_inside_its_buffers',
+    ),
+    (
+        'a conditional rendering predicate may lie past its buffer',
+        'src/venus/driver.rs',
+        """            .buffer_span(info.buffer, info.offset, Some(4))""",
+        """            .buffer_span(info.buffer, VkDeviceSize(0), Some(0))""",
+        'an_indirect_read_stays_inside_its_buffers',
+    ),
+    (
+        'query results may be copied past their buffer',
+        'src/venus/driver.rs',
+        """                .buffer_span(dst, offset, Some(bytes))""",
+        """                .buffer_span(dst, VkDeviceSize(0), Some(0))""",
+        'every_query_index_is_held_to_the_pool',
     ),
     (
         'a submit chained array is trusted by its count alone',

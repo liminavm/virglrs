@@ -1075,9 +1075,18 @@ fn planted_limits() -> VkPhysicalDeviceLimits {
         maxImageDimension3D: 2048,
         maxImageDimensionCube: 16384,
         maxImageArrayLayers: 2048,
+        maxDrawIndirectCount: u32::from(u16::MAX),
         ..Default::default()
     }
 }
+
+/// The bytes of one `VkDrawIndirectCommand`, `VkDrawIndexedIndirectCommand`,
+/// `VkDrawMeshTasksIndirectCommandEXT` and `VkDispatchIndirectCommand`: the records an indirect
+/// command reads from its buffer.
+const DRAW_RECORD: u64 = 16;
+const INDEXED_RECORD: u64 = 20;
+const MESH_RECORD: u64 = 12;
+const DISPATCH_RECORD: u64 = 12;
 
 /// Whether `count` entries written from `first` lie inside an array of `limit`, the shape of every
 /// windowed dynamic-state command: the driver copies them to `first` in an array that long.
@@ -6679,11 +6688,54 @@ impl Driver {
         Ok(())
     }
 
-    // The indirect draws and dispatch. Each reads its parameters from a buffer of the guest's
-    // on the GPU, where the bounds are the guest's own allocation's -- the same footing as a
-    // copy's regions. `stride` is the spacing of those records in that buffer, so it is the
-    // guest's to choose and goes through as sent; it describes nothing in our arena, which is
-    // what separates it from `cmd_draw_multi`'s.
+    // The indirect draws and dispatch. Each reads its parameters from a buffer of the guest's on
+    // the GPU. The Mesa runtime turns the buffer and offset into a device address holding them to
+    // the buffer only with asserts, so every record read is held to the buffer here, and the
+    // count to `maxDrawIndirectCount`: KosmicKrisp sizes a 32-bit allocation by it and writes
+    // that many records into what it got. `stride` is the spacing of those records in that
+    // buffer; it describes nothing in our arena, which is what separates it from
+    // `cmd_draw_multi`'s.
+
+    /// Whether `count` records of `record` bytes, laid `stride` apart from `offset`, lie inside
+    /// `buffer`, and the count inside the device's `maxDrawIndirectCount`. No records read nothing.
+    fn indirect_fits(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        count: u32,
+        stride: u32,
+        record: u64,
+    ) -> Result<(), Unrecorded> {
+        let limits = self.recorder_limits(cb).ok_or(Unrecorded::NoDevice)?;
+        if count > limits.maxDrawIndirectCount {
+            return Err(Unrecorded::Invalid("drew more indirect draws than the device allows"));
+        }
+        let Some(last) = count.checked_sub(1) else { return Ok(()) };
+        // A `u32` times a `u32`, plus a record, cannot overflow a `u64`.
+        let span = u64::from(last) * u64::from(stride) + record;
+        self.facts().buffer_span(buffer, offset, Some(span)).map_err(Unrecorded::Invalid)
+    }
+
+    /// [`Self::indirect_fits`] for a draw whose count is read from `count_buffer`: the four bytes
+    /// of the count inside that buffer, and `max_draws` records inside `buffer`.
+    #[allow(clippy::too_many_arguments)]
+    fn counted_fits(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        count_buffer: VkBuffer,
+        count_offset: VkDeviceSize,
+        max_draws: u32,
+        stride: u32,
+        record: u64,
+    ) -> Result<(), Unrecorded> {
+        self.facts()
+            .buffer_span(count_buffer, count_offset, Some(4))
+            .map_err(Unrecorded::Invalid)?;
+        self.indirect_fits(cb, buffer, offset, max_draws, stride, record)
+    }
 
     pub fn cmd_draw_indirect(
         &self,
@@ -6694,6 +6746,7 @@ impl Driver {
         stride: u32,
     ) -> Result<(), Unrecorded> {
         let d = self.drawer(cb, BindPoint::Graphics)?;
+        self.indirect_fits(cb, buffer, offset, draws, stride, DRAW_RECORD)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDrawIndirect())(cb, buffer, offset, draws, stride) };
         Ok(())
@@ -6708,6 +6761,7 @@ impl Driver {
         stride: u32,
     ) -> Result<(), Unrecorded> {
         let d = self.drawer(cb, BindPoint::Graphics)?;
+        self.indirect_fits(cb, buffer, offset, draws, stride, INDEXED_RECORD)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDrawIndexedIndirect())(cb, buffer, offset, draws, stride) };
         Ok(())
@@ -6730,6 +6784,8 @@ impl Driver {
             .drawer(cb, BindPoint::Graphics)?
             .try_vkCmdDrawIndirectCount()
             .ok_or(Unrecorded::NoDevice)?;
+        let (b, o, cbuf, co) = (buffer, offset, count_buffer, count_offset);
+        self.counted_fits(cb, b, o, cbuf, co, max_draws, stride, DRAW_RECORD)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };
         Ok(())
@@ -6765,6 +6821,7 @@ impl Driver {
             .drawer(cb, BindPoint::Graphics)?
             .try_vkCmdDrawMeshTasksIndirectEXT()
             .ok_or(Unrecorded::NoDevice)?;
+        self.indirect_fits(cb, buffer, offset, draws, stride, MESH_RECORD)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, draws, stride) };
         Ok(())
@@ -6786,6 +6843,8 @@ impl Driver {
             .drawer(cb, BindPoint::Graphics)?
             .try_vkCmdDrawMeshTasksIndirectCountEXT()
             .ok_or(Unrecorded::NoDevice)?;
+        let (b, o, cbuf, co) = (buffer, offset, count_buffer, count_offset);
+        self.counted_fits(cb, b, o, cbuf, co, max_draws, stride, MESH_RECORD)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };
         Ok(())
@@ -6989,6 +7048,8 @@ impl Driver {
             .drawer(cb, BindPoint::Graphics)?
             .try_vkCmdDrawIndexedIndirectCount()
             .ok_or(Unrecorded::NoDevice)?;
+        let (b, o, cbuf, co) = (buffer, offset, count_buffer, count_offset);
+        self.counted_fits(cb, b, o, cbuf, co, max_draws, stride, INDEXED_RECORD)?;
         // SAFETY: as above.
         unsafe { f(cb, buffer, offset, count_buffer, count_offset, max_draws, stride) };
         Ok(())
@@ -7001,6 +7062,9 @@ impl Driver {
         offset: VkDeviceSize,
     ) -> Result<(), Unrecorded> {
         let d = self.drawer(cb, BindPoint::Compute)?;
+        self.facts()
+            .buffer_span(buffer, offset, Some(DISPATCH_RECORD))
+            .map_err(Unrecorded::Invalid)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDispatchIndirect())(cb, buffer, offset) };
         Ok(())
@@ -8036,17 +8100,24 @@ impl Driver {
     }
 
     /// `vkCmdBeginConditionalRenderingEXT` and its end: the draws between them run only if a
-    /// value in a guest buffer is non-zero, read on the GPU where the bounds are the guest's
-    /// own allocation's. The begin forwards the guest's struct; the end has nothing to forward.
+    /// four-byte value in a guest buffer is non-zero, read on the GPU at an address the Mesa
+    /// runtime holds to the buffer only with an assert. The begin forwards the guest's struct
+    /// once that value is inside its buffer; the end has nothing to forward.
     pub fn cmd_begin_conditional_rendering(
         &self,
         cb: VkCommandBuffer,
         info: cs::Decoded<'_, VkConditionalRenderingBeginInfoEXT>,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdBeginConditionalRenderingEXT()?;
+    ) -> Result<(), RecordRefused> {
+        self.facts()
+            .buffer_span(info.buffer, info.offset, Some(4))
+            .map_err(RecordRefused::Invalid)?;
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdBeginConditionalRenderingEXT())
+            .ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above; `info` is a struct the decoder built, live for the call.
         unsafe { f(cb, info.get()) };
-        Some(())
+        Ok(())
     }
 
     /// See [`Driver::cmd_begin_conditional_rendering`].
@@ -8879,9 +8950,9 @@ impl Driver {
         Ok(r)
     }
 
-    /// The GPU-side read-back: results land in a buffer of the guest's, on the device, where the
-    /// bounds are the guest's own allocation's -- the same footing as every other `vkCmd*`
-    /// that names a buffer. The queries read are the pool's to hold, as everywhere.
+    /// The GPU-side read-back: results land in a buffer of the guest's, on the device, at an
+    /// address the Mesa runtime holds to the buffer only with an assert. The queries read are the
+    /// pool's to hold, as everywhere, and the bytes they are written as the buffer's.
     #[allow(clippy::too_many_arguments)]
     pub fn cmd_copy_query_pool_results(
         &self,
@@ -8896,7 +8967,13 @@ impl Driver {
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
         facts.holds(first, count)?;
-        // SAFETY: as above, and a range of queries the pool holds.
+        if count > 0 {
+            let bytes = facts.bytes_for(count, stride, flags)?;
+            self.facts()
+                .buffer_span(dst, offset, Some(bytes))
+                .map_err(|_| QueryRefused::OutOfRoom)?;
+        }
+        // SAFETY: as above, and a range of queries the pool holds, written inside `dst`.
         unsafe {
             (d.vkCmdCopyQueryPoolResults())(cb, pool, first, count, dst, offset, stride, flags)
         };
@@ -23690,6 +23767,7 @@ mod tests {
             VkQueryResultFlags(VkQueryResultFlagBits::VK_QUERY_RESULT_WITH_STATUS_BIT_KHR.0 as u32);
         const STAGE: VkPipelineStageFlagBits = VkPipelineStageFlagBits(1);
         const BUF: VkBuffer = VkBuffer::forged(0x60);
+        d.plant_buffer(BUF, 1 << 20);
         let mut buf = [0u8; 64];
         let out_of_pool: Result<(), QueryRefused> = Err(QueryRefused::OutOfPool);
         let read_out_of_pool: Result<VkResult, QueryRefused> = Err(QueryRefused::OutOfPool);
@@ -23711,6 +23789,26 @@ mod tests {
             ),
             Ok(())
         );
+        // The four results laid four bytes apart are sixteen bytes, which must land inside the
+        // destination; none of these reach the driver.
+        const SIXTEEN: VkBuffer = VkBuffer::forged(0x61);
+        d.plant_buffer(SIXTEEN, 16);
+        for (dst, offset) in [(SIXTEEN, 1), (SIXTEEN, u64::MAX), (VkBuffer::forged(0x99), 0)] {
+            assert_eq!(
+                d.cmd_copy_query_pool_results(
+                    CB,
+                    POOL,
+                    0,
+                    4,
+                    dst,
+                    VkDeviceSize(offset),
+                    VkDeviceSize(4),
+                    NONE
+                ),
+                Err(QueryRefused::OutOfRoom),
+                "results copied to {offset} in {dst:?}"
+            );
+        }
         assert_eq!(d.cmd_begin_query(CB, OCCLUSION, 3, VkQueryControlFlags(0)), Ok(()));
         assert_eq!(d.cmd_end_query(CB, OCCLUSION, 3), Ok(()));
         assert_eq!(d.cmd_write_timestamp(CB, STAGE, POOL, 3), Ok(()));
