@@ -12071,9 +12071,22 @@ impl cs::Validate<DeviceFacts<'_>> for VkGraphicsPipelineCreateInfo {
                 "named vertex and mesh stages together, or a task stage without a mesh one",
             );
         }
-        let linked = chained::<VkPipelineLibraryCreateInfoKHR, _>(this).is_some();
-        let whole = !linked && !is_library(this, u64::from(this.flags.0));
-        if !vertex && !mesh && whole {
+        // The parts of a pipeline the runtime builds from this create info, as
+        // `vk_graphics_pipeline_state_fill` works them out: those a library link names; none for
+        // a library, or a pipeline linking libraries, without one; and every part a complete
+        // pipeline has, which `None` stands for here.
+        type L = super::proto::types::VkGraphicsPipelineLibraryFlagBitsEXT;
+        let links =
+            chained::<VkPipelineLibraryCreateInfoKHR, _>(this).is_some_and(|l| l.libraryCount > 0);
+        let parts = match chained::<VkGraphicsPipelineLibraryCreateInfoEXT, _>(this) {
+            Some(link) => Some(link.flags.0),
+            None if links || is_library(this, u64::from(this.flags.0)) => Some(0),
+            None => None,
+        };
+        let has = |part: L| parts.is_none_or(|p| p & part.0 as u32 != 0);
+        let pre_rasterization =
+            has(L::VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT);
+        if !vertex && !mesh && pre_rasterization {
             return Err("made a graphics pipeline with no vertex or mesh stage");
         }
         if this.renderPass.host().raw() != 0 {
@@ -12086,7 +12099,7 @@ impl cs::Validate<DeviceFacts<'_>> for VkGraphicsPipelineCreateInfo {
                 return Err("made a pipeline for a subpass its render pass does not have");
             }
         }
-        let vertex_input = held(&this, this.pVertexInputState, facts)?;
+        held(&this, this.pVertexInputState, facts)?;
         held(&this, this.pTessellationState, facts)?;
         held(&this, this.pViewportState, facts)?;
         let raster = held(&this, this.pRasterizationState, facts)?;
@@ -12107,30 +12120,37 @@ impl cs::Validate<DeviceFacts<'_>> for VkGraphicsPipelineCreateInfo {
                 return Err("rasterized at a sample count no device has");
             }
         }
-        // A whole pipeline's states the runtime reads with no null check unless the state they
-        // carry is dynamic. A library, or a pipeline linking libraries, takes the parts it lacks
-        // from them, and the runtime reads only the parts it has.
-        if whole {
-            let discard_dynamic = is_dynamic(D::VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE);
-            if vertex && vertex_input.is_none() && !is_dynamic(D::VK_DYNAMIC_STATE_VERTEX_INPUT_EXT)
-            {
-                return Err("made a pipeline with a vertex stage and no vertex input");
+        // The two states the runtime reads with no null check: `may_have_rasterization` reads
+        // the rasterization state of a pipeline with pre-rasterization shaders unless its discard
+        // is dynamic, and the fragment output interface's multisample state gives its sample
+        // count for the standard sample locations unless the count or the locations are dynamic.
+        let discard_dynamic = is_dynamic(D::VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE);
+        if pre_rasterization && raster.is_none() && !discard_dynamic {
+            return Err(
+                "made a pipeline with pre-rasterization shaders and no rasterization state",
+            );
+        }
+        let rasterizes = discard_dynamic || raster.is_none_or(|r| r.rasterizerDiscardEnable.0 == 0);
+        let fragment_output = match parts {
+            Some(p) => {
+                p & L::VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT.0 as u32 != 0
             }
-            if raster.is_none() && !discard_dynamic {
-                return Err("made a pipeline with no rasterization state");
-            }
-            let discards =
-                raster.is_some_and(|r| r.rasterizerDiscardEnable.0 != 0) && !discard_dynamic;
-            if multisample.is_none() && !discards && !samples_dynamic {
-                return Err("made a pipeline that rasterizes with no multisample state");
-            }
+            None => rasterizes,
+        };
+        let locations_dynamic = is_dynamic(D::VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT);
+        if fragment_output && multisample.is_none() && !samples_dynamic && !locations_dynamic {
+            return Err(
+                "made a pipeline with a fragment output interface and no multisample state",
+            );
         }
         Ok(())
     }
 }
 
 /// The dynamic states the Mesa runtime has a case for. It reaches `UNREACHABLE` on any other,
-/// which a release build compiles to undefined behaviour.
+/// which a release build compiles to undefined behaviour. Copied, in its order, from
+/// `vk_get_dynamic_graphics_states` in Mesa 26.3.0-devel: a host on another Mesa may have a case
+/// this lacks, which only costs a refusal, or lack one this has.
 const RUNTIME_DYNAMIC_STATES: [VkDynamicState; 57] = [
     VkDynamicState::VK_DYNAMIC_STATE_VERTEX_INPUT_EXT,
     VkDynamicState::VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
@@ -14427,6 +14447,13 @@ unsafe impl InStruct for VkPipelineLibraryCreateInfoKHR {
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
 // same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkGraphicsPipelineLibraryCreateInfoEXT {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
 unsafe impl InStruct for VkPipelineLayoutCreateInfo {
     const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 }
@@ -16259,6 +16286,8 @@ mod tests {
         let subpass = || SubpassShape { named: Vec::new(), colors: 0 };
         let pass = RenderPassFacts::held(0, vec![subpass(), subpass()], []).expect("a pass");
         d.render_passes.insert(PASS, Arc::new(pass));
+        const LIBRARY: VkPipeline = VkPipeline::forged(0x800);
+        d.record_pipeline(LIBRARY, DEVICE, PipelineKind::Graphics, true);
         let facts = d.device_facts(DEVICE).expect("a planted device");
 
         let stage = |bits: S| VkPipelineShaderStageCreateInfo {
@@ -16451,12 +16480,7 @@ mod tests {
             made(VkGraphicsPipelineCreateInfo { pDynamicState: &dy, ..info })
         };
         let null_vi = VkGraphicsPipelineCreateInfo { pVertexInputState: core::ptr::null(), ..base };
-        assert!(missing(null_vi, &[]).is_err(), "no vertex input");
-        assert_eq!(
-            missing(null_vi, &[Dy::VK_DYNAMIC_STATE_VERTEX_INPUT_EXT]),
-            Ok(()),
-            "dynamic vertex input"
-        );
+        assert_eq!(missing(null_vi, &[]), Ok(()), "the runtime reads no vertex input as none");
         let null_rs =
             VkGraphicsPipelineCreateInfo { pRasterizationState: core::ptr::null(), ..base };
         assert!(missing(null_rs, &[]).is_err(), "no rasterization state");
@@ -16471,6 +16495,11 @@ mod tests {
             missing(null_ms, &[Dy::VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT]),
             Ok(()),
             "dynamic samples"
+        );
+        assert_eq!(
+            missing(null_ms, &[Dy::VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT]),
+            Ok(()),
+            "dynamic sample locations"
         );
         let discarding = VkPipelineRasterizationStateCreateInfo {
             rasterizerDiscardEnable: VkBool32(1),
@@ -16503,6 +16532,56 @@ mod tests {
             ..base
         };
         assert_eq!(made(bare), Ok(()), "a library takes what it lacks from others");
+        let unlinked = VkPipelineLibraryCreateInfoKHR {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+            ..Default::default()
+        };
+        let linking_none = VkGraphicsPipelineCreateInfo {
+            flags: VkPipelineCreateFlags(0),
+            pNext: (&raw const unlinked).cast(),
+            ..bare
+        };
+        assert!(made(linking_none).is_err(), "linking no library is a complete pipeline");
+        let libraries = [LIBRARY];
+        let linked = VkPipelineLibraryCreateInfoKHR {
+            libraryCount: 1,
+            pLibraries: libraries.as_ptr(),
+            ..unlinked
+        };
+        let linking =
+            VkGraphicsPipelineCreateInfo { pNext: (&raw const linked).cast(), ..linking_none };
+        assert_eq!(
+            made(linking),
+            Ok(()),
+            "a pipeline linking a library takes what it lacks from it"
+        );
+        type L = crate::venus::proto::types::VkGraphicsPipelineLibraryFlagBitsEXT;
+        let part = |flags: L, info: VkGraphicsPipelineCreateInfo| {
+            let link = VkGraphicsPipelineLibraryCreateInfoEXT {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+                flags: crate::venus::proto::types::VkGraphicsPipelineLibraryFlagsEXT(
+                    flags.0 as u32,
+                ),
+                ..Default::default()
+            };
+            made(VkGraphicsPipelineCreateInfo { pNext: (&raw const link).cast(), ..info })
+        };
+        let pre = L::VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+        let output = L::VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
+        let input = L::VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT;
+        assert_eq!(part(input, bare), Ok(()), "a vertex input library");
+        assert!(part(pre, bare).is_err(), "pre-rasterization shaders and no rasterization state");
+        let with_raster = VkGraphicsPipelineCreateInfo { pRasterizationState: &raster, ..bare };
+        assert_eq!(part(pre, with_raster), Ok(()), "pre-rasterization shaders with their state");
+        let no_stages = VkGraphicsPipelineCreateInfo { stageCount: 0, ..with_raster };
+        assert!(part(pre, no_stages).is_err(), "pre-rasterization shaders of no vertex stage");
+        let fragment_output = VkGraphicsPipelineCreateInfo { stageCount: 0, ..bare };
+        assert!(
+            part(output, fragment_output).is_err(),
+            "a fragment output and no multisample state"
+        );
+        let with_ms = VkGraphicsPipelineCreateInfo { pMultisampleState: &ms, ..fragment_output };
+        assert_eq!(part(output, with_ms), Ok(()), "a fragment output with its multisample state");
         d.abandon_planted();
     }
 
