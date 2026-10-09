@@ -178,7 +178,7 @@ vkCopyMemoryToImageMESA                          validated
 vkCreateAccelerationStructureKHR                 reviewed
 vkCreateBuffer                                   reviewed
 vkCreateBufferView                               validated
-vkCreateCommandPool                              reviewed
+vkCreateCommandPool                              validated
 vkCreateComputePipelines                         validated
 vkCreateDescriptorPool                           validated
 vkCreateDescriptorSetLayout                      validated

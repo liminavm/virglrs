@@ -2650,23 +2650,7 @@ macro_rules! simple_create {
     };
 }
 
-/// A pool, which is [`simple_create`] plus the record of what will be allocated from it.
-///
-/// Destroying a pool destroys its contents, so the driver has to know which objects a pool owns
-/// to stop answering for them afterwards; see [`Driver::create_pool`].
-macro_rules! pool_create {
-    ($cmd:ident, $args:ty, $info:ident, $out:ident, $shadow:ident) => {
-        fn $cmd(&mut self, args: &mut $args) {
-            let Some(info) = self.names(args.$info) else { return };
-            let host =
-                self.driver.create_pool(args.device, |d| Some(d.$cmd()), info, args.pAllocator);
-            args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
-            self.plant(stringify!($cmd), args.$out(), args.$shadow(), host);
-        }
-    };
-}
-
-/// The destroy half of [`pool_create`].
+/// The destroy of a pool, which [`Driver::destroy_pool`] destroys with its contents.
 macro_rules! pool_destroy {
     ($cmd:ident, $args:ty, $target:ident) => {
         fn $cmd(&mut self, args: &mut $args) {
@@ -3061,13 +3045,28 @@ impl Commands for Handlers<'_> {
     simple_create!(vkCreateEvent, vn_command_vkCreateEvent, pCreateInfo, pEvent, handle_pEvent_mut);
     simple_destroy!(vkDestroyEvent, vn_command_vkDestroyEvent, event);
 
-    pool_create!(
-        vkCreateCommandPool,
-        vn_command_vkCreateCommandPool,
-        pCreateInfo,
-        pCommandPool,
-        handle_pCommandPool_mut
-    );
+    fn vkCreateCommandPool(&mut self, args: &mut vn_command_vkCreateCommandPool<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        // As `vkCreateDescriptorPool`: the pool's queue family must be one the device has.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => self.driver.create_pool(
+                args.device,
+                |d| Some(d.vkCreateCommandPool()),
+                info,
+                args.pAllocator,
+            ),
+        };
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant(
+            "vkCreateCommandPool",
+            args.pCommandPool(),
+            args.handle_pCommandPool_mut(),
+            host,
+        );
+    }
     pool_destroy!(vkDestroyCommandPool, vn_command_vkDestroyCommandPool, commandPool);
 
     /// Not [`simple_create`]: the buffer's size is recorded for the binds held to it.
@@ -3282,7 +3281,7 @@ impl Commands for Handlers<'_> {
         descriptorSetLayout
     );
 
-    /// Not [`pool_create`]: the pool is held to the types it may hold first.
+    /// Held to the types the pool may hold before the driver is asked.
     fn vkCreateDescriptorPool(&mut self, args: &mut vn_command_vkCreateDescriptorPool<'_>) {
         let Some(info) = self.names(args.pCreateInfo) else { return };
         // As `vkCreatePipelineLayout`.
@@ -21842,6 +21841,75 @@ mod tests {
         assert_eq!(SAW.with_borrow(Vec::len), 4, "and the driver never saw it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
+    /// A command pool names a queue family its device has, or the driver is never asked.
+    #[test]
+    fn a_command_pool_names_a_queue_family_its_device_has() {
+        use super::super::proto::types::{VkCommandPool, VkCommandPoolCreateInfo, VkDevice};
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 0x70;
+        unsafe extern "C" fn create(
+            _: VkDevice,
+            _: *const VkCommandPoolCreateInfo,
+            _: *const super::super::proto::types::VkAllocationCallbacks,
+            out: *mut VkCommandPool,
+        ) -> VkResult {
+            // SAFETY: the out-handle the driver path hands the entry point.
+            unsafe { *out = VkCommandPool::forged(POOL) };
+            VkResult::VK_SUCCESS
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateCommandPool(create);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        // A planted device has the one queue family.
+        const REFUSED: Option<&str> =
+            Some("created a command pool for a queue family the device does not have");
+        for (family, why) in [(1, REFUSED), (u32::MAX, REFUSED), (0, None)] {
+            let info = VkCommandPoolCreateInfo { queueFamilyIndex: family, ..Default::default() };
+            let mut wire = VkCommandPool::forged(0x40 + u64::from(family & 0xf));
+            let mut shadow = VkCommandPool::forged(0);
+            let mut args = vn_command_vkCreateCommandPool::default();
+            args.device = VkDevice::forged(DEVICE);
+            args.pCreateInfo = Some(Decoded::planted(&info));
+            args.plant_pCommandPool(&mut wire);
+            args.plant_handle_pCommandPool(&mut shadow);
+            h.vkCreateCommandPool(&mut args);
+            assert_eq!(h.take_rejected(), why, "family {family}");
+            let made = if why.is_none() { POOL } else { 0 };
+            assert_eq!(shadow, VkCommandPool::forged(made), "family {family}");
+        }
         h.driver.abandon_planted();
     }
 

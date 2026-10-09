@@ -1088,6 +1088,22 @@ const INDEXED_RECORD: u64 = 20;
 const MESH_RECORD: u64 = 12;
 const DISPATCH_RECORD: u64 = 12;
 
+/// The queue families of `pd`, as the driver reports them.
+fn queue_families(inst: &InstanceFns, pd: VkPhysicalDevice) -> Vec<VkQueueFamilyProperties> {
+    let mut count = 0u32;
+    // SAFETY: `pd` is a handle this instance returned; the first call writes only the count.
+    unsafe {
+        (inst.vkGetPhysicalDeviceQueueFamilyProperties())(pd, &mut count, core::ptr::null_mut())
+    };
+    let mut families = vec![VkQueueFamilyProperties::default(); count as usize];
+    // SAFETY: as above, and `families` holds the `count` entries the second call may write.
+    unsafe {
+        (inst.vkGetPhysicalDeviceQueueFamilyProperties())(pd, &mut count, families.as_mut_ptr())
+    };
+    families.truncate(count as usize);
+    families
+}
+
 /// Whether `count` entries written from `first` lie inside an array of `limit`, the shape of every
 /// windowed dynamic-state command: the driver copies them to `first` in an array that long.
 fn window_fits(limit: u32, first: u32, count: usize) -> bool {
@@ -2618,6 +2634,10 @@ struct DeviceState {
     /// creation because it never changes, and because an allocation must not pay an instance
     /// round trip to learn whether it is host-visible.
     memory_types: Vec<VkMemoryPropertyFlags>,
+    /// How many queue families its physical device has. A command pool names one, and anv takes
+    /// the family out of a fixed array by that index when a buffer is allocated from the pool,
+    /// checking it only with an assert. Read once at creation for the reason `memory_types` is.
+    queue_families: u32,
     /// How big a shader group handle is on this device, if it enabled ray-tracing pipelines.
     /// Read once at creation for the reason `memory_types` is; the handle queries hold the
     /// guest's room to it.
@@ -3372,18 +3392,7 @@ impl Driver {
     ) -> Result<(), &'static str> {
         // A device on no instance is `create_device`'s to answer, as the driver would.
         let Some(inst) = self.instance() else { return Ok(()) };
-        let mut count = 0u32;
-        // SAFETY: `pd` is a handle this instance returned; the first call writes only the count.
-        unsafe {
-            (inst.vkGetPhysicalDeviceQueueFamilyProperties())(pd, &mut count, core::ptr::null_mut())
-        };
-        let mut families = vec![VkQueueFamilyProperties::default(); count as usize];
-        // SAFETY: as above, and `families` holds the `count` entries the second call may write.
-        unsafe {
-            (inst.vkGetPhysicalDeviceQueueFamilyProperties())(pd, &mut count, families.as_mut_ptr())
-        };
-        families.truncate(count as usize);
-        let queues: Vec<u32> = families.iter().map(|f| f.queueCount).collect();
+        let queues: Vec<u32> = queue_families(inst, pd).iter().map(|f| f.queueCount).collect();
         queue_requests_fit(
             &queues,
             regions_of(info, info.queueCreateInfoCount, info.pQueueCreateInfos),
@@ -3455,6 +3464,7 @@ impl Driver {
             .iter()
             .map(|t| t.propertyFlags)
             .collect();
+        let families = queue_families(inst, pd).len() as u32;
         let mut properties = VkPhysicalDeviceProperties::default();
         // SAFETY: `pd` is a handle this instance returned, and `properties` is a local.
         unsafe { (inst.vkGetPhysicalDeviceProperties())(pd, &mut properties) };
@@ -3518,6 +3528,7 @@ impl Driver {
                 fns,
                 stages: enabled_stages(&wanted),
                 memory_types,
+                queue_families: families,
                 group_handles,
                 xfb,
                 limits,
@@ -4589,6 +4600,7 @@ impl Driver {
             stages: d.stages,
             formats: FormatQueries { source: &d.formats, instance: self.instance() },
             memory_types: &d.memory_types,
+            queue_families: d.queue_families,
         })
     }
 
@@ -5474,6 +5486,7 @@ impl Driver {
                 fns,
                 stages: enabled_stages(&[]),
                 memory_types: Vec::new(),
+                queue_families: 1,
                 group_handles: None,
                 xfb: None,
                 limits: planted_limits(),
@@ -14299,6 +14312,21 @@ pub struct DeviceFacts<'d> {
     pub formats: FormatQueries<'d>,
     /// The property flags of each of its memory types, indexed by `memoryTypeIndex`.
     pub memory_types: &'d [VkMemoryPropertyFlags],
+    /// How many queue families its physical device has.
+    pub queue_families: u32,
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkCommandPoolCreateInfo {
+    /// A queue family the device has: see `DeviceState::queue_families`.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        if this.queueFamilyIndex >= facts.queue_families {
+            return Err("created a command pool for a queue family the device does not have");
+        }
+        Ok(())
+    }
 }
 
 impl cs::Validate<DeviceFacts<'_>> for VkMemoryAllocateInfo {
@@ -14444,7 +14472,6 @@ macro_rules! forwarded_unchecked {
 forwarded_unchecked!(
     VkAccelerationStructureCreateInfoKHR,
     VkBufferCreateInfo,
-    VkCommandPoolCreateInfo,
     VkDescriptorUpdateTemplateCreateInfo,
     VkEventCreateInfo,
     VkFenceCreateInfo,

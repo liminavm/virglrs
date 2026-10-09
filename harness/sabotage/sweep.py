@@ -5724,6 +5724,13 @@ SABOTAGES = [
         'every_query_index_is_held_to_the_pool',
     ),
     (
+        'a command pool may name a queue family the device does not have',
+        'src/venus/driver.rs',
+        """        if this.queueFamilyIndex >= facts.queue_families {""",
+        """        if false && this.queueFamilyIndex >= facts.queue_families {""",
+        'a_command_pool_names_a_queue_family_its_device_has',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",
