@@ -4935,6 +4935,18 @@ SABOTAGES = [
         'a_render_pass_is_begun_and_moved_through_in_order',
     ),
     (
+        'a create forwarded unchecked may be written down as validated',
+        'src/venus/driver.rs',
+        """    VkSamplerYcbcrConversionCreateInfo,
+    VkSemaphoreCreateInfo,
+""",
+        """    VkSamplerCreateInfo,
+    VkSamplerYcbcrConversionCreateInfo,
+    VkSemaphoreCreateInfo,
+""",
+        'no_create_forwarded_unchecked_is_written_down_as_validated',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

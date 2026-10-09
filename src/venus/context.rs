@@ -16663,6 +16663,36 @@ mod tests {
         assert!(stale.is_empty(), "validation.txt names unserved command(s): {stale:?}");
     }
 
+    /// No create whose info still goes to the driver unchecked is written down as validated:
+    /// `vkCreateX` forwards a `VkXCreateInfo`, and a type on `forwarded_unchecked!` has no check
+    /// in front of the driver to be the validation the file claims.
+    #[test]
+    fn no_create_forwarded_unchecked_is_written_down_as_validated() {
+        const FILE: &str = include_str!("validation.txt");
+        // `create_image` holds the info to its check, then forwards the host's rewrite of it,
+        // which it builds unchecked: see `external_images_are_linear`.
+        const CHECKED_ELSEWHERE: [&str; 1] = ["VkImageCreateInfo"];
+        let status = |command: &str| {
+            FILE.lines()
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| l.split_once(char::is_whitespace))
+                .find(|(c, _)| *c == command)
+                .map(|(_, s)| s.trim())
+        };
+        for info in driver::FORWARDED_UNCHECKED {
+            if CHECKED_ELSEWHERE.contains(info) {
+                continue;
+            }
+            let (object, suffix) = info
+                .strip_prefix("Vk")
+                .and_then(|i| i.split_once("CreateInfo"))
+                .unwrap_or_else(|| panic!("{info} is not named as a create info is"));
+            let command = format!("vkCreate{object}{suffix}");
+            let said = status(&command).unwrap_or_else(|| panic!("{command} is not in the file"));
+            assert_ne!(said, "validated", "{command} forwards {info} unchecked");
+        }
+    }
+
     /// Every command the protocol defines is either served or written down as not served.
     ///
     /// A guest may send any of them -- what it is offered is built from what the pinned vk.xml can

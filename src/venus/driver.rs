@@ -13259,6 +13259,10 @@ impl<I: ?Sized> Forward<cs::Checked> for I {}
 macro_rules! forwarded_unchecked {
     ($($info:ty),* $(,)?) => {
         $(impl Forward<cs::Unchecked> for $info {})*
+
+        /// The infos on this list, by name, for the test that holds `validation.txt` to it.
+        #[cfg(test)]
+        pub(super) const FORWARDED_UNCHECKED: &[&str] = &[$(stringify!($info)),*];
     };
 }
 
