@@ -2960,8 +2960,8 @@ SABOTAGES = [
     (
         'vkCmdNextSubpass drops the guest\'s subpass contents',
         'src/venus/driver.rs',
-        """        unsafe { (d.vkCmdNextSubpass())(cb, contents) };""",
-        """        unsafe { (d.vkCmdNextSubpass())(cb, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE) };""",
+        """        unsafe { f(cb, contents) };""",
+        """        unsafe { f(cb, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE) };""",
         'the_render_pass2_commands_hand_the_driver_the_guests_structs',
     ),
     (
@@ -3442,7 +3442,8 @@ SABOTAGES = [
         'a served bind marks nothing bound',
         'src/venus/driver.rs',
         """        let child = self.pools.child_mut(cb).expect("the pool record `device_of` just read");
-        child.bound = child.bound.with(point, Binding { pipeline, serial: facts.serial });
+        child.recording.bound =
+            child.recording.bound.with(point, Binding { pipeline, serial: facts.serial });
 """,
         """        let child = self.pools.child_mut(cb).expect("the pool record `device_of` just read");
 """,
@@ -4834,6 +4835,104 @@ SABOTAGES = [
         """        if this.attachmentCount != pass.attachments || described != pass.attachments {""",
         """        if described != pass.attachments {""",
         'a_render_pass_is_held_to_what_it_describes',
+    ),
+    (
+        'a secondary command buffer may begin a render pass',
+        'src/venus/driver.rs',
+        """        if child.level != Level::Primary {""",
+        """        if false {""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'a render pass may begin inside another',
+        'src/venus/driver.rs',
+        """        if child.recording.pass.is_some() {""",
+        """        if false {""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'a recording may move past the last subpass',
+        'src/venus/driver.rs',
+        """        if at.subpass + 1 >= at.pass.subpasses() {""",
+        """        if false {""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'an ended render pass stays begun',
+        'src/venus/driver.rs',
+        """        child.recording.pass = None;
+""",
+        """""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'a reset keeps the render pass begun',
+        'src/venus/driver.rs',
+        """        if let Some(c) = self.child_mut(cb) {
+            c.recording = Recording::default();""",
+        """        if let Some(c) = self.child_mut(cb) {
+            c.recording.bound = Bound::default();""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'a pass may begin in a framebuffer for another',
+        'src/venus/driver.rs',
+        """        if framebuffer.attachments != pass.attachments {""",
+        """        if false {""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'a render area may reach past its framebuffer',
+        'src/venus/driver.rs',
+        """            u32::try_from(offset).is_ok_and(|o| u64::from(o) + u64::from(extent) <= u64::from(size))""",
+        """            u32::try_from(offset).is_ok()""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'a render area may start before its framebuffer',
+        'src/venus/driver.rs',
+        """            u32::try_from(offset).is_ok_and(|o| u64::from(o) + u64::from(extent) <= u64::from(size))""",
+        """            i64::from(offset) + i64::from(extent) <= i64::from(size)""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'an imageless framebuffer may begin without its views',
+        'src/venus/driver.rs',
+        """        if framebuffer.imageless && chained::<VkRenderPassAttachmentBeginInfo, _>(this).is_none() {""",
+        """        if false {""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'a begin may name views for a framebuffer with its own',
+        'src/venus/driver.rs',
+        """        let wanted = if framebuffer.imageless { pass.attachments } else { 0 };""",
+        """        let wanted = if framebuffer.imageless { pass.attachments } else { this.attachmentCount };""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'a begin may name fewer views than its pass',
+        'src/venus/driver.rs',
+        """        let wanted = if framebuffer.imageless { pass.attachments } else { 0 };""",
+        """        let wanted = if framebuffer.imageless { this.attachmentCount } else { 0 };""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'sample locations may name any attachment',
+        'src/venus/driver.rs',
+        """        if attachments.iter().any(|a| a.attachmentIndex >= pass.attachments)
+""",
+        """        if false
+""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
+    ),
+    (
+        'sample locations may name any subpass',
+        'src/venus/driver.rs',
+        """            || subpasses.iter().any(|s| s.subpassIndex >= pass.subpasses())
+""",
+        """            || false
+""",
+        'a_render_pass_is_begun_and_moved_through_in_order',
     ),
     (
         'a submit chained array is trusted by its count alone',

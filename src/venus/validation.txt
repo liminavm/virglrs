@@ -33,8 +33,8 @@ vkBindImageMemory2                               validated
 vkCmdBeginConditionalRenderingEXT                reviewed
 vkCmdBeginQuery                                  reviewed
 vkCmdBeginQueryIndexedEXT                        reviewed
-vkCmdBeginRenderPass                             pending:render-passes
-vkCmdBeginRenderPass2                            pending:render-passes
+vkCmdBeginRenderPass                             validated
+vkCmdBeginRenderPass2                            validated
 vkCmdBeginRendering                              validated
 vkCmdBeginTransformFeedbackEXT                   reviewed
 vkCmdBindDescriptorSets                          validated
@@ -89,8 +89,8 @@ vkCmdEndRendering2KHR                            reviewed
 vkCmdEndTransformFeedbackEXT                     reviewed
 vkCmdExecuteCommands                             reviewed
 vkCmdFillBuffer                                  reviewed
-vkCmdNextSubpass                                 pending:render-passes
-vkCmdNextSubpass2                                pending:render-passes
+vkCmdNextSubpass                                 validated
+vkCmdNextSubpass2                                validated
 vkCmdPipelineBarrier                             reviewed
 vkCmdPipelineBarrier2                            reviewed
 vkCmdPushConstants                               validated

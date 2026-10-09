@@ -3203,12 +3203,7 @@ impl Commands for Handlers<'_> {
         let host = match checked {
             None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
             Some(Err(why)) => return self.reject(why),
-            Some(Ok(info)) => self.driver.create_object(
-                args.device,
-                |d| Some(d.vkCreateFramebuffer()),
-                info,
-                args.pAllocator,
-            ),
+            Some(Ok(info)) => self.driver.create_framebuffer(args.device, info, args.pAllocator),
         };
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant(
@@ -5293,38 +5288,40 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdBeginRenderPass(&mut self, args: &mut vn_command_vkCmdBeginRenderPass<'_>) {
         let Some(begin) = self.names(args.pRenderPassBegin) else { return };
+        let Some(begin) = self.checked_for(args.commandBuffer, begin) else { return };
         let done = self.driver.cmd_begin_render_pass(args.commandBuffer, begin, args.contents);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdEndRenderPass(&mut self, args: &mut vn_command_vkCmdEndRenderPass<'_>) {
         let done = self.driver.cmd_end_render_pass(args.commandBuffer);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdNextSubpass(&mut self, args: &mut vn_command_vkCmdNextSubpass<'_>) {
         let done = self.driver.cmd_next_subpass(args.commandBuffer, args.contents);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdBeginRenderPass2(&mut self, args: &mut vn_command_vkCmdBeginRenderPass2<'_>) {
         let Some(begin) = self.names(args.pRenderPassBegin) else { return };
         let Some(subpass) = self.names(args.pSubpassBeginInfo) else { return };
+        let Some(begin) = self.checked_for(args.commandBuffer, begin) else { return };
         let done = self.driver.cmd_begin_render_pass2(args.commandBuffer, begin, subpass);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdNextSubpass2(&mut self, args: &mut vn_command_vkCmdNextSubpass2<'_>) {
         let Some(begin) = self.names(args.pSubpassBeginInfo) else { return };
         let Some(end) = self.names(args.pSubpassEndInfo) else { return };
         let done = self.driver.cmd_next_subpass2(args.commandBuffer, begin, end);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdEndRenderPass2(&mut self, args: &mut vn_command_vkCmdEndRenderPass2<'_>) {
         let Some(end) = self.names(args.pSubpassEndInfo) else { return };
         let done = self.driver.cmd_end_render_pass2(args.commandBuffer, end);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdBindPipeline(&mut self, args: &mut vn_command_vkCmdBindPipeline<'_>) {
@@ -19795,7 +19792,13 @@ mod tests {
         };
         let cb = VkCommandBuffer::forged(CB.0);
 
-        let info = VkRenderPassCreateInfo2::default();
+        // Three subpasses, for the begin and the two moves on below.
+        let subpasses = [super::super::proto::types::VkSubpassDescription2::default(); 3];
+        let info = VkRenderPassCreateInfo2 {
+            subpassCount: 3,
+            pSubpasses: subpasses.as_ptr(),
+            ..Default::default()
+        };
         let mut args = vn_command_vkCreateRenderPass2::default();
         args.device = VkDevice::forged(DEVICE);
         args.pCreateInfo = Some(Decoded::planted(&info));
@@ -19803,7 +19806,13 @@ mod tests {
         assert_eq!(args.ret, VkResult::VK_SUCCESS, "a device that has it makes the pass");
         assert!(h.rejected().is_none(), "served now; a build that still refuses it fails here");
 
-        let pass_begin = VkRenderPassBeginInfo::default();
+        let framebuffer = super::super::proto::types::VkFramebuffer::forged(0x78);
+        h.driver.plant_framebuffer(framebuffer, 0, 64, 64);
+        let pass_begin = VkRenderPassBeginInfo {
+            renderPass: VkRenderPass::forged(0x77),
+            framebuffer,
+            ..Default::default()
+        };
         let subpass_begin = VkSubpassBeginInfo::default();
         let subpass_end = VkSubpassEndInfo::default();
         h.vkCmdBeginRenderPass2(&mut vn_command_vkCmdBeginRenderPass2 {

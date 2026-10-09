@@ -134,6 +134,9 @@ use super::proto::types::{
     VkImageDrmFormatModifierListCreateInfoEXT, VkImageFormatListCreateInfo,
     VkImageStencilUsageCreateInfo,
 };
+use super::proto::types::{
+    VkRenderPassAttachmentBeginInfo, VkRenderPassSampleLocationsBeginInfoEXT,
+};
 use crate::budget::{Account, Charge, Charged};
 use std::sync::{Arc, Weak};
 
@@ -236,19 +239,37 @@ pub enum Level {
 }
 
 /// One object a pool handed out: the guest id it was allocated under, its level, and -- for a
-/// command buffer -- which bind points its recording has bound a pipeline at.
+/// command buffer -- what its current recording has done that later commands are held to.
 ///
-/// `bound` lives here rather than in a map of its own because a command buffer's pool record is
-/// already the thing that lives exactly as long as the buffer does: a freed buffer, a destroyed
-/// pool and a destroyed device all take it, and a record kept anywhere else would need each of
-/// those to remember it. Every other pool child carries it empty, as it carries `Unleveled`.
+/// `recording` lives here rather than in a map of its own because a command buffer's pool record
+/// is already the thing that lives exactly as long as the buffer does: a freed buffer, a
+/// destroyed pool and a destroyed device all take it, and a record kept anywhere else would need
+/// each of those to remember it. Every other pool child carries it empty, as it carries
+/// `Unleveled`.
 #[derive(Clone, Debug)]
 struct Child {
     id: ObjectId,
     level: Level,
-    bound: Bound,
-    /// For a descriptor set, what it was allocated as: kept here for the reason `bound` is.
+    recording: Recording,
+    /// For a descriptor set, what it was allocated as: kept here for the reason `recording` is.
     set: Option<SetFacts>,
+}
+
+/// What one command buffer's current recording has done that later commands in it are held to:
+/// the pipelines it has bound, and the render pass it is inside. A begin or a reset starts it
+/// over, all of it at once.
+#[derive(Clone, Debug, Default)]
+struct Recording {
+    bound: Bound,
+    pass: Option<InPass>,
+}
+
+/// The render pass a recording is inside, and which of its subpasses it is at. The pass is a
+/// share of its record, so a recording stays answerable after the pass is destroyed.
+#[derive(Clone, Debug)]
+struct InPass {
+    pass: Arc<RenderPassFacts>,
+    subpass: u32,
 }
 
 /// One binding of a descriptor set layout, as an update of a set of it is held to.
@@ -364,6 +385,16 @@ const SUBPASS_EXTERNAL: u32 = u32::MAX;
 pub struct RenderPassFacts {
     attachments: u32,
     colors: Vec<u32>,
+}
+
+/// What a framebuffer is, as a render pass begun in it is held to.
+#[derive(Clone, Copy, Debug)]
+pub struct FramebufferFacts {
+    attachments: u32,
+    width: u32,
+    height: u32,
+    /// Whether its views are named at each begin rather than at its making.
+    imageless: bool,
 }
 
 /// One subpass of either form of render pass, as its check reads it.
@@ -495,6 +526,11 @@ impl RenderPassFacts {
                 }
             });
         Self::held(info.attachmentCount, subpasses, dependencies)
+    }
+
+    /// How many subpasses it has.
+    fn subpasses(&self) -> u32 {
+        self.colors.len() as u32
     }
 
     /// Whether each subpass writes no more colour attachments than the device has: the runtime
@@ -751,7 +787,7 @@ impl Pools {
         for (handle, id) in children {
             p.children.insert(
                 TypedHandle::of(handle),
-                Child { id, level, bound: Bound::default(), set: None },
+                Child { id, level, recording: Recording::default(), set: None },
             );
             self.owner.insert(TypedHandle::of(handle), pool);
         }
@@ -803,13 +839,13 @@ impl Pools {
     /// Which bind points of a command buffer have a pipeline, if a pool here holds it.
     fn bound(&self, cb: VkCommandBuffer) -> Option<Bound> {
         let handle = TypedHandle::of(cb);
-        Some(self.open.get(self.owner.get(&handle)?)?.children.get(&handle)?.bound)
+        Some(self.open.get(self.owner.get(&handle)?)?.children.get(&handle)?.recording.bound)
     }
 
     /// Start a command buffer's bindings over, as a begin or a reset starts its recording over.
     fn unbind(&mut self, cb: VkCommandBuffer) {
         if let Some(c) = self.child_mut(cb) {
-            c.bound = Bound::default();
+            c.recording = Recording::default();
         }
     }
 
@@ -818,7 +854,7 @@ impl Pools {
     fn unbind_pool<P: Handle>(&mut self, pool: P) {
         if let Some(p) = self.open.get_mut(&TypedHandle::of(pool)) {
             for c in p.children.values_mut() {
-                c.bound = Bound::default();
+                c.recording = Recording::default();
             }
         }
     }
@@ -1114,6 +1150,8 @@ pub struct Driver {
     pipeline_layouts: BTreeMap<VkPipelineLayout, Arc<PipelineLayoutFacts>>,
     /// What each render pass is, keyed and kept as `set_layouts` is.
     render_passes: BTreeMap<VkRenderPass, Arc<RenderPassFacts>>,
+    /// What each framebuffer is, for the render passes begun in it.
+    framebuffers: BTreeMap<VkFramebuffer, FramebufferFacts>,
     /// What each query pool answers with, for the read-back that has to fit the room the guest
     /// offered. Keyed by host handle for the same reason as `images`, and kept honest the same
     /// way: the record dies at both places the pool does, so a recycled handle finds no record
@@ -2908,6 +2946,7 @@ impl Driver {
             set_layouts: BTreeMap::new(),
             pipeline_layouts: BTreeMap::new(),
             render_passes: BTreeMap::new(),
+            framebuffers: BTreeMap::new(),
             query_pools: BTreeMap::new(),
             buffers: BTreeMap::new(),
             semaphores: BTreeMap::new(),
@@ -4250,6 +4289,7 @@ impl Driver {
             set_layouts: &self.set_layouts,
             pipeline_layouts: &self.pipeline_layouts,
             render_passes: &self.render_passes,
+            framebuffers: &self.framebuffers,
         }
     }
 
@@ -4700,6 +4740,9 @@ impl Driver {
             }
             VkObjectType::VK_OBJECT_TYPE_RENDER_PASS => {
                 self.render_passes.remove(&VkRenderPass::from_host(handle));
+            }
+            VkObjectType::VK_OBJECT_TYPE_FRAMEBUFFER => {
+                self.framebuffers.remove(&VkFramebuffer::from_host(handle));
             }
             VkObjectType::VK_OBJECT_TYPE_BUFFER => {
                 self.buffers.remove(&VkBuffer::from_host(handle));
@@ -5480,6 +5523,20 @@ impl Driver {
         }
     }
 
+    /// Record a framebuffer of `attachments` attachments and `width` by `height`, with its own
+    /// views, as [`Driver::create_framebuffer`] would have.
+    #[cfg(test)]
+    pub(super) fn plant_framebuffer(
+        &mut self,
+        framebuffer: VkFramebuffer,
+        attachments: u32,
+        width: u32,
+        height: u32,
+    ) {
+        let facts = FramebufferFacts { attachments, width, height, imageless: false };
+        self.framebuffers.insert(framebuffer, facts);
+    }
+
     /// Record a pipeline layout of the set layouts `sets` describe, as
     /// [`Driver::create_pipeline_layout`] would have; `None` is a set it leaves to a library.
     #[cfg(test)]
@@ -5526,7 +5583,7 @@ impl Driver {
         self.record_pipeline(pipeline, device, kind);
         let serial = self.pipelines[&pipeline].serial;
         let child = self.pools.child_mut(cb).expect("a command buffer planted first");
-        child.bound = child.bound.with(point, Binding { pipeline, serial });
+        child.recording.bound = child.recording.bound.with(point, Binding { pipeline, serial });
     }
 
     /// Whether a pool is still open, for the test that a reset keeps it so where a destroy does
@@ -5707,6 +5764,28 @@ impl Driver {
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
     ) -> Result<VkBufferView, VkResult> {
         self.create_object(device, |d| Some(d.vkCreateBufferView()), info, alloc)
+    }
+
+    /// Create a framebuffer, and record what it is for the render passes begun in it.
+    pub fn create_framebuffer(
+        &mut self,
+        device: VkDevice,
+        info: cs::Decoded<'_, VkFramebufferCreateInfo, cs::Checked>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+    ) -> Result<VkFramebuffer, VkResult> {
+        const IMAGELESS: u32 =
+            VkFramebufferCreateFlagBits::VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT.0 as u32;
+        let facts = FramebufferFacts {
+            attachments: info.attachmentCount,
+            width: info.width,
+            height: info.height,
+            imageless: info.flags.0 & IMAGELESS != 0,
+        };
+        let host = self.create_object(device, |d| Some(d.vkCreateFramebuffer()), info, alloc);
+        if let Ok(framebuffer) = host {
+            self.framebuffers.insert(framebuffer, facts);
+        }
+        host
     }
 
     /// Create a render pass, and record what it is for the framebuffers made for it.
@@ -6077,70 +6156,136 @@ impl Driver {
         Some(())
     }
 
+    /// Begin a render pass in a primary recording not already inside one, and record that it is
+    /// at the pass's first subpass. The runtime begins over a pass already begun, and only a
+    /// primary command buffer begins one.
     pub fn cmd_begin_render_pass(
-        &self,
+        &mut self,
         cb: VkCommandBuffer,
-        begin: cs::Decoded<'_, VkRenderPassBeginInfo>,
+        begin: cs::Decoded<'_, VkRenderPassBeginInfo, cs::Checked>,
         contents: VkSubpassContents,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), RecordRefused> {
+        let f =
+            self.recorder(cb).map(|d| d.vkCmdBeginRenderPass()).ok_or(RecordRefused::NoDevice)?;
+        self.enter_pass(cb, begin)?;
         // SAFETY: as above.
-        unsafe { (d.vkCmdBeginRenderPass())(cb, begin.get(), contents) };
-        Some(())
+        unsafe { f(cb, begin.get(), contents) };
+        Ok(())
     }
 
-    pub fn cmd_end_render_pass(&self, cb: VkCommandBuffer) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above.
-        unsafe { (d.vkCmdEndRenderPass())(cb) };
-        Some(())
+    /// Record that `cb` is inside the pass `begin` begins, if it may begin one.
+    fn enter_pass(
+        &mut self,
+        cb: VkCommandBuffer,
+        begin: cs::Decoded<'_, VkRenderPassBeginInfo, cs::Checked>,
+    ) -> Result<(), RecordRefused> {
+        let pass = Arc::clone(
+            self.render_passes.get(&begin.renderPass).expect("its check found the pass's record"),
+        );
+        let child = self.pools.child_mut(cb).ok_or(RecordRefused::NoDevice)?;
+        if child.level != Level::Primary {
+            return Err(RecordRefused::Invalid(
+                "began a render pass in a secondary command buffer",
+            ));
+        }
+        if child.recording.pass.is_some() {
+            return Err(RecordRefused::Invalid("began a render pass inside another"));
+        }
+        child.recording.pass = Some(InPass { pass, subpass: 0 });
+        Ok(())
     }
 
-    pub fn cmd_next_subpass(&self, cb: VkCommandBuffer, contents: VkSubpassContents) -> Option<()> {
-        let d = self.recorder(cb)?;
+    /// Move `cb` on to the next subpass of the pass it is inside, if it has one: the runtime
+    /// reads the subpass after the last one past the end of the pass's array.
+    fn next_subpass(&mut self, cb: VkCommandBuffer) -> Result<(), RecordRefused> {
+        let child = self.pools.child_mut(cb).ok_or(RecordRefused::NoDevice)?;
+        let inside = child.recording.pass.as_mut();
+        let at = inside
+            .ok_or(RecordRefused::Invalid("moved to a next subpass outside a render pass"))?;
+        if at.subpass + 1 >= at.pass.subpasses() {
+            return Err(RecordRefused::Invalid("moved past the last subpass of its render pass"));
+        }
+        at.subpass += 1;
+        Ok(())
+    }
+
+    /// Record that `cb` is no longer inside a render pass.
+    fn leave_pass(&mut self, cb: VkCommandBuffer) -> Result<(), RecordRefused> {
+        let child = self.pools.child_mut(cb).ok_or(RecordRefused::NoDevice)?;
+        child.recording.pass = None;
+        Ok(())
+    }
+
+    pub fn cmd_end_render_pass(&mut self, cb: VkCommandBuffer) -> Result<(), RecordRefused> {
+        let f = self.recorder(cb).map(|d| d.vkCmdEndRenderPass()).ok_or(RecordRefused::NoDevice)?;
+        self.leave_pass(cb)?;
         // SAFETY: as above.
-        unsafe { (d.vkCmdNextSubpass())(cb, contents) };
-        Some(())
+        unsafe { f(cb) };
+        Ok(())
+    }
+
+    pub fn cmd_next_subpass(
+        &mut self,
+        cb: VkCommandBuffer,
+        contents: VkSubpassContents,
+    ) -> Result<(), RecordRefused> {
+        let f = self.recorder(cb).map(|d| d.vkCmdNextSubpass()).ok_or(RecordRefused::NoDevice)?;
+        self.next_subpass(cb)?;
+        // SAFETY: as above.
+        unsafe { f(cb, contents) };
+        Ok(())
     }
 
     /// The `VK_KHR_create_renderpass2` forms of the render pass commands, core in 1.2: the
     /// subpass contents move into a `VkSubpassBeginInfo`, and the end of a subpass gains a
     /// `VkSubpassEndInfo` of its own, each a struct the decoder built.
     pub fn cmd_begin_render_pass2(
-        &self,
+        &mut self,
         cb: VkCommandBuffer,
-        begin: cs::Decoded<'_, VkRenderPassBeginInfo>,
+        begin: cs::Decoded<'_, VkRenderPassBeginInfo, cs::Checked>,
         subpass: cs::Decoded<'_, VkSubpassBeginInfo>,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdBeginRenderPass2()?;
+    ) -> Result<(), RecordRefused> {
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdBeginRenderPass2())
+            .ok_or(RecordRefused::NoDevice)?;
+        self.enter_pass(cb, begin)?;
         // SAFETY: as above; both structs are arena allocations live for the call.
         unsafe { f(cb, begin.get(), subpass.get()) };
-        Some(())
+        Ok(())
     }
 
     /// See [`Driver::cmd_begin_render_pass2`].
     pub fn cmd_next_subpass2(
-        &self,
+        &mut self,
         cb: VkCommandBuffer,
         begin: cs::Decoded<'_, VkSubpassBeginInfo>,
         end: cs::Decoded<'_, VkSubpassEndInfo>,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdNextSubpass2()?;
+    ) -> Result<(), RecordRefused> {
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdNextSubpass2())
+            .ok_or(RecordRefused::NoDevice)?;
+        self.next_subpass(cb)?;
         // SAFETY: as above.
         unsafe { f(cb, begin.get(), end.get()) };
-        Some(())
+        Ok(())
     }
 
     /// See [`Driver::cmd_begin_render_pass2`].
     pub fn cmd_end_render_pass2(
-        &self,
+        &mut self,
         cb: VkCommandBuffer,
         end: cs::Decoded<'_, VkSubpassEndInfo>,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdEndRenderPass2()?;
+    ) -> Result<(), RecordRefused> {
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdEndRenderPass2())
+            .ok_or(RecordRefused::NoDevice)?;
+        self.leave_pass(cb)?;
         // SAFETY: as above.
         unsafe { f(cb, end.get()) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdBindPipeline`, held to the pipeline's record: a pipeline of this command buffer's
@@ -6166,7 +6311,8 @@ impl Driver {
         // SAFETY: as above.
         unsafe { (d.vkCmdBindPipeline())(cb, bind_point, pipeline) };
         let child = self.pools.child_mut(cb).expect("the pool record `device_of` just read");
-        child.bound = child.bound.with(point, Binding { pipeline, serial: facts.serial });
+        child.recording.bound =
+            child.recording.bound.with(point, Binding { pipeline, serial: facts.serial });
         Ok(())
     }
 
@@ -11775,6 +11921,109 @@ impl cs::Validate<cs::Chained<'_, VkRenderPassCreateInfo, DeviceFacts<'_>>>
     }
 }
 
+impl cs::Validate<DeviceFacts<'_>> for VkRenderPassBeginInfo {
+    /// A pass begun in a framebuffer made for one like it, over an area inside it. The runtime
+    /// looks up the framebuffer's views by the pass's attachments, and KosmicKrisp hands Metal
+    /// the area as it is. An imageless framebuffer's views come with the begin.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let (pass, framebuffer) = begun(&this, facts)?;
+        if framebuffer.attachments != pass.attachments {
+            return Err("began a pass in a framebuffer with other attachments than it");
+        }
+        let area = this.renderArea;
+        let within = |offset: i32, extent: u32, size: u32| {
+            u32::try_from(offset).is_ok_and(|o| u64::from(o) + u64::from(extent) <= u64::from(size))
+        };
+        if !within(area.offset.x, area.extent.width, framebuffer.width)
+            || !within(area.offset.y, area.extent.height, framebuffer.height)
+        {
+            return Err("began a pass over an area outside its framebuffer");
+        }
+        if framebuffer.imageless && chained::<VkRenderPassAttachmentBeginInfo, _>(this).is_none() {
+            return Err("began a pass in an imageless framebuffer without naming its views");
+        }
+        Ok(())
+    }
+}
+
+/// The pass a begin names and the framebuffer it names, from their records.
+fn begun(
+    info: &cs::Decoded<'_, VkRenderPassBeginInfo>,
+    facts: &DeviceFacts<'_>,
+) -> Result<(Arc<RenderPassFacts>, FramebufferFacts), &'static str> {
+    let pass = facts
+        .facts
+        .render_passes
+        .get(&info.renderPass)
+        .ok_or("began a render pass this renderer has no record of")?;
+    let framebuffer = facts
+        .facts
+        .framebuffers
+        .get(&info.framebuffer)
+        .ok_or("began a pass in a framebuffer this renderer has no record of")?;
+    Ok((Arc::clone(pass), *framebuffer))
+}
+
+impl cs::Validate<cs::Chained<'_, VkRenderPassBeginInfo, DeviceFacts<'_>>>
+    for VkRenderPassAttachmentBeginInfo
+{
+    /// The views of an imageless framebuffer, one for each attachment of the pass -- and none for
+    /// a framebuffer that has its own, since the runtime takes these over the framebuffer's
+    /// whenever there are any.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkRenderPassBeginInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let (pass, framebuffer) = begun(&on.root, on.facts)?;
+        let wanted = if framebuffer.imageless { pass.attachments } else { 0 };
+        if this.attachmentCount != wanted {
+            return Err("named other views at a begin than its framebuffer takes");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkRenderPassBeginInfo, DeviceFacts<'_>>>
+    for VkRenderPassSampleLocationsBeginInfoEXT
+{
+    /// Sample locations for attachments and subpasses of the pass, each set the device takes. The
+    /// runtime stores an attachment's into its array of the pass's attachments, unchecked.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkRenderPassBeginInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let (pass, _) = begun(&on.root, on.facts)?;
+        let attachments = regions_of(
+            &this,
+            this.attachmentInitialSampleLocationsCount,
+            this.pAttachmentInitialSampleLocations,
+        );
+        let subpasses = regions_of(
+            &this,
+            this.postSubpassSampleLocationsCount,
+            this.pPostSubpassSampleLocations,
+        );
+        if attachments.iter().any(|a| a.attachmentIndex >= pass.attachments)
+            || subpasses.iter().any(|s| s.subpassIndex >= pass.subpasses())
+        {
+            return Err("set sample locations for an attachment or subpass its pass does not have");
+        }
+        let infos = attachments
+            .iter()
+            .map(|a| &a.sampleLocationsInfo)
+            .chain(subpasses.iter().map(|s| &s.sampleLocationsInfo));
+        for info in infos {
+            // SAFETY: the decoder built these inside the arrays it allocated in the arena `this`
+            // borrows (see `Decoded::vouch`).
+            unsafe { cs::Decoded::vouch(info) }.validate(on.facts)?;
+        }
+        Ok(())
+    }
+}
+
 impl cs::Validate<DeviceFacts<'_>> for VkFramebufferCreateInfo {
     /// A framebuffer of the device's size or less, carrying the attachments its render pass
     /// describes -- an imageless one describing that many as well.
@@ -12898,6 +13147,7 @@ pub struct Facts<'d> {
     set_layouts: &'d BTreeMap<VkDescriptorSetLayout, Arc<LayoutFacts>>,
     pipeline_layouts: &'d BTreeMap<VkPipelineLayout, Arc<PipelineLayoutFacts>>,
     render_passes: &'d BTreeMap<VkRenderPass, Arc<RenderPassFacts>>,
+    framebuffers: &'d BTreeMap<VkFramebuffer, FramebufferFacts>,
 }
 
 /// [`Facts`], with the limits of the one device a command records or runs on. A check that holds
@@ -13434,6 +13684,13 @@ unsafe impl InStruct for VkFragmentShadingRateAttachmentInfoKHR {
 unsafe impl InStruct for VkFramebufferAttachmentsCreateInfo {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkRenderPassAttachmentBeginInfo {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -14891,6 +15148,132 @@ mod tests {
         assert!(alloc(&[9, 2], 2).is_err(), "more than its binding holds");
         assert!(alloc(&[1], 2).is_err(), "counts for another number of sets");
 
+        d.abandon_planted();
+    }
+
+    /// A pass is begun in a framebuffer made for one like it, over an area inside it, with views
+    /// only for an imageless one; a primary recording outside a pass begins it, moves through
+    /// its subpasses no further than the last, and leaves it at the end.
+    #[test]
+    fn a_render_pass_is_begun_and_moved_through_in_order() {
+        use crate::venus::proto::types::{
+            VkAttachmentSampleLocationsEXT, VkCommandPool, VkOffset2D, VkSubpassSampleLocationsEXT,
+        };
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const PASS: VkRenderPass = VkRenderPass::forged(0x900);
+        const FB: VkFramebuffer = VkFramebuffer::forged(0x910);
+        const IMAGELESS: VkFramebuffer = VkFramebuffer::forged(0x911);
+        const NARROW: VkFramebuffer = VkFramebuffer::forged(0x912);
+        let (cb, secondary) = (VkCommandBuffer::forged(0x20), VkCommandBuffer::forged(0x21));
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x30), &[(cb, ObjectId(1))]);
+        d.plant_pool_at(
+            DEVICE,
+            VkCommandPool::forged(0x31),
+            Level::Secondary,
+            &[(secondary, ObjectId(2))],
+        );
+        let subpass = || SubpassShape { named: Vec::new(), colors: 0 };
+        let pass = RenderPassFacts::held(2, vec![subpass(), subpass()], []).expect("a pass");
+        d.render_passes.insert(PASS, Arc::new(pass));
+        d.plant_framebuffer(FB, 2, 64, 64);
+        d.plant_framebuffer(NARROW, 1, 64, 64);
+        let imageless = FramebufferFacts { attachments: 2, width: 64, height: 64, imageless: true };
+        d.framebuffers.insert(IMAGELESS, imageless);
+
+        let begin = |framebuffer, x: i32, width: u32, next: *const core::ffi::c_void| {
+            VkRenderPassBeginInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                pNext: next,
+                renderPass: PASS,
+                framebuffer,
+                renderArea: VkRect2D {
+                    offset: VkOffset2D { x, y: 0 },
+                    extent: VkExtent2D { width, height: 64 },
+                },
+                ..Default::default()
+            }
+        };
+        let none = core::ptr::null();
+        let views = [VkImageView::forged(0xa00); 2];
+        let named = |count| VkRenderPassAttachmentBeginInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO,
+            attachmentCount: count,
+            pAttachments: views.as_ptr(),
+            ..Default::default()
+        };
+        let (two, one) = (named(2), named(1));
+        let (two, one) = ((&raw const two).cast(), (&raw const one).cast());
+        let located = |attachment, subpass| {
+            let a = [VkAttachmentSampleLocationsEXT {
+                attachmentIndex: attachment,
+                ..Default::default()
+            }];
+            let s = [VkSubpassSampleLocationsEXT { subpassIndex: subpass, ..Default::default() }];
+            (a, s)
+        };
+        let locations =
+            |(a, s): &([VkAttachmentSampleLocationsEXT; 1], [VkSubpassSampleLocationsEXT; 1])| {
+                VkRenderPassSampleLocationsBeginInfoEXT {
+                sType:
+                    VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_SAMPLE_LOCATIONS_BEGIN_INFO_EXT,
+                attachmentInitialSampleLocationsCount: 1,
+                pAttachmentInitialSampleLocations: a.as_ptr(),
+                postSubpassSampleLocationsCount: 1,
+                pPostSubpassSampleLocations: s.as_ptr(),
+                ..Default::default()
+            }
+            };
+        let (past_attachment, past_subpass) = (located(2, 0), located(0, 2));
+        let (past_attachment, past_subpass) =
+            (locations(&past_attachment), locations(&past_subpass));
+        {
+            let facts = d.device_facts(DEVICE).expect("a planted device");
+            let begun = |info: &VkRenderPassBeginInfo| {
+                cs::Decoded::planted(info).validate(&facts).map(|_| ())
+            };
+            assert_eq!(begun(&begin(FB, 0, 64, none)), Ok(()));
+            assert_eq!(begun(&begin(FB, 16, 48, none)), Ok(()), "an area reaching its edge");
+            assert!(begun(&begin(FB, 16, 49, none)).is_err(), "an area past its edge");
+            assert!(begun(&begin(FB, -1, 8, none)).is_err(), "an area before its edge");
+            assert!(begun(&begin(NARROW, 0, 64, none)).is_err(), "a framebuffer for another pass");
+            assert!(
+                begun(&begin(VkFramebuffer::forged(0x9ff), 0, 64, none)).is_err(),
+                "no framebuffer"
+            );
+            let mut stray = begin(FB, 0, 64, none);
+            stray.renderPass = VkRenderPass::forged(0x9ff);
+            assert!(begun(&stray).is_err(), "no pass");
+            assert_eq!(begun(&begin(IMAGELESS, 0, 64, two)), Ok(()), "an imageless one's views");
+            assert!(begun(&begin(IMAGELESS, 0, 64, none)).is_err(), "an imageless one without");
+            assert!(begun(&begin(IMAGELESS, 0, 64, one)).is_err(), "fewer views than its pass");
+            assert!(begun(&begin(FB, 0, 64, two)).is_err(), "views for one with its own");
+            let at = |l: &VkRenderPassSampleLocationsBeginInfoEXT| {
+                begun(&begin(FB, 0, 64, (&raw const *l).cast()))
+            };
+            assert!(at(&past_attachment).is_err(), "locations for an attachment past the pass's");
+            assert!(at(&past_subpass).is_err(), "locations for a subpass past the pass's");
+        }
+
+        let info = begin(FB, 0, 64, none);
+        let checked = || {
+            let facts = d.device_facts(DEVICE).expect("a planted device");
+            cs::Decoded::planted(&info).validate(&facts).expect("a begin")
+        };
+        let invalid = |r: Result<(), RecordRefused>| matches!(r, Err(RecordRefused::Invalid(_)));
+        let begin_checked = checked();
+        assert!(invalid(d.next_subpass(cb)), "a next subpass outside a pass");
+        assert!(invalid(d.enter_pass(secondary, begin_checked)), "a pass begun in a secondary");
+        assert_eq!(d.enter_pass(cb, begin_checked), Ok(()));
+        assert!(invalid(d.enter_pass(cb, begin_checked)), "a pass begun inside another");
+        assert_eq!(d.next_subpass(cb), Ok(()), "on to the second subpass");
+        assert!(invalid(d.next_subpass(cb)), "past the last subpass");
+        assert_eq!(d.leave_pass(cb), Ok(()));
+        assert_eq!(d.enter_pass(cb, begin_checked), Ok(()), "a pass begun after the last ended");
+        d.pools.unbind(cb);
+        assert!(invalid(d.next_subpass(cb)), "a reset leaves the pass");
+        assert_eq!(d.enter_pass(cb, begin_checked), Ok(()), "and a pass may begin again");
         d.abandon_planted();
     }
 
