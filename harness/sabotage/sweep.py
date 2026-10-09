@@ -150,7 +150,7 @@ SABOTAGES = [
         'a recorded query begin is handed to the driver past the end of the pool',
         'src/venus/driver.rs',
         """        let (d, facts) = self.query_recorder(cb, pool)?;
-        facts.holds(query, 1)?;
+        self.queries_from(cb, facts, query)?;
         facts.is_bracketed()?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdBeginQuery())(cb, pool, query, flags) };""",
@@ -3035,7 +3035,7 @@ SABOTAGES = [
     (
         'vkCmdBeginQueryIndexedEXT is not held to the pool',
         'src/venus/driver.rs',
-        """facts.holds(query, 1)?;
+        """self.queries_from(cb, facts, query)?;
         facts.is_bracketed()?;
         self.stream_fits(cb, facts, index)?;
         let f = d.try_vkCmdBeginQueryIndexedEXT()""",
@@ -4710,7 +4710,7 @@ SABOTAGES = [
     (
         'a subpass may write more colour attachments than the device has',
         'src/venus/driver.rs',
-        """        self.colors.iter().try_for_each(|&n| color_attachments_fit(facts, n))""",
+        """        self.subpasses.iter().try_for_each(|s| color_attachments_fit(facts, s.colors))""",
         """        Ok(())""",
         'a_render_pass_is_held_to_what_it_describes',
     ),
@@ -5777,15 +5777,15 @@ SABOTAGES = [
     (
         'a continued subpass is read as the first',
         'src/venus/driver.rs',
-        """        Ok(Scope::Rendering { colors: pass.colors[inheritance.subpass as usize] })""",
-        """        Ok(Scope::Rendering { colors: pass.colors[0] })""",
+        """        Ok(Scope::Rendering(pass.subpasses[inheritance.subpass as usize]))""",
+        """        Ok(Scope::Rendering(pass.subpasses[0]))""",
         'a_clear_names_an_attachment_of_the_rendering_it_is_inside',
     ),
     (
         'continued dynamic rendering is read as writing nothing',
         'src/venus/driver.rs',
-        """                .map_or(0, |r| r.colorAttachmentCount);""",
-        """                .map_or(0, |_| 0);""",
+        """                |r| SubpassFacts { colors: r.colorAttachmentCount, views: r.viewMask },""",
+        """                |r| SubpassFacts { colors: 0, views: r.viewMask },""",
         'a_clear_names_an_attachment_of_the_rendering_it_is_inside',
     ),
     (
@@ -5878,6 +5878,52 @@ SABOTAGES = [
         """                d.xfb.map_or(1, |x| x.streams)""",
         """                d.xfb.map_or(u32::MAX, |x| x.streams)""",
         'a_query_counts_only_what_its_device_counts',
+    ),
+    (
+        'a multiview query writes one query',
+        'src/venus/driver.rs',
+        """        self.at().map_or(0, |at| at.views.count_ones()).max(1)""",
+        """        1""",
+        'a_multiview_query_holds_one_query_per_view',
+    ),
+    (
+        'a query command is held to one query whatever the views',
+        'src/venus/driver.rs',
+        """        facts.holds(query, scope.queries())""",
+        """        facts.holds(query, 1)""",
+        'a_multiview_query_holds_one_query_per_view',
+    ),
+    (
+        'a version 1 render pass records no views',
+        'src/venus/driver.rs',
+        """                views: masks.get(i).copied().unwrap_or(0),""",
+        """                views: 0,""",
+        'a_multiview_query_holds_one_query_per_view',
+    ),
+    (
+        'a version 2 render pass records no views',
+        'src/venus/driver.rs',
+        """                views: s.viewMask,
+            });""",
+        """                views: 0,
+            });""",
+        'a_multiview_query_holds_one_query_per_view',
+    ),
+    (
+        'dynamic rendering records no views',
+        'src/venus/driver.rs',
+        """            colors: info.colorAttachmentCount,
+            views: info.viewMask,""",
+        """            colors: info.colorAttachmentCount,
+            views: 0,""",
+        'a_multiview_query_holds_one_query_per_view',
+    ),
+    (
+        'continued dynamic rendering inherits no views',
+        'src/venus/driver.rs',
+        """                |r| SubpassFacts { colors: r.colorAttachmentCount, views: r.viewMask },""",
+        """                |r| SubpassFacts { colors: r.colorAttachmentCount, views: 0 },""",
+        'a_clear_names_an_attachment_of_the_rendering_it_is_inside',
     ),
     (
         'a submit chained array is trusted by its count alone',

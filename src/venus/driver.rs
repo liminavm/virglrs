@@ -303,18 +303,29 @@ enum Scope {
     Pass(InPass),
     /// Dynamic rendering this recording began, or the rendering a secondary command buffer was
     /// begun to continue. Neither moves between subpasses, so all a later command reads of it is
-    /// how many colour attachments it writes.
-    Rendering { colors: u32 },
+    /// what one subpass would say.
+    Rendering(SubpassFacts),
 }
 
 impl Scope {
-    /// How many colour attachments the rendering writes, or `None` outside any.
-    fn colors(&self) -> Option<u32> {
+    /// The subpass the rendering is at, or `None` outside any.
+    fn at(&self) -> Option<SubpassFacts> {
         match self {
             Scope::Outside => None,
-            Scope::Pass(at) => Some(at.pass.colors[at.subpass as usize]),
-            Scope::Rendering { colors } => Some(*colors),
+            Scope::Pass(at) => Some(at.pass.subpasses[at.subpass as usize]),
+            Scope::Rendering(at) => Some(*at),
         }
+    }
+
+    /// How many colour attachments the rendering writes, or `None` outside any.
+    fn colors(&self) -> Option<u32> {
+        self.at().map(|at| at.colors)
+    }
+
+    /// How many queries a query command here writes: one per view of a multiview rendering, and
+    /// one outside any.
+    fn queries(&self) -> u32 {
+        self.at().map_or(0, |at| at.views.count_ones()).max(1)
     }
 }
 
@@ -434,11 +445,20 @@ const ATTACHMENT_UNUSED: u32 = u32::MAX;
 const SUBPASS_EXTERNAL: u32 = u32::MAX;
 
 /// What a render pass is, as what is made with it is held to: how many attachments a framebuffer
-/// for it carries, and how many colour attachments each of its subpasses writes.
+/// for it carries, and what each of its subpasses is.
 #[derive(Debug)]
 pub struct RenderPassFacts {
     attachments: u32,
-    colors: Vec<u32>,
+    subpasses: Vec<SubpassFacts>,
+}
+
+/// One subpass, or rendering that stands for one, as the commands recorded inside it are held to
+/// it: how many colour attachments it writes, and the views it renders, which multiply the queries
+/// a query command writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SubpassFacts {
+    colors: u32,
+    views: u32,
 }
 
 /// What a framebuffer is, as a render pass begun in it is held to.
@@ -456,6 +476,8 @@ struct SubpassShape {
     /// Every attachment it names, in every slot: `ATTACHMENT_UNUSED` for one it leaves empty.
     named: Vec<u32>,
     colors: u32,
+    /// Its view mask: zero for a subpass that is not multiview.
+    views: u32,
 }
 
 /// One dependency of either form of render pass, as its check reads it.
@@ -497,18 +519,24 @@ impl RenderPassFacts {
                 return Err("made a view-local dependency outside its pass, or past every view");
             }
         }
-        Ok(RenderPassFacts { attachments, colors: subpasses.iter().map(|s| s.colors).collect() })
+        let subpasses =
+            subpasses.iter().map(|s| SubpassFacts { colors: s.colors, views: s.views }).collect();
+        Ok(RenderPassFacts { attachments, subpasses })
     }
 
     /// A render pass made from a version 1 create info, whose view offsets are chained.
     fn of1<S>(info: cs::Decoded<'_, VkRenderPassCreateInfo, S>) -> Result<Self, &'static str> {
-        let offsets = chained::<VkRenderPassMultiviewCreateInfo, _>(info)
-            .map_or(&[][..], |m| regions_of(&m, m.dependencyCount, m.pViewOffsets));
+        let multiview = chained::<VkRenderPassMultiviewCreateInfo, _>(info);
+        let offsets =
+            multiview.map_or(&[][..], |m| regions_of(&m, m.dependencyCount, m.pViewOffsets));
+        // One mask per subpass or none, as the multiview struct's own check holds them.
+        let masks = multiview.map_or(&[][..], |m| regions_of(&m, m.subpassCount, m.pViewMasks));
         let refs =
             |n, p| regions_of(&info, n, p).iter().map(|r: &VkAttachmentReference| r.attachment);
         let subpasses = regions_of(&info, info.subpassCount, info.pSubpasses)
             .iter()
-            .map(|s| SubpassShape {
+            .enumerate()
+            .map(|(i, s)| SubpassShape {
                 named: refs(s.inputAttachmentCount, s.pInputAttachments)
                     .chain(refs(s.colorAttachmentCount, s.pColorAttachments))
                     .chain(refs(s.colorAttachmentCount, s.pResolveAttachments))
@@ -520,6 +548,7 @@ impl RenderPassFacts {
                     )
                     .collect(),
                 colors: s.colorAttachmentCount,
+                views: masks.get(i).copied().unwrap_or(0),
             })
             .collect();
         let dependencies = regions_of(&info, info.dependencyCount, info.pDependencies)
@@ -568,6 +597,7 @@ impl RenderPassFacts {
                     )
                     .collect(),
                 colors: s.colorAttachmentCount,
+                views: s.viewMask,
             });
         }
         let dependencies =
@@ -584,14 +614,14 @@ impl RenderPassFacts {
 
     /// How many subpasses it has.
     fn subpasses(&self) -> u32 {
-        self.colors.len() as u32
+        self.subpasses.len() as u32
     }
 
     /// Whether each subpass writes no more colour attachments than the device has: the runtime
     /// copies a subpass's into an array of eight, and KosmicKrisp begins rendering into one of
     /// `maxColorAttachments`.
     fn colors_fit(&self, facts: &DeviceFacts<'_>) -> Result<(), &'static str> {
-        self.colors.iter().try_for_each(|&n| color_attachments_fit(facts, n))
+        self.subpasses.iter().try_for_each(|s| color_attachments_fit(facts, s.colors))
     }
 }
 
@@ -5875,7 +5905,7 @@ impl Driver {
     #[cfg(test)]
     pub(super) fn plant_rendering(&mut self, cb: VkCommandBuffer, colors: u32) {
         let child = self.pools.child_mut(cb).expect("a command buffer planted first");
-        child.recording.scope = Scope::Rendering { colors };
+        child.recording.scope = Scope::Rendering(SubpassFacts { colors, views: 0 });
     }
 
     /// [`Driver::plant_pool`], with the children at a level of the test's choosing.
@@ -6416,9 +6446,11 @@ impl Driver {
             // SAFETY: the decoder allocated the inheritance, and all it points at, in the arena
             // `info` borrows (see `Decoded::vouch`).
             let inheritance = unsafe { cs::Decoded::vouch(inheritance) };
-            let colors = chained::<VkCommandBufferInheritanceRenderingInfo, _>(inheritance)
-                .map_or(0, |r| r.colorAttachmentCount);
-            return Ok(Scope::Rendering { colors });
+            let at = chained::<VkCommandBufferInheritanceRenderingInfo, _>(inheritance).map_or(
+                SubpassFacts { colors: 0, views: 0 },
+                |r| SubpassFacts { colors: r.colorAttachmentCount, views: r.viewMask },
+            );
+            return Ok(Scope::Rendering(at));
         }
         let pass = self.render_passes.get(&inheritance.renderPass).ok_or(
             RecordRefused::Invalid("continued a render pass this renderer has no record of"),
@@ -6428,7 +6460,7 @@ impl Driver {
                 "continued a subpass its render pass does not have",
             ));
         }
-        Ok(Scope::Rendering { colors: pass.colors[inheritance.subpass as usize] })
+        Ok(Scope::Rendering(pass.subpasses[inheritance.subpass as usize]))
     }
 
     pub fn end_command_buffer(&self, cb: VkCommandBuffer) -> Option<VkResult> {
@@ -7810,7 +7842,10 @@ impl Driver {
         if !matches!(child.recording.scope, Scope::Outside) {
             return Err(RecordRefused::Invalid("began rendering inside another"));
         }
-        child.recording.scope = Scope::Rendering { colors: info.colorAttachmentCount };
+        child.recording.scope = Scope::Rendering(SubpassFacts {
+            colors: info.colorAttachmentCount,
+            views: info.viewMask,
+        });
         // SAFETY: as above.
         unsafe { f(cb, info.get()) };
         Ok(())
@@ -9044,6 +9079,19 @@ impl Driver {
     // and the caller here is a guest. See [`QueryRefused`].
 
     /// The recorder for `cb` and the record for `pool`, for the query commands.
+    /// How many queries from `query` on a query command in `cb` writes: one per view of the
+    /// multiview rendering it is inside, which anv and KosmicKrisp both write past the one named,
+    /// so all must be the pool's. See [`Scope::queries`].
+    fn queries_from(
+        &self,
+        cb: VkCommandBuffer,
+        facts: &QueryFacts,
+        query: u32,
+    ) -> Result<(), QueryRefused> {
+        let scope = self.pools.scope(cb).ok_or(QueryRefused::NoDevice)?;
+        facts.holds(query, scope.queries())
+    }
+
     fn query_recorder(
         &self,
         cb: VkCommandBuffer,
@@ -9061,7 +9109,7 @@ impl Driver {
         flags: VkQueryControlFlags,
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
-        facts.holds(query, 1)?;
+        self.queries_from(cb, facts, query)?;
         facts.is_bracketed()?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdBeginQuery())(cb, pool, query, flags) };
@@ -9075,7 +9123,7 @@ impl Driver {
         query: u32,
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
-        facts.holds(query, 1)?;
+        self.queries_from(cb, facts, query)?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdEndQuery())(cb, pool, query) };
         Ok(())
@@ -9118,7 +9166,7 @@ impl Driver {
         index: u32,
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
-        facts.holds(query, 1)?;
+        self.queries_from(cb, facts, query)?;
         facts.is_bracketed()?;
         self.stream_fits(cb, facts, index)?;
         let f = d.try_vkCmdBeginQueryIndexedEXT().ok_or(QueryRefused::NotExported)?;
@@ -9136,7 +9184,7 @@ impl Driver {
         index: u32,
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
-        facts.holds(query, 1)?;
+        self.queries_from(cb, facts, query)?;
         self.stream_fits(cb, facts, index)?;
         let f = d.try_vkCmdEndQueryIndexedEXT().ok_or(QueryRefused::NotExported)?;
         // SAFETY: as above, and a query the pool holds.
@@ -9166,7 +9214,7 @@ impl Driver {
         query: u32,
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
-        facts.holds(query, 1)?;
+        self.queries_from(cb, facts, query)?;
         facts.counts(VkQueryType::VK_QUERY_TYPE_TIMESTAMP)?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdWriteTimestamp())(cb, stage, pool, query) };
@@ -9183,7 +9231,7 @@ impl Driver {
         query: u32,
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
-        facts.holds(query, 1)?;
+        self.queries_from(cb, facts, query)?;
         facts.counts(VkQueryType::VK_QUERY_TYPE_TIMESTAMP)?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdWriteTimestamp2())(cb, stage, pool, query) };
@@ -17370,7 +17418,7 @@ mod tests {
         const PASS: VkRenderPass = VkRenderPass::forged(0x900);
         let mut d = Driver::new(Account::for_test(None));
         d.plant_device(DEVICE, crate::vulkan::Device::default());
-        let subpass = || SubpassShape { named: Vec::new(), colors: 0 };
+        let subpass = || SubpassShape { named: Vec::new(), colors: 0, views: 0 };
         let pass = RenderPassFacts::held(0, vec![subpass(), subpass()], []).expect("a pass");
         d.render_passes.insert(PASS, Arc::new(pass));
         const LIBRARY: VkPipeline = VkPipeline::forged(0x800);
@@ -17708,7 +17756,7 @@ mod tests {
             Level::Secondary,
             &[(secondary, ObjectId(2))],
         );
-        let subpass = || SubpassShape { named: Vec::new(), colors: 0 };
+        let subpass = || SubpassShape { named: Vec::new(), colors: 0, views: 0 };
         let pass = RenderPassFacts::held(2, vec![subpass(), subpass()], []).expect("a pass");
         d.render_passes.insert(PASS, Arc::new(pass));
         d.plant_framebuffer(FB, 2, 64, 64);
@@ -23910,6 +23958,125 @@ mod tests {
         d.abandon_planted();
     }
 
+    /// A query command inside multiview rendering writes one query per view from the one it
+    /// names, so all of them are held to the pool; and each form of render pass, and dynamic
+    /// rendering, records the views its subpasses render.
+    #[test]
+    fn a_multiview_query_holds_one_query_per_view() {
+        use super::super::proto::types::{
+            VkQueryControlFlags, VkQueryPoolCreateInfo, VkRenderPassCreateInfo2,
+            VkRenderPassMultiviewCreateInfo, VkSubpassDescription, VkSubpassDescription2,
+        };
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        let cb = VkCommandBuffer::forged(0x10);
+        unsafe extern "C" fn begin(
+            _: VkCommandBuffer,
+            _: VkQueryPool,
+            _: u32,
+            _: VkQueryControlFlags,
+        ) {
+        }
+        unsafe extern "C" fn end(_: VkCommandBuffer, _: VkQueryPool, _: u32) {}
+        unsafe extern "C" fn stamp(
+            _: VkCommandBuffer,
+            _: VkPipelineStageFlagBits,
+            _: VkQueryPool,
+            _: u32,
+        ) {
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdBeginQuery(begin);
+        fns.plant_vkCmdEndQuery(end);
+        fns.plant_vkCmdWriteTimestamp(stamp);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x30), &[(cb, ObjectId(1))]);
+        let pool = |d: &mut Driver, handle: u64, kind: VkQueryType| {
+            let info =
+                VkQueryPoolCreateInfo { queryType: kind, queryCount: 4, ..Default::default() };
+            d.query_pools.insert(VkQueryPool::forged(handle), QueryFacts::of(&info));
+            VkQueryPool::forged(handle)
+        };
+        let occlusion = pool(&mut d, 0x50, VkQueryType::VK_QUERY_TYPE_OCCLUSION);
+        let timestamps = pool(&mut d, 0x51, VkQueryType::VK_QUERY_TYPE_TIMESTAMP);
+        let stage = VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        let at = |d: &Driver, query| {
+            let begun = d.cmd_begin_query(cb, occlusion, query, VkQueryControlFlags(0));
+            assert_eq!(begun, d.cmd_end_query(cb, occlusion, query), "begin and end agree");
+            assert_eq!(begun, d.cmd_write_timestamp(cb, stage, timestamps, query), "and a stamp");
+            begun
+        };
+        let past = Err(QueryRefused::OutOfPool);
+        // Outside any rendering, and inside rendering without views, one query is written.
+        assert_eq!(at(&d, 3), Ok(()));
+        d.plant_rendering(cb, 0);
+        assert_eq!(at(&d, 3), Ok(()));
+        // Three views write three queries, wherever the views are in the mask.
+        let views = |d: &mut Driver, mask| {
+            d.pools.child_mut(cb).expect("planted").recording.scope =
+                Scope::Rendering(SubpassFacts { colors: 0, views: mask });
+        };
+        views(&mut d, 0b1011);
+        assert_eq!(at(&d, 1), Ok(()));
+        assert_eq!(at(&d, 2), past);
+        views(&mut d, 1 << 31);
+        assert_eq!(at(&d, 3), Ok(()));
+        views(&mut d, u32::MAX);
+        assert_eq!(at(&d, 0), past, "32 views in a pool of 4");
+
+        // Each form of render pass records its subpasses' masks.
+        static MASKS: [u32; 2] = [0b11, 0b101];
+        let multiview = VkRenderPassMultiviewCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO,
+            subpassCount: 2,
+            pViewMasks: MASKS.as_ptr(),
+            ..Default::default()
+        };
+        let subpasses = [VkSubpassDescription::default(); 2];
+        let info = VkRenderPassCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+            pNext: (&raw const multiview).cast(),
+            subpassCount: 2,
+            pSubpasses: subpasses.as_ptr(),
+            ..Default::default()
+        };
+        let facts = RenderPassFacts::of1(cs::Decoded::planted(&info)).expect("a valid pass");
+        let views_of =
+            |f: &RenderPassFacts| f.subpasses.iter().map(|s| s.views).collect::<Vec<_>>();
+        assert_eq!(views_of(&facts), [0b11, 0b101]);
+        let info = VkRenderPassCreateInfo { pNext: core::ptr::null(), ..info };
+        let facts = RenderPassFacts::of1(cs::Decoded::planted(&info)).expect("a valid pass");
+        assert_eq!(views_of(&facts), [0, 0], "no multiview struct, no views");
+        let subpasses2 = MASKS.map(|mask| VkSubpassDescription2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+            viewMask: mask,
+            ..Default::default()
+        });
+        let info2 = VkRenderPassCreateInfo2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,
+            subpassCount: 2,
+            pSubpasses: subpasses2.as_ptr(),
+            ..Default::default()
+        };
+        let facts = RenderPassFacts::of2(cs::Decoded::planted(&info2)).expect("a valid pass");
+        assert_eq!(views_of(&facts), [0b11, 0b101]);
+
+        // Dynamic rendering records its own mask.
+        unsafe extern "C" fn rendering(_: VkCommandBuffer, _: *const VkRenderingInfo) {}
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdBeginRendering(rendering);
+        fns.plant_vkCmdBeginQuery(begin);
+        let fresh = VkCommandBuffer::forged(0x11);
+        d.plant_device(VkDevice::forged(4), fns);
+        d.plant_pool(VkDevice::forged(4), VkCommandPool::forged(0x31), &[(fresh, ObjectId(2))]);
+        let info = VkRenderingInfo { viewMask: 0b111, ..Default::default() };
+        assert_eq!(d.cmd_begin_rendering(fresh, cs::Decoded::planted_checked(&info)), Ok(()));
+        let flags = VkQueryControlFlags(0);
+        assert_eq!(d.cmd_begin_query(fresh, occlusion, 1, flags), Ok(()));
+        assert_eq!(d.cmd_begin_query(fresh, occlusion, 2, flags), past);
+        d.abandon_planted();
+    }
+
     /// A pipeline-statistics pool counts only statistics its device counts, and an indexed query
     /// names a vertex stream its pool counts: one of the device's transform feedback streams for
     /// a pool of streams, stream 0 for any other.
@@ -24068,7 +24235,7 @@ mod tests {
             Level::Secondary,
             &[(secondary, ObjectId(2))],
         );
-        let subpass = |colors| SubpassShape { named: Vec::new(), colors };
+        let subpass = |colors| SubpassShape { named: Vec::new(), colors, views: 0 };
         let pass = RenderPassFacts::held(0, vec![subpass(1), subpass(3)], []).expect("a pass");
         d.render_passes.insert(PASS, Arc::new(pass));
 
@@ -24111,13 +24278,14 @@ mod tests {
         let rendering = VkCommandBufferInheritanceRenderingInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO,
             colorAttachmentCount: 2,
+            viewMask: 0b11,
             ..Default::default()
         };
         let next = (&rendering as *const VkCommandBufferInheritanceRenderingInfo).cast();
-        for (what, pass, subpass, chain, last) in [
-            ("a pass's second subpass", PASS, 1, core::ptr::null(), Some(2)),
-            ("dynamic rendering", VkRenderPass::NULL, 0, next, Some(1)),
-            ("dynamic rendering naming nothing", VkRenderPass::NULL, 0, core::ptr::null(), None),
+        for (what, pass, subpass, chain, last, queries) in [
+            ("a pass's second subpass", PASS, 1, core::ptr::null(), Some(2), 1),
+            ("dynamic rendering", VkRenderPass::NULL, 0, next, Some(1), 2),
+            ("dynamic rendering naming nothing", VkRenderPass::NULL, 0, core::ptr::null(), None, 1),
         ] {
             let inheritance = VkCommandBufferInheritanceInfo {
                 pNext: chain,
@@ -24132,6 +24300,8 @@ mod tests {
             };
             let began = d.begin_command_buffer(secondary, cs::Decoded::planted(&info));
             assert_eq!(began, Ok(VkResult::VK_SUCCESS), "{what}");
+            let views = d.pools.scope(secondary).map(|s| s.queries());
+            assert_eq!(views, Some(queries), "{what}: one query per view");
             if let Some(last) = last {
                 assert_eq!(clear(&d, secondary, COLOR, last), Ok(()), "{what}: its last");
             }
@@ -24170,7 +24340,7 @@ mod tests {
             Level::Secondary,
             &[(secondary, ObjectId(2))],
         );
-        let subpass = || SubpassShape { named: Vec::new(), colors: 0 };
+        let subpass = || SubpassShape { named: Vec::new(), colors: 0, views: 0 };
         let pass = RenderPassFacts::held(0, vec![subpass(), subpass()], []).expect("a pass");
         d.render_passes.insert(PASS, Arc::new(pass));
 
