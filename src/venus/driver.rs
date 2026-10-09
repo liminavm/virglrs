@@ -144,6 +144,10 @@ use super::proto::types::{
     VkDescriptorPoolInlineUniformBlockCreateInfo, VkDescriptorSetLayoutSupport,
 };
 use super::proto::types::{
+    VkDeviceQueueCreateInfo, VkMemoryAllocateFlagsInfo, VkMemoryOpaqueCaptureAddressAllocateInfo,
+    VkQueueFamilyProperties,
+};
+use super::proto::types::{
     VkDrmFormatModifierPropertiesEXT, VkDrmFormatModifierPropertiesListEXT, VkFormatProperties2,
     VkImageDrmFormatModifierListCreateInfoEXT, VkImageFormatListCreateInfo,
     VkImageStencilUsageCreateInfo,
@@ -155,7 +159,6 @@ use super::proto::types::{
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo,
     VkShaderDescriptorSetAndBindingMappingInfoEXT, VkSpecializationMapEntry,
 };
-use super::proto::types::{VkMemoryAllocateFlagsInfo, VkMemoryOpaqueCaptureAddressAllocateInfo};
 use super::proto::types::{VkPipelineCreateFlagBits, VkPipelineShaderStageCreateInfo};
 use super::proto::types::{
     VkRenderPassAttachmentBeginInfo, VkRenderPassSampleLocationsBeginInfoEXT,
@@ -2549,6 +2552,30 @@ impl DriverWait {
     }
 }
 
+/// Whether each queue request names a family `families` has (by its queue count), asks for at
+/// least one and at most that many queues of it, and names a family no other request names.
+/// anv looks the family up in a fixed array by the guest's index and sizes its engine list by the
+/// queues asked for, checking both only with asserts.
+fn queue_requests_fit(
+    families: &[u32],
+    requests: &[VkDeviceQueueCreateInfo],
+) -> Result<(), &'static str> {
+    let mut named = vec![false; families.len()];
+    for r in requests {
+        let i = r.queueFamilyIndex as usize;
+        let Some(&most) = families.get(i) else {
+            return Err("created a device with a queue family it does not have");
+        };
+        if r.queueCount == 0 || r.queueCount > most {
+            return Err("created a device with more queues of a family than it has, or none");
+        }
+        if std::mem::replace(&mut named[i], true) {
+            return Err("created a device naming one queue family twice");
+        }
+    }
+    Ok(())
+}
+
 /// One live `VkDevice`: its entry points, and what its allocations need to know.
 struct DeviceState {
     fns: Arc<LiveDevice>,
@@ -3283,6 +3310,32 @@ impl Driver {
     }
 
     /// Create a device under this context's instance, and load its entry points.
+    /// Whether `info` asks only for queues `pd` has: see [`queue_requests_fit`].
+    pub fn device_queues_fit(
+        &self,
+        pd: VkPhysicalDevice,
+        info: &cs::Decoded<'_, VkDeviceCreateInfo>,
+    ) -> Result<(), &'static str> {
+        // A device on no instance is `create_device`'s to answer, as the driver would.
+        let Some(inst) = self.instance() else { return Ok(()) };
+        let mut count = 0u32;
+        // SAFETY: `pd` is a handle this instance returned; the first call writes only the count.
+        unsafe {
+            (inst.vkGetPhysicalDeviceQueueFamilyProperties())(pd, &mut count, core::ptr::null_mut())
+        };
+        let mut families = vec![VkQueueFamilyProperties::default(); count as usize];
+        // SAFETY: as above, and `families` holds the `count` entries the second call may write.
+        unsafe {
+            (inst.vkGetPhysicalDeviceQueueFamilyProperties())(pd, &mut count, families.as_mut_ptr())
+        };
+        families.truncate(count as usize);
+        let queues: Vec<u32> = families.iter().map(|f| f.queueCount).collect();
+        queue_requests_fit(
+            &queues,
+            regions_of(info, info.queueCreateInfoCount, info.pQueueCreateInfos),
+        )
+    }
+
     pub fn create_device(
         &mut self,
         pd: VkPhysicalDevice,
@@ -15683,6 +15736,13 @@ mod tests {
             ppEnabledExtensionNames: names.as_ptr(),
             ..Default::default()
         };
+        assert_eq!(d.device_queues_fit(pds[0], &cs::Decoded::planted(&info)), Ok(()));
+        let stray = VkDeviceQueueCreateInfo { queueFamilyIndex: 99, ..queue };
+        let astray = VkDeviceCreateInfo { pQueueCreateInfos: &stray, ..info };
+        assert!(
+            d.device_queues_fit(pds[0], &cs::Decoded::planted(&astray)).is_err(),
+            "a family KosmicKrisp does not have"
+        );
         let device = d.create_device(pds[0], cs::Decoded::planted(&info), None).expect("a device");
 
         let facts = d.device_facts(device).expect("the device just made");
@@ -16238,6 +16298,32 @@ mod tests {
         assert_eq!(located(&[1, ATTACHMENT_UNUSED, 7]), Ok(()));
         assert!(located(&[8]).is_err(), "a location past the device's");
         d.abandon_planted();
+    }
+
+    /// A device's queue requests name families it has, each once, for as many queues as the
+    /// family has at most and at least one.
+    #[test]
+    fn a_device_asks_only_for_queues_it_has() {
+        let ask = |family: u32, queues: u32| VkDeviceQueueCreateInfo {
+            queueFamilyIndex: family,
+            queueCount: queues,
+            ..Default::default()
+        };
+        let families = [1, 4];
+        assert_eq!(queue_requests_fit(&families, &[ask(0, 1), ask(1, 4)]), Ok(()));
+        assert_eq!(
+            queue_requests_fit(&families, &[]),
+            Ok(()),
+            "no queues is the driver's to answer"
+        );
+        assert!(queue_requests_fit(&families, &[ask(2, 1)]).is_err(), "a family past the device's");
+        assert!(queue_requests_fit(&families, &[ask(u32::MAX, 1)]).is_err(), "the largest index");
+        assert!(
+            queue_requests_fit(&families, &[ask(1, 5)]).is_err(),
+            "more queues than the family"
+        );
+        assert!(queue_requests_fit(&families, &[ask(0, 0)]).is_err(), "no queues of a family");
+        assert!(queue_requests_fit(&families, &[ask(1, 1), ask(1, 1)]).is_err(), "a family twice");
     }
 
     /// An allocation names a memory type the device has, and asks for no capture address.

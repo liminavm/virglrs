@@ -2907,6 +2907,9 @@ impl Commands for Handlers<'_> {
 
     fn vkCreateDevice(&mut self, args: &mut vn_command_vkCreateDevice<'_>) {
         let Some(info) = self.names(args.pCreateInfo) else { return };
+        if let Err(why) = self.driver.device_queues_fit(args.physicalDevice, &info) {
+            return self.reject(why);
+        }
         let host = self.driver.create_device(args.physicalDevice, info, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkCreateDevice", args.pDevice(), args.handle_pDevice_mut(), host);

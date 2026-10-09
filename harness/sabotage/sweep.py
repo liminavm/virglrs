@@ -5459,6 +5459,39 @@ SABOTAGES = [
         'an_allocation_names_a_memory_type_the_device_has',
     ),
     (
+        'a device may ask for a queue family it does not have',
+        'src/venus/driver.rs',
+        """        let Some(&most) = families.get(i) else {
+            return Err("created a device with a queue family it does not have");
+        };""",
+        """        let most = families.get(i).copied().unwrap_or(u32::MAX);
+        if i >= named.len() {
+            continue;
+        }""",
+        'a_device_asks_only_for_queues_it_has',
+    ),
+    (
+        'a device may ask for more queues of a family than it has',
+        'src/venus/driver.rs',
+        """        if r.queueCount == 0 || r.queueCount > most {""",
+        """        if r.queueCount == 0 {""",
+        'a_device_asks_only_for_queues_it_has',
+    ),
+    (
+        'a device may ask for no queues of a family',
+        'src/venus/driver.rs',
+        """        if r.queueCount == 0 || r.queueCount > most {""",
+        """        if r.queueCount > most {""",
+        'a_device_asks_only_for_queues_it_has',
+    ),
+    (
+        'a device may name a queue family twice',
+        'src/venus/driver.rs',
+        """        if std::mem::replace(&mut named[i], true) {""",
+        """        if std::mem::replace(&mut named[i], true) && false {""",
+        'a_device_asks_only_for_queues_it_has',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

@@ -182,7 +182,7 @@ vkCreateComputePipelines                         validated
 vkCreateDescriptorPool                           validated
 vkCreateDescriptorSetLayout                      validated
 vkCreateDescriptorUpdateTemplate                 reviewed
-vkCreateDevice                                   reviewed
+vkCreateDevice                                   validated
 vkCreateEvent                                    reviewed
 vkCreateFence                                    reviewed
 vkCreateFramebuffer                              validated
