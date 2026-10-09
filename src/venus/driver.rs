@@ -12096,6 +12096,9 @@ impl cs::Validate<DeviceFacts<'_>> for VkGraphicsPipelineCreateInfo {
         let dynamic = regions_of(&this, 1, this.pDynamicState)
             .first()
             .map_or(&[][..], |d| regions_of(&this, d.dynamicStateCount, d.pDynamicStates));
+        if !dynamic.iter().all(|state| RUNTIME_DYNAMIC_STATES.contains(state)) {
+            return Err("made a pipeline dynamic in a state the driver has no case for");
+        }
         let is_dynamic = |state: D| dynamic.contains(&state);
         let samples_dynamic = is_dynamic(D::VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT);
         if let Some(ms) = multisample {
@@ -12125,6 +12128,68 @@ impl cs::Validate<DeviceFacts<'_>> for VkGraphicsPipelineCreateInfo {
         Ok(())
     }
 }
+
+/// The dynamic states the Mesa runtime has a case for. It reaches `UNREACHABLE` on any other,
+/// which a release build compiles to undefined behaviour.
+const RUNTIME_DYNAMIC_STATES: [VkDynamicState; 57] = [
+    VkDynamicState::VK_DYNAMIC_STATE_VERTEX_INPUT_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
+    VkDynamicState::VK_DYNAMIC_STATE_VIEWPORT,
+    VkDynamicState::VK_DYNAMIC_STATE_SCISSOR,
+    VkDynamicState::VK_DYNAMIC_STATE_LINE_WIDTH,
+    VkDynamicState::VK_DYNAMIC_STATE_DEPTH_BIAS,
+    VkDynamicState::VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+    VkDynamicState::VK_DYNAMIC_STATE_DEPTH_BOUNDS,
+    VkDynamicState::VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+    VkDynamicState::VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+    VkDynamicState::VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+    VkDynamicState::VK_DYNAMIC_STATE_CULL_MODE,
+    VkDynamicState::VK_DYNAMIC_STATE_FRONT_FACE,
+    VkDynamicState::VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+    VkDynamicState::VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT,
+    VkDynamicState::VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
+    VkDynamicState::VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+    VkDynamicState::VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+    VkDynamicState::VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+    VkDynamicState::VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
+    VkDynamicState::VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+    VkDynamicState::VK_DYNAMIC_STATE_STENCIL_OP,
+    VkDynamicState::VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE,
+    VkDynamicState::VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+    VkDynamicState::VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
+    VkDynamicState::VK_DYNAMIC_STATE_DISCARD_RECTANGLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_DISCARD_RECTANGLE_ENABLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_DISCARD_RECTANGLE_MODE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR,
+    VkDynamicState::VK_DYNAMIC_STATE_LINE_STIPPLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_LOGIC_OP_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_COLOR_WRITE_ENABLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_TESSELLATION_DOMAIN_ORIGIN_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_POLYGON_MODE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_SAMPLE_MASK_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_ALPHA_TO_ONE_ENABLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_RASTERIZATION_STREAM_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_CONSERVATIVE_RASTERIZATION_MODE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_EXTRA_PRIMITIVE_OVERESTIMATION_SIZE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_DEPTH_CLIP_ENABLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_ENABLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_PROVOKING_VERTEX_MODE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_LINE_RASTERIZATION_MODE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_LINE_STIPPLE_ENABLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT,
+    VkDynamicState::VK_DYNAMIC_STATE_COLOR_BLEND_ADVANCED_EXT,
+];
 
 /// The state a graphics pipeline create info points at, held to its own check with its chain,
 /// or `None` where it points at none.
@@ -16369,6 +16434,17 @@ mod tests {
         assert_eq!(blended(8, 8), Ok(()));
         assert!(blended(9, 0).is_err(), "more blended attachments than the device has");
         assert!(blended(1, 9).is_err(), "more write enables than the device has");
+
+        assert!(
+            sampled(&ms, &[Dy::VK_DYNAMIC_STATE_RAY_TRACING_PIPELINE_STACK_SIZE_KHR]).is_err(),
+            "a state with no case"
+        );
+        assert!(sampled(&ms, &[Dy(0x7fff_0000)]).is_err(), "a state Vulkan has not");
+        assert_eq!(
+            sampled(&ms, &[Dy::VK_DYNAMIC_STATE_COLOR_BLEND_ADVANCED_EXT]),
+            Ok(()),
+            "the last state with a case"
+        );
 
         let missing = |info: VkGraphicsPipelineCreateInfo, dy: &[Dy]| {
             let dy = dynamic(dy);

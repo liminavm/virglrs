@@ -5424,6 +5424,13 @@ SABOTAGES = [
         'ray_tracing_groups_name_their_own_stages',
     ),
     (
+        'a pipeline may be dynamic in a state the driver has no case for',
+        'src/venus/driver.rs',
+        """        if !dynamic.iter().all(|state| RUNTIME_DYNAMIC_STATES.contains(state)) {""",
+        """        if dynamic.is_empty() && dynamic.len() > 1 {""",
+        'a_graphics_pipeline_holds_its_states',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",
