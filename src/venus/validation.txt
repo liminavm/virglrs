@@ -110,7 +110,7 @@ vkCmdSetBlendConstants                           reviewed
 vkCmdSetColorBlendAdvancedEXT                    validated
 vkCmdSetColorBlendEnableEXT                      validated
 vkCmdSetColorBlendEquationEXT                    validated
-vkCmdSetColorWriteEnableEXT                      reviewed
+vkCmdSetColorWriteEnableEXT                      validated
 vkCmdSetColorWriteMaskEXT                        validated
 vkCmdSetConservativeRasterizationModeEXT         reviewed
 vkCmdSetCullMode                                 reviewed
@@ -130,7 +130,7 @@ vkCmdSetDeviceMask                               reviewed
 vkCmdSetEvent                                    reviewed
 vkCmdSetEvent2                                   reviewed
 vkCmdSetExtraPrimitiveOverestimationSizeEXT      reviewed
-vkCmdSetFragmentShadingRateKHR                   reviewed
+vkCmdSetFragmentShadingRateKHR                   validated
 vkCmdSetFrontFace                                reviewed
 vkCmdSetLineRasterizationModeEXT                 reviewed
 vkCmdSetLineStipple                              reviewed
@@ -138,15 +138,15 @@ vkCmdSetLineStippleEnableEXT                     reviewed
 vkCmdSetLineWidth                                reviewed
 vkCmdSetLogicOpEXT                               reviewed
 vkCmdSetLogicOpEnableEXT                         reviewed
-vkCmdSetPatchControlPointsEXT                    reviewed
-vkCmdSetPolygonModeEXT                           reviewed
+vkCmdSetPatchControlPointsEXT                    validated
+vkCmdSetPolygonModeEXT                           validated
 vkCmdSetPrimitiveRestartEnable                   reviewed
 vkCmdSetPrimitiveTopology                        reviewed
 vkCmdSetProvokingVertexModeEXT                   reviewed
-vkCmdSetRasterizationSamplesEXT                  reviewed
+vkCmdSetRasterizationSamplesEXT                  validated
 vkCmdSetRasterizationStreamEXT                   reviewed
 vkCmdSetRasterizerDiscardEnable                  reviewed
-vkCmdSetRayTracingPipelineStackSizeKHR           reviewed
+vkCmdSetRayTracingPipelineStackSizeKHR           validated
 vkCmdSetRenderingAttachmentLocations             validated
 vkCmdSetRenderingInputAttachmentIndices          validated
 vkCmdSetSampleLocationsEXT                       validated

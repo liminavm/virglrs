@@ -5550,7 +5550,7 @@ impl Commands for Handlers<'_> {
         let done = self
             .driver
             .cmd_set_ray_tracing_pipeline_stack_size(args.commandBuffer, args.pipelineStackSize);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdDrawMeshTasksEXT(&mut self, args: &mut vn_command_vkCmdDrawMeshTasksEXT<'_>) {
@@ -5987,7 +5987,7 @@ impl Commands for Handlers<'_> {
     ) {
         let done =
             self.driver.cmd_set_patch_control_points(args.commandBuffer, args.patchControlPoints);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdSetBlendConstants(&mut self, args: &mut vn_command_vkCmdSetBlendConstants<'_>) {
@@ -6123,7 +6123,7 @@ impl Commands for Handlers<'_> {
     ) {
         let done =
             self.driver.cmd_set_color_write_enable(args.commandBuffer, args.pColorWriteEnables());
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdSetScissor(&mut self, args: &mut vn_command_vkCmdSetScissor<'_>) {
@@ -6412,7 +6412,7 @@ impl Commands for Handlers<'_> {
         };
         let done =
             self.driver.cmd_set_fragment_shading_rate(args.commandBuffer, size, args.combinerOps);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdBindTransformFeedbackBuffersEXT(
@@ -6510,7 +6510,7 @@ impl Commands for Handlers<'_> {
 
     fn vkCmdSetPolygonModeEXT(&mut self, args: &mut vn_command_vkCmdSetPolygonModeEXT<'_>) {
         let done = self.driver.cmd_set_polygon_mode(args.commandBuffer, args.polygonMode);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdSetRasterizationSamplesEXT(
@@ -6520,7 +6520,7 @@ impl Commands for Handlers<'_> {
         let done = self
             .driver
             .cmd_set_rasterization_samples(args.commandBuffer, args.rasterizationSamples);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdSetAlphaToCoverageEnableEXT(
@@ -21843,6 +21843,174 @@ mod tests {
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
+    }
+
+    /// The dynamic-state setters whose values a driver indexes or divides by are held to what
+    /// the device has: a ray-tracing stack to this renderer's ceiling, a polygon mode to the
+    /// extensions enabled, a sample count, a fragment size, a patch size, and a run of colour
+    /// write switches to the device's limits.
+    #[test]
+    fn a_dynamic_state_value_is_one_the_device_has() {
+        use super::super::proto::types::{
+            VkBool32, VkCommandBuffer, VkCommandPool, VkDevice, VkExtent2D,
+            VkFragmentShadingRateCombinerOpKHR, VkPolygonMode, VkSampleCountFlagBits,
+            vn_command_vkCmdSetColorWriteEnableEXT, vn_command_vkCmdSetFragmentShadingRateKHR,
+            vn_command_vkCmdSetPatchControlPointsEXT, vn_command_vkCmdSetPolygonModeEXT,
+            vn_command_vkCmdSetRasterizationSamplesEXT,
+            vn_command_vkCmdSetRayTracingPipelineStackSizeKHR,
+        };
+
+        const DEVICE: u64 = 3;
+        const CB: (u64, u64) = (0x71, 0x17);
+        unsafe extern "C" fn stack(_: VkCommandBuffer, _: u32) {}
+        unsafe extern "C" fn polygon(_: VkCommandBuffer, _: VkPolygonMode) {}
+        unsafe extern "C" fn samples(_: VkCommandBuffer, _: VkSampleCountFlagBits) {}
+        unsafe extern "C" fn rate(
+            _: VkCommandBuffer,
+            _: *const VkExtent2D,
+            _: *const VkFragmentShadingRateCombinerOpKHR,
+        ) {
+        }
+        unsafe extern "C" fn patch(_: VkCommandBuffer, _: u32) {}
+        unsafe extern "C" fn writes(_: VkCommandBuffer, _: u32, _: *const VkBool32) {}
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetRayTracingPipelineStackSizeKHR(stack);
+        fns.plant_vkCmdSetPolygonModeEXT(polygon);
+        fns.plant_vkCmdSetRasterizationSamplesEXT(samples);
+        fns.plant_vkCmdSetFragmentShadingRateKHR(rate);
+        fns.plant_vkCmdSetPatchControlPointsEXT(patch);
+        fns.plant_vkCmdSetColorWriteEnableEXT(writes);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(0x70),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+
+        macro_rules! run {
+            ($call:expr) => {{
+                let mut rings = BTreeMap::new();
+                let mut ctx_reply = None;
+                let mut monitor = None;
+                let mut jrnl = Journal::new();
+                let mut h = Handlers {
+                    objects: &objects,
+                    todo: &todo,
+                    driver: &mut driver,
+                    global: &global,
+                    ctx: ContextId::new(1).expect("1 is not zero"),
+                    ask: None,
+                    resources: &NO_RESOURCES,
+                    rings: &mut rings,
+                    monitor: &mut monitor,
+                    replaying: false,
+                    depth: 0,
+                    answer: None,
+                    own_wait: None,
+                    current_ring: None,
+                    reply: &mut ctx_reply,
+                    note: None,
+                    journal: &mut jrnl,
+                };
+                #[allow(clippy::redundant_closure_call)]
+                (|h: &mut Handlers| $call(h))(&mut h);
+                h.rejected()
+            }};
+        }
+        let cb = VkCommandBuffer::forged(CB.0);
+
+        let too_deep = Some("set a ray-tracing stack larger than this renderer serves");
+        for (size, why) in [(32 << 20, None), ((32 << 20) + 1, too_deep), (u32::MAX, too_deep)] {
+            let mut args = vn_command_vkCmdSetRayTracingPipelineStackSizeKHR {
+                commandBuffer: cb,
+                pipelineStackSize: size,
+                ..Default::default()
+            };
+            let refused =
+                run!(|h: &mut Handlers| h.vkCmdSetRayTracingPipelineStackSizeKHR(&mut args));
+            assert_eq!(refused, why, "a stack of {size} bytes");
+        }
+
+        // Fill rectangle is a polygon mode only on a device that enabled its extension.
+        type M = VkPolygonMode;
+        let not_enabled = Some("set a polygon mode the device did not enable");
+        let rectangle = M::VK_POLYGON_MODE_FILL_RECTANGLE_NV;
+        for (mode, why) in [
+            (M::VK_POLYGON_MODE_POINT, None),
+            (rectangle, not_enabled),
+            (VkPolygonMode(3), not_enabled),
+        ] {
+            let mut args = vn_command_vkCmdSetPolygonModeEXT {
+                commandBuffer: cb,
+                polygonMode: mode,
+                ..Default::default()
+            };
+            assert_eq!(run!(|h: &mut Handlers| h.vkCmdSetPolygonModeEXT(&mut args)), why);
+        }
+        driver.plant_fill_rectangle(VkDevice::forged(DEVICE));
+        let mut args = vn_command_vkCmdSetPolygonModeEXT {
+            commandBuffer: cb,
+            polygonMode: rectangle,
+            ..Default::default()
+        };
+        assert_eq!(run!(|h: &mut Handlers| h.vkCmdSetPolygonModeEXT(&mut args)), None);
+
+        // The planted device rasterizes at 1, 2, 4 and 8 samples.
+        let no_count = Some("set a rasterization sample count the device does not have");
+        for (bits, why) in [(8, None), (16, no_count), (64, no_count), (3, no_count), (0, no_count)]
+        {
+            let mut args = vn_command_vkCmdSetRasterizationSamplesEXT {
+                commandBuffer: cb,
+                rasterizationSamples: VkSampleCountFlagBits(bits),
+                ..Default::default()
+            };
+            let refused = run!(|h: &mut Handlers| h.vkCmdSetRasterizationSamplesEXT(&mut args));
+            assert_eq!(refused, why, "{bits} samples");
+        }
+
+        let no_size = Some("set a fragment size Vulkan does not have");
+        for (width, height, why) in
+            [(4, 2, None), (1, 1, None), (3, 1, no_size), (1, 8, no_size), (0, 1, no_size)]
+        {
+            let size = VkExtent2D { width, height };
+            let mut args = vn_command_vkCmdSetFragmentShadingRateKHR {
+                commandBuffer: cb,
+                pFragmentSize: Some(&size),
+                ..Default::default()
+            };
+            let refused = run!(|h: &mut Handlers| h.vkCmdSetFragmentShadingRateKHR(&mut args));
+            assert_eq!(refused, why, "{width}x{height}");
+        }
+
+        // The planted patch size limit is KosmicKrisp's 32.
+        let no_patch = Some("set a patch size the device does not have");
+        for (points, why) in [(1, None), (32, None), (0, no_patch), (33, no_patch), (256, no_patch)]
+        {
+            let mut args = vn_command_vkCmdSetPatchControlPointsEXT {
+                commandBuffer: cb,
+                patchControlPoints: points,
+                ..Default::default()
+            };
+            let refused = run!(|h: &mut Handlers| h.vkCmdSetPatchControlPointsEXT(&mut args));
+            assert_eq!(refused, why, "{points} control points");
+        }
+
+        // The planted device has eight colour attachments.
+        let too_many = Some("set color writes for more attachments than the device has");
+        for (n, why) in [(8, None), (9, too_many), (33, too_many)] {
+            let switches = vec![VkBool32(1); n];
+            let mut args = vn_command_vkCmdSetColorWriteEnableEXT::default();
+            args.commandBuffer = cb;
+            args.plant_pColorWriteEnables(&switches);
+            let refused = run!(|h: &mut Handlers| h.vkCmdSetColorWriteEnableEXT(&mut args));
+            assert_eq!(refused, why, "{n} switches");
+        }
+        driver.abandon_planted();
     }
 
     /// A command pool names a queue family its device has, or the driver is never asked.

@@ -1106,9 +1106,22 @@ fn planted_limits() -> VkPhysicalDeviceLimits {
         maxImageDimensionCube: 16384,
         maxImageArrayLayers: 2048,
         maxDrawIndirectCount: u32::from(u16::MAX),
+        maxTessellationPatchSize: 32,
+        framebufferColorSampleCounts: super::proto::types::VkSampleCountFlags(0b1111),
+        framebufferDepthSampleCounts: super::proto::types::VkSampleCountFlags(0b1111),
+        framebufferStencilSampleCounts: super::proto::types::VkSampleCountFlags(0b1111),
+        framebufferNoAttachmentsSampleCounts: super::proto::types::VkSampleCountFlags(0b1111),
         ..Default::default()
     }
 }
+
+/// The largest ray-tracing pipeline stack, in bytes per invocation, this renderer passes on.
+///
+/// Vulkan sets no limit, but anv keeps its scratch buffers in sixteen buckets indexed by the
+/// stack's size, the last for stacks up to 32 MiB, and indexes past them on the host for anything
+/// larger, checking only with an assert. This is this renderer's own ceiling, not Vulkan's, and
+/// is set where anv's table ends.
+const MAX_RAY_TRACING_STACK: u32 = 32 << 20;
 
 /// The bytes of one `VkDrawIndirectCommand`, `VkDrawIndexedIndirectCommand`,
 /// `VkDrawMeshTasksIndirectCommandEXT` and `VkDispatchIndirectCommand`: the records an indirect
@@ -1132,6 +1145,18 @@ fn queue_families(inst: &InstanceFns, pd: VkPhysicalDevice) -> Vec<VkQueueFamily
     };
     families.truncate(count as usize);
     families
+}
+
+/// Whether `samples` is one sample count a framebuffer of the device can be rasterized at. The
+/// Mesa runtime holds it only by an assert, and anv programs counts past sixteen as reserved
+/// encodings.
+fn rasterizes_at(limits: &VkPhysicalDeviceLimits, samples: VkSampleCountFlagBits) -> bool {
+    let counts = limits.framebufferColorSampleCounts.0
+        | limits.framebufferDepthSampleCounts.0
+        | limits.framebufferStencilSampleCounts.0
+        | limits.framebufferNoAttachmentsSampleCounts.0;
+    let bit = samples.0 as u32;
+    bit.is_power_of_two() && counts & bit != 0
 }
 
 /// Whether `count` entries written from `first` lie inside an array of `limit`, the shape of every
@@ -2676,6 +2701,10 @@ struct DeviceState {
     /// feedback. anv stores a bound buffer at `firstBinding + i` in an array this long, checking
     /// only with an assert, and reads a stream's register by an index it bounds the same way.
     xfb: Option<XfbLimits>,
+    /// Whether it enabled `VK_NV_fill_rectangle`, the one extension that makes
+    /// `VK_POLYGON_MODE_FILL_RECTANGLE_NV` a polygon mode: anv takes the hardware fill mode out of
+    /// a three-entry table by the mode, unchecked.
+    fill_rectangle: bool,
     /// The device's limits, read once at creation. A driver indexes fixed arrays by guest values
     /// these bound -- the push-constant block is `maxPushConstantsSize` bytes in KosmicKrisp --
     /// and checks none of them, so a command whose values exceed one is refused here.
@@ -3525,6 +3554,7 @@ impl Driver {
                     capture_replay: rt.shaderGroupHandleCaptureReplaySize,
                 }
             });
+        let fill_rectangle = wanted.iter().any(|n| n == "VK_NV_fill_rectangle");
         let xfb = wanted.iter().any(|n| n == "VK_EXT_transform_feedback").then(|| {
             let mut tf = VkPhysicalDeviceTransformFeedbackPropertiesEXT {
                 sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT,
@@ -3561,6 +3591,7 @@ impl Driver {
                 queue_families: families,
                 group_handles,
                 xfb,
+                fill_rectangle,
                 limits,
                 sample_locations,
                 query_types,
@@ -5519,6 +5550,7 @@ impl Driver {
                 queue_families: 1,
                 group_handles: None,
                 xfb: None,
+                fill_rectangle: false,
                 limits: planted_limits(),
                 sample_locations: None,
                 query_types: enabled_query_types(&[], true),
@@ -5579,15 +5611,22 @@ impl Driver {
         self.devices.get_mut(&handle).expect("a planted device").limits = limits;
     }
 
-    /// Give a planted device the shader group handle sizes `vkCreateDevice` would have read off a
-    /// driver with ray-tracing pipelines.
+    /// Mark a planted device as having enabled `VK_NV_fill_rectangle`. Test scaffolding.
+    #[cfg(test)]
+    pub(super) fn plant_fill_rectangle(&mut self, handle: VkDevice) {
+        self.devices.get_mut(&handle).expect("a planted device").fill_rectangle = true;
+    }
+
+    /// Give a planted device the transform feedback limits `vkCreateDevice` would have read off
+    /// a driver with transform feedback.
     #[cfg(test)]
     pub(super) fn plant_xfb_limits(&mut self, handle: VkDevice, buffers: u32, streams: u32) {
         let d = self.devices.get_mut(&handle).expect("a planted device");
         d.xfb = Some(XfbLimits { buffers, streams });
     }
 
-    /// Give a planted device the shader group handle sizes `vkCreateDevice` would have read.
+    /// Give a planted device the shader group handle sizes `vkCreateDevice` would have read off a
+    /// driver with ray-tracing pipelines.
     #[cfg(test)]
     pub(super) fn plant_group_handle_sizes(
         &mut self,
@@ -7091,16 +7130,24 @@ impl Driver {
         Ok(())
     }
 
-    /// `vkCmdSetRayTracingPipelineStackSizeKHR`.
+    /// `vkCmdSetRayTracingPipelineStackSizeKHR`, held to [`MAX_RAY_TRACING_STACK`].
     pub fn cmd_set_ray_tracing_pipeline_stack_size(
         &self,
         cb: VkCommandBuffer,
         size: u32,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdSetRayTracingPipelineStackSizeKHR()?;
+    ) -> Result<(), RecordRefused> {
+        if size > MAX_RAY_TRACING_STACK {
+            return Err(RecordRefused::Invalid(
+                "set a ray-tracing stack larger than this renderer serves",
+            ));
+        }
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdSetRayTracingPipelineStackSizeKHR())
+            .ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, size) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdWriteAccelerationStructuresPropertiesKHR`: one query per structure, from `first` on,
@@ -7253,11 +7300,22 @@ impl Driver {
         &self,
         cb: VkCommandBuffer,
         enables: &[VkBool32],
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdSetColorWriteEnableEXT()?;
+    ) -> Result<(), RecordRefused> {
+        // The Mesa runtime folds the switches into a mask of one bit per attachment, an
+        // undefined shift past 32, holding the count only with an assert.
+        let limits = self.recorder_limits(cb).ok_or(RecordRefused::NoDevice)?;
+        if !window_fits(limits.maxColorAttachments, 0, enables.len()) {
+            return Err(RecordRefused::Invalid(
+                "set color writes for more attachments than the device has",
+            ));
+        }
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdSetColorWriteEnableEXT())
+            .ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above; the count is the slice's own length.
         unsafe { f(cb, enables.len() as u32, enables.as_ptr()) };
-        Some(())
+        Ok(())
     }
 
     // The recording commands the seated desktop sends that this build did not serve. Nothing
@@ -7707,11 +7765,24 @@ impl Driver {
         Some(())
     }
 
-    pub fn cmd_set_patch_control_points(&self, cb: VkCommandBuffer, points: u32) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdSetPatchControlPointsEXT()?;
+    /// `vkCmdSetPatchControlPointsEXT`, held to 1 through `maxTessellationPatchSize`. The Mesa
+    /// runtime stores the count in a byte, so 256 wraps to 0, and KosmicKrisp divides by it.
+    pub fn cmd_set_patch_control_points(
+        &self,
+        cb: VkCommandBuffer,
+        points: u32,
+    ) -> Result<(), RecordRefused> {
+        let limits = self.recorder_limits(cb).ok_or(RecordRefused::NoDevice)?;
+        if points == 0 || points > limits.maxTessellationPatchSize {
+            return Err(RecordRefused::Invalid("set a patch size the device does not have"));
+        }
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdSetPatchControlPointsEXT())
+            .ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, points) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdBeginRendering`, which the recording is then inside until its end: see [`Scope`].
@@ -8275,12 +8346,21 @@ impl Driver {
         cb: VkCommandBuffer,
         size: VkExtent2D,
         ops: [VkFragmentShadingRateCombinerOpKHR; 2],
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdSetFragmentShadingRateKHR()?;
+    ) -> Result<(), RecordRefused> {
+        // Vulkan's fragment sizes are 1, 2 and 4 on each side; anv takes each side's encoding out
+        // of a five-entry table by the side, unchecked.
+        let side = |n: u32| matches!(n, 1 | 2 | 4);
+        if !side(size.width) || !side(size.height) {
+            return Err(RecordRefused::Invalid("set a fragment size Vulkan does not have"));
+        }
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdSetFragmentShadingRateKHR())
+            .ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above; `size` and `ops` are locals live for the call, and `ops` is the
         // two-element array the entry point reads.
         unsafe { f(cb, &size, ops.as_ptr()) };
-        Some(())
+        Ok(())
     }
 
     /// The transform feedback limits of `cb`'s device, refusing a device that did not enable
@@ -8460,11 +8540,21 @@ impl Driver {
         &self,
         cb: VkCommandBuffer,
         polygon_mode: VkPolygonMode,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdSetPolygonModeEXT()?;
+    ) -> Result<(), RecordRefused> {
+        let device = self.pools.device_of(cb).ok_or(RecordRefused::NoDevice)?;
+        let d = self.devices.get(&device).ok_or(RecordRefused::NoDevice)?;
+        type M = VkPolygonMode;
+        match polygon_mode {
+            M::VK_POLYGON_MODE_FILL | M::VK_POLYGON_MODE_LINE | M::VK_POLYGON_MODE_POINT => {}
+            M::VK_POLYGON_MODE_FILL_RECTANGLE_NV if d.fill_rectangle => {}
+            _ => {
+                return Err(RecordRefused::Invalid("set a polygon mode the device did not enable"));
+            }
+        }
+        let f = d.fns.try_vkCmdSetPolygonModeEXT().ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, polygon_mode) };
-        Some(())
+        Ok(())
     }
 
     /// See [`Driver::cmd_set_tessellation_domain_origin`].
@@ -8472,11 +8562,20 @@ impl Driver {
         &self,
         cb: VkCommandBuffer,
         rasterization_samples: VkSampleCountFlagBits,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdSetRasterizationSamplesEXT()?;
+    ) -> Result<(), RecordRefused> {
+        let limits = self.recorder_limits(cb).ok_or(RecordRefused::NoDevice)?;
+        if !rasterizes_at(limits, rasterization_samples) {
+            return Err(RecordRefused::Invalid(
+                "set a rasterization sample count the device does not have",
+            ));
+        }
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdSetRasterizationSamplesEXT())
+            .ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above.
         unsafe { f(cb, rasterization_samples) };
-        Some(())
+        Ok(())
     }
 
     /// See [`Driver::cmd_set_tessellation_domain_origin`].
