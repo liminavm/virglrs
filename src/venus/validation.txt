@@ -193,7 +193,7 @@ vkCreateInstance                                 reviewed
 vkCreatePipelineCache                            reviewed
 vkCreatePipelineLayout                           validated
 vkCreateQueryPool                                validated
-vkCreateRayTracingPipelinesKHR                   pending:pipelines
+vkCreateRayTracingPipelinesKHR                   validated
 vkCreateRenderPass                               validated
 vkCreateRenderPass2                              validated
 vkCreateRingMESA                                 reviewed

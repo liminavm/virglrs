@@ -2288,8 +2288,6 @@ impl Handlers<'_> {
                         "asked a ray-tracing command of a device that does not serve it"
                     }
                     T::UnknownPipeline => "named a pipeline that is not a ray-tracing one",
-                    T::NotALibrary => "linked a library that is not a ray-tracing pipeline",
-                    T::ShaderOutOfStages => "grouped a shader stage its pipeline does not have",
                     T::OutOfGroups => "named shader groups past the end of the pipeline's",
                     T::OutOfRoom => "asked for shader group handles past the room it offered",
                     T::UnknownShader => "asked the stack size of a shader kind Vulkan has not",

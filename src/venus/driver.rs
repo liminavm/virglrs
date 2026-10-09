@@ -995,10 +995,6 @@ pub enum RayTracingRefused {
     NotExported,
     /// The pipeline is not a ray-tracing pipeline this renderer has a record of.
     UnknownPipeline,
-    /// A library named in a create is not a ray-tracing pipeline this renderer has a record of.
-    NotALibrary,
-    /// A group names a stage its create-info does not have.
-    ShaderOutOfStages,
     /// The groups named run past the pipeline's, or a count overflows.
     OutOfGroups,
     /// The handles asked for need more room than the guest offered.
@@ -2710,6 +2706,12 @@ const MESH_STAGE: u32 = 0x80;
 const TASK_STAGE: u32 = 0x40;
 /// Ray generation, any hit, closest hit, miss, intersection and callable.
 const RAY_TRACING_STAGES: u32 = 0x3f00;
+const RAYGEN_STAGE: u32 = 0x100;
+const ANY_HIT_STAGE: u32 = 0x200;
+const CLOSEST_HIT_STAGE: u32 = 0x400;
+const MISS_STAGE: u32 = 0x800;
+const INTERSECTION_STAGE: u32 = 0x1000;
+const CALLABLE_STAGE: u32 = 0x2000;
 
 fn enabled_query_types(extensions: &[String], statistics: bool) -> Vec<VkQueryType> {
     type Q = VkQueryType;
@@ -5065,44 +5067,14 @@ impl Driver {
         let f = d.fns.try_vkCreateRayTracingPipelinesKHR().ok_or(RayTracingRefused::NotExported)?;
         let mut groups = Vec::with_capacity(infos.len());
         for info in infos.iter() {
-            let info = info.get();
-            // SAFETY: the decoder allocated each array from the batch arena at the count beside
-            // it, which is live for this call; a split pair poisoned the decode and never
-            // reached a handler.
-            let (own, stages) = unsafe {
-                (
-                    cs::wire_array(info.groupCount as usize, info.pGroups),
-                    cs::wire_array(info.stageCount as usize, info.pStages),
-                )
-            };
-            let own = own.expect("the decoder holds pGroups to groupCount");
-            let stages = stages.expect("the decoder holds pStages to stageCount").len();
-            let names_a_stage = |i: u32| i == SHADER_UNUSED || (i as usize) < stages;
-            let in_stages = own.iter().all(|g| {
-                [g.generalShader, g.closestHitShader, g.anyHitShader, g.intersectionShader]
-                    .into_iter()
-                    .all(names_a_stage)
-            });
-            if !in_stages {
-                return Err(RayTracingRefused::ShaderOutOfStages);
-            }
             let mut total = info.groupCount;
-            if !info.pLibraryInfo.is_null() {
-                // SAFETY: a pointer the decoder set to an arena struct of its own, and the
-                // library array inside it allocated at the count beside it.
-                let libraries = unsafe {
-                    let l = &*info.pLibraryInfo;
-                    cs::wire_array(l.libraryCount as usize, l.pLibraries)
-                }
-                .expect("the decoder holds pLibraries to libraryCount");
-                for lib in libraries {
-                    let n = self
-                        .pipelines
-                        .get(lib)
-                        .and_then(|p| p.kind.groups())
-                        .ok_or(RayTracingRefused::NotALibrary)?;
-                    total = total.checked_add(n).ok_or(RayTracingRefused::OutOfGroups)?;
-                }
+            for library in ray_tracing_libraries(&info) {
+                let n = self
+                    .pipelines
+                    .get(library)
+                    .and_then(|p| p.kind.groups())
+                    .expect("its check found each library a ray-tracing pipeline's record");
+                total = total.checked_add(n).ok_or(RayTracingRefused::OutOfGroups)?;
             }
             groups.push(total);
         }
@@ -12343,17 +12315,69 @@ impl cs::Validate<DeviceFacts<'_>> for VkComputePipelineCreateInfo {
 }
 
 impl cs::Validate<DeviceFacts<'_>> for VkRayTracingPipelineCreateInfoKHR {
-    /// Ray-tracing stages, which a pipeline may name more than once each.
+    /// Ray-tracing stages, which a pipeline may name more than once each; groups of its own
+    /// stages, each the kind its type takes; and libraries this renderer made as ray-tracing
+    /// libraries. The runtime looks each group's shaders up in the stages by index, checking only
+    /// with asserts that a general group has one and a procedural group an intersection, and
+    /// takes each library as a library.
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
         facts: &DeviceFacts<'_>,
     ) -> Result<(), &'static str> {
-        let stages = stages_of(&this, this.stageCount, this.pStages, facts, true)?;
-        if stages & !RAY_TRACING_STAGES != 0 {
+        const GENERAL: u32 = RAYGEN_STAGE | MISS_STAGE | CALLABLE_STAGE;
+        type T = super::proto::types::VkRayTracingShaderGroupTypeKHR;
+        let kinds = stages_of(&this, this.stageCount, this.pStages, facts, true)?;
+        if kinds & !RAY_TRACING_STAGES != 0 {
             return Err("named a stage a ray-tracing pipeline does not have");
+        }
+        let stages = regions_of(&this, this.stageCount, this.pStages);
+        let names = |i: u32, kinds: u32| {
+            stages.get(i as usize).is_some_and(|s| s.stage.0 as u32 & kinds != 0)
+        };
+        let unused_or = |i: u32, kinds: u32| i == SHADER_UNUSED || names(i, kinds);
+        for g in regions_of(&this, this.groupCount, this.pGroups) {
+            let hits = unused_or(g.closestHitShader, CLOSEST_HIT_STAGE)
+                && unused_or(g.anyHitShader, ANY_HIT_STAGE);
+            let unused = |i: u32| i == SHADER_UNUSED;
+            let grouped = match g.r#type {
+                T::VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR => {
+                    names(g.generalShader, GENERAL)
+                        && unused(g.closestHitShader)
+                        && unused(g.anyHitShader)
+                        && unused(g.intersectionShader)
+                }
+                T::VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR => {
+                    unused(g.generalShader) && unused(g.intersectionShader) && hits
+                }
+                T::VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR => {
+                    unused(g.generalShader)
+                        && names(g.intersectionShader, INTERSECTION_STAGE)
+                        && hits
+                }
+                _ => false,
+            };
+            if !grouped {
+                return Err("grouped shaders its pipeline does not have, or not as its type takes");
+            }
+        }
+        let library = |l: &VkPipeline| {
+            facts.facts.pipelines.get(l).is_some_and(|p| p.library && p.kind.groups().is_some())
+        };
+        if !ray_tracing_libraries(&this).iter().all(library) {
+            return Err("linked a pipeline that is not a ray-tracing library this renderer made");
         }
         Ok(())
     }
+}
+
+/// The libraries a ray-tracing pipeline create info links, which it points at rather than
+/// chains.
+fn ray_tracing_libraries<'a, S>(
+    info: &cs::Decoded<'a, VkRayTracingPipelineCreateInfoKHR, S>,
+) -> &'a [VkPipeline] {
+    regions_of(info, 1, info.pLibraryInfo)
+        .first()
+        .map_or(&[][..], |l| regions_of(info, l.libraryCount, l.pLibraries))
 }
 
 /// A pipeline create info, by how many stages it names.
@@ -16054,6 +16078,102 @@ mod tests {
         };
         assert_eq!(located(&[1, ATTACHMENT_UNUSED, 7]), Ok(()));
         assert!(located(&[8]).is_err(), "a location past the device's");
+        d.abandon_planted();
+    }
+
+    /// A ray-tracing group names its pipeline's own stages, of the kinds its type takes, and a
+    /// pipeline links only ray-tracing libraries this renderer made.
+    #[test]
+    fn ray_tracing_groups_name_their_own_stages() {
+        use crate::venus::proto::types::{
+            VkRayTracingShaderGroupCreateInfoKHR, VkRayTracingShaderGroupTypeKHR as T,
+            VkShaderModule, VkShaderStageFlagBits as S,
+        };
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const LIB: VkPipeline = VkPipeline::forged(0x700);
+        const PLAIN: VkPipeline = VkPipeline::forged(0x701);
+        const GRAPHICS_LIB: VkPipeline = VkPipeline::forged(0x702);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        d.plant_stages(DEVICE, &["VK_KHR_ray_tracing_pipeline"]);
+        d.record_pipeline(LIB, DEVICE, PipelineKind::RayTracing { groups: 1 }, true);
+        d.record_pipeline(PLAIN, DEVICE, PipelineKind::RayTracing { groups: 1 }, false);
+        d.record_pipeline(GRAPHICS_LIB, DEVICE, PipelineKind::Graphics, true);
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let stage = |bits: S| VkPipelineShaderStageCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage: bits,
+            module: VkShaderModule::forged(0x5ade),
+            pName: c"main".as_ptr(),
+            ..Default::default()
+        };
+        // 0 raygen, 1 closest hit, 2 any hit, 3 intersection, 4 miss.
+        let stages = [
+            stage(S::VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+            stage(S::VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR),
+            stage(S::VK_SHADER_STAGE_ANY_HIT_BIT_KHR),
+            stage(S::VK_SHADER_STAGE_INTERSECTION_BIT_KHR),
+            stage(S::VK_SHADER_STAGE_MISS_BIT_KHR),
+        ];
+        const U: u32 = SHADER_UNUSED;
+        let group =
+            |ty, general, closest, any, intersection| VkRayTracingShaderGroupCreateInfoKHR {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,
+                r#type: ty,
+                generalShader: general,
+                closestHitShader: closest,
+                anyHitShader: any,
+                intersectionShader: intersection,
+                ..Default::default()
+            };
+        let made = |groups: &[VkRayTracingShaderGroupCreateInfoKHR], libraries: &[VkPipeline]| {
+            let link = VkPipelineLibraryCreateInfoKHR {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+                libraryCount: libraries.len() as u32,
+                pLibraries: libraries.as_ptr(),
+                ..Default::default()
+            };
+            let info = VkRayTracingPipelineCreateInfoKHR {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR,
+                stageCount: stages.len() as u32,
+                pStages: stages.as_ptr(),
+                groupCount: groups.len() as u32,
+                pGroups: groups.as_ptr(),
+                pLibraryInfo: &link,
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+        };
+        let general = |i| group(T::VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, i, U, U, U);
+        let triangles =
+            |c, a| group(T::VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR, U, c, a, U);
+        let procedural =
+            |i| group(T::VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR, U, U, U, i);
+        assert_eq!(
+            made(&[general(0), general(4), triangles(1, 2), triangles(U, U), procedural(3)], &[]),
+            Ok(())
+        );
+        assert!(made(&[general(U)], &[]).is_err(), "a general group of no shader");
+        assert!(made(&[general(5)], &[]).is_err(), "a general shader past the stages");
+        assert!(made(&[general(1)], &[]).is_err(), "a general group of a hit shader");
+        let mut both = general(0);
+        both.closestHitShader = 1;
+        assert!(made(&[both], &[]).is_err(), "a general group with a hit shader too");
+        assert!(made(&[triangles(2, U)], &[]).is_err(), "a closest hit of another kind");
+        assert!(made(&[triangles(U, 5)], &[]).is_err(), "an any hit past the stages");
+        let mut generous = triangles(1, U);
+        generous.generalShader = 0;
+        assert!(made(&[generous], &[]).is_err(), "a hit group with a general shader");
+        let mut boxed = triangles(1, U);
+        boxed.intersectionShader = 3;
+        assert!(made(&[boxed], &[]).is_err(), "a triangles group with an intersection");
+        assert!(made(&[procedural(U)], &[]).is_err(), "a procedural group of no intersection");
+        assert!(made(&[procedural(0)], &[]).is_err(), "an intersection of another kind");
+        assert!(made(&[group(T(7), 0, U, U, U)], &[]).is_err(), "a type Vulkan has not");
+        assert_eq!(made(&[], &[LIB]), Ok(()), "a ray-tracing library");
+        assert!(made(&[], &[PLAIN]).is_err(), "a pipeline that is not a library");
+        assert!(made(&[], &[GRAPHICS_LIB]).is_err(), "a library of another kind");
+        assert!(made(&[], &[VkPipeline::forged(0x7ff)]).is_err(), "no record");
         d.abandon_planted();
     }
 
@@ -23028,22 +23148,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(run(&mut d, &[info(&one, &link)]), (Ok(Ok(())), vec![LINKED]));
-
-        // A group naming a stage past the create-info's, and a library that is not one, are
-        // refused before the driver makes anything.
-        let past = [group(2)];
-        let unknown = [VkPipeline::forged(0x99)];
-        let stray = VkPipelineLibraryCreateInfoKHR {
-            libraryCount: 1,
-            pLibraries: unknown.as_ptr(),
-            ..Default::default()
-        };
-        assert_eq!(
-            run(&mut d, &[info(&past, core::ptr::null())]).0,
-            Err(RayTracingRefused::ShaderOutOfStages)
-        );
-        assert_eq!(run(&mut d, &[info(&one, &stray)]).0, Err(RayTracingRefused::NotALibrary));
-        assert_eq!(NEXT.get(), 0x72, "neither reached the driver");
 
         let shader = GroupHandle::Shader;
         let general = VkShaderGroupShaderKHR::VK_SHADER_GROUP_SHADER_GENERAL_KHR;

@@ -3330,13 +3330,6 @@ SABOTAGES = [
         'ray_tracing_pipelines_are_created_traced_and_forgotten_through_the_handlers',
     ),
     (
-        'a ray-tracing group may name any stage',
-        'src/venus/driver.rs',
-        """            let names_a_stage = |i: u32| i == SHADER_UNUSED || (i as usize) < stages;""",
-        """            let names_a_stage = |_: u32| stages < usize::MAX;""",
-        'ray_tracing_groups_are_held_to_the_pipeline',
-    ),
-    (
         'a derivative may name any pipeline of its run as its base',
         'src/venus/context.rs',
         """            base => usize::try_from(base).is_ok_and(|base| base < i),""",
@@ -5102,7 +5095,7 @@ SABOTAGES = [
     (
         'a ray-tracing pipeline may name a stage of another kind',
         'src/venus/driver.rs',
-        """        if stages & !RAY_TRACING_STAGES != 0 {""",
+        """        if kinds & !RAY_TRACING_STAGES != 0 {""",
         """        if false {""",
         'a_pipeline_names_stages_the_device_runs',
     ),
@@ -5336,6 +5329,99 @@ SABOTAGES = [
         """        if true {
             let discard_dynamic""",
         'a_graphics_pipeline_holds_its_states',
+    ),
+    (
+        'a group shader may be a stage of any kind',
+        'src/venus/driver.rs',
+        """            stages.get(i as usize).is_some_and(|s| s.stage.0 as u32 & kinds != 0)""",
+        """            stages.get(i as usize).is_some()""",
+        'ray_tracing_groups_name_their_own_stages',
+    ),
+    (
+        'a group shader may be past the stages',
+        'src/venus/driver.rs',
+        """            stages.get(i as usize).is_some_and(|s| s.stage.0 as u32 & kinds != 0)""",
+        """            i < u32::MAX && kinds != 0""",
+        'ray_tracing_groups_name_their_own_stages',
+    ),
+    (
+        'a closest hit shader is not held',
+        'src/venus/driver.rs',
+        """            let hits = unused_or(g.closestHitShader, CLOSEST_HIT_STAGE)
+                && unused_or(g.anyHitShader, ANY_HIT_STAGE);""",
+        """            let hits = unused_or(g.anyHitShader, ANY_HIT_STAGE);""",
+        'ray_tracing_groups_name_their_own_stages',
+    ),
+    (
+        'an any hit shader is not held',
+        'src/venus/driver.rs',
+        """            let hits = unused_or(g.closestHitShader, CLOSEST_HIT_STAGE)
+                && unused_or(g.anyHitShader, ANY_HIT_STAGE);""",
+        """            let hits = unused_or(g.closestHitShader, CLOSEST_HIT_STAGE);""",
+        'ray_tracing_groups_name_their_own_stages',
+    ),
+    (
+        'a general group may have no shader',
+        'src/venus/driver.rs',
+        """                    names(g.generalShader, GENERAL)
+""",
+        """                    unused_or(g.generalShader, GENERAL)
+""",
+        'ray_tracing_groups_name_their_own_stages',
+    ),
+    (
+        'a general group may carry a hit shader',
+        'src/venus/driver.rs',
+        """                        && unused(g.closestHitShader)
+""",
+        """""",
+        'ray_tracing_groups_name_their_own_stages',
+    ),
+    (
+        'a hit group may carry a general shader',
+        'src/venus/driver.rs',
+        """                    unused(g.generalShader) && unused(g.intersectionShader) && hits""",
+        """                    unused(g.intersectionShader) && hits""",
+        'ray_tracing_groups_name_their_own_stages',
+    ),
+    (
+        'a triangles group may carry an intersection',
+        'src/venus/driver.rs',
+        """                    unused(g.generalShader) && unused(g.intersectionShader) && hits""",
+        """                    unused(g.generalShader) && hits""",
+        'ray_tracing_groups_name_their_own_stages',
+    ),
+    (
+        'a procedural group may have no intersection',
+        'src/venus/driver.rs',
+        """                        && names(g.intersectionShader, INTERSECTION_STAGE)
+""",
+        """                        && unused_or(g.intersectionShader, INTERSECTION_STAGE)
+""",
+        'ray_tracing_groups_name_their_own_stages',
+    ),
+    (
+        'a group of an unknown type is taken',
+        'src/venus/driver.rs',
+        """            if !grouped {
+                return Err("grouped shaders its pipeline does not have, or not as its type takes");""",
+        """            if !grouped && g.r#type.0 < 3 {
+                return Err("grouped shaders its pipeline does not have, or not as its type takes");""",
+        'ray_tracing_groups_name_their_own_stages',
+    ),
+    (
+        'a linked ray-tracing pipeline need not be a library',
+        'src/venus/driver.rs',
+        """            facts.facts.pipelines.get(l).is_some_and(|p| p.library && p.kind.groups().is_some())""",
+        """            facts.facts.pipelines.get(l).is_some_and(|p| p.kind.groups().is_some())""",
+        'ray_tracing_groups_name_their_own_stages',
+    ),
+    (
+        'a linked ray-tracing library may be of another kind',
+        'src/venus/driver.rs',
+        """            facts.facts.pipelines.get(l).is_some_and(|p| p.library && p.kind.groups().is_some())""",
+        """            facts.facts.pipelines.get(l).is_some_and(|p| p.library)""",
+        'ray_tracing_groups_name_their_own_stages',
     ),
     (
         'a submit chained array is trusted by its count alone',
