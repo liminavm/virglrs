@@ -5602,6 +5602,48 @@ SABOTAGES = [
         'only_cache_data_this_renderer_handed_out_reaches_the_driver',
     ),
     (
+        'transform feedback may bind past the last buffer',
+        'src/venus/driver.rs',
+        """        if !window_fits(xfb.buffers, first, n) {""",
+        """        if !window_fits(u32::MAX, first, n) {""",
+        'transform_feedback_is_held_to_its_buffers_and_the_device',
+    ),
+    (
+        'transform feedback may bind a range past its buffer',
+        'src/venus/driver.rs',
+        """            self.buffer_range_fits(buffer, offset, sizes.map(|s| s[i]))?;
+        }
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdBindTransformFeedbackBuffersEXT())""",
+        """        }
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdBindTransformFeedbackBuffersEXT())""",
+        'transform_feedback_is_held_to_its_buffers_and_the_device',
+    ),
+    (
+        'transform feedback may name counters past the last buffer',
+        'src/venus/driver.rs',
+        """        if !window_fits(xfb.buffers, counters.first, counters.count as usize) {""",
+        """        if !window_fits(u32::MAX, counters.first, counters.count as usize) {""",
+        'transform_feedback_is_held_to_its_buffers_and_the_device',
+    ),
+    (
+        'transform feedback may count past its counter buffer',
+        'src/venus/driver.rs',
+        """            if offset.checked_add(4).is_none_or(|end| end > len) {""",
+        """            if offset.checked_add(4).is_none() {""",
+        'transform_feedback_is_held_to_its_buffers_and_the_device',
+    ),
+    (
+        'transform feedback may record on a device without it',
+        'src/venus/driver.rs',
+        """        d.xfb.ok_or(RecordRefused::Invalid(""",
+        """        d.xfb.or(Some(XfbLimits { buffers: 4, streams: 4 })).ok_or(RecordRefused::Invalid(""",
+        'transform_feedback_is_held_to_its_buffers_and_the_device',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

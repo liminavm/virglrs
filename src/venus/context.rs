@@ -6424,7 +6424,7 @@ impl Commands for Handlers<'_> {
             args.pOffsets(),
             args.pSizes(),
         );
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdBeginTransformFeedbackEXT(
@@ -6438,7 +6438,7 @@ impl Commands for Handlers<'_> {
             args.pCounterBufferOffsets(),
         );
         let done = self.driver.cmd_begin_transform_feedback(args.commandBuffer, counters);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdEndTransformFeedbackEXT(
@@ -6452,7 +6452,7 @@ impl Commands for Handlers<'_> {
             args.pCounterBufferOffsets(),
         );
         let done = self.driver.cmd_end_transform_feedback(args.commandBuffer, counters);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdDrawIndirectByteCountEXT(
@@ -21720,6 +21720,11 @@ mod tests {
             &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
         driver.plant_bound(VkCommandBuffer::forged(CB.0), driver::BindPoint::Graphics);
+        // KosmicKrisp's limits, and the buffers the commands below name, big enough for them.
+        driver.plant_xfb_limits(VkDevice::forged(DEVICE), 4, 4);
+        for (buffer, size) in [(0x40, 1024), (0x41, 1024), (0x50, 64)] {
+            driver.plant_buffer(VkBuffer::forged(buffer), size);
+        }
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -21805,6 +21810,209 @@ mod tests {
 
         // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
+    }
+
+    /// Transform feedback is held to the device's buffers and to each buffer it names: binding
+    /// windows, ranges, counter slots and counter offsets, and to a device that enabled it.
+    #[test]
+    fn transform_feedback_is_held_to_its_buffers_and_the_device() {
+        use super::super::proto::types::{
+            VkBuffer, VkCommandBuffer, VkCommandPool, VkDevice, VkDeviceSize,
+            vn_command_vkCmdBeginTransformFeedbackEXT,
+            vn_command_vkCmdBindTransformFeedbackBuffersEXT,
+            vn_command_vkCmdEndTransformFeedbackEXT,
+        };
+
+        const DEVICE: u64 = 3;
+        const CB: (u64, u64) = (0x71, 0x17);
+        const BUFFER: u64 = 0x40;
+        const COUNTER: u64 = 0x50;
+
+        unsafe extern "C" fn bind(
+            _: VkCommandBuffer,
+            _: u32,
+            _: u32,
+            _: *const VkBuffer,
+            _: *const VkDeviceSize,
+            _: *const VkDeviceSize,
+        ) {
+        }
+        unsafe extern "C" fn counters(
+            _: VkCommandBuffer,
+            _: u32,
+            _: u32,
+            _: *const VkBuffer,
+            _: *const VkDeviceSize,
+        ) {
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdBindTransformFeedbackBuffersEXT(bind);
+        fns.plant_vkCmdBeginTransformFeedbackEXT(counters);
+        fns.plant_vkCmdEndTransformFeedbackEXT(counters);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(0x70),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+        driver.plant_buffer(VkBuffer::forged(BUFFER), 256);
+        driver.plant_buffer(VkBuffer::forged(COUNTER), 16);
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+
+        macro_rules! run {
+            ($call:expr) => {{
+                let mut rings = BTreeMap::new();
+                let mut ctx_reply = None;
+                let mut monitor = None;
+                let mut jrnl = Journal::new();
+                let mut h = Handlers {
+                    objects: &objects,
+                    todo: &todo,
+                    driver: &mut driver,
+                    global: &global,
+                    ctx: ContextId::new(1).expect("1 is not zero"),
+                    ask: None,
+                    resources: &NO_RESOURCES,
+                    rings: &mut rings,
+                    monitor: &mut monitor,
+                    replaying: false,
+                    depth: 0,
+                    answer: None,
+                    own_wait: None,
+                    current_ring: None,
+                    reply: &mut ctx_reply,
+                    note: None,
+                    journal: &mut jrnl,
+                };
+                #[allow(clippy::redundant_closure_call)]
+                (|h: &mut Handlers| $call(h))(&mut h);
+                h.rejected()
+            }};
+        }
+
+        let cb = VkCommandBuffer::forged(CB.0);
+        macro_rules! bind {
+            ($first:expr, $buffer:expr, $offset:expr, $size:expr) => {{
+                let buffers = [VkBuffer::forged($buffer)];
+                let offsets = [VkDeviceSize($offset)];
+                let sizes: Option<[VkDeviceSize; 1]> = $size.map(|s: u64| [VkDeviceSize(s)]);
+                let mut args = vn_command_vkCmdBindTransformFeedbackBuffersEXT::default();
+                args.commandBuffer = cb;
+                args.firstBinding = $first;
+                args.plant_pBuffers(&buffers);
+                args.plant_pOffsets(&offsets);
+                if let Some(sizes) = &sizes {
+                    args.plant_pSizes(sizes);
+                }
+                run!(|h: &mut Handlers| h.vkCmdBindTransformFeedbackBuffersEXT(&mut args))
+            }};
+        }
+
+        // A device that did not enable transform feedback has no limits to hold anything to.
+        assert_eq!(
+            bind!(0, BUFFER, 0, None::<u64>),
+            Some("recorded transform feedback on a device that did not enable it")
+        );
+        driver.plant_xfb_limits(VkDevice::forged(DEVICE), 4, 4);
+
+        for (first, buffer, offset, size, why) in [
+            (3, BUFFER, 0, None, None),
+            (4, BUFFER, 0, None, Some("bound transform feedback buffers past the last binding")),
+            (
+                u32::MAX,
+                BUFFER,
+                0,
+                None,
+                Some("bound transform feedback buffers past the last binding"),
+            ),
+            (0, 0, 0, None, Some("bound no transform feedback buffer")),
+            (0, BUFFER, 255, None, None),
+            (0, BUFFER, 256, None, Some("bound a buffer at an offset past its end")),
+            (0, BUFFER, 128, Some(128), None),
+            (0, BUFFER, 128, Some(129), Some("bound a range past the end of its buffer")),
+            (0, 0x99, 0, None, Some("bound a buffer this renderer has no record of")),
+        ] {
+            assert_eq!(
+                bind!(first, buffer, offset, size),
+                why,
+                "first {first}, buffer {buffer:#x}, offset {offset}, size {size:?}"
+            );
+        }
+
+        for end in [false, true] {
+            for (first, count, buffer, offset, why) in [
+                (0, 4, None, None, None),
+                (1, 4, None, None, Some("named transform feedback counters past the last buffer")),
+                (
+                    0x3ffff,
+                    1,
+                    None,
+                    None,
+                    Some("named transform feedback counters past the last buffer"),
+                ),
+                (3, 1, Some(COUNTER), Some(12), None),
+                (
+                    3,
+                    1,
+                    Some(COUNTER),
+                    Some(13),
+                    Some("counted transform feedback past the end of its counter buffer"),
+                ),
+                (
+                    0,
+                    1,
+                    Some(COUNTER),
+                    Some(u64::MAX),
+                    Some("counted transform feedback past the end of its counter buffer"),
+                ),
+                (0, 1, Some(COUNTER), None, None),
+                (0, 1, Some(0), Some(1 << 40), None),
+                (
+                    0,
+                    1,
+                    Some(0x99),
+                    Some(0),
+                    Some("counted transform feedback into a buffer this renderer has no record of"),
+                ),
+            ] {
+                let buffers = buffer.map(|b| [VkBuffer::forged(b)]);
+                let offsets = offset.map(|o| [VkDeviceSize(o)]);
+                let refused = if end {
+                    let mut args = vn_command_vkCmdEndTransformFeedbackEXT::default();
+                    args.commandBuffer = cb;
+                    args.firstCounterBuffer = first;
+                    match &buffers {
+                        Some(b) => args.plant_pCounterBuffers(b),
+                        None => args.plant_counterBufferCount(count),
+                    }
+                    if let Some(o) = &offsets {
+                        args.plant_pCounterBufferOffsets(o);
+                    }
+                    run!(|h: &mut Handlers| h.vkCmdEndTransformFeedbackEXT(&mut args))
+                } else {
+                    let mut args = vn_command_vkCmdBeginTransformFeedbackEXT::default();
+                    args.commandBuffer = cb;
+                    args.firstCounterBuffer = first;
+                    match &buffers {
+                        Some(b) => args.plant_pCounterBuffers(b),
+                        None => args.plant_counterBufferCount(count),
+                    }
+                    if let Some(o) = &offsets {
+                        args.plant_pCounterBufferOffsets(o);
+                    }
+                    run!(|h: &mut Handlers| h.vkCmdBeginTransformFeedbackEXT(&mut args))
+                };
+                assert_eq!(
+                    refused, why,
+                    "end {end}, first {first}, buffer {buffer:?}, offset {offset:?}"
+                );
+            }
+        }
+        driver.abandon_planted();
     }
 
     /// Every scalar setter of `VK_EXT_extended_dynamic_state3` hands the driver the value the

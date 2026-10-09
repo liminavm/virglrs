@@ -147,7 +147,8 @@ use super::proto::types::{
 use super::proto::types::{
     VkDeviceQueueCreateInfo, VkMemoryAllocateFlagsInfo, VkMemoryOpaqueCaptureAddressAllocateInfo,
     VkPhysicalDeviceAccelerationStructureFeaturesKHR,
-    VkPhysicalDeviceImageDrmFormatModifierInfoEXT, VkQueueFamilyProperties,
+    VkPhysicalDeviceImageDrmFormatModifierInfoEXT, VkPhysicalDeviceTransformFeedbackPropertiesEXT,
+    VkQueueFamilyProperties,
 };
 use super::proto::types::{
     VkDrmFormatModifierPropertiesEXT, VkDrmFormatModifierPropertiesListEXT, VkFormatProperties2,
@@ -2608,6 +2609,10 @@ struct DeviceState {
     /// Read once at creation for the reason `memory_types` is; the handle queries hold the
     /// guest's room to it.
     group_handles: Option<GroupHandleSizes>,
+    /// How many transform feedback buffers and streams the device has, if it enabled transform
+    /// feedback. anv stores a bound buffer at `firstBinding + i` in an array this long, checking
+    /// only with an assert, and reads a stream's register by an index it bounds the same way.
+    xfb: Option<XfbLimits>,
     /// The device's limits, read once at creation. A driver indexes fixed arrays by guest values
     /// these bound -- the push-constant block is `maxPushConstantsSize` bytes in KosmicKrisp --
     /// and checks none of them, so a command whose values exceed one is refused here.
@@ -2858,6 +2863,13 @@ impl SampleLocationGrids {
         let grid = *self.grids.get(samples.trailing_zeros() as usize)?;
         (grid.width != 0 && grid.height != 0).then_some(grid)
     }
+}
+
+/// A device's transform feedback limits. See `DeviceState::xfb`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct XfbLimits {
+    buffers: u32,
+    streams: u32,
 }
 
 /// A device's shader group handle sizes, in bytes.
@@ -3460,6 +3472,23 @@ impl Driver {
                     capture_replay: rt.shaderGroupHandleCaptureReplaySize,
                 }
             });
+        let xfb = wanted.iter().any(|n| n == "VK_EXT_transform_feedback").then(|| {
+            let mut tf = VkPhysicalDeviceTransformFeedbackPropertiesEXT {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT,
+                ..Default::default()
+            };
+            let mut props = VkPhysicalDeviceProperties2 {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                pNext: (&mut tf as *mut VkPhysicalDeviceTransformFeedbackPropertiesEXT).cast(),
+                ..Default::default()
+            };
+            // SAFETY: as for the group handle sizes above.
+            unsafe { (inst.vkGetPhysicalDeviceProperties2())(pd, &mut props) };
+            XfbLimits {
+                buffers: tf.maxTransformFeedbackBuffers,
+                streams: tf.maxTransformFeedbackStreams,
+            }
+        });
         let sample_locations = wanted
             .iter()
             .any(|n| n == "VK_EXT_sample_locations")
@@ -3477,6 +3506,7 @@ impl Driver {
                 stages: enabled_stages(&wanted),
                 memory_types,
                 group_handles,
+                xfb,
                 limits,
                 sample_locations,
                 query_types,
@@ -5432,6 +5462,7 @@ impl Driver {
                 stages: enabled_stages(&[]),
                 memory_types: Vec::new(),
                 group_handles: None,
+                xfb: None,
                 limits: planted_limits(),
                 sample_locations: None,
                 query_types: enabled_query_types(&[], true),
@@ -5494,6 +5525,13 @@ impl Driver {
 
     /// Give a planted device the shader group handle sizes `vkCreateDevice` would have read off a
     /// driver with ray-tracing pipelines.
+    #[cfg(test)]
+    pub(super) fn plant_xfb_limits(&mut self, handle: VkDevice, buffers: u32, streams: u32) {
+        let d = self.devices.get_mut(&handle).expect("a planted device");
+        d.xfb = Some(XfbLimits { buffers, streams });
+    }
+
+    /// Give a planted device the shader group handle sizes `vkCreateDevice` would have read.
     #[cfg(test)]
     pub(super) fn plant_group_handle_sizes(
         &mut self,
@@ -8047,9 +8085,22 @@ impl Driver {
         Some(())
     }
 
+    /// The transform feedback limits of `cb`'s device, refusing a device that did not enable
+    /// transform feedback: it has no limits to hold a command to.
+    fn recorder_xfb(&self, cb: VkCommandBuffer) -> Result<XfbLimits, RecordRefused> {
+        let device = self.pools.device_of(cb).ok_or(RecordRefused::NoDevice)?;
+        let d = self.devices.get(&device).ok_or(RecordRefused::NoDevice)?;
+        d.xfb.ok_or(RecordRefused::Invalid(
+            "recorded transform feedback on a device that did not enable it",
+        ))
+    }
+
     /// `vkCmdBindTransformFeedbackBuffersEXT`: the buffers vertex streams are captured into.
     ///
-    /// Three arrays under one count, the sizes optional, as [`Self::cmd_bind_vertex_buffers2`].
+    /// Three arrays under one count, the sizes optional, as [`Self::cmd_bind_vertex_buffers2`],
+    /// and held the same way: the bindings to the device's buffers, each range to its buffer. The
+    /// Mesa runtime computes a whole-size range as the buffer's size less the offset, and the
+    /// capture is bounded by what that gives.
     pub fn cmd_bind_transform_feedback_buffers(
         &self,
         cb: VkCommandBuffer,
@@ -8057,15 +8108,63 @@ impl Driver {
         buffers: &[VkBuffer],
         offsets: &[VkDeviceSize],
         sizes: Option<&[VkDeviceSize]>,
-    ) -> Option<()> {
+    ) -> Result<(), RecordRefused> {
         let n = buffers.len();
         assert_eq!(offsets.len(), n, "one count governs every array");
         assert!(sizes.is_none_or(|s| s.len() == n), "one count governs every array");
-        let f = self.recorder(cb)?.try_vkCmdBindTransformFeedbackBuffersEXT()?;
+        let xfb = self.recorder_xfb(cb)?;
+        if !window_fits(xfb.buffers, first, n) {
+            return Err(RecordRefused::Invalid(
+                "bound transform feedback buffers past the last binding",
+            ));
+        }
+        for (i, (&buffer, &offset)) in buffers.iter().zip(offsets).enumerate() {
+            if buffer.is_null() {
+                return Err(RecordRefused::Invalid("bound no transform feedback buffer"));
+            }
+            self.buffer_range_fits(buffer, offset, sizes.map(|s| s[i]))?;
+        }
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdBindTransformFeedbackBuffersEXT())
+            .ok_or(RecordRefused::NoDevice)?;
         // SAFETY: as above; the count is the length every array present shares, and absent sizes
         // are the null the driver reads as "to the end of each buffer".
         unsafe { f(cb, first, n as u32, buffers.as_ptr(), offsets.as_ptr(), optional(sizes)) };
-        Some(())
+        Ok(())
+    }
+
+    /// Whether `counters` name counter slots the device has, and each counter buffer has room
+    /// at its offset for the four-byte count. anv stores and loads the count through a register
+    /// chosen by the slot, and both drivers address the buffer at the offset unchecked.
+    fn xfb_counters_fit(
+        &self,
+        cb: VkCommandBuffer,
+        counters: &XfbCounters<'_>,
+    ) -> Result<(), RecordRefused> {
+        let xfb = self.recorder_xfb(cb)?;
+        if !window_fits(xfb.buffers, counters.first, counters.count as usize) {
+            return Err(RecordRefused::Invalid(
+                "named transform feedback counters past the last buffer",
+            ));
+        }
+        for (i, &buffer) in counters.buffers.unwrap_or_default().iter().enumerate() {
+            if buffer.is_null() {
+                continue;
+            }
+            let offset = counters.offsets.map_or(0, |o| o[i].0);
+            let Some(&len) = self.buffers.get(&buffer) else {
+                return Err(RecordRefused::Invalid(
+                    "counted transform feedback into a buffer this renderer has no record of",
+                ));
+            };
+            if offset.checked_add(4).is_none_or(|end| end > len) {
+                return Err(RecordRefused::Invalid(
+                    "counted transform feedback past the end of its counter buffer",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// `vkCmdBeginTransformFeedbackEXT`: start capturing, resuming from the byte counts in
@@ -8074,12 +8173,16 @@ impl Driver {
         &self,
         cb: VkCommandBuffer,
         counters: XfbCounters<'_>,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdBeginTransformFeedbackEXT()?;
+    ) -> Result<(), RecordRefused> {
+        self.xfb_counters_fit(cb, &counters)?;
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdBeginTransformFeedbackEXT())
+            .ok_or(RecordRefused::NoDevice)?;
         let (first, n, buffers, offsets) = counters.raw();
         // SAFETY: as above; `raw` rebuilds the count from the arrays it measures.
         unsafe { f(cb, first, n, buffers, offsets) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdEndTransformFeedbackEXT`: stop capturing, saving the byte counts into `counters` if
@@ -8088,12 +8191,16 @@ impl Driver {
         &self,
         cb: VkCommandBuffer,
         counters: XfbCounters<'_>,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdEndTransformFeedbackEXT()?;
+    ) -> Result<(), RecordRefused> {
+        self.xfb_counters_fit(cb, &counters)?;
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdEndTransformFeedbackEXT())
+            .ok_or(RecordRefused::NoDevice)?;
         let (first, n, buffers, offsets) = counters.raw();
         // SAFETY: as above; `raw` rebuilds the count from the arrays it measures.
         unsafe { f(cb, first, n, buffers, offsets) };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdDrawIndirectByteCountEXT`: a draw whose vertex count is the byte count a transform

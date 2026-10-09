@@ -37,13 +37,13 @@ vkCmdBeginQueryIndexedEXT                        reviewed
 vkCmdBeginRenderPass                             validated
 vkCmdBeginRenderPass2                            validated
 vkCmdBeginRendering                              validated
-vkCmdBeginTransformFeedbackEXT                   reviewed
+vkCmdBeginTransformFeedbackEXT                   validated
 vkCmdBindDescriptorSets                          validated
 vkCmdBindDescriptorSets2                         validated
 vkCmdBindIndexBuffer                             validated
 vkCmdBindIndexBuffer2                            validated
 vkCmdBindPipeline                                reviewed
-vkCmdBindTransformFeedbackBuffersEXT             reviewed
+vkCmdBindTransformFeedbackBuffersEXT             validated
 vkCmdBindVertexBuffers                           validated
 vkCmdBindVertexBuffers2                          validated
 vkCmdBlitImage                                   validated
@@ -87,7 +87,7 @@ vkCmdEndRenderPass                               reviewed
 vkCmdEndRenderPass2                              reviewed
 vkCmdEndRendering                                reviewed
 vkCmdEndRendering2KHR                            reviewed
-vkCmdEndTransformFeedbackEXT                     reviewed
+vkCmdEndTransformFeedbackEXT                     validated
 vkCmdExecuteCommands                             reviewed
 vkCmdFillBuffer                                  reviewed
 vkCmdNextSubpass                                 validated
