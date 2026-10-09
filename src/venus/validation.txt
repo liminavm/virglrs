@@ -24,7 +24,7 @@
 
 vkAllocateCommandBuffers                         reviewed
 vkAllocateDescriptorSets                         validated
-vkAllocateMemory                                 reviewed
+vkAllocateMemory                                 validated
 vkBeginCommandBuffer                             reviewed
 vkBindBufferMemory                               validated
 vkBindBufferMemory2                              validated

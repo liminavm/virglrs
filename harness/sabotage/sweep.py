@@ -5445,6 +5445,20 @@ SABOTAGES = [
         'a_graphics_pipeline_holds_its_states',
     ),
     (
+        'an allocation may name a memory type past the device',
+        'src/venus/driver.rs',
+        """        if this.memoryTypeIndex as usize >= facts.memory_types.len() {""",
+        """        if false {""",
+        'an_allocation_names_a_memory_type_the_device_has',
+    ),
+    (
+        'an allocation may ask for an opaque capture address',
+        'src/venus/driver.rs',
+        """        if this.opaqueCaptureAddress != 0 {""",
+        """        if false {""",
+        'an_allocation_names_a_memory_type_the_device_has',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

@@ -2939,6 +2939,21 @@ impl Commands for Handlers<'_> {
             return;
         };
         let Some(info) = self.names(args.pAllocateInfo) else { return };
+        // As `vkCreatePipelineLayout`: a device this context does not have answers as the driver
+        // would, and one it has holds the allocation to its memory types.
+        let info = match self.driver.device_facts(args.device).map(|facts| info.validate(&facts)) {
+            None => {
+                args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
+                return self.plant(
+                    "vkAllocateMemory",
+                    args.pMemory(),
+                    args.handle_pMemory_mut(),
+                    Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+                );
+            }
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => info,
+        };
         // Read out of `self` before the driver takes it mutably: both are plain copies of a
         // shared reference and an id, so the resolver borrows nothing the driver also wants.
         let (resources, ctx) = (self.resources, self.ctx);

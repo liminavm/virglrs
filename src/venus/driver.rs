@@ -155,6 +155,7 @@ use super::proto::types::{
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo,
     VkShaderDescriptorSetAndBindingMappingInfoEXT, VkSpecializationMapEntry,
 };
+use super::proto::types::{VkMemoryAllocateFlagsInfo, VkMemoryOpaqueCaptureAddressAllocateInfo};
 use super::proto::types::{VkPipelineCreateFlagBits, VkPipelineShaderStageCreateInfo};
 use super::proto::types::{
     VkRenderPassAttachmentBeginInfo, VkRenderPassSampleLocationsBeginInfoEXT,
@@ -4366,6 +4367,7 @@ impl Driver {
             query_types: &d.query_types,
             stages: d.stages,
             formats: FormatQueries { source: &d.formats, instance: self.instance() },
+            memory_types: &d.memory_types,
         })
     }
 
@@ -9171,7 +9173,7 @@ impl Driver {
         &mut self,
         device: VkDevice,
         id: ObjectId,
-        info: cs::Decoded<'_, VkMemoryAllocateInfo>,
+        info: cs::Decoded<'_, VkMemoryAllocateInfo, cs::Checked>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
         resource_bytes: &dyn Fn(ResourceHandle) -> Option<ResourceBytes>,
     ) -> Result<VkDeviceMemory, NoMemory> {
@@ -13871,6 +13873,40 @@ pub struct DeviceFacts<'d> {
     pub stages: u32,
     /// Its format properties.
     pub formats: FormatQueries<'d>,
+    /// The property flags of each of its memory types, indexed by `memoryTypeIndex`.
+    pub memory_types: &'d [VkMemoryPropertyFlags],
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkMemoryAllocateInfo {
+    /// A memory type the device has: anv takes the type and its heap out of fixed arrays by this
+    /// index, checking it only with an assert.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        if this.memoryTypeIndex as usize >= facts.memory_types.len() {
+            return Err("allocated from a memory type the device does not have");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkMemoryAllocateInfo, DeviceFacts<'_>>>
+    for VkMemoryOpaqueCaptureAddressAllocateInfo
+{
+    /// No address to replay at. No served command hands a guest an address it may ask for back
+    /// legitimately except `vkGetDeviceMemoryOpaqueCaptureAddress` in a capture tool, and anv
+    /// places a requested address in its heap checking the range only with an assert. Zero asks
+    /// for nothing.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _on: &cs::Chained<'_, VkMemoryAllocateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        if this.opaqueCaptureAddress != 0 {
+            return Err("asked for memory at an opaque capture address");
+        }
+        Ok(())
+    }
 }
 
 /// Whether `count` color attachments fit the device: KosmicKrisp begins rendering into an array
@@ -14218,6 +14254,14 @@ macro_rules! needs_no_check {
 }
 
 needs_no_check!(
+    // Handle types to export as, which the driver checks against what it can export.
+    VkExportMemoryAllocateInfo,
+    // A resource this renderer resolves itself, to storage it holds a share of; never forwarded.
+    VkImportMemoryResourceInfoMESA,
+    // Allocation flags and a device mask, which no single-device driver indexes by.
+    VkMemoryAllocateFlagsInfo,
+    // An image or a buffer the decoder resolved, or neither.
+    VkMemoryDedicatedAllocateInfo,
     // `protectedSubmit`, a boolean.
     VkProtectedSubmitInfo,
     // A device mask and per-device render areas, which neither KosmicKrisp nor anv nor the Mesa
@@ -16193,6 +16237,40 @@ mod tests {
         };
         assert_eq!(located(&[1, ATTACHMENT_UNUSED, 7]), Ok(()));
         assert!(located(&[8]).is_err(), "a location past the device's");
+        d.abandon_planted();
+    }
+
+    /// An allocation names a memory type the device has, and asks for no capture address.
+    #[test]
+    fn an_allocation_names_a_memory_type_the_device_has() {
+        use crate::venus::proto::types::VkMemoryOpaqueCaptureAddressAllocateInfo;
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(0), VkMemoryPropertyFlags(0)]);
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let info = |index: u32, next: *const core::ffi::c_void| VkMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: next,
+            allocationSize: VkDeviceSize(4096),
+            memoryTypeIndex: index,
+        };
+        let made = |i: VkMemoryAllocateInfo| cs::Decoded::planted(&i).validate(&facts).map(|_| ());
+        let none = core::ptr::null();
+        assert_eq!(made(info(1, none)), Ok(()));
+        assert!(made(info(2, none)).is_err(), "a type past the device's");
+        assert!(made(info(u32::MAX, none)).is_err(), "the largest index");
+        let at = |address: u64| {
+            let chain = VkMemoryOpaqueCaptureAddressAllocateInfo {
+                sType:
+                    VkStructureType::VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO,
+                opaqueCaptureAddress: address,
+                ..Default::default()
+            };
+            made(info(0, (&raw const chain).cast()))
+        };
+        assert_eq!(at(0), Ok(()), "zero asks for no address");
+        assert!(at(0x1000).is_err(), "an address to replay at");
         d.abandon_planted();
     }
 
@@ -19506,8 +19584,14 @@ mod tests {
             allocationSize: VkDeviceSize(4096),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(72), cs::Decoded::planted(&plain), None, &|_| None)
-            .expect("no cap");
+        d.allocate_memory(
+            DEVICE,
+            ObjectId(72),
+            cs::Decoded::planted_checked(&plain),
+            None,
+            &|_| None,
+        )
+        .expect("no cap");
 
         // The route is worth nothing if the census never names it: an undeclared allocation the
         // driver owns is exactly the memory a desktop's images live in, and leaving it out would
@@ -19795,7 +19879,8 @@ mod tests {
                 memoryTypeIndex: 0,
             };
             let resolve = |_| Some(ResourceBytes::Shared(lent.clone()));
-            d.allocate_memory(DEVICE, id, cs::Decoded::planted(&info), None, &resolve).is_ok()
+            d.allocate_memory(DEVICE, id, cs::Decoded::planted_checked(&info), None, &resolve)
+                .is_ok()
         };
 
         assert!(
@@ -19945,8 +20030,14 @@ mod tests {
         };
         let resolve = |_| Some(ResourceBytes::Shared(storage.clone()));
         assert!(
-            d.allocate_memory(DEVICE, ObjectId(80), cs::Decoded::planted(&info), None, &resolve)
-                .is_ok()
+            d.allocate_memory(
+                DEVICE,
+                ObjectId(80),
+                cs::Decoded::planted_checked(&info),
+                None,
+                &resolve
+            )
+            .is_ok()
         );
 
         // The exporter's record and the resource both let go: the client is gone.
@@ -20019,10 +20110,13 @@ mod tests {
                 allocationSize: VkDeviceSize(16384),
                 memoryTypeIndex: 0,
             };
-            let refused =
-                d.allocate_memory(DEVICE, ObjectId(80), cs::Decoded::planted(&info), None, &|_| {
-                    None
-                });
+            let refused = d.allocate_memory(
+                DEVICE,
+                ObjectId(80),
+                cs::Decoded::planted_checked(&info),
+                None,
+                &|_| None,
+            );
             assert!(
                 matches!(
                     refused,
@@ -20130,7 +20224,13 @@ mod tests {
                 allocationSize: VkDeviceSize(SIZE),
                 memoryTypeIndex: 0,
             };
-            d.allocate_memory(DEVICE, ObjectId(id), cs::Decoded::planted(&info), None, &|_| None)
+            d.allocate_memory(
+                DEVICE,
+                ObjectId(id),
+                cs::Decoded::planted_checked(&info),
+                None,
+                &|_| None,
+            )
         };
 
         assert!(ask(&mut d, 1).is_ok(), "the first fits under the cap");
@@ -20184,7 +20284,13 @@ mod tests {
             allocationSize: VkDeviceSize(900),
             memoryTypeIndex: 0,
         };
-        match d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None) {
+        match d.allocate_memory(
+            DEVICE,
+            ObjectId(1),
+            cs::Decoded::planted_checked(&info),
+            None,
+            &|_| None,
+        ) {
             Err(NoMemory::Driver(r)) => {
                 assert_eq!(r, VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY, "the driver's own answer")
             }
@@ -20422,8 +20528,10 @@ mod tests {
             allocationSize: VkDeviceSize(ASKED),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None)
-            .expect("no cap");
+        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted_checked(&info), None, &|_| {
+            None
+        })
+        .expect("no cap");
 
         assert_eq!(
             GIVEN.with(Cell::get),
@@ -20582,8 +20690,10 @@ mod tests {
             allocationSize: VkDeviceSize(SIZE),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None)
-            .expect("a declared export is an export whether or not anything can describe it");
+        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted_checked(&info), None, &|_| {
+            None
+        })
+        .expect("a declared export is an export whether or not anything can describe it");
 
         let allocated = d.memory.get(&ObjectId(1)).expect("allocated");
         assert!(
@@ -20757,8 +20867,10 @@ mod tests {
             allocationSize: VkDeviceSize(SIZE),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None)
-            .expect("a tiling this side cannot describe is not a refusal to export");
+        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted_checked(&info), None, &|_| {
+            None
+        })
+        .expect("a tiling this side cannot describe is not a refusal to export");
 
         assert_eq!(
             LAYOUT_ASKED.get(),
@@ -20924,9 +21036,13 @@ mod tests {
         };
         assert!(
             matches!(
-                d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| {
-                    None
-                }),
+                d.allocate_memory(
+                    DEVICE,
+                    ObjectId(1),
+                    cs::Decoded::planted_checked(&info),
+                    None,
+                    &|_| { None }
+                ),
                 Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE))
             ),
             "no descriptor and no address is no route to the bytes at all"
@@ -20938,8 +21054,14 @@ mod tests {
         // failed. Without this the assertion above would pass just as well if the refusal were
         // about the export failing rather than about there being nowhere left to go.
         let addressable = VkMemoryAllocateInfo { memoryTypeIndex: 1, ..info };
-        d.allocate_memory(DEVICE, ObjectId(2), cs::Decoded::planted(&addressable), None, &|_| None)
-            .expect("host-visible memory still has a mapping to be composited from");
+        d.allocate_memory(
+            DEVICE,
+            ObjectId(2),
+            cs::Decoded::planted_checked(&addressable),
+            None,
+            &|_| None,
+        )
+        .expect("host-visible memory still has a mapping to be composited from");
         let allocated = d.memory.get(&ObjectId(2)).expect("allocated");
         assert!(allocated.surface().is_none(), "there is no surface, and none is invented");
         assert!(matches!(allocated.backing, Backing::Owned { storage: Storage::Heap(_), .. }));
@@ -21067,8 +21189,10 @@ mod tests {
             allocationSize: VkDeviceSize(ASKED),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None)
-            .expect("no cap");
+        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted_checked(&info), None, &|_| {
+            None
+        })
+        .expect("no cap");
 
         let (ptr, told) = GIVEN.with(Cell::get);
         let page = crate::guest_mem::page_size();
@@ -21135,8 +21259,10 @@ mod tests {
         let plain = VkMemoryAllocateInfo { pNext: core::ptr::null(), ..info };
         GIVEN.with(|g| g.set((0, 0)));
         HEAP.with(|b| *b.borrow_mut() = vec![0u8; padded as usize]);
-        d.allocate_memory(DEVICE, ObjectId(2), cs::Decoded::planted(&plain), None, &|_| None)
-            .expect("no cap");
+        d.allocate_memory(DEVICE, ObjectId(2), cs::Decoded::planted_checked(&plain), None, &|_| {
+            None
+        })
+        .expect("no cap");
         assert_eq!(GIVEN.with(Cell::get).0, 0, "the driver was handed no pages: the memory is its");
         assert_eq!(MAPPED.with(Cell::get), 1, "and this renderer took the one mapping over it");
 
@@ -21307,8 +21433,14 @@ mod tests {
             // 1. A scanout: exported and dedicated to a LINEAR image, which is the one shape a
             //    window buffer has.
             let scanout = VkMemoryAllocateInfo { pNext: (&raw const export).cast(), ..base };
-            d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&scanout), None, &|_| None)
-                .expect("no cap");
+            d.allocate_memory(
+                DEVICE,
+                ObjectId(1),
+                cs::Decoded::planted_checked(&scanout),
+                None,
+                &|_| None,
+            )
+            .expect("no cap");
 
             // 2. Declared for export but dedicated to nothing, so there is no surface to mint and
             //    the bytes are pages this renderer mints instead.
@@ -21318,17 +21450,35 @@ mod tests {
                 memoryTypeIndex: 0,
                 ..base
             };
-            d.allocate_memory(DEVICE, ObjectId(2), cs::Decoded::planted(&linear), None, &|_| None)
-                .expect("no cap");
+            d.allocate_memory(
+                DEVICE,
+                ObjectId(2),
+                cs::Decoded::planted_checked(&linear),
+                None,
+                &|_| None,
+            )
+            .expect("no cap");
 
             // 3. Host-visible and undeclared: the driver's own memory, mapped once and owned.
             let heap = VkMemoryAllocateInfo { memoryTypeIndex: 0, ..base };
-            d.allocate_memory(DEVICE, ObjectId(3), cs::Decoded::planted(&heap), None, &|_| None)
-                .expect("no cap");
+            d.allocate_memory(
+                DEVICE,
+                ObjectId(3),
+                cs::Decoded::planted_checked(&heap),
+                None,
+                &|_| None,
+            )
+            .expect("no cap");
 
             // 4. Memory the host cannot address at all.
-            d.allocate_memory(DEVICE, ObjectId(4), cs::Decoded::planted(&base), None, &|_| None)
-                .expect("no cap");
+            d.allocate_memory(
+                DEVICE,
+                ObjectId(4),
+                cs::Decoded::planted_checked(&base),
+                None,
+                &|_| None,
+            )
+            .expect("no cap");
 
             // 5. An import: the bytes are another allocation's, the handle is this one's.
             let lent = Storage::pages_for_test(4096, &Account::for_test(None));
@@ -21343,8 +21493,14 @@ mod tests {
                 ..base
             };
             let resolve = |_| Some(ResourceBytes::Shared(lent.clone()));
-            d.allocate_memory(DEVICE, ObjectId(5), cs::Decoded::planted(&imported), None, &resolve)
-                .expect("no cap");
+            d.allocate_memory(
+                DEVICE,
+                ObjectId(5),
+                cs::Decoded::planted_checked(&imported),
+                None,
+                &resolve,
+            )
+            .expect("no cap");
 
             // The premise, asserted: five allocations, five different backings. A shape that
             // stopped reaching the backing it is named for would otherwise quietly test nothing.
@@ -22116,8 +22272,10 @@ mod tests {
             allocationSize: VkDeviceSize(ASKED),
             memoryTypeIndex: 0,
         };
-        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted(&info), None, &|_| None)
-            .expect("no cap");
+        d.allocate_memory(DEVICE, ObjectId(1), cs::Decoded::planted_checked(&info), None, &|_| {
+            None
+        })
+        .expect("no cap");
         assert!(d.memory_surface_id(ObjectId(1)).is_some(), "the premise: this minted a surface");
         assert_eq!(d.account.live(), extent, "charged for the pages, not for the rows");
 
@@ -22125,8 +22283,14 @@ mod tests {
         let opaque_export =
             VkExportMemoryAllocateInfo { pNext: (&raw const opaque_dedicated).cast(), ..export };
         let opaque = VkMemoryAllocateInfo { pNext: (&raw const opaque_export).cast(), ..info };
-        d.allocate_memory(DEVICE, ObjectId(2), cs::Decoded::planted(&opaque), None, &|_| None)
-            .expect("no cap");
+        d.allocate_memory(
+            DEVICE,
+            ObjectId(2),
+            cs::Decoded::planted_checked(&opaque),
+            None,
+            &|_| None,
+        )
+        .expect("no cap");
         assert!(
             d.memory_surface_id(ObjectId(2)).is_none(),
             "an opaque image has no rows to alias, whatever pitch the driver quotes for it"
@@ -22199,15 +22363,27 @@ mod tests {
         let pages = Storage::pages_for_test(4096, &Account::for_test(None));
         let resolve = |_| Some(ResourceBytes::Shared(pages.clone()));
         assert!(
-            d.allocate_memory(DEVICE, ObjectId(2), cs::Decoded::planted(&info), None, &resolve)
-                .is_ok(),
+            d.allocate_memory(
+                DEVICE,
+                ObjectId(2),
+                cs::Decoded::planted_checked(&info),
+                None,
+                &resolve
+            )
+            .is_ok(),
             "an import is admitted with no room left, because it takes none"
         );
         assert_eq!(d.account.live(), 900, "and the ledger did not move");
 
         assert!(
-            d.allocate_memory(DEVICE, ObjectId(3), cs::Decoded::planted(&info), None, &|_| None)
-                .is_err(),
+            d.allocate_memory(
+                DEVICE,
+                ObjectId(3),
+                cs::Decoded::planted_checked(&info),
+                None,
+                &|_| None
+            )
+            .is_err(),
             "an import that resolved to nothing is an ordinary allocation, and there is no room"
         );
         assert_eq!(d.account.live(), 900, "a refusal costs nothing");
