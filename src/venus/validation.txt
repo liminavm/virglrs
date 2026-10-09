@@ -42,7 +42,7 @@ vkCmdBindDescriptorSets                          validated
 vkCmdBindDescriptorSets2                         validated
 vkCmdBindIndexBuffer                             validated
 vkCmdBindIndexBuffer2                            validated
-vkCmdBindPipeline                                reviewed
+vkCmdBindPipeline                                validated
 vkCmdBindTransformFeedbackBuffersEXT             validated
 vkCmdBindVertexBuffers                           validated
 vkCmdBindVertexBuffers2                          validated

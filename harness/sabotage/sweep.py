@@ -5644,6 +5644,13 @@ SABOTAGES = [
         'transform_feedback_is_held_to_its_buffers_and_the_device',
     ),
     (
+        'a pipeline library may be bound',
+        'src/venus/driver.rs',
+        """        if facts.library {""",
+        """        if false && facts.library {""",
+        'a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

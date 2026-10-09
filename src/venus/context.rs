@@ -2436,6 +2436,7 @@ impl Handlers<'_> {
             Err(B::UnknownBindPoint) => self.reject(BIND_UNKNOWN_POINT),
             Err(B::UnknownPipeline) => self.reject(BIND_UNKNOWN_PIPELINE),
             Err(B::WrongKind) => self.reject(BIND_WRONG_KIND),
+            Err(B::Library) => self.reject(BIND_LIBRARY),
         }
     }
 
@@ -2621,6 +2622,7 @@ const UNBOUND_DESTROYED: &str =
 const BIND_UNKNOWN_POINT: &str = "bound a pipeline at a point this renderer serves none at";
 const BIND_UNKNOWN_PIPELINE: &str = "bound a pipeline its command buffer's device never made";
 const BIND_WRONG_KIND: &str = "bound a pipeline at another kind's bind point";
+const BIND_LIBRARY: &str = "bound a pipeline library, which is linked into pipelines, not bound";
 
 const BASE_OUTSIDE_RUN: &str =
     "derived a pipeline from an index that is not an earlier pipeline in the same run";
@@ -18862,10 +18864,26 @@ mod tests {
         let mine = compute(&mut h, DEVICE);
         let shaded = graphics(&mut h, 41);
         let theirs = compute(&mut h, OTHER);
+        let library = {
+            let mut infos = [a_graphics_pipeline()];
+            infos[0].flags.0 =
+                VkPipelineCreateFlagBits::VK_PIPELINE_CREATE_LIBRARY_BIT_KHR.0 as u32;
+            let mut wire = [VkPipeline::forged(42)];
+            let mut shadow = [VkPipeline::forged(0)];
+            let mut args = vn_command_vkCreateGraphicsPipelines::default();
+            args.device = VkDevice::forged(DEVICE);
+            args.plant_pCreateInfos(&infos);
+            args.plant_pPipelines(&mut wire);
+            args.plant_handle_pPipelines(&mut shadow);
+            h.vkCreateGraphicsPipelines(&mut args);
+            assert_eq!(h.take_rejected(), None, "a graphics library is made");
+            shadow[0]
+        };
         let refusals = [
             ("a compute pipeline at the graphics point", GRAPHICS, mine, BIND_WRONG_KIND),
             ("a graphics pipeline at the compute point", COMPUTE, shaded, BIND_WRONG_KIND),
             ("another device's pipeline", COMPUTE, theirs, BIND_UNKNOWN_PIPELINE),
+            ("a pipeline library", GRAPHICS, library, BIND_LIBRARY),
             ("a pipeline never made", COMPUTE, VkPipeline::forged(0x5eed), BIND_UNKNOWN_PIPELINE),
             (
                 "a bind point this renderer serves nothing at",

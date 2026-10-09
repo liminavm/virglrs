@@ -1022,6 +1022,10 @@ pub enum BindRefused {
     UnknownPipeline,
     /// The pipeline is of another kind than the bind point.
     WrongKind,
+    /// The pipeline is a library, made to be linked into others. It has no stage it lacks a
+    /// library for, and the Mesa runtime binds those as null, guarded only by an assert;
+    /// KosmicKrisp then reads the missing vertex shader.
+    Library,
 }
 
 /// Why a draw, dispatch or trace was not recorded. None reached the driver.
@@ -6579,6 +6583,9 @@ impl Driver {
             .ok_or(BindRefused::UnknownPipeline)?;
         if facts.kind.bind_point() != point {
             return Err(BindRefused::WrongKind);
+        }
+        if facts.library {
+            return Err(BindRefused::Library);
         }
         let d = self.recorder(cb).ok_or(BindRefused::NoDevice)?;
         // SAFETY: as above.
