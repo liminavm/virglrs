@@ -47,8 +47,8 @@ vkCmdBindVertexBuffers                           validated
 vkCmdBindVertexBuffers2                          validated
 vkCmdBlitImage                                   validated
 vkCmdBlitImage2                                  validated
-vkCmdBuildAccelerationStructuresIndirectKHR      reviewed
-vkCmdBuildAccelerationStructuresKHR              reviewed
+vkCmdBuildAccelerationStructuresIndirectKHR      validated
+vkCmdBuildAccelerationStructuresKHR              validated
 vkCmdClearAttachments                            reviewed
 vkCmdClearColorImage                             validated
 vkCmdClearDepthStencilImage                      validated

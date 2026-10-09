@@ -5526,6 +5526,29 @@ SABOTAGES = [
         'a_drm_modifier_query_names_its_modifier',
     ),
     (
+        'a build may name no destination',
+        'src/venus/context.rs',
+        """    !info.dstAccelerationStructure.is_null()
+""",
+        """    true
+""",
+        'a_build_names_its_destination',
+    ),
+    (
+        'indirect builds may be enabled without their feature',
+        'src/venus/driver.rs',
+        """        .is_some_and(|f| f.accelerationStructureIndirectBuild.0 != 0)""",
+        """        .is_some()""",
+        'indirect_builds_are_enabled_only_by_their_feature',
+    ),
+    (
+        'an indirect build may skip its feature check',
+        'src/venus/context.rs',
+        """        if self.driver.recorder_facts(args.commandBuffer).is_some_and(|f| !f.indirect_builds) {""",
+        """        if false {""",
+        'a_build_with_no_destination_or_no_indirect_feature_is_refused',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

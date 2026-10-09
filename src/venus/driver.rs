@@ -145,6 +145,7 @@ use super::proto::types::{
 };
 use super::proto::types::{
     VkDeviceQueueCreateInfo, VkMemoryAllocateFlagsInfo, VkMemoryOpaqueCaptureAddressAllocateInfo,
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR,
     VkPhysicalDeviceImageDrmFormatModifierInfoEXT, VkQueueFamilyProperties,
 };
 use super::proto::types::{
@@ -2611,6 +2612,9 @@ struct DeviceState {
     /// The query types the device was created able to make. Read once at creation from what the
     /// guest enabled; see [`enabled_query_types`].
     query_types: Vec<VkQueryType>,
+    /// Whether the guest enabled `accelerationStructureIndirectBuild`; see
+    /// [`enables_indirect_builds`].
+    indirect_builds: bool,
     /// Where the device's format properties are read from.
     formats: Formats,
 }
@@ -3449,6 +3453,7 @@ impl Driver {
             .any(|n| n == "VK_EXT_sample_locations")
             .then(|| sample_location_grids(inst, pd));
         let query_types = enabled_query_types(&wanted, enables_pipeline_statistics(info_decoded));
+        let indirect_builds = enables_indirect_builds(info_decoded);
         let formats = Formats::Driver {
             physical: pd,
             modifiers: wanted.iter().any(|n| n == "VK_EXT_image_drm_format_modifier"),
@@ -3463,6 +3468,7 @@ impl Driver {
                 limits,
                 sample_locations,
                 query_types,
+                indirect_builds,
                 formats,
             },
         );
@@ -4431,6 +4437,7 @@ impl Driver {
             limits: &d.limits,
             sample_locations: d.sample_locations.as_ref(),
             query_types: &d.query_types,
+            indirect_builds: d.indirect_builds,
             stages: d.stages,
             formats: FormatQueries { source: &d.formats, instance: self.instance() },
             memory_types: &d.memory_types,
@@ -5323,6 +5330,7 @@ impl Driver {
                 limits: planted_limits(),
                 sample_locations: None,
                 query_types: enabled_query_types(&[], true),
+                indirect_builds: false,
                 formats: Formats::Planted(PlantedFormats::default()),
             },
         );
@@ -5358,6 +5366,12 @@ impl Driver {
     #[cfg(test)]
     pub(super) fn plant_image(&mut self, image: VkImage, info: &VkImageCreateInfo) {
         self.note_image(image, info);
+    }
+
+    /// Enable indirect acceleration-structure builds on a planted device, which starts without.
+    #[cfg(test)]
+    pub(super) fn plant_indirect_builds(&mut self, handle: VkDevice) {
+        self.devices.get_mut(&handle).expect("a planted device").indirect_builds = true;
     }
 
     /// Give a planted device the query types `vkCreateDevice` would have read off what the guest
@@ -13935,6 +13949,8 @@ pub struct DeviceFacts<'d> {
     pub sample_locations: Option<&'d SampleLocationGrids>,
     /// The query types the device was created able to make.
     pub query_types: &'d [VkQueryType],
+    /// Whether it was created with `accelerationStructureIndirectBuild`.
+    pub indirect_builds: bool,
     /// The shader stages it runs: see [`enabled_stages`].
     pub stages: u32,
     /// Its format properties.
@@ -14260,6 +14276,14 @@ impl cs::Validate<cs::Chained<'_, VkSubmitInfo, Facts<'_>>> for VkTimelineSemaph
 
 /// Whether the guest's device create info enables `pipelineStatisticsQuery`, in either of the two
 /// places Vulkan lets it: `pEnabledFeatures`, or a `VkPhysicalDeviceFeatures2` in its chain.
+/// Whether `info` enables `accelerationStructureIndirectBuild`. The Mesa runtime's
+/// `vkCmdBuildAccelerationStructuresIndirectKHR` is an `UNREACHABLE` stub that anv and radv, which
+/// report the feature false, leave in place: a device that did not enable it must never be asked.
+fn enables_indirect_builds(info: cs::Decoded<'_, VkDeviceCreateInfo>) -> bool {
+    chained::<VkPhysicalDeviceAccelerationStructureFeaturesKHR, _>(info)
+        .is_some_and(|f| f.accelerationStructureIndirectBuild.0 != 0)
+}
+
 fn enables_pipeline_statistics(info: cs::Decoded<'_, VkDeviceCreateInfo>) -> bool {
     // SAFETY: `info` is the decoder's, so `pEnabledFeatures` is null or a struct it allocated in
     // the arena `info` borrows (see `Decoded::vouch`).
@@ -14560,6 +14584,13 @@ unsafe impl InStruct for VkPipelineLibraryCreateInfoKHR {
 unsafe impl InStruct for VkPhysicalDeviceImageDrmFormatModifierInfoEXT {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkPhysicalDeviceAccelerationStructureFeaturesKHR {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -16318,6 +16349,32 @@ mod tests {
         assert_eq!(located(&[1, ATTACHMENT_UNUSED, 7]), Ok(()));
         assert!(located(&[8]).is_err(), "a location past the device's");
         d.abandon_planted();
+    }
+
+    /// Indirect acceleration-structure builds are enabled only by the feature struct saying so.
+    #[test]
+    fn indirect_builds_are_enabled_only_by_their_feature() {
+        let mut features = VkPhysicalDeviceAccelerationStructureFeaturesKHR {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+            accelerationStructure: VkBool32(1),
+            ..Default::default()
+        };
+        let enables = |features: &VkPhysicalDeviceAccelerationStructureFeaturesKHR| {
+            let info = VkDeviceCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+                pNext: (&raw const *features).cast(),
+                ..Default::default()
+            };
+            enables_indirect_builds(cs::Decoded::planted(&info))
+        };
+        assert!(!enables(&features), "the structures, not their indirect builds");
+        features.accelerationStructureIndirectBuild = VkBool32(1);
+        assert!(enables(&features));
+        let bare = VkDeviceCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            ..Default::default()
+        };
+        assert!(!enables_indirect_builds(cs::Decoded::planted(&bare)), "no feature struct");
     }
 
     /// A device's queue requests name families it has, each once, for as many queues as the

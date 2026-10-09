@@ -2547,6 +2547,14 @@ fn one_geometry_array(info: &VkAccelerationStructureBuildGeometryInfoKHR) -> boo
     info.geometryCount == 0 || info.pGeometries.is_null() != info.ppGeometries.is_null()
 }
 
+/// Whether a build names the structure it builds into: the Mesa runtime follows it unchecked.
+/// vk.xml lets the handle be null, so the decoder admits it.
+fn builds_into_a_structure(info: &VkAccelerationStructureBuildGeometryInfoKHR) -> bool {
+    !info.dstAccelerationStructure.is_null()
+}
+
+const NO_DESTINATION: &str = "built an acceleration structure into none";
+
 const NOT_ONE_GEOMETRY_ARRAY: &str = "built an acceleration structure whose geometries are in \
      neither of its two arrays, or in both";
 
@@ -5662,6 +5670,9 @@ impl Commands for Handlers<'_> {
             self.reject(NOT_ONE_GEOMETRY_ARRAY);
             return;
         }
+        if !infos.iter().all(|i| builds_into_a_structure(i.get())) {
+            return self.reject(NO_DESTINATION);
+        }
         let done = self.driver.cmd_build_acceleration_structures(
             args.commandBuffer,
             infos,
@@ -5678,6 +5689,15 @@ impl Commands for Handlers<'_> {
         if !infos.iter().all(|i| one_geometry_array(i.get())) {
             self.reject(NOT_ONE_GEOMETRY_ARRAY);
             return;
+        }
+        if !infos.iter().all(|i| builds_into_a_structure(i.get())) {
+            return self.reject(NO_DESTINATION);
+        }
+        // A command buffer this context does not have is the recorder's to answer.
+        if self.driver.recorder_facts(args.commandBuffer).is_some_and(|f| !f.indirect_builds) {
+            return self.reject(
+                "built an acceleration structure indirectly on a device that did not enable it",
+            );
         }
         let done = self.driver.cmd_build_acceleration_structures_indirect(
             args.commandBuffer,
@@ -9785,6 +9805,120 @@ mod tests {
             run!(|h: &mut Handlers| h.vkGetPhysicalDeviceQueueFamilyProperties(&mut args)),
             Some(MISSING)
         );
+    }
+
+    /// A build into no structure is refused in both forms, and an indirect build on a device that
+    /// did not enable the feature is refused, before the recorder is reached.
+    #[test]
+    fn a_build_with_no_destination_or_no_indirect_feature_is_refused() {
+        use super::super::proto::types::{
+            VkAccelerationStructureBuildRangeInfoKHR, VkAccelerationStructureKHR, VkCommandPool,
+            VkDeviceAddress, vn_command_vkCmdBuildAccelerationStructuresIndirectKHR,
+            vn_command_vkCmdBuildAccelerationStructuresKHR,
+        };
+
+        const DEVICE: u64 = 3;
+        const CB: (u64, u64) = (0x71, 0x17);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), crate::vulkan::Device::default());
+        driver.plant_pool(
+            VkDevice::forged(DEVICE),
+            VkCommandPool::forged(0x70),
+            &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
+        );
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+
+        macro_rules! run {
+            ($call:expr) => {{
+                let mut rings = BTreeMap::new();
+                let mut ctx_reply = None;
+                let mut monitor = None;
+                let mut jrnl = Journal::new();
+                let mut h = Handlers {
+                    objects: &objects,
+                    todo: &todo,
+                    driver: &mut driver,
+                    global: &global,
+                    ctx: ContextId::new(1).expect("1 is not zero"),
+                    ask: None,
+                    resources: &NO_RESOURCES,
+                    rings: &mut rings,
+                    monitor: &mut monitor,
+                    replaying: false,
+                    depth: 0,
+                    answer: None,
+                    own_wait: None,
+                    current_ring: None,
+                    reply: &mut ctx_reply,
+                    note: None,
+                    journal: &mut jrnl,
+                };
+                #[allow(clippy::redundant_closure_call)]
+                (|h: &mut Handlers| $call(h))(&mut h);
+                h.rejected()
+            }};
+        }
+
+        let cb = VkCommandBuffer::forged(CB.0);
+        let into = |dst| {
+            [VkAccelerationStructureBuildGeometryInfoKHR {
+                dstAccelerationStructure: dst,
+                ..Default::default()
+            }]
+        };
+        let nowhere = into(VkAccelerationStructureKHR::NULL);
+        let somewhere = into(VkAccelerationStructureKHR::forged(0x61));
+        let ranges = [VkAccelerationStructureBuildRangeInfoKHR::default()];
+        let range_rows = [ranges.as_ptr()];
+        let addresses = [VkDeviceAddress(0xd000)];
+        let strides = [16u32];
+        let bounds = [5u32];
+        let bound_rows = [bounds.as_ptr()];
+
+        let mut args = vn_command_vkCmdBuildAccelerationStructuresKHR::default();
+        args.commandBuffer = cb;
+        args.plant_pInfos(&nowhere);
+        args.plant_ppBuildRangeInfos(&range_rows);
+        assert_eq!(
+            run!(|h: &mut Handlers| h.vkCmdBuildAccelerationStructuresKHR(&mut args)),
+            Some(NO_DESTINATION)
+        );
+
+        let indirect = |infos| {
+            let mut args = vn_command_vkCmdBuildAccelerationStructuresIndirectKHR::default();
+            args.commandBuffer = cb;
+            args.plant_pInfos(infos);
+            args.plant_pIndirectDeviceAddresses(&addresses);
+            args.plant_pIndirectStrides(&strides);
+            args.plant_ppMaxPrimitiveCounts(&bound_rows);
+            args
+        };
+        let mut args = indirect(&nowhere);
+        assert_eq!(
+            run!(|h: &mut Handlers| h.vkCmdBuildAccelerationStructuresIndirectKHR(&mut args)),
+            Some(NO_DESTINATION)
+        );
+        let mut args = indirect(&somewhere);
+        assert_eq!(
+            run!(|h: &mut Handlers| h.vkCmdBuildAccelerationStructuresIndirectKHR(&mut args)),
+            Some("built an acceleration structure indirectly on a device that did not enable it")
+        );
+        driver.abandon_planted();
+    }
+
+    /// A build names the structure it builds into.
+    #[test]
+    fn a_build_names_its_destination() {
+        use super::super::proto::types::VkAccelerationStructureKHR;
+        let into = |dst| VkAccelerationStructureBuildGeometryInfoKHR {
+            dstAccelerationStructure: dst,
+            ..Default::default()
+        };
+        assert!(builds_into_a_structure(&into(VkAccelerationStructureKHR::forged(7))));
+        assert!(!builds_into_a_structure(&into(VkAccelerationStructureKHR::NULL)));
     }
 
     /// A format query about DRM-modifier tiling names its modifier, and the forms that cannot
@@ -19115,6 +19249,7 @@ mod tests {
             ..Default::default()
         };
         driver.plant_query_types(VkDevice::forged(DEVICE), &[pool_info.queryType]);
+        driver.plant_indirect_builds(VkDevice::forged(DEVICE));
         let facts = driver.device_facts(VkDevice::forged(DEVICE)).expect("a planted device");
         let pool_info = super::super::cs::Decoded::planted(&pool_info)
             .validate(&facts)
@@ -19155,11 +19290,13 @@ mod tests {
         let by_row = [&two[0] as *const _, &two[1] as *const _];
         let infos = [
             VkAccelerationStructureBuildGeometryInfoKHR {
+                dstAccelerationStructure: VkAccelerationStructureKHR::forged(0x61),
                 geometryCount: 1,
                 pGeometries: one.as_ptr(),
                 ..Default::default()
             },
             VkAccelerationStructureBuildGeometryInfoKHR {
+                dstAccelerationStructure: VkAccelerationStructureKHR::forged(0x62),
                 geometryCount: 2,
                 ppGeometries: by_row.as_ptr(),
                 ..Default::default()
