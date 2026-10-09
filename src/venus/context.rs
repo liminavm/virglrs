@@ -18417,7 +18417,9 @@ mod tests {
             VkCommandPool::forged(POOL),
             &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
-        driver.plant_bound(VkCommandBuffer::forged(CB.0), driver::BindPoint::Graphics);
+        let mesh = super::super::proto::types::VkShaderStageFlagBits::VK_SHADER_STAGE_MESH_BIT_EXT.0
+            as u32;
+        driver.plant_bound_graphics(VkCommandBuffer::forged(CB.0), mesh, None);
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();

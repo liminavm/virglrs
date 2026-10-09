@@ -286,12 +286,16 @@ struct Child {
 }
 
 /// What one command buffer's current recording has done that later commands in it are held to:
-/// the pipelines it has bound, and the rendering it is inside. A begin or a reset starts it over,
-/// all of it at once.
+/// the pipelines it has bound, the rendering it is inside, and the topology a draw would use. A
+/// begin or a reset starts it over, all of it at once.
 #[derive(Clone, Debug, Default)]
 struct Recording {
     bound: Bound,
     scope: Scope,
+    /// The topology the driver will draw with: the last one fixed by a graphics pipeline bound
+    /// or set by `vkCmdSetPrimitiveTopology`, whichever came later. The Mesa runtime keeps one
+    /// value for both, so a pipeline that fixes its topology overwrites the set one at its bind.
+    topology: VkPrimitiveTopology,
 }
 
 /// The rendering a recording is inside.
@@ -924,6 +928,12 @@ impl Pools {
     fn scope(&self, cb: VkCommandBuffer) -> Option<&Scope> {
         let handle = TypedHandle::of(cb);
         Some(&self.open.get(self.owner.get(&handle)?)?.children.get(&handle)?.recording.scope)
+    }
+
+    /// The topology a draw in a command buffer would use, if a pool here holds it.
+    fn topology(&self, cb: VkCommandBuffer) -> Option<VkPrimitiveTopology> {
+        let handle = TypedHandle::of(cb);
+        Some(self.open.get(self.owner.get(&handle)?)?.children.get(&handle)?.recording.topology)
     }
 
     /// Which bind points of a command buffer have a pipeline, if a pool here holds it.
@@ -5339,7 +5349,8 @@ impl Driver {
             for (pipeline, info) in out.iter().zip(infos.iter()) {
                 if pipeline.host().raw() != 0 {
                     let library = is_library(info, info.flags());
-                    self.record_pipeline(*pipeline, device, I::KIND, library);
+                    let kind = I::kind(info, &self.pipelines);
+                    self.record_pipeline(*pipeline, device, kind, library);
                 }
             }
         }
@@ -5989,12 +6000,30 @@ impl Driver {
     /// [`Driver::plant_pool`]: a test about a draw has no pipeline to create.
     #[cfg(test)]
     pub(super) fn plant_bound(&mut self, cb: VkCommandBuffer, point: BindPoint) {
-        let device = self.pools.device_of(cb).expect("a command buffer planted first");
         let kind = match point {
-            BindPoint::Graphics => PipelineKind::Graphics,
+            BindPoint::Graphics => PipelineKind::Graphics(GraphicsShape::default()),
             BindPoint::Compute => PipelineKind::Compute,
             BindPoint::RayTracing => PipelineKind::RayTracing { groups: 0 },
         };
+        self.plant_bound_kind(cb, kind);
+    }
+
+    /// [`Driver::plant_bound`] for a graphics pipeline of `stages`, a `VkShaderStageFlags`, that
+    /// fixes `topology` if one is given.
+    #[cfg(test)]
+    pub(super) fn plant_bound_graphics(
+        &mut self,
+        cb: VkCommandBuffer,
+        stages: u32,
+        topology: Option<VkPrimitiveTopology>,
+    ) {
+        self.plant_bound_kind(cb, PipelineKind::Graphics(GraphicsShape { stages, topology }));
+    }
+
+    #[cfg(test)]
+    fn plant_bound_kind(&mut self, cb: VkCommandBuffer, kind: PipelineKind) {
+        let device = self.pools.device_of(cb).expect("a command buffer planted first");
+        let point = kind.bind_point();
         // Out of the way of any handle a planted driver hands out.
         let pipeline = VkPipeline::forged(0xb0d0_0000 + self.next_pipeline);
         self.record_pipeline(pipeline, device, kind, false);
@@ -6385,13 +6414,18 @@ impl Driver {
 
     /// [`Driver::recorder`] for a draw, dispatch or trace: the entry points only if the
     /// recording has bound a pipeline at the point the command uses. See [`Bound`].
-    fn drawer(&self, cb: VkCommandBuffer, point: BindPoint) -> Result<&DeviceFns, Unrecorded> {
+    fn drawer(&self, cb: VkCommandBuffer, draws: Draws) -> Result<&DeviceFns, Unrecorded> {
         let bound = self.pools.bound(cb).ok_or(Unrecorded::NoDevice)?;
-        let binding = bound.at(point).ok_or(Unrecorded::Unbound)?;
-        self.pipelines
+        let binding = bound.at(draws.bind_point()).ok_or(Unrecorded::Unbound)?;
+        let facts = self
+            .pipelines
             .get(&binding.pipeline)
             .filter(|facts| facts.serial == binding.serial)
             .ok_or(Unrecorded::Destroyed)?;
+        if let PipelineKind::Graphics(shape) = facts.kind {
+            let topology = self.pools.topology(cb).ok_or(Unrecorded::NoDevice)?;
+            shape.draws(draws, topology).map_err(Unrecorded::Invalid)?;
+        }
         self.recorder(cb).ok_or(Unrecorded::NoDevice)
     }
 
@@ -6785,6 +6819,9 @@ impl Driver {
         let child = self.pools.child_mut(cb).expect("the pool record `device_of` just read");
         child.recording.bound =
             child.recording.bound.with(point, Binding { pipeline, serial: facts.serial });
+        if let PipelineKind::Graphics(GraphicsShape { topology: Some(fixed), .. }) = facts.kind {
+            child.recording.topology = fixed;
+        }
         Ok(())
     }
 
@@ -6828,7 +6865,7 @@ impl Driver {
         first_vertex: u32,
         first_instance: u32,
     ) -> Result<(), Unrecorded> {
-        let d = self.drawer(cb, BindPoint::Graphics)?;
+        let d = self.drawer(cb, Draws::Vertices)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDraw())(cb, vertices, instances, first_vertex, first_instance) };
         Ok(())
@@ -6841,7 +6878,7 @@ impl Driver {
         y: u32,
         z: u32,
     ) -> Result<(), Unrecorded> {
-        let d = self.drawer(cb, BindPoint::Compute)?;
+        let d = self.drawer(cb, Draws::Dispatch)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDispatch())(cb, x, y, z) };
         Ok(())
@@ -6856,7 +6893,7 @@ impl Driver {
         vertex_offset: i32,
         first_instance: u32,
     ) -> Result<(), Unrecorded> {
-        let d = self.drawer(cb, BindPoint::Graphics)?;
+        let d = self.drawer(cb, Draws::Vertices)?;
         // SAFETY: as above.
         unsafe {
             (d.vkCmdDrawIndexed())(
@@ -6928,7 +6965,7 @@ impl Driver {
         draws: u32,
         stride: u32,
     ) -> Result<(), Unrecorded> {
-        let d = self.drawer(cb, BindPoint::Graphics)?;
+        let d = self.drawer(cb, Draws::Vertices)?;
         self.indirect_fits(cb, buffer, offset, draws, stride, DRAW_RECORD)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDrawIndirect())(cb, buffer, offset, draws, stride) };
@@ -6943,7 +6980,7 @@ impl Driver {
         draws: u32,
         stride: u32,
     ) -> Result<(), Unrecorded> {
-        let d = self.drawer(cb, BindPoint::Graphics)?;
+        let d = self.drawer(cb, Draws::Vertices)?;
         self.indirect_fits(cb, buffer, offset, draws, stride, INDEXED_RECORD)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDrawIndexedIndirect())(cb, buffer, offset, draws, stride) };
@@ -6964,7 +7001,7 @@ impl Driver {
         stride: u32,
     ) -> Result<(), Unrecorded> {
         let f = self
-            .drawer(cb, BindPoint::Graphics)?
+            .drawer(cb, Draws::Vertices)?
             .try_vkCmdDrawIndirectCount()
             .ok_or(Unrecorded::NoDevice)?;
         let (b, o, cbuf, co) = (buffer, offset, count_buffer, count_offset);
@@ -6983,7 +7020,7 @@ impl Driver {
         z: u32,
     ) -> Result<(), Unrecorded> {
         let f = self
-            .drawer(cb, BindPoint::Graphics)?
+            .drawer(cb, Draws::MeshTasks)?
             .try_vkCmdDrawMeshTasksEXT()
             .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
@@ -7001,7 +7038,7 @@ impl Driver {
         stride: u32,
     ) -> Result<(), Unrecorded> {
         let f = self
-            .drawer(cb, BindPoint::Graphics)?
+            .drawer(cb, Draws::MeshTasks)?
             .try_vkCmdDrawMeshTasksIndirectEXT()
             .ok_or(Unrecorded::NoDevice)?;
         self.indirect_fits(cb, buffer, offset, draws, stride, MESH_RECORD)?;
@@ -7023,7 +7060,7 @@ impl Driver {
         stride: u32,
     ) -> Result<(), Unrecorded> {
         let f = self
-            .drawer(cb, BindPoint::Graphics)?
+            .drawer(cb, Draws::MeshTasks)?
             .try_vkCmdDrawMeshTasksIndirectCountEXT()
             .ok_or(Unrecorded::NoDevice)?;
         let (b, o, cbuf, co) = (buffer, offset, count_buffer, count_offset);
@@ -7131,10 +7168,8 @@ impl Driver {
         height: u32,
         depth: u32,
     ) -> Result<(), Unrecorded> {
-        let f = self
-            .drawer(cb, BindPoint::RayTracing)?
-            .try_vkCmdTraceRaysKHR()
-            .ok_or(Unrecorded::NoDevice)?;
+        let f =
+            self.drawer(cb, Draws::Rays)?.try_vkCmdTraceRaysKHR().ok_or(Unrecorded::NoDevice)?;
         let t = tables;
         // SAFETY: as above; each table is a borrow live for the call.
         unsafe { f(cb, t.raygen, t.miss, t.hit, t.callable, width, height, depth) };
@@ -7149,7 +7184,7 @@ impl Driver {
         grid: VkDeviceAddress,
     ) -> Result<(), Unrecorded> {
         let f = self
-            .drawer(cb, BindPoint::RayTracing)?
+            .drawer(cb, Draws::Rays)?
             .try_vkCmdTraceRaysIndirectKHR()
             .ok_or(Unrecorded::NoDevice)?;
         let t = tables;
@@ -7165,7 +7200,7 @@ impl Driver {
         at: VkDeviceAddress,
     ) -> Result<(), Unrecorded> {
         let f = self
-            .drawer(cb, BindPoint::RayTracing)?
+            .drawer(cb, Draws::Rays)?
             .try_vkCmdTraceRaysIndirect2KHR()
             .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
@@ -7236,7 +7271,7 @@ impl Driver {
         stride: u32,
     ) -> Result<(), Unrecorded> {
         let f = self
-            .drawer(cb, BindPoint::Graphics)?
+            .drawer(cb, Draws::Vertices)?
             .try_vkCmdDrawIndexedIndirectCount()
             .ok_or(Unrecorded::NoDevice)?;
         let (b, o, cbuf, co) = (buffer, offset, count_buffer, count_offset);
@@ -7252,7 +7287,7 @@ impl Driver {
         buffer: VkBuffer,
         offset: VkDeviceSize,
     ) -> Result<(), Unrecorded> {
-        let d = self.drawer(cb, BindPoint::Compute)?;
+        let d = self.drawer(cb, Draws::Dispatch)?;
         self.facts()
             .buffer_span(buffer, offset, Some(DISPATCH_RECORD))
             .map_err(Unrecorded::Invalid)?;
@@ -7269,7 +7304,7 @@ impl Driver {
         groups: [u32; 3],
     ) -> Result<(), Unrecorded> {
         let f = self
-            .drawer(cb, BindPoint::Compute)?
+            .drawer(cb, Draws::Dispatch)?
             .try_vkCmdDispatchBase()
             .ok_or(Unrecorded::NoDevice)?;
         let ([bx, by, bz], [x, y, z]) = (base, groups);
@@ -7685,14 +7720,16 @@ impl Driver {
         Some(())
     }
 
+    /// `vkCmdSetPrimitiveTopology`, which the recording remembers: see [`Recording::topology`].
     pub fn cmd_set_primitive_topology(
-        &self,
+        &mut self,
         cb: VkCommandBuffer,
         topology: VkPrimitiveTopology,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdSetPrimitiveTopology()?;
         // SAFETY: as above.
         unsafe { f(cb, topology) };
+        self.pools.child_mut(cb)?.recording.topology = topology;
         Some(())
     }
 
@@ -7885,7 +7922,7 @@ impl Driver {
         first_instance: u32,
     ) -> Result<(), Unrecorded> {
         let f = self
-            .drawer(cb, BindPoint::Graphics)?
+            .drawer(cb, Draws::Vertices)?
             .try_vkCmdDrawMultiEXT()
             .ok_or(Unrecorded::NoDevice)?;
         let stride = size_of::<VkMultiDrawInfoEXT>() as u32;
@@ -7913,7 +7950,7 @@ impl Driver {
         vertex_offset: Option<&i32>,
     ) -> Result<(), Unrecorded> {
         let f = self
-            .drawer(cb, BindPoint::Graphics)?
+            .drawer(cb, Draws::Vertices)?
             .try_vkCmdDrawMultiIndexedEXT()
             .ok_or(Unrecorded::NoDevice)?;
         let stride = size_of::<VkMultiDrawIndexedInfoEXT>() as u32;
@@ -8547,7 +8584,7 @@ impl Driver {
             return Err(Unrecorded::Invalid("drew from a transform feedback count with no stride"));
         }
         let f = self
-            .drawer(cb, BindPoint::Graphics)?
+            .drawer(cb, Draws::Vertices)?
             .try_vkCmdDrawIndirectByteCountEXT()
             .ok_or(Unrecorded::NoDevice)?;
         // SAFETY: as above.
@@ -10910,7 +10947,7 @@ enum Planned {
 
 /// What a pipeline was created as, and by which device.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct PipelineFacts {
+pub struct PipelineFacts {
     device: VkDevice,
     kind: PipelineKind,
     /// Whether it was created as a library, to be linked into others rather than bound.
@@ -10922,7 +10959,7 @@ struct PipelineFacts {
 /// A pipeline's kind: the create that made it, and so the one bind point it may be bound at.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PipelineKind {
-    Graphics,
+    Graphics(GraphicsShape),
     Compute,
     /// With how many shader groups it has, its libraries' included. The group queries name
     /// groups by index and the driver indexes its own array with it, so the index is held to this.
@@ -10931,10 +10968,96 @@ pub enum PipelineKind {
     },
 }
 
+/// What a graphics pipeline draws with, as each draw is held to it: the shader stages it has,
+/// its libraries' included, and the topology it fixes, when it fixes one rather than leaving it
+/// to `vkCmdSetPrimitiveTopology`.
+///
+/// anv reads a vertex shader's program data on a mesh pipeline and a mesh shader's on a vertex
+/// pipeline without a null check, and draws patches without a tessellation stage by looking the
+/// patch topology up in a table that has no entry for it. A draw is held to what its pipeline
+/// draws in [`Driver::drawer`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct GraphicsShape {
+    /// Its `VkShaderStageFlags`.
+    stages: u32,
+    topology: Option<VkPrimitiveTopology>,
+}
+
+impl GraphicsShape {
+    const MESH: u32 =
+        super::proto::types::VkShaderStageFlagBits::VK_SHADER_STAGE_MESH_BIT_EXT.0 as u32;
+    const TESSELLATION: u32 =
+        super::proto::types::VkShaderStageFlagBits::VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT.0
+            as u32;
+
+    /// The shape `info` makes, linking the libraries it names that this renderer recorded.
+    fn of<S>(
+        info: cs::Decoded<'_, VkGraphicsPipelineCreateInfo, S>,
+        known: &BTreeMap<VkPipeline, PipelineFacts>,
+    ) -> Self {
+        let stages = regions_of(&info, info.stageCount, info.pStages)
+            .iter()
+            .fold(0, |all, stage| all | stage.stage.0 as u32);
+        let dynamic = regions_of(&info, 1, info.pDynamicState).first().is_some_and(|d| {
+            regions_of(&info, d.dynamicStateCount, d.pDynamicStates)
+                .contains(&VkDynamicState::VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY)
+        });
+        let fixed = regions_of(&info, 1, info.pInputAssemblyState).first().map(|ia| ia.topology);
+        let mut shape = GraphicsShape { stages, topology: fixed.filter(|_| !dynamic) };
+        let libraries = chained::<VkPipelineLibraryCreateInfoKHR, _>(info)
+            .map_or(&[][..], |l| regions_of(&l, l.libraryCount, l.pLibraries));
+        for library in libraries {
+            if let Some(PipelineFacts { kind: PipelineKind::Graphics(linked), .. }) =
+                known.get(library)
+            {
+                shape.stages |= linked.stages;
+                shape.topology = shape.topology.or(linked.topology);
+            }
+        }
+        shape
+    }
+
+    /// Whether a draw of `draws` may be recorded with this pipeline, the recording's topology
+    /// being `topology`.
+    fn draws(self, draws: Draws, topology: VkPrimitiveTopology) -> Result<(), &'static str> {
+        let mesh = self.stages & Self::MESH != 0;
+        match draws {
+            Draws::MeshTasks if !mesh => Err("drew mesh tasks with a pipeline of no mesh stage"),
+            Draws::Vertices if mesh => Err("drew vertices with a mesh pipeline"),
+            Draws::Vertices
+                if topology == VkPrimitiveTopology::VK_PRIMITIVE_TOPOLOGY_PATCH_LIST
+                    && self.stages & Self::TESSELLATION == 0 =>
+            {
+                Err("drew patches with a pipeline of no tessellation stage")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// What a draw command draws, as the pipeline bound for it is held to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Draws {
+    Vertices,
+    MeshTasks,
+    Dispatch,
+    Rays,
+}
+
+impl Draws {
+    fn bind_point(self) -> BindPoint {
+        match self {
+            Draws::Vertices | Draws::MeshTasks => BindPoint::Graphics,
+            Draws::Dispatch => BindPoint::Compute,
+            Draws::Rays => BindPoint::RayTracing,
+        }
+    }
+}
+
 impl PipelineKind {
     fn bind_point(self) -> BindPoint {
         match self {
-            Self::Graphics => BindPoint::Graphics,
+            Self::Graphics(_) => BindPoint::Graphics,
             Self::Compute => BindPoint::Compute,
             Self::RayTracing { .. } => BindPoint::RayTracing,
         }
@@ -10943,7 +11066,7 @@ impl PipelineKind {
     fn groups(self) -> Option<u32> {
         match self {
             Self::RayTracing { groups } => Some(groups),
-            Self::Graphics | Self::Compute => None,
+            Self::Graphics(_) | Self::Compute => None,
         }
     }
 }
@@ -10962,7 +11085,11 @@ pub type CreatePipelines<I> = unsafe extern "C" fn(
 /// what kind of pipeline comes out. One trait, so the entry point and the kind recorded for its
 /// pipelines cannot be named apart.
 pub trait PipelineInfo: Sized + cs::Links {
-    const KIND: PipelineKind;
+    /// The kind of pipeline `info` makes, given the pipelines already recorded.
+    fn kind(
+        info: cs::Decoded<'_, Self, cs::Checked>,
+        known: &BTreeMap<VkPipeline, PipelineFacts>,
+    ) -> PipelineKind;
     fn create(fns: &DeviceFns) -> CreatePipelines<Self>;
     /// Its `flags`, which a chained `VkPipelineCreateFlags2CreateInfo` replaces.
     fn flags(&self) -> u64;
@@ -10978,7 +11105,12 @@ fn is_library<T: cs::Links, S>(info: cs::Decoded<'_, T, S>, flags: u64) -> bool 
 }
 
 impl PipelineInfo for VkGraphicsPipelineCreateInfo {
-    const KIND: PipelineKind = PipelineKind::Graphics;
+    fn kind(
+        info: cs::Decoded<'_, Self, cs::Checked>,
+        known: &BTreeMap<VkPipeline, PipelineFacts>,
+    ) -> PipelineKind {
+        PipelineKind::Graphics(GraphicsShape::of(info, known))
+    }
     fn create(fns: &DeviceFns) -> CreatePipelines<Self> {
         fns.vkCreateGraphicsPipelines()
     }
@@ -10988,7 +11120,12 @@ impl PipelineInfo for VkGraphicsPipelineCreateInfo {
 }
 
 impl PipelineInfo for VkComputePipelineCreateInfo {
-    const KIND: PipelineKind = PipelineKind::Compute;
+    fn kind(
+        _info: cs::Decoded<'_, Self, cs::Checked>,
+        _known: &BTreeMap<VkPipeline, PipelineFacts>,
+    ) -> PipelineKind {
+        PipelineKind::Compute
+    }
     fn create(fns: &DeviceFns) -> CreatePipelines<Self> {
         fns.vkCreateComputePipelines()
     }
@@ -13241,7 +13378,7 @@ impl cs::Validate<cs::Chained<'_, VkGraphicsPipelineCreateInfo, DeviceFacts<'_>>
                 .facts
                 .pipelines
                 .get(l)
-                .is_some_and(|p| p.library && p.kind == PipelineKind::Graphics)
+                .is_some_and(|p| p.library && matches!(p.kind, PipelineKind::Graphics(_)))
         };
         if !libraries.iter().all(library) {
             return Err("linked a pipeline that is not a graphics library this renderer made");
@@ -16977,8 +17114,8 @@ mod tests {
         d.plant_device(DEVICE, crate::vulkan::Device::default());
         d.plant_device(MESHY, crate::vulkan::Device::default());
         d.plant_stages(MESHY, &["VK_EXT_mesh_shader", "VK_KHR_ray_tracing_pipeline"]);
-        d.record_pipeline(LIB, DEVICE, PipelineKind::Graphics, true);
-        d.record_pipeline(PLAIN, DEVICE, PipelineKind::Graphics, false);
+        d.record_pipeline(LIB, DEVICE, PipelineKind::Graphics(GraphicsShape::default()), true);
+        d.record_pipeline(PLAIN, DEVICE, PipelineKind::Graphics(GraphicsShape::default()), false);
         d.record_pipeline(COMPUTE_LIB, DEVICE, PipelineKind::Compute, true);
         // The states a whole graphics pipeline carries.
         let vertex_input =
@@ -17325,7 +17462,12 @@ mod tests {
         d.plant_stages(DEVICE, &["VK_KHR_ray_tracing_pipeline"]);
         d.record_pipeline(LIB, DEVICE, PipelineKind::RayTracing { groups: 1 }, true);
         d.record_pipeline(PLAIN, DEVICE, PipelineKind::RayTracing { groups: 1 }, false);
-        d.record_pipeline(GRAPHICS_LIB, DEVICE, PipelineKind::Graphics, true);
+        d.record_pipeline(
+            GRAPHICS_LIB,
+            DEVICE,
+            PipelineKind::Graphics(GraphicsShape::default()),
+            true,
+        );
         let facts = d.device_facts(DEVICE).expect("a planted device");
         let stage = |bits: S| VkPipelineShaderStageCreateInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -17422,7 +17564,7 @@ mod tests {
         let pass = RenderPassFacts::held(0, vec![subpass(), subpass()], []).expect("a pass");
         d.render_passes.insert(PASS, Arc::new(pass));
         const LIBRARY: VkPipeline = VkPipeline::forged(0x800);
-        d.record_pipeline(LIBRARY, DEVICE, PipelineKind::Graphics, true);
+        d.record_pipeline(LIBRARY, DEVICE, PipelineKind::Graphics(GraphicsShape::default()), true);
         let facts = d.device_facts(DEVICE).expect("a planted device");
 
         let stage = |bits: S| VkPipelineShaderStageCreateInfo {
@@ -23955,6 +24097,165 @@ mod tests {
             assert_eq!(*s, [(3, 0x20, 7)], "only the first reached the driver, with its flags")
         });
 
+        d.abandon_planted();
+    }
+
+    /// A draw is held to what the pipeline bound for it draws: mesh tasks to a pipeline with a
+    /// mesh stage, vertices to one without, and patches to one with a tessellation stage. The
+    /// topology is the last one a bound pipeline fixed or `vkCmdSetPrimitiveTopology` set, and a
+    /// linked pipeline draws with its libraries' stages and topology.
+    #[test]
+    fn a_draw_is_held_to_what_its_pipeline_draws() {
+        use super::super::proto::types::{
+            VkDynamicState, VkGraphicsPipelineCreateInfo, VkPipelineBindPoint, VkPipelineCache,
+            VkPipelineDynamicStateCreateInfo, VkPipelineInputAssemblyStateCreateInfo,
+            VkPipelineLibraryCreateInfoKHR, VkPipelineShaderStageCreateInfo, VkShaderStageFlagBits,
+        };
+        use core::cell::Cell;
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        let cb = VkCommandBuffer::forged(0x10);
+        thread_local!(static NEXT: Cell<u64> = const { Cell::new(0x900) });
+        unsafe extern "C" fn create(
+            _: VkDevice,
+            _: VkPipelineCache,
+            n: u32,
+            _: *const VkGraphicsPipelineCreateInfo,
+            _: *const VkAllocationCallbacks,
+            out: *mut VkPipeline,
+        ) -> VkResult {
+            // SAFETY: the wrapper passes its slice's own pointer and length.
+            let out = unsafe { core::slice::from_raw_parts_mut(out, n as usize) };
+            for e in out {
+                *e = VkPipeline::forged(NEXT.get());
+                NEXT.set(NEXT.get() + 1);
+            }
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn bind(_: VkCommandBuffer, _: VkPipelineBindPoint, _: VkPipeline) {}
+        unsafe extern "C" fn set(_: VkCommandBuffer, _: VkPrimitiveTopology) {}
+        unsafe extern "C" fn draw(_: VkCommandBuffer, _: u32, _: u32, _: u32, _: u32) {}
+        unsafe extern "C" fn mesh(_: VkCommandBuffer, _: u32, _: u32, _: u32) {}
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateGraphicsPipelines(create);
+        fns.plant_vkCmdBindPipeline(bind);
+        fns.plant_vkCmdSetPrimitiveTopology(set);
+        fns.plant_vkCmdDraw(draw);
+        fns.plant_vkCmdDrawMeshTasksEXT(mesh);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x30), &[(cb, ObjectId(1))]);
+
+        type S = VkShaderStageFlagBits;
+        type T = VkPrimitiveTopology;
+        let stage = |stage: VkShaderStageFlagBits| VkPipelineShaderStageCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage,
+            ..Default::default()
+        };
+        let vertex = [stage(S::VK_SHADER_STAGE_VERTEX_BIT), stage(S::VK_SHADER_STAGE_FRAGMENT_BIT)];
+        let tessellated = [
+            stage(S::VK_SHADER_STAGE_VERTEX_BIT),
+            stage(S::VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT),
+            stage(S::VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT),
+        ];
+        let meshed = [stage(S::VK_SHADER_STAGE_MESH_BIT_EXT)];
+        let assembly = |topology| VkPipelineInputAssemblyStateCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            topology,
+            ..Default::default()
+        };
+        let (triangles, patches) = (
+            assembly(T::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST),
+            assembly(T::VK_PRIMITIVE_TOPOLOGY_PATCH_LIST),
+        );
+        let states = [VkDynamicState::VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY];
+        let dynamic = VkPipelineDynamicStateCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            dynamicStateCount: 1,
+            pDynamicStates: states.as_ptr(),
+            ..Default::default()
+        };
+        let info = |stages: &[VkPipelineShaderStageCreateInfo],
+                    ia: Option<&VkPipelineInputAssemblyStateCreateInfo>,
+                    dynamic: Option<&VkPipelineDynamicStateCreateInfo>| {
+            VkGraphicsPipelineCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                stageCount: stages.len() as u32,
+                pStages: stages.as_ptr(),
+                pInputAssemblyState: ia.map_or(core::ptr::null(), |r| r),
+                pDynamicState: dynamic.map_or(core::ptr::null(), |r| r),
+                ..Default::default()
+            }
+        };
+        let make = |d: &mut Driver, info: &VkGraphicsPipelineCreateInfo| {
+            let mut out = [VkPipeline::NULL];
+            let infos = cs::Decoded::planted_checked(core::slice::from_ref(info));
+            d.create_pipelines(DEVICE, VkPipelineCache::NULL, infos, None, &mut out).expect("made");
+            out[0]
+        };
+        let plain = make(&mut d, &info(&vertex, Some(&triangles), None));
+        let free = make(&mut d, &info(&vertex, Some(&triangles), Some(&dynamic)));
+        let fixed_patches = make(&mut d, &info(&vertex, Some(&patches), None));
+        let tessellation = make(&mut d, &info(&tessellated, Some(&patches), None));
+        let mesh_pipeline = make(&mut d, &info(&meshed, None, None));
+        // A pipeline linked from a library: the stages and the topology are the library's.
+        let library = make(&mut d, &info(&tessellated, Some(&patches), None));
+        let libraries = [library];
+        let link = VkPipelineLibraryCreateInfoKHR {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+            libraryCount: 1,
+            pLibraries: libraries.as_ptr(),
+            ..Default::default()
+        };
+        let linked = make(
+            &mut d,
+            &VkGraphicsPipelineCreateInfo {
+                pNext: (&raw const link).cast(),
+                ..info(&[], None, None)
+            },
+        );
+
+        const GRAPHICS: VkPipelineBindPoint = VkPipelineBindPoint::VK_PIPELINE_BIND_POINT_GRAPHICS;
+        let vertices = |d: &mut Driver, pipeline| {
+            d.cmd_bind_pipeline(cb, GRAPHICS, pipeline).expect("a pipeline this renderer made");
+            d.cmd_draw(cb, 3, 1, 0, 0)
+        };
+        let tasks = |d: &mut Driver, pipeline| {
+            d.cmd_bind_pipeline(cb, GRAPHICS, pipeline).expect("a pipeline this renderer made");
+            d.cmd_draw_mesh_tasks(cb, 1, 1, 1)
+        };
+        let set = |d: &mut Driver, topology| {
+            d.cmd_set_primitive_topology(cb, topology).expect("a recording command buffer")
+        };
+        let refused = |why| Err(Unrecorded::Invalid(why));
+        let no_mesh = refused("drew mesh tasks with a pipeline of no mesh stage");
+        let mesh_vertices = refused("drew vertices with a mesh pipeline");
+        let untessellated = refused("drew patches with a pipeline of no tessellation stage");
+
+        assert_eq!(vertices(&mut d, plain), Ok(()));
+        assert_eq!(tasks(&mut d, plain), no_mesh);
+        assert_eq!(tasks(&mut d, mesh_pipeline), Ok(()));
+        assert_eq!(vertices(&mut d, mesh_pipeline), mesh_vertices);
+
+        // Patches set on a pipeline that leaves the topology to the recording.
+        set(&mut d, T::VK_PRIMITIVE_TOPOLOGY_PATCH_LIST);
+        assert_eq!(vertices(&mut d, free), untessellated);
+        assert_eq!(vertices(&mut d, tessellation), Ok(()));
+        // A pipeline that fixes triangles overwrites them at its bind, and they stay.
+        assert_eq!(vertices(&mut d, plain), Ok(()));
+        assert_eq!(vertices(&mut d, free), Ok(()));
+        // A pipeline that fixes patches fixes them for the next that does not.
+        assert_eq!(vertices(&mut d, fixed_patches), untessellated);
+        assert_eq!(vertices(&mut d, free), untessellated);
+        set(&mut d, T::VK_PRIMITIVE_TOPOLOGY_LINE_LIST);
+        assert_eq!(d.cmd_draw(cb, 2, 1, 0, 0), Ok(()), "a set after the bind wins");
+        // A linked pipeline draws patches with its library's tessellation, and fixes them.
+        assert_eq!(vertices(&mut d, linked), Ok(()));
+        assert_eq!(vertices(&mut d, free), untessellated);
+        // A begin starts the topology over.
+        d.pools.unbind(cb);
+        d.plant_bound_graphics(cb, GraphicsShape::default().stages, None);
+        assert_eq!(d.cmd_draw(cb, 3, 1, 0, 0), Ok(()));
         d.abandon_planted();
     }
 

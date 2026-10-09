@@ -3362,23 +3362,33 @@ SABOTAGES = [
     (
         'a draw is recorded with no pipeline bound at its point',
         'src/venus/driver.rs',
-        """        let binding = bound.at(point).ok_or(Unrecorded::Unbound)?;
-        self.pipelines
+        """        let binding = bound.at(draws.bind_point()).ok_or(Unrecorded::Unbound)?;
+        let facts = self
+            .pipelines
             .get(&binding.pipeline)
             .filter(|facts| facts.serial == binding.serial)
-            .ok_or(Unrecorded::Destroyed)?;""",
-        """        let _ = bound;""",
+            .ok_or(Unrecorded::Destroyed)?;
+        if let PipelineKind::Graphics(shape) = facts.kind {
+            let topology = self.pools.topology(cb).ok_or(Unrecorded::NoDevice)?;
+            shape.draws(draws, topology).map_err(Unrecorded::Invalid)?;
+        }""",
+        """        let _ = (bound, draws);""",
         'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
     ),
     (
         'a draw is recorded with the pipeline bound at its point destroyed',
         'src/venus/driver.rs',
-        """        let binding = bound.at(point).ok_or(Unrecorded::Unbound)?;
-        self.pipelines
+        """        let binding = bound.at(draws.bind_point()).ok_or(Unrecorded::Unbound)?;
+        let facts = self
+            .pipelines
             .get(&binding.pipeline)
             .filter(|facts| facts.serial == binding.serial)
-            .ok_or(Unrecorded::Destroyed)?;""",
-        """        let _binding = bound.at(point).ok_or(Unrecorded::Unbound)?;""",
+            .ok_or(Unrecorded::Destroyed)?;
+        if let PipelineKind::Graphics(shape) = facts.kind {
+            let topology = self.pools.topology(cb).ok_or(Unrecorded::NoDevice)?;
+            shape.draws(draws, topology).map_err(Unrecorded::Invalid)?;
+        }""",
+        """        let _binding = bound.at(draws.bind_point()).ok_or(Unrecorded::Unbound)?;""",
         'venus::context::tests::a_draw_reaches_the_driver_only_with_a_pipeline_of_its_kind_bound',
     ),
     (
@@ -3392,11 +3402,8 @@ SABOTAGES = [
     (
         'a trace reaches the driver without asking what is bound',
         'src/venus/driver.rs',
-        """            .drawer(cb, BindPoint::RayTracing)?
-            .try_vkCmdTraceRaysKHR()""",
-        """            .recorder(cb)
-            .ok_or(Unrecorded::NoDevice)?
-            .try_vkCmdTraceRaysKHR()""",
+        """self.drawer(cb, Draws::Rays)?.try_vkCmdTraceRaysKHR()""",
+        """self.recorder(cb).ok_or(Unrecorded::NoDevice)?.try_vkCmdTraceRaysKHR()""",
         'venus::context::tests::ray_tracing_pipelines_are_created_traced_and_forgotten_through_the_handlers',
     ),
     (
@@ -3804,7 +3811,7 @@ SABOTAGES = [
     (
         'a served command goes unclassified for validation',
         'src/venus/validation.txt',
-        '\nvkCmdDraw                                        reviewed\n',
+        '\nvkCmdDraw                                        validated\n',
         '\n',
         'every_served_command_is_classified_for_validation',
     ),
@@ -5084,14 +5091,14 @@ SABOTAGES = [
     (
         'a linked pipeline need not be a library',
         'src/venus/driver.rs',
-        """                .is_some_and(|p| p.library && p.kind == PipelineKind::Graphics)""",
-        """                .is_some_and(|p| p.kind == PipelineKind::Graphics)""",
+        """                .is_some_and(|p| p.library && matches!(p.kind, PipelineKind::Graphics(_)))""",
+        """                .is_some_and(|p| matches!(p.kind, PipelineKind::Graphics(_)))""",
         'a_pipeline_names_stages_the_device_runs',
     ),
     (
         'a linked library may be of another kind',
         'src/venus/driver.rs',
-        """                .is_some_and(|p| p.library && p.kind == PipelineKind::Graphics)""",
+        """                .is_some_and(|p| p.library && matches!(p.kind, PipelineKind::Graphics(_)))""",
         """                .is_some_and(|p| p.library)""",
         'a_pipeline_names_stages_the_device_runs',
     ),
@@ -5924,6 +5931,69 @@ SABOTAGES = [
         """                |r| SubpassFacts { colors: r.colorAttachmentCount, views: r.viewMask },""",
         """                |r| SubpassFacts { colors: r.colorAttachmentCount, views: 0 },""",
         'a_clear_names_an_attachment_of_the_rendering_it_is_inside',
+    ),
+    (
+        'mesh tasks are drawn with any graphics pipeline',
+        'src/venus/driver.rs',
+        """            Draws::MeshTasks if !mesh =>""",
+        """            Draws::MeshTasks if false =>""",
+        'a_draw_is_held_to_what_its_pipeline_draws',
+    ),
+    (
+        'vertices are drawn with a mesh pipeline',
+        'src/venus/driver.rs',
+        """            Draws::Vertices if mesh =>""",
+        """            Draws::Vertices if false =>""",
+        'a_draw_is_held_to_what_its_pipeline_draws',
+    ),
+    (
+        'patches are drawn without tessellation',
+        'src/venus/driver.rs',
+        """                    && self.stages & Self::TESSELLATION == 0""",
+        """                    && false""",
+        'a_draw_is_held_to_what_its_pipeline_draws',
+    ),
+    (
+        'a draw is not held to its pipeline',
+        'src/venus/driver.rs',
+        """            shape.draws(draws, topology).map_err(Unrecorded::Invalid)?;""",
+        """            let _ = (shape, draws, topology);""",
+        'a_draw_is_held_to_what_its_pipeline_draws',
+    ),
+    (
+        'a bound pipeline fixes no topology',
+        'src/venus/driver.rs',
+        """            child.recording.topology = fixed;""",
+        """            let _ = fixed;""",
+        'a_draw_is_held_to_what_its_pipeline_draws',
+    ),
+    (
+        'a set topology is not remembered',
+        'src/venus/driver.rs',
+        """        self.pools.child_mut(cb)?.recording.topology = topology;""",
+        """        let _ = topology;""",
+        'a_draw_is_held_to_what_its_pipeline_draws',
+    ),
+    (
+        'a dynamic topology is read as fixed',
+        'src/venus/driver.rs',
+        """        let mut shape = GraphicsShape { stages, topology: fixed.filter(|_| !dynamic) };""",
+        """        let mut shape = GraphicsShape { stages, topology: fixed.filter(|_| dynamic | true) };""",
+        'a_draw_is_held_to_what_its_pipeline_draws',
+    ),
+    (
+        "a linked pipeline leaves out its libraries' stages",
+        'src/venus/driver.rs',
+        """                shape.stages |= linked.stages;""",
+        """                shape.stages |= linked.stages & 0;""",
+        'a_draw_is_held_to_what_its_pipeline_draws',
+    ),
+    (
+        "a linked pipeline leaves out its libraries' topology",
+        'src/venus/driver.rs',
+        """                shape.topology = shape.topology.or(linked.topology);""",
+        """                shape.topology = shape.topology.or(None);""",
+        'a_draw_is_held_to_what_its_pipeline_draws',
     ),
     (
         'a submit chained array is trusted by its count alone',
