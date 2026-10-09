@@ -3614,15 +3614,32 @@ SABOTAGES = [
         'a_1d_image_stores_to_the_texel_it_names',
     ),
     (
-        'a load through a GLES store alias is left unordered against the stores',
+        'a load through a GLES store alias can move above the stores before it',
         'src/vrend/shader/glsl/tex.rs',
-        """        if alias {
+        """        .is_some_and(|s| ctx.images[s].stored_through_alias(gles));
+        if alias {
             ctx.bufs.emit("memoryBarrierImage();\\n");
         }""",
-        """        if alias && false {
+        """        .is_some_and(|s| ctx.images[s].stored_through_alias(gles));
+        if alias && false {
             ctx.bufs.emit("memoryBarrierImage();\\n");
         }""",
-        'loads_and_stores_through_one_image_keep_their_order',
+        'a_load_through_a_gles_store_alias_is_fenced_on_both_sides',
+    ),
+    (
+        'a load through a GLES store alias can move below the stores after it',
+        'src/vrend/shader/glsl/tex.rs',
+        """            ctx.bufs.emit("}\\n");
+        }
+        if alias {
+            ctx.bufs.emit("memoryBarrierImage();\\n");
+        }""",
+        """            ctx.bufs.emit("}\\n");
+        }
+        if alias && false {
+            ctx.bufs.emit("memoryBarrierImage();\\n");
+        }""",
+        'a_load_through_a_gles_store_alias_is_fenced_on_both_sides',
     ),
     (
         'a GLES texture buffer range needs ES 3.2, not GL_EXT_texture_buffer',

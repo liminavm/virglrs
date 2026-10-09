@@ -1507,6 +1507,48 @@ mod tests {
         }
     }
 
+    /// On GLES a load through a store alias's `readonly` twin is fenced on both sides, so that a
+    /// driver can move it past neither a store before it nor one after it. Desktop GL declares one
+    /// writable image and fences nothing.
+    #[test]
+    fn a_load_through_a_gles_store_alias_is_fenced_on_both_sides() {
+        let tgsi = "FRAG\nDCL IMAGE[0], 1D, PIPE_FORMAT_R32G32B32A32_FLOAT, WR\nDCL OUT[0], COLOR\n\
+                    DCL TEMP[0..2]\nIMM[0] FLT32 {33.0, 33.0, 33.0, 33.0}\n\
+                    \x20 0: STORE IMAGE[0], TEMP[0], IMM[0], 1D, PIPE_FORMAT_R32G32B32A32_FLOAT\n\
+                    \x20 1: LOAD TEMP[1], IMAGE[0], TEMP[0], 1D, PIPE_FORMAT_R32G32B32A32_FLOAT\n\
+                    \x20 2: STORE IMAGE[0], TEMP[0], TEMP[1], 1D, PIPE_FORMAT_R32G32B32A32_FLOAT\n\
+                    \x20 3: MOV OUT[0], TEMP[1]\n  4: END\n";
+        let shader = tgsi::text::parse(tgsi.as_bytes(), u32::MAX).expect("the shader parses");
+        let program = tgsi::Program::scan(shader).expect("the shader scans");
+        for (cfg, fenced) in [(corpus_cfg(), true), (desktop_corpus_cfg(), false)] {
+            let (strings, _, _) =
+                convert(&cfg, &program, 0, &Key::default(), &StreamOutput::default())
+                    .unwrap_or_else(|e| panic!("the shader translates: {e}"));
+            let source = strings.source();
+            // The accesses of main in order, barriers among them.
+            let order: Vec<&str> = source
+                .lines()
+                .filter_map(|l| {
+                    ["imageStore", "imageLoad", "memoryBarrierImage"]
+                        .into_iter()
+                        .find(|a| l.contains(a))
+                })
+                .collect();
+            let want: &[&str] = if fenced {
+                &[
+                    "imageStore",
+                    "memoryBarrierImage",
+                    "imageLoad",
+                    "memoryBarrierImage",
+                    "imageStore",
+                ]
+            } else {
+                &["imageStore", "imageLoad", "imageStore"]
+            };
+            assert_eq!(order, want, "gles={fenced}:\n{source}");
+        }
+    }
+
     /// A coherent image store marks the image it writes as coherent, and nothing else.
     ///
     /// The coordinate register is the one the C asked about: `TEMP[0]` left `IMAGE[1]` declared

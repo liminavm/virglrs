@@ -1377,7 +1377,8 @@ pub(super) fn translate_load(
         // A load through a GLES store alias's `readonly` twin has to keep its place among the
         // stores through the `writeonly` one. The two are separate variables of one texture, and
         // a driver may move a load from a `readonly` image freely, past a store to the other in
-        // either direction. A barrier after the load pins it.
+        // either direction. A barrier on each side pins it: the one before keeps it after the
+        // stores that precede it, the one after keeps it before the stores that follow.
         let alias = if !gles || !src.indirect {
             Some(sreg)
         } else {
@@ -1385,6 +1386,9 @@ pub(super) fn translate_load(
                 .and_then(|a| ImageSlot::new(ctx.image_arrays[a].first))
         }
         .is_some_and(|s| ctx.images[s].stored_through_alias(gles));
+        if alias {
+            ctx.bufs.emit("memoryBarrierImage();\n");
+        }
         if !gles || !src.indirect {
             emit!(
                 ctx.bufs,
