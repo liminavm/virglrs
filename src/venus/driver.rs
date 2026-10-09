@@ -15576,6 +15576,11 @@ mod tests {
     /// created with drm modifiers lays a linear BGRA image out in one plane, and makes uniform
     /// texel buffers of RGBA8. No corpus creates an image by an explicit modifier, so this is the
     /// only place the two-call modifier list is ever asked of a driver.
+    ///
+    /// Its answers are KosmicKrisp's, so it runs only on macOS, and there it fails rather than
+    /// skips when the device is some other driver: a check that passes on a host where it never
+    /// ran is indistinguishable from one that passed.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_format_queries_ask_the_real_driver() {
         use crate::venus::proto::types::{
@@ -15597,6 +15602,24 @@ mod tests {
             d.create_instance(&global, cs::Decoded::planted(&info), None).expect("an instance");
         let mut pds = [VkPhysicalDevice::NULL; 1];
         assert_eq!(d.physical_devices(instance, &mut pds), Ok(1), "one physical device");
+        let mut driver = crate::venus::proto::types::VkPhysicalDeviceDriverProperties {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+            ..Default::default()
+        };
+        let mut props = VkPhysicalDeviceProperties2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            pNext: (&raw mut driver).cast(),
+            ..Default::default()
+        };
+        let inst = d.instance.as_ref().expect("the instance just made");
+        // SAFETY: `pds[0]` is a handle this instance returned, and the chain is two locals of a
+        // core 1.2 query.
+        unsafe { (inst.vkGetPhysicalDeviceProperties2())(pds[0], &mut props) };
+        assert_eq!(
+            driver.driverID,
+            crate::venus::proto::types::VkDriverId::VK_DRIVER_ID_MESA_KOSMICKRISP,
+            "the host Vulkan driver is not KosmicKrisp: run this with the KosmicKrisp ICD"
+        );
         d.learn_extensions(pds[0]).expect("its extensions");
 
         let priority = 1.0f32;
