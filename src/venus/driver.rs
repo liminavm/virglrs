@@ -135,6 +135,14 @@ use super::proto::types::{
     VkImageStencilUsageCreateInfo,
 };
 use super::proto::types::{
+    VkGraphicsPipelineLibraryCreateInfoEXT, VkPipelineCreationFeedbackCreateInfo,
+    VkPipelineFragmentShadingRateStateCreateInfoKHR, VkPipelineLibraryCreateInfoKHR,
+    VkPipelineRenderingCreateInfo, VkPipelineRobustnessCreateInfo,
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo,
+    VkShaderDescriptorSetAndBindingMappingInfoEXT, VkSpecializationMapEntry,
+};
+use super::proto::types::{VkPipelineCreateFlagBits, VkPipelineShaderStageCreateInfo};
+use super::proto::types::{
     VkRenderPassAttachmentBeginInfo, VkRenderPassSampleLocationsBeginInfoEXT,
 };
 use crate::budget::{Account, Charge, Charged};
@@ -2533,6 +2541,8 @@ impl DriverWait {
 /// One live `VkDevice`: its entry points, and what its allocations need to know.
 struct DeviceState {
     fns: Arc<LiveDevice>,
+    /// The shader stages it runs: see [`enabled_stages`].
+    stages: u32,
     /// The property flags of each memory type, indexed by `memoryTypeIndex`. Read once at device
     /// creation because it never changes, and because an allocation must not pay an instance
     /// round trip to learn whether it is host-visible.
@@ -2658,6 +2668,35 @@ impl FormatQueries<'_> {
 /// impossible: KosmicKrisp's `kk_reports_per_query` is `UNREACHABLE` for anything but occlusion and
 /// timestamp. The device was created with only what it offered, so a type it was not created with
 /// is one no guest may ask for.
+/// The shader stages a device created with `extensions` runs: the five graphics stages and
+/// compute always, the mesh stages with `VK_EXT_mesh_shader`, and the ray-tracing stages with
+/// `VK_KHR_ray_tracing_pipeline`. The Mesa runtime sorts a pipeline's stages into arrays by a
+/// stage index it takes from the bit, sized for the stages the device has, and checks the device
+/// has the stage only with an assert.
+fn enabled_stages(extensions: &[String]) -> u32 {
+    let has = |name: &str| extensions.iter().any(|e| e == name);
+    let mut stages = GRAPHICS_STAGES | COMPUTE_STAGE;
+    if has("VK_EXT_mesh_shader") {
+        stages |= MESH_STAGES;
+    }
+    if has("VK_KHR_ray_tracing_pipeline") {
+        stages |= RAY_TRACING_STAGES;
+    }
+    stages
+}
+
+/// Vertex, the two tessellation stages, geometry and fragment.
+const GRAPHICS_STAGES: u32 = 0x1f;
+const VERTEX_STAGE: u32 = 0x1;
+const TESSELLATION_STAGES: u32 = 0x6;
+const COMPUTE_STAGE: u32 = 0x20;
+/// Task and mesh.
+const MESH_STAGES: u32 = 0xc0;
+const MESH_STAGE: u32 = 0x80;
+const TASK_STAGE: u32 = 0x40;
+/// Ray generation, any hit, closest hit, miss, intersection and callable.
+const RAY_TRACING_STAGES: u32 = 0x3f00;
+
 fn enabled_query_types(extensions: &[String], statistics: bool) -> Vec<VkQueryType> {
     type Q = VkQueryType;
     const BY_EXTENSION: &[(&str, VkQueryType)] = &[
@@ -3335,6 +3374,7 @@ impl Driver {
             out,
             DeviceState {
                 fns,
+                stages: enabled_stages(&wanted),
                 memory_types,
                 group_handles,
                 limits,
@@ -4290,6 +4330,7 @@ impl Driver {
             pipeline_layouts: &self.pipeline_layouts,
             render_passes: &self.render_passes,
             framebuffers: &self.framebuffers,
+            pipelines: &self.pipelines,
         }
     }
 
@@ -4307,6 +4348,7 @@ impl Driver {
             limits: &d.limits,
             sample_locations: d.sample_locations.as_ref(),
             query_types: &d.query_types,
+            stages: d.stages,
             formats: FormatQueries { source: &d.formats, instance: self.instance() },
         })
     }
@@ -4926,7 +4968,7 @@ impl Driver {
         &mut self,
         device: VkDevice,
         cache: VkPipelineCache,
-        infos: cs::Decoded<'_, [I]>,
+        infos: cs::Decoded<'_, [I], cs::Checked>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
         out: &mut [VkPipeline],
     ) -> Result<(), VkResult> {
@@ -4942,8 +4984,11 @@ impl Driver {
             }
         });
         if made.is_ok() {
-            for pipeline in out.iter().filter(|p| p.host().raw() != 0) {
-                self.record_pipeline(*pipeline, device, I::KIND);
+            for (pipeline, info) in out.iter().zip(infos.iter()) {
+                if pipeline.host().raw() != 0 {
+                    let library = is_library(info, info.flags());
+                    self.record_pipeline(*pipeline, device, I::KIND, library);
+                }
             }
         }
         made
@@ -4998,7 +5043,7 @@ impl Driver {
         &mut self,
         device: VkDevice,
         cache: VkPipelineCache,
-        infos: cs::Decoded<'_, [VkRayTracingPipelineCreateInfoKHR]>,
+        infos: cs::Decoded<'_, [VkRayTracingPipelineCreateInfoKHR], cs::Checked>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
         out: &mut [VkPipeline],
     ) -> Result<Result<(), VkResult>, RayTracingRefused> {
@@ -5062,9 +5107,11 @@ impl Driver {
             }
         });
         if made.is_ok() {
-            for (pipeline, groups) in out.iter().zip(groups) {
+            for ((pipeline, groups), info) in out.iter().zip(groups).zip(infos.iter()) {
                 if pipeline.host().raw() != 0 {
-                    self.record_pipeline(*pipeline, device, PipelineKind::RayTracing { groups });
+                    let library = is_library(info, u64::from(info.flags.0));
+                    let kind = PipelineKind::RayTracing { groups };
+                    self.record_pipeline(*pipeline, device, kind, library);
                 }
             }
         }
@@ -5072,10 +5119,16 @@ impl Driver {
     }
 
     /// Record a pipeline the driver just made, under a serial no earlier record had.
-    fn record_pipeline(&mut self, pipeline: VkPipeline, device: VkDevice, kind: PipelineKind) {
+    fn record_pipeline(
+        &mut self,
+        pipeline: VkPipeline,
+        device: VkDevice,
+        kind: PipelineKind,
+        library: bool,
+    ) {
         let serial = PipelineSerial(self.next_pipeline);
         self.next_pipeline += 1;
-        self.pipelines.insert(pipeline, PipelineFacts { device, kind, serial });
+        self.pipelines.insert(pipeline, PipelineFacts { device, kind, library, serial });
     }
 
     /// `vkGetRayTracingShaderGroupHandlesKHR`, or its capture-replay twin: the handles of
@@ -5210,6 +5263,7 @@ impl Driver {
             handle,
             DeviceState {
                 fns,
+                stages: enabled_stages(&[]),
                 memory_types: Vec::new(),
                 group_handles: None,
                 limits: planted_limits(),
@@ -5218,6 +5272,14 @@ impl Driver {
                 formats: Formats::Planted(PlantedFormats::default()),
             },
         );
+    }
+
+    /// Give a planted device the shader stages a device created with `extensions` runs.
+    #[cfg(test)]
+    pub(super) fn plant_stages(&mut self, handle: VkDevice, extensions: &[&str]) {
+        let extensions: Vec<String> = extensions.iter().map(|e| e.to_string()).collect();
+        self.devices.get_mut(&handle).expect("a planted device").stages =
+            enabled_stages(&extensions);
     }
 
     /// Give a planted device the drm format modifiers a driver would have listed, as the format,
@@ -5580,7 +5642,7 @@ impl Driver {
         };
         // Out of the way of any handle a planted driver hands out.
         let pipeline = VkPipeline::forged(0xb0d0_0000 + self.next_pipeline);
-        self.record_pipeline(pipeline, device, kind);
+        self.record_pipeline(pipeline, device, kind, false);
         let serial = self.pipelines[&pipeline].serial;
         let child = self.pools.child_mut(cb).expect("a command buffer planted first");
         child.recording.bound = child.recording.bound.with(point, Binding { pipeline, serial });
@@ -10157,6 +10219,8 @@ enum Planned {
 struct PipelineFacts {
     device: VkDevice,
     kind: PipelineKind,
+    /// Whether it was created as a library, to be linked into others rather than bound.
+    library: bool,
     /// Which record this is, for a bind to name it by. See [`Binding`].
     serial: PipelineSerial,
 }
@@ -10203,9 +10267,20 @@ pub type CreatePipelines<I> = unsafe extern "C" fn(
 /// A create-info [`Driver::create_pipelines`] makes a run from: which entry point takes it, and
 /// what kind of pipeline comes out. One trait, so the entry point and the kind recorded for its
 /// pipelines cannot be named apart.
-pub trait PipelineInfo: Sized {
+pub trait PipelineInfo: Sized + cs::Links {
     const KIND: PipelineKind;
     fn create(fns: &DeviceFns) -> CreatePipelines<Self>;
+    /// Its `flags`, which a chained `VkPipelineCreateFlags2CreateInfo` replaces.
+    fn flags(&self) -> u64;
+}
+
+/// Whether a pipeline create info makes a library: by its own `flags`, or by the chained flags
+/// that replace them whole.
+fn is_library<T: cs::Links, S>(info: cs::Decoded<'_, T, S>, flags: u64) -> bool {
+    const LIBRARY: u64 = VkPipelineCreateFlagBits::VK_PIPELINE_CREATE_LIBRARY_BIT_KHR.0 as u64;
+    let flags =
+        chained::<VkPipelineCreateFlags2CreateInfo, _>(info).map_or(flags, |two| two.flags.0);
+    flags & LIBRARY != 0
 }
 
 impl PipelineInfo for VkGraphicsPipelineCreateInfo {
@@ -10213,12 +10288,18 @@ impl PipelineInfo for VkGraphicsPipelineCreateInfo {
     fn create(fns: &DeviceFns) -> CreatePipelines<Self> {
         fns.vkCreateGraphicsPipelines()
     }
+    fn flags(&self) -> u64 {
+        u64::from(self.flags.0)
+    }
 }
 
 impl PipelineInfo for VkComputePipelineCreateInfo {
     const KIND: PipelineKind = PipelineKind::Compute;
     fn create(fns: &DeviceFns) -> CreatePipelines<Self> {
         fns.vkCreateComputePipelines()
+    }
+    fn flags(&self) -> u64 {
+        u64::from(self.flags.0)
     }
 }
 
@@ -11859,6 +11940,285 @@ impl cs::Validate<cs::Chained<'_, VkImageCreateInfo, DeviceFacts<'_>>>
     }
 }
 
+/// SPIR-V a driver can read: a whole number of words, and some. The decoder sizes the code at
+/// `codeSize / 4` words, and the runtime hashes `codeSize` bytes of it -- past the end of a
+/// shorter allocation, or through a null one.
+fn spirv_fits(info: &VkShaderModuleCreateInfo) -> Result<(), &'static str> {
+    if info.codeSize == 0 || !info.codeSize.is_multiple_of(4) || info.pCode.is_null() {
+        return Err("gave a shader no code, or code that is not a whole number of words");
+    }
+    Ok(())
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkShaderModuleCreateInfo {
+    /// See [`spirv_fits`].
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        spirv_fits(&this)
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkPipelineShaderStageCreateInfo, DeviceFacts<'_>>>
+    for VkShaderModuleCreateInfo
+{
+    /// Code a stage carries in place of naming a module, held as a module's is.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _on: &cs::Chained<'_, VkPipelineShaderStageCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        spirv_fits(&this)
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkPipelineShaderStageCreateInfo {
+    /// One stage the device runs, with code, an entry point and specialization data its entries
+    /// lie inside. The runtime takes a stage's index from its lowest bit, reads the entry point's
+    /// name and the code with no null check, and copies each specialization constant from the
+    /// data by the entry's offset and size into a value eight bytes wide, checking neither.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let stage = this.stage.0 as u32;
+        if stage.count_ones() != 1 || stage & facts.stages == 0 {
+            return Err("named a shader stage that is not one the device runs");
+        }
+        if this.pName.is_null() {
+            return Err("named no entry point for a shader stage");
+        }
+        let carried = chained::<VkShaderModuleCreateInfo, _>(this).is_some();
+        if this.module.host().raw() == 0 && !carried {
+            return Err("gave a shader stage no code");
+        }
+        let Some(special) = regions_of(&this, 1, this.pSpecializationInfo).first() else {
+            return Ok(());
+        };
+        let entries = regions_of(&this, special.mapEntryCount, special.pMapEntries);
+        let data = if special.pData.is_null() { 0 } else { special.dataSize as u64 };
+        let fits = |e: &VkSpecializationMapEntry| {
+            matches!(e.size, 1 | 2 | 4 | 8) && u64::from(e.offset) + e.size as u64 <= data
+        };
+        if !entries.iter().all(fits) {
+            return Err("specialized a constant from outside its data, or at a size none has");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkPipelineShaderStageCreateInfo, DeviceFacts<'_>>>
+    for VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
+{
+    /// A subgroup size a device can have: a power of two no larger than 128, the widest any
+    /// Vulkan device runs. The runtime checks it only with asserts.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _on: &cs::Chained<'_, VkPipelineShaderStageCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let size = this.requiredSubgroupSize;
+        if !size.is_power_of_two() || size > 128 {
+            return Err("required a subgroup size no device has");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkPipelineShaderStageCreateInfo, DeviceFacts<'_>>>
+    for VkShaderDescriptorSetAndBindingMappingInfoEXT
+{
+    /// A stage's bindings mapped into descriptor heaps, which the runtime follows into the
+    /// heaps. No command that binds a heap is served, so no guest has one to map into.
+    fn validate(
+        _this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _on: &cs::Chained<'_, VkPipelineShaderStageCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        Err("mapped a stage's bindings into descriptor heaps this renderer does not serve")
+    }
+}
+
+/// The stages a pipeline create info names, each held to [`VkPipelineShaderStageCreateInfo`]'s
+/// check, as one mask -- or why they cannot be one: a stage named twice.
+fn stages_of<T, S>(
+    info: &cs::Decoded<'_, T, S>,
+    count: u32,
+    stages: *const VkPipelineShaderStageCreateInfo,
+    facts: &DeviceFacts<'_>,
+    repeats: bool,
+) -> Result<u32, &'static str> {
+    let stages = regions_of(info, count, stages);
+    // SAFETY: the decoder allocated the stages, and all they point at, in the arena `info`
+    // borrows (see `Decoded::vouch`).
+    unsafe { cs::Decoded::vouch(stages) }.validate(facts)?;
+    let mut mask = 0;
+    for s in stages {
+        let stage = s.stage.0 as u32;
+        if mask & stage != 0 && !repeats {
+            return Err("named a shader stage twice in one pipeline");
+        }
+        mask |= stage;
+    }
+    Ok(mask)
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkGraphicsPipelineCreateInfo {
+    /// Graphics stages, each once, that make a pipeline: tessellation control and evaluation
+    /// together, vertex or mesh but not both, and one of them unless the stages come from
+    /// libraries. The runtime keeps a graphics pipeline's stages in arrays of five, which those
+    /// rules keep it inside, and KosmicKrisp reads the tessellation evaluation stage of one with
+    /// a control stage, and the vertex input of one without a mesh stage.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let stages = stages_of(&this, this.stageCount, this.pStages, facts, false)?;
+        if stages & !(GRAPHICS_STAGES | MESH_STAGES) != 0 {
+            return Err("named a stage a graphics pipeline does not have");
+        }
+        let tessellation = stages & TESSELLATION_STAGES;
+        if tessellation != 0 && tessellation != TESSELLATION_STAGES {
+            return Err("named one tessellation stage without the other");
+        }
+        let (vertex, mesh) = (stages & VERTEX_STAGE != 0, stages & MESH_STAGE != 0);
+        if vertex && mesh || stages & TASK_STAGE != 0 && !mesh {
+            return Err(
+                "named vertex and mesh stages together, or a task stage without a mesh one",
+            );
+        }
+        let linked = chained::<VkPipelineLibraryCreateInfoKHR, _>(this).is_some();
+        if !vertex && !mesh && !linked && !is_library(this, u64::from(this.flags.0)) {
+            return Err("made a graphics pipeline with no vertex or mesh stage");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkComputePipelineCreateInfo {
+    /// One compute stage: the runtime compiles the stage as compute whatever it says it is.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        // SAFETY: the stage is a field of the struct the decoder built in its arena.
+        unsafe { cs::Decoded::vouch(&this.stage) }.validate(facts)?;
+        if this.stage.stage.0 as u32 != COMPUTE_STAGE {
+            return Err("made a compute pipeline of a stage that is not compute");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkRayTracingPipelineCreateInfoKHR {
+    /// Ray-tracing stages, which a pipeline may name more than once each.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let stages = stages_of(&this, this.stageCount, this.pStages, facts, true)?;
+        if stages & !RAY_TRACING_STAGES != 0 {
+            return Err("named a stage a ray-tracing pipeline does not have");
+        }
+        Ok(())
+    }
+}
+
+/// A pipeline create info, by how many stages it names.
+trait Staged {
+    fn stage_count(&self) -> u32;
+}
+
+impl Staged for VkGraphicsPipelineCreateInfo {
+    fn stage_count(&self) -> u32 {
+        self.stageCount
+    }
+}
+
+impl Staged for VkComputePipelineCreateInfo {
+    fn stage_count(&self) -> u32 {
+        1
+    }
+}
+
+impl Staged for VkRayTracingPipelineCreateInfoKHR {
+    fn stage_count(&self) -> u32 {
+        self.stageCount
+    }
+}
+
+impl<R: Staged> cs::Validate<cs::Chained<'_, R, DeviceFacts<'_>>>
+    for VkPipelineCreationFeedbackCreateInfo
+{
+    /// Room for the driver to say how each stage went: none, or one for each stage. The runtime
+    /// writes one for every stage the pipeline names whenever there is any.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, R, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let count = this.pipelineStageCreationFeedbackCount;
+        let room = if this.pPipelineStageCreationFeedbacks.is_null() { 0 } else { count };
+        if count != 0 && (count != on.root.stage_count() || room != count) {
+            return Err("gave room for another number of stage feedbacks than it has stages");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkGraphicsPipelineCreateInfo, DeviceFacts<'_>>>
+    for VkPipelineLibraryCreateInfoKHR
+{
+    /// Libraries this renderer made, as graphics libraries: the runtime takes each as one,
+    /// checking what it is only with asserts.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkGraphicsPipelineCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let libraries = regions_of(&this, this.libraryCount, this.pLibraries);
+        let library = |l: &VkPipeline| {
+            on.facts
+                .facts
+                .pipelines
+                .get(l)
+                .is_some_and(|p| p.library && p.kind == PipelineKind::Graphics)
+        };
+        if !libraries.iter().all(library) {
+            return Err("linked a pipeline that is not a graphics library this renderer made");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkGraphicsPipelineCreateInfo, DeviceFacts<'_>>>
+    for VkPipelineRenderingCreateInfo
+{
+    /// The attachments a pipeline renders to: see [`color_attachments_fit`].
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkGraphicsPipelineCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        color_attachments_fit(on.facts, this.colorAttachmentCount)
+    }
+}
+
+impl<R> cs::Validate<cs::Chained<'_, R, DeviceFacts<'_>>> for VkRenderingAttachmentLocationInfo {
+    /// As `vkCmdSetRenderingAttachmentLocations` holds it.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, R, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        <Self as cs::Validate<DeviceFacts<'_>>>::validate(this, on.facts)
+    }
+}
+
+impl<R> cs::Validate<cs::Chained<'_, R, DeviceFacts<'_>>> for VkRenderingInputAttachmentIndexInfo {
+    /// As `vkCmdSetRenderingInputAttachmentIndices` holds it.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, R, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        <Self as cs::Validate<DeviceFacts<'_>>>::validate(this, on.facts)
+    }
+}
+
 impl cs::Validate<DeviceFacts<'_>> for VkRenderPassCreateInfo {
     /// See [`RenderPassFacts::held`].
     fn validate(
@@ -13148,6 +13508,7 @@ pub struct Facts<'d> {
     pipeline_layouts: &'d BTreeMap<VkPipelineLayout, Arc<PipelineLayoutFacts>>,
     render_passes: &'d BTreeMap<VkRenderPass, Arc<RenderPassFacts>>,
     framebuffers: &'d BTreeMap<VkFramebuffer, FramebufferFacts>,
+    pipelines: &'d BTreeMap<VkPipeline, PipelineFacts>,
 }
 
 /// [`Facts`], with the limits of the one device a command records or runs on. A check that holds
@@ -13163,6 +13524,8 @@ pub struct DeviceFacts<'d> {
     pub sample_locations: Option<&'d SampleLocationGrids>,
     /// The query types the device was created able to make.
     pub query_types: &'d [VkQueryType],
+    /// The shader stages it runs: see [`enabled_stages`].
+    pub stages: u32,
     /// Its format properties.
     pub formats: FormatQueries<'d>,
 }
@@ -13187,11 +13550,20 @@ impl cs::Validate<DeviceFacts<'_>> for VkRenderingInfo {
 }
 
 impl cs::Validate<DeviceFacts<'_>> for VkRenderingAttachmentLocationInfo {
+    /// Locations the device has, or none: KosmicKrisp writes each attachment's into arrays of
+    /// `maxColorAttachments` by its location, skipping only `VK_ATTACHMENT_UNUSED`.
     fn validate(
         this: cs::Decoded<'_, Self, cs::Unchecked>,
         facts: &DeviceFacts<'_>,
     ) -> Result<(), &'static str> {
-        color_attachments_fit(facts, this.colorAttachmentCount)
+        color_attachments_fit(facts, this.colorAttachmentCount)?;
+        let most = facts.limits.maxColorAttachments;
+        let locations =
+            regions_of(&this, this.colorAttachmentCount, this.pColorAttachmentLocations);
+        if !locations.iter().all(|&l| l == ATTACHMENT_UNUSED || l < most) {
+            return Err("put a color attachment at a location the device does not have");
+        }
+        Ok(())
     }
 }
 
@@ -13279,7 +13651,6 @@ forwarded_unchecked!(
     VkPipelineCacheCreateInfo,
     VkSamplerYcbcrConversionCreateInfo,
     VkSemaphoreCreateInfo,
-    VkShaderModuleCreateInfo,
 );
 
 /// The shader stages a push constant range is counted by: every stage bit core Vulkan and the
@@ -13524,6 +13895,14 @@ needs_no_check!(
     VkBindImageMemoryDeviceGroupInfo,
     // A result the driver writes into a slot the decoder allocated for it.
     VkBindMemoryStatus,
+    // Enums saying how robustly a pipeline or a stage reads.
+    VkPipelineRobustnessCreateInfo,
+    // Flags, which replace the create info's own whole.
+    VkPipelineCreateFlags2CreateInfo,
+    // Flags saying which parts of a pipeline a library holds.
+    VkGraphicsPipelineLibraryCreateInfoEXT,
+    // A fragment size and two combiner enums.
+    VkPipelineFragmentShadingRateStateCreateInfoKHR,
     // An imageless framebuffer's attachments, counted against its render pass by the
     // framebuffer's own check.
     VkFramebufferAttachmentsCreateInfo,
@@ -13695,6 +14074,19 @@ unsafe impl InStruct for VkFramebufferAttachmentsCreateInfo {
 unsafe impl InStruct for VkRenderPassAttachmentBeginInfo {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkShaderModuleCreateInfo {
+    const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkPipelineLibraryCreateInfoKHR {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -15152,6 +15544,249 @@ mod tests {
         assert!(alloc(&[9, 2], 2).is_err(), "more than its binding holds");
         assert!(alloc(&[1], 2).is_err(), "counts for another number of sets");
 
+        d.abandon_planted();
+    }
+
+    /// A pipeline names stages the device runs, each with code, an entry point and
+    /// specialization data its entries lie inside; a graphics pipeline's stages make one, a
+    /// compute pipeline's is compute; its feedback, libraries and attachment locations fit it.
+    #[test]
+    fn a_pipeline_names_stages_the_device_runs() {
+        use crate::venus::proto::types::{
+            VkPipelineCreateFlags, VkPipelineCreationFeedback, VkShaderModule,
+            VkShaderStageFlagBits as S, VkSpecializationInfo,
+        };
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const MESHY: VkDevice = VkDevice::forged(0x9a);
+        const LIB: VkPipeline = VkPipeline::forged(0x700);
+        const PLAIN: VkPipeline = VkPipeline::forged(0x701);
+        const COMPUTE_LIB: VkPipeline = VkPipeline::forged(0x702);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        d.plant_device(MESHY, crate::vulkan::Device::default());
+        d.plant_stages(MESHY, &["VK_EXT_mesh_shader", "VK_KHR_ray_tracing_pipeline"]);
+        d.record_pipeline(LIB, DEVICE, PipelineKind::Graphics, true);
+        d.record_pipeline(PLAIN, DEVICE, PipelineKind::Graphics, false);
+        d.record_pipeline(COMPUTE_LIB, DEVICE, PipelineKind::Compute, true);
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let meshy = d.device_facts(MESHY).expect("a planted device");
+
+        let stage = |bits: S| VkPipelineShaderStageCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage: bits,
+            module: VkShaderModule::forged(0x5ade),
+            pName: c"main".as_ptr(),
+            ..Default::default()
+        };
+        let one = |s: &VkPipelineShaderStageCreateInfo, f: &DeviceFacts<'_>| {
+            cs::Decoded::planted(s).validate(f).map(|_| ())
+        };
+        assert_eq!(one(&stage(S::VK_SHADER_STAGE_VERTEX_BIT), &facts), Ok(()));
+        assert!(one(&stage(S::VK_SHADER_STAGE_ALL_GRAPHICS), &facts).is_err(), "several stages");
+        assert!(one(&stage(S(0)), &facts).is_err(), "no stage");
+        assert!(one(&stage(S::VK_SHADER_STAGE_MESH_BIT_EXT), &facts).is_err(), "no mesh shaders");
+        assert_eq!(one(&stage(S::VK_SHADER_STAGE_MESH_BIT_EXT), &meshy), Ok(()));
+        let mut unnamed = stage(S::VK_SHADER_STAGE_VERTEX_BIT);
+        unnamed.pName = core::ptr::null();
+        assert!(one(&unnamed, &facts).is_err(), "no entry point");
+        let mut codeless = stage(S::VK_SHADER_STAGE_VERTEX_BIT);
+        codeless.module = VkShaderModule::NULL;
+        assert!(one(&codeless, &facts).is_err(), "no code");
+        let code = [0u32; 2];
+        let module = |size| VkShaderModuleCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            codeSize: size,
+            pCode: code.as_ptr(),
+            ..Default::default()
+        };
+        let carried = |m: &VkShaderModuleCreateInfo| {
+            let mut s = codeless;
+            s.pNext = (&raw const *m).cast();
+            one(&s, &facts)
+        };
+        assert_eq!(carried(&module(8)), Ok(()), "code carried in place of a module");
+        assert!(carried(&module(6)).is_err(), "code in pieces of a word");
+        assert!(carried(&module(0)).is_err(), "no code carried");
+        let mut nowhere = module(8);
+        nowhere.pCode = core::ptr::null();
+        assert!(cs::Decoded::planted(&nowhere).validate(&facts).is_err(), "a module of no code");
+
+        let data = [0u8; 8];
+        let special = |offset, size: usize, data: &[u8]| {
+            let entries = [VkSpecializationMapEntry { constantID: 0, offset, size }];
+            let info = VkSpecializationInfo {
+                mapEntryCount: 1,
+                pMapEntries: entries.as_ptr(),
+                dataSize: 8,
+                pData: if data.is_empty() { core::ptr::null() } else { data.as_ptr().cast() },
+            };
+            let mut s = stage(S::VK_SHADER_STAGE_VERTEX_BIT);
+            s.pSpecializationInfo = &info;
+            one(&s, &facts)
+        };
+        assert_eq!(special(4, 4, &data), Ok(()));
+        assert!(special(4, 8, &data).is_err(), "a constant past its data");
+        assert!(special(u32::MAX, 4, &data).is_err(), "far past it");
+        assert!(special(0, 3, &data).is_err(), "a size no constant has");
+        assert!(special(0, 4, &[]).is_err(), "no data at all");
+
+        let subgroup = |size| {
+            let chain = VkPipelineShaderStageRequiredSubgroupSizeCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+                requiredSubgroupSize: size,
+                ..Default::default()
+            };
+            let mut s = stage(S::VK_SHADER_STAGE_COMPUTE_BIT);
+            s.pNext = (&raw const chain).cast();
+            cs::Decoded::planted(&s).validate(&facts).map(|_| ())
+        };
+        assert_eq!(subgroup(32), Ok(()));
+        assert!(subgroup(48).is_err(), "not a power of two");
+        assert!(subgroup(256).is_err(), "wider than any device");
+        let mapping = VkShaderDescriptorSetAndBindingMappingInfoEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT,
+            ..Default::default()
+        };
+        let mut mapped = stage(S::VK_SHADER_STAGE_VERTEX_BIT);
+        mapped.pNext = (&raw const mapping).cast();
+        assert!(one(&mapped, &facts).is_err(), "bindings mapped into descriptor heaps");
+
+        let graphics =
+            |stages: &[VkPipelineShaderStageCreateInfo], flags: u32, f: &DeviceFacts<'_>| {
+                let info = VkGraphicsPipelineCreateInfo {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                    flags: VkPipelineCreateFlags(flags),
+                    stageCount: stages.len() as u32,
+                    pStages: stages.as_ptr(),
+                    ..Default::default()
+                };
+                cs::Decoded::planted(&info).validate(f).map(|_| ())
+            };
+        let (v, f) = (stage(S::VK_SHADER_STAGE_VERTEX_BIT), stage(S::VK_SHADER_STAGE_FRAGMENT_BIT));
+        let tc = stage(S::VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT);
+        let te = stage(S::VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT);
+        let (task, mesh) =
+            (stage(S::VK_SHADER_STAGE_TASK_BIT_EXT), stage(S::VK_SHADER_STAGE_MESH_BIT_EXT));
+        let library = VkPipelineCreateFlagBits::VK_PIPELINE_CREATE_LIBRARY_BIT_KHR.0 as u32;
+        assert_eq!(graphics(&[v, f], 0, &facts), Ok(()));
+        assert_eq!(graphics(&[v, tc, te, f], 0, &facts), Ok(()));
+        assert!(graphics(&[v, v, f], 0, &facts).is_err(), "a stage twice");
+        assert!(graphics(&[v, tc, f], 0, &facts).is_err(), "control without evaluation");
+        assert!(graphics(&[v, te, f], 0, &facts).is_err(), "evaluation without control");
+        assert!(graphics(&[f], 0, &facts).is_err(), "no vertex or mesh stage");
+        assert_eq!(graphics(&[f], library, &facts), Ok(()), "a library of the fragment stage");
+        assert_eq!(graphics(&[task, mesh, f], 0, &meshy), Ok(()));
+        assert!(graphics(&[v, mesh, f], 0, &meshy).is_err(), "vertex and mesh");
+        assert!(graphics(&[task, v, f], 0, &meshy).is_err(), "task without mesh");
+        assert!(
+            graphics(&[v, stage(S::VK_SHADER_STAGE_COMPUTE_BIT)], 0, &facts).is_err(),
+            "compute"
+        );
+
+        let compute = |s: VkPipelineShaderStageCreateInfo| {
+            let info = VkComputePipelineCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                stage: s,
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+        };
+        assert_eq!(compute(stage(S::VK_SHADER_STAGE_COMPUTE_BIT)), Ok(()));
+        assert!(compute(f).is_err(), "a fragment stage");
+        let mut unnamed_compute = stage(S::VK_SHADER_STAGE_COMPUTE_BIT);
+        unnamed_compute.pName = core::ptr::null();
+        assert!(compute(unnamed_compute).is_err(), "its stage held as any other");
+
+        let traced = |stages: &[VkPipelineShaderStageCreateInfo], f: &DeviceFacts<'_>| {
+            let info = VkRayTracingPipelineCreateInfoKHR {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR,
+                stageCount: stages.len() as u32,
+                pStages: stages.as_ptr(),
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(f).map(|_| ())
+        };
+        let (raygen, miss) =
+            (stage(S::VK_SHADER_STAGE_RAYGEN_BIT_KHR), stage(S::VK_SHADER_STAGE_MISS_BIT_KHR));
+        assert_eq!(traced(&[raygen, miss, miss], &meshy), Ok(()), "a stage more than once");
+        assert!(traced(&[raygen], &facts).is_err(), "on a device without ray tracing");
+        assert!(traced(&[raygen, v], &meshy).is_err(), "a graphics stage");
+
+        let feedback = [VkPipelineCreationFeedback::default(); 2];
+        let fed = |count, room: *mut VkPipelineCreationFeedback| {
+            let mut whole = VkPipelineCreationFeedback::default();
+            let chain = VkPipelineCreationFeedbackCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
+                pPipelineCreationFeedback: &mut whole,
+                pipelineStageCreationFeedbackCount: count,
+                pPipelineStageCreationFeedbacks: room,
+                ..Default::default()
+            };
+            let stages = [v, f];
+            let info = VkGraphicsPipelineCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                pNext: (&raw const chain).cast(),
+                stageCount: 2,
+                pStages: stages.as_ptr(),
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+        };
+        let room = feedback.as_ptr().cast_mut();
+        assert_eq!(fed(2, room), Ok(()));
+        assert_eq!(fed(0, core::ptr::null_mut()), Ok(()), "no stage feedback");
+        assert!(fed(1, room).is_err(), "feedback for fewer stages");
+        assert!(fed(2, core::ptr::null_mut()).is_err(), "no room for it");
+
+        let linked = |libraries: &[VkPipeline]| {
+            let chain = VkPipelineLibraryCreateInfoKHR {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+                libraryCount: libraries.len() as u32,
+                pLibraries: libraries.as_ptr(),
+                ..Default::default()
+            };
+            let info = VkGraphicsPipelineCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                pNext: (&raw const chain).cast(),
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+        };
+        assert_eq!(linked(&[LIB]), Ok(()), "stages from a library");
+        assert!(linked(&[PLAIN]).is_err(), "a pipeline that is not a library");
+        assert!(linked(&[COMPUTE_LIB]).is_err(), "a library of another kind");
+        assert!(linked(&[VkPipeline::forged(0x7ff)]).is_err(), "no record");
+
+        let rendered = |colors| {
+            let chain = VkPipelineRenderingCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+                colorAttachmentCount: colors,
+                ..Default::default()
+            };
+            let stages = [v, f];
+            let info = VkGraphicsPipelineCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                pNext: (&raw const chain).cast(),
+                stageCount: 2,
+                pStages: stages.as_ptr(),
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+        };
+        assert_eq!(rendered(8), Ok(()));
+        assert!(rendered(9).is_err(), "more colours than the device has");
+
+        let located = |locations: &[u32]| {
+            let info = VkRenderingAttachmentLocationInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO,
+                colorAttachmentCount: locations.len() as u32,
+                pColorAttachmentLocations: locations.as_ptr(),
+                ..Default::default()
+            };
+            cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+        };
+        assert_eq!(located(&[1, ATTACHMENT_UNUSED, 7]), Ok(()));
+        assert!(located(&[8]).is_err(), "a location past the device's");
         d.abandon_planted();
     }
 
@@ -21842,7 +22477,7 @@ mod tests {
             let r = d.create_ray_tracing_pipelines(
                 DEVICE,
                 VkPipelineCache::NULL,
-                cs::Decoded::planted(infos),
+                cs::Decoded::planted_checked(infos),
                 None,
                 &mut out,
             );

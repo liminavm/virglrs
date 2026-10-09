@@ -289,6 +289,15 @@ impl<'a, T: ?Sized> Decoded<'a, T> {
     }
 }
 
+impl<'a, T: ?Sized> Decoded<'a, T, Checked> {
+    /// Plant a struct a test built, as though the decoder had and its check had passed: for a
+    /// test of what the driver does with a struct, not of the check.
+    #[cfg(test)]
+    pub fn planted_checked(r: &'a T) -> Self {
+        Decoded(r, PhantomData)
+    }
+}
+
 impl<'a, T: ?Sized, S> Decoded<'a, T, S> {
     /// The reference, for reading. Reading is not what needs vouching for; handing a struct on is.
     pub fn get(self) -> &'a T {

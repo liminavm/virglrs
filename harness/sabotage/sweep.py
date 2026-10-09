@@ -305,9 +305,9 @@ SABOTAGES = [
     ),
     (
         'a shader whose code is not a whole number of words is passed on',
-        'src/venus/context.rs',
-        '        if info.codeSize % 4 != 0 {',
-        '        if false {',
+        'src/venus/driver.rs',
+        """    if info.codeSize == 0 || !info.codeSize.is_multiple_of(4) || info.pCode.is_null() {""",
+        """    if info.codeSize == 0 || info.pCode.is_null() {""",
         '',
     ),
     (
@@ -3372,14 +3372,12 @@ SABOTAGES = [
         let ids = args.pPipelines();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
-        let out = args.handle_pPipelines_mut();
-        let made = self.driver.create_ray_tracing_pipelines(""",
+        let checked = self.driver.device_facts(device).map(|facts| infos.validate(&facts));""",
         """        let infos = args.pCreateInfos();
         let ids = args.pPipelines();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
-        let out = args.handle_pPipelines_mut();
-        let made = self.driver.create_ray_tracing_pipelines(""",
+        let checked = self.driver.device_facts(device).map(|facts| infos.validate(&facts));""",
         'a_derivative_pipeline_names_only_an_earlier_pipeline_of_its_run_as_its_base',
     ),
     (
@@ -4945,6 +4943,228 @@ SABOTAGES = [
     VkSemaphoreCreateInfo,
 """,
         'no_create_forwarded_unchecked_is_written_down_as_validated',
+    ),
+    (
+        'a stage may name several stages at once',
+        'src/venus/driver.rs',
+        """        if stage.count_ones() != 1 || stage & facts.stages == 0 {""",
+        """        if stage & facts.stages == 0 {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a stage may be one the device does not run',
+        'src/venus/driver.rs',
+        """        if stage.count_ones() != 1 || stage & facts.stages == 0 {""",
+        """        if stage.count_ones() != 1 {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a stage may name no entry point',
+        'src/venus/driver.rs',
+        """        if this.pName.is_null() {""",
+        """        if false {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a stage may carry no code',
+        'src/venus/driver.rs',
+        """        if this.module.host().raw() == 0 && !carried {""",
+        """        if false {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a specialization constant may be any size',
+        'src/venus/driver.rs',
+        """            matches!(e.size, 1 | 2 | 4 | 8) && u64::from(e.offset) + e.size as u64 <= data""",
+        """            u64::from(e.offset) + e.size as u64 <= data""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a specialization constant may lie outside its data',
+        'src/venus/driver.rs',
+        """            matches!(e.size, 1 | 2 | 4 | 8) && u64::from(e.offset) + e.size as u64 <= data""",
+        """            matches!(e.size, 1 | 2 | 4 | 8)""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'specialization data may be missing',
+        'src/venus/driver.rs',
+        """        let data = if special.pData.is_null() { 0 } else { special.dataSize as u64 };""",
+        """        let data = special.dataSize as u64;""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a shader may have no code',
+        'src/venus/driver.rs',
+        """    if info.codeSize == 0 || !info.codeSize.is_multiple_of(4) || info.pCode.is_null() {""",
+        """    if !info.codeSize.is_multiple_of(4) || info.pCode.is_null() {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a shader may point at no code',
+        'src/venus/driver.rs',
+        """    if info.codeSize == 0 || !info.codeSize.is_multiple_of(4) || info.pCode.is_null() {""",
+        """    if info.codeSize == 0 || !info.codeSize.is_multiple_of(4) {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a subgroup size may be any number',
+        'src/venus/driver.rs',
+        """        if !size.is_power_of_two() || size > 128 {""",
+        """        if size > 128 {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a subgroup size may be wider than any device',
+        'src/venus/driver.rs',
+        """        if !size.is_power_of_two() || size > 128 {""",
+        """        if !size.is_power_of_two() {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a stage may map its bindings into descriptor heaps',
+        'src/venus/driver.rs',
+        """        Err("mapped a stage's bindings into descriptor heaps this renderer does not serve")""",
+        """        Ok(())""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a graphics pipeline may name a stage twice',
+        'src/venus/driver.rs',
+        """        if mask & stage != 0 && !repeats {""",
+        """        if false {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a graphics pipeline may name a stage of another kind',
+        'src/venus/driver.rs',
+        """        if stages & !(GRAPHICS_STAGES | MESH_STAGES) != 0 {""",
+        """        if false {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a graphics pipeline may name one tessellation stage',
+        'src/venus/driver.rs',
+        """        if tessellation != 0 && tessellation != TESSELLATION_STAGES {""",
+        """        if false {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a graphics pipeline may name vertex and mesh stages',
+        'src/venus/driver.rs',
+        """        if vertex && mesh || stages & TASK_STAGE != 0 && !mesh {""",
+        """        if stages & TASK_STAGE != 0 && !mesh {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a graphics pipeline may name a task stage alone',
+        'src/venus/driver.rs',
+        """        if vertex && mesh || stages & TASK_STAGE != 0 && !mesh {""",
+        """        if vertex && mesh {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a graphics pipeline may have no vertex or mesh stage',
+        'src/venus/driver.rs',
+        """        if !vertex && !mesh && !linked && !is_library(this, u64::from(this.flags.0)) {""",
+        """        if false {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a graphics library must still have a vertex stage',
+        'src/venus/driver.rs',
+        """        if !vertex && !mesh && !linked && !is_library(this, u64::from(this.flags.0)) {""",
+        """        if !vertex && !mesh && !linked {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a graphics pipeline linking libraries must still have a vertex stage',
+        'src/venus/driver.rs',
+        """        if !vertex && !mesh && !linked && !is_library(this, u64::from(this.flags.0)) {""",
+        """        if !vertex && !mesh && !is_library(this, u64::from(this.flags.0)) {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a compute pipeline may be of any stage',
+        'src/venus/driver.rs',
+        """        if this.stage.stage.0 as u32 != COMPUTE_STAGE {""",
+        """        if false {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a compute pipeline stage is not held',
+        'src/venus/driver.rs',
+        """        unsafe { cs::Decoded::vouch(&this.stage) }.validate(facts)?;
+""",
+        """""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a ray-tracing pipeline may name a stage of another kind',
+        'src/venus/driver.rs',
+        """        if stages & !RAY_TRACING_STAGES != 0 {""",
+        """        if false {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'stage feedback may be given for fewer stages',
+        'src/venus/driver.rs',
+        """        if count != 0 && (count != on.root.stage_count() || room != count) {""",
+        """        if count != 0 && room != count {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'stage feedback may have no room',
+        'src/venus/driver.rs',
+        """        if count != 0 && (count != on.root.stage_count() || room != count) {""",
+        """        if count != 0 && count != on.root.stage_count() {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a linked pipeline need not be a library',
+        'src/venus/driver.rs',
+        """                .is_some_and(|p| p.library && p.kind == PipelineKind::Graphics)""",
+        """                .is_some_and(|p| p.kind == PipelineKind::Graphics)""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a linked library may be of another kind',
+        'src/venus/driver.rs',
+        """                .is_some_and(|p| p.library && p.kind == PipelineKind::Graphics)""",
+        """                .is_some_and(|p| p.library)""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'a rendering pipeline may name more colours than the device has',
+        'src/venus/driver.rs',
+        """        color_attachments_fit(on.facts, this.colorAttachmentCount)
+""",
+        """        Ok(())
+""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'an attachment location may be past the device',
+        'src/venus/driver.rs',
+        """        if !locations.iter().all(|&l| l == ATTACHMENT_UNUSED || l < most) {""",
+        """        if false {""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'mesh shaders are never enabled',
+        'src/venus/driver.rs',
+        """        stages |= MESH_STAGES;
+""",
+        """""",
+        'a_pipeline_names_stages_the_device_runs',
+    ),
+    (
+        'ray-tracing stages are never enabled',
+        'src/venus/driver.rs',
+        """        stages |= RAY_TRACING_STAGES;
+""",
+        """""",
+        'a_pipeline_names_stages_the_device_runs',
     ),
     (
         'a submit chained array is trusted by its count alone',

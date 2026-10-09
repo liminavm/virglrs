@@ -200,7 +200,7 @@ vkCreateRingMESA                                 reviewed
 vkCreateSampler                                  validated
 vkCreateSamplerYcbcrConversion                   reviewed
 vkCreateSemaphore                                reviewed
-vkCreateShaderModule                             reviewed
+vkCreateShaderModule                             validated
 vkDestroyAccelerationStructureKHR                reviewed
 vkDestroyBuffer                                  reviewed
 vkDestroyBufferView                              reviewed

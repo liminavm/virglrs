@@ -3398,24 +3398,22 @@ impl Commands for Handlers<'_> {
         }
     }
 
-    /// The one simple object with a check in front of it.
-    ///
     /// `codeSize` is a byte count, uniquely among Vulkan's typed arrays, and the wire carries
-    /// `codeSize / 4` words -- so a `codeSize` that is not a multiple of four decodes into an
-    /// allocation shorter than the number the driver is then handed, and the driver reads off the
-    /// end of it. The guest chooses that number, which makes rejecting it the boundary's job.
+    /// `codeSize / 4` words: see `spirv_fits` for what the check holds it to.
     fn vkCreateShaderModule(&mut self, args: &mut vn_command_vkCreateShaderModule<'_>) {
         let Some(info) = self.names(args.pCreateInfo) else { return };
-        if info.codeSize % 4 != 0 {
-            self.reject("gave a shader a code size that is not a whole number of words");
-            return;
-        }
-        let host = self.driver.create_object(
-            args.device,
-            |d| Some(d.vkCreateShaderModule()),
-            info,
-            args.pAllocator,
-        );
+        // As `vkCreatePipelineLayout`.
+        let checked = self.driver.device_facts(args.device).map(|facts| info.validate(&facts));
+        let host = match checked {
+            None => Err(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            Some(Err(why)) => return self.reject(why),
+            Some(Ok(info)) => self.driver.create_object(
+                args.device,
+                |d| Some(d.vkCreateShaderModule()),
+                info,
+                args.pAllocator,
+            ),
+        };
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant(
             "vkCreateShaderModule",
@@ -4989,6 +4987,14 @@ impl Commands for Handlers<'_> {
         let ids = args.pPipelines();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
+        let infos = match self.driver.device_facts(device).map(|facts| infos.validate(&facts)) {
+            Some(Ok(infos)) => infos,
+            Some(Err(why)) => return self.reject(why),
+            None => {
+                args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
+                return self.ghost_ids(ids);
+            }
+        };
         let out = args.handle_pPipelines_mut();
         let host = self.driver.create_pipelines(device, cache, infos, alloc, out);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
@@ -5015,6 +5021,14 @@ impl Commands for Handlers<'_> {
         let ids = args.pPipelines();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
+        let infos = match self.driver.device_facts(device).map(|facts| infos.validate(&facts)) {
+            Some(Ok(infos)) => infos,
+            Some(Err(why)) => return self.reject(why),
+            None => {
+                args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
+                return self.ghost_ids(ids);
+            }
+        };
         let out = args.handle_pPipelines_mut();
         let host = self.driver.create_pipelines(device, cache, infos, alloc, out);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
@@ -5046,6 +5060,15 @@ impl Commands for Handlers<'_> {
         let ids = args.pPipelines();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
+        let checked = self.driver.device_facts(device).map(|facts| infos.validate(&facts));
+        let infos = match checked {
+            Some(Ok(infos)) => infos,
+            Some(Err(why)) => return self.reject(why),
+            None => {
+                self.rayed::<()>(Err(driver::RayTracingRefused::NoDevice));
+                return;
+            }
+        };
         let out = args.handle_pPipelines_mut();
         let made = self.driver.create_ray_tracing_pipelines(device, cache, infos, alloc, out);
         let Some(host) = self.rayed(made) else { return };
@@ -7174,6 +7197,43 @@ mod tests {
     // The fakes stand in for the Vulkan driver, and a driver writes through the pointers it is
     // handed. Test code, which a handler's `unsafe` would not be.
     #![allow(unsafe_code)]
+
+    /// A shader stage of `stage` its check takes: code named by a module, and an entry point.
+    fn a_stage(
+        stage: super::super::proto::types::VkShaderStageFlagBits,
+    ) -> super::super::proto::types::VkPipelineShaderStageCreateInfo {
+        super::super::proto::types::VkPipelineShaderStageCreateInfo {
+            sType: super::super::proto::types::VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage,
+            module: super::super::proto::types::VkShaderModule::forged(0x5ade),
+            pName: c"main".as_ptr(),
+            ..Default::default()
+        }
+    }
+
+    /// A graphics pipeline its check takes: a vertex and a fragment stage, which the test keeps
+    /// for its whole run.
+    fn a_graphics_pipeline() -> VkGraphicsPipelineCreateInfo {
+        use super::super::proto::types::VkShaderStageFlagBits as S;
+        let stages = Box::leak(Box::new([
+            a_stage(S::VK_SHADER_STAGE_VERTEX_BIT),
+            a_stage(S::VK_SHADER_STAGE_FRAGMENT_BIT),
+        ]));
+        VkGraphicsPipelineCreateInfo {
+            stageCount: 2,
+            pStages: stages.as_ptr(),
+            ..Default::default()
+        }
+    }
+
+    /// A compute pipeline its check takes.
+    fn a_compute_pipeline() -> VkComputePipelineCreateInfo {
+        use super::super::proto::types::VkShaderStageFlagBits as S;
+        VkComputePipelineCreateInfo {
+            stage: a_stage(S::VK_SHADER_STAGE_COMPUTE_BIT),
+            ..Default::default()
+        }
+    }
 
     /// A resource table with nothing in it, for the tests that are not about rings. A ring
     /// handler reaching for a resource here gets the same answer a guest naming a bogus one does.
@@ -13731,7 +13791,9 @@ mod tests {
         h.vkCmdPushConstants(&mut args);
         assert!(h.rejected().is_none());
 
-        let info = VkShaderModuleCreateInfo { codeSize: 8, ..Default::default() };
+        let code = [0u32; 2];
+        let info =
+            VkShaderModuleCreateInfo { codeSize: 8, pCode: code.as_ptr(), ..Default::default() };
         let mut args = vn_command_vkCreateShaderModule::default();
         args.device = VkDevice::forged(DEVICE);
         args.pCreateInfo = Some(Decoded::planted(&info));
@@ -14415,7 +14477,7 @@ mod tests {
             journal: &mut jrnl,
         };
 
-        let infos = [VkGraphicsPipelineCreateInfo::default(); 3];
+        let infos = [a_graphics_pipeline(); 3];
         let mut wire: [VkPipeline; 3] = core::array::from_fn(|i| VkPipeline::forged(IDS[i]));
         let mut shadow = [VkPipeline::forged(0); 3];
         let mut args = vn_command_vkCreateGraphicsPipelines::default();
@@ -14553,6 +14615,9 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new(Account::for_test(None));
+        // A device for the check to hold the code to; it exports nothing, so a create that got
+        // past the check would abort the test rather than pass it.
+        driver.plant_device(VkDevice::forged(3), crate::vulkan::Device::default());
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -14579,20 +14644,25 @@ mod tests {
             journal: &mut jrnl,
         };
 
-        let odd = VkShaderModuleCreateInfo { codeSize: 7, ..Default::default() };
+        let code = [0u32; 2];
+        let odd =
+            VkShaderModuleCreateInfo { codeSize: 7, pCode: code.as_ptr(), ..Default::default() };
         let mut args = vn_command_vkCreateShaderModule::default();
+        args.device = VkDevice::forged(3);
         args.pCreateInfo = Some(Decoded::planted(&odd));
         h.vkCreateShaderModule(&mut args);
         assert!(h.rejected().is_some(), "a code size of 7 must not reach the driver");
 
-        // Four is a whole word, so the guard lets it through; there is no device, so the driver
-        // refuses it -- which is a different answer from a protocol violation.
-        let whole = VkShaderModuleCreateInfo { codeSize: 4, ..Default::default() };
+        // Four is a whole word; on a device this context does not have, the create fails --
+        // which is a different answer from a protocol violation.
+        let whole =
+            VkShaderModuleCreateInfo { codeSize: 4, pCode: code.as_ptr(), ..Default::default() };
         let mut args = vn_command_vkCreateShaderModule::default();
         args.pCreateInfo = Some(Decoded::planted(&whole));
         h.take_rejected();
         h.vkCreateShaderModule(&mut args);
         assert!(h.rejected().is_none(), "a whole number of words is not a protocol violation");
+        h.driver.abandon_planted();
     }
 
     /// A command that claims an array and sends none is refused, not quietly done as nothing.
@@ -14745,9 +14815,7 @@ mod tests {
     /// driver a number the guest invented.
     #[test]
     fn a_refused_pipeline_run_ghosts_the_whole_run() {
-        use super::super::proto::types::{
-            VkGraphicsPipelineCreateInfo, VkPipeline, vn_command_vkCreateGraphicsPipelines,
-        };
+        use super::super::proto::types::{VkPipeline, vn_command_vkCreateGraphicsPipelines};
 
         const IDS: [u64; 3] = [41, 42, 43];
 
@@ -14781,7 +14849,7 @@ mod tests {
 
         // There is no device, so the driver refuses the whole run -- which is the only way to
         // reach the refusal path without a driver that fails on demand.
-        let infos = [VkGraphicsPipelineCreateInfo::default(); IDS.len()];
+        let infos = [a_graphics_pipeline(); IDS.len()];
         let mut ids = IDS.map(VkPipeline::forged);
         let mut shadow = [VkPipeline::forged(0); IDS.len()];
         let mut args = vn_command_vkCreateGraphicsPipelines::default();
@@ -14892,7 +14960,7 @@ mod tests {
             journal: &mut jrnl,
         };
 
-        let infos = [VkComputePipelineCreateInfo::default(); IDS.len()];
+        let infos = [a_compute_pipeline(); IDS.len()];
         let mut wire = IDS.map(VkPipeline::forged);
         let mut shadow = [VkPipeline::forged(0); IDS.len()];
         let mut args = vn_command_vkCreateComputePipelines::default();
@@ -18187,7 +18255,7 @@ mod tests {
         let compute = |flags: VkPipelineCreateFlags, base: i32| VkComputePipelineCreateInfo {
             flags,
             basePipelineIndex: base,
-            ..Default::default()
+            ..a_compute_pipeline()
         };
         let plain = compute(VkPipelineCreateFlags(0), -1);
         // The flags2 link: derivative, or not, whatever the 1.0 flags beside it say.
@@ -18433,7 +18501,7 @@ mod tests {
         };
 
         let compute = |h: &mut Handlers<'_>, device: u64| {
-            let infos = [VkComputePipelineCreateInfo::default()];
+            let infos = [a_compute_pipeline()];
             let mut wire = [VkPipeline::forged(40)];
             let mut shadow = [VkPipeline::forged(0)];
             let mut args = vn_command_vkCreateComputePipelines::default();
@@ -18446,7 +18514,7 @@ mod tests {
             shadow[0]
         };
         let graphics = |h: &mut Handlers<'_>, id: u64| {
-            let infos = [VkGraphicsPipelineCreateInfo::default()];
+            let infos = [a_graphics_pipeline()];
             let mut wire = [VkPipeline::forged(id)];
             let mut shadow = [VkPipeline::forged(0)];
             let mut args = vn_command_vkCreateGraphicsPipelines::default();
