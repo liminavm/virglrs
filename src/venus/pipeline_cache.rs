@@ -59,13 +59,38 @@ pub fn tag(key: &PipelineCacheKey, data: &[u8]) -> [u8; TAG_LEN] {
     mac(key, data).finalize().into_bytes().into()
 }
 
+/// Why initial data did not open, for the line that says so.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unopened {
+    /// Shorter than a tag: no data this renderer handed out.
+    Short,
+    /// The tag is not this key's over these bytes: another key's data, a changed or truncated
+    /// copy, or a forgery.
+    Tag,
+    /// Tagged by this key but not framed as Mesa frames a cache.
+    Framing,
+}
+
+impl std::fmt::Display for Unopened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Unopened::Short => "shorter than a tag",
+            Unopened::Tag => "not signed by this key",
+            Unopened::Framing => "not framed as Mesa frames a cache",
+        })
+    }
+}
+
 /// The driver's data inside `sealed`, if `key` tagged it and it is framed as Mesa frames it.
-pub fn opened<'a>(key: &PipelineCacheKey, sealed: &'a [u8]) -> Option<&'a [u8]> {
-    let split = sealed.len().checked_sub(TAG_LEN)?;
+pub fn opened<'a>(key: &PipelineCacheKey, sealed: &'a [u8]) -> Result<&'a [u8], Unopened> {
+    let split = sealed.len().checked_sub(TAG_LEN).ok_or(Unopened::Short)?;
     let (data, tag) = sealed.split_at(split);
     // Constant time, so a guest timing the refusal learns nothing about the tag it guessed.
-    mac(key, data).verify_slice(tag).ok()?;
-    framed(data).then_some(data)
+    mac(key, data).verify_slice(tag).map_err(|_| Unopened::Tag)?;
+    if !framed(data) {
+        return Err(Unopened::Framing);
+    }
+    Ok(data)
 }
 
 /// Whether `data` is the Mesa runtime's framing: its header, a count, and that many entries --
@@ -146,16 +171,16 @@ mod tests {
         let key = PipelineCacheKey::new([9; PipelineCacheKey::LEN]);
         let data = mesa_data();
         let s = sealed(&key, &data);
-        assert_eq!(opened(&key, &s), Some(&data[..]));
+        assert_eq!(opened(&key, &s), Ok(&data[..]));
 
         let other = PipelineCacheKey::new([8; PipelineCacheKey::LEN]);
-        assert_eq!(opened(&other, &s), None, "another key's data");
+        assert_eq!(opened(&other, &s), Err(Unopened::Tag), "another key's data");
         let mut flipped = s.clone();
         flipped[40] ^= 1;
-        assert_eq!(opened(&key, &flipped), None, "a byte changed after tagging");
-        assert_eq!(opened(&key, &s[..s.len() - 1]), None, "a truncated copy");
-        assert_eq!(opened(&key, &data), None, "no tag at all");
-        assert_eq!(opened(&key, &[]), None, "nothing");
+        assert_eq!(opened(&key, &flipped), Err(Unopened::Tag), "a byte changed after tagging");
+        assert_eq!(opened(&key, &s[..s.len() - 1]), Err(Unopened::Tag), "a truncated copy");
+        assert_eq!(opened(&key, &data), Err(Unopened::Tag), "no tag at all");
+        assert_eq!(opened(&key, &[]), Err(Unopened::Short), "nothing");
     }
 
     /// Behind a good tag, the data must still be framed as Mesa frames it.
@@ -168,7 +193,7 @@ mod tests {
             let mut d = data.clone();
             edit(&mut d);
             assert!(!framed(&d));
-            assert_eq!(opened(&key, &sealed(&key, &d)), None);
+            assert_eq!(opened(&key, &sealed(&key, &d)), Err(Unopened::Framing));
         };
         fails(&|d| d[0] = 31);
         fails(&|d| d[4] = 2);

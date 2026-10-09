@@ -3909,7 +3909,26 @@ impl Driver {
         let sealed: &[u8] =
             unsafe { cs::wire_array(guest.initialDataSize, guest.pInitialData.cast::<u8>()) }
                 .unwrap_or_default();
-        let data = self.cache_key.as_ref().and_then(|key| pipeline_cache::opened(key, sealed));
+        let data = match &self.cache_key {
+            _ if sealed.is_empty() => None,
+            None => None,
+            Some(key) => {
+                let opened = pipeline_cache::opened(key, sealed);
+                // Once per cache a guest warms, so a line each costs nothing and says whether a
+                // saved cache came back: what tells a warm start from a cold one.
+                match opened {
+                    Ok(data) => eprintln!(
+                        "[virglrs] pipeline cache initial data: accepted ({} bytes)",
+                        data.len()
+                    ),
+                    Err(why) => eprintln!(
+                        "[virglrs] pipeline cache initial data: ignored ({why}, {} bytes)",
+                        sealed.len()
+                    ),
+                }
+                opened.ok()
+            }
+        };
         let forwarded = VkPipelineCacheCreateInfo {
             initialDataSize: data.map_or(0, <[u8]>::len),
             pInitialData: data.map_or(core::ptr::null(), |d| d.as_ptr().cast()),
@@ -15908,7 +15927,7 @@ mod tests {
         let mut sealed = vec![0u8; n];
         let (n, r) = d.pipeline_cache_data(device, cache, Some(&mut sealed)).expect("its device");
         assert_eq!((n, r), (sealed.len(), VkResult::VK_SUCCESS));
-        assert!(pipeline_cache::opened(&key, &sealed).is_some(), "KosmicKrisp frames as Mesa");
+        assert!(pipeline_cache::opened(&key, &sealed).is_ok(), "KosmicKrisp frames as Mesa");
         let warm = VkPipelineCacheCreateInfo {
             initialDataSize: sealed.len(),
             pInitialData: sealed.as_ptr().cast(),
