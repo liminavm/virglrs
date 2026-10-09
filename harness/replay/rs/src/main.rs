@@ -1301,6 +1301,11 @@ fn score_text(t: &Tally, census: &[String]) -> String {
 /// measured. A golden of those is a corpus of zeros agreeing with itself. Acceptance still means
 /// the same thing on any driver, and this pins that.
 ///
+/// The other case is a line whose value is the scheduler's rather than the renderer's: a buffer two
+/// guest processes share holds whatever frame one had got to when the census sampled it. A fixture
+/// may leave such a line out only on a measurement that it moves between replays of one tree with
+/// every other line matching, and its header names the lines and the measurement.
+///
 /// It is not a weaker `--expect` for anyone to reach for, and three rules keep it from becoming
 /// one. `prologue`, `cmds` and `ctl` must be pinned, so every failure the score counts moves a
 /// pinned line and cannot be dropped by choosing a smaller fixture. A fixture that pins every

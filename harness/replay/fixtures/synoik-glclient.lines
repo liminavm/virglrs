@@ -1,3 +1,13 @@
+# `synoik-glclient` with the GL client's four shared scanout buffers left unpinned.
+#
+# Generated from synoik-glclient's C-recorded score by deleting four lines, never transcribed. The
+# four are `blob ctx=2 res=7` and `res=12` and `mem ctx=2 id=66` and `id=204`: the 4 MiB buffers
+# the classic GL client and the compositor share. What they hold when the census samples them is
+# where the client's frames had got to, which is the scheduler's to say -- measured 2026-10-08, they
+# hashed differently in 2 of about 12 replays on one tree, with every command accepted and every
+# other line matching. A pin of a timing-dependent value fails at random and says nothing about the
+# renderer. Every other line, acceptance included, is still pinned at the C leg's value.
+
 prologue 0 / 0
 cmds 58983 / 58983
 ctl 52 / 52
@@ -5,10 +15,8 @@ skipped flow-control 2277
 skipped classic [3, 4, 5]
 unreplayable imports []
 parked 0
-blob ctx=2 res=12 size=4096000 read=1048576 hash=f4c53273496207d5
 blob ctx=2 res=16 size=67108864 read=1048576 hash=a96777069d622325
 blob ctx=2 res=5 size=16384 read=16384 hash=9c1bda7f8c872325
-blob ctx=2 res=7 size=4096000 read=1048576 hash=f4c53273496207d5
 blob ctx=2 res=8 size=4194304 read=1048576 hash=a96777069d622325
 census ctx=2 allocations=23
 mem ctx=2 id=1160 size=65536 read=65536 hash=eb05052ea5b62325
@@ -22,7 +30,6 @@ mem ctx=2 id=166 size=65536 read=65536 hash=36c472389cdbf965
 mem ctx=2 id=176 size=65536 read=65536 hash=eb05052ea5b62325
 mem ctx=2 id=182 size=65536 read=65536 hash=eb05052ea5b62325
 mem ctx=2 id=188 size=65536 read=65536 hash=eb05052ea5b62325
-mem ctx=2 id=204 size=4128768 read=1048576 hash=f4c53273496207d5
 mem ctx=2 id=216 size=65536 read=65536 hash=eb05052ea5b62325
 mem ctx=2 id=230 size=67108864 read=1048576 hash=a96777069d622325
 mem ctx=2 id=237 size=393216 read=393216 hash=505d079c427cd725
@@ -31,7 +38,6 @@ mem ctx=2 id=257 size=393216 read=393216 hash=156ad9514d9a2325
 mem ctx=2 id=262 size=196608 read=196608 hash=cbd9b8792eb0adf5
 mem ctx=2 id=271 size=196608 read=196608 hash=cbd9b8792eb0adf5
 mem ctx=2 id=368 size=65536 read=65536 hash=eb05052ea5b62325
-mem ctx=2 id=66 size=4128768 read=1048576 hash=f4c53273496207d5
 mem ctx=2 id=72 size=65536 read=65536 hash=eb05052ea5b62325
 mem ctx=2 id=89 size=262144 read=262144 hash=9c735bed0a722325
 iosurface ctx=2 backed=2

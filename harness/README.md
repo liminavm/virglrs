@@ -348,7 +348,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   censuses zero at its destroy — a port that leaks a VkDeviceMemory fails there. The two synoik
   fixtures are one workload measured twice on purpose, and neither one can be the other: the
   census scores memory that is still live, so the corpus that proves teardown has nothing left to
-  hash (`vm/README.md`). `synoik-glclient.score` is glmark2 on the synoik session: a Vulkan
+  hash (`vm/README.md`). `synoik-glclient.lines` is glmark2 on the synoik session: a Vulkan
   compositor compositing a *classic* client, so the GL contexts are skipped and the corpus can
   carry a C-recorded fixture rather than gating virglrs against its own previous build. Skipping
   them is also what makes four of its allocations imports that resolve to nothing — they name
@@ -979,6 +979,12 @@ first time only one is re-recorded. So:
   recorded it. Pinning those at zero would be a corpus of zeros agreeing with itself, so they are
   left unpinned and acceptance is what the fixture carries.
 
+  The same mechanism carries `synoik-glclient`, for a second reason: four of its lines are the 4
+  MiB buffers the GL client shares with the compositor, and what they hold when the census samples
+  them is the scheduler's to say. Measured 2026-10-08, they hashed differently in 2 of about 12
+  replays of one tree with every other line matching, so `fixtures/synoik-glclient.lines` pins the
+  other 33. A line is left out this way only on such a measurement, named in the fixture's header.
+
   Three rules keep it from being a weaker `--expect` for anyone to reach for: `prologue`, `cmds`
   and `ctl` must be pinned, so every failure the score counts moves a pinned line and cannot be
   dropped by choosing a smaller fixture; a fixture that pins every line is refused as `--expect`
@@ -1118,10 +1124,9 @@ more. Before it, measured 2026-09-06, `synoik` scored 20 of 22 entries as zeros 
 data are the 4 MiB scanouts, which are not read through pages at all -- their backing is an
 IOSurface and `Surface::read_into` copies from the surface.
 
-The two 4,128,768-byte framebuffers are the exception to trusting a single replay: one sample of
-`synoik-glclient` put them at a hash three later runs did not reproduce, and the pin's value is
-what the C leg gives. They are the allocations the settle discussion below is about; a lone
-deviation there is a sample, not a regression.
+The two 4,128,768-byte framebuffers, and the two 4,096,000-byte blobs the GL client shares with
+them, are not pinned: their bytes are the scheduler's to say (see `--expect-lines` above). They are
+the allocations the settle discussion below is about.
 
 Reaching what is left needs a census that copies out of the `VkImage` rather than out of the
 memory, which is guest image-layout tracking on both sides -- see "The census reads the memory, so

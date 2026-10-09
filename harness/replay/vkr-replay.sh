@@ -8,7 +8,8 @@
 #
 # --score <file> writes the score; --expect <file> compares against a pinned one and exits
 # non-zero on any difference; --expect-lines <file> compares against a fixture that pins only some
-# of the score's lines, for a corpus whose content half means nothing on this driver. The score is
+# of the score's lines, for a corpus whose content half means nothing on this driver or whose
+# fixture leaves out lines the scheduler decides (see compare_lines in rs/src/main.rs). The score is
 # renderer state, not pixels: a VM-free replay has no scanout, so what it compares is the accept
 # counts and the device memory the commands left.
 #
