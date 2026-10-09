@@ -7214,14 +7214,27 @@ mod tests {
     /// A graphics pipeline its check takes: a vertex and a fragment stage, which the test keeps
     /// for its whole run.
     fn a_graphics_pipeline() -> VkGraphicsPipelineCreateInfo {
-        use super::super::proto::types::VkShaderStageFlagBits as S;
+        use super::super::proto::types::{
+            VkPipelineMultisampleStateCreateInfo, VkPipelineRasterizationStateCreateInfo,
+            VkPipelineVertexInputStateCreateInfo, VkSampleCountFlagBits,
+            VkShaderStageFlagBits as S,
+        };
         let stages = Box::leak(Box::new([
             a_stage(S::VK_SHADER_STAGE_VERTEX_BIT),
             a_stage(S::VK_SHADER_STAGE_FRAGMENT_BIT),
         ]));
+        let vertex_input = Box::leak(Box::new(VkPipelineVertexInputStateCreateInfo::default()));
+        let raster = Box::leak(Box::new(VkPipelineRasterizationStateCreateInfo::default()));
+        let multisample = Box::leak(Box::new(VkPipelineMultisampleStateCreateInfo {
+            rasterizationSamples: VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT,
+            ..Default::default()
+        }));
         VkGraphicsPipelineCreateInfo {
             stageCount: 2,
             pStages: stages.as_ptr(),
+            pVertexInputState: vertex_input,
+            pRasterizationState: raster,
+            pMultisampleState: multisample,
             ..Default::default()
         }
     }

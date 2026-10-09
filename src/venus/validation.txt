@@ -178,7 +178,7 @@ vkCreateAccelerationStructureKHR                 reviewed
 vkCreateBuffer                                   reviewed
 vkCreateBufferView                               validated
 vkCreateCommandPool                              reviewed
-vkCreateComputePipelines                         pending:pipelines
+vkCreateComputePipelines                         validated
 vkCreateDescriptorPool                           validated
 vkCreateDescriptorSetLayout                      validated
 vkCreateDescriptorUpdateTemplate                 reviewed
@@ -186,7 +186,7 @@ vkCreateDevice                                   reviewed
 vkCreateEvent                                    reviewed
 vkCreateFence                                    reviewed
 vkCreateFramebuffer                              validated
-vkCreateGraphicsPipelines                        pending:pipelines
+vkCreateGraphicsPipelines                        validated
 vkCreateImage                                    validated
 vkCreateImageView                                validated
 vkCreateInstance                                 reviewed

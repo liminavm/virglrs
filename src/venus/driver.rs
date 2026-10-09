@@ -120,6 +120,20 @@ use super::proto::types::{
     VkStridedDeviceAddressRegionKHR,
 };
 use super::proto::types::{
+    VkDepthBiasRepresentationInfoEXT, VkDynamicState,
+    VkPipelineColorBlendAdvancedStateCreateInfoEXT, VkPipelineColorBlendStateCreateInfo,
+    VkPipelineColorWriteCreateInfoEXT, VkPipelineMultisampleStateCreateInfo,
+    VkPipelineRasterizationConservativeStateCreateInfoEXT,
+    VkPipelineRasterizationDepthClipStateCreateInfoEXT, VkPipelineRasterizationLineStateCreateInfo,
+    VkPipelineRasterizationProvokingVertexStateCreateInfoEXT,
+    VkPipelineRasterizationStateCreateInfo, VkPipelineRasterizationStateStreamCreateInfoEXT,
+    VkPipelineSampleLocationsStateCreateInfoEXT, VkPipelineTessellationDomainOriginStateCreateInfo,
+    VkPipelineTessellationStateCreateInfo, VkPipelineVertexInputDivisorStateCreateInfo,
+    VkPipelineVertexInputStateCreateInfo, VkPipelineViewportDepthClampControlCreateInfoEXT,
+    VkPipelineViewportDepthClipControlCreateInfoEXT, VkPipelineViewportStateCreateInfo,
+    VkVertexInputAttributeDescription, VkVertexInputBindingDescription,
+};
+use super::proto::types::{
     VkDescriptorBindingFlagBits, VkDescriptorSetAllocateInfo,
     VkDescriptorSetLayoutBindingFlagsCreateInfo,
     VkDescriptorSetVariableDescriptorCountAllocateInfo, VkDescriptorType,
@@ -12086,10 +12100,230 @@ impl cs::Validate<DeviceFacts<'_>> for VkGraphicsPipelineCreateInfo {
             );
         }
         let linked = chained::<VkPipelineLibraryCreateInfoKHR, _>(this).is_some();
-        if !vertex && !mesh && !linked && !is_library(this, u64::from(this.flags.0)) {
+        let whole = !linked && !is_library(this, u64::from(this.flags.0));
+        if !vertex && !mesh && whole {
             return Err("made a graphics pipeline with no vertex or mesh stage");
         }
+        if this.renderPass.host().raw() != 0 {
+            let pass = facts
+                .facts
+                .render_passes
+                .get(&this.renderPass)
+                .ok_or("made a pipeline for a render pass this renderer has no record of")?;
+            if this.subpass >= pass.subpasses() {
+                return Err("made a pipeline for a subpass its render pass does not have");
+            }
+        }
+        let vertex_input = held(&this, this.pVertexInputState, facts)?;
+        held(&this, this.pTessellationState, facts)?;
+        held(&this, this.pViewportState, facts)?;
+        let raster = held(&this, this.pRasterizationState, facts)?;
+        let multisample = held(&this, this.pMultisampleState, facts)?;
+        held(&this, this.pColorBlendState, facts)?;
+        type D = VkDynamicState;
+        let dynamic = regions_of(&this, 1, this.pDynamicState)
+            .first()
+            .map_or(&[][..], |d| regions_of(&this, d.dynamicStateCount, d.pDynamicStates));
+        let is_dynamic = |state: D| dynamic.contains(&state);
+        let samples_dynamic = is_dynamic(D::VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT);
+        if let Some(ms) = multisample {
+            let samples = ms.rasterizationSamples.0 as u32;
+            if !samples_dynamic && (samples.count_ones() != 1 || samples > 16) {
+                return Err("rasterized at a sample count no device has");
+            }
+        }
+        // A whole pipeline's states the runtime reads with no null check unless the state they
+        // carry is dynamic. A library, or a pipeline linking libraries, takes the parts it lacks
+        // from them, and the runtime reads only the parts it has.
+        if whole {
+            let discard_dynamic = is_dynamic(D::VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE);
+            if vertex && vertex_input.is_none() && !is_dynamic(D::VK_DYNAMIC_STATE_VERTEX_INPUT_EXT)
+            {
+                return Err("made a pipeline with a vertex stage and no vertex input");
+            }
+            if raster.is_none() && !discard_dynamic {
+                return Err("made a pipeline with no rasterization state");
+            }
+            let discards =
+                raster.is_some_and(|r| r.rasterizerDiscardEnable.0 != 0) && !discard_dynamic;
+            if multisample.is_none() && !discards && !samples_dynamic {
+                return Err("made a pipeline that rasterizes with no multisample state");
+            }
+        }
         Ok(())
+    }
+}
+
+/// The state a graphics pipeline create info points at, held to its own check with its chain,
+/// or `None` where it points at none.
+fn held<'a, R, S, T>(
+    info: &cs::Decoded<'a, R, S>,
+    state: *const T,
+    facts: &DeviceFacts<'_>,
+) -> Result<Option<&'a T>, &'static str>
+where
+    T: for<'d> cs::Validate<DeviceFacts<'d>> + for<'d> cs::ValidateChain<DeviceFacts<'d>>,
+{
+    let Some(state) = regions_of(info, 1, state).first() else { return Ok(None) };
+    // SAFETY: the decoder allocated the state, and all it points at, in the arena `info` borrows
+    // (see `Decoded::vouch`).
+    unsafe { cs::Decoded::vouch(state) }.validate(facts)?;
+    Ok(Some(state))
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkPipelineVertexInputStateCreateInfo {
+    /// Bindings and attributes the device has, each attribute reading a binding described
+    /// beside it: the runtime stores each by its index in arrays the device's limits long, and
+    /// looks an attribute's binding up among the described ones unchecked.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let l = facts.limits;
+        let bindings =
+            regions_of(&this, this.vertexBindingDescriptionCount, this.pVertexBindingDescriptions);
+        let attributes = regions_of(
+            &this,
+            this.vertexAttributeDescriptionCount,
+            this.pVertexAttributeDescriptions,
+        );
+        let fits = |b: &VkVertexInputBindingDescription| {
+            b.binding < l.maxVertexInputBindings && b.stride <= l.maxVertexInputBindingStride
+        };
+        if !bindings.iter().all(fits) {
+            return Err("described a vertex binding the device does not have");
+        }
+        let described = |n: u32| bindings.iter().any(|b| b.binding == n);
+        let reads = |a: &VkVertexInputAttributeDescription| {
+            a.location < l.maxVertexInputAttributes
+                && described(a.binding)
+                && a.offset <= l.maxVertexInputAttributeOffset
+        };
+        if !attributes.iter().all(reads) {
+            return Err("described a vertex attribute the device does not have, or of no binding");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkPipelineVertexInputStateCreateInfo, DeviceFacts<'_>>>
+    for VkPipelineVertexInputDivisorStateCreateInfo
+{
+    /// Divisors for bindings the device has: the runtime stores each by its binding.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkPipelineVertexInputStateCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let divisors =
+            regions_of(&this, this.vertexBindingDivisorCount, this.pVertexBindingDivisors);
+        let most = on.facts.limits.maxVertexInputBindings;
+        if !divisors.iter().all(|d| d.binding < most) {
+            return Err("divided a vertex binding the device does not have");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkPipelineTessellationStateCreateInfo {
+    /// A patch size and its chained domain origin, neither of which a driver indexes by.
+    fn validate(
+        _this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkPipelineViewportStateCreateInfo {
+    /// No more viewports or scissors than the device has: the runtime copies them into arrays of
+    /// sixteen, `maxViewports` on every Mesa driver, checking the counts only with asserts.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        let most = facts.limits.maxViewports;
+        if this.viewportCount > most || this.scissorCount > most {
+            return Err("set more viewports or scissors than the device has");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkPipelineViewportStateCreateInfo, DeviceFacts<'_>>>
+    for VkPipelineViewportDepthClampControlCreateInfoEXT
+{
+    /// A user-defined clamp comes with its range, which the runtime reads with no null check.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _on: &cs::Chained<'_, VkPipelineViewportStateCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        let user =
+            this.depthClampMode == VkDepthClampModeEXT::VK_DEPTH_CLAMP_MODE_USER_DEFINED_RANGE_EXT;
+        if user && this.pDepthClampRange.is_null() {
+            return Err("clamped depth to a range of its own without giving one");
+        }
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkPipelineRasterizationStateCreateInfo {
+    /// Enums, booleans and widths, and chained ones: nothing a driver indexes by.
+    fn validate(
+        _this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkPipelineMultisampleStateCreateInfo {
+    /// Its sample count is held by the pipeline, which knows whether it is dynamic.
+    fn validate(
+        _this: cs::Decoded<'_, Self, cs::Unchecked>,
+        _facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkPipelineMultisampleStateCreateInfo, DeviceFacts<'_>>>
+    for VkPipelineSampleLocationsStateCreateInfoEXT
+{
+    /// Sample locations the pipeline sets, held as `vkCmdSetSampleLocationsEXT` holds them: the
+    /// runtime copies them into an array of 32.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkPipelineMultisampleStateCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        if this.sampleLocationsEnable.0 == 0 {
+            return Ok(());
+        }
+        // SAFETY: the set is a field of the struct the decoder built in its arena.
+        unsafe { cs::Decoded::vouch(&this.sampleLocationsInfo) }.validate(on.facts).map(|_| ())
+    }
+}
+
+impl cs::Validate<DeviceFacts<'_>> for VkPipelineColorBlendStateCreateInfo {
+    /// Blend states for no more colour attachments than the device has: see
+    /// [`color_attachments_fit`].
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        facts: &DeviceFacts<'_>,
+    ) -> Result<(), &'static str> {
+        color_attachments_fit(facts, this.attachmentCount)
+    }
+}
+
+impl cs::Validate<cs::Chained<'_, VkPipelineColorBlendStateCreateInfo, DeviceFacts<'_>>>
+    for VkPipelineColorWriteCreateInfoEXT
+{
+    /// Write enables for no more colour attachments than the device has: the runtime sets a bit
+    /// for each, by its index.
+    fn validate(
+        this: cs::Decoded<'_, Self, cs::Unchecked>,
+        on: &cs::Chained<'_, VkPipelineColorBlendStateCreateInfo, DeviceFacts<'_>>,
+    ) -> Result<(), &'static str> {
+        color_attachments_fit(on.facts, this.attachmentCount)
     }
 }
 
@@ -13903,6 +14137,19 @@ needs_no_check!(
     VkGraphicsPipelineLibraryCreateInfoEXT,
     // A fragment size and two combiner enums.
     VkPipelineFragmentShadingRateStateCreateInfoKHR,
+    // An enum.
+    VkPipelineTessellationDomainOriginStateCreateInfo,
+    // A boolean.
+    VkPipelineViewportDepthClipControlCreateInfoEXT,
+    // Rasterization enums, booleans, widths and a stream number the driver stores.
+    VkDepthBiasRepresentationInfoEXT,
+    VkPipelineRasterizationConservativeStateCreateInfoEXT,
+    VkPipelineRasterizationDepthClipStateCreateInfoEXT,
+    VkPipelineRasterizationLineStateCreateInfo,
+    VkPipelineRasterizationProvokingVertexStateCreateInfoEXT,
+    VkPipelineRasterizationStateStreamCreateInfoEXT,
+    // Blend enums and booleans.
+    VkPipelineColorBlendAdvancedStateCreateInfoEXT,
     // An imageless framebuffer's attachments, counted against its render pass by the
     // framebuffer's own check.
     VkFramebufferAttachmentsCreateInfo,
@@ -15568,6 +15815,14 @@ mod tests {
         d.record_pipeline(LIB, DEVICE, PipelineKind::Graphics, true);
         d.record_pipeline(PLAIN, DEVICE, PipelineKind::Graphics, false);
         d.record_pipeline(COMPUTE_LIB, DEVICE, PipelineKind::Compute, true);
+        // The states a whole graphics pipeline carries.
+        let vertex_input =
+            crate::venus::proto::types::VkPipelineVertexInputStateCreateInfo::default();
+        let raster = crate::venus::proto::types::VkPipelineRasterizationStateCreateInfo::default();
+        let multisample = crate::venus::proto::types::VkPipelineMultisampleStateCreateInfo {
+            rasterizationSamples: VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT,
+            ..Default::default()
+        };
         let facts = d.device_facts(DEVICE).expect("a planted device");
         let meshy = d.device_facts(MESHY).expect("a planted device");
 
@@ -15655,6 +15910,9 @@ mod tests {
             |stages: &[VkPipelineShaderStageCreateInfo], flags: u32, f: &DeviceFacts<'_>| {
                 let info = VkGraphicsPipelineCreateInfo {
                     sType: VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                    pVertexInputState: &vertex_input,
+                    pRasterizationState: &raster,
+                    pMultisampleState: &multisample,
                     flags: VkPipelineCreateFlags(flags),
                     stageCount: stages.len() as u32,
                     pStages: stages.as_ptr(),
@@ -15725,6 +15983,9 @@ mod tests {
             let stages = [v, f];
             let info = VkGraphicsPipelineCreateInfo {
                 sType: VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                pVertexInputState: &vertex_input,
+                pRasterizationState: &raster,
+                pMultisampleState: &multisample,
                 pNext: (&raw const chain).cast(),
                 stageCount: 2,
                 pStages: stages.as_ptr(),
@@ -15747,6 +16008,9 @@ mod tests {
             };
             let info = VkGraphicsPipelineCreateInfo {
                 sType: VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                pVertexInputState: &vertex_input,
+                pRasterizationState: &raster,
+                pMultisampleState: &multisample,
                 pNext: (&raw const chain).cast(),
                 ..Default::default()
             };
@@ -15766,6 +16030,9 @@ mod tests {
             let stages = [v, f];
             let info = VkGraphicsPipelineCreateInfo {
                 sType: VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                pVertexInputState: &vertex_input,
+                pRasterizationState: &raster,
+                pMultisampleState: &multisample,
                 pNext: (&raw const chain).cast(),
                 stageCount: 2,
                 pStages: stages.as_ptr(),
@@ -15787,6 +16054,259 @@ mod tests {
         };
         assert_eq!(located(&[1, ATTACHMENT_UNUSED, 7]), Ok(()));
         assert!(located(&[8]).is_err(), "a location past the device's");
+        d.abandon_planted();
+    }
+
+    /// A whole graphics pipeline carries the states the runtime reads, each held to the device:
+    /// vertex bindings and attributes it has, viewports it has, a sample count it has, colour
+    /// attachments it has, and a subpass of a recorded render pass.
+    #[test]
+    fn a_graphics_pipeline_holds_its_states() {
+        use crate::venus::proto::types::{
+            VkDepthClampRangeEXT, VkDynamicState as Dy, VkPipelineCreateFlags,
+            VkPipelineDynamicStateCreateInfo, VkShaderModule, VkShaderStageFlagBits as S,
+            VkVertexInputBindingDivisorDescription,
+        };
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const PASS: VkRenderPass = VkRenderPass::forged(0x900);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, crate::vulkan::Device::default());
+        let subpass = || SubpassShape { named: Vec::new(), colors: 0 };
+        let pass = RenderPassFacts::held(0, vec![subpass(), subpass()], []).expect("a pass");
+        d.render_passes.insert(PASS, Arc::new(pass));
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+
+        let stage = |bits: S| VkPipelineShaderStageCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage: bits,
+            module: VkShaderModule::forged(0x5ade),
+            pName: c"main".as_ptr(),
+            ..Default::default()
+        };
+        let stages = [stage(S::VK_SHADER_STAGE_VERTEX_BIT), stage(S::VK_SHADER_STAGE_FRAGMENT_BIT)];
+        let bindings =
+            [VkVertexInputBindingDescription { binding: 3, stride: 16, ..Default::default() }];
+        let attributes = |location, binding, offset| {
+            [VkVertexInputAttributeDescription { location, binding, offset, ..Default::default() }]
+        };
+        let vertex_input = |b: &[VkVertexInputBindingDescription],
+                            a: &[VkVertexInputAttributeDescription]| {
+            VkPipelineVertexInputStateCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+                vertexBindingDescriptionCount: b.len() as u32,
+                pVertexBindingDescriptions: b.as_ptr(),
+                vertexAttributeDescriptionCount: a.len() as u32,
+                pVertexAttributeDescriptions: a.as_ptr(),
+                ..Default::default()
+            }
+        };
+        let fine_attributes = attributes(31, 3, 2047);
+        let vi = vertex_input(&bindings, &fine_attributes);
+        let raster = VkPipelineRasterizationStateCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            ..Default::default()
+        };
+        let samples = |n: i32| VkPipelineMultisampleStateCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            rasterizationSamples: VkSampleCountFlagBits(n),
+            ..Default::default()
+        };
+        let ms = samples(4);
+        let base = VkGraphicsPipelineCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            stageCount: 2,
+            pStages: stages.as_ptr(),
+            pVertexInputState: &vi,
+            pRasterizationState: &raster,
+            pMultisampleState: &ms,
+            ..Default::default()
+        };
+        let made = |info: VkGraphicsPipelineCreateInfo| {
+            cs::Decoded::planted(&info).validate(&facts).map(|_| ())
+        };
+        let dynamic = |states: &[Dy]| VkPipelineDynamicStateCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            dynamicStateCount: states.len() as u32,
+            pDynamicStates: states.as_ptr(),
+            ..Default::default()
+        };
+        assert_eq!(made(base), Ok(()));
+
+        assert_eq!(
+            made(VkGraphicsPipelineCreateInfo { renderPass: PASS, subpass: 1, ..base }),
+            Ok(())
+        );
+        assert!(
+            made(VkGraphicsPipelineCreateInfo { renderPass: PASS, subpass: 2, ..base }).is_err(),
+            "a subpass past"
+        );
+        let stray = VkRenderPass::forged(0x9ff);
+        assert!(
+            made(VkGraphicsPipelineCreateInfo { renderPass: stray, ..base }).is_err(),
+            "no pass record"
+        );
+
+        let with_input = |v: &VkPipelineVertexInputStateCreateInfo| {
+            made(VkGraphicsPipelineCreateInfo { pVertexInputState: v, ..base })
+        };
+        let far = [VkVertexInputBindingDescription { binding: 32, ..Default::default() }];
+        let wide =
+            [VkVertexInputBindingDescription { binding: 0, stride: 2049, ..Default::default() }];
+        assert!(with_input(&vertex_input(&far, &[])).is_err(), "a binding past the device's");
+        assert!(with_input(&vertex_input(&wide, &[])).is_err(), "a stride past the device's");
+        assert!(
+            with_input(&vertex_input(&bindings, &attributes(32, 3, 0))).is_err(),
+            "a location past"
+        );
+        assert!(
+            with_input(&vertex_input(&bindings, &attributes(0, 4, 0))).is_err(),
+            "an undescribed binding"
+        );
+        assert!(
+            with_input(&vertex_input(&bindings, &attributes(0, 3, 2048))).is_err(),
+            "an offset past"
+        );
+        let divided = |binding| {
+            let divisor = [VkVertexInputBindingDivisorDescription { binding, divisor: 1 }];
+            let chain = VkPipelineVertexInputDivisorStateCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO,
+                vertexBindingDivisorCount: 1,
+                pVertexBindingDivisors: divisor.as_ptr(),
+                ..Default::default()
+            };
+            let mut v = vi;
+            v.pNext = (&raw const chain).cast();
+            with_input(&v)
+        };
+        assert_eq!(divided(3), Ok(()));
+        assert!(divided(32).is_err(), "a divisor for a binding past the device's");
+
+        let viewports = |count, scissors, next: *const core::ffi::c_void| {
+            let v = VkPipelineViewportStateCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                pNext: next,
+                viewportCount: count,
+                scissorCount: scissors,
+                ..Default::default()
+            };
+            made(VkGraphicsPipelineCreateInfo { pViewportState: &v, ..base })
+        };
+        let none = core::ptr::null();
+        assert_eq!(viewports(16, 16, none), Ok(()));
+        assert!(viewports(17, 1, none).is_err(), "more viewports than the device has");
+        assert!(viewports(1, 17, none).is_err(), "more scissors than the device has");
+        let range = VkDepthClampRangeEXT::default();
+        let clamped = |range: *const VkDepthClampRangeEXT| {
+            let chain = VkPipelineViewportDepthClampControlCreateInfoEXT {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLAMP_CONTROL_CREATE_INFO_EXT,
+                depthClampMode: VkDepthClampModeEXT::VK_DEPTH_CLAMP_MODE_USER_DEFINED_RANGE_EXT,
+                pDepthClampRange: range,
+                ..Default::default()
+            };
+            viewports(1, 1, (&raw const chain).cast())
+        };
+        assert_eq!(clamped(&range), Ok(()));
+        assert!(clamped(core::ptr::null()).is_err(), "a range of its own and none given");
+
+        let sampled = |ms: &VkPipelineMultisampleStateCreateInfo, dy: &[Dy]| {
+            let dy = dynamic(dy);
+            made(VkGraphicsPipelineCreateInfo { pMultisampleState: ms, pDynamicState: &dy, ..base })
+        };
+        assert!(sampled(&samples(3), &[]).is_err(), "several sample counts at once");
+        assert!(sampled(&samples(32), &[]).is_err(), "a sample count no device has");
+        assert_eq!(
+            sampled(&samples(3), &[Dy::VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT]),
+            Ok(()),
+            "a dynamic count is ignored"
+        );
+        let located = |enable: u32| {
+            let chain = VkPipelineSampleLocationsStateCreateInfoEXT {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT,
+                sampleLocationsEnable: VkBool32(enable),
+                ..Default::default()
+            };
+            let mut m = ms;
+            m.pNext = (&raw const chain).cast();
+            sampled(&m, &[])
+        };
+        assert_eq!(located(0), Ok(()), "locations it does not enable");
+        assert!(located(1).is_err(), "locations on a device without them");
+
+        let blended = |count, writes| {
+            let chain = VkPipelineColorWriteCreateInfoEXT {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_COLOR_WRITE_CREATE_INFO_EXT,
+                attachmentCount: writes,
+                ..Default::default()
+            };
+            let b = VkPipelineColorBlendStateCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                pNext: (&raw const chain).cast(),
+                attachmentCount: count,
+                ..Default::default()
+            };
+            made(VkGraphicsPipelineCreateInfo { pColorBlendState: &b, ..base })
+        };
+        assert_eq!(blended(8, 8), Ok(()));
+        assert!(blended(9, 0).is_err(), "more blended attachments than the device has");
+        assert!(blended(1, 9).is_err(), "more write enables than the device has");
+
+        let missing = |info: VkGraphicsPipelineCreateInfo, dy: &[Dy]| {
+            let dy = dynamic(dy);
+            made(VkGraphicsPipelineCreateInfo { pDynamicState: &dy, ..info })
+        };
+        let null_vi = VkGraphicsPipelineCreateInfo { pVertexInputState: core::ptr::null(), ..base };
+        assert!(missing(null_vi, &[]).is_err(), "no vertex input");
+        assert_eq!(
+            missing(null_vi, &[Dy::VK_DYNAMIC_STATE_VERTEX_INPUT_EXT]),
+            Ok(()),
+            "dynamic vertex input"
+        );
+        let null_rs =
+            VkGraphicsPipelineCreateInfo { pRasterizationState: core::ptr::null(), ..base };
+        assert!(missing(null_rs, &[]).is_err(), "no rasterization state");
+        assert_eq!(
+            missing(null_rs, &[Dy::VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE]),
+            Ok(()),
+            "a dynamic discard"
+        );
+        let null_ms = VkGraphicsPipelineCreateInfo { pMultisampleState: core::ptr::null(), ..base };
+        assert!(missing(null_ms, &[]).is_err(), "no multisample state");
+        assert_eq!(
+            missing(null_ms, &[Dy::VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT]),
+            Ok(()),
+            "dynamic samples"
+        );
+        let discarding = VkPipelineRasterizationStateCreateInfo {
+            rasterizerDiscardEnable: VkBool32(1),
+            ..raster
+        };
+        assert_eq!(
+            missing(
+                VkGraphicsPipelineCreateInfo { pRasterizationState: &discarding, ..null_ms },
+                &[]
+            ),
+            Ok(()),
+            "nothing rasterized"
+        );
+        assert!(
+            missing(
+                VkGraphicsPipelineCreateInfo { pRasterizationState: &discarding, ..null_ms },
+                &[Dy::VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE]
+            )
+            .is_err(),
+            "a discard that may change"
+        );
+        let library = VkPipelineCreateFlags(
+            VkPipelineCreateFlagBits::VK_PIPELINE_CREATE_LIBRARY_BIT_KHR.0 as u32,
+        );
+        let bare = VkGraphicsPipelineCreateInfo {
+            flags: library,
+            pVertexInputState: core::ptr::null(),
+            pRasterizationState: core::ptr::null(),
+            pMultisampleState: core::ptr::null(),
+            ..base
+        };
+        assert_eq!(made(bare), Ok(()), "a library takes what it lacks from others");
         d.abandon_planted();
     }
 
