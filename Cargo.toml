@@ -58,8 +58,14 @@ default = ["vaapi"]
 bumpalo = "3.20"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 dav1d = "0.11.1"
+# Signs the pipeline cache data a guest is handed, so what it hands back can be told from a
+# forgery; the same RustCrypto crates limina's vTPM uses.
+getrandom = "0.4.3"
+hmac = "0.13.0"
 libc = "0.2"
 rustc-hash = "2.1"
+sha2 = "0.11.0"
+zeroize = "1.9.1"
 # The `trace` feature's FIFO, made without an unsafe block of our own.
 nix = { version = "0.31.3", default-features = false, features = ["fs"], optional = true }
 

@@ -63,8 +63,12 @@ pub enum Error {
 /// passed.
 pub struct Vkr {
     /// What the renderer was configured to be. The capset reports part of it straight back to
-    /// the guest, which is why it is kept rather than consumed at startup.
+    /// the guest, which is why it is kept rather than consumed at startup -- all but the pipeline
+    /// cache key, which is taken out into `cache_key` so that one place holds it.
     pub config: Config,
+    /// The key every context signs its pipeline cache data with: the embedder's, or one made for
+    /// this process. See [`super::pipeline_cache`].
+    cache_key: crate::config::PipelineCacheKey,
     /// One lock per context, not one over the table: a context is exactly the unit a ring thread
     /// needs exclusively, so two guests' rings dispatch at the same time. The `Arc` is what lets a
     /// ring thread hold a claim on its own context without holding the renderer.
@@ -258,13 +262,18 @@ impl Dispatch for RingDispatch {
 
 impl Vkr {
     pub fn new(
-        config: Config,
+        mut config: Config,
         resources: SharedResources,
         budget: &Arc<Budget>,
         retire: crate::fence::Handle,
     ) -> Vkr {
+        let cache_key = config
+            .pipeline_cache_key
+            .take()
+            .unwrap_or_else(crate::config::PipelineCacheKey::random);
         Vkr {
             config,
+            cache_key,
             retire,
             contexts: BTreeMap::new(),
             generations: 0,
@@ -299,6 +308,7 @@ impl Vkr {
         // fence retires the moment it is asked for, saying work is done that has only been
         // submitted.
         context.attach_ring_queues(fences.clone());
+        context.attach_cache_key(self.cache_key.clone());
         self.contexts.insert(id, Arc::new(ContextSlot { ctx: Mutex::new(context), fences }));
     }
 

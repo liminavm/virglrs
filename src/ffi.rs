@@ -71,6 +71,9 @@ fn config_of(flags: c_int) -> Config {
         // environment override it.
         linear_shared: Config::default().linear_shared,
         host_gl: if flags & abi::USE_GLES != 0 { HostGl::Gles } else { HostGl::Desktop },
+        // No flag carries a key either, and a C embedder has no way to hand one over: a process
+        // key keeps caches warm for the run.
+        pipeline_cache_key: None,
     }
 }
 
@@ -461,7 +464,7 @@ pub extern "C" fn virgl_renderer_init(
     }
     eprintln!(
         "[virglrs] init flags={flags:#x} cb v{version} -- {}, GL {}{}",
-        crate::renderer::unsupported_renderers(config),
+        crate::renderer::unsupported_renderers(&config),
         if contexts.is_some() { "minted by the VMM" } else { "of our own" },
         if forced { ", video by VIRGLRS_VIDEO" } else { "" },
     );
@@ -3086,6 +3089,7 @@ mod tests {
                 video: false,
                 linear_shared: true,
                 host_gl: HostGl::Desktop,
+                pipeline_cache_key: None,
             }
         );
 
@@ -3100,6 +3104,7 @@ mod tests {
                 video: true,
                 linear_shared: true,
                 host_gl: HostGl::Desktop,
+                pipeline_cache_key: None,
             }
         );
 

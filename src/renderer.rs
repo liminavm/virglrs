@@ -763,7 +763,7 @@ impl Renderer {
         let fences = Retirement::recording(fences, debug, traces.stream.clone());
         let vrend = if config.vrend {
             Some(vrend::vrend::Vrend::new(
-                config,
+                config.clone(),
                 &budget,
                 fences.handle(),
                 contexts,
@@ -774,14 +774,15 @@ impl Renderer {
         } else {
             None
         };
+        let venus = config.venus.then(|| {
+            venus::vkr::Vkr::new(config.clone(), resources.clone(), &budget, fences.handle())
+        });
         Ok(Renderer {
             config,
             resources: Arc::clone(&resources),
             condemned,
             contexts: crate::Map::default(),
-            venus: config
-                .venus
-                .then(|| venus::vkr::Vkr::new(config, resources.clone(), &budget, fences.handle())),
+            venus,
             budget,
             vrend,
             traces,
@@ -818,7 +819,7 @@ impl Renderer {
     pub fn capset(&self, set: CapsetId) -> Option<Capset> {
         match set {
             CapsetId::Venus => {
-                self.venus.as_ref().map(|_| Capset::Venus(venus::capset::Capset::new(self.config)))
+                self.venus.as_ref().map(|_| Capset::Venus(venus::capset::Capset::new(&self.config)))
             }
             CapsetId::Virgl => self.vrend.as_ref().map(|v| Capset::Virgl(v.caps().v1())),
             CapsetId::Virgl2 => self.vrend.as_ref().map(|v| Capset::Virgl2(*v.caps())),
@@ -2358,7 +2359,7 @@ fn trace_blank_readback(
 /// venus decodes and dispatches everything but serves only part of it -- `dump_state` prints
 /// which part -- and vrend does not exist at all. Saying which is which is the difference between
 /// a log line that explains a failure and one that misleads about it.
-pub fn unsupported_renderers(config: Config) -> &'static str {
+pub fn unsupported_renderers(config: &Config) -> &'static str {
     match (config.venus, config.vrend) {
         (true, true) => {
             "venus serves only part of the protocol; vrend serves resources and transfers"

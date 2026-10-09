@@ -18,6 +18,7 @@ pub mod journal;
 pub mod ledger;
 pub mod monitor;
 pub mod objects;
+pub mod pipeline_cache;
 #[cfg(target_os = "macos")]
 pub mod present_copy;
 #[allow(unsafe_code)]

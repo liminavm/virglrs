@@ -22,6 +22,7 @@ use crate::ids::{ContextId, FenceId, RingIdx};
 use super::cs::{self, Handle, HostHandle, ObjectId, PoolOf, TypedHandle};
 use super::ledger;
 use super::objects::Doomed;
+use super::pipeline_cache;
 use super::proto::types::VkDescriptorSetLayoutCreateFlagBits;
 use super::proto::types::VkFormatProperties;
 use super::proto::types::VkOpaqueCaptureDataCreateInfoEXT;
@@ -1231,6 +1232,10 @@ pub struct Driver {
     queues: BTreeMap<VkQueue, Arc<HostQueue>>,
     /// Which queue each ring's fences are ordered against. See [`RingQueues`].
     ring_queues: RingQueues,
+    /// What pipeline cache data is signed with on its way to the guest, and checked against on
+    /// its way back; see [`super::pipeline_cache`]. `None` only in a test that stood a driver
+    /// up on its own, which signs nothing and takes no initial data.
+    cache_key: Option<crate::config::PipelineCacheKey>,
 }
 
 /// The last stand: a driver may not be dropped while it still owes Vulkan a destroy.
@@ -3054,7 +3059,14 @@ impl Driver {
             pools: Pools::default(),
             queues: BTreeMap::new(),
             ring_queues: RingQueues::detached(),
+            cache_key: None,
         }
+    }
+
+    /// Give this driver the key its pipeline cache data is signed with. Set once, by
+    /// [`Vkr::context_create`](super::vkr::Vkr::context_create), with the renderer's one key.
+    pub(super) fn attach_cache_key(&mut self, key: crate::config::PipelineCacheKey) {
+        self.cache_key = Some(key);
     }
 
     /// Give this driver the context's ring-fence queues, which is what makes its fences real.
@@ -3801,19 +3813,13 @@ impl Driver {
         Ok(unsafe { f(device, a, info.get(), out.as_mut_ptr()) })
     }
 
-    /// An enumeration, in whichever of Vulkan's two calls the guest asked for.
+    /// A pipeline cache's serialised contents, in Vulkan's count-then-fill shape -- counted in
+    /// bytes, with a `size_t` -- signed for the guest; see [`super::pipeline_cache`].
     ///
-    /// Generic over what is being enumerated *for* -- a physical device's queue families, an
-    /// instance's device groups -- because the two-call shape is the same and only the handle in
-    /// front of it differs.
-    ///
-    /// `out` is `None` for the count query -- the guest asking how many there are, with no array
-    /// behind it -- and `Some` for the fill, where the slice's own length is what the driver is
-    /// told it has room for. The count comes back either way, and the caller writes it where the
-    /// guest can read it.
-    ///
-    /// A pipeline cache's serialised contents, in Vulkan's count-then-fill shape -- but counted
-    /// in bytes, with a `size_t` where the enumerations have a `u32`, and on the device table.
+    /// `out` is `None` for the size query and `Some` for the fill. The size is the driver's plus
+    /// the tag. The fill reads the driver's whole data into a buffer of its own, since the tag is
+    /// over all of it, and copies that and the tag into `out`: whole, or not at all. The byte
+    /// count comes back either way, and the caller writes it where the guest can read it.
     ///
     /// The guest saves this to disk between runs, so it is asked a few seconds after every new
     /// pipeline, on every client that has a cache at all.
@@ -3828,17 +3834,97 @@ impl Driver {
             .get(&device)
             .and_then(|d| d.fns.try_vkGetPipelineCacheData())
             .ok_or(VkResult::VK_ERROR_INITIALIZATION_FAILED)?;
-        let (mut n, room, data) = match out {
-            Some(s) => (s.len(), Some(s.len()), s.as_mut_ptr().cast::<core::ffi::c_void>()),
-            None => (0, None, core::ptr::null_mut()),
+        let Some(key) = &self.cache_key else {
+            let (mut n, room, data) = match out {
+                Some(s) => (s.len(), Some(s.len()), s.as_mut_ptr().cast::<core::ffi::c_void>()),
+                None => (0, None, core::ptr::null_mut()),
+            };
+            // SAFETY: a device and a cache this context made, and `n` is initialised to the
+            // length of the buffer `data` points at -- the pair the caller handed us as one slice.
+            let r = unsafe { f(device, cache, &mut n, data) };
+            if let Some(room) = room {
+                assert!(n <= room, "the driver wrote more cache data than the room it was given");
+            }
+            return Ok((n, r));
         };
-        // SAFETY: a device and a cache this context made, and `n` is initialised to the length of
-        // the buffer `data` points at -- the pair the caller handed us as one slice.
-        let r = unsafe { f(device, cache, &mut n, data) };
-        if let Some(room) = room {
-            assert!(n <= room, "the driver wrote more cache data than the room it was given");
+        let Some(out) = out else {
+            let mut n = 0usize;
+            // SAFETY: a device and a cache this context made; with no buffer the driver writes
+            // only the size.
+            let r = unsafe { f(device, cache, &mut n, core::ptr::null_mut()) };
+            let n = if r == VkResult::VK_SUCCESS { n + pipeline_cache::TAG_LEN } else { 0 };
+            return Ok((n, r));
+        };
+        // The tag is over the whole of the driver's data, so the driver writes into a buffer of
+        // its own size and the guest's is filled from that. A cache that grew between the two
+        // calls is asked again; one that keeps growing answers as a short buffer does.
+        for _ in 0..8 {
+            let mut n = 0usize;
+            // SAFETY: as above.
+            let r = unsafe { f(device, cache, &mut n, core::ptr::null_mut()) };
+            if r != VkResult::VK_SUCCESS {
+                return Ok((0, r));
+            }
+            let mut data = vec![0u8; n];
+            let mut got = n;
+            // SAFETY: a device and a cache this context made, and `got` is the length of `data`.
+            let r = unsafe { f(device, cache, &mut got, data.as_mut_ptr().cast()) };
+            if r == VkResult::VK_INCOMPLETE {
+                continue;
+            }
+            if r != VkResult::VK_SUCCESS {
+                return Ok((0, r));
+            }
+            assert!(got <= n, "the driver wrote more cache data than the room it was given");
+            data.truncate(got);
+            let sealed = data.len() + pipeline_cache::TAG_LEN;
+            // No prefix of signed data is worth anything, so a short buffer gets none of it:
+            // Vulkan's "at most this many bytes" allows writing nothing.
+            let Some(dst) = out.get_mut(..sealed) else {
+                return Ok((0, VkResult::VK_INCOMPLETE));
+            };
+            let (body, tag) = dst.split_at_mut(data.len());
+            body.copy_from_slice(&data);
+            tag.copy_from_slice(&pipeline_cache::tag(key, &data));
+            return Ok((sealed, VkResult::VK_SUCCESS));
         }
-        Ok((n, r))
+        Ok((0, VkResult::VK_INCOMPLETE))
+    }
+
+    /// `vkCreatePipelineCache`, forwarding the guest's initial data only if it is data this
+    /// renderer handed out; see [`super::pipeline_cache`]. Anything else makes an empty cache.
+    pub fn create_pipeline_cache(
+        &self,
+        device: VkDevice,
+        info: cs::Decoded<'_, VkPipelineCacheCreateInfo>,
+        alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
+    ) -> Result<VkPipelineCache, VkResult> {
+        let Some(d) = self.devices.get(&device) else {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        };
+        let guest = *info.get();
+        // SAFETY: `info` is `Decoded`, so the decoder allocated the initial data from the batch
+        // arena sized to the count beside it (see `Decoded::vouch`), and the arena outlives this
+        // call.
+        let sealed: &[u8] =
+            unsafe { cs::wire_array(guest.initialDataSize, guest.pInitialData.cast::<u8>()) }
+                .unwrap_or_default();
+        let data = self.cache_key.as_ref().and_then(|key| pipeline_cache::opened(key, sealed));
+        let forwarded = VkPipelineCacheCreateInfo {
+            initialDataSize: data.map_or(0, <[u8]>::len),
+            pInitialData: data.map_or(core::ptr::null(), |d| d.as_ptr().cast()),
+            ..guest
+        };
+        let mut out = VkPipelineCache::NULL;
+        // SAFETY: `device` is a handle in this table; `forwarded` is a local whose chain and data
+        // are the decoder's arena allocations, live for this call; `out` is a local.
+        let r =
+            unsafe { (d.fns.vkCreatePipelineCache())(device, &forwarded, ptr(alloc), &mut out) };
+        if r != VkResult::VK_SUCCESS {
+            return Err(r);
+        }
+        assert!(!out.is_null(), "vkCreatePipelineCache succeeded and returned a null cache");
+        Ok(out)
     }
 
     // ---------------------------------------------------------------------- semaphores
@@ -14109,7 +14195,6 @@ forwarded_unchecked!(
     // Checked at `create_image`, which forwards the host's rewrite of it: see
     // `external_images_are_linear`.
     VkImageCreateInfo,
-    VkPipelineCacheCreateInfo,
     VkSamplerYcbcrConversionCreateInfo,
     VkSemaphoreCreateInfo,
 );
@@ -15807,7 +15892,152 @@ mod tests {
         let uniform = VkFormatFeatureFlagBits::VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT.0 as u32;
         assert_ne!(facts.formats.buffer_features(VkFormat::VK_FORMAT_R8G8B8A8_UNORM) & uniform, 0);
         assert_eq!(facts.formats.buffer_features(VkFormat::VK_FORMAT_D32_SFLOAT) & uniform, 0);
+
+        // KosmicKrisp's own cache data is framed as the Mesa runtime frames it, so the check on
+        // initial data lets the real driver's through: signed, handed back, and taken.
+        let key = crate::config::PipelineCacheKey::new([5; crate::config::PipelineCacheKey::LEN]);
+        d.attach_cache_key(key.clone());
+        let empty = VkPipelineCacheCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+            ..Default::default()
+        };
+        let cache =
+            d.create_pipeline_cache(device, cs::Decoded::planted(&empty), None).expect("a cache");
+        let (n, r) = d.pipeline_cache_data(device, cache, None).expect("a device it has");
+        assert_eq!(r, VkResult::VK_SUCCESS);
+        let mut sealed = vec![0u8; n];
+        let (n, r) = d.pipeline_cache_data(device, cache, Some(&mut sealed)).expect("its device");
+        assert_eq!((n, r), (sealed.len(), VkResult::VK_SUCCESS));
+        assert!(pipeline_cache::opened(&key, &sealed).is_some(), "KosmicKrisp frames as Mesa");
+        let warm = VkPipelineCacheCreateInfo {
+            initialDataSize: sealed.len(),
+            pInitialData: sealed.as_ptr().cast(),
+            ..empty
+        };
+        let again =
+            d.create_pipeline_cache(device, cs::Decoded::planted(&warm), None).expect("a cache");
+        for c in [cache, again] {
+            d.destroy_object(device, |f| Some(f.vkDestroyPipelineCache()), c, None);
+        }
         d.teardown(&[]);
+    }
+
+    /// Pipeline cache data goes to the guest signed, and comes back to the driver as initial data
+    /// only with its signature intact: another key's, a short copy or a forgery makes an empty
+    /// cache. A short buffer gets none of the data, since no prefix of it would open.
+    #[test]
+    fn only_cache_data_this_renderer_handed_out_reaches_the_driver() {
+        use crate::config::PipelineCacheKey;
+        use std::cell::RefCell;
+
+        const DEVICE: VkDevice = VkDevice::forged(0x99);
+        const CACHE: VkPipelineCache = VkPipelineCache::forged(0x77);
+        thread_local! {
+            static SEEN: RefCell<Vec<Option<Vec<u8>>>> = const { RefCell::new(Vec::new()) };
+        }
+        /// An empty cache, framed as the Mesa runtime frames one.
+        fn driver_data() -> Vec<u8> {
+            let mut d: Vec<u8> =
+                [32u32, 1, 0x106b, 0x1234].iter().flat_map(|w| w.to_le_bytes()).collect();
+            d.extend_from_slice(&[7; 16]);
+            d.extend_from_slice(&0u32.to_le_bytes());
+            d
+        }
+        unsafe extern "C" fn get(
+            _: VkDevice,
+            _: VkPipelineCache,
+            size: *mut usize,
+            data: *mut core::ffi::c_void,
+        ) -> VkResult {
+            let blob = driver_data();
+            // SAFETY: the driver passes a size it owns, and a buffer of that size or none.
+            unsafe {
+                if data.is_null() {
+                    *size = blob.len();
+                    return VkResult::VK_SUCCESS;
+                }
+                let n = (*size).min(blob.len());
+                core::ptr::copy_nonoverlapping(blob.as_ptr(), data.cast::<u8>(), n);
+                *size = n;
+            }
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn create(
+            _: VkDevice,
+            info: *const VkPipelineCacheCreateInfo,
+            _: *const VkAllocationCallbacks,
+            out: *mut VkPipelineCache,
+        ) -> VkResult {
+            // SAFETY: the driver passes its create info, live for the call, and a handle slot.
+            let seen = unsafe {
+                let info = &*info;
+                (info.initialDataSize > 0).then(|| {
+                    core::slice::from_raw_parts(
+                        info.pInitialData.cast::<u8>(),
+                        info.initialDataSize,
+                    )
+                    .to_vec()
+                })
+            };
+            SEEN.with_borrow_mut(|s| s.push(seen));
+            // SAFETY: as above.
+            unsafe { *out = CACHE };
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkGetPipelineCacheData(get);
+        fns.plant_vkCreatePipelineCache(create);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        let key = PipelineCacheKey::new([9; PipelineCacheKey::LEN]);
+        d.attach_cache_key(key.clone());
+
+        let blob = driver_data();
+        let full = blob.len() + pipeline_cache::TAG_LEN;
+        assert_eq!(d.pipeline_cache_data(DEVICE, CACHE, None), Ok((full, VkResult::VK_SUCCESS)));
+        let mut sealed = vec![0u8; full + 5];
+        assert_eq!(
+            d.pipeline_cache_data(DEVICE, CACHE, Some(&mut sealed)),
+            Ok((full, VkResult::VK_SUCCESS))
+        );
+        sealed.truncate(full);
+        assert_eq!(&sealed[..blob.len()], &blob[..], "the driver's bytes, then the tag");
+        let mut short = vec![0u8; full - 1];
+        assert_eq!(
+            d.pipeline_cache_data(DEVICE, CACHE, Some(&mut short)),
+            Ok((0, VkResult::VK_INCOMPLETE))
+        );
+
+        let initial = |data: &[u8]| {
+            let info = VkPipelineCacheCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                initialDataSize: data.len(),
+                pInitialData: if data.is_empty() {
+                    core::ptr::null()
+                } else {
+                    data.as_ptr().cast()
+                },
+                ..Default::default()
+            };
+            assert_eq!(
+                d.create_pipeline_cache(DEVICE, cs::Decoded::planted(&info), None),
+                Ok(CACHE)
+            );
+            SEEN.with_borrow_mut(|s| s.pop().expect("the driver was asked"))
+        };
+        assert_eq!(initial(&sealed), Some(blob.clone()), "its own data, without the tag");
+        assert_eq!(initial(&blob), None, "the driver's bytes with no tag");
+        assert_eq!(initial(&sealed[..full - 1]), None, "a short copy");
+        let mut forged = sealed.clone();
+        forged[40] ^= 1;
+        assert_eq!(initial(&forged), None, "a byte changed");
+        let other = PipelineCacheKey::new([8; PipelineCacheKey::LEN]);
+        let mut theirs = blob.clone();
+        theirs.extend_from_slice(&pipeline_cache::tag(&other, &blob));
+        assert_eq!(initial(&theirs), None, "another key's data");
+        assert_eq!(initial(&[]), None, "none at all");
+        d.abandon_planted();
     }
 
     /// A texel view lies inside its buffer, holds whole texels, is in a format the device makes

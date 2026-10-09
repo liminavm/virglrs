@@ -467,6 +467,13 @@ impl Context {
         self.driver.attach_ring_queues(queues);
     }
 
+    /// Give this context's driver the key its pipeline cache data is signed with. Called by
+    /// [`Vkr::context_create`](super::vkr::Vkr::context_create); a context made without it -- a
+    /// unit test -- signs nothing and takes no initial data.
+    pub fn attach_cache_key(&mut self, key: crate::config::PipelineCacheKey) {
+        self.driver.attach_cache_key(key);
+    }
+
     pub fn new(key: ContextKey, budget: &Arc<Budget>, name: String) -> Context {
         Context {
             key,
@@ -3320,13 +3327,17 @@ impl Commands for Handlers<'_> {
     }
     simple_destroy!(vkDestroyPipelineLayout, vn_command_vkDestroyPipelineLayout, pipelineLayout);
 
-    simple_create!(
-        vkCreatePipelineCache,
-        vn_command_vkCreatePipelineCache,
-        pCreateInfo,
-        pPipelineCache,
-        handle_pPipelineCache_mut
-    );
+    fn vkCreatePipelineCache(&mut self, args: &mut vn_command_vkCreatePipelineCache<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        let host = self.driver.create_pipeline_cache(args.device, info, args.pAllocator);
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant(
+            "vkCreatePipelineCache",
+            args.pPipelineCache(),
+            args.handle_pPipelineCache_mut(),
+            host,
+        );
+    }
     simple_destroy!(vkDestroyPipelineCache, vn_command_vkDestroyPipelineCache, pipelineCache);
 
     /// Count-then-fill like the enumerations below, but counted in bytes and asked of the device.

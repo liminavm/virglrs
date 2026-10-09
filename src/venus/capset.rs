@@ -55,7 +55,7 @@ pub struct Capset {
 
 impl Capset {
     /// Build the capset this renderer advertises, for the configuration it was asked for.
-    pub fn new(config: Config) -> Capset {
+    pub fn new(config: &Config) -> Capset {
         let mut c = Capset {
             wire_format_version: info::WIRE_FORMAT_VERSION,
             vk_xml_version: info::VK_XML_VERSION,
@@ -118,7 +118,7 @@ mod tests {
         assert_eq!(at(&c.use_guest_vram), 156);
         assert_eq!(size() as usize, core::mem::size_of::<Capset>());
 
-        let c = Capset::new(Config::default());
+        let c = Capset::new(&Config::default());
         assert_eq!(c.as_bytes().len(), core::mem::size_of::<Capset>());
         // The first word of the image is the first field, which is what fixes the field order.
         assert_eq!(&c.as_bytes()[..4], &info::WIRE_FORMAT_VERSION.to_ne_bytes());
@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn the_mask_is_marked_meaningful_and_carries_venus() {
-        let c = Capset::new(Config::default());
+        let c = Capset::new(&Config::default());
         assert_eq!(c.vk_extension_mask1[0] & 1, 1, "guest ignores a mask without bit 0");
 
         let (_, number, version) = info::extension("VK_MESA_venus_protocol").unwrap();
@@ -139,8 +139,8 @@ mod tests {
     /// shim's business, and is checked there.
     #[test]
     fn guest_vram_is_reported_exactly_as_it_was_configured() {
-        assert_eq!(Capset::new(Config::default()).use_guest_vram, 0);
+        assert_eq!(Capset::new(&Config::default()).use_guest_vram, 0);
         let on = Config { guest_vram: true, ..Config::default() };
-        assert_eq!(Capset::new(on).use_guest_vram, 1);
+        assert_eq!(Capset::new(&on).use_guest_vram, 1);
     }
 }

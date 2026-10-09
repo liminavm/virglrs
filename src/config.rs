@@ -9,7 +9,7 @@
 /// mean anything here; the rest select a winsys this build does not use. So the Rust API asks for
 /// the four, by name, and the shim does the decoding -- a caller should not have to know which
 /// bit is which, nor that one of them is spelled inside out.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Config {
     /// Serve venus.
     pub venus: bool,
@@ -37,7 +37,59 @@ pub struct Config {
     /// in; under an embedder the embedder makes them, and this is whether a desktop context it
     /// hands over is taken or refused.
     pub host_gl: HostGl,
+    /// The key the pipeline cache data a venus guest is handed is signed with, so that what it
+    /// hands back as a new cache's initial data can be told from a forgery: a driver parses
+    /// that data assuming it wrote it. The guest keeps its cache on disk across boots, so the key
+    /// has to outlive the process for those caches to stay warm -- the embedder keeps it, and
+    /// passes the same one every time. `None` signs with a key made for this process, which
+    /// keeps caches warm within a run and lets no cache from before it through.
+    pub pipeline_cache_key: Option<PipelineCacheKey>,
 }
+
+/// A secret that signs pipeline cache data. See [`Config::pipeline_cache_key`].
+///
+/// Cheap to clone, since every venus context signs with it, and wiped when the last clone goes.
+/// It never prints.
+#[derive(Clone)]
+pub struct PipelineCacheKey(std::sync::Arc<zeroize::Zeroizing<[u8; PipelineCacheKey::LEN]>>);
+
+impl PipelineCacheKey {
+    /// The key's length in bytes: HMAC-SHA256's block is longer, and a key shorter than its
+    /// output would be the weaker of the two.
+    pub const LEN: usize = 32;
+
+    /// A key made of `bytes`, which should be uniformly random and kept secret.
+    pub fn new(bytes: [u8; PipelineCacheKey::LEN]) -> PipelineCacheKey {
+        PipelineCacheKey(std::sync::Arc::new(zeroize::Zeroizing::new(bytes)))
+    }
+
+    /// A key from the operating system's random source, for a process whose embedder kept none.
+    pub fn random() -> PipelineCacheKey {
+        let mut bytes = zeroize::Zeroizing::new([0u8; PipelineCacheKey::LEN]);
+        // A host with no random source has nothing to sign with, and signing with something
+        // guessable would let a guest's forgery through.
+        getrandom::fill(&mut *bytes).expect("the host's random source failed");
+        PipelineCacheKey(std::sync::Arc::new(bytes))
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8; PipelineCacheKey::LEN] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PipelineCacheKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PipelineCacheKey(..)")
+    }
+}
+
+impl PartialEq for PipelineCacheKey {
+    fn eq(&self, other: &PipelineCacheKey) -> bool {
+        *self.0 == *other.0
+    }
+}
+
+impl Eq for PipelineCacheKey {}
 
 /// Which GL vrend runs on. See [`Config::host_gl`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,6 +111,7 @@ impl Default for Config {
             video: false,
             linear_shared: true,
             host_gl: HostGl::Gles,
+            pipeline_cache_key: None,
         }
     }
 }

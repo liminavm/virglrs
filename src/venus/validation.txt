@@ -191,7 +191,7 @@ vkCreateGraphicsPipelines                        validated
 vkCreateImage                                    validated
 vkCreateImageView                                validated
 vkCreateInstance                                 reviewed
-vkCreatePipelineCache                            reviewed
+vkCreatePipelineCache                            validated
 vkCreatePipelineLayout                           validated
 vkCreateQueryPool                                validated
 vkCreateRayTracingPipelinesKHR                   validated
@@ -287,7 +287,7 @@ vkGetPhysicalDeviceQueueFamilyProperties2        reviewed
 vkGetPhysicalDeviceSparseImageFormatProperties   validated
 vkGetPhysicalDeviceSparseImageFormatProperties2  validated
 vkGetPhysicalDeviceToolProperties                reviewed
-vkGetPipelineCacheData                           reviewed
+vkGetPipelineCacheData                           validated
 vkGetQueryPoolResults                            reviewed
 vkGetRayTracingCaptureReplayShaderGroupHandlesKHR reviewed
 vkGetRayTracingShaderGroupHandlesKHR             reviewed
