@@ -12612,18 +12612,6 @@ pub struct DeviceFacts<'d> {
     pub formats: FormatQueries<'d>,
 }
 
-/// Whether the counts a submit's `pNext` chain carries agree with the submit's own.
-///
-/// The wire carries each array beside its own count, so the decoder reconciles every pair it
-/// reads; what it cannot see is that `VkDeviceGroupSubmitInfo` and
-/// `VkTimelineSemaphoreSubmitInfo` restate the submit's counts, and that the driver walks their
-/// arrays by the submit's. Mesa's `vk_common_QueueSubmit` reads a device index for every
-/// semaphore and command buffer the submit names, and a timeline value for every timeline
-/// semaphore -- so a guest sending fewer reads through a null pointer, which aborts the whole
-/// VMM, or past the arena array into host memory. Vulkan requires the device-group counts to
-/// be equal (VUID-VkDeviceGroupSubmitInfo-*-00082/00083/00084), and a timeline value count to
-/// be equal where that side names a timeline semaphore (VUID-VkSubmitInfo-pNext-03240/03241).
-/// A semaphore this driver has no record of may be a timeline, so it counts as one.
 /// Whether `count` color attachments fit the device: KosmicKrisp begins rendering into an array
 /// of `maxColorAttachments`, and the Mesa runtime keeps each attachment map in one that long, and
 /// all of them index by the guest's count unchecked.
@@ -12812,6 +12800,18 @@ impl cs::Validate<DeviceFacts<'_>> for VkSampleLocationsInfoEXT {
     }
 }
 
+/// Whether the counts a submit's `pNext` chain carries agree with the submit's own.
+///
+/// The wire carries each array beside its own count, so the decoder reconciles every pair it
+/// reads; what it cannot see is that `VkDeviceGroupSubmitInfo` and
+/// `VkTimelineSemaphoreSubmitInfo` restate the submit's counts, and that the driver walks their
+/// arrays by the submit's. Mesa's `vk_common_QueueSubmit` reads a device index for every
+/// semaphore and command buffer the submit names, and a timeline value for every timeline
+/// semaphore -- so a guest sending fewer reads through a null pointer, which aborts the whole
+/// VMM, or past the arena array into host memory. Vulkan requires the device-group counts to
+/// be equal (VUID-VkDeviceGroupSubmitInfo-*-00082/00083/00084), and a timeline value count to
+/// be equal where that side names a timeline semaphore (VUID-VkSubmitInfo-pNext-03240/03241).
+/// A semaphore this driver has no record of may be a timeline, so it counts as one.
 impl cs::Validate<Facts<'_>> for VkSubmitInfo {
     /// The submit's own arrays are the decoder's, each its own count long; what can disagree
     /// with them is in its chain.
