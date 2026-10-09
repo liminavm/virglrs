@@ -50,7 +50,7 @@ vkCmdBlitImage                                   validated
 vkCmdBlitImage2                                  validated
 vkCmdBuildAccelerationStructuresIndirectKHR      validated
 vkCmdBuildAccelerationStructuresKHR              validated
-vkCmdClearAttachments                            reviewed
+vkCmdClearAttachments                            validated
 vkCmdClearColorImage                             validated
 vkCmdClearDepthStencilImage                      validated
 vkCmdCopyAccelerationStructureKHR                reviewed

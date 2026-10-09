@@ -115,6 +115,12 @@ use super::proto::types::{
 };
 use super::proto::types::{VkBufferUsageFlags2CreateInfo, VkFormatFeatureFlagBits};
 use super::proto::types::{
+    VkCommandBufferInheritanceRenderingInfo, VkDeviceQueueCreateInfo, VkMemoryAllocateFlagsInfo,
+    VkMemoryOpaqueCaptureAddressAllocateInfo, VkPhysicalDeviceAccelerationStructureFeaturesKHR,
+    VkPhysicalDeviceImageDrmFormatModifierInfoEXT, VkPhysicalDeviceTransformFeedbackPropertiesEXT,
+    VkQueueFamilyProperties,
+};
+use super::proto::types::{
     VkComputePipelineCreateInfo, VkDeferredOperationKHR, VkGraphicsPipelineCreateInfo,
     VkPhysicalDeviceProperties2, VkPhysicalDeviceRayTracingPipelinePropertiesKHR,
     VkPipelineCreateFlags2CreateInfo, VkRayTracingPipelineCreateInfoKHR, VkShaderGroupShaderKHR,
@@ -143,12 +149,6 @@ use super::proto::types::{
 };
 use super::proto::types::{
     VkDescriptorPoolInlineUniformBlockCreateInfo, VkDescriptorSetLayoutSupport,
-};
-use super::proto::types::{
-    VkDeviceQueueCreateInfo, VkMemoryAllocateFlagsInfo, VkMemoryOpaqueCaptureAddressAllocateInfo,
-    VkPhysicalDeviceAccelerationStructureFeaturesKHR,
-    VkPhysicalDeviceImageDrmFormatModifierInfoEXT, VkPhysicalDeviceTransformFeedbackPropertiesEXT,
-    VkQueueFamilyProperties,
 };
 use super::proto::types::{
     VkDrmFormatModifierPropertiesEXT, VkDrmFormatModifierPropertiesListEXT, VkFormatProperties2,
@@ -285,12 +285,36 @@ struct Child {
 }
 
 /// What one command buffer's current recording has done that later commands in it are held to:
-/// the pipelines it has bound, and the render pass it is inside. A begin or a reset starts it
-/// over, all of it at once.
+/// the pipelines it has bound, and the rendering it is inside. A begin or a reset starts it over,
+/// all of it at once.
 #[derive(Clone, Debug, Default)]
 struct Recording {
     bound: Bound,
-    pass: Option<InPass>,
+    scope: Scope,
+}
+
+/// The rendering a recording is inside.
+#[derive(Clone, Debug, Default)]
+enum Scope {
+    #[default]
+    Outside,
+    /// A render pass this recording began, at one of its subpasses.
+    Pass(InPass),
+    /// Dynamic rendering this recording began, or the rendering a secondary command buffer was
+    /// begun to continue. Neither moves between subpasses, so all a later command reads of it is
+    /// how many colour attachments it writes.
+    Rendering { colors: u32 },
+}
+
+impl Scope {
+    /// How many colour attachments the rendering writes, or `None` outside any.
+    fn colors(&self) -> Option<u32> {
+        match self {
+            Scope::Outside => None,
+            Scope::Pass(at) => Some(at.pass.colors[at.subpass as usize]),
+            Scope::Rendering { colors } => Some(*colors),
+        }
+    }
 }
 
 /// The render pass a recording is inside, and which of its subpasses it is at. The pass is a
@@ -863,6 +887,12 @@ impl Pools {
     fn child_mut<T: Handle>(&mut self, handle: T) -> Option<&mut Child> {
         let handle = TypedHandle::of(handle);
         self.open.get_mut(self.owner.get(&handle)?)?.children.get_mut(&handle)
+    }
+
+    /// The rendering a command buffer's recording is inside, if a pool here holds it.
+    fn scope(&self, cb: VkCommandBuffer) -> Option<&Scope> {
+        let handle = TypedHandle::of(cb);
+        Some(&self.open.get(self.owner.get(&handle)?)?.children.get(&handle)?.recording.scope)
     }
 
     /// Which bind points of a command buffer have a pipeline, if a pool here holds it.
@@ -5790,6 +5820,14 @@ impl Driver {
         self.plant_pool_at(device, pool, Level::Primary, children);
     }
 
+    /// Put a planted command buffer's recording inside rendering that writes `colors` colour
+    /// attachments, as a `vkCmdBeginRendering` would have. Test scaffolding.
+    #[cfg(test)]
+    pub(super) fn plant_rendering(&mut self, cb: VkCommandBuffer, colors: u32) {
+        let child = self.pools.child_mut(cb).expect("a command buffer planted first");
+        child.recording.scope = Scope::Rendering { colors };
+    }
+
     /// [`Driver::plant_pool`], with the children at a level of the test's choosing.
     #[cfg(test)]
     pub(super) fn plant_pool_at<P: PoolOf>(
@@ -6284,38 +6322,53 @@ impl Driver {
         cb: VkCommandBuffer,
         info: cs::Decoded<'_, VkCommandBufferBeginInfo>,
     ) -> Result<VkResult, RecordRefused> {
-        self.inheritance_fits(cb, &info)?;
+        let inherited = self.inherited_scope(cb, &info)?;
         // A begin starts the recording over, bindings and all, whether the driver's answer is a
         // success or not: a failed begin leaves nothing a draw may rely on either.
         self.pools.unbind(cb);
+        if let Some(child) = self.pools.child_mut(cb) {
+            child.recording.scope = inherited;
+        }
         let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
         // SAFETY: a command buffer this context allocated, and `info` is an arena allocation
         // live for the call. The same holds for every call in this section.
         Ok(unsafe { (d.vkBeginCommandBuffer())(cb, info.get()) })
     }
 
-    /// Whether a secondary command buffer begins with an inheritance the driver can follow: one
-    /// there at all, since anv reads it for every secondary, and a render pass it continues
-    /// named with a subpass that pass has. The Mesa runtime looks the subpass up in the pass's
-    /// array, checking it only with an assert. A primary's inheritance is ignored, and so is a
-    /// render pass a secondary does not continue.
-    fn inheritance_fits(
+    /// The rendering a command buffer begins inside: none for a primary, or for a secondary that
+    /// continues nothing, and otherwise the one its inheritance names.
+    ///
+    /// That inheritance must be one the driver can follow: there at all, since anv reads it for
+    /// every secondary, and a render pass it continues named with a subpass that pass has. The
+    /// Mesa runtime looks the subpass up in the pass's array, checking it only with an assert. A
+    /// primary's inheritance is ignored, and so is a render pass a secondary does not continue.
+    /// Continued dynamic rendering names its colour attachments in a chained
+    /// `VkCommandBufferInheritanceRenderingInfo`; without one it writes none.
+    fn inherited_scope(
         &self,
         cb: VkCommandBuffer,
         info: &cs::Decoded<'_, VkCommandBufferBeginInfo>,
-    ) -> Result<(), RecordRefused> {
+    ) -> Result<Scope, RecordRefused> {
         const CONTINUE: u32 =
             super::proto::types::VkCommandBufferUsageFlagBits::VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT.0 as u32;
         if self.pools.level_of(cb) != Some(Level::Secondary) {
-            return Ok(());
+            return Ok(Scope::Outside);
         }
         let Some(inheritance) = regions_of(info, 1, info.pInheritanceInfo).first() else {
             return Err(RecordRefused::Invalid(
                 "began a secondary command buffer inheriting nothing",
             ));
         };
-        if info.flags.0 & CONTINUE == 0 || inheritance.renderPass.host().raw() == 0 {
-            return Ok(());
+        if info.flags.0 & CONTINUE == 0 {
+            return Ok(Scope::Outside);
+        }
+        if inheritance.renderPass.host().raw() == 0 {
+            // SAFETY: the decoder allocated the inheritance, and all it points at, in the arena
+            // `info` borrows (see `Decoded::vouch`).
+            let inheritance = unsafe { cs::Decoded::vouch(inheritance) };
+            let colors = chained::<VkCommandBufferInheritanceRenderingInfo, _>(inheritance)
+                .map_or(0, |r| r.colorAttachmentCount);
+            return Ok(Scope::Rendering { colors });
         }
         let pass = self.render_passes.get(&inheritance.renderPass).ok_or(
             RecordRefused::Invalid("continued a render pass this renderer has no record of"),
@@ -6325,7 +6378,7 @@ impl Driver {
                 "continued a subpass its render pass does not have",
             ));
         }
-        Ok(())
+        Ok(Scope::Rendering { colors: pass.colors[inheritance.subpass as usize] })
     }
 
     pub fn end_command_buffer(&self, cb: VkCommandBuffer) -> Option<VkResult> {
@@ -6522,10 +6575,10 @@ impl Driver {
                 "began a render pass in a secondary command buffer",
             ));
         }
-        if child.recording.pass.is_some() {
+        if !matches!(child.recording.scope, Scope::Outside) {
             return Err(RecordRefused::Invalid("began a render pass inside another"));
         }
-        child.recording.pass = Some(InPass { pass, subpass: 0 });
+        child.recording.scope = Scope::Pass(InPass { pass, subpass: 0 });
         Ok(())
     }
 
@@ -6533,9 +6586,9 @@ impl Driver {
     /// reads the subpass after the last one past the end of the pass's array.
     fn next_subpass(&mut self, cb: VkCommandBuffer) -> Result<(), RecordRefused> {
         let child = self.pools.child_mut(cb).ok_or(RecordRefused::NoDevice)?;
-        let inside = child.recording.pass.as_mut();
-        let at = inside
-            .ok_or(RecordRefused::Invalid("moved to a next subpass outside a render pass"))?;
+        let Scope::Pass(at) = &mut child.recording.scope else {
+            return Err(RecordRefused::Invalid("moved to a next subpass outside a render pass"));
+        };
         if at.subpass + 1 >= at.pass.subpasses() {
             return Err(RecordRefused::Invalid("moved past the last subpass of its render pass"));
         }
@@ -6546,7 +6599,7 @@ impl Driver {
     /// Record that `cb` is no longer inside a render pass.
     fn leave_pass(&mut self, cb: VkCommandBuffer) -> Result<(), RecordRefused> {
         let child = self.pools.child_mut(cb).ok_or(RecordRefused::NoDevice)?;
-        child.recording.pass = None;
+        child.recording.scope = Scope::Outside;
         Ok(())
     }
 
@@ -7495,8 +7548,9 @@ impl Driver {
         Some(())
     }
 
-    pub fn cmd_end_rendering(&self, cb: VkCommandBuffer) -> Option<()> {
+    pub fn cmd_end_rendering(&mut self, cb: VkCommandBuffer) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdEndRendering()?;
+        self.pools.child_mut(cb)?.recording.scope = Scope::Outside;
         // SAFETY: as above.
         unsafe { f(cb) };
         Some(())
@@ -7505,11 +7559,12 @@ impl Driver {
     /// `vkCmdEndRendering2KHR`, `VK_KHR_maintenance10`'s end of rendering, whose struct is optional
     /// and whose chain may carry the fragment density map's offsets.
     pub fn cmd_end_rendering2(
-        &self,
+        &mut self,
         cb: VkCommandBuffer,
         info: Option<cs::Decoded<'_, VkRenderingEndInfoKHR>>,
     ) -> Option<()> {
         let f = self.recorder(cb)?.try_vkCmdEndRendering2KHR()?;
+        self.pools.child_mut(cb)?.recording.scope = Scope::Outside;
         // SAFETY: as above; `info` is null or a struct the decoder built, live for the call.
         unsafe { f(cb, ptr(info)) };
         Some(())
@@ -7659,15 +7714,24 @@ impl Driver {
         Some(())
     }
 
+    /// `vkCmdBeginRendering`, which the recording is then inside until its end: see [`Scope`].
     pub fn cmd_begin_rendering(
-        &self,
+        &mut self,
         cb: VkCommandBuffer,
         info: cs::Decoded<'_, VkRenderingInfo, cs::Checked>,
-    ) -> Option<()> {
-        let f = self.recorder(cb)?.try_vkCmdBeginRendering()?;
+    ) -> Result<(), RecordRefused> {
+        let f = self
+            .recorder(cb)
+            .and_then(|d| d.try_vkCmdBeginRendering())
+            .ok_or(RecordRefused::NoDevice)?;
+        let child = self.pools.child_mut(cb).ok_or(RecordRefused::NoDevice)?;
+        if !matches!(child.recording.scope, Scope::Outside) {
+            return Err(RecordRefused::Invalid("began rendering inside another"));
+        }
+        child.recording.scope = Scope::Rendering { colors: info.colorAttachmentCount };
         // SAFETY: as above.
         unsafe { f(cb, info.get()) };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_pipeline_barrier2(
@@ -8781,6 +8845,10 @@ impl Driver {
 
     /// `vkCmdClearAttachments`, whose two arrays are counted separately and mean different things.
     ///
+    /// Each colour attachment cleared must be one the rendering in progress writes: the Mesa
+    /// runtime reads its format and writes its clear value into fixed arrays by the index, and anv
+    /// takes the attachment out of its own, checking it only with asserts. See [`Scope`].
+    ///
     /// Every attachment is cleared over every rect, so the two are a product, not a pair: neither
     /// count governs the other and neither may be derived from the other. Either being empty
     /// clears nothing, and a zero count is itself invalid usage, so no call is made -- but the
@@ -8790,10 +8858,27 @@ impl Driver {
         cb: VkCommandBuffer,
         attachments: &[VkClearAttachment],
         rects: &[VkClearRect],
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
+    ) -> Result<(), RecordRefused> {
+        let scope = self.pools.scope(cb).ok_or(RecordRefused::NoDevice)?;
+        if !attachments.is_empty() {
+            let colors = scope
+                .colors()
+                .ok_or(RecordRefused::Invalid("cleared attachments outside any rendering"))?;
+            const COLOR: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32;
+            let named = |a: &VkClearAttachment| {
+                a.aspectMask.0 & COLOR == 0
+                    || a.colorAttachment == ATTACHMENT_UNUSED
+                    || a.colorAttachment < colors
+            };
+            if !attachments.iter().all(named) {
+                return Err(RecordRefused::Invalid(
+                    "cleared a color attachment the rendering does not have",
+                ));
+            }
+        }
+        let d = self.recorder(cb).ok_or(RecordRefused::NoDevice)?;
         if attachments.is_empty() || rects.is_empty() {
-            return Some(());
+            return Ok(());
         }
         // SAFETY: as above; each count is its own slice's length.
         unsafe {
@@ -8805,7 +8890,7 @@ impl Driver {
                 rects.as_ptr(),
             )
         };
-        Some(())
+        Ok(())
     }
 
     /// `vkCmdPushConstants`, whose `size` is the length of the bytes and nothing else.
@@ -14980,6 +15065,13 @@ unsafe impl InStruct for VkShaderModuleCreateInfo {
 unsafe impl InStruct for VkPipelineLibraryCreateInfoKHR {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkCommandBufferInheritanceRenderingInfo {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -23632,6 +23724,123 @@ mod tests {
             assert_eq!(*s, [(3, 0x20, 7)], "only the first reached the driver, with its flags")
         });
 
+        d.abandon_planted();
+    }
+
+    /// A colour attachment cleared is one the rendering in progress writes: dynamic rendering
+    /// this recording began, or the pass or rendering a secondary continues. Outside any, a clear
+    /// is refused, and rendering does not begin inside rendering.
+    #[test]
+    fn a_clear_names_an_attachment_of_the_rendering_it_is_inside() {
+        use super::super::proto::types::{
+            VkClearAttachment, VkClearRect, VkCommandBufferInheritanceInfo,
+            VkCommandBufferInheritanceRenderingInfo, VkCommandBufferUsageFlagBits,
+            VkCommandBufferUsageFlags, VkImageAspectFlags, VkRenderingInfo,
+        };
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        const PASS: VkRenderPass = VkRenderPass::forged(0x50);
+        let primary = VkCommandBuffer::forged(0x10);
+        let secondary = VkCommandBuffer::forged(0x11);
+        unsafe extern "C" fn begin(
+            _: VkCommandBuffer,
+            _: *const VkCommandBufferBeginInfo,
+        ) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn begin_rendering(_: VkCommandBuffer, _: *const VkRenderingInfo) {}
+        unsafe extern "C" fn end_rendering(_: VkCommandBuffer) {}
+        unsafe extern "C" fn clear(
+            _: VkCommandBuffer,
+            _: u32,
+            _: *const VkClearAttachment,
+            _: u32,
+            _: *const VkClearRect,
+        ) {
+        }
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkBeginCommandBuffer(begin);
+        fns.plant_vkCmdBeginRendering(begin_rendering);
+        fns.plant_vkCmdEndRendering(end_rendering);
+        fns.plant_vkCmdClearAttachments(clear);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x30), &[(primary, ObjectId(1))]);
+        d.plant_pool_at(
+            DEVICE,
+            VkCommandPool::forged(0x31),
+            Level::Secondary,
+            &[(secondary, ObjectId(2))],
+        );
+        let subpass = |colors| SubpassShape { named: Vec::new(), colors };
+        let pass = RenderPassFacts::held(0, vec![subpass(1), subpass(3)], []).expect("a pass");
+        d.render_passes.insert(PASS, Arc::new(pass));
+
+        const COLOR: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32;
+        const DEPTH: u32 = VkImageAspectFlagBits::VK_IMAGE_ASPECT_DEPTH_BIT.0 as u32;
+        let rect = [VkClearRect { layerCount: 1, ..Default::default() }];
+        let clear = |d: &Driver, cb, aspect: u32, index: u32| {
+            let attachment = [VkClearAttachment {
+                aspectMask: VkImageAspectFlags(aspect),
+                colorAttachment: index,
+                ..Default::default()
+            }];
+            d.cmd_clear_attachments(cb, &attachment, &rect)
+        };
+        let outside = Err(RecordRefused::Invalid("cleared attachments outside any rendering"));
+        let missing =
+            Err(RecordRefused::Invalid("cleared a color attachment the rendering does not have"));
+
+        assert_eq!(clear(&d, primary, COLOR, 0), outside, "before any rendering");
+        assert_eq!(d.cmd_clear_attachments(primary, &[], &rect), Ok(()), "clearing nothing");
+
+        let two = VkRenderingInfo { colorAttachmentCount: 2, ..Default::default() };
+        assert_eq!(d.cmd_begin_rendering(primary, cs::Decoded::planted_checked(&two)), Ok(()));
+        assert_eq!(clear(&d, primary, COLOR, 1), Ok(()), "the last of two");
+        assert_eq!(clear(&d, primary, COLOR, 2), missing, "one past it");
+        assert_eq!(clear(&d, primary, COLOR, u32::MAX), Ok(()), "an unused attachment");
+        assert_eq!(clear(&d, primary, DEPTH, 99), Ok(()), "depth names no colour attachment");
+        assert_eq!(
+            d.cmd_begin_rendering(primary, cs::Decoded::planted_checked(&two)),
+            Err(RecordRefused::Invalid("began rendering inside another"))
+        );
+        assert_eq!(d.cmd_end_rendering(primary), Some(()));
+        assert_eq!(clear(&d, primary, COLOR, 0), outside, "after its end");
+
+        // A secondary is inside what it continues: the second subpass's three, or a dynamic
+        // rendering's own count, or none when it names none.
+        const CONTINUE: VkCommandBufferUsageFlags = VkCommandBufferUsageFlags(
+            VkCommandBufferUsageFlagBits::VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT.0 as u32,
+        );
+        let rendering = VkCommandBufferInheritanceRenderingInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO,
+            colorAttachmentCount: 2,
+            ..Default::default()
+        };
+        let next = (&rendering as *const VkCommandBufferInheritanceRenderingInfo).cast();
+        for (what, pass, subpass, chain, last) in [
+            ("a pass's second subpass", PASS, 1, core::ptr::null(), Some(2)),
+            ("dynamic rendering", VkRenderPass::NULL, 0, next, Some(1)),
+            ("dynamic rendering naming nothing", VkRenderPass::NULL, 0, core::ptr::null(), None),
+        ] {
+            let inheritance = VkCommandBufferInheritanceInfo {
+                pNext: chain,
+                renderPass: pass,
+                subpass,
+                ..Default::default()
+            };
+            let info = VkCommandBufferBeginInfo {
+                flags: CONTINUE,
+                pInheritanceInfo: &inheritance,
+                ..Default::default()
+            };
+            let began = d.begin_command_buffer(secondary, cs::Decoded::planted(&info));
+            assert_eq!(began, Ok(VkResult::VK_SUCCESS), "{what}");
+            if let Some(last) = last {
+                assert_eq!(clear(&d, secondary, COLOR, last), Ok(()), "{what}: its last");
+            }
+            let past = last.map_or(0, |l| l + 1);
+            assert_eq!(clear(&d, secondary, COLOR, past), missing, "{what}: one past it");
+        }
         d.abandon_planted();
     }
 

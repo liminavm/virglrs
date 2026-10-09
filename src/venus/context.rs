@@ -5999,7 +5999,7 @@ impl Commands for Handlers<'_> {
         let Some(info) = self.names(args.pRenderingInfo) else { return };
         let Some(info) = self.checked_for(args.commandBuffer, info) else { return };
         let done = self.driver.cmd_begin_rendering(args.commandBuffer, info);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdPipelineBarrier2(&mut self, args: &mut vn_command_vkCmdPipelineBarrier2<'_>) {
@@ -6749,7 +6749,7 @@ impl Commands for Handlers<'_> {
             Cow::Owned(all.iter().copied().filter(clear_rect_is_sound).collect())
         };
         let done = self.driver.cmd_clear_attachments(args.commandBuffer, attachments, &rects);
-        self.recorded(done);
+        self.held(done);
     }
 
     fn vkCmdPushConstants(&mut self, args: &mut vn_command_vkCmdPushConstants<'_>) {
@@ -23399,6 +23399,7 @@ mod tests {
         // Two arrays under two counts. Unequal on purpose: both counts are `u32` and the
         // pointers differ only in type, so passing one where the other belongs compiles.
         // The rects cover something: an empty one is dropped before the driver sees it.
+        h.driver.plant_rendering(cb, 1);
         let attachments = [VkClearAttachment::default(); 2];
         let mut rect = VkClearRect { layerCount: 1, ..Default::default() };
         rect.rect.extent.width = 1;
@@ -23496,6 +23497,7 @@ mod tests {
             VkCommandPool::forged(POOL),
             &[(VkCommandBuffer::forged(CB.0), ObjectId(CB.1))],
         );
+        driver.plant_rendering(VkCommandBuffer::forged(CB.0), 1);
 
         let todo = Unimplemented::default();
         let global = crate::vulkan::global();

@@ -4821,8 +4821,10 @@ SABOTAGES = [
     (
         'a render pass may begin inside another',
         'src/venus/driver.rs',
-        """        if child.recording.pass.is_some() {""",
-        """        if false {""",
+        """        if !matches!(child.recording.scope, Scope::Outside) {
+            return Err(RecordRefused::Invalid("began a render pass inside another"));""",
+        """        if false {
+            return Err(RecordRefused::Invalid("began a render pass inside another"));""",
         'a_render_pass_is_begun_and_moved_through_in_order',
     ),
     (
@@ -4835,7 +4837,8 @@ SABOTAGES = [
     (
         'an ended render pass stays begun',
         'src/venus/driver.rs',
-        """        child.recording.pass = None;
+        """        let child = self.pools.child_mut(cb).ok_or(RecordRefused::NoDevice)?;
+        child.recording.scope = Scope::Outside;
 """,
         """""",
         'a_render_pass_is_begun_and_moved_through_in_order',
@@ -5745,6 +5748,51 @@ SABOTAGES = [
         """        if inheritance.subpass >= pass.subpasses() {""",
         """        if false && inheritance.subpass >= pass.subpasses() {""",
         'a_secondary_begins_inside_the_pass_it_continues',
+    ),
+    (
+        'a clear may name a colour attachment the rendering does not have',
+        'src/venus/driver.rs',
+        """            if !attachments.iter().all(named) {""",
+        """            if false && !attachments.iter().all(named) {""",
+        'a_clear_names_an_attachment_of_the_rendering_it_is_inside',
+    ),
+    (
+        'a clear may run outside any rendering',
+        'src/venus/driver.rs',
+        """                .ok_or(RecordRefused::Invalid("cleared attachments outside any rendering"))?;""",
+        """                .unwrap_or(u32::MAX);""",
+        'a_clear_names_an_attachment_of_the_rendering_it_is_inside',
+    ),
+    (
+        'rendering may begin inside rendering',
+        'src/venus/driver.rs',
+        """        if !matches!(child.recording.scope, Scope::Outside) {
+            return Err(RecordRefused::Invalid("began rendering inside another"));""",
+        """        if false {
+            return Err(RecordRefused::Invalid("began rendering inside another"));""",
+        'a_clear_names_an_attachment_of_the_rendering_it_is_inside',
+    ),
+    (
+        'a continued subpass is read as the first',
+        'src/venus/driver.rs',
+        """        Ok(Scope::Rendering { colors: pass.colors[inheritance.subpass as usize] })""",
+        """        Ok(Scope::Rendering { colors: pass.colors[0] })""",
+        'a_clear_names_an_attachment_of_the_rendering_it_is_inside',
+    ),
+    (
+        'continued dynamic rendering is read as writing nothing',
+        'src/venus/driver.rs',
+        """                .map_or(0, |r| r.colorAttachmentCount);""",
+        """                .map_or(0, |_| 0);""",
+        'a_clear_names_an_attachment_of_the_rendering_it_is_inside',
+    ),
+    (
+        'an end of rendering leaves the recording inside it',
+        'src/venus/driver.rs',
+        """        let f = self.recorder(cb)?.try_vkCmdEndRendering()?;
+        self.pools.child_mut(cb)?.recording.scope = Scope::Outside;""",
+        """        let f = self.recorder(cb)?.try_vkCmdEndRendering()?;""",
+        'a_clear_names_an_attachment_of_the_rendering_it_is_inside',
     ),
     (
         'a submit chained array is trusted by its count alone',
