@@ -2278,6 +2278,7 @@ impl Handlers<'_> {
                     Q::OutOfRoom => "asked for query results past the room it offered",
                     Q::WrongKind => "wrote a query into a pool that counts another kind",
                     Q::Unsized => "read results of a query kind this renderer cannot size",
+                    Q::NoStream => "named a vertex stream the query pool does not count",
                 });
                 None
             }

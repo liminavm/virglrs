@@ -117,7 +117,8 @@ use super::proto::types::{VkBufferUsageFlags2CreateInfo, VkFormatFeatureFlagBits
 use super::proto::types::{
     VkCommandBufferInheritanceRenderingInfo, VkDeviceQueueCreateInfo, VkMemoryAllocateFlagsInfo,
     VkMemoryOpaqueCaptureAddressAllocateInfo, VkPhysicalDeviceAccelerationStructureFeaturesKHR,
-    VkPhysicalDeviceImageDrmFormatModifierInfoEXT, VkPhysicalDeviceTransformFeedbackPropertiesEXT,
+    VkPhysicalDeviceImageDrmFormatModifierInfoEXT, VkPhysicalDeviceMeshShaderFeaturesEXT,
+    VkPhysicalDeviceTransformFeedbackPropertiesEXT, VkQueryPipelineStatisticFlagBits,
     VkQueueFamilyProperties,
 };
 use super::proto::types::{
@@ -1020,6 +1021,9 @@ pub enum QueryRefused {
     WrongKind,
     /// A pool whose result this renderer cannot size, so it cannot hold the read to the room.
     Unsized,
+    /// An indexed query names a vertex stream the device does not have, or a stream at all on a
+    /// pool that counts none.
+    NoStream,
 }
 
 /// Why a ray-tracing pipeline command was refused. None reached the driver.
@@ -2714,6 +2718,9 @@ struct DeviceState {
     /// The query types the device was created able to make. Read once at creation from what the
     /// guest enabled; see [`enabled_query_types`].
     query_types: Vec<VkQueryType>,
+    /// The pipeline statistics it counts, as `VkQueryPipelineStatisticFlags` bits: see
+    /// [`enabled_statistics`].
+    statistics: u32,
     /// Whether the guest enabled `accelerationStructureIndirectBuild`; see
     /// [`enables_indirect_builds`].
     indirect_builds: bool,
@@ -3577,6 +3584,7 @@ impl Driver {
             .any(|n| n == "VK_EXT_sample_locations")
             .then(|| sample_location_grids(inst, pd));
         let query_types = enabled_query_types(&wanted, enables_pipeline_statistics(info_decoded));
+        let statistics = enabled_statistics(&wanted, info_decoded);
         let indirect_builds = enables_indirect_builds(info_decoded);
         let formats = Formats::Driver {
             physical: pd,
@@ -3595,6 +3603,7 @@ impl Driver {
                 limits,
                 sample_locations,
                 query_types,
+                statistics,
                 indirect_builds,
                 formats,
             },
@@ -4657,6 +4666,7 @@ impl Driver {
             limits: &d.limits,
             sample_locations: d.sample_locations.as_ref(),
             query_types: &d.query_types,
+            statistics: d.statistics,
             indirect_builds: d.indirect_builds,
             stages: d.stages,
             formats: FormatQueries { source: &d.formats, instance: self.instance() },
@@ -5554,6 +5564,7 @@ impl Driver {
                 limits: planted_limits(),
                 sample_locations: None,
                 query_types: enabled_query_types(&[], true),
+                statistics: CORE_STATISTICS,
                 indirect_builds: false,
                 formats: Formats::Planted(PlantedFormats::default()),
             },
@@ -9070,8 +9081,34 @@ impl Driver {
         Ok(())
     }
 
+    /// Whether an indexed query on `pool` may name vertex stream `index`: one of the device's
+    /// transform feedback streams for a pool counting them, and stream 0 for any other. anv
+    /// reads the stream's counter register at an offset chosen by the index, checking it only with
+    /// an assert.
+    fn stream_fits(
+        &self,
+        cb: VkCommandBuffer,
+        facts: &QueryFacts,
+        index: u32,
+    ) -> Result<(), QueryRefused> {
+        type Q = VkQueryType;
+        let streams = match facts.kind {
+            Q::VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT
+            | Q::VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT => {
+                let device = self.pools.device_of(cb).ok_or(QueryRefused::NoDevice)?;
+                let d = self.devices.get(&device).ok_or(QueryRefused::NoDevice)?;
+                d.xfb.map_or(1, |x| x.streams)
+            }
+            _ => 1,
+        };
+        if index >= streams {
+            return Err(QueryRefused::NoStream);
+        }
+        Ok(())
+    }
+
     /// `vkCmdBeginQueryIndexedEXT`: [`Self::cmd_begin_query`] on one vertex stream of a
-    /// transform feedback query, held to the pool the same way.
+    /// transform feedback query, held to the pool the same way, and the stream to the device's.
     pub fn cmd_begin_query_indexed(
         &self,
         cb: VkCommandBuffer,
@@ -9083,6 +9120,7 @@ impl Driver {
         let (d, facts) = self.query_recorder(cb, pool)?;
         facts.holds(query, 1)?;
         facts.is_bracketed()?;
+        self.stream_fits(cb, facts, index)?;
         let f = d.try_vkCmdBeginQueryIndexedEXT().ok_or(QueryRefused::NotExported)?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { f(cb, pool, query, flags, index) };
@@ -9099,6 +9137,7 @@ impl Driver {
     ) -> Result<(), QueryRefused> {
         let (d, facts) = self.query_recorder(cb, pool)?;
         facts.holds(query, 1)?;
+        self.stream_fits(cb, facts, index)?;
         let f = d.try_vkCmdEndQueryIndexedEXT().ok_or(QueryRefused::NotExported)?;
         // SAFETY: as above, and a query the pool holds.
         unsafe { f(cb, pool, query, index) };
@@ -14523,6 +14562,8 @@ pub struct DeviceFacts<'d> {
     pub sample_locations: Option<&'d SampleLocationGrids>,
     /// The query types the device was created able to make.
     pub query_types: &'d [VkQueryType],
+    /// The pipeline statistics it counts.
+    pub statistics: u32,
     /// Whether it was created with `accelerationStructureIndirectBuild`.
     pub indirect_builds: bool,
     /// The shader stages it runs: see [`enabled_stages`].
@@ -14871,6 +14912,37 @@ fn enables_indirect_builds(info: cs::Decoded<'_, VkDeviceCreateInfo>) -> bool {
         .is_some_and(|f| f.accelerationStructureIndirectBuild.0 != 0)
 }
 
+/// The eleven pipeline statistics core Vulkan defines, input assembly vertices through compute
+/// shader invocations.
+const CORE_STATISTICS: u32 =
+    (VkQueryPipelineStatisticFlagBits::VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT.0
+        as u32)
+        * 2
+        - 1;
+
+/// The pipeline statistics a device counts: the eleven core ones once the guest enabled
+/// `pipelineStatisticsQuery`, the task and mesh shader invocations once it also enabled
+/// `meshShaderQueries`, and cluster culling invocations once it enabled the Huawei extension that
+/// defines them. anv sizes a pipeline-statistics query by the bits it knows and reads and writes
+/// one value per bit the pool names, so a bit it does not know runs past the query.
+fn enabled_statistics(extensions: &[String], info: cs::Decoded<'_, VkDeviceCreateInfo>) -> u32 {
+    type S = VkQueryPipelineStatisticFlagBits;
+    if !enables_pipeline_statistics(info) {
+        return 0;
+    }
+    let mut bits = CORE_STATISTICS as i32;
+    if chained::<VkPhysicalDeviceMeshShaderFeaturesEXT, _>(info)
+        .is_some_and(|f| f.meshShaderQueries.0 != 0)
+    {
+        bits |= S::VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT.0
+            | S::VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT.0;
+    }
+    if extensions.iter().any(|n| n == "VK_HUAWEI_cluster_culling_shader") {
+        bits |= S::VK_QUERY_PIPELINE_STATISTIC_CLUSTER_CULLING_SHADER_INVOCATIONS_BIT_HUAWEI.0;
+    }
+    bits as u32
+}
+
 fn enables_pipeline_statistics(info: cs::Decoded<'_, VkDeviceCreateInfo>) -> bool {
     // SAFETY: `info` is the decoder's, so `pEnabledFeatures` is null or a struct it allocated in
     // the arena `info` borrows (see `Decoded::vouch`).
@@ -14891,6 +14963,11 @@ impl cs::Validate<DeviceFacts<'_>> for VkQueryPoolCreateInfo {
         }
         if !facts.query_types.contains(&this.queryType) {
             return Err("created a query pool of a type the device was not created with");
+        }
+        if this.queryType == VkQueryType::VK_QUERY_TYPE_PIPELINE_STATISTICS
+            && this.pipelineStatistics.0 & !facts.statistics != 0
+        {
+            return Err("counted a pipeline statistic the device does not count");
         }
         Ok(())
     }
@@ -15164,6 +15241,13 @@ unsafe impl InStruct for VkShaderModuleCreateInfo {
 unsafe impl InStruct for VkPipelineLibraryCreateInfoKHR {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkPhysicalDeviceMeshShaderFeaturesEXT {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
@@ -23826,6 +23910,120 @@ mod tests {
         d.abandon_planted();
     }
 
+    /// A pipeline-statistics pool counts only statistics its device counts, and an indexed query
+    /// names a vertex stream its pool counts: one of the device's transform feedback streams for
+    /// a pool of streams, stream 0 for any other.
+    #[test]
+    fn a_query_counts_only_what_its_device_counts() {
+        use super::super::proto::types::{
+            VkPhysicalDeviceFeatures, VkQueryControlFlags, VkQueryPipelineStatisticFlags,
+            VkQueryPoolCreateInfo,
+        };
+        const DEVICE: VkDevice = VkDevice::forged(3);
+        let cb = VkCommandBuffer::forged(0x10);
+        unsafe extern "C" fn begin(
+            _: VkCommandBuffer,
+            _: VkQueryPool,
+            _: u32,
+            _: VkQueryControlFlags,
+            _: u32,
+        ) {
+        }
+        unsafe extern "C" fn end(_: VkCommandBuffer, _: VkQueryPool, _: u32, _: u32) {}
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdBeginQueryIndexedEXT(begin);
+        fns.plant_vkCmdEndQueryIndexedEXT(end);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+        d.plant_pool(DEVICE, VkCommandPool::forged(0x30), &[(cb, ObjectId(1))]);
+
+        // The planted device counts the core statistics only.
+        type S = VkQueryPipelineStatisticFlagBits;
+        let statistics = |bits: i32| VkQueryPoolCreateInfo {
+            queryType: VkQueryType::VK_QUERY_TYPE_PIPELINE_STATISTICS,
+            queryCount: 1,
+            pipelineStatistics: VkQueryPipelineStatisticFlags(bits as u32),
+            ..Default::default()
+        };
+        let facts = d.device_facts(DEVICE).expect("a planted device");
+        let uncounted = Err("counted a pipeline statistic the device does not count");
+        for (what, bits, want) in [
+            ("every core statistic", CORE_STATISTICS as i32, Ok(())),
+            (
+                "mesh invocations",
+                S::VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT.0,
+                uncounted,
+            ),
+            (
+                "task invocations",
+                S::VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT.0,
+                uncounted,
+            ),
+        ] {
+            let info = statistics(bits);
+            let checked = cs::Decoded::planted(&info).validate(&facts).map(|_| ());
+            assert_eq!(checked, want, "{what}");
+        }
+
+        // What a device counts is read off what it enabled.
+        let features =
+            VkPhysicalDeviceFeatures { pipelineStatisticsQuery: VkBool32(1), ..Default::default() };
+        let mesh = VkPhysicalDeviceMeshShaderFeaturesEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
+            meshShaderQueries: VkBool32(1),
+            ..Default::default()
+        };
+        let with = |next: *const core::ffi::c_void, enabled: *const VkPhysicalDeviceFeatures| {
+            VkDeviceCreateInfo { pNext: next, pEnabledFeatures: enabled, ..Default::default() }
+        };
+        let mesh_bits = (S::VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT.0
+            | S::VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT.0)
+            as u32;
+        let next = (&mesh as *const VkPhysicalDeviceMeshShaderFeaturesEXT).cast();
+        for (what, info, want) in [
+            ("no statistics", with(core::ptr::null(), core::ptr::null()), 0),
+            ("the core statistics", with(core::ptr::null(), &features), CORE_STATISTICS),
+            ("mesh queries", with(next, &features), CORE_STATISTICS | mesh_bits),
+            ("mesh queries without statistics", with(next, core::ptr::null()), 0),
+        ] {
+            assert_eq!(enabled_statistics(&[], cs::Decoded::planted(&info)), want, "{what}");
+        }
+
+        let pool = |d: &mut Driver, handle: u64, kind: VkQueryType| {
+            let info =
+                VkQueryPoolCreateInfo { queryType: kind, queryCount: 4, ..Default::default() };
+            d.query_pools.insert(VkQueryPool::forged(handle), QueryFacts::of(&info));
+            VkQueryPool::forged(handle)
+        };
+        let streams = pool(&mut d, 0x50, VkQueryType::VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT);
+        let generated = pool(&mut d, 0x51, VkQueryType::VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT);
+        let occlusion = pool(&mut d, 0x52, VkQueryType::VK_QUERY_TYPE_OCCLUSION);
+        let flags = VkQueryControlFlags(0);
+        let indexed = |d: &Driver, pool, index| {
+            let begun = d.cmd_begin_query_indexed(cb, pool, 0, flags, index);
+            assert_eq!(begun, d.cmd_end_query_indexed(cb, pool, 0, index), "begin and end agree");
+            begun
+        };
+        let no_stream = Err(QueryRefused::NoStream);
+        // Before transform feedback, every pool counts stream 0 alone.
+        for pool in [streams, generated, occlusion] {
+            assert_eq!(indexed(&d, pool, 0), Ok(()));
+            assert_eq!(indexed(&d, pool, 1), no_stream);
+        }
+        d.plant_xfb_limits(DEVICE, 4, 4);
+        for (pool, index, want) in [
+            (streams, 3, Ok(())),
+            (streams, 4, no_stream),
+            (streams, u32::MAX, no_stream),
+            (generated, 3, Ok(())),
+            (generated, 4, no_stream),
+            (occlusion, 1, no_stream),
+        ] {
+            assert_eq!(indexed(&d, pool, index), want, "stream {index} of {pool:?}");
+        }
+        d.abandon_planted();
+    }
+
     /// A colour attachment cleared is one the rendering in progress writes: dynamic rendering
     /// this recording began, or the pass or rendering a secondary continues. Outside any, a clear
     /// is refused, and rendering does not begin inside rendering.
@@ -24263,8 +24461,8 @@ mod tests {
         assert_eq!(d.cmd_begin_query(CB, OCCLUSION, 3, VkQueryControlFlags(0)), Ok(()));
         assert_eq!(d.cmd_end_query(CB, OCCLUSION, 3), Ok(()));
         assert_eq!(d.cmd_write_timestamp(CB, STAGE, POOL, 3), Ok(()));
-        assert_eq!(d.cmd_begin_query_indexed(CB, OCCLUSION, 3, VkQueryControlFlags(0), 2), Ok(()));
-        assert_eq!(d.cmd_end_query_indexed(CB, OCCLUSION, 3, 2), Ok(()));
+        assert_eq!(d.cmd_begin_query_indexed(CB, OCCLUSION, 3, VkQueryControlFlags(0), 0), Ok(()));
+        assert_eq!(d.cmd_end_query_indexed(CB, OCCLUSION, 3, 0), Ok(()));
         let r = d.query_pool_results(DEVICE, POOL, 0, 4, &mut buf[..16], VkDeviceSize(4), NONE);
         assert_eq!(r, Ok(VkResult::VK_NOT_READY), "the driver's answer, as it gave it");
         ASKED.with_borrow(|a| {
@@ -24277,8 +24475,8 @@ mod tests {
                     ("begin", 3, 1),
                     ("end", 3, 1),
                     ("timestamp", 3, 1),
-                    ("begin_indexed", 3, 2),
-                    ("end_indexed", 3, 2),
+                    ("begin_indexed", 3, 0),
+                    ("end_indexed", 3, 0),
                     ("results", 0, 4),
                     ("bytes", 16, 0),
                 ],

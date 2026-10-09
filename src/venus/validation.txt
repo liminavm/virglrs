@@ -33,7 +33,7 @@ vkBindImageMemory                                validated
 vkBindImageMemory2                               validated
 vkCmdBeginConditionalRenderingEXT                validated
 vkCmdBeginQuery                                  reviewed
-vkCmdBeginQueryIndexedEXT                        reviewed
+vkCmdBeginQueryIndexedEXT                        validated
 vkCmdBeginRenderPass                             validated
 vkCmdBeginRenderPass2                            validated
 vkCmdBeginRendering                              validated
@@ -82,7 +82,7 @@ vkCmdDrawMultiEXT                                reviewed
 vkCmdDrawMultiIndexedEXT                         reviewed
 vkCmdEndConditionalRenderingEXT                  reviewed
 vkCmdEndQuery                                    reviewed
-vkCmdEndQueryIndexedEXT                          reviewed
+vkCmdEndQueryIndexedEXT                          validated
 vkCmdEndRenderPass                               reviewed
 vkCmdEndRenderPass2                              reviewed
 vkCmdEndRendering                                reviewed

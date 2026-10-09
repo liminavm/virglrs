@@ -3037,8 +3037,10 @@ SABOTAGES = [
         'src/venus/driver.rs',
         """facts.holds(query, 1)?;
         facts.is_bracketed()?;
+        self.stream_fits(cb, facts, index)?;
         let f = d.try_vkCmdBeginQueryIndexedEXT()""",
         """facts.is_bracketed()?;
+        self.stream_fits(cb, facts, index)?;
         let f = d.try_vkCmdBeginQueryIndexedEXT()""",
         'every_query_index_is_held_to_the_pool',
     ),
@@ -5835,6 +5837,47 @@ SABOTAGES = [
         """        if !window_fits(limits.maxColorAttachments, 0, enables.len()) {""",
         """        if !window_fits(u32::MAX, 0, enables.len()) {""",
         'a_dynamic_state_value_is_one_the_device_has',
+    ),
+    (
+        'a pipeline-statistics pool may count what its device does not',
+        'src/venus/driver.rs',
+        """            && this.pipelineStatistics.0 & !facts.statistics != 0""",
+        """            && false""",
+        'a_query_counts_only_what_its_device_counts',
+    ),
+    (
+        'mesh shader queries are never read off the device',
+        'src/venus/driver.rs',
+        """        .is_some_and(|f| f.meshShaderQueries.0 != 0)""",
+        """        .is_some_and(|_| false)""",
+        'a_query_counts_only_what_its_device_counts',
+    ),
+    (
+        'an indexed query may name any stream',
+        'src/venus/driver.rs',
+        """        if index >= streams {
+            return Err(QueryRefused::NoStream);""",
+        """        if false {
+            return Err(QueryRefused::NoStream);""",
+        'a_query_counts_only_what_its_device_counts',
+    ),
+    (
+        'a pool counting no streams takes any stream',
+        'src/venus/driver.rs',
+        """            _ => 1,
+        };
+        if index >= streams {""",
+        """            _ => u32::MAX,
+        };
+        if index >= streams {""",
+        'a_query_counts_only_what_its_device_counts',
+    ),
+    (
+        'a pool of streams on a device without them takes any stream',
+        'src/venus/driver.rs',
+        """                d.xfb.map_or(1, |x| x.streams)""",
+        """                d.xfb.map_or(u32::MAX, |x| x.streams)""",
+        'a_query_counts_only_what_its_device_counts',
     ),
     (
         'a submit chained array is trusted by its count alone',
