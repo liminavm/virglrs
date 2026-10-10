@@ -2544,6 +2544,19 @@ impl Handlers<'_> {
             self.objects.borrow_mut().add_ghost(id.id());
         }
     }
+
+    /// Ghost each id of a run whose slot the driver left null: every one of a failed run, and
+    /// those a run asked to fail rather than compile was declined. The reply answers each such
+    /// slot with a zero id, which the guest takes as "not made" (see the reply encoder), so
+    /// nothing it sends later can name one -- and if it does, the ghost skips it rather than
+    /// letting the lifecycle hook register the id as an object the driver never made.
+    fn ghost_unmade<T: Handle>(&mut self, ids: &[Guest<T>], made: &[T]) {
+        for (id, handle) in ids.iter().zip(made) {
+            if handle.host().raw() == 0 {
+                self.objects.borrow_mut().add_ghost(id.id());
+            }
+        }
+    }
 }
 
 /// Whether a build names its geometries through exactly one of its two arrays, as Vulkan
@@ -5036,7 +5049,8 @@ impl Commands for Handlers<'_> {
     //
     // Not a `simple_create`: one command makes a run of them, and it is the only create that can
     // come back part real. What that costs is in [`Driver::create_pipelines`]; what is left here
-    // is the all-or-nothing the guest sees.
+    // is the guest's side of it: each id whose slot came back null is ghosted, and the reply
+    // hands it back as zero.
 
     fn vkCreateGraphicsPipelines(&mut self, args: &mut vn_command_vkCreateGraphicsPipelines<'_>) {
         let infos = args.pCreateInfos();
@@ -5057,13 +5071,13 @@ impl Commands for Handlers<'_> {
         };
         let out = args.handle_pPipelines_mut();
         let host = self.driver.create_pipelines(device, cache, infos, alloc, out);
-        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.ghost_unmade(ids, out);
+        args.ret = host.map_or_else(|e| e, driver::PipelinesMade::result);
         if host.is_err() {
             // A pipeline the host refuses is a shader the guest cannot draw with, which is worth
             // saying out loud -- unlike a descriptor pool running dry, it is not something a
             // working guest does on purpose.
             eprintln!("[virglrs] vkCreateGraphicsPipelines refused by the driver");
-            self.ghost_ids(ids);
         }
     }
 
@@ -5091,10 +5105,10 @@ impl Commands for Handlers<'_> {
         };
         let out = args.handle_pPipelines_mut();
         let host = self.driver.create_pipelines(device, cache, infos, alloc, out);
-        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.ghost_unmade(ids, out);
+        args.ret = host.map_or_else(|e| e, driver::PipelinesMade::result);
         if host.is_err() {
             eprintln!("[virglrs] vkCreateComputePipelines refused by the driver");
-            self.ghost_ids(ids);
         }
     }
 
@@ -5132,10 +5146,10 @@ impl Commands for Handlers<'_> {
         let out = args.handle_pPipelines_mut();
         let made = self.driver.create_ray_tracing_pipelines(device, cache, infos, alloc, out);
         let Some(host) = self.rayed(made) else { return };
-        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.ghost_unmade(ids, out);
+        args.ret = host.map_or_else(|e| e, driver::PipelinesMade::result);
         if host.is_err() {
             eprintln!("[virglrs] vkCreateRayTracingPipelinesKHR refused by the driver");
-            self.ghost_ids(ids);
         }
     }
 
@@ -7287,6 +7301,20 @@ mod tests {
 
     /// A graphics pipeline its check takes: a vertex and a fragment stage, which the test keeps
     /// for its whole run.
+    /// The pipeline ids a `vkCreateGraphicsPipelines` reply hands back to the guest, read off
+    /// the encoded bytes: the command type and result, then the array's size and its ids.
+    fn replied_pipelines(
+        args: &super::super::proto::types::vn_command_vkCreateGraphicsPipelines<'_>,
+    ) -> Vec<u64> {
+        let mut wire = Vec::new();
+        super::super::proto::serialize::vn_encode_vkCreateGraphicsPipelines_reply(
+            &mut Encoder::growing(&mut wire, &AllOfIt),
+            args,
+        );
+        let word = |at: usize| u64::from_le_bytes(wire[at..at + 8].try_into().expect("8 bytes"));
+        (0..word(8) as usize).map(|i| word(16 + 8 * i)).collect()
+    }
+
     fn a_graphics_pipeline() -> VkGraphicsPipelineCreateInfo {
         use super::super::proto::types::{
             VkPipelineMultisampleStateCreateInfo, VkPipelineRasterizationStateCreateInfo,
@@ -14795,6 +14823,7 @@ mod tests {
             "a driver refusing to compile is an answer, not a bad command"
         );
         assert_eq!(args.ret, VkResult::VK_ERROR_INVALID_SHADER_NV);
+        let replied = replied_pipelines(&args);
 
         ASKED.with_borrow(|a| {
             assert_eq!(a.as_slice(), &[3], "one handle slot per create-info, and it says so");
@@ -14818,6 +14847,118 @@ mod tests {
                 objects.borrow().is_ghost(ObjectId(id)),
                 "id {id} was asked for and the run failed, so it names a ghost"
             );
+        }
+        assert_eq!(
+            replied,
+            [0, 0, 0],
+            "and the reply hands back no id, so the guest keeps no object for one"
+        );
+
+        h.driver.abandon_planted();
+    }
+
+    /// A run asked to fail rather than compile is answered with the driver's own result, and
+    /// each pipeline the driver declined comes back as no pipeline at all.
+    ///
+    /// zink asks for its fast-linked pipelines this way: on `VK_PIPELINE_COMPILE_REQUIRED` it
+    /// compiles the pipeline in the background and draws with the slower one meanwhile, and it
+    /// knows which by the handle the venus guest leaves null -- which the guest does for a slot
+    /// whose reply id is zero. Answered `VK_SUCCESS` with the guest's own ids, zink bound a
+    /// pipeline the host never made.
+    #[test]
+    fn a_pipeline_the_driver_declines_to_compile_comes_back_null() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkDevice, VkGraphicsPipelineCreateInfo, VkPipeline,
+            VkPipelineCache, vn_command_vkCreateGraphicsPipelines,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const IDS: [u64; 3] = [71, 72, 73];
+        /// The driver makes the first and the last, and would have had to compile the middle one.
+        const MADE: [u64; 3] = [0x7100, 0, 0x7300];
+
+        thread_local! {
+            static DESTROYED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        unsafe extern "C" fn create(
+            _device: VkDevice,
+            _cache: VkPipelineCache,
+            n: u32,
+            _infos: *const VkGraphicsPipelineCreateInfo,
+            _alloc: *const VkAllocationCallbacks,
+            out: *mut VkPipeline,
+        ) -> VkResult {
+            // SAFETY: the wrapper passes its slice's own pointer and length.
+            let out = unsafe { core::slice::from_raw_parts_mut(out, n as usize) };
+            for (e, h) in out.iter_mut().zip(MADE) {
+                *e = VkPipeline::forged(h);
+            }
+            VkResult::VK_PIPELINE_COMPILE_REQUIRED
+        }
+
+        unsafe extern "C" fn destroy(
+            _device: VkDevice,
+            pipeline: VkPipeline,
+            _alloc: *const VkAllocationCallbacks,
+        ) {
+            DESTROYED.with_borrow_mut(|d| d.push(pipeline.raw()));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateGraphicsPipelines(create);
+        fns.plant_vkDestroyPipeline(destroy);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice::forged(DEVICE), fns);
+
+        let todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            ask: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            replaying: false,
+            depth: 0,
+            answer: None,
+            own_wait: None,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let infos = [a_graphics_pipeline(); 3];
+        let mut wire: [VkPipeline; 3] = core::array::from_fn(|i| VkPipeline::forged(IDS[i]));
+        let mut shadow = [VkPipeline::forged(0); 3];
+        let mut args = vn_command_vkCreateGraphicsPipelines::default();
+        args.device = VkDevice::forged(DEVICE);
+        args.plant_pCreateInfos(&infos);
+        args.plant_pPipelines(&mut wire);
+        args.plant_handle_pPipelines(&mut shadow);
+
+        h.vkCreateGraphicsPipelines(&mut args);
+        assert!(h.rejected().is_none(), "a declined compile is an answer, not a bad command");
+        assert_eq!(args.ret, VkResult::VK_PIPELINE_COMPILE_REQUIRED, "the driver's own result");
+        assert_eq!(replied_pipelines(&args), [71, 0, 73], "the declined one comes back null");
+        DESTROYED.with_borrow(|d| assert!(d.is_empty(), "the two it made are the guest's"));
+        assert_eq!(shadow.map(|p| p.raw()), MADE, "and stay in the shadow to be registered");
+        assert!(objects.borrow().is_ghost(ObjectId(72)), "and its id names nothing");
+        for id in [71, 73] {
+            assert!(!objects.borrow().is_ghost(ObjectId(id)), "id {id} names a real pipeline");
         }
 
         h.driver.abandon_planted();

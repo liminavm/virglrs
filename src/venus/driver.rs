@@ -5317,11 +5317,13 @@ impl Driver {
 
     /// Create a run of pipelines: `vkCreateXPipelines(device, cache, count, infos, alloc, out)`.
     ///
-    /// The one create in the protocol that can half-succeed. On a failure Vulkan still writes a
-    /// handle for every pipeline it did build, `VK_NULL_HANDLE` for each it did not, and returns
-    /// the first error -- so the array can come back part real. The guest is never told which
-    /// half: the whole run is refused and every id it named is ghosted, because a partial answer
-    /// is one the venus reply has no way to express.
+    /// The one create in the protocol that can come back part real, two ways. A run asked to
+    /// fail rather than compile (`VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`)
+    /// succeeds with [`PipelinesMade::Declined`] and a null handle in each slot the driver would
+    /// have had to compile; the rest are real. And on a failure Vulkan still writes a handle for
+    /// every pipeline it did build, `VK_NULL_HANDLE` for each it did not, and returns the first
+    /// error. The guest is never told which half of a failure succeeded: the whole run is refused,
+    /// because the venus reply's only "not made" is a null slot, and a failed run's are all null.
     ///
     /// Which leaves the survivors owned by nobody, so they are destroyed here. The C zeroes the
     /// array and walks away, leaking them until the device goes; there is nothing to be faithful
@@ -5333,7 +5335,7 @@ impl Driver {
         infos: cs::Decoded<'_, [I], cs::Checked>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
         out: &mut [VkPipeline],
-    ) -> Result<(), VkResult> {
+    ) -> Result<PipelinesMade, VkResult> {
         let Some(d) = self.devices.get(&device) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
@@ -5359,6 +5361,11 @@ impl Driver {
 
     /// The part of a pipeline create every kind shares: one handle slot per create-info, and on
     /// failure no survivor left owned by nobody. `create` makes the one call that fills `out`.
+    ///
+    /// A success code Vulkan does not give a pipeline create is not trusted to mean the handles
+    /// are what it would mean: the run is undone as a failure and answered `VK_ERROR_UNKNOWN`.
+    /// The deferred-operation codes are the ones a ray-tracing create could give, and it is never
+    /// handed an operation to defer to.
     fn pipeline_run(
         fns: &DeviceFns,
         device: VkDevice,
@@ -5366,7 +5373,7 @@ impl Driver {
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
         out: &mut [VkPipeline],
         create: impl FnOnce(&mut [VkPipeline]) -> VkResult,
-    ) -> Result<(), VkResult> {
+    ) -> Result<PipelinesMade, VkResult> {
         // One handle comes back per create-info, so the decoder sized both from the same count.
         // A mismatch is this renderer having got it wrong, not the guest -- so it asserts.
         assert_eq!(infos, out.len(), "a pipeline run needs one handle slot per create-info");
@@ -5374,11 +5381,12 @@ impl Driver {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         }
         let r = create(out);
-        // A positive result is not a failure: `VK_PIPELINE_COMPILE_REQUIRED` says the driver
-        // declined to compile early, and every handle is real.
-        if r.0 >= VkResult::VK_SUCCESS.0 {
-            return Ok(());
-        }
+        let failed = match r {
+            VkResult::VK_SUCCESS => return Ok(PipelinesMade::All),
+            VkResult::VK_PIPELINE_COMPILE_REQUIRED => return Ok(PipelinesMade::Declined),
+            r if r.0 < 0 => r,
+            _ => VkResult::VK_ERROR_UNKNOWN,
+        };
         for survivor in out.iter_mut() {
             if survivor.host().raw() == 0 {
                 continue;
@@ -5389,7 +5397,7 @@ impl Driver {
             // The guest's reply must not carry a handle that is now gone.
             *survivor = VkPipeline::NULL;
         }
-        Err(r)
+        Err(failed)
     }
 
     /// `vkCreateRayTracingPipelinesKHR`: [`Driver::create_pipelines`] for the one kind whose
@@ -5409,7 +5417,7 @@ impl Driver {
         infos: cs::Decoded<'_, [VkRayTracingPipelineCreateInfoKHR], cs::Checked>,
         alloc: Option<cs::Decoded<'_, VkAllocationCallbacks>>,
         out: &mut [VkPipeline],
-    ) -> Result<Result<(), VkResult>, RayTracingRefused> {
+    ) -> Result<Result<PipelinesMade, VkResult>, RayTracingRefused> {
         let d = self.devices.get(&device).ok_or(RayTracingRefused::NoDevice)?;
         let f = d.fns.try_vkCreateRayTracingPipelinesKHR().ok_or(RayTracingRefused::NotExported)?;
         let mut groups = Vec::with_capacity(infos.len());
@@ -11080,6 +11088,26 @@ pub type CreatePipelines<I> = unsafe extern "C" fn(
     *const VkAllocationCallbacks,
     *mut VkPipeline,
 ) -> VkResult;
+
+/// How a pipeline run the driver accepted came back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelinesMade {
+    /// Every slot holds a pipeline.
+    All,
+    /// `VK_PIPELINE_COMPILE_REQUIRED`: the run asked to fail rather than compile, and each slot
+    /// the driver would have had to compile is null. The others are real.
+    Declined,
+}
+
+impl PipelinesMade {
+    /// The result the guest is answered with.
+    pub fn result(self) -> VkResult {
+        match self {
+            Self::All => VkResult::VK_SUCCESS,
+            Self::Declined => VkResult::VK_PIPELINE_COMPILE_REQUIRED,
+        }
+    }
+}
 
 /// A create-info [`Driver::create_pipelines`] makes a run from: which entry point takes it, and
 /// what kind of pipeline comes out. One trait, so the entry point and the kind recorded for its
@@ -25315,14 +25343,17 @@ mod tests {
         };
 
         // A library of two groups, and a pipeline of one linking it: three.
-        assert_eq!(run(&mut d, &[info(&two, core::ptr::null())]), (Ok(Ok(())), vec![LIBRARY]));
+        assert_eq!(
+            run(&mut d, &[info(&two, core::ptr::null())]),
+            (Ok(Ok(PipelinesMade::All)), vec![LIBRARY])
+        );
         let libraries = [LIBRARY];
         let link = VkPipelineLibraryCreateInfoKHR {
             libraryCount: 1,
             pLibraries: libraries.as_ptr(),
             ..Default::default()
         };
-        assert_eq!(run(&mut d, &[info(&one, &link)]), (Ok(Ok(())), vec![LINKED]));
+        assert_eq!(run(&mut d, &[info(&one, &link)]), (Ok(Ok(PipelinesMade::All)), vec![LINKED]));
 
         let shader = GroupHandle::Shader;
         let general = VkShaderGroupShaderKHR::VK_SHADER_GROUP_SHADER_GENERAL_KHR;

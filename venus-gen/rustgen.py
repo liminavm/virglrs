@@ -1719,6 +1719,37 @@ class RustGen:
             return ['vn_fill_%s(a, f, %s);' % (base.name, target)]
         return ['*%s = %s;' % (target, self._fill_leaf(var.ty, value))]
 
+    def _fill_made(self, ty):
+        """Plant the host handles behind a create's array of ids, every other one null.
+
+        The reply encoder derives each id from its handle (see `_made_ids`); the C instead zeroes
+        the id of a slot the driver left null. So a null slot is planted both ways at once -- a
+        null handle here, a zero id the C reads -- and the oracle holds the two conventions to the
+        same bytes.
+        """
+        out = []
+        for var, shape in self.out_handles(ty):
+            if shape[0] != 'dynamic':
+                continue
+            m = self.member_expr(var)
+            f = 'val.handle_%s' % self.field_name(var.name)
+            base = self.base_name(var.ty)
+            out += ['if !%s.is_null() {' % m,
+                    '    let n = (%s) as usize;' % shape[1],
+                    '    let made = a.alloc_slice_fill_with(n, |_| %s::NULL);' % base,
+                    '    // SAFETY: the fill above allocated this many ids.',
+                    '    let ids = unsafe { core::slice::from_raw_parts_mut(%s, n) };' % m,
+                    '    for (i, (h, id)) in made.iter_mut().zip(ids).enumerate() {',
+                    '        if i % 2 == 0 {',
+                    '            *h = f.handle();',
+                    '        } else {',
+                    '            *id = %s::NULL;' % base,
+                    '        }',
+                    '    }',
+                    '    %s = made.as_mut_ptr();' % f,
+                    '}']
+        return out
+
     def _fill_member(self, ty, var, small, gaps):
         """Plant a value in one member, whatever shape it is."""
         m = 'val.%s' % self.field_name(var.name)
@@ -1818,6 +1849,7 @@ class RustGen:
             body = []
             for var in self._out_vars(ty):
                 body += self._fill_member(ty, var, small, gaps)
+            body += self._fill_made(ty)
             out += ['#[allow(unused_variables)]',
                     "pub fn vn_fill_%s_outs(a: &Bump, f: &mut Fill, "
                     "val: &mut vn_command_%s<'_>) {" % (ty.name, ty.name)]
@@ -3020,6 +3052,43 @@ class RustGen:
                         lambda: self._struct_body('decode', ty, v + '_temp', gaps), gaps, n)
         return out
 
+    def _made_ids(self, var, shape):
+        """The reply encode of a create's array of guest ids: each slot's id if the host made its
+        object, and zero if not.
+
+        The ids and the host handles are two arrays holding one fact -- which slots came back
+        real -- and only the handle array is the driver's word on it. Vulkan leaves a slot null
+        when the driver declines it (`VK_PIPELINE_COMPILE_REQUIRED`) and nulls every slot of a
+        run that fails, and the venus guest frees each object whose reply id is zero. So the id
+        is derived here, where both arrays are in view, rather than kept in step by every
+        handler. The C zeroes its id array instead; the reply oracle holds the two to the same
+        bytes. A null shadow means no handler ran, and the ids go back as they came.
+        """
+        m = self.member_expr(var)
+        f = 'val.handle_%s' % self.field_name(var.name)
+        base = self.base_name(var.ty)
+        n = '(%s) as usize' % shape[1]
+        return ['if !%s.is_null() {' % m,
+                '    enc.encode_array_size(%s);' % shape[1],
+                '    // SAFETY: non-null, and the decoder allocated exactly this many elements',
+                '    // from its arena for each of the two.',
+                '    let ids = unsafe { core::slice::from_raw_parts(%s, %s) };' % (m, n),
+                '    if %s.is_null() {' % f,
+                '        for e in ids {',
+                '            vn_encode_%s(enc, e);' % base,
+                '        }',
+                '    } else {',
+                '        // SAFETY: as above.',
+                '        let made = unsafe { core::slice::from_raw_parts(%s, %s) };' % (f, n),
+                '        for (e, h) in ids.iter().zip(made) {',
+                '            let real = cs::Handle::host(*h).raw() != 0;',
+                '            vn_encode_%s(enc, if real { e } else { &%s::NULL });' % (base, base),
+                '        }',
+                '    }',
+                '} else {',
+                '    enc.encode_array_size(0);',
+                '}']
+
     def _command_fns(self, ty, gaps):
         """One command's request decode, request encode and reply encode.
 
@@ -3049,8 +3118,14 @@ class RustGen:
                 capture = None
                 if kind == 'decode' and (var is target_var or var is owner_var):
                     capture = 'id_%s' % self.field_name(var.name)
+                if reply and kind == 'encode' and var.name in made_arrays:
+                    out += self._made_ids(var, made_arrays[var.name])
+                    continue
                 out += self._member(kind, ty, var, validity, kind == 'decode', capture)
             return out
+
+        made_arrays = {var.name: shape for var, shape in self.out_handles(ty)
+                       if shape[0] == 'dynamic'}
 
         def out_handle_storage():
             """Arena room for the host handles a create will produce.

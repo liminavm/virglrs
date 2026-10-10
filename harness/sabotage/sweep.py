@@ -426,11 +426,13 @@ SABOTAGES = [
         "a compute pipeline run is compiled without the guest's pipeline cache",
         'src/venus/context.rs',
         """        let host = self.driver.create_pipelines(device, cache, infos, alloc, out);
-        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.ghost_unmade(ids, out);
+        args.ret = host.map_or_else(|e| e, driver::PipelinesMade::result);
         if host.is_err() {
             eprintln!("[virglrs] vkCreateComputePipelines refused by the driver");""",
         """        let host = self.driver.create_pipelines(device, Default::default(), infos, alloc, out);
-        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.ghost_unmade(ids, out);
+        args.ret = host.map_or_else(|e| e, driver::PipelinesMade::result);
         if host.is_err() {
             eprintln!("[virglrs] vkCreateComputePipelines refused by the driver");""",
         'the_compute_pipeline_pair_reaches_the_driver_as_the_guest_sent_it',
@@ -6039,6 +6041,29 @@ SABOTAGES = [
         """        let reads_samples = (fragment_shader || fragment_output) && !samples_dynamic;""",
         """        let reads_samples = fragment_output && !samples_dynamic;""",
         'a_graphics_pipeline_holds_its_states',
+    ),
+    (
+        'a pipeline the driver declined to compile is answered as made',
+        'src/venus/driver.rs',
+        """            VkResult::VK_PIPELINE_COMPILE_REQUIRED => return Ok(PipelinesMade::Declined),""",
+        """            VkResult::VK_PIPELINE_COMPILE_REQUIRED => return Ok(PipelinesMade::All),""",
+        'a_pipeline_the_driver_declines_to_compile_comes_back_null',
+    ),
+    (
+        'a create reply hands back the id of a slot the host left null',
+        'venus-gen/rustgen.py',
+        """                '            let real = cs::Handle::host(*h).raw() != 0;',""",
+        """                '            let real = true;',""",
+        'a_pipeline_the_driver_declines_to_compile_comes_back_null',
+    ),
+    (
+        'an id whose pipeline the driver left null is not ghosted',
+        'src/venus/context.rs',
+        """            if handle.host().raw() == 0 {
+                self.objects.borrow_mut().add_ghost(id.id());""",
+        """            if handle.host().raw() == 0 && false {
+                self.objects.borrow_mut().add_ghost(id.id());""",
+        'a_pipeline_the_driver_declines_to_compile_comes_back_null',
     ),
     (
         'a submit chained array is trusted by its count alone',
