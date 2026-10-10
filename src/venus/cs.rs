@@ -2015,6 +2015,36 @@ mod tests {
         assert!(!query(H(3)), "but not two at once");
     }
 
+    /// A multisample state's sample count decodes whatever it holds: Vulkan ignores it when the
+    /// count is dynamic and in a pipeline part that reads no multisample state, and zink sends
+    /// zero there. The graphics pipeline create checks it where the runtime reads it.
+    #[test]
+    fn a_sample_count_is_left_to_the_pipeline_it_is_part_of() {
+        use crate::venus::proto::serialize::{
+            vn_decode_VkPipelineMultisampleStateCreateInfo_self_temp,
+            vn_encode_VkPipelineMultisampleStateCreateInfo_self,
+        };
+        use crate::venus::proto::types::{
+            VkPipelineMultisampleStateCreateInfo, VkSampleCountFlagBits,
+        };
+        let sent = VkPipelineMultisampleStateCreateInfo {
+            rasterizationSamples: VkSampleCountFlagBits(0),
+            ..Default::default()
+        };
+        let mut wire = Vec::new();
+        vn_encode_VkPipelineMultisampleStateCreateInfo_self(
+            &mut Encoder::growing(&mut wire, &AllOfIt),
+            &sent,
+        );
+        let (temp, hard) = (Bump::new(), AtomicBool::new(false));
+        let mut dec = Decoder::new(&wire, &temp, &IdentityObjects, &hard);
+        let mut got = VkPipelineMultisampleStateCreateInfo::default();
+        vn_decode_VkPipelineMultisampleStateCreateInfo_self_temp(&mut dec, &mut got);
+        assert!(!dec.fatal());
+        assert_eq!(got.rasterizationSamples.0, 0);
+        assert!(got.pSampleMask.is_null(), "a mask of no words is no mask");
+    }
+
     /// A bitmask with a bit set that vk.xml does not define poisons the stream at the decode, as
     /// an undefined enum value does. anv indexes a four-entry table by the cull mode and
     /// KosmicKrisp switches on it with an `UNREACHABLE` default. A mask reserved for future use

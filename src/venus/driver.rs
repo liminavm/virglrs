@@ -12971,12 +12971,6 @@ impl cs::Validate<DeviceFacts<'_>> for VkGraphicsPipelineCreateInfo {
         }
         let is_dynamic = |state: D| dynamic.contains(&state);
         let samples_dynamic = is_dynamic(D::VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT);
-        if let Some(ms) = multisample {
-            let samples = ms.rasterizationSamples.0 as u32;
-            if !samples_dynamic && (samples.count_ones() != 1 || samples > 16) {
-                return Err("rasterized at a sample count no device has");
-            }
-        }
         // The two states the runtime reads with no null check: `may_have_rasterization` reads
         // the rasterization state of a pipeline with pre-rasterization shaders unless its discard
         // is dynamic, and the fragment output interface's multisample state gives its sample
@@ -12999,6 +12993,20 @@ impl cs::Validate<DeviceFacts<'_>> for VkGraphicsPipelineCreateInfo {
             return Err(
                 "made a pipeline with a fragment output interface and no multisample state",
             );
+        }
+        // The runtime reads the sample count of a part with fragment shader or fragment output
+        // state, unless the count is dynamic, and sizes its sample locations by it. Anywhere else
+        // Vulkan ignores it, and zink sends zero there, so the decoder leaves it to this check.
+        let fragment_shader = match parts {
+            Some(p) => p & L::VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT.0 as u32 != 0,
+            None => rasterizes,
+        };
+        let reads_samples = (fragment_shader || fragment_output) && !samples_dynamic;
+        if let Some(ms) = multisample.filter(|_| reads_samples) {
+            let samples = ms.rasterizationSamples.0 as u32;
+            if samples.count_ones() != 1 || samples > 16 {
+                return Err("rasterized at a sample count no device has");
+            }
         }
         Ok(())
     }
@@ -17705,10 +17713,17 @@ mod tests {
         };
         assert!(sampled(&samples(3), &[]).is_err(), "several sample counts at once");
         assert!(sampled(&samples(32), &[]).is_err(), "a sample count no device has");
+        let no_count = Err("rasterized at a sample count no device has");
+        assert_eq!(sampled(&samples(0), &[]), no_count, "no sample count at all");
         assert_eq!(
             sampled(&samples(3), &[Dy::VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT]),
             Ok(()),
             "a dynamic count is ignored"
+        );
+        assert_eq!(
+            sampled(&samples(0), &[Dy::VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT]),
+            Ok(()),
+            "and may be zero, as zink sends it"
         );
         let located = |enable: u32| {
             let chain = VkPipelineSampleLocationsStateCreateInfoEXT {
@@ -17859,6 +17874,22 @@ mod tests {
         );
         let with_ms = VkGraphicsPipelineCreateInfo { pMultisampleState: &ms, ..fragment_output };
         assert_eq!(part(output, with_ms), Ok(()), "a fragment output with its multisample state");
+        let no_samples = samples(0);
+        let zero_ms = VkGraphicsPipelineCreateInfo { pMultisampleState: &no_samples, ..with_ms };
+        let no_count = Err("rasterized at a sample count no device has");
+        assert_eq!(part(output, zero_ms), no_count, "a fragment output reads its sample count");
+        let shader = L::VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
+        assert_eq!(part(shader, zero_ms), no_count, "and so does a fragment shader given one");
+        let zero_raster =
+            VkGraphicsPipelineCreateInfo { pMultisampleState: &no_samples, ..with_raster };
+        assert_eq!(
+            part(pre, zero_raster),
+            Ok(()),
+            "pre-rasterization shaders ignore a sample count, as zink sends it"
+        );
+        let zero_linking =
+            VkGraphicsPipelineCreateInfo { pMultisampleState: &no_samples, ..linking };
+        assert_eq!(made(zero_linking), Ok(()), "and so does a link of libraries");
         d.abandon_planted();
     }
 

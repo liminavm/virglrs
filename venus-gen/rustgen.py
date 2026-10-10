@@ -627,7 +627,17 @@ class RustGen:
                 out.append((self.field_name(var.name), '%s::witness_default()' % base.name))
         return out
 
-    def _enum_check(self, var, validity, value, plain=False):
+    # Members vk.xml leaves to the automatic check that Vulkan nonetheless ignores in a state the
+    # decoder cannot see, each with where it is checked instead. The registry has no word for
+    # "ignored when another field says so", so this is a list, and every entry names its reason.
+    VALUE_CHECKED_ELSEWHERE = {
+        # Ignored when the sample count is dynamic, and by a pipeline part that reads no
+        # multisample state; zink sends zero for both. The graphics pipeline create checks it
+        # where the Mesa runtime reads it.
+        ('VkPipelineMultisampleStateCreateInfo', 'rasterizationSamples'),
+    }
+
+    def _enum_check(self, ty, var, validity, value, plain=False):
         """Statements refusing an enum `value` vk.xml does not define, or a bitmask `value`
         with a bit set that vk.xml does not define, for a member whose validity vk.xml has not
         left to other fields. Empty for anything else.
@@ -637,7 +647,8 @@ class RustGen:
         sample count when the pass has no attachments, or an external handle type nothing is
         imported with. An array element's `optional` speaks of the pointer, not the values."""
         if (var.ty.base.category not in (VkType.ENUM, VkType.BITMASK) or validity == Gen_INVALID
-                or not var.can_validate()):
+                or not var.can_validate()
+                or (ty.name, var.name) in self.VALUE_CHECKED_ELSEWHERE):
             return []
         if plain and var.is_optional() and var.ty.base.category == VkType.ENUM:
             return ['if %s.0 != 0 && !%s.is_defined() {' % (value, value),
@@ -989,7 +1000,7 @@ class RustGen:
                 return ['/* skip %s */' % m]
             if elem_kind == 'scalar':
                 return (['%s = dec.decode_scalar::<%s>();' % (m, elem)]
-                        + self._enum_check(var, validity, m, plain=True))
+                        + self._enum_check(ty, var, validity, m, plain=True))
             if capture:
                 return ['val.%s = %s(dec, &mut %s);' % (capture, elem, m)]
             return ['%s(dec, &mut %s%s);' % (elem, m, tag)]
@@ -1119,7 +1130,7 @@ class RustGen:
         if validity != Gen_INVALID:
             if elem_kind == 'scalar':
                 hit.append('dec.decode_scalar_array(a);')
-                check = self._enum_check(var, validity, 'e')
+                check = self._enum_check(ty, var, validity, 'e')
                 if check:
                     hit += ['for e in a.iter() {'] + ['    ' + l for l in check] + ['}']
             elif capture:
