@@ -6013,6 +6013,13 @@ SABOTAGES = [
         'a_draw_is_held_to_what_its_pipeline_draws',
     ),
     (
+        'an optional enum member is refused at zero',
+        'venus-gen/rustgen.py',
+        """        if plain and var.is_optional() and var.ty.base.category == VkType.ENUM:""",
+        """        if False:""",
+        'an_optional_enum_member_may_be_zero',
+    ),
+    (
         'a submit chained array is trusted by its count alone',
         'src/venus/driver.rs',
         """count == wanted && (wanted == 0 || !array.is_null())""",

@@ -1979,6 +1979,42 @@ mod tests {
         assert!(!bind(VkIndexType(-1)), "nor a negative one");
     }
 
+    /// A member vk.xml marks `optional` may be zero even where its enum defines no zero: that is
+    /// the registry's "none". An image format query with no external handle type sends one, and
+    /// so does an inheritance whose rendering has no attachments. Any other value is still held
+    /// to the registry.
+    #[test]
+    fn an_optional_enum_member_may_be_zero() {
+        use crate::venus::proto::serialize::{
+            vn_decode_VkPhysicalDeviceExternalImageFormatInfo_self_temp,
+            vn_encode_VkPhysicalDeviceExternalImageFormatInfo_self,
+        };
+        use crate::venus::proto::types::{
+            VkExternalMemoryHandleTypeFlagBits as H, VkPhysicalDeviceExternalImageFormatInfo,
+        };
+        let query = |handle: H| {
+            let sent = VkPhysicalDeviceExternalImageFormatInfo {
+                handleType: handle,
+                ..Default::default()
+            };
+            let mut wire = Vec::new();
+            vn_encode_VkPhysicalDeviceExternalImageFormatInfo_self(
+                &mut Encoder::growing(&mut wire, &AllOfIt),
+                &sent,
+            );
+            let (temp, hard) = (Bump::new(), AtomicBool::new(false));
+            let mut dec = Decoder::new(&wire, &temp, &IdentityObjects, &hard);
+            vn_decode_VkPhysicalDeviceExternalImageFormatInfo_self_temp(
+                &mut dec,
+                &mut VkPhysicalDeviceExternalImageFormatInfo::default(),
+            );
+            !dec.fatal()
+        };
+        assert!(query(H(0)), "no handle type");
+        assert!(query(H::VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT), "a defined one");
+        assert!(!query(H(3)), "but not two at once");
+    }
+
     /// A bitmask with a bit set that vk.xml does not define poisons the stream at the decode, as
     /// an undefined enum value does. anv indexes a four-entry table by the cull mode and
     /// KosmicKrisp switches on it with an `UNREACHABLE` default. A mask reserved for future use

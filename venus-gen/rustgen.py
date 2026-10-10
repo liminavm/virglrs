@@ -627,13 +627,21 @@ class RustGen:
                 out.append((self.field_name(var.name), '%s::witness_default()' % base.name))
         return out
 
-    def _enum_check(self, var, validity, value):
+    def _enum_check(self, var, validity, value, plain=False):
         """Statements refusing an enum `value` vk.xml does not define, or a bitmask `value`
         with a bit set that vk.xml does not define, for a member whose validity vk.xml has not
-        left to other fields. Empty for anything else."""
+        left to other fields. Empty for anything else.
+
+        A `plain` member vk.xml marks `optional` may also be zero, which is how the registry says
+        "none" for an enum that defines no zero -- `VkCommandBufferInheritanceRenderingInfo`'s
+        sample count when the pass has no attachments, or an external handle type nothing is
+        imported with. An array element's `optional` speaks of the pointer, not the values."""
         if (var.ty.base.category not in (VkType.ENUM, VkType.BITMASK) or validity == Gen_INVALID
                 or not var.can_validate()):
             return []
+        if plain and var.is_optional() and var.ty.base.category == VkType.ENUM:
+            return ['if %s.0 != 0 && !%s.is_defined() {' % (value, value),
+                    '    dec.set_fatal();', '}']
         return ['if !%s.is_defined() {' % value, '    dec.set_fatal();', '}']
 
     # ------------------------------------------------------------------
@@ -981,7 +989,7 @@ class RustGen:
                 return ['/* skip %s */' % m]
             if elem_kind == 'scalar':
                 return (['%s = dec.decode_scalar::<%s>();' % (m, elem)]
-                        + self._enum_check(var, validity, m))
+                        + self._enum_check(var, validity, m, plain=True))
             if capture:
                 return ['val.%s = %s(dec, &mut %s);' % (capture, elem, m)]
             return ['%s(dec, &mut %s%s);' % (elem, m, tag)]
