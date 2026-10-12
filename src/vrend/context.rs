@@ -1437,6 +1437,13 @@ impl Context {
     }
 
     /// This context's fences in flight. See [`super::in_flight`].
+    /// Whether END_FRAME into this context's video target `handle` would wait for the picture;
+    /// see [`video::Video::settles_at_end_frame`].
+    #[cfg(test)]
+    pub fn video_settles_at_end_frame(&self, handle: VideoBufferHandle) -> Option<bool> {
+        self.video.settles_at_end_frame(handle)
+    }
+
     pub fn in_flight(&self) -> &super::in_flight::Gate {
         &self.in_flight
     }

@@ -631,6 +631,17 @@ impl Vrend {
         c
     }
 
+    /// Whether END_FRAME into context `ctx`'s video target `handle` would wait for the picture,
+    /// or `None` for a context or target that is not here.
+    #[cfg(test)]
+    pub fn video_settles_at_end_frame(
+        &self,
+        ctx: ContextId,
+        handle: super::proto::VideoBufferHandle,
+    ) -> Option<bool> {
+        self.contexts.get(&ctx)?.video_settles_at_end_frame(handle)
+    }
+
     /// One context's journal, as the bytes the VMM stores and hands back.
     ///
     /// `None` for a context that is not here. An empty journal still serializes: a context that
