@@ -97,6 +97,12 @@ impl Landing {
         matches!(&*self.lock(), Stage::Landed(Outcome::Picture(picture)) if test(picture))
     }
 
+    /// Whether the decode thread wrote the picture into the target's surfaces itself.
+    #[cfg(test)]
+    pub fn written(&self) -> bool {
+        matches!(&*self.lock(), Stage::Landed(Outcome::Written))
+    }
+
     fn landed_guard(&self) -> MutexGuard<'_, Stage> {
         let mut stage = self.lock();
         while matches!(*stage, Stage::InFlight) {
