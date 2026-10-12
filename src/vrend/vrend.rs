@@ -5497,25 +5497,30 @@ mod tests {
     /// is generated on stream 0 and none on stream 1. A statistic past the table is refused,
     /// and a host without the queries -- GLES has none of them -- refuses them, as its caps never
     /// offered them.
+    ///
+    /// The overflow query counts a draw of its own. radeonsi (Mesa 26.2.4) answers it TRUE with
+    /// no stream-out bound while a primitives-generated query is open beside it, which a bare GL
+    /// program reproduces, so beside one it would score the host driver rather than the
+    /// translation (`docs/linux-port.md`).
     #[test]
     fn pipeline_statistics_and_overflow_queries_count_where_the_host_has_them() {
         use crate::vrend::pipe::QueryType;
         use crate::vrend::proto::{Command, Object, QueryCreate};
         let h = |n| ResourceHandle::new(n).expect("non-zero");
         let o = |n| ObjectHandle::new(n).expect("non-zero");
-        // VIRGL_STAT_QUERY_IA_VERTICES and _IA_PRIMITIVES, then the overflow of any stream.
-        let queries = |stat0: u16| {
-            [
+        // VIRGL_STAT_QUERY_IA_VERTICES and _IA_PRIMITIVES, then generated on streams 0 and 1.
+        let counted = |stat0: u16| {
+            vec![
                 (o(20), h(10), QueryType::PipelineStatistics, stat0),
                 (o(21), h(11), QueryType::PipelineStatistics, 1),
-                (o(22), h(12), QueryType::SoOverflowAnyPredicate, 0),
                 (o(23), h(13), QueryType::PrimitivesGenerated, 0),
                 (o(24), h(14), QueryType::PrimitivesGenerated, 1),
             ]
         };
-        let run = |host_gl, stat0| {
+        // The overflow of any stream.
+        let overflow = vec![(o(22), h(12), QueryType::SoOverflowAnyPredicate, 0)];
+        let run = |host_gl, qs: &[(ObjectHandle, ResourceHandle, QueryType, u16)]| {
             let read = std::cell::RefCell::new(Vec::new());
-            let qs = queries(stat0);
             let more = More {
                 resources: qs
                     .iter()
@@ -5560,21 +5565,24 @@ mod tests {
                 && host_has(host_gl, Feature::transform_feedback_overflow_query)
                 && host_has(host_gl, Feature::transform_feedback3);
             if !has {
-                let ran = run(host_gl, 0);
+                let ran = run(host_gl, &[counted(0), overflow.clone()].concat());
                 assert!(
                     matches!(ran, Err(Fault::NoFeature { .. })),
                     "{host_gl:?}: a host without the queries refuses them: {ran:?}"
                 );
                 continue;
             }
-            let read = run(host_gl, 0).expect("the draw runs");
             let word = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
             let result = |b: &[u8]| u64::from_le_bytes(b[8..16].try_into().unwrap());
-            for (b, want) in read.iter().zip([3, 1, 0, 1, 0]) {
-                assert_eq!(word(b, 0), 1, "{host_gl:?}: VIRGL_QUERY_STATE_DONE");
-                assert_eq!(result(b), want, "{host_gl:?}: the counted value");
+            for (qs, wants) in [(counted(0), &[3, 1, 1, 0][..]), (overflow.clone(), &[0][..])] {
+                let read = run(host_gl, &qs).expect("the draw runs");
+                assert_eq!(read.len(), wants.len(), "{host_gl:?}: every query read back");
+                for (b, want) in read.iter().zip(wants) {
+                    assert_eq!(word(b, 0), 1, "{host_gl:?}: VIRGL_QUERY_STATE_DONE");
+                    assert_eq!(result(b), *want, "{host_gl:?}: the counted value");
+                }
             }
-            let past = run(host_gl, 11);
+            let past = run(host_gl, &counted(11));
             assert!(
                 matches!(past, Err(Fault::OutOfRange { .. })),
                 "{host_gl:?}: no twelfth statistic: {past:?}"

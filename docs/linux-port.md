@@ -518,16 +518,13 @@ fails on the Mac with 132 submits replayed against the pin's 2238, identically b
 2026-09-04. The cause is not established: a capture older than its pin is the first thing to
 rule out.
 
-**A vrend unit test fails on radeonsi** (banana: Radeon 890M, Fedora 44, Mesa 26.2.4), at
-9e4906b and identically at its parent, so no native-context change caused it. The suite on
-goiaba's iris passes it. Chased after the native-context work:
-
-- `vrend::vrend::tests::pipeline_statistics_and_overflow_queries_count_where_the_host_has_them` --
-  the stream-out overflow query reads 1 with no transform feedback bound. It is radeonsi's: a
-  bare EGL program reproduces it on banana (Mesa 26.2.4) and not on goiaba's iris, and only
-  while a `PRIMITIVES_GENERATED` query is open beside it -- the overflow query alone reads 0. The
-  renderer issues `GL_TRANSFORM_FEEDBACK_OVERFLOW` as the C does, so both legs answer a guest
-  the same wrong value.
+**radeonsi reports a stream-out overflow that never happened** (banana: Radeon 890M, Mesa 26.2.4).
+A `GL_TRANSFORM_FEEDBACK_OVERFLOW` query over a draw with no transform feedback bound reads TRUE
+while a `PRIMITIVES_GENERATED` query is open beside it, and FALSE alone; iris reads FALSE both
+ways. A bare EGL program reproduces it, and the renderer issues the same query as the C, so a
+guest nesting the two reads the wrong value on either leg. The overflow test counts a draw of
+its own so it scores the translation, not the driver. The upstream report is drafted, not
+filed.
 
 ## Missing infrastructure
 
