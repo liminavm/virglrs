@@ -250,7 +250,7 @@ pub struct Winsys {
     linear: Option<std::sync::Mutex<crate::gbm::Allocator>>,
     /// Which of [`Winsys::linear_surface`]'s two answers has been reported.
     pub linear_said: Said,
-    /// Whether the host GL's refusal of a video plane's surface has been reported.
+    /// Which of the host GL's two answers to a video plane's surface has been reported.
     pub plane_surface_said: Said,
 }
 
