@@ -2156,8 +2156,10 @@ impl Renderer {
     /// whose own renderer imports it: the same pages, whichever of vrend, venus or the embedder
     /// made them.
     ///
-    /// Only single-plane 32-bit surfaces. `Err(NotExportable)` for a resource with no surface or
-    /// another kind of one, `Err(NoResource)` when the handle names nothing.
+    /// Only single-plane surfaces: the four 32-bit formats and a video plane's R8 or RG8.
+    /// `Err(NotExportable)` for a resource with no surface or another kind of one,
+    /// `Err(NoResource)` when the handle names nothing. `&mut self` because a classic resource's
+    /// surface is settled before it is handed out, and a decode may still be landing in it.
     #[cfg(target_os = "macos")]
     pub fn resource_surface_port(
         &mut self,
@@ -3228,9 +3230,6 @@ mod tests {
         );
     }
 
-    /// A surface minted for the embedder is a texture's storage to a classic context that attaches
-    /// and types it, and a share to a venus one: the embedder's renderer and both of ours meet in
-    /// the same pages, with no copy between them.
     /// Whichever renderer made a resource's surface, the embedder can have it to import: a gbm
     /// buffer vrend minted one for, and one the embedder minted itself. A resource with GL storage
     /// has none to give.
@@ -3741,6 +3740,9 @@ mod tests {
         assert_eq!(read, bytes, "and reads back what was written");
     }
 
+    /// A surface minted for the embedder is a texture's storage to a classic context that attaches
+    /// and types it, and a share to a venus one: the embedder's renderer and both of ours meet in
+    /// the same pages, with no copy between them.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_embedders_surface_is_adopted_by_vrend_and_lent_to_venus() {
