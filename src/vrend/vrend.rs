@@ -717,10 +717,10 @@ impl Vrend {
         })
     }
 
-    /// Finish rebuilding a classic context, and report what it could not use.
-    pub fn replay_end(&mut self, ctx: ClassicCtx) -> Result<(), ReplayRefused> {
-        self.contexts.get_mut(&ctx.id()).ok_or(ReplayRefused::NoContext)?.replay_end();
-        Ok(())
+    /// Finish rebuilding a classic context, and report what it could not use: how many retained
+    /// commands it dropped.
+    pub fn replay_end(&mut self, ctx: ClassicCtx) -> Result<u64, ReplayRefused> {
+        Ok(self.contexts.get_mut(&ctx.id()).ok_or(ReplayRefused::NoContext)?.replay_end())
     }
 
     // ---- contexts ----
