@@ -1434,6 +1434,13 @@ Mesa has `-Damdgpu-virtio=true`, which Fedora's does not. The rig lives outside 
   captured frame is read. Run it with `-M rgba`: the textured cube imports a buffer from one
   native context into another, which the plain cube never does. Measured 2026-10-12: both legs
   draw the textured cube, two captures apart showing it turned.
+- **RADV, by vkmark on KMS.** `vkmark --winsys kms` with only the radeon ICD needs no compositor,
+  and its buffers cross from the guest's GBM into RADV. `vkcube --wsi display` cannot score this:
+  RADV on a virtio render node has no display to offer, on either leg. Measured 2026-10-12, cube
+  for 20 s: virglrs 5938 and 6090 fps, C 6206, the cube on screen.
+- **glmark2 `--validate` is not a correctness score here.** `glmark2-es2-drm` runs fullscreen at
+  the KMS mode, and its references are for a fixed size, so most scenes read `Failure` on both
+  legs alike. Compare the two legs' lists, never one list against all-pass.
 
 The control is Fedora's own libvirglrenderer, built without any native-context backend: asked for
 one, it fails its init, QEMU turns 3D off, and the guest has no render node at all. A gate that

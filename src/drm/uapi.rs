@@ -335,6 +335,32 @@ pub struct AmdgpuGemOp {
 
 pub const AMDGPU_GEM_OP_GET_GEM_CREATE_INFO: u32 = 0;
 
+/// `struct drm_amdgpu_vm_in`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuVmIn {
+    pub op: u32,
+    pub flags: u32,
+}
+
+pub const AMDGPU_VM_OP_RESERVE_VMID: u32 = 1;
+pub const AMDGPU_VM_OP_UNRESERVE_VMID: u32 = 2;
+pub const AMDGPU_CTX_OP_GET_STABLE_PSTATE: u32 = 5;
+pub const AMDGPU_CTX_OP_SET_STABLE_PSTATE: u32 = 6;
+
+/// `struct drm_amdgpu_wait_cs_in`; the answer's `status`, nonzero while busy, overlays `handle`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuWaitCsIn {
+    pub handle: u64,
+    /// Absolute, in the host's `CLOCK_MONOTONIC` nanoseconds.
+    pub timeout: u64,
+    pub ip_type: u32,
+    pub ip_instance: u32,
+    pub ring: u32,
+    pub ctx_id: u32,
+}
+
 /// `AMDGPU_CHUNK_ID_*`.
 pub mod chunk {
     pub const IB: u32 = 0x01;
@@ -361,6 +387,8 @@ const _: () = {
     assert!(size_of::<AmdgpuGemCreate>() == 32);
     assert!(size_of::<AmdgpuGemVa>() == 40);
     assert!(size_of::<AmdgpuCtxIn>() == 16);
+    assert!(size_of::<AmdgpuVmIn>() == 8);
+    assert!(size_of::<AmdgpuWaitCsIn>() == 32);
     assert!(size_of::<AmdgpuGemMetadata>() == 288);
     assert!(size_of::<AmdgpuGemOp>() == 16);
     assert!(size_of::<AmdgpuCsIn>() == 24);

@@ -88,9 +88,6 @@ held by the context under its `blob_id`, until `get_blob` binds it to a resource
   buffer a file already holds with the handle it already has, and a GEM handle closes once. A
   guest that closes a buffer and reopens it in the same context reaches exactly that.
 
-The bind refuses a blob larger than its buffer. The C does not check, and maps the buffer's size
-for a blob of any size.
-
 The storage holds the `Gem`, not a dma-buf, because most of radeonsi's buffers cannot be exported
 at all: the kernel refuses a dma-buf for a buffer created `VM_ALWAYS_VALID`
 (`amdgpu_dma_buf.c`, `-EPERM`), and the capset tells the guest it may use that flag. So a buffer
@@ -141,13 +138,23 @@ and the heap info from several `AMDGPU_INFO` queries plus its own arithmetic, an
 from `amdgpu.ids`, a data file read at run time, which this reads too. A guest Mesa is configured by
 those bytes, so they are scored byte for byte against the C leg.
 
-The C has two holes this closes at the boundary:
+The C has holes this closes at the boundary:
 
-- `CS_SUBMIT` and `SET_PSTATE` with an unknown context id hand the C a null context, which libdrm
-  dereferences. Here that is a rejected request.
+- `CS_SUBMIT` with an unknown context id hands the C a null context, which libdrm dereferences.
+  Here that is a rejected request.
+- `SET_PSTATE` passes the guest's operation to `DRM_AMDGPU_CTX` as it came, so a guest can free a
+  GPU context the host still holds. Only the two power-state operations reach the kernel here.
 - `CS_QUERY_FENCE_STATUS` takes a guest-chosen timeout and blocks the submitting thread for it.
-  Refusing a non-zero timeout would break RADV, whose wait-idle sends one second. The timeout is
-  bounded instead; see below.
+  Refusing a non-zero timeout would break RADV, whose wait-idle sends one second, so the wait is
+  bounded at one second instead: no guest Mesa asks for more, and a hostile one stalls its own
+  context for at most that. An absolute deadline is in the guest's clock, which the host does not
+  share, and gets the same bound.
+- A blob larger than its buffer: the C maps the buffer's size whatever the blob claims. Here the
+  bind refuses a blob past the buffer's last page; the guest's kernel rounds a blob up to a page,
+  and the host's allocated the same page.
+- Importing a buffer into a device file that already holds it hands back the handle it already
+  has. libdrm counts that; here the sys layer refuses the second owner, so no handle is ever
+  closed twice.
 
 ## The C ABI
 
@@ -198,9 +205,6 @@ match sites refuse it as they refuse an unserved context today.
 
 - Refusing buffers over budget. It needs a per-context account, which today only venus mints.
 
-- The `CS_QUERY_FENCE_STATUS` bound. Recommended: one second, the most the guest's driver asks
-  for, so no guest that Mesa ships is changed by it, and a hostile one stalls its device for at
-  most that.
 - Whether a failed command's response is delivered. The C drops it, along with the seqno update,
   and aborts the rest of the batch; matching that is the default, since the guest was written
   against it.

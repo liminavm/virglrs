@@ -160,6 +160,49 @@ pub struct BoQueryInfoRsp {
     pub pad2: u32,
 }
 
+/// `struct amdgpu_ccmd_reserve_vmid_req`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct ReserveVmidReq {
+    pub hdr: ReqHeader,
+    pub flags: u64,
+}
+
+/// `AMDGPU_CCMD_RESERVE_VMID_UNRESERVE`.
+pub const RESERVE_VMID_UNRESERVE: u64 = 1;
+
+/// `struct amdgpu_ccmd_set_pstate_req`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct SetPstateReq {
+    pub hdr: ReqHeader,
+    pub ctx_id: u32,
+    pub op: u32,
+    pub flags: u32,
+    pub pad: u32,
+}
+
+/// `struct amdgpu_ccmd_cs_query_fence_status_req`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct QueryFenceStatusReq {
+    pub hdr: ReqHeader,
+    pub ctx_id: u32,
+    pub ip_type: u32,
+    pub ip_instance: u32,
+    pub ring: u32,
+    pub fence: u64,
+    pub timeout_ns: u64,
+    pub flags: u64,
+}
+
+/// `AMDGPU_QUERY_FENCE_TIMEOUT_IS_ABSOLUTE`.
+pub const FENCE_TIMEOUT_IS_ABSOLUTE: u64 = 1;
+
+/// The answers to `SET_PSTATE` and `CS_QUERY_FENCE_STATUS`: the result, then one word.
+pub const RSP_WITH_WORD: usize = 16;
+pub const RSP_WORD: usize = 8;
+
 /// `AMDGPU_CCMD_CS_SUBMIT_MAX_NUM_CHUNKS`.
 pub const MAX_CHUNKS: u32 = 128;
 
@@ -169,6 +212,9 @@ const _: () = {
     assert!(size_of::<CsSubmitReq>() == 32);
     assert!(size_of::<ChunkDesc>() == 8);
     assert!(size_of::<SetMetadataReq>() == 40);
+    assert!(size_of::<ReserveVmidReq>() == 24);
+    assert!(size_of::<SetPstateReq>() == 32);
+    assert!(size_of::<QueryFenceStatusReq>() == 56);
     assert!(size_of::<BoQueryInfoReq>() == 24);
     assert!(size_of::<BoQueryInfoRsp>() == 320);
     assert!(size_of::<GemNewReq>() == 56);

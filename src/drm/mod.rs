@@ -154,9 +154,9 @@ impl std::fmt::Display for Refused {
 pub struct Buffer {
     #[cfg(all(target_os = "linux", feature = "drm"))]
     object: Arc<Object>,
-    /// The same buffer in other contexts' device files, one per file.
+    /// The same buffer in other contexts' device files.
     #[cfg(all(target_os = "linux", feature = "drm"))]
-    imports: Vec<Arc<Object>>,
+    imports: Imports,
     /// Made the first time the VMM asks, as the C maps at `resource_map`: most buffers are never
     /// mapped, and one the CPU cannot reach refuses it. A refusal is kept as the answer.
     #[cfg(all(target_os = "linux", feature = "drm"))]
@@ -171,7 +171,7 @@ pub struct Buffer {
 impl Buffer {
     #[cfg(all(target_os = "linux", feature = "drm"))]
     fn new(object: Arc<Object>, dmabuf: Option<std::os::fd::OwnedFd>) -> Buffer {
-        Buffer { object, imports: Vec::new(), map: std::sync::OnceLock::new(), dmabuf }
+        Buffer { object, imports: Imports::default(), map: std::sync::OnceLock::new(), dmabuf }
     }
 
     /// Where the buffer is mapped in this process, and how far: mapped now if it was not yet.
@@ -224,6 +224,31 @@ impl Buffer {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "drm"))]
+impl Object {
+    /// How much memory the buffer has: what the guest asked for, in whole pages, as the kernel
+    /// allocates it. The guest's kernel rounds a blob the same way, so this is what a blob of the
+    /// buffer may cover and what a mapping of it spans.
+    pub fn extent(&self) -> Option<usize> {
+        usize::try_from(self.size).ok().and_then(crate::guest_mem::page_round)
+    }
+}
+
+/// A resource's storage imported into native contexts' device files: at most one copy per file,
+/// owned here, so a context's name for one stops resolving when the resource goes.
+#[derive(Default)]
+pub struct Imports {
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    copies: Vec<Arc<Object>>,
+}
+
+/// What a context attached to a resource can name: the resource's native buffer, or the dma-buf
+/// of storage some other renderer holds, with the copies already imported from it.
+pub enum Source<'a> {
+    Native(&'a mut Buffer),
+    Foreign { imports: &'a mut Imports, dmabuf: std::os::fd::OwnedFd },
+}
+
 /// A kernel buffer and what was known of it when it was made. Shared by the context that made it
 /// and the resource it was bound to.
 #[cfg(all(target_os = "linux", feature = "drm"))]
@@ -235,16 +260,6 @@ pub struct Object {
     /// What the buffer is counted as, for as long as it lives. An import is the same memory
     /// again, and is not counted twice.
     pub _charge: Option<crate::budget::Charge>,
-}
-
-#[cfg(all(target_os = "linux", feature = "drm"))]
-impl Object {
-    /// How much memory the buffer has: what the guest asked for, in whole pages, as the kernel
-    /// allocates it. The guest's kernel rounds a blob the same way, so this is what a blob of the
-    /// buffer may cover and what a mapping of it spans.
-    pub fn extent(&self) -> Option<usize> {
-        usize::try_from(self.size).ok().and_then(crate::guest_mem::page_round)
-    }
 }
 
 /// The native-context root: the backend this host has, its capset, and the contexts open on it.
@@ -383,15 +398,15 @@ impl Native {
         Some(self.contexts.get_mut(&ctx)?.get_blob(handle, blob, size, flags))
     }
 
-    /// `ctx` was attached to `handle`, whose buffer is `buffer`. A buffer the context does not
-    /// name yet is named, imported onto its device file first if it was made in another.
+    /// `ctx` was attached to `handle`, whose storage is `source`. Storage the context does not
+    /// name yet is named, imported onto its device file first when it is not already there.
     pub fn attach(
         &mut self,
         ctx: ContextId,
         handle: ResourceHandle,
-        buffer: &mut Buffer,
+        source: Source<'_>,
     ) -> Option<Result<(), Refused>> {
-        Some(self.contexts.get_mut(&ctx)?.attach(handle, buffer))
+        Some(self.contexts.get_mut(&ctx)?.attach(handle, source))
     }
 
     /// `ctx` detached `handle`: the guest closed it there. The resource keeps its share.

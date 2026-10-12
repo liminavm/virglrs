@@ -7,7 +7,7 @@
 use super::proto::{self, ReqHeader};
 use super::region::ResponseRegion;
 use super::timeline::Timelines;
-use super::{Buffer, Refused};
+use super::{Buffer, Refused, Source};
 use crate::guest_mem::GuestMap;
 use crate::ids::{BlobId, FenceId, ResourceHandle, RingIdx};
 use std::os::fd::OwnedFd;
@@ -51,9 +51,9 @@ pub trait Backend: Send {
         region: Option<&ResponseRegion>,
     ) -> Result<Buffer, Refused>;
 
-    /// Name `buffer` as `handle` in this context, if it does not already: the copy on this
+    /// Name `source` as `handle` in this context, if it does not already: the copy on this
     /// context's device file, imported now if there is none.
-    fn attach(&mut self, handle: ResourceHandle, buffer: &mut Buffer) -> Result<(), Refused>;
+    fn attach(&mut self, handle: ResourceHandle, source: Source<'_>) -> Result<(), Refused>;
 
     /// Let go of whatever buffer `handle` names in this context.
     fn forget(&mut self, handle: ResourceHandle);
@@ -155,8 +155,8 @@ impl Context {
         self.backend.get_blob(handle, id, size, flags, self.region.as_ref())
     }
 
-    pub fn attach(&mut self, handle: ResourceHandle, buffer: &mut Buffer) -> Result<(), Refused> {
-        self.backend.attach(handle, buffer)
+    pub fn attach(&mut self, handle: ResourceHandle, source: Source<'_>) -> Result<(), Refused> {
+        self.backend.attach(handle, source)
     }
 
     pub fn forget(&mut self, handle: ResourceHandle) {
@@ -247,7 +247,7 @@ mod tests {
         ) -> Result<Buffer, Refused> {
             Err(Refused::NoSuchBlob(blob as u64))
         }
-        fn attach(&mut self, _handle: ResourceHandle, _buffer: &mut Buffer) -> Result<(), Refused> {
+        fn attach(&mut self, _handle: ResourceHandle, _source: Source<'_>) -> Result<(), Refused> {
             Ok(())
         }
         fn forget(&mut self, _handle: ResourceHandle) {}

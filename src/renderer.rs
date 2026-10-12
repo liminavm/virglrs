@@ -454,6 +454,9 @@ pub struct Resource {
     /// Contexts this resource is attached to. A resource outlives the contexts that used it, so
     /// this is what says whether an unref may actually free it.
     pub attached: Vec<ContextId>,
+    /// This resource's storage imported into native contexts, for one that is not a native
+    /// buffer itself (which keeps its own). Owned here so it goes with the resource.
+    pub native_imports: crate::drm::Imports,
 }
 
 // The resource table is shared with every ring thread, so it must be safe to read from more than
@@ -1112,6 +1115,7 @@ impl Renderer {
             iov,
             priv_: VmmPtr::NULL,
             attached: Vec::new(),
+            native_imports: Default::default(),
             host: self.claim(handle),
         };
         self.resources.write().expect("the resource lock is never poisoned").insert(handle, r);
@@ -1377,26 +1381,38 @@ impl Renderer {
                 r.attached.push(ctx);
             }
         });
-        // A native context names the resource's buffer, importing it onto its own device file
-        // when another context made it. Only a native buffer is imported for now.
-        if let Bound::Native(n) = bound
-            && let Some(native) = self.native.as_mut()
-        {
-            let mut table = self.resources.write().expect("the resource lock is never poisoned");
-            let buffer = table.get_mut(&handle).and_then(|r| match &mut r.backing {
-                Backing::Blob { storage: BlobStorage::Native(b), .. } => Some(b),
-                Backing::Blob { .. } | Backing::Classic { .. } | Backing::Imported { .. } => None,
-            });
-            match buffer.map(|b| native.attach(n.id(), handle, b)) {
-                Some(Some(Err(r))) => {
-                    native_refused(ctx, r);
+        // A native context names the resource's storage, imported onto its own device file when
+        // it is not there already: a native buffer from another context, or the dma-buf of what
+        // classic or venus holds. Storage with no dma-buf is not importable, and the C passes
+        // over it the same way; a command that names it later is refused then.
+        if let Bound::Native(n) = bound {
+            let native_buffer = self
+                .with_resource(handle, |r| {
+                    matches!(r.backing, Backing::Blob { storage: BlobStorage::Native(_), .. })
+                })
+                .unwrap_or(false);
+            let dmabuf = if native_buffer {
+                None
+            } else {
+                match self.resource_export(handle) {
+                    Ok((fd, _, _)) => Some(fd),
+                    Err(_) => return,
                 }
-                Some(None) | Some(Some(Ok(()))) => {}
-                None => eprintln!(
-                    "[virglrs] ctx {}: resource {handle} is not a native buffer, which this \
-                     context cannot import yet",
-                    ctx.get()
-                ),
+            };
+            let Some(native) = self.native.as_mut() else { return };
+            let mut table = self.resources.write().expect("the resource lock is never poisoned");
+            let Some(r) = table.get_mut(&handle) else { return };
+            let source = match (dmabuf, &mut r.backing) {
+                (None, Backing::Blob { storage: BlobStorage::Native(b), .. }) => {
+                    crate::drm::Source::Native(b)
+                }
+                (Some(dmabuf), _) => {
+                    crate::drm::Source::Foreign { imports: &mut r.native_imports, dmabuf }
+                }
+                (None, _) => unreachable!("decided above, under the same handle"),
+            };
+            if let Some(Err(refused)) = native.attach(n.id(), handle, source) {
+                native_refused(ctx, refused);
             }
             return;
         }
@@ -2944,6 +2960,7 @@ mod tests {
             iov: Vec::new(),
             priv_: VmmPtr(core::ptr::null_mut()),
             attached,
+            native_imports: Default::default(),
         };
 
         let mut table = crate::Map::default();
@@ -2994,6 +3011,7 @@ mod tests {
                 iov: Vec::new(),
                 priv_: VmmPtr(core::ptr::null_mut()),
                 attached: vec![one],
+                native_imports: Default::default(),
             },
         );
         assert!(
@@ -3024,6 +3042,7 @@ mod tests {
                 iov: Vec::new(),
                 priv_: VmmPtr(core::ptr::null_mut()),
                 attached: vec![one],
+                native_imports: Default::default(),
             },
         );
         assert!(
@@ -3077,6 +3096,7 @@ mod tests {
             iov: Vec::new(),
             priv_: VmmPtr(core::ptr::null_mut()),
             attached,
+            native_imports: Default::default(),
         };
 
         let mut table = crate::Map::default();
@@ -3149,6 +3169,7 @@ mod tests {
                 iov: Vec::new(),
                 priv_: VmmPtr(core::ptr::null_mut()),
                 attached: vec![one, two],
+                native_imports: Default::default(),
             },
         );
 
@@ -3196,6 +3217,7 @@ mod tests {
                 iov: Vec::new(),
                 priv_: VmmPtr(core::ptr::null_mut()),
                 attached: vec![two],
+                native_imports: Default::default(),
             },
         );
         assert_eq!(
