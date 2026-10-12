@@ -6,9 +6,11 @@
 
 use super::proto::{self, ReqHeader};
 use super::region::ResponseRegion;
+use super::timeline::Timelines;
 use super::{Buffer, Refused};
 use crate::guest_mem::GuestMap;
-use crate::ids::{BlobId, ResourceHandle};
+use crate::ids::{BlobId, FenceId, ResourceHandle, RingIdx};
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 /// `VIRTGPU_BLOB_FLAG_USE_MAPPABLE`, which the response region must be created with and alone.
@@ -49,8 +51,19 @@ pub trait Backend: Send {
         region: Option<&ResponseRegion>,
     ) -> Result<Buffer, Refused>;
 
+    /// Name `buffer` as `handle` in this context, if it does not already: the copy on this
+    /// context's device file, imported now if there is none.
+    fn attach(&mut self, handle: ResourceHandle, buffer: &mut Buffer) -> Result<(), Refused>;
+
     /// Let go of whatever buffer `handle` names in this context.
     fn forget(&mut self, handle: ResourceHandle);
+
+    /// How many hardware rings the guest may submit to; it numbers them from 1.
+    fn rings(&self) -> u32;
+
+    /// What the newest submission on `ring` signals, if the ring has submitted since this was
+    /// last taken.
+    fn take_last_submit(&mut self, ring: RingIdx) -> Option<OwnedFd>;
 }
 
 /// Where a request's answer is staged before the request is known to have succeeded.
@@ -81,11 +94,31 @@ pub struct Context {
     pub name: String,
     backend: Box<dyn Backend>,
     region: Option<ResponseRegion>,
+    /// `None` only for a backend with no rings.
+    timelines: Option<Timelines>,
 }
 
 impl Context {
-    pub fn new(name: String, backend: Box<dyn Backend>) -> Context {
-        Context { name, backend, region: None }
+    pub fn new(name: String, backend: Box<dyn Backend>, timelines: Option<Timelines>) -> Context {
+        assert!(
+            timelines.is_some() || backend.rings() == 0,
+            "a backend with rings has a waiter for them"
+        );
+        Context { name, backend, region: None, timelines }
+    }
+
+    /// Order `fence` behind the newest submission on `ring`, or behind the ring's earlier fences
+    /// when it has submitted nothing since. `Ok(false)` is ring 0, which the caller retires.
+    pub fn submit_fence(&mut self, ring: RingIdx, fence: FenceId) -> Result<bool, Refused> {
+        if ring.0 == 0 {
+            return Ok(false);
+        }
+        if ring.0 > self.backend.rings() {
+            return Err(Refused::Ring(ring.0));
+        }
+        let sync = self.backend.take_last_submit(ring);
+        self.timelines.as_ref().expect("checked at new").push(ring, sync, fence);
+        Ok(true)
     }
 
     /// Take `map` as this context's response region: the guest's blob 0, which it asked for
@@ -120,6 +153,10 @@ impl Context {
     ) -> Result<Buffer, Refused> {
         let id = u32::try_from(blob.0).ok().filter(|&id| id != 0).ok_or(Refused::BlobId(blob.0))?;
         self.backend.get_blob(handle, id, size, flags, self.region.as_ref())
+    }
+
+    pub fn attach(&mut self, handle: ResourceHandle, buffer: &mut Buffer) -> Result<(), Refused> {
+        self.backend.attach(handle, buffer)
     }
 
     pub fn forget(&mut self, handle: ResourceHandle) {
@@ -210,7 +247,16 @@ mod tests {
         ) -> Result<Buffer, Refused> {
             Err(Refused::NoSuchBlob(blob as u64))
         }
+        fn attach(&mut self, _handle: ResourceHandle, _buffer: &mut Buffer) -> Result<(), Refused> {
+            Ok(())
+        }
         fn forget(&mut self, _handle: ResourceHandle) {}
+        fn rings(&self) -> u32 {
+            0
+        }
+        fn take_last_submit(&mut self, _ring: RingIdx) -> Option<OwnedFd> {
+            None
+        }
     }
 
     fn req(cmd: u32, seqno: u32, rsp_off: u32) -> Vec<u8> {
@@ -219,7 +265,7 @@ mod tests {
 
     fn context() -> (Arc<GuestMap>, Context) {
         let map = Arc::new(GuestMap::anonymous(4096).unwrap());
-        let mut c = Context::new("t".into(), Box::new(Echo));
+        let mut c = Context::new("t".into(), Box::new(Echo), None);
         c.attach_region(Arc::clone(&map), 4096, BLOB_FLAG_USE_MAPPABLE).unwrap();
         (map, c)
     }
@@ -274,7 +320,7 @@ mod tests {
     #[test]
     fn the_region_is_attached_once_and_mappable_only() {
         let map = Arc::new(GuestMap::anonymous(4096).unwrap());
-        let mut c = Context::new("t".into(), Box::new(Echo));
+        let mut c = Context::new("t".into(), Box::new(Echo), None);
         assert_eq!(c.attach_region(Arc::clone(&map), 4096, 3), Err(Refused::RegionFlags(3)));
         c.attach_region(Arc::clone(&map), 4096, BLOB_FLAG_USE_MAPPABLE).unwrap();
         assert_eq!(c.attach_region(map, 4096, BLOB_FLAG_USE_MAPPABLE), Err(Refused::SecondRegion));
@@ -290,8 +336,15 @@ mod tests {
     }
 
     #[test]
+    fn ring_zero_is_the_callers_and_a_ring_past_the_last_is_refused() {
+        let (_map, mut c) = context();
+        assert_eq!(c.submit_fence(RingIdx(0), FenceId(1)), Ok(false));
+        assert_eq!(c.submit_fence(RingIdx(1), FenceId(2)), Err(Refused::Ring(1)));
+    }
+
+    #[test]
     fn an_answer_with_no_region_refuses_the_request() {
-        let mut c = Context::new("t".into(), Box::new(Echo));
+        let mut c = Context::new("t".into(), Box::new(Echo), None);
         assert_eq!(c.submit(&req(1, 1, 0)), Err(Refused::NoRegion));
     }
 }

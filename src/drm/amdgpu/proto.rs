@@ -80,8 +80,97 @@ pub struct BoVaOpReq {
 /// `AMDGPU_CCMD_BO_VA_OP_SPARSE_BO`: the range is mapped to no buffer.
 pub const BO_VA_OP_SPARSE_BO: u64 = 1;
 
+/// `struct amdgpu_ccmd_create_ctx_req`: a GPU context, or with [`CREATE_CTX_DESTROY`] the end of
+/// one. The first word is the new context's priority, or the id of the one to destroy.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct CreateCtxReq {
+    pub hdr: ReqHeader,
+    pub priority_or_id: u32,
+    pub flags: u32,
+}
+
+/// `AMDGPU_CCMD_CREATE_CTX_DESTROY`.
+pub const CREATE_CTX_DESTROY: u32 = 1;
+
+/// `struct amdgpu_ccmd_create_ctx_rsp`: the result, then the new context's id.
+pub const CREATE_CTX_RSP: usize = 16;
+pub const CREATE_CTX_RSP_ID: usize = 8;
+
+/// `struct amdgpu_ccmd_cs_submit_req` up to its payload, which is `num_chunks` [`ChunkDesc`]s and
+/// then the chunks' data, each at its descriptor's offset from the end of the descriptors.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct CsSubmitReq {
+    pub hdr: ReqHeader,
+    pub ctx_id: u32,
+    pub num_chunks: u32,
+    pub pad: u32,
+    pub ring_idx: u32,
+}
+
+/// One chunk's place in a submission's payload.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct ChunkDesc {
+    pub chunk_id: u16,
+    pub length_dw: u16,
+    pub offset: u32,
+}
+
+/// `struct amdgpu_ccmd_set_metadata_req` up to its metadata, which follows: `size_metadata`
+/// bytes of it.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct SetMetadataReq {
+    pub hdr: ReqHeader,
+    pub flags: u64,
+    pub tiling_info: u64,
+    pub res_id: u32,
+    pub size_metadata: u32,
+}
+
+/// The most metadata a buffer holds, `sizeof(amdgpu_bo_metadata::umd_metadata)`.
+pub const MAX_METADATA: u32 = 256;
+
+/// `struct amdgpu_ccmd_bo_query_info_req`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct BoQueryInfoReq {
+    pub hdr: ReqHeader,
+    pub res_id: u32,
+    pub pad: u32,
+}
+
+/// `struct amdgpu_ccmd_bo_query_info_rsp`: libdrm's `amdgpu_bo_info`, padded.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct BoQueryInfoRsp {
+    pub len: u32,
+    pub ret: i32,
+    pub alloc_size: u64,
+    pub phys_alignment: u64,
+    pub preferred_heap: u32,
+    pub pad: u32,
+    pub alloc_flags: u64,
+    pub flags: u64,
+    pub tiling_info: u64,
+    pub size_metadata: u32,
+    pub umd_metadata: [u32; 64],
+    pub pad2: u32,
+}
+
+/// `AMDGPU_CCMD_CS_SUBMIT_MAX_NUM_CHUNKS`.
+pub const MAX_CHUNKS: u32 = 128;
+
 const _: () = {
     assert!(size_of::<QueryInfoReq>() == 48);
+    assert!(size_of::<CreateCtxReq>() == 24);
+    assert!(size_of::<CsSubmitReq>() == 32);
+    assert!(size_of::<ChunkDesc>() == 8);
+    assert!(size_of::<SetMetadataReq>() == 40);
+    assert!(size_of::<BoQueryInfoReq>() == 24);
+    assert!(size_of::<BoQueryInfoRsp>() == 320);
     assert!(size_of::<GemNewReq>() == 56);
     assert!(size_of::<BoVaOpReq>() == 64);
     assert!(shmem::VIS_VRAM + size_of::<crate::drm::uapi::AmdgpuHeapInfo>() == shmem::LEN);

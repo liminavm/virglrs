@@ -220,6 +220,130 @@ pub const AMDGPU_GEM_DOMAIN_GTT: u32 = 0x2;
 /// `AMDGPU_GEM_CREATE_CPU_GTT_USWC`: GTT the CPU maps write-combined.
 pub const AMDGPU_GEM_CREATE_CPU_GTT_USWC: u64 = 1 << 2;
 
+/// `struct drm_amdgpu_ctx_in`; the answer's `alloc.ctx_id` overlays `op`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuCtxIn {
+    pub op: u32,
+    pub flags: u32,
+    pub ctx_id: u32,
+    pub priority: i32,
+}
+
+pub const AMDGPU_CTX_OP_ALLOC_CTX: u32 = 1;
+pub const AMDGPU_CTX_OP_FREE_CTX: u32 = 2;
+
+/// `struct drm_amdgpu_cs_in`; the answer's `handle`, the submission's sequence number, overlays
+/// the first eight bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuCsIn {
+    pub ctx_id: u32,
+    pub bo_list_handle: u32,
+    pub num_chunks: u32,
+    pub flags: u32,
+    pub chunks: u64,
+}
+
+/// `struct drm_amdgpu_cs_chunk`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuCsChunk {
+    pub chunk_id: u32,
+    pub length_dw: u32,
+    pub chunk_data: u64,
+}
+
+/// `struct drm_amdgpu_cs_chunk_ib`: one indirect buffer, by GPU address. Passed to the kernel as
+/// the guest wrote it; every field is checked there against the context's own address space.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuCsChunkIb {
+    pub _pad: u32,
+    pub flags: u32,
+    pub va_start: u64,
+    pub ib_bytes: u32,
+    pub ip_type: u32,
+    pub ip_instance: u32,
+    pub ring: u32,
+}
+
+/// `struct drm_amdgpu_cs_chunk_dep`: wait for an earlier submission, named by the context and
+/// sequence number the kernel gave it.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuCsChunkDep {
+    pub ip_type: u32,
+    pub ip_instance: u32,
+    pub ring: u32,
+    pub ctx_id: u32,
+    pub handle: u64,
+}
+
+/// `struct drm_amdgpu_cs_chunk_fence`: where the GPU writes the submission's user fence.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuCsChunkFence {
+    pub handle: u32,
+    pub offset: u32,
+}
+
+/// `struct drm_amdgpu_bo_list_in`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuBoListIn {
+    pub operation: u32,
+    pub list_handle: u32,
+    pub bo_number: u32,
+    pub bo_info_size: u32,
+    pub bo_info_ptr: u64,
+}
+
+/// `struct drm_amdgpu_bo_list_entry`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuBoListEntry {
+    pub bo_handle: u32,
+    pub bo_priority: u32,
+}
+
+/// `struct drm_amdgpu_gem_metadata`, for both directions.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
+pub struct AmdgpuGemMetadata {
+    pub handle: u32,
+    pub op: u32,
+    pub flags: u64,
+    pub tiling_info: u64,
+    pub data_size_bytes: u32,
+    pub data: [u32; 64],
+    pub _pad: u32,
+}
+
+pub const AMDGPU_GEM_METADATA_OP_SET_METADATA: u32 = 1;
+pub const AMDGPU_GEM_METADATA_OP_GET_METADATA: u32 = 2;
+
+/// `struct drm_amdgpu_gem_op`. For `GET_GEM_CREATE_INFO`, `value` is where the kernel writes the
+/// buffer's `drm_amdgpu_gem_create_in`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuGemOp {
+    pub handle: u32,
+    pub op: u32,
+    pub value: u64,
+}
+
+pub const AMDGPU_GEM_OP_GET_GEM_CREATE_INFO: u32 = 0;
+
+/// `AMDGPU_CHUNK_ID_*`.
+pub mod chunk {
+    pub const IB: u32 = 0x01;
+    pub const FENCE: u32 = 0x02;
+    pub const DEPENDENCIES: u32 = 0x03;
+    pub const SYNCOBJ_OUT: u32 = 0x05;
+    pub const BO_HANDLES: u32 = 0x06;
+}
+
 // Sizes from the headers, computed by hand from their field lists and pinned here: a field added
 // or reordered without the header saying so is caught before anything reaches the kernel.
 const _: () = {
@@ -236,4 +360,14 @@ const _: () = {
     assert!(size_of::<AmdgpuHeapInfo>() == 24);
     assert!(size_of::<AmdgpuGemCreate>() == 32);
     assert!(size_of::<AmdgpuGemVa>() == 40);
+    assert!(size_of::<AmdgpuCtxIn>() == 16);
+    assert!(size_of::<AmdgpuGemMetadata>() == 288);
+    assert!(size_of::<AmdgpuGemOp>() == 16);
+    assert!(size_of::<AmdgpuCsIn>() == 24);
+    assert!(size_of::<AmdgpuCsChunk>() == 16);
+    assert!(size_of::<AmdgpuCsChunkIb>() == 32);
+    assert!(size_of::<AmdgpuCsChunkDep>() == 24);
+    assert!(size_of::<AmdgpuCsChunkFence>() == 8);
+    assert!(size_of::<AmdgpuBoListIn>() == 24);
+    assert!(size_of::<AmdgpuBoListEntry>() == 8);
 };

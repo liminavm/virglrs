@@ -17,12 +17,30 @@ pub mod context;
 pub mod proto;
 pub mod region;
 #[cfg(all(target_os = "linux", feature = "drm"))]
+pub mod timeline;
+/// No backend, so no rings: a type with no values, so code that holds one compiles and none runs.
+#[cfg(not(all(target_os = "linux", feature = "drm")))]
+pub mod timeline {
+    pub enum Timelines {}
+
+    impl Timelines {
+        pub fn push(
+            &self,
+            _ring: crate::ids::RingIdx,
+            _sync: Option<std::os::fd::OwnedFd>,
+            _fence: crate::ids::FenceId,
+        ) {
+            match *self {}
+        }
+    }
+}
+#[cfg(all(target_os = "linux", feature = "drm"))]
 #[allow(unsafe_code)]
 pub mod sys;
 pub mod uapi;
 
 use crate::guest_mem::GuestMap;
-use crate::ids::{BlobId, ContextId, ResourceHandle};
+use crate::ids::{BlobId, ContextId, FenceId, ResourceHandle, RingIdx};
 use std::sync::Arc;
 
 pub use capset::Capset;
@@ -70,6 +88,15 @@ pub enum Refused {
     NoBuffer(u32),
     /// A blob larger than the buffer it would publish.
     BlobTooLarge { asked: u64, have: u64 },
+    /// A ring index the context has no ring for.
+    Ring(u32),
+    /// No GPU context has that id in this native context.
+    NoGpuContext(u32),
+    /// A submission with more chunks than the protocol allows.
+    TooManyChunks(u32),
+    /// A submission chunk that is out of bounds, misaligned, the wrong size, repeated, or of a
+    /// kind no guest sends.
+    Chunk(u32),
     /// A field the protocol reserves was not zero, or a flag it does not define was set.
     Reserved(u64),
     /// The kernel refused a command the protocol answers by dropping the submission; the error is
@@ -106,6 +133,10 @@ impl std::fmt::Display for Refused {
             Refused::BlobTooLarge { asked, have } => {
                 write!(f, "a {asked}-byte blob of a {have}-byte buffer")
             }
+            Refused::Ring(r) => write!(f, "no ring {r}"),
+            Refused::NoGpuContext(id) => write!(f, "no GPU context {id}"),
+            Refused::TooManyChunks(n) => write!(f, "{n} chunks in one submission"),
+            Refused::Chunk(id) => write!(f, "a malformed or unknown chunk {id}"),
             Refused::Reserved(v) => write!(f, "a reserved field or flag is set: {v:#x}"),
             Refused::Kernel(e) => {
                 write!(f, "the kernel refused: {}", std::io::Error::from_raw_os_error(*e))
@@ -114,15 +145,18 @@ impl std::fmt::Display for Refused {
     }
 }
 
-/// A buffer a native context made, as a resource holds it: a share of the buffer, and its mapping
-/// in this process when the guest asked for one.
+/// A buffer a native context made, as a resource holds it: the buffer, its mapping in this process
+/// when the VMM asked for one, and the buffer imported into each other context that attached it.
 ///
-/// A second owner of the buffer, not a record of it: the context that made it holds a share too,
-/// and the buffer lives until both let go. A resource can outlive its context, and its buffer then
-/// keeps the context's device file open, which is what a handle into that file needs.
+/// The owner of all of them: a context only names a buffer, and the name stops resolving when the
+/// resource goes. A resource can outlive its context, and its buffer then keeps the context's
+/// device file open, which is what a handle into that file needs.
 pub struct Buffer {
     #[cfg(all(target_os = "linux", feature = "drm"))]
     object: Arc<Object>,
+    /// The same buffer in other contexts' device files, one per file.
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    imports: Vec<Arc<Object>>,
     /// Made the first time the VMM asks, as the C maps at `resource_map`: most buffers are never
     /// mapped, and one the CPU cannot reach refuses it. A refusal is kept as the answer.
     #[cfg(all(target_os = "linux", feature = "drm"))]
@@ -137,7 +171,7 @@ pub struct Buffer {
 impl Buffer {
     #[cfg(all(target_os = "linux", feature = "drm"))]
     fn new(object: Arc<Object>, dmabuf: Option<std::os::fd::OwnedFd>) -> Buffer {
-        Buffer { object, map: std::sync::OnceLock::new(), dmabuf }
+        Buffer { object, imports: Vec::new(), map: std::sync::OnceLock::new(), dmabuf }
     }
 
     /// Where the buffer is mapped in this process, and how far: mapped now if it was not yet.
@@ -198,8 +232,9 @@ pub struct Object {
     /// What the guest asked for, which is what a mapping covers.
     pub size: u64,
     pub write_combining: bool,
-    /// What the buffer is counted as, for as long as it lives.
-    pub _charge: crate::budget::Charge,
+    /// What the buffer is counted as, for as long as it lives. An import is the same memory
+    /// again, and is not counted twice.
+    pub _charge: Option<crate::budget::Charge>,
 }
 
 /// The native-context root: the backend this host has, its capset, and the contexts open on it.
@@ -212,6 +247,12 @@ pub struct Native {
         expect(dead_code, reason = "no backend makes buffers")
     )]
     budget: Arc<crate::budget::Budget>,
+    /// Where each context's waiter retires its fences.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "drm-amdgpu")),
+        expect(dead_code, reason = "no backend has rings")
+    )]
+    fences: crate::fence::Handle,
 }
 
 /// The backend found at probe, and how to open a device for a new context.
@@ -229,13 +270,17 @@ impl Native {
         not(all(target_os = "linux", feature = "drm-amdgpu")),
         expect(unused_variables, reason = "no backend, so nothing to count")
     )]
-    pub fn probe(budget: &Arc<crate::budget::Budget>) -> Option<Native> {
+    pub fn probe(
+        budget: &Arc<crate::budget::Budget>,
+        fences: &crate::fence::Handle,
+    ) -> Option<Native> {
         #[cfg(all(target_os = "linux", feature = "drm-amdgpu"))]
         if let Some(p) = amdgpu::Probed::find() {
             return Some(Native {
                 host: Host::Amdgpu(p),
                 contexts: Default::default(),
                 budget: Arc::clone(budget),
+                fences: fences.clone(),
             });
         }
         None
@@ -257,10 +302,11 @@ impl Native {
         }
     }
 
-    /// Open a context: a device file of its own, so its GPU address space is its own.
+    /// Open a context: a device file of its own, so its GPU address space is its own, and a
+    /// waiter for its rings' fences.
     pub fn context_create(&mut self, id: ContextId, name: String) -> Result<(), Refused> {
-        let backend = self.open(&name)?;
-        self.contexts.insert(id, context::Context::new(name, backend));
+        let context = self.open(id, name)?;
+        self.contexts.insert(id, context);
         Ok(())
     }
 
@@ -268,11 +314,31 @@ impl Native {
         not(all(target_os = "linux", feature = "drm-amdgpu")),
         expect(unused_variables, reason = "no backend, so nothing to name")
     )]
-    fn open(&self, name: &str) -> Result<Box<dyn context::Backend>, Refused> {
-        match self.host {
+    fn open(&self, id: ContextId, name: String) -> Result<context::Context, Refused> {
+        let backend: Box<dyn context::Backend> = match self.host {
             #[cfg(all(target_os = "linux", feature = "drm-amdgpu"))]
-            Host::Amdgpu(ref p) => Ok(Box::new(p.open(name, &self.budget)?)),
+            Host::Amdgpu(ref p) => Box::new(p.open(&name, &self.budget)?),
+        };
+        #[cfg(all(target_os = "linux", feature = "drm"))]
+        {
+            let timelines = timeline::Timelines::start(id, backend.rings(), self.fences.clone())
+                .map_err(|e| Refused::NoDevice(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            Ok(context::Context::new(name, backend, Some(timelines)))
         }
+        #[cfg(not(all(target_os = "linux", feature = "drm")))]
+        #[expect(unreachable_code, reason = "no backend, so nothing reaches here")]
+        return Ok(context::Context::new(name, backend, None));
+    }
+
+    /// Order `fence` behind `ctx`'s work on `ring`. `Ok(false)` is ring 0, the CPU's, whose
+    /// fences have nothing to wait for and are the caller's to retire.
+    pub fn submit_fence(
+        &mut self,
+        ctx: ContextId,
+        ring: RingIdx,
+        fence: FenceId,
+    ) -> Option<Result<bool, Refused>> {
+        Some(self.contexts.get_mut(&ctx)?.submit_fence(ring, fence))
     }
 
     pub fn context_destroy(&mut self, id: ContextId) {
@@ -305,6 +371,17 @@ impl Native {
         flags: u32,
     ) -> Option<Result<Buffer, Refused>> {
         Some(self.contexts.get_mut(&ctx)?.get_blob(handle, blob, size, flags))
+    }
+
+    /// `ctx` was attached to `handle`, whose buffer is `buffer`. A buffer the context does not
+    /// name yet is named, imported onto its device file first if it was made in another.
+    pub fn attach(
+        &mut self,
+        ctx: ContextId,
+        handle: ResourceHandle,
+        buffer: &mut Buffer,
+    ) -> Option<Result<(), Refused>> {
+        Some(self.contexts.get_mut(&ctx)?.attach(handle, buffer))
     }
 
     /// `ctx` detached `handle`: the guest closed it there. The resource keeps its share.

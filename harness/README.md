@@ -1431,7 +1431,9 @@ Mesa has `-Damdgpu-virtio=true`, which Fedora's does not. The rig lives outside 
   configures itself from them. Measured 2026-10-12: identical, 592 bytes, 61 of them non-zero.
 - **The renderer string, then the pixels.** kmscube on the guest's KMS names `radeonsi` directly
   when native context is in use and `virgl (...)` when the guest fell back to classic, and the
-  captured frame is read.
+  captured frame is read. Run it with `-M rgba`: the textured cube imports a buffer from one
+  native context into another, which the plain cube never does. Measured 2026-10-12: both legs
+  draw the textured cube, two captures apart showing it turned.
 
 The control is Fedora's own libvirglrenderer, built without any native-context backend: asked for
 one, it fails its init, QEMU turns 3D off, and the guest has no render node at all. A gate that

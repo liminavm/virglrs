@@ -83,6 +83,10 @@ held by the context under its `blob_id`, until `get_blob` binds it to a resource
   context's file, as the C does. Either way it is one lookup and one kind of entry. A detach
   removes the name, and a resource that is gone stops resolving on its own: there is no purge to
   remember at the unref.
+- an import is owned by the resource too, beside the original: one copy per device file. Attach
+  reuses the copy already on the context's file before importing, because the kernel answers a
+  buffer a file already holds with the handle it already has, and a GEM handle closes once. A
+  guest that closes a buffer and reopens it in the same context reaches exactly that.
 
 The bind refuses a blob larger than its buffer. The C does not check, and maps the buffer's size
 for a blob of any size.
@@ -185,8 +189,10 @@ match sites refuse it as they refuse an unserved context today.
 1. Probe, capset, context create, the response region and `QUERY_INFO`: the guest's radeonsi
    initialises, and the capset matches the C's.
 2. `GEM_NEW`, `get_blob`, `BO_VA_OP`, mapping and export: buffers exist and are shared.
-3. `CREATE_CTX`, `CS_SUBMIT`, the timelines: kmscube draws.
-4. The remaining commands, cross-context import: RADV, glmark2, a desktop.
+3. `CREATE_CTX`, `CS_SUBMIT`, the timelines, `SET_METADATA`, `BO_QUERY_INFO`, and importing a
+   native buffer into another native context: kmscube draws, textured.
+4. `RESERVE_VMID`, `SET_PSTATE`, `CS_QUERY_FENCE_STATUS`, and importing classic and venus
+   resources: RADV, glmark2, a desktop.
 
 ## Open
 

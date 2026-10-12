@@ -5,21 +5,26 @@
 //! way libdrm_amdgpu describes it, and the per-context device a guest's commands run against.
 
 use super::ids;
-use super::proto::{self, BoVaOpReq, GemNewReq, QueryInfoReq, cmd};
+use super::proto::{
+    self, BoQueryInfoReq, BoQueryInfoRsp, BoVaOpReq, ChunkDesc, CreateCtxReq, CsSubmitReq,
+    GemNewReq, QueryInfoReq, SetMetadataReq, cmd,
+};
 use crate::drm::capset::{Capset, DriverVersion};
 use crate::drm::context::{Backend, Reply};
 use crate::drm::region::ResponseRegion;
-use crate::drm::sys::{self, Device};
+use crate::drm::sys::{self, AmdgpuCtx, Chunk, Device};
 use crate::drm::uapi::{
     AMDGPU_FAMILY_AI, AMDGPU_FAMILY_CI, AMDGPU_GEM_CREATE_CPU_GTT_USWC, AMDGPU_GEM_DOMAIN_GTT,
     AMDGPU_HW_IP_NUM, AMDGPU_IDS_FLAGS_FUSION, AMDGPU_VA_OP_MAP, AMDGPU_VA_OP_REPLACE,
-    AmdgpuBufferSizeAlignments, AmdgpuDeviceInfo, AmdgpuGemCreate, AmdgpuGemVa, AmdgpuGpuInfo,
-    AmdgpuHeapInfo, AmdgpuHwIpInfo, query,
+    AmdgpuBoListEntry, AmdgpuBufferSizeAlignments, AmdgpuCsChunkDep, AmdgpuCsChunkFence,
+    AmdgpuCsChunkIb, AmdgpuDeviceInfo, AmdgpuGemCreate, AmdgpuGemVa, AmdgpuGpuInfo, AmdgpuHeapInfo,
+    AmdgpuHwIpInfo, chunk, query,
 };
 use crate::drm::{Buffer, Object, Refused};
-use crate::ids::ResourceHandle;
+use crate::ids::{ResourceHandle, RingIdx};
 use bytemuck::Zeroable;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
@@ -83,6 +88,8 @@ impl Probed {
         Ok(Amdgpu {
             device,
             rings,
+            gpu_contexts: Default::default(),
+            last_submit: (0..rings).map(|_| None).collect(),
             async_error: 0,
             pending: Default::default(),
             bound: Default::default(),
@@ -215,8 +222,12 @@ fn rings(dev: &Device) -> u32 {
 pub struct Amdgpu {
     device: Arc<Device>,
     /// The guest's ring indices run from 1 to this.
-    #[allow(dead_code, reason = "fences arrive with command submission")]
     rings: u32,
+    /// The GPU contexts the guest made, by the id the kernel gave each.
+    gpu_contexts: crate::Map<u32, AmdgpuCtx>,
+    /// What each ring's newest submission signals, until a fence takes it. Index `i` is ring
+    /// `i + 1`.
+    last_submit: Vec<Option<OwnedFd>>,
     /// The count of failures the guest learns of through the response region's header. The host
     /// owns it: the guest can write that word, so it is stored there and never read back.
     async_error: u32,
@@ -319,7 +330,7 @@ impl Amdgpu {
         // Write-combined unless it is GTT the guest did not ask to be, as the C decides it.
         let write_combining = req.preferred_heap != AMDGPU_GEM_DOMAIN_GTT
             || req.flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC != 0;
-        let charge = self.budget.charge("native buffer", req.alloc_size);
+        let charge = Some(self.budget.charge("native buffer", req.alloc_size));
         self.pending
             .insert(blob, Object { gem, size: req.alloc_size, write_combining, _charge: charge });
         Ok(())
@@ -379,6 +390,216 @@ impl Amdgpu {
         Ok(())
     }
 
+    /// `AMDGPU_CCMD_CREATE_CTX`: a GPU context, answered with its id, or the end of one. The
+    /// kernel's refusal is the guest's answer.
+    fn create_ctx(&mut self, req: &[u8], reply: &mut Reply<'_>) -> Result<(), Refused> {
+        let req: CreateCtxReq = crate::drm::proto::decode(req);
+        let rsp = reply.stage(proto::CREATE_CTX_RSP)?;
+        if req.flags & !proto::CREATE_CTX_DESTROY != 0 {
+            return Err(Refused::Reserved(req.flags as u64));
+        }
+        let ret = if req.flags & proto::CREATE_CTX_DESTROY != 0 {
+            // Dropping it frees it. An id with no context is the guest's mistake, and is answered.
+            match self.gpu_contexts.remove(&req.priority_or_id) {
+                Some(_) => 0,
+                None => -libc::EINVAL,
+            }
+        } else {
+            match self.device.amdgpu_ctx_create(req.priority_or_id as i32) {
+                Ok(ctx) => {
+                    let id = ctx.id();
+                    rsp[proto::CREATE_CTX_RSP_ID..][..4].copy_from_slice(&id.to_le_bytes());
+                    self.gpu_contexts.insert(id, ctx);
+                    0
+                }
+                Err(e) => -errno(&e),
+            }
+        };
+        rsp[proto::RSP_RET..][..4].copy_from_slice(&ret.to_le_bytes());
+        Ok(())
+    }
+
+    /// `AMDGPU_CCMD_CS_SUBMIT`: run the guest's chunks on one of its GPU contexts, and keep what
+    /// the submission signals for the ring's next fence.
+    ///
+    /// Every resource id is resolved to this context's buffer and every chunk is checked before
+    /// anything reaches the kernel. Indirect buffers and dependencies go through as the guest
+    /// wrote them: they name GPU addresses and sequence numbers in this context's own file, and
+    /// the kernel checks those.
+    fn cs_submit(
+        &mut self,
+        req: &[u8],
+        reply: &mut Reply<'_>,
+        region: Option<&ResponseRegion>,
+    ) -> Result<(), Refused> {
+        let head: CsSubmitReq = crate::drm::proto::decode(req);
+        reply.stage(proto::RSP_HEADER)?;
+        if head.num_chunks > proto::MAX_CHUNKS {
+            return Err(Refused::TooManyChunks(head.num_chunks));
+        }
+        if head.ring_idx == 0 || head.ring_idx > self.rings {
+            return Err(Refused::Ring(head.ring_idx));
+        }
+        let ctx = self.gpu_contexts.get(&head.ctx_id).ok_or(Refused::NoGpuContext(head.ctx_id))?;
+        let descs_at = size_of::<CsSubmitReq>();
+        let data_at = descs_at + head.num_chunks as usize * size_of::<ChunkDesc>();
+        let descs = req.get(descs_at..data_at).ok_or(Refused::Chunk(0))?;
+        let descs: Vec<ChunkDesc> = descs
+            .as_chunks::<{ size_of::<ChunkDesc>() }>()
+            .0
+            .iter()
+            .map(|d| bytemuck::pod_read_unaligned(d))
+            .collect();
+
+        // What the chunks name, held here so the borrows below outlive the call.
+        let mut ibs = Vec::new();
+        let mut deps: Vec<Vec<AmdgpuCsChunkDep>> = Vec::new();
+        let mut fence: Option<(Arc<Object>, u32)> = None;
+        let mut bo_list: Option<Vec<(Arc<Object>, u32)>> = None;
+        for d in &descs {
+            let id = d.chunk_id as u32;
+            let bad = || Refused::Chunk(id);
+            let at = data_at.checked_add(d.offset as usize).ok_or_else(bad)?;
+            let bytes = req.get(at..at + d.length_dw as usize * 4).ok_or_else(bad)?;
+            match id {
+                chunk::IB => {
+                    if bytes.len() != size_of::<AmdgpuCsChunkIb>() {
+                        return Err(bad());
+                    }
+                    ibs.push(bytemuck::pod_read_unaligned::<AmdgpuCsChunkIb>(bytes));
+                }
+                chunk::DEPENDENCIES => {
+                    let (whole, rest) = bytes.as_chunks::<{ size_of::<AmdgpuCsChunkDep>() }>();
+                    if !rest.is_empty() {
+                        return Err(bad());
+                    }
+                    deps.push(whole.iter().map(|d| bytemuck::pod_read_unaligned(d)).collect());
+                }
+                chunk::FENCE => {
+                    let size = size_of::<AmdgpuCsChunkFence>();
+                    // The C's checks: aligned for the struct, room for one, the offset a whole
+                    // number of fence values, and one fence per submission.
+                    if !at.is_multiple_of(4) || bytes.len() < size || fence.is_some() {
+                        return Err(bad());
+                    }
+                    let f: AmdgpuCsChunkFence = bytemuck::pod_read_unaligned(&bytes[..size]);
+                    if !f.offset.is_multiple_of(8) {
+                        return Err(bad());
+                    }
+                    let object = self.buffer(f.handle).ok_or(Refused::NoBuffer(f.handle))?;
+                    fence = Some((object, f.offset));
+                }
+                chunk::BO_HANDLES => {
+                    if !at.is_multiple_of(4) || bo_list.is_some() {
+                        return Err(bad());
+                    }
+                    let entries = bytes.as_chunks::<{ size_of::<AmdgpuBoListEntry>() }>().0;
+                    let list = entries
+                        .iter()
+                        .map(|e| {
+                            let e: AmdgpuBoListEntry = bytemuck::pod_read_unaligned(e);
+                            let object = self.buffer(e.bo_handle);
+                            Ok((object.ok_or(Refused::NoBuffer(e.bo_handle))?, e.bo_priority))
+                        })
+                        .collect::<Result<_, Refused>>()?;
+                    bo_list = Some(list);
+                }
+                _ => return Err(bad()),
+            }
+        }
+
+        let signalled = self.device.syncobj_create().map_err(|e| Refused::Kernel(errno(&e)))?;
+        let gems: Option<Vec<(&sys::Gem, u32)>> =
+            bo_list.as_ref().map(|l| l.iter().map(|(o, p)| (&o.gem, *p)).collect());
+        // In the guest's order, as the C passes them; the output syncobj last.
+        let mut chunks = Vec::with_capacity(descs.len() + 1);
+        let (mut ib, mut dep) = (ibs.iter(), deps.iter());
+        for d in &descs {
+            chunks.push(match d.chunk_id as u32 {
+                chunk::IB => Chunk::Ib(*ib.next().expect("one per IB descriptor")),
+                chunk::DEPENDENCIES => Chunk::Dependencies(dep.next().expect("one per descriptor")),
+                chunk::FENCE => {
+                    let (object, offset) = fence.as_ref().expect("the one FENCE descriptor");
+                    Chunk::Fence { gem: &object.gem, offset: *offset }
+                }
+                chunk::BO_HANDLES => Chunk::BoList(gems.as_deref().expect("the one list")),
+                _ => unreachable!("refused above"),
+            });
+        }
+        chunks.push(Chunk::SyncobjOut(&signalled));
+
+        let submitted =
+            self.device.amdgpu_cs(ctx, &chunks).and_then(|_seqno| signalled.export_sync_file());
+        match submitted {
+            Ok(sync) => {
+                self.last_submit[head.ring_idx as usize - 1] = Some(sync);
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!(
+                    "[virglrs] native: submission to ring {} of GPU context {} refused: {e}",
+                    head.ring_idx, head.ctx_id
+                );
+                self.async_failure(region);
+                Err(Refused::Kernel(errno(&e)))
+            }
+        }
+    }
+
+    /// `AMDGPU_CCMD_SET_METADATA`: the buffer's tiling and the guest driver's description of it,
+    /// stored by the kernel for whoever imports the buffer next. The kernel's refusal is the
+    /// guest's answer.
+    fn set_metadata(&mut self, req: &[u8], reply: &mut Reply<'_>) -> Result<(), Refused> {
+        let head: SetMetadataReq = crate::drm::proto::decode(req);
+        let rsp = reply.stage(proto::RSP_HEADER)?;
+        let object = self.buffer(head.res_id).ok_or(Refused::NoBuffer(head.res_id))?;
+        if head.size_metadata > proto::MAX_METADATA {
+            return Err(Refused::Reserved(head.size_metadata as u64));
+        }
+        let at = size_of::<SetMetadataReq>();
+        let data = req
+            .get(at..at + head.size_metadata as usize)
+            .ok_or(Refused::RequestLength(head.hdr.len))?;
+        let ret = match object.gem.amdgpu_set_metadata(head.flags, head.tiling_info, data) {
+            Ok(()) => 0,
+            Err(e) => -errno(&e),
+        };
+        rsp[proto::RSP_RET..].copy_from_slice(&ret.to_le_bytes());
+        Ok(())
+    }
+
+    /// `AMDGPU_CCMD_BO_QUERY_INFO`: how a resource's buffer was made, and its metadata. A
+    /// resource with no buffer here is answered, not refused, as the C answers it: a guest's KMS
+    /// may name a classic resource.
+    fn bo_query_info(&mut self, req: &[u8], reply: &mut Reply<'_>) -> Result<(), Refused> {
+        let req: BoQueryInfoReq = crate::drm::proto::decode(req);
+        let rsp = reply.stage(size_of::<BoQueryInfoRsp>())?;
+        if req.pad != 0 {
+            return Err(Refused::Reserved(req.pad as u64));
+        }
+        let mut out: BoQueryInfoRsp = bytemuck::Zeroable::zeroed();
+        out.ret = match self.buffer(req.res_id).map(|o| o.gem.amdgpu_query()) {
+            None => -libc::EINVAL,
+            Some(Err(e)) => -errno(&e),
+            // libdrm's own check on the kernel's answer.
+            Some(Ok((_, meta))) if meta.data_size_bytes > proto::MAX_METADATA => -libc::EINVAL,
+            Some(Ok((info, meta))) => {
+                out.alloc_size = info.bo_size;
+                out.phys_alignment = info.alignment;
+                out.preferred_heap = info.domains as u32;
+                out.alloc_flags = info.domain_flags;
+                out.flags = meta.flags;
+                out.tiling_info = meta.tiling_info;
+                out.size_metadata = meta.data_size_bytes;
+                out.umd_metadata = meta.data;
+                0
+            }
+        };
+        // The length word is the region's to write; the rest is the answer.
+        rsp[proto::RSP_RET..].copy_from_slice(&bytemuck::bytes_of(&out)[proto::RSP_RET..]);
+        Ok(())
+    }
+
     /// `AMDGPU_CCMD_QUERY_INFO`: the guest's `DRM_AMDGPU_INFO`, run on its own device and answered
     /// with the kernel's result and up to `return_size` bytes.
     fn query_info(&self, req: &[u8], reply: &mut Reply<'_>) -> Result<(), Refused> {
@@ -425,13 +646,13 @@ impl Backend for Amdgpu {
             cmd::QUERY_INFO => self.query_info(req, reply),
             cmd::GEM_NEW => self.gem_new(req, region),
             cmd::BO_VA_OP => self.bo_va_op(req, reply, region),
-            cmd::CS_SUBMIT
-            | cmd::SET_METADATA
-            | cmd::BO_QUERY_INFO
-            | cmd::CREATE_CTX
-            | cmd::RESERVE_VMID
-            | cmd::SET_PSTATE
-            | cmd::CS_QUERY_FENCE_STATUS => Err(Refused::Unserved(command)),
+            cmd::CREATE_CTX => self.create_ctx(req, reply),
+            cmd::CS_SUBMIT => self.cs_submit(req, reply, region),
+            cmd::SET_METADATA => self.set_metadata(req, reply),
+            cmd::BO_QUERY_INFO => self.bo_query_info(req, reply),
+            cmd::RESERVE_VMID | cmd::SET_PSTATE | cmd::CS_QUERY_FENCE_STATUS => {
+                Err(Refused::Unserved(command))
+            }
             other => Err(Refused::UnknownCommand(other)),
         }
     }
@@ -467,8 +688,54 @@ impl Backend for Amdgpu {
         Ok(Buffer::new(object, dmabuf))
     }
 
+    /// The C imports the buffer's dma-buf whenever the context has no name for it. Here the copy
+    /// already on this file is reused first -- the original, when the guest closed and reopened
+    /// the buffer in the context that made it, or an earlier import -- because importing a buffer
+    /// a file already holds hands back the handle it already has, and two owners would close it
+    /// twice.
+    fn attach(&mut self, handle: ResourceHandle, buffer: &mut Buffer) -> Result<(), Refused> {
+        if self.bound.get(&handle).is_some_and(|w| w.strong_count() > 0) {
+            return Ok(());
+        }
+        let here = std::iter::once(&buffer.object)
+            .chain(&buffer.imports)
+            .find(|o| o.gem.is_in(&self.device))
+            .cloned();
+        let object = match here {
+            Some(o) => o,
+            None => {
+                let imported =
+                    match buffer.dmabuf.as_ref() {
+                        Some(fd) => self.device.import_dmabuf(std::os::fd::AsFd::as_fd(fd)),
+                        None => buffer.object.gem.export().and_then(|fd| {
+                            self.device.import_dmabuf(std::os::fd::AsFd::as_fd(&fd))
+                        }),
+                    };
+                let gem = imported.map_err(|e| Refused::Kernel(errno(&e)))?;
+                let object = Arc::new(Object {
+                    gem,
+                    size: buffer.object.size,
+                    write_combining: buffer.object.write_combining,
+                    _charge: None,
+                });
+                buffer.imports.push(Arc::clone(&object));
+                object
+            }
+        };
+        self.bound.insert(handle, Arc::downgrade(&object));
+        Ok(())
+    }
+
     fn forget(&mut self, handle: ResourceHandle) {
         self.bound.remove(&handle);
+    }
+
+    fn rings(&self) -> u32 {
+        self.rings
+    }
+
+    fn take_last_submit(&mut self, ring: RingIdx) -> Option<OwnedFd> {
+        self.last_submit[ring.0 as usize - 1].take()
     }
 }
 
@@ -506,7 +773,18 @@ mod tests {
             return;
         };
         let budget = crate::budget::Budget::with_cap(None, false);
-        let mut ctx = Context::new("t".into(), Box::new(probed.open("t", &budget).unwrap()));
+        let backend = probed.open("t", &budget).unwrap();
+        let retirement = crate::fence::Retirement::start(
+            Box::new(NoFences),
+            crate::vrend::debug::Switches::default(),
+        );
+        let timelines = crate::drm::timeline::Timelines::start(
+            crate::ids::ContextId::new(1).unwrap(),
+            backend.rings,
+            retirement.handle(),
+        )
+        .unwrap();
+        let mut ctx = Context::new("t".into(), Box::new(backend), Some(timelines));
         let region = Arc::new(GuestMap::anonymous(4096).unwrap());
         ctx.attach_region(Arc::clone(&region), 4096, 1).unwrap();
         let hdr =
@@ -564,10 +842,59 @@ mod tests {
         assert_eq!(region.load_u32(ret_at), Some(-libc::EINVAL as u32), "a second map overlaps");
         assert_eq!(region.load_u32(proto::shmem::ASYNC_ERROR), Some(2));
 
+        // A GPU context, answered with its id; a submission naming it with no IB is the kernel's
+        // to refuse, which ends the submission and is counted; one naming a resource the context
+        // has no buffer for never reaches the kernel.
+        let create = CreateCtxReq {
+            hdr: hdr(cmd::CREATE_CTX, size_of::<CreateCtxReq>(), 5, rsp_off),
+            priority_or_id: 0,
+            flags: 0,
+        };
+        assert!(region.store_u32(proto::shmem::LEN + rsp_off as usize, 16));
+        ctx.submit(bytemuck::bytes_of(&create)).unwrap();
+        assert_eq!(region.load_u32(ret_at), Some(0));
+        let gpu_ctx = region.load_u32(ret_at + 4).unwrap();
+        assert!(gpu_ctx != 0, "the kernel numbers contexts from 1");
+        let submit = |bo: u32, seqno| {
+            let mut req = bytemuck::bytes_of(&CsSubmitReq {
+                hdr: hdr(cmd::CS_SUBMIT, 48, seqno, rsp_off),
+                ctx_id: gpu_ctx,
+                num_chunks: 1,
+                pad: 0,
+                ring_idx: 1,
+            })
+            .to_vec();
+            req.extend(bytemuck::bytes_of(&ChunkDesc {
+                chunk_id: chunk::BO_HANDLES as u16,
+                length_dw: 2,
+                offset: 0,
+            }));
+            req.extend(bytemuck::bytes_of(&AmdgpuBoListEntry { bo_handle: bo, bo_priority: 0 }));
+            req
+        };
+        assert_eq!(ctx.submit(&submit(9, 6)).err(), Some(Refused::NoBuffer(9)));
+        assert_eq!(ctx.submit(&submit(3, 7)).err(), Some(Refused::Kernel(libc::EINVAL)));
+        assert_eq!(region.load_u32(proto::shmem::ASYNC_ERROR), Some(3));
+        assert_eq!(ctx.submit_fence(RingIdx(1), crate::ids::FenceId(1)), Ok(true));
+        let destroy =
+            CreateCtxReq { priority_or_id: gpu_ctx, flags: proto::CREATE_CTX_DESTROY, ..create };
+        ctx.submit(bytemuck::bytes_of(&destroy)).unwrap();
+        assert_eq!(region.load_u32(ret_at), Some(0));
+        ctx.submit(bytemuck::bytes_of(&destroy)).unwrap();
+        assert_eq!(region.load_u32(ret_at), Some(-libc::EINVAL as u32), "it is gone");
+
         ctx.forget(res);
-        assert_eq!(ctx.submit(bytemuck::bytes_of(&va_op(3, 4))).err(), Some(Refused::NoBuffer(3)));
+        assert_eq!(ctx.submit(bytemuck::bytes_of(&va_op(3, 9))).err(), Some(Refused::NoBuffer(3)));
         drop(buffer);
         eprintln!("RAN: on {}", probed.describe());
+    }
+
+    struct NoFences;
+
+    impl crate::fence::FenceSink for NoFences {
+        fn context_fence(&mut self, _: crate::ids::ContextId, _: RingIdx, _: crate::ids::FenceId) {}
+        fn global_fence(&mut self, _: crate::ids::ClientFenceId) {}
+        fn present_fence(&mut self, _: crate::ids::FenceId) {}
     }
 
     #[test]

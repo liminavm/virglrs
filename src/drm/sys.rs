@@ -8,10 +8,17 @@
 //! libdrm is not linked; these are the `ioctl`s libdrm and libdrm_amdgpu make, with the structs
 //! from the pinned tree's `drm-uapi` headers (`uapi.rs`).
 
-use super::uapi::{AmdgpuGemCreate, AmdgpuGemVa, AmdgpuInfo};
+use super::uapi::{
+    AMDGPU_CTX_OP_ALLOC_CTX, AMDGPU_CTX_OP_FREE_CTX, AMDGPU_GEM_METADATA_OP_GET_METADATA,
+    AMDGPU_GEM_METADATA_OP_SET_METADATA, AMDGPU_GEM_OP_GET_GEM_CREATE_INFO, AmdgpuBoListEntry,
+    AmdgpuBoListIn, AmdgpuCsChunk, AmdgpuCsChunkDep, AmdgpuCsChunkFence, AmdgpuCsChunkIb,
+    AmdgpuCsIn, AmdgpuCtxIn, AmdgpuGemCreate, AmdgpuGemMetadata, AmdgpuGemOp, AmdgpuGemVa,
+    AmdgpuInfo, chunk,
+};
+use bytemuck::Pod;
 use std::ffi::{c_char, c_int};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -66,14 +73,49 @@ struct DrmPrimeHandle {
     fd: i32,
 }
 
+/// `struct drm_syncobj_create` and `struct drm_syncobj_destroy`, which share a shape.
+#[repr(C)]
+struct DrmSyncobjHandleOnly {
+    handle: u32,
+    flags_or_pad: u32,
+}
+
+/// `struct drm_syncobj_handle`.
+#[repr(C)]
+struct DrmSyncobjHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+    pad: u32,
+}
+
+/// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE`.
+const SYNCOBJ_EXPORT_SYNC_FILE: u32 = 1;
+
+const DRM_IOCTL_SYNCOBJ_CREATE: libc::Ioctl =
+    ioc(READ | WRITE, 0xbf, size_of::<DrmSyncobjHandleOnly>());
+const DRM_IOCTL_SYNCOBJ_DESTROY: libc::Ioctl =
+    ioc(READ | WRITE, 0xc0, size_of::<DrmSyncobjHandleOnly>());
+const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: libc::Ioctl =
+    ioc(READ | WRITE, 0xc1, size_of::<DrmSyncobjHandle>());
+const DRM_IOCTL_AMDGPU_CTX: libc::Ioctl =
+    ioc(READ | WRITE, COMMAND_BASE + 0x02, size_of::<AmdgpuCtxIn>());
+const DRM_IOCTL_AMDGPU_CS: libc::Ioctl =
+    ioc(READ | WRITE, COMMAND_BASE + 0x04, size_of::<AmdgpuCsIn>());
 const DRM_IOCTL_GEM_CLOSE: libc::Ioctl = ioc(WRITE, 0x09, size_of::<DrmGemClose>());
 const DRM_IOCTL_PRIME_HANDLE_TO_FD: libc::Ioctl =
     ioc(READ | WRITE, 0x2d, size_of::<DrmPrimeHandle>());
+const DRM_IOCTL_PRIME_FD_TO_HANDLE: libc::Ioctl =
+    ioc(READ | WRITE, 0x2e, size_of::<DrmPrimeHandle>());
 const DRM_IOCTL_AMDGPU_GEM_CREATE: libc::Ioctl =
     ioc(READ | WRITE, COMMAND_BASE, size_of::<AmdgpuGemCreate>());
 /// `union drm_amdgpu_gem_mmap`: a handle in, the mapping's offset in the device file out.
 const DRM_IOCTL_AMDGPU_GEM_MMAP: libc::Ioctl = ioc(READ | WRITE, COMMAND_BASE + 0x01, 8);
 const DRM_IOCTL_AMDGPU_INFO: libc::Ioctl = ioc(WRITE, COMMAND_BASE + 0x05, size_of::<AmdgpuInfo>());
+const DRM_IOCTL_AMDGPU_GEM_METADATA: libc::Ioctl =
+    ioc(READ | WRITE, COMMAND_BASE + 0x06, size_of::<AmdgpuGemMetadata>());
+const DRM_IOCTL_AMDGPU_GEM_OP: libc::Ioctl =
+    ioc(READ | WRITE, COMMAND_BASE + 0x10, size_of::<AmdgpuGemOp>());
 const DRM_IOCTL_AMDGPU_GEM_VA: libc::Ioctl =
     ioc(WRITE, COMMAND_BASE + 0x08, size_of::<AmdgpuGemVa>());
 
@@ -189,6 +231,116 @@ impl Device {
         unsafe { self.ioctl(DRM_IOCTL_AMDGPU_GEM_VA, &mut va) }
     }
 
+    /// `DRM_AMDGPU_CTX` `ALLOC_CTX`: a GPU context, the scheduling entity submissions run in.
+    pub fn amdgpu_ctx_create(self: &Arc<Self>, priority: i32) -> io::Result<AmdgpuCtx> {
+        let mut arg = AmdgpuCtxIn { op: AMDGPU_CTX_OP_ALLOC_CTX, priority, ..Default::default() };
+        // SAFETY: the union's `in` half, as large as the union, with no pointer in it.
+        unsafe { self.ioctl(DRM_IOCTL_AMDGPU_CTX, &mut arg) }?;
+        // The answer's `alloc.ctx_id` overlays the first word.
+        Ok(AmdgpuCtx { device: Arc::clone(self), id: arg.op })
+    }
+
+    /// A dma-buf made a buffer in this file.
+    ///
+    /// The kernel answers a buffer this file already has a handle for with that same handle, and
+    /// a GEM handle is closed once however many times it was handed out: the caller must not
+    /// import what this file already holds, or two `Gem`s would close one handle.
+    pub fn import_dmabuf(self: &Arc<Self>, fd: BorrowedFd<'_>) -> io::Result<Gem> {
+        let mut arg = DrmPrimeHandle { handle: 0, flags: 0, fd: fd.as_raw_fd() };
+        // SAFETY: a `drm_prime_handle` with no pointer, naming a descriptor borrowed for the call.
+        unsafe { self.ioctl(DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut arg) }?;
+        Ok(Gem { device: Arc::clone(self), handle: arg.handle })
+    }
+
+    /// A syncobj, for a submission to signal.
+    pub fn syncobj_create(self: &Arc<Self>) -> io::Result<Syncobj> {
+        let mut arg = DrmSyncobjHandleOnly { handle: 0, flags_or_pad: 0 };
+        // SAFETY: a `drm_syncobj_create` with no pointer in it.
+        unsafe { self.ioctl(DRM_IOCTL_SYNCOBJ_CREATE, &mut arg) }?;
+        Ok(Syncobj { device: Arc::clone(self), handle: arg.handle })
+    }
+
+    /// `DRM_AMDGPU_CS`: submit `chunks` in `ctx`, and answer the sequence number the kernel gave
+    /// the submission.
+    ///
+    /// The kernel follows a pointer to an array of pointers to chunks, some of which point
+    /// further; all of that is built here from the typed chunks and lives until the call returns.
+    /// Every buffer, syncobj and context must belong to this file -- a handle is a number in one
+    /// file's table, and in another it names something else.
+    pub fn amdgpu_cs(&self, ctx: &AmdgpuCtx, chunks: &[Chunk<'_>]) -> io::Result<u64> {
+        assert!(std::ptr::eq(&*ctx.device, self), "a context submits in its own file");
+        let mine = |d: &Arc<Device>| assert!(std::ptr::eq(&**d, self), "a chunk names this file");
+        // What the kernel reads for each chunk, as eight-byte words so every struct in it is
+        // aligned. The buffer lists are built first and only read after, so their heap storage
+        // does not move once a list's header has pointed at it.
+        let entries: Vec<Vec<AmdgpuBoListEntry>> = chunks
+            .iter()
+            .filter_map(|c| match c {
+                Chunk::BoList(list) => Some(
+                    list.iter()
+                        .map(|&(gem, bo_priority)| {
+                            mine(&gem.device);
+                            AmdgpuBoListEntry { bo_handle: gem.handle, bo_priority }
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+        let mut lists = entries.iter();
+        let data: Vec<(u32, Vec<u64>)> = chunks
+            .iter()
+            .map(|c| match *c {
+                Chunk::Ib(ib) => (chunk::IB, words(std::slice::from_ref(&ib))),
+                Chunk::Dependencies(deps) => (chunk::DEPENDENCIES, words(deps)),
+                Chunk::Fence { gem, offset } => {
+                    mine(&gem.device);
+                    let f = AmdgpuCsChunkFence { handle: gem.handle, offset };
+                    (chunk::FENCE, words(std::slice::from_ref(&f)))
+                }
+                Chunk::BoList(_) => {
+                    let list = lists.next().expect("one entry list per BO_HANDLES chunk");
+                    let head = AmdgpuBoListIn {
+                        operation: !0,
+                        list_handle: !0,
+                        bo_number: list.len() as u32,
+                        bo_info_size: size_of::<AmdgpuBoListEntry>() as u32,
+                        bo_info_ptr: list.as_ptr() as u64,
+                    };
+                    (chunk::BO_HANDLES, words(std::slice::from_ref(&head)))
+                }
+                Chunk::SyncobjOut(sync) => {
+                    mine(&sync.device);
+                    (chunk::SYNCOBJ_OUT, words(std::slice::from_ref(&sync.handle)))
+                }
+            })
+            .collect();
+        let headers: Vec<AmdgpuCsChunk> = data
+            .iter()
+            .zip(chunks)
+            .map(|((id, words), c)| AmdgpuCsChunk {
+                chunk_id: *id,
+                length_dw: c.length_dw(),
+                chunk_data: words.as_ptr() as u64,
+            })
+            .collect();
+        let pointers: Vec<u64> = headers.iter().map(|h| std::ptr::from_ref(h) as u64).collect();
+        let mut arg = AmdgpuCsIn {
+            ctx_id: ctx.id,
+            bo_list_handle: 0,
+            num_chunks: u32::try_from(pointers.len()).expect("a bounded chunk count"),
+            flags: 0,
+            chunks: pointers.as_ptr() as u64,
+        };
+        // SAFETY: `arg` points at `pointers`, which point at `headers`, which point into `data`
+        // and, for a buffer list, on into `entries`. All four are alive and unmoved until this
+        // returns, every length was computed from the storage it describes, and the kernel only
+        // reads through them.
+        unsafe { self.ioctl(DRM_IOCTL_AMDGPU_CS, &mut arg) }?;
+        // The answer's `handle` overlays the first eight bytes.
+        Ok(u64::from_ne_bytes(bytemuck::bytes_of(&arg)[..8].try_into().expect("eight bytes")))
+    }
+
     /// One `ioctl`, retried when interrupted as libdrm's `drmIoctl` retries it.
     ///
     /// # Safety
@@ -222,6 +374,11 @@ pub struct Gem {
 }
 
 impl Gem {
+    /// Whether this is a handle in `device`'s file.
+    pub fn is_in(&self, device: &Arc<Device>) -> bool {
+        Arc::ptr_eq(&self.device, device)
+    }
+
     /// The buffer mapped into this process, `len` bytes from its start, through the fake offset
     /// `DRM_AMDGPU_GEM_MMAP` gives for it in its device file.
     pub fn amdgpu_mmap(&self, len: usize) -> io::Result<Mapping> {
@@ -251,6 +408,44 @@ impl Gem {
         Ok(Mapping { ptr, len })
     }
 
+    /// `DRM_AMDGPU_GEM_METADATA` `SET`: the buffer's tiling and the driver's opaque description
+    /// of it, for whoever imports it next. `data` is at most 256 bytes.
+    pub fn amdgpu_set_metadata(&self, flags: u64, tiling_info: u64, data: &[u8]) -> io::Result<()> {
+        let mut arg = AmdgpuGemMetadata {
+            handle: self.handle,
+            op: AMDGPU_GEM_METADATA_OP_SET_METADATA,
+            flags,
+            tiling_info,
+            data_size_bytes: data.len() as u32,
+            data: [0; 64],
+            _pad: 0,
+        };
+        bytemuck::cast_slice_mut::<u32, u8>(&mut arg.data)[..data.len()].copy_from_slice(data);
+        // SAFETY: a `drm_amdgpu_gem_metadata` with no pointer in it.
+        unsafe { self.device.ioctl(DRM_IOCTL_AMDGPU_GEM_METADATA, &mut arg) }
+    }
+
+    /// The buffer as the kernel describes it: how it was created, and its metadata.
+    pub fn amdgpu_query(&self) -> io::Result<(AmdgpuGemCreate, AmdgpuGemMetadata)> {
+        let mut meta = AmdgpuGemMetadata {
+            handle: self.handle,
+            op: AMDGPU_GEM_METADATA_OP_GET_METADATA,
+            ..bytemuck::Zeroable::zeroed()
+        };
+        // SAFETY: a `drm_amdgpu_gem_metadata` with no pointer in it.
+        unsafe { self.device.ioctl(DRM_IOCTL_AMDGPU_GEM_METADATA, &mut meta) }?;
+        let mut info = AmdgpuGemCreate::default();
+        let mut op = AmdgpuGemOp {
+            handle: self.handle,
+            op: AMDGPU_GEM_OP_GET_GEM_CREATE_INFO,
+            value: std::ptr::from_mut(&mut info) as u64,
+        };
+        // SAFETY: `value` points at `info`, a `drm_amdgpu_gem_create_in` that lives until this
+        // returns, which is what the kernel writes for this op.
+        unsafe { self.device.ioctl(DRM_IOCTL_AMDGPU_GEM_OP, &mut op) }?;
+        Ok((info, meta))
+    }
+
     /// A dma-buf of the buffer, which another device or process can import.
     pub fn export(&self) -> io::Result<OwnedFd> {
         let mut arg = DrmPrimeHandle {
@@ -276,6 +471,119 @@ impl Drop for Gem {
             panic!("GEM handle {} would not close: {e}", self.handle);
         }
     }
+}
+
+/// One chunk of a command submission, as the kernel will be told it. Each names what it refers to
+/// by the owning type, never by a raw handle.
+pub enum Chunk<'a> {
+    /// An indirect buffer, by GPU address.
+    Ib(AmdgpuCsChunkIb),
+    /// Earlier submissions to wait for.
+    Dependencies(&'a [AmdgpuCsChunkDep]),
+    /// Where the GPU writes the user fence: `offset` bytes into `gem`.
+    Fence { gem: &'a Gem, offset: u32 },
+    /// The buffers the submission uses, each with its migration priority.
+    BoList(&'a [(&'a Gem, u32)]),
+    /// A syncobj the submission signals when it completes.
+    SyncobjOut(&'a Syncobj),
+}
+
+impl Chunk<'_> {
+    fn length_dw(&self) -> u32 {
+        let bytes = match self {
+            Chunk::Ib(_) => size_of::<AmdgpuCsChunkIb>(),
+            Chunk::Dependencies(deps) => size_of_val(*deps),
+            Chunk::Fence { .. } => size_of::<AmdgpuCsChunkFence>(),
+            Chunk::BoList(_) => size_of::<AmdgpuBoListIn>(),
+            Chunk::SyncobjOut(_) => size_of::<u32>(),
+        };
+        u32::try_from(bytes / 4).expect("a chunk the protocol bounded")
+    }
+}
+
+/// `v`'s bytes in eight-byte words, zero-padded.
+fn words<T: Pod>(v: &[T]) -> Vec<u64> {
+    let bytes: &[u8] = bytemuck::cast_slice(v);
+    let mut out = vec![0u64; bytes.len().div_ceil(8)];
+    bytemuck::cast_slice_mut::<u64, u8>(&mut out)[..bytes.len()].copy_from_slice(bytes);
+    out
+}
+
+/// A GPU context in one device file. Freed when dropped.
+pub struct AmdgpuCtx {
+    device: Arc<Device>,
+    id: u32,
+}
+
+impl AmdgpuCtx {
+    /// The id the kernel gave it, which is what the guest names it by.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+}
+
+impl Drop for AmdgpuCtx {
+    fn drop(&mut self) {
+        let mut arg =
+            AmdgpuCtxIn { op: AMDGPU_CTX_OP_FREE_CTX, ctx_id: self.id, ..Default::default() };
+        // SAFETY: the union's `in` half with no pointer, naming a context this value owns.
+        if let Err(e) = unsafe { self.device.ioctl(DRM_IOCTL_AMDGPU_CTX, &mut arg) } {
+            panic!("GPU context {} would not free: {e}", self.id);
+        }
+    }
+}
+
+/// A DRM syncobj in one device file. Destroyed when dropped.
+pub struct Syncobj {
+    device: Arc<Device>,
+    handle: u32,
+}
+
+impl Syncobj {
+    /// The fence the syncobj holds now, as a sync_file.
+    pub fn export_sync_file(&self) -> io::Result<OwnedFd> {
+        let mut arg = DrmSyncobjHandle {
+            handle: self.handle,
+            flags: SYNCOBJ_EXPORT_SYNC_FILE,
+            fd: -1,
+            pad: 0,
+        };
+        // SAFETY: a `drm_syncobj_handle` with no pointer; the kernel writes the new fd.
+        unsafe { self.device.ioctl(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut arg) }?;
+        // SAFETY: the kernel just made this descriptor for us, and nothing else holds it.
+        Ok(unsafe { OwnedFd::from_raw_fd(arg.fd) })
+    }
+}
+
+impl Drop for Syncobj {
+    fn drop(&mut self) {
+        let mut arg = DrmSyncobjHandleOnly { handle: self.handle, flags_or_pad: 0 };
+        // SAFETY: a `drm_syncobj_destroy` with no pointer, naming a syncobj this value owns.
+        if let Err(e) = unsafe { self.device.ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &mut arg) } {
+            panic!("syncobj {} would not destroy: {e}", self.handle);
+        }
+    }
+}
+
+/// Wait until at least one of `fds` is readable, or in error, and say which are.
+pub fn wait_readable(fds: &[BorrowedFd<'_>]) -> io::Result<Vec<bool>> {
+    let mut polled: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|fd| libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 })
+        .collect();
+    loop {
+        // SAFETY: `polled` is a live array of `polled.len()` pollfds, each naming a descriptor
+        // borrowed for the length of this call.
+        let r = unsafe { libc::poll(polled.as_mut_ptr(), polled.len() as libc::nfds_t, -1) };
+        if r >= 0 {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINTR) {
+            return Err(e);
+        }
+    }
+    Ok(polled.iter().map(|p| p.revents != 0).collect())
 }
 
 /// A buffer mapped into this process. Unmapped when dropped.
@@ -339,8 +647,16 @@ mod tests {
         assert_eq!(DRM_IOCTL_AMDGPU_INFO as u32, 0x4020_6445);
         assert_eq!(DRM_IOCTL_GEM_CLOSE as u32, 0x4008_6409);
         assert_eq!(DRM_IOCTL_PRIME_HANDLE_TO_FD as u32, 0xc00c_642d);
+        assert_eq!(DRM_IOCTL_PRIME_FD_TO_HANDLE as u32, 0xc00c_642e);
         assert_eq!(DRM_IOCTL_AMDGPU_GEM_CREATE as u32, 0xc020_6440);
         assert_eq!(DRM_IOCTL_AMDGPU_GEM_MMAP as u32, 0xc008_6441);
         assert_eq!(DRM_IOCTL_AMDGPU_GEM_VA as u32, 0x4028_6448);
+        assert_eq!(DRM_IOCTL_AMDGPU_CTX as u32, 0xc010_6442);
+        assert_eq!(DRM_IOCTL_AMDGPU_GEM_METADATA as u32, 0xc120_6446);
+        assert_eq!(DRM_IOCTL_AMDGPU_GEM_OP as u32, 0xc010_6450);
+        assert_eq!(DRM_IOCTL_AMDGPU_CS as u32, 0xc018_6444);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_CREATE as u32, 0xc008_64bf);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_DESTROY as u32, 0xc008_64c0);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD as u32, 0xc010_64c1);
     }
 }

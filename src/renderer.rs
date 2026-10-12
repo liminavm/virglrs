@@ -818,7 +818,10 @@ impl Renderer {
         let venus = config.venus.then(|| {
             venus::vkr::Vkr::new(config.clone(), resources.clone(), &budget, fences.handle())
         });
-        let native = config.native_context.then(|| crate::drm::Native::probe(&budget)).flatten();
+        let native = config
+            .native_context
+            .then(|| crate::drm::Native::probe(&budget, &fences.handle()))
+            .flatten();
         match (&native, config.native_context) {
             (Some(n), _) => eprintln!("[virglrs] native contexts: {}", n.describe()),
             (None, true) => eprintln!(
@@ -1374,6 +1377,29 @@ impl Renderer {
                 r.attached.push(ctx);
             }
         });
+        // A native context names the resource's buffer, importing it onto its own device file
+        // when another context made it. Only a native buffer is imported for now.
+        if let Bound::Native(n) = bound
+            && let Some(native) = self.native.as_mut()
+        {
+            let mut table = self.resources.write().expect("the resource lock is never poisoned");
+            let buffer = table.get_mut(&handle).and_then(|r| match &mut r.backing {
+                Backing::Blob { storage: BlobStorage::Native(b), .. } => Some(b),
+                Backing::Blob { .. } | Backing::Classic { .. } | Backing::Imported { .. } => None,
+            });
+            match buffer.map(|b| native.attach(n.id(), handle, b)) {
+                Some(Some(Err(r))) => {
+                    native_refused(ctx, r);
+                }
+                Some(None) | Some(Some(Ok(()))) => {}
+                None => eprintln!(
+                    "[virglrs] ctx {}: resource {handle} is not a native buffer, which this \
+                     context cannot import yet",
+                    ctx.get()
+                ),
+            }
+            return;
+        }
         // Only a classic context's attach reaches vrend, as the C's does: its attach dispatches
         // to the attaching context's own renderer, so vrend never hears of a venus context
         // attaching its own blob. Told anyway it would park a share of every venus blob in its
@@ -1441,6 +1467,16 @@ impl Renderer {
             }
             (Bound::Venus(vctx), _) => {
                 self.venus.as_ref().is_some_and(|v| v.ring_fence(vctx, ring, fence))
+            }
+            // A hardware ring's fence waits for the ring's newest submission on the context's
+            // own waiter; ring 0, the CPU's, retires here.
+            (Bound::Native(n), _) => {
+                drop(table);
+                let native = self.native.as_mut().ok_or(Error::RendererAbsent)?;
+                native
+                    .submit_fence(n.id(), ring, fence)
+                    .ok_or(Error::NoContext)?
+                    .map_err(|r| native_refused(ctx, r))?
             }
             _ => false,
         };
