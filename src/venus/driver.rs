@@ -10257,9 +10257,13 @@ impl Driver {
                 // at the allocate, and the failure below is the same failure for both.
                 let described = image.map(|image| {
                     let facts = self.images.get(&image).copied();
-                    facts
-                        .ok_or(NoSurface::UnknownImage)
-                        .and_then(|facts| export_dmabuf(&mem.device, device, out, image, facts))
+                    let formats = self
+                        .devices
+                        .get(&device)
+                        .map(|d| FormatQueries { source: &d.formats, instance: self.instance() });
+                    facts.ok_or(NoSurface::UnknownImage).and_then(|facts| {
+                        export_dmabuf(&mem.device, device, out, image, facts, formats.as_ref())
+                    })
                 });
                 match described {
                     Some(Ok(surface)) => Backing::Owned {
@@ -15913,6 +15917,7 @@ fn export_dmabuf(
     memory: VkDeviceMemory,
     image: VkImage,
     facts: ImageFacts,
+    formats: Option<&FormatQueries<'_>>,
 ) -> Result<Surface, NoSurface> {
     use crate::dmabuf::{
         DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, Layout, MAX_PLANES, PlaneLayout,
@@ -15950,24 +15955,10 @@ fn export_dmabuf(
         tiling => return Err(NoSurface::Tiling(tiling)),
     };
 
-    // How many *memory* planes an image has is a property of the modifier, not of the FourCC:
-    // every format this renderer exports has one plane of pixels, and a compressed modifier adds
-    // an auxiliary plane to it -- this host's ICL lays `I915_FORMAT_MOD_Y_TILED_CCS` out as two
-    // planes of single-plane ARGB8888. The modifier above is the guest's image's, so this cannot
-    // assume it is one that adds none.
-    //
-    // Reading the real count wants `VkDrmFormatModifierPropertiesListEXT`, which needs the
-    // physical device this function is not given and a struct the wire bindings do not yet carry.
-    // Until it does, an image whose modifier has an auxiliary plane is described here as having
-    // one. Measured against iris on this host: a `Y_TILED_CCS` buffer declared as a single plane
-    // is refused at `eglCreateImageKHR` with `EGL_BAD_MATCH` -- so such an import is refused at
-    // the importer rather than read as the wrong pixels, and the guest gets a resource it cannot
-    // create. The modifier is the guest's choice, which is why that refusal is a refusal and not
-    // an assertion; see [`crate::surface::Adoptable::Exported`].
-    let plane_count = 1u32;
+    let plane_count = memory_planes(formats, facts.format, modifier)?;
     let layout_query = d.try_vkGetImageSubresourceLayout().ok_or(NoSurface::Layout)?;
     let mut planes = [PlaneLayout { offset: 0, pitch: 0 }; MAX_PLANES];
-    for (at, plane) in planes.iter_mut().enumerate().take(plane_count as usize) {
+    for (at, plane) in planes.iter_mut().enumerate().take(plane_count) {
         // A modifier image's planes are named by MEMORY_PLANE aspects; a linear one has a single
         // COLOR aspect and no memory planes at all. Naming the wrong one is not an error the
         // driver has to report, so the two cases are kept apart here.
@@ -15986,12 +15977,6 @@ fn export_dmabuf(
         unsafe { layout_query(device, image, &subresource, &mut out) };
         let pitch =
             u32::try_from(out.rowPitch.0).ok().filter(|p| *p != 0).ok_or(NoSurface::Layout)?;
-        // A pitch narrower than one tight row cannot describe this image whatever the layout is.
-        // It is the one arithmetic check worth keeping: it catches a stale image record, where
-        // every number is plausible on its own and none of them is about this image.
-        if format.linear_pitch(facts.width).is_none_or(|tight| pitch < tight) {
-            return Err(NoSurface::Layout);
-        }
         *plane = PlaneLayout { offset: out.offset.0, pitch };
     }
 
@@ -16002,22 +15987,19 @@ fn export_dmabuf(
     // hand here, which is exactly why only one of them may be recorded.
     let size =
         crate::dmabuf::buffer_size(std::os::fd::AsFd::as_fd(&fd)).ok_or(NoSurface::Layout)?;
-    // And the driver's own layout is checked against it, in the arithmetic `describe` uses for
-    // the guest's. A driver is not the trust boundary the guest is, so this is an assertion about
-    // a host invariant in every way but the response: an image whose planes do not fit its own
-    // buffer is one this side must not read, whoever got it wrong.
-    for (at, plane) in planes.iter().enumerate().take(plane_count as usize) {
-        let end = u64::from(plane.pitch)
-            .checked_mul(u64::from(facts.height))
-            .and_then(|rows| rows.checked_add(plane.offset));
-        if end.is_none_or(|end| end > size) {
-            eprintln!(
-                "[virglrs] venus: the driver's plane {at} does not fit the buffer it exported \
-                 ({:?} of {size} bytes)",
-                end
-            );
-            return Err(NoSurface::Layout);
-        }
+    // And the driver's own layout is checked against it. A driver is not the trust boundary the
+    // guest is, so this is an assertion about a host invariant in every way but the response: an
+    // image whose planes do not fit its own buffer is one this side must not read, whoever got
+    // it wrong.
+    if !planes_fit(&planes[..plane_count], format, facts.width, facts.height, size) {
+        eprintln!(
+            "[virglrs] venus: the driver's planes {:?} do not fit the {size}-byte buffer it \
+             exported for a {}x{} image",
+            &planes[..plane_count],
+            facts.width,
+            facts.height
+        );
+        return Err(NoSurface::Layout);
     }
 
     Ok(Surface::exported(
@@ -16027,11 +16009,62 @@ fn export_dmabuf(
             height: facts.height,
             fourcc: format.fourcc(),
             modifier,
-            planes: PlaneLayouts::new(&planes[..plane_count as usize])
-                .expect("one plane fits a layout"),
+            planes: PlaneLayouts::new(&planes[..plane_count])
+                .expect("memory_planes bounds the count by MAX_PLANES"),
             alloc_size: size,
         },
     ))
+}
+
+/// How many memory planes the driver lays an exported image out in.
+///
+/// A property of the modifier, not of the FourCC: every format this renderer exports has one
+/// plane of pixels, and a compressed modifier adds an auxiliary plane to it -- anv lays
+/// `I915_FORMAT_MOD_Y_TILED_CCS` out as two planes of single-plane ARGB8888. The modifier is the
+/// guest's image's, so it may be one of those, and the count is the driver's own answer for that
+/// format and modifier. `LINEAR` has one plane by definition and is not asked; a modifier the
+/// driver does not list for the format is an image it could not have made, and is refused rather
+/// than described as one plane, which an importer would take as the whole buffer.
+#[cfg(not(target_os = "macos"))]
+fn memory_planes(
+    formats: Option<&FormatQueries<'_>>,
+    format: VkFormat,
+    modifier: u64,
+) -> Result<usize, NoSurface> {
+    use crate::dmabuf::{DRM_FORMAT_MOD_LINEAR, MAX_PLANES};
+    if modifier == DRM_FORMAT_MOD_LINEAR {
+        return Ok(1);
+    }
+    let count =
+        formats.and_then(|f| f.modifier_planes(format, modifier)).ok_or(NoSurface::Layout)?;
+    match count as usize {
+        n @ 1..=MAX_PLANES => Ok(n),
+        _ => Err(NoSurface::Layout),
+    }
+}
+
+/// Whether the driver's plane layouts fit the buffer it exported for a `width` x `height` image.
+///
+/// The colour plane is checked as rows: a pitch narrower than one tight row cannot describe the
+/// image whatever the layout is -- which catches a stale image record, where every number is
+/// plausible on its own and none of them is about this image -- and its rows must end inside the
+/// buffer. An auxiliary plane's extent follows the modifier's own rule, which is not rows of
+/// pixels -- the CCS plane above is 128 bytes a row against the colour plane's 1024 -- so all it
+/// is held to is starting inside the buffer.
+#[cfg(not(target_os = "macos"))]
+fn planes_fit(
+    planes: &[crate::dmabuf::PlaneLayout],
+    format: crate::surface::PixelFormat,
+    width: u32,
+    height: u32,
+    size: u64,
+) -> bool {
+    let Some((colour, aux)) = planes.split_first() else { return false };
+    let tight = format.linear_pitch(width).is_some_and(|tight| colour.pitch >= tight);
+    let end = u64::from(colour.pitch)
+        .checked_mul(u64::from(height))
+        .and_then(|rows| rows.checked_add(colour.offset));
+    tight && end.is_some_and(|end| end <= size) && aux.iter().all(|p| p.offset < size)
 }
 
 /// Ask the driver for a dma-buf descriptor of an allocation it just made.
@@ -25463,5 +25496,72 @@ mod tests {
             panic!("a minted share is a texture share");
         };
         assert!(lent.surface().is_lent(), "the share was built without marking its surface");
+    }
+
+    /// A modifier's memory planes are the driver's count for it, so a compressed modifier's
+    /// auxiliary plane is described with the colour plane.
+    ///
+    /// The export used to describe every image as one plane, so a guest asking for
+    /// `Y_TILED_CCS` got a descriptor whose modifier says two planes and whose layout says one,
+    /// which iris refuses at `eglCreateImageKHR` with `EGL_BAD_MATCH`.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_exported_image_has_the_planes_its_modifier_has() {
+        const BGRA: VkFormat = VkFormat::VK_FORMAT_B8G8R8A8_UNORM;
+        const CCS: u64 = 0x0100_0000_0000_0004;
+        const X_TILED: u64 = 0x0100_0000_0000_0001;
+        let offered = Formats::Planted(PlantedFormats {
+            modifiers: Some(vec![(BGRA, CCS, 2), (BGRA, X_TILED, 1), (BGRA, 7, 5)]),
+            ..Default::default()
+        });
+        let formats = FormatQueries { source: &offered, instance: None };
+
+        assert_eq!(memory_planes(Some(&formats), BGRA, CCS), Ok(2), "colour and aux");
+        assert_eq!(memory_planes(Some(&formats), BGRA, X_TILED), Ok(1));
+        assert_eq!(
+            memory_planes(None, BGRA, crate::dmabuf::DRM_FORMAT_MOD_LINEAR),
+            Ok(1),
+            "linear is one plane by definition, and asks nothing"
+        );
+        assert_eq!(
+            memory_planes(Some(&formats), BGRA, 0x0100_0000_0000_0002),
+            Err(NoSurface::Layout),
+            "a modifier the driver does not list is not described as one plane"
+        );
+        assert_eq!(memory_planes(None, BGRA, CCS), Err(NoSurface::Layout), "nothing to ask");
+        assert_eq!(
+            memory_planes(Some(&formats), BGRA, 7),
+            Err(NoSurface::Layout),
+            "more planes than a layout holds"
+        );
+    }
+
+    /// The colour plane is checked as rows of the image and an auxiliary plane only for where it
+    /// starts. The numbers are anv's `Y_TILED_CCS` export of a 256x64 ARGB8888 image on goiaba's
+    /// ICL: an aux plane whose pitch is an eighth of a tight row, which the colour plane's rule
+    /// would refuse.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_aux_plane_is_not_held_to_the_colour_planes_rows() {
+        use crate::dmabuf::PlaneLayout;
+        let bgra = crate::surface::PixelFormat::Bgra;
+        let colour = PlaneLayout { offset: 0, pitch: 1024 };
+        let aux = PlaneLayout { offset: 65536, pitch: 128 };
+
+        assert!(planes_fit(&[colour, aux], bgra, 256, 64, 131072), "anv's own layout");
+        assert!(planes_fit(&[colour], bgra, 256, 64, 65536), "one plane, exactly the rows");
+        assert!(
+            !planes_fit(&[colour, PlaneLayout { offset: 131072, ..aux }], bgra, 256, 64, 131072),
+            "an aux plane starting past the buffer"
+        );
+        assert!(
+            !planes_fit(&[PlaneLayout { pitch: 512, ..colour }, aux], bgra, 256, 64, 131072),
+            "a colour pitch narrower than a tight row"
+        );
+        assert!(
+            !planes_fit(&[colour], bgra, 256, 64, 65535),
+            "colour rows that run past the buffer"
+        );
+        assert!(!planes_fit(&[], bgra, 256, 64, 131072), "no planes at all");
     }
 }

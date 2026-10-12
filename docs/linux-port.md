@@ -461,18 +461,6 @@ every case measured on this host takes the descriptor path instead. The first GL
 client that shares host-visible memory will find it. Routing it through a descriptor as well, with
 the mapping taken by `vkMapMemory` for the MAPPABLE half, is the fix.
 
-**Multi-plane export on the venus side.** A classic export takes every plane a compressed
-modifier reports; a venus one still describes every image as having a single memory plane.
-`export_dmabuf` cannot do better yet: the real count is
-`VkDrmFormatModifierPropertiesListEXT::drmFormatModifierPlaneCount`, which needs a physical device
-that function is not given and a struct the wire bindings do not carry. The modifier there is the
-guest's image's, so a guest that asks for `Y_TILED_CCS` gets a descriptor claiming one plane under
-a two-plane modifier. Measured against iris here, that pairing is refused at `eglCreateImageKHR`
-with `EGL_BAD_MATCH`, so the failure is an importer's refusal and not a picture read from the
-wrong bytes -- and a refusal by construction rather than by luck, because such a layout is the
-guest's driver's answer about a guest's image and is offered as
-[`Adoptable::Exported`](../src/surface.rs), whose refusals are refused.
-
 **Shared buffers are linear by default.** A guest that presents through virtio-gpu KMS can scan
 out `LINEAR` and nothing else, and a venus context importing a classic buffer must be told its
 true layout -- so a Vulkan compositor in the guest needs both. `Config::linear_shared`, with
