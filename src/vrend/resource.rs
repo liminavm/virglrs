@@ -2374,9 +2374,10 @@ fn plane_format(a: &Args) -> Option<PixelFormat> {
 /// storage, which every consumer but another driver's import reads as before.
 #[cfg(target_os = "macos")]
 fn plane_image(winsys: &Winsys, budget: &Classic, a: &Args, format: PixelFormat) -> Option<Image> {
-    // A host GL that refused a plane surface refuses them all; minting one per plane of every
-    // decoder pool slot just to free it again is the whole cost of asking.
-    if winsys.plane_surface_said.only_refused() {
+    // A host GL that refused a plane surface of this format refuses them all; minting one per
+    // plane of every decoder pool slot just to free it again is the whole cost of asking.
+    let said = winsys.plane_surface_said.of(format);
+    if said.only_refused() {
         return None;
     }
     let surface = match Surface::plain(a.width, a.height, format) {
@@ -2397,23 +2398,23 @@ fn plane_image(winsys: &Winsys, budget: &Classic, a: &Args, format: PixelFormat)
     let made = plane_faults::answer(format, made);
     match made {
         Ok(image) => {
-            if winsys.plane_surface_said.first(true) {
+            if said.first(true) {
                 eprintln!(
-                    "[virglrs] vrend: video planes are IOSurfaces (first: {}x{} {}, IOSurface id \
+                    "[virglrs] vrend: {} video planes are IOSurfaces (first: {}x{}, IOSurface id \
                      {}); other drivers can import them",
+                    a.format.name(),
                     a.width,
                     a.height,
-                    a.format.name(),
                     image.surface().id().0
                 );
             }
             Some(image)
         }
         Err(e) => {
-            if winsys.plane_surface_said.first(false) {
+            if said.first(false) {
                 eprintln!(
-                    "[virglrs] vrend: the host GL takes no {} IOSurface ({e}); video planes keep \
-                     GL storage, and other drivers cannot import them",
+                    "[virglrs] vrend: the host GL takes no {0} IOSurface ({e}); {0} video planes \
+                     keep GL storage, and other drivers cannot import them",
                     a.format.name()
                 );
             }
