@@ -274,7 +274,9 @@ fn errno(e: renderer::Error) -> c_int {
         | JournalRefused(_)
         | ClassicRefused(_)
         | ClaimRefused(_)
-        | Native(_) => EINVAL,
+        | Native(_)
+        | SurfaceLayout
+        | SurfaceUnwritable => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
         OverBudget(_) | SurfaceRefused => -libc::ENOMEM,
         NotExportable => -libc::EINVAL,

@@ -106,6 +106,11 @@ pub enum Error {
     Native(crate::drm::Refused),
     /// The host would not mint the surface the embedder asked for.
     SurfaceRefused,
+    /// Rows handed to a surface are not laid out as the surface is: another pitch, another
+    /// height, or fewer bytes than that many rows hold.
+    SurfaceLayout,
+    /// The surface would not take the rows: it would not lock, or has no base address.
+    SurfaceUnwritable,
 }
 
 /// A native context's refusal, said where the guest's operator will see it, as the renderer's
@@ -184,6 +189,8 @@ impl std::fmt::Display for Error {
             Error::ZeroSize => "an import of zero bytes names no memory",
             Error::Unmappable => "that shm descriptor could not be mapped",
             Error::SurfaceRefused => "the host would not mint that surface",
+            Error::SurfaceLayout => "the rows are not laid out as the surface is",
+            Error::SurfaceUnwritable => "the surface would not take the rows",
             Error::ClassicRefused(r) => return write!(f, "vrend refused the resource: {r}"),
             Error::ClaimRefused(r) => return write!(f, "vrend refused the blob: {r}"),
             Error::Transfer(e) => return write!(f, "the transfer failed: {e}"),
@@ -2379,6 +2386,42 @@ impl Renderer {
         Some(rows)
     }
 
+    /// Write a surface-backed resource's rows from a caller's buffer: the inverse of
+    /// [`Self::resource_read_surface`], at the surface's own layout (`stride` its bytes per row,
+    /// `height` its height), which is refused rather than clamped.
+    ///
+    /// A CPU write with no ordering against GL, Vulkan or the embedder's renderer: the caller
+    /// makes sure nothing is drawing into the surface or reading it meanwhile, as for a read.
+    #[cfg(target_os = "macos")]
+    pub fn resource_write_surface(
+        &mut self,
+        handle: ResourceHandle,
+        src: &[u8],
+        stride: usize,
+        height: u32,
+    ) -> Result<(), Error> {
+        let write = |surface: &crate::surface::Surface| {
+            if stride != surface.bytes_per_row() as usize
+                || height != surface.height()
+                || src.len() < stride * height as usize
+            {
+                return Err(Error::SurfaceLayout);
+            }
+            if surface.write_rows(src, stride, height, stride) {
+                Ok(())
+            } else {
+                Err(Error::SurfaceUnwritable)
+            }
+        };
+        if let Some(surface) = self.classic_surface(handle) {
+            return write(surface);
+        }
+        self.with_resource(handle, |_| ()).ok_or(Error::NoResource)?;
+        let storage = self.resource_storage(handle).ok_or(Error::NotExportable)?;
+        let surface = storage.surface().map_err(|_| Error::NotExportable)?;
+        write(surface)
+    }
+
     /// The round trip through a classic resource's exported descriptor.
     ///
     /// Split out for one reason: the read needs `&mut self` and the caller is holding a borrow of
@@ -3738,6 +3781,91 @@ mod tests {
         r.transfer(luma, Some(ctx), transfer::Direction::ToGuest, &info, iov)
             .expect("the plain plane reads back");
         assert_eq!(read, bytes, "and reads back what was written");
+    }
+
+    /// Rows written into an embedder's surface read back the same, before vrend adopts it and
+    /// after, and a write laid out otherwise than the surface is refused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_embedders_surface_takes_rows_and_gives_them_back() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::Command;
+
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut r =
+            Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
+                .expect("vrend comes up");
+        let compositor = ContextId::new(1).unwrap();
+        r.context_create(compositor, CapsetId::Virgl, "compositor".into()).expect("a context");
+        let window = ResourceHandle::new(1).unwrap();
+        const W: u32 = 64;
+        const H: u32 = 8;
+        const PITCH: usize = 256;
+        r.resource_create_surface(
+            window,
+            SurfaceShape {
+                width: W,
+                height: H,
+                format: crate::surface::PixelFormat::Bgra,
+                bytes_per_row: PITCH as u32,
+            },
+        )
+        .expect("a surface");
+        let pattern: Vec<u8> = (0..PITCH * H as usize).map(|i| (i * 7 + 3) as u8).collect();
+        let read = |r: &mut Renderer| {
+            let mut rows = vec![0u8; PITCH * H as usize];
+            assert_eq!(r.resource_read_surface(window, &mut rows, PITCH, H), Some(H));
+            rows
+        };
+
+        r.resource_write_surface(window, &pattern, PITCH, H).expect("the rows are taken");
+        assert_eq!(read(&mut r), pattern, "read back from the embedder's surface");
+
+        assert_eq!(
+            r.resource_write_surface(window, &pattern, PITCH - 4, H),
+            Err(Error::SurfaceLayout),
+            "another pitch"
+        );
+        assert_eq!(
+            r.resource_write_surface(window, &pattern, PITCH, H - 1),
+            Err(Error::SurfaceLayout),
+            "another height"
+        );
+        assert_eq!(
+            r.resource_write_surface(window, &pattern[1..], PITCH, H),
+            Err(Error::SurfaceLayout),
+            "too few bytes"
+        );
+        assert_eq!(
+            r.resource_write_surface(ResourceHandle::new(9).unwrap(), &pattern, PITCH, H),
+            Err(Error::NoResource)
+        );
+
+        r.ctx_attach_resource(compositor, window);
+        let mut wire = Vec::new();
+        encode(
+            &Command::PipeResourceSetType {
+                resource: window,
+                format: crate::vrend::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM"),
+                bind: crate::vrend::resource::Bind::SAMPLER_VIEW.0,
+                width: W,
+                height: H,
+                usage: 0,
+                modifier: 0,
+                planes: vec![crate::vrend::proto::Plane { stride: PITCH as u32, offset: 0 }],
+            },
+            &mut wire,
+        );
+        let bytes: Vec<u8> = wire.iter().flat_map(|d| d.to_le_bytes()).collect();
+        assert!(matches!(r.submit_cmd(compositor, &bytes), Ok(Submitted::Done)));
+        assert!(
+            r.vrend.as_mut().expect("vrend").resource_surface_share(window).is_some(),
+            "vrend adopted the surface"
+        );
+        assert_eq!(read(&mut r), pattern, "vrend's texture is the same pages");
+        let again: Vec<u8> = pattern.iter().map(|b| !b).collect();
+        r.resource_write_surface(window, &again, PITCH, H).expect("written through vrend's share");
+        assert_eq!(read(&mut r), again);
     }
 
     /// A surface minted for the embedder is a texture's storage to a classic context that attaches
