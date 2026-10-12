@@ -1031,14 +1031,12 @@ mod tests {
         assert_eq!((region.load_u32(ret_at), region.load_u32(word_at)), (Some(0), Some(1)));
         ctx.submit(bytemuck::bytes_of(&fence(1, 8, 12))).unwrap();
         assert_eq!(region.load_u32(ret_at), Some(-libc::EINVAL as u32), "libdrm's ring check");
+        // A sequence number the ring never reached is the kernel's to refuse, and it does at
+        // once, so this does not reach the bound on the wait.
         let started = std::time::Instant::now();
         ctx.submit(bytemuck::bytes_of(&fence(1, 0, 13))).unwrap();
-        eprintln!(
-            "a fence that never was submitted answered {:?} after {:?}",
-            region.load_u32(ret_at),
-            started.elapsed()
-        );
-        assert!(started.elapsed() < FENCE_WAIT_BOUND * 2, "an endless wait is bounded");
+        assert_eq!(region.load_u32(ret_at), Some(-libc::EINVAL as u32), "a fence never submitted");
+        assert!(started.elapsed() < FENCE_WAIT_BOUND, "refused, not waited for");
         assert_eq!(
             ctx.submit(bytemuck::bytes_of(&QueryFenceStatusReq { ctx_id: 99, ..fence(1, 0, 14) }))
                 .err(),
@@ -1091,6 +1089,55 @@ mod tests {
         let imported = other.import_dmabuf(std::os::fd::AsFd::as_fd(&fd)).unwrap();
         drop((gem, imported));
         eprintln!("RAN: re-import on {}", probed.describe());
+    }
+
+    /// Storage another renderer holds reaches a native context as a dma-buf: it is imported at
+    /// its whole size, owned by the resource, and imported once per device file however many
+    /// handles name it there.
+    #[test]
+    fn a_foreign_buffer_is_imported_once_per_file_at_its_own_size() {
+        use crate::drm::Imports;
+        use crate::drm::context::Backend;
+
+        let Some(probed) = Probed::find() else {
+            eprintln!("SKIPPED: no amdgpu device on this host");
+            return;
+        };
+        let budget = crate::budget::Budget::with_cap(None, false);
+        let mut a = probed.open("a", &budget).unwrap();
+        let mut b = probed.open("b", &budget).unwrap();
+        // The renderer that made it: a file of its own, as vrend's or venus's would be.
+        let maker = Arc::new(Device::open(&probed.node).unwrap());
+        let gem = maker
+            .amdgpu_gem_create(AmdgpuGemCreate {
+                bo_size: 960,
+                alignment: 4096,
+                domains: AMDGPU_GEM_DOMAIN_GTT as u64,
+                domain_flags: 0,
+            })
+            .unwrap();
+        let mut imports = Imports::default();
+        fn foreign<'a>(imports: &'a mut Imports, gem: &sys::Gem) -> Source<'a> {
+            Source::Foreign { imports, dmabuf: gem.export().unwrap() }
+        }
+        let (one, two) = (ResourceHandle::new(1).unwrap(), ResourceHandle::new(2).unwrap());
+
+        a.attach(one, foreign(&mut imports, &gem)).unwrap();
+        let in_a = a.bound[&one].upgrade().expect("the resource owns what a names");
+        let page = crate::guest_mem::page_round(1).unwrap() as u64;
+        assert_eq!(in_a.size, page, "the size is the dma-buf's, not what was asked of it");
+        assert!(in_a.gem.is_in(&a.device));
+        b.attach(one, foreign(&mut imports, &gem)).unwrap();
+        assert_eq!(imports.copies.len(), 2, "one copy per file");
+        // A second handle on the same storage in a file that has it reuses the copy, where a
+        // second import would be refused as a second owner.
+        a.attach(two, foreign(&mut imports, &gem)).unwrap();
+        assert_eq!(imports.copies.len(), 2);
+        assert!(Arc::ptr_eq(&a.bound[&two].upgrade().unwrap(), &in_a));
+        drop(in_a);
+        drop(imports);
+        assert!(a.bound[&one].upgrade().is_none(), "the context's name dies with the resource");
+        eprintln!("RAN: foreign import on {}", probed.describe());
     }
 
     struct NoFences;
