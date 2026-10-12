@@ -704,6 +704,49 @@ impl Surface {
         true
     }
 
+    /// Copy a decoded plane's rows into this surface, which has no planes of its own: one plane
+    /// of a decode target that is a resource per plane. [`Self::write_plane`]'s contract, with
+    /// the surface's own extent and pitch standing for the plane's.
+    pub fn write_rows(&self, src: &[u8], src_pitch: usize, rows: u32, row_bytes: usize) -> bool {
+        if self.plane_count() != 0 {
+            return false;
+        }
+        let pitch = self.bytes_per_row() as usize;
+        let rows = rows.min(self.height());
+        let row_bytes = row_bytes.min(pitch);
+        if rows == 0 || row_bytes == 0 {
+            return true;
+        }
+        if src.len() < (rows as usize - 1) * src_pitch + row_bytes {
+            return false;
+        }
+        // SAFETY: the surface is live and owned by `self`; the lock is balanced by the unlock
+        // below with the same options, as IOSurface requires.
+        if unsafe { IOSurfaceLock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut()) } != 0 {
+            return false;
+        }
+        // SAFETY: the surface has no planes, so its base address is its one region, `height`
+        // rows `pitch` apart. Each row writes `row_bytes <= pitch` at an offset of at most
+        // `(rows - 1) * pitch` with `rows <= height`, so every byte lands inside it. The source's
+        // length was just checked against what is read out of it, and the two regions cannot
+        // overlap -- one is this surface, the other is not.
+        unsafe {
+            let base = IOSurfaceGetBaseAddress(self.as_ref()).cast::<u8>();
+            if !base.is_null() {
+                for row in 0..rows as usize {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr().add(row * src_pitch),
+                        base.add(row * pitch),
+                        row_bytes,
+                    );
+                }
+            }
+            // SAFETY: balanced against the lock above, with the same options.
+            IOSurfaceUnlock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut());
+        }
+        true
+    }
+
     /// Copy one plane of another surface into the same plane of this one.
     ///
     /// This is how a picture is replicated from one decode target into another: the pixels of a

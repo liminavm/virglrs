@@ -1196,6 +1196,13 @@ enum Write {
     /// Hand it back, for per-plane targets to upload as each plane's texture settles. Uploads
     /// need a GL context, which this thread does not have.
     Keep,
+    /// Write each plane into the surface of that plane's own resource: a per-plane target whose
+    /// every plane is a surface, which needs no GL either. Done here, before the picture lands,
+    /// because a fence waits for the landing and the surfaces have readers no GL barrier
+    /// reaches (another driver importing them); an upload left to the render thread would make
+    /// END_FRAME wait for it instead.
+    #[cfg(target_os = "macos")]
+    PlaneSurfaces { planes: Vec<PlaneWrite>, layout: TargetFormat },
     /// Write it into a composite target's surface planes, which needs no GL at all.
     Planes {
         surface: Arc<dyn Held>,
@@ -1254,6 +1261,22 @@ fn decode_one<B: Backend>(
     match &job.write {
         Write::Nothing => pending::Outcome::Nothing,
         Write::Keep => pending::Outcome::Picture(picture),
+        #[cfg(target_os = "macos")]
+        Write::PlaneSurfaces { planes, layout } => {
+            let began = std::time::Instant::now();
+            let _timed = Timed(began, &mut phases.write);
+            let Some(locked) = picture.lock() else {
+                eprintln!(
+                    "[virglrs] video codec {handle}: the decoded picture could not be mapped"
+                );
+                return pending::Outcome::Nothing;
+            };
+            if write_plane_surfaces(planes, *layout, &locked) > 0 {
+                pending::Outcome::Written
+            } else {
+                pending::Outcome::Nothing
+            }
+        }
         Write::Planes { surface, geometry, layout } => {
             let began = std::time::Instant::now();
             let _timed = Timed(began, &mut phases.write);
@@ -1310,6 +1333,54 @@ fn write_planes(
             eprintln!(
                 "[virglrs] video: plane {index} of a composite target would not take a picture; \
                  the frame keeps whatever was there"
+            );
+        }
+    }
+    written
+}
+
+/// One plane of a per-plane target whose storage is a surface: where its picture plane goes, and
+/// the arithmetic [`pending`]'s GL upload clamps it by.
+#[cfg(target_os = "macos")]
+pub struct PlaneWrite {
+    surface: Arc<dyn Held>,
+    index: usize,
+    block_bytes: u32,
+    width: u32,
+    height: u32,
+}
+
+/// Copy a decoded picture into the surfaces of a per-plane target, returning how many planes
+/// were written. The clamps are the GL upload's: the target plane's extent, the source plane's
+/// rows, and as many pixels as the decoder's pitch holds.
+#[cfg(target_os = "macos")]
+fn write_plane_surfaces(
+    planes: &[PlaneWrite],
+    layout: TargetFormat,
+    picture: &Locked<'_>,
+) -> usize {
+    let count = picture.plane_count();
+    let mut written = 0;
+    for plane in planes {
+        // A target with more planes than the picture is the guest's choice of layout: the planes
+        // past the picture's are left alone, as the upload leaves them.
+        if plane.index >= count {
+            continue;
+        }
+        let Some(source) = picture.plane(layout.source_plane(plane.index, count)) else {
+            continue;
+        };
+        let row_pixels = source.pitch as u32 / plane.block_bytes;
+        let w = plane.width.min(row_pixels);
+        let h = plane.height.min(source.height);
+        let row_bytes = (w * plane.block_bytes) as usize;
+        if plane.surface.surface().write_rows(source.bytes, source.pitch, h, row_bytes) {
+            written += 1;
+        } else {
+            eprintln!(
+                "[virglrs] video: plane {} of a decode target would not take a picture; the \
+                 frame keeps whatever was there",
+                plane.index
             );
         }
     }
@@ -1404,11 +1475,13 @@ impl HostDecoder<'_> {
     ///
     /// - a composite surface lent to a venus context, which reads it on a Vulkan queue (see
     ///   [`crate::surface::Surface::mark_lent`]);
-    /// - a per-plane target any of whose plane textures has a surface of its own, which can be
-    ///   presented or lent, and whose picture reaches it by an upload on this thread -- a fence
-    ///   waits for the decode to land, not for that upload. None does today: a surface is minted
-    ///   only for a 32-bit colour texture, and a plane is R8 or RG8. The rule is here so that
-    ///   minting one for a plane does not quietly make the fence a lie.
+    /// - a per-plane target only some of whose plane textures have a surface of their own, which
+    ///   another driver can import, and whose picture reaches them by an upload on this thread --
+    ///   a fence waits for the decode to land, not for that upload.
+    ///
+    /// A per-plane target whose planes are *all* surfaces -- every video buffer's planes are, on a
+    /// host GL that takes R8 and RG8 surfaces -- is neither: the decode thread writes its picture
+    /// into the surfaces before it lands ([`Write::PlaneSurfaces`]), so it stays asynchronous.
     ///
     /// The composite case is decided at END_FRAME, so a lend that happens later leaves the
     /// decode already queued to land on its own. Asynchronous decode widens that window from the
@@ -1422,6 +1495,33 @@ impl HostDecoder<'_> {
     ) -> (Write, bool) {
         let pending = |recipe| pending::Pending::new(Arc::clone(landing), recipe, self.unsettled);
         match &buffer.destination {
+            #[cfg(target_os = "macos")]
+            Destination::PerPlane(planes)
+                if planes.iter().all(|plane| plane.texture.minted().is_some()) =>
+            {
+                // Every plane a surface: the decode thread writes them and the picture lands
+                // whole, so nothing is left for a read to settle and END_FRAME need not wait.
+                let mut writes = Vec::with_capacity(planes.len());
+                for (index, plane) in planes.iter().enumerate() {
+                    let upload = pending::PlaneUpload {
+                        index,
+                        layout,
+                        gl: plane.gl,
+                        block_bytes: plane.block_bytes,
+                        width: plane.width,
+                        height: plane.height,
+                    };
+                    plane.texture.expect_decode(self.gl, pending(pending::Recipe::Plane(upload)));
+                    writes.push(PlaneWrite {
+                        surface: plane.texture.minted().expect("checked above").held(),
+                        index,
+                        block_bytes: plane.block_bytes,
+                        width: plane.width,
+                        height: plane.height,
+                    });
+                }
+                (Write::PlaneSurfaces { planes: writes, layout }, false)
+            }
             Destination::PerPlane(planes) => {
                 for (index, plane) in planes.iter().enumerate() {
                     let upload = pending::PlaneUpload {
@@ -2824,6 +2924,74 @@ mod tests {
                 landing.picture_landed(|picture| matches!(picture, Picture::Software(p)
                     if p.plane(0).is_some_and(|y| (y.width, y.height) == (64, 48)))),
                 "every unit lands a 64x48 picture from dav1d"
+            );
+        }
+    }
+
+    /// A per-plane target whose planes are all surfaces gets its picture from the decode thread,
+    /// written into each plane's surface before the picture lands -- so nothing is left for the
+    /// render thread, and a reader of the surfaces that waited for the landing sees the frame.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_decode_thread_writes_a_per_plane_target_into_its_surfaces() {
+        use crate::surface::{PixelFormat as SurfaceFormat, Surface};
+        let stream = include_bytes!("testdata/testsrc-64x48.ivf");
+        let rest = &stream[32..];
+        let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+        let key = rest[12..12 + len].to_vec();
+        let job = |codec, write, landing: &Arc<pending::Landing>| Job {
+            codec: VideoCodecHandle(codec),
+            unit: Work::Software(SoftwareUnit {
+                bytes: key.clone(),
+                replay: None,
+                pixels: Some(PixelFormat::Planar420),
+            }),
+            write,
+            landing: Arc::clone(landing),
+            sent: std::time::Instant::now(),
+        };
+        let extents = [(64, 48), (32, 24), (32, 24)];
+        let surfaces: Vec<Arc<Surface>> = extents
+            .iter()
+            .map(|&(w, h)| {
+                Arc::new(Surface::plain(w, h, SurfaceFormat::R8).expect("a plane surface"))
+            })
+            .collect();
+        let planes = surfaces
+            .iter()
+            .zip(extents)
+            .enumerate()
+            .map(|(index, (s, (width, height)))| PlaneWrite {
+                surface: Arc::clone(s) as Arc<dyn Held>,
+                index,
+                block_bytes: 1,
+                width,
+                height,
+            })
+            .collect();
+        let (kept, written) = (pending::Landing::new(), pending::Landing::new());
+        let (jobs, queue) = std::sync::mpsc::sync_channel(2);
+        jobs.send(job(1, Write::Keep, &kept)).expect("room");
+        jobs.send(job(2, Write::PlaneSurfaces { planes, layout: TargetFormat::Iyuv }, &written))
+            .expect("room");
+        drop(jobs);
+        decode_thread::<Refuses>(queue, &pending::Unsettled::default(), None);
+
+        assert!(written.written(), "the picture went into the surfaces on the decode thread");
+        for (index, (surface, (w, h))) in surfaces.iter().zip(extents).enumerate() {
+            let mut rows = vec![0u8; (w * h) as usize];
+            assert_eq!(surface.read_rows(&mut rows, w as usize, h), h, "plane {index}: every row");
+            assert!(
+                kept.picture_landed(|picture| {
+                    let locked = picture.lock().expect("a software picture maps");
+                    let plane = locked.plane(index).expect("the picture has the plane");
+                    (0..h).all(|y| {
+                        plane.row(y).is_some_and(|row| {
+                            row[..w as usize] == rows[(y * w) as usize..((y + 1) * w) as usize]
+                        })
+                    })
+                }),
+                "plane {index} holds the picture's plane"
             );
         }
     }
