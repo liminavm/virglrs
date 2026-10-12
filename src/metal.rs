@@ -887,6 +887,12 @@ impl Surface {
     /// How the surface actually laid its rows out, which is not necessarily what was asked for.
     /// Minted here, so a refusal to adopt one is this renderer's own bug. See
     /// [`crate::surface::Layouter`].
+    /// A send right for this surface, for an embedder that hands it to a process of its own.
+    pub fn port(&self) -> Option<SurfacePort> {
+        // SAFETY: we hold a reference to the surface for the duration of this call.
+        unsafe { SurfacePort::of(self.as_ref()) }
+    }
+
     pub fn layouter(&self) -> crate::surface::Layouter {
         crate::surface::Layouter::ThisHost
     }
@@ -1097,7 +1103,7 @@ impl SurfacePort {
 
     /// Whether this right names the surface `id` -- the receiver's half, done in-process.
     #[cfg(test)]
-    fn resolves_to(&self, id: u32) -> bool {
+    pub(crate) fn resolves_to(&self, id: u32) -> bool {
         // SAFETY: the lookup returns a +1 reference or null, released before returning; the
         // right itself is only borrowed.
         unsafe {

@@ -104,6 +104,8 @@ pub enum Error {
     OverBudget(crate::budget::Refused),
     /// A native context refused what the guest asked of it, for the reason given.
     Native(crate::drm::Refused),
+    /// The host would not mint the surface the embedder asked for.
+    SurfaceRefused,
 }
 
 /// A native context's refusal, said where the guest's operator will see it, as the renderer's
@@ -181,6 +183,7 @@ impl std::fmt::Display for Error {
             }
             Error::ZeroSize => "an import of zero bytes names no memory",
             Error::Unmappable => "that shm descriptor could not be mapped",
+            Error::SurfaceRefused => "the host would not mint that surface",
             Error::ClassicRefused(r) => return write!(f, "vrend refused the resource: {r}"),
             Error::ClaimRefused(r) => return write!(f, "vrend refused the blob: {r}"),
             Error::Transfer(e) => return write!(f, "the transfer failed: {e}"),
@@ -434,6 +437,11 @@ pub enum Backing {
     /// shm is host-addressable: a dma-buf or an opaque handle names memory belonging to a driver,
     /// which the host reaches through Vulkan and never through a pointer.
     Imported { desc: ImportDesc, fd: OwnedFd, map: Option<Arc<GuestMap>> },
+    /// A surface this renderer minted for the embedder, which renders into it with a renderer of
+    /// its own (limina's Metal transport). Every context sees it as a share of that surface, the
+    /// way it sees a classic resource's: vrend adopts it as a texture's storage, venus imports it.
+    /// Nothing maps it, because the embedder's renderer is the only one that writes it.
+    Embedder { surface: Arc<dyn crate::surface::Held> },
 }
 
 pub struct Resource {
@@ -538,6 +546,9 @@ impl venus::ring::ShmResources for crate::Map<ResourceHandle, Resource> {
                     None
                 }
             },
+            Backing::Embedder { surface } => {
+                Some(ResourceBytes::Shared(Storage::lent(Arc::clone(surface))))
+            }
             Backing::Imported { .. } => {
                 eprintln!(
                     "[virglrs] ctx {}: resource {handle:?} is not host-addressable",
@@ -600,7 +611,7 @@ impl Resource {
         match &self.backing {
             Backing::Imported { map, .. } => map.as_ref(),
             Backing::Blob { storage: BlobStorage::Minted(h), .. } => Some(&h.map),
-            Backing::Blob { .. } | Backing::Classic { .. } => None,
+            Backing::Blob { .. } | Backing::Classic { .. } | Backing::Embedder { .. } => None,
         }
     }
 }
@@ -1101,6 +1112,43 @@ impl Renderer {
         Ok(())
     }
 
+    /// Mint a surface for the embedder and file it as a resource: see [`Backing::Embedder`].
+    ///
+    /// The surface's rows are `bytes_per_row` apart exactly, or it is refused: the embedder's
+    /// renderer lays its texture over these bytes at the pitch the guest was told, so a surface
+    /// IOSurface laid out its own way would shear. The port is the embedder's to send on.
+    #[cfg(target_os = "macos")]
+    pub fn resource_create_surface(
+        &mut self,
+        handle: ResourceHandle,
+        width: u32,
+        height: u32,
+        format: crate::surface::PixelFormat,
+        bytes_per_row: u32,
+    ) -> Result<crate::metal::SurfacePort, Error> {
+        self.free_handle(handle)?;
+        let surface = crate::metal::Surface::scanout(width, height, format, bytes_per_row)
+            .map_err(|e| {
+                eprintln!("[virglrs] resource {handle}: no {width}x{height} surface: {e:?}");
+                Error::SurfaceRefused
+            })?;
+        if surface.bytes_per_row() != bytes_per_row {
+            eprintln!(
+                "[virglrs] resource {handle}: IOSurface laid {width}x{height} out at {} bytes a \
+                 row, not {bytes_per_row}",
+                surface.bytes_per_row()
+            );
+            return Err(Error::SurfaceRefused);
+        }
+        let port = surface.port().ok_or(Error::SurfaceRefused)?;
+        let charge =
+            crate::budget::Classic::open(&self.budget).charge("IOSurface", surface.alloc_size());
+        let surface: Arc<dyn crate::surface::Held> =
+            Arc::new(crate::budget::Charged::new(surface, charge));
+        self.insert(handle, Backing::Embedder { surface }, Vec::new());
+        Ok(port)
+    }
+
     /// The claim a new resource carries: `Some` exactly when there is a vrend holding a half to
     /// claim. One place decides it, so a resource cannot come into the table without one.
     fn claim(&self, handle: ResourceHandle) -> Option<crate::vrend::resource::Claim> {
@@ -1435,6 +1483,9 @@ impl Renderer {
                     Some(storage.adoptable())
                 }
                 Backing::Blob { .. } => Some(None),
+                Backing::Embedder { surface } => {
+                    Some(Some(crate::surface::Adoptable::of(Arc::clone(surface))))
+                }
                 Backing::Classic { .. } | Backing::Imported { .. } => None,
             })
             .flatten();
@@ -2142,7 +2193,10 @@ impl Renderer {
                 .inspect_err(|e| eprintln!("[virglrs] resource {handle}: no dma-buf: {e}"))
                 .ok()
                 .map(|fd| (fd, FdType::DmaBuf, None)),
-            Backing::Blob { .. } | Backing::Classic { .. } | Backing::Imported { .. } => None,
+            Backing::Blob { .. }
+            | Backing::Classic { .. }
+            | Backing::Imported { .. }
+            | Backing::Embedder { .. } => None,
         })
         .flatten()
         .ok_or(Error::NotExportable)
@@ -2173,7 +2227,10 @@ impl Renderer {
             Backing::Blob { storage: BlobStorage::Native(b), .. } => {
                 b.descriptor().map(|fd| f(fd, None))
             }
-            Backing::Blob { .. } | Backing::Classic { .. } | Backing::Imported { .. } => None,
+            Backing::Blob { .. }
+            | Backing::Classic { .. }
+            | Backing::Imported { .. }
+            | Backing::Embedder { .. } => None,
         })?
     }
 
@@ -2215,6 +2272,7 @@ impl Renderer {
             Backing::Blob { storage: BlobStorage::Shared { storage, .. }, .. } => {
                 Some(storage.clone())
             }
+            Backing::Embedder { surface } => Some(Storage::lent(Arc::clone(surface))),
             Backing::Blob { .. } | Backing::Classic { .. } | Backing::Imported { .. } => None,
         })?
     }
@@ -2464,7 +2522,7 @@ impl Renderer {
                 // it did not get from gbm.
                 HostMapping { addr, size, caching: Caching::Cached }
             }),
-            Backing::Imported { .. } => None,
+            Backing::Imported { .. } | Backing::Embedder { .. } => None,
         })
         .ok_or(Error::NoResource)?
         .ok_or(Error::NotMappable)
@@ -3122,6 +3180,82 @@ mod tests {
             table.bytes(two, plain).is_none(),
             "a classic resource with GL storage has no host address to import"
         );
+    }
+
+    /// A surface minted for the embedder is a texture's storage to a classic context that attaches
+    /// and types it, and a share to a venus one: the embedder's renderer and both of ours meet in
+    /// the same pages, with no copy between them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_embedders_surface_is_adopted_by_vrend_and_lent_to_venus() {
+        use crate::venus::ring::ShmResources;
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::Command;
+
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut r = Renderer::new(
+            Box::new(NoSink),
+            Config { vrend: true, venus: true, ..Config::default() },
+            None,
+        )
+        .expect("vrend comes up");
+        let compositor = ContextId::new(1).unwrap();
+        let client = ContextId::new(2).unwrap();
+        r.context_create(compositor, CapsetId::Virgl, "compositor".into()).expect("a context");
+        r.context_create(client, CapsetId::Venus, "client".into()).expect("a context");
+
+        let window = ResourceHandle::new(1).unwrap();
+        let port = r
+            .resource_create_surface(window, 64, 8, crate::surface::PixelFormat::Bgra, 256)
+            .expect("a surface at the pitch asked");
+        assert_eq!(
+            r.resource_create_surface(window, 64, 8, crate::surface::PixelFormat::Bgra, 256).err(),
+            Some(Error::ResourceExists),
+            "the handle is taken"
+        );
+        r.ctx_attach_resource(compositor, window);
+        r.ctx_attach_resource(client, window);
+
+        let mut wire = Vec::new();
+        encode(
+            &Command::PipeResourceSetType {
+                resource: window,
+                format: crate::vrend::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM"),
+                bind: crate::vrend::resource::Bind::SAMPLER_VIEW.0,
+                width: 64,
+                height: 8,
+                usage: 0,
+                modifier: 0,
+                planes: vec![crate::vrend::proto::Plane { stride: 256, offset: 0 }],
+            },
+            &mut wire,
+        );
+        let bytes: Vec<u8> = wire.iter().flat_map(|d| d.to_le_bytes()).collect();
+        assert!(
+            matches!(r.submit_cmd(compositor, &bytes), Ok(Submitted::Done)),
+            "the typing is accepted"
+        );
+        let adopted = r
+            .vrend
+            .as_mut()
+            .expect("vrend")
+            .resource_surface_share(window)
+            .expect("vrend adopted the surface as the texture's storage");
+        assert!(port.resolves_to(adopted.surface().id().0), "the surface the port names");
+
+        let Some(ResourceBytes::Shared(lent)) = r.resources.read().unwrap().bytes(client, window)
+        else {
+            panic!("a venus context imports the surface");
+        };
+        assert_eq!(lent.span().0, adopted.surface().host_addr(), "the same pages");
+
+        let refused = ResourceHandle::new(2).unwrap();
+        assert_eq!(
+            r.resource_create_surface(refused, 64, 8, crate::surface::PixelFormat::Bgra, 0).err(),
+            Some(Error::SurfaceRefused),
+            "a surface with no pitch is refused"
+        );
+        assert!(r.with_resource(refused, |_| ()).is_none(), "and leaves nothing behind");
     }
 
     #[cfg(target_os = "macos")]
