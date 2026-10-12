@@ -346,6 +346,29 @@ impl Buffer {
         per_plane.iter().map(|plane| &plane.texture).chain(composite)
     }
 
+    /// Whether a picture decoded into this target has to be settled before END_FRAME returns,
+    /// because something reads it where no barrier of ours stands. See [`HostDecoder::expect`].
+    fn settles_at_end_frame(&self) -> bool {
+        match &self.destination {
+            // Every plane a surface: the decode thread writes them before the picture lands.
+            #[cfg(target_os = "macos")]
+            Destination::PerPlane(planes)
+                if planes.iter().all(|plane| plane.texture.minted().is_some()) =>
+            {
+                false
+            }
+            Destination::PerPlane(planes) => planes
+                .iter()
+                .any(|plane| plane.texture.minted().is_some() || plane.texture.exported()),
+            Destination::Composite(texture) => texture
+                .planes
+                .as_ref()
+                .expect("a composite decode target has planes")
+                .surface()
+                .is_lent(),
+        }
+    }
+
     /// Deliver whatever picture is in flight into this target, waiting for it.
     fn settle(&self, gl: &Gl) {
         for texture in self.textures() {
@@ -1586,7 +1609,7 @@ impl HostDecoder<'_> {
                         height: plane.height,
                     });
                 }
-                (Write::PlaneSurfaces { planes: writes, layout }, false)
+                (Write::PlaneSurfaces { planes: writes, layout }, buffer.settles_at_end_frame())
             }
             Destination::PerPlane(planes) => {
                 for (index, plane) in planes.iter().enumerate() {
@@ -1600,10 +1623,7 @@ impl HostDecoder<'_> {
                     };
                     plane.texture.expect_decode(self.gl, pending(pending::Recipe::Plane(upload)));
                 }
-                let surfaced = planes
-                    .iter()
-                    .any(|plane| plane.texture.minted().is_some() || plane.texture.exported());
-                (Write::Keep, surfaced)
+                (Write::Keep, buffer.settles_at_end_frame())
             }
             Destination::Composite(texture) => {
                 // A composite target without planes cannot be built -- `create_buffer` refuses it
@@ -1612,7 +1632,7 @@ impl HostDecoder<'_> {
                 let geometry = (0..planes.count()).map(|index| planes.geometry(index)).collect();
                 texture.expect_decode(self.gl, pending(pending::Recipe::Composite));
                 let write = Write::Planes { surface: planes.held(), geometry, layout };
-                (write, planes.surface().is_lent())
+                (write, buffer.settles_at_end_frame())
             }
         }
     }
@@ -2216,6 +2236,13 @@ impl Video {
             Kind::Av1(_) => unreachable!("AV1 takes the whole call"),
         }
         Ok(())
+    }
+
+    /// Whether a picture decoded into target `handle` would be settled before END_FRAME returns,
+    /// or `None` for a target this video does not have.
+    #[cfg(test)]
+    pub fn settles_at_end_frame(&self, handle: VideoBufferHandle) -> Option<bool> {
+        self.buffers.get(&handle).map(|b| b.settles_at_end_frame())
     }
 
     /// The decodes this context has in flight, one per codec: a codec's decodes land in order,
