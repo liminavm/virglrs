@@ -8196,6 +8196,11 @@ mod tests {
                     }),
                 },
                 Command::BindObject { kind: ObjectType::Blend, handle: Some(blend) },
+                // The clear touched every sample, and blending one touched earlier in the pass
+                // is undefined without a barrier between them (KHR_blend_equation_advanced): the
+                // guest's `glBlendBarrier` arrives as this. iris reads the clear without it;
+                // radeonsi, which blends in the shader, does not.
+                Command::TextureBarrier(crate::vrend::context::PIPE_TEXTURE_BARRIER_FRAMEBUFFER),
             ],
             ..Default::default()
         };

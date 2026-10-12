@@ -518,12 +518,10 @@ fails on the Mac with 132 submits replayed against the pin's 2238, identically b
 2026-09-04. The cause is not established: a capture older than its pin is the first thing to
 rule out.
 
-**Two vrend unit tests fail on radeonsi** (banana: Radeon 890M, Fedora 44, Mesa 26.2.4), at
-9e4906b and identically at its parent, so no native-context change caused them. The suite on
-goiaba's iris passes them all. Chased after the native-context work:
+**A vrend unit test fails on radeonsi** (banana: Radeon 890M, Fedora 44, Mesa 26.2.4), at
+9e4906b and identically at its parent, so no native-context change caused it. The suite on
+goiaba's iris passes it. Chased after the native-context work:
 
-- `vrend::vrend::tests::an_advanced_blend_equation_blends_the_draw` -- on the GLES flavour, red
-  multiplied over grey reads `[192, 0, 0, 255]`.
 - `vrend::vrend::tests::pipeline_statistics_and_overflow_queries_count_where_the_host_has_them` --
   on the desktop flavour, the counted value is 1 where the test expects 0.
 

@@ -70,7 +70,7 @@ const PIPE_CLEAR_STENCIL: u32 = 1 << 1;
 const PIPE_CLEAR_COLOR0: u32 = 1 << 2;
 const PIPE_CLEAR_COLOR: u32 = 0xff << 2;
 /// `PIPE_TEXTURE_BARRIER_FRAMEBUFFER`: draws read what earlier draws wrote to the framebuffer.
-const PIPE_TEXTURE_BARRIER_FRAMEBUFFER: u32 = 1 << 1;
+pub(crate) const PIPE_TEXTURE_BARRIER_FRAMEBUFFER: u32 = 1 << 1;
 
 /// What the guest side of the renderer answers about a resource's pages.
 pub trait Guest {
