@@ -1688,13 +1688,23 @@ impl Resource {
         let (w, h) = (a.width as GLsizei, a.height as GLsizei);
         gl.copy_image_sub_data(old.name, target, 0, [0; 3], new.name, target, 0, [0; 3], [w, h, 1]);
         let err = gl.drain_errors();
+        #[cfg(test)]
+        let err = if plane_faults::copy_fails() { GL_INVALID_OPERATION } else { err };
         if err != GL_NO_ERROR {
+            // The surface holds none of the plane's pixels: swapping it in would empty the plane
+            // and report success for it.
             eprintln!(
-                "[virglrs] vrend: copying a {}x{} {} plane into its surface: GL error {err:#x}",
+                "[virglrs] vrend: copying a {}x{} {} plane into its surface: GL error {err:#x}; it \
+                 keeps GL storage",
                 a.width,
                 a.height,
                 a.format.name()
             );
+            match Arc::try_unwrap(new) {
+                Ok(new) => new.destroy(gl),
+                Err(_) => unreachable!("storage made a moment ago, held by nothing else"),
+            }
+            return false;
         }
         let Storage::Texture(old) = std::mem::replace(&mut self.storage, Storage::Texture(new))
         else {
@@ -2331,7 +2341,10 @@ fn plane_image(winsys: &Winsys, budget: &Classic, a: &Args, format: PixelFormat)
         }
     };
     let charge = budget.charge("IOSurface", surface.alloc_size());
-    match winsys.image_from_surface(Arc::new(Charged::new(surface, charge))) {
+    let made = winsys.image_from_surface(Arc::new(Charged::new(surface, charge)));
+    #[cfg(test)]
+    let made = plane_faults::answer(format, made);
+    match made {
         Ok(image) => {
             if winsys.plane_surface_said.first(true) {
                 eprintln!(
@@ -2355,6 +2368,69 @@ fn plane_image(winsys: &Winsys, budget: &Classic, a: &Args, format: PixelFormat)
             }
             None
         }
+    }
+}
+
+/// Faults a test injects into a video plane's promotion: a host GL refusing a plane's surface,
+/// and a copy into the surface failing. No host produces either on demand, and the path each
+/// takes is the one every stock guest runs where it happens.
+///
+/// Thread-local, as `cargo test` runs each test on a thread of its own and the renderer under
+/// test does its GL work on the thread that submits.
+#[cfg(all(test, target_os = "macos"))]
+pub mod plane_faults {
+    use std::cell::Cell;
+
+    use crate::surface::PixelFormat;
+    use crate::vrend::egl::{EglError, Image};
+
+    thread_local! {
+        static COPY_FAILS: Cell<bool> = const { Cell::new(false) };
+        static REFUSED: Cell<[bool; 2]> = const { Cell::new([false; 2]) };
+        static ASKED: Cell<[u32; 2]> = const { Cell::new([0; 2]) };
+    }
+
+    fn slot(format: PixelFormat) -> usize {
+        match format {
+            PixelFormat::R8 => 0,
+            PixelFormat::Rg8 => 1,
+            other => unreachable!("{other:?} is no plane format"),
+        }
+    }
+
+    /// Every later copy of a plane into its surface fails with a GL error.
+    pub fn fail_copies() {
+        COPY_FAILS.set(true);
+    }
+
+    /// The host GL refuses every later surface of `format`.
+    pub fn refuse(format: PixelFormat) {
+        let mut r = REFUSED.get();
+        r[slot(format)] = true;
+        REFUSED.set(r);
+    }
+
+    /// How many times the host GL was asked for a surface of `format`.
+    pub fn asked(format: PixelFormat) -> u32 {
+        ASKED.get()[slot(format)]
+    }
+
+    pub(super) fn copy_fails() -> bool {
+        COPY_FAILS.get()
+    }
+
+    /// The host GL's answer for a surface of `format`, as the test wants it given.
+    pub(super) fn answer(
+        format: PixelFormat,
+        made: Result<Image, EglError>,
+    ) -> Result<Image, EglError> {
+        let mut a = ASKED.get();
+        a[slot(format)] += 1;
+        ASKED.set(a);
+        if REFUSED.get()[slot(format)] {
+            return Err(EglError { call: "eglCreateImage (refused by the test)", code: 0x3009 });
+        }
+        made
     }
 }
 
