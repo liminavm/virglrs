@@ -953,14 +953,14 @@ impl Surface {
     /// How the surface actually laid its rows out, which is not necessarily what was asked for.
     /// Minted here, so a refusal to adopt one is this renderer's own bug. See
     /// [`crate::surface::Layouter`].
+    pub fn layouter(&self) -> crate::surface::Layouter {
+        crate::surface::Layouter::ThisHost
+    }
+
     /// A send right for this surface, for an embedder that hands it to a process of its own.
     pub fn port(&self) -> Option<SurfacePort> {
         // SAFETY: we hold a reference to the surface for the duration of this call.
         unsafe { SurfacePort::of(self.as_ref()) }
-    }
-
-    pub fn layouter(&self) -> crate::surface::Layouter {
-        crate::surface::Layouter::ThisHost
     }
 
     pub fn bytes_per_row(&self) -> u32 {
