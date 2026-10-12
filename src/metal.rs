@@ -730,6 +730,9 @@ impl Surface {
         // `(rows - 1) * pitch` with `rows <= height`, so every byte lands inside it. The source's
         // length was just checked against what is read out of it, and the two regions cannot
         // overlap -- one is this surface, the other is not.
+        //
+        // A surface with no base address takes none of the rows, and answers `false`: success
+        // would report a picture that never reached it.
         unsafe {
             let base = IOSurfaceGetBaseAddress(self.as_ref()).cast::<u8>();
             if !base.is_null() {
@@ -743,8 +746,8 @@ impl Surface {
             }
             // SAFETY: balanced against the lock above, with the same options.
             IOSurfaceUnlock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut());
+            !base.is_null()
         }
-        true
     }
 
     /// Copy one plane of another surface into the same plane of this one.
