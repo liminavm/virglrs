@@ -1280,8 +1280,14 @@ slice's reference lists takes HEVC to 27. The four `SLIST` vectors and `VPSSPSPP
 ones that catch the scaling lists going to the driver in the order mesa's frontend stored
 them.
 
-H.264's five failures are the SP-slice and FMO streams (`SP1_BT_A`, `sp2_bt_b`, `FM*`), which the
-guest refuses before they reach the renderer. The field-coded, PAFF and MBAFF streams decode:
+H.264's five failures are the SP-slice and FMO streams. `SP1_BT_A`, `sp2_bt_b` and `FM2_SVA_C`
+are refused by the guest before they reach the renderer. `FM1_BT_B` and `FM1_FT_E` are not, and
+arrive looking like plain Baseline: mesa's VA frontend never copies the slice-group fields into
+the descriptor, so `num_slice_groups_minus1` is always 0 on the wire and the slice reader's
+refusal of slice groups cannot fire. Their slice headers are then read without
+`slice_group_change_cycle`; `FM1_FT_E` is every `internal decoding error` from iHD in a full run
+(159 of them), and `FM1_BT_B` decodes to wrong pixels without one. Neither is servable here: the
+slice-group map is in a PPS the renderer never sees, and iHD decodes no FMO. The field-coded, PAFF and MBAFF streams decode:
 VA-API is handed the descriptor's fields and needs no parameter set, so only VideoToolbox, which
 does, refuses them. `BASQP1_Sony_C` is the vector that holds an emulation-prevention byte inside a
 slice header: it fails if the slice data offset is counted in raw bits rather than RBSP bits.
