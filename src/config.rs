@@ -5,16 +5,20 @@
 
 /// What the caller asked this renderer to be.
 ///
-/// The C ABI says this in a bitmask of eleven `virgl_renderer_init` flags, of which exactly four
-/// mean anything here; the rest select a winsys this build does not use. So the Rust API asks for
-/// the four, by name, and the shim does the decoding -- a caller should not have to know which
-/// bit is which, nor that one of them is spelled inside out.
+/// The C ABI says this in a bitmask of eleven `virgl_renderer_init` flags, of which a handful mean
+/// anything here; the rest select a winsys this build does not use. So the Rust API asks for
+/// those by name, and the shim does the decoding -- a caller should not have to know which bit is
+/// which, nor that one of them is spelled inside out.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Config {
     /// Serve venus.
     pub venus: bool,
     /// Serve vrend, the classic virgl renderer. Spelled positively; the ABI spells it `NO_VIRGL`.
     pub vrend: bool,
+    /// Serve DRM native contexts, where the host has a GPU this build has a backend for. The
+    /// capset is offered only then: asked for on a host with no such GPU, this serves the rest
+    /// and says why not this.
+    pub native_context: bool,
     /// The VMM cannot inject memory pages, so a blob must come from the guest's own heap. The
     /// guest reads this back out of the venus capset and allocates accordingly.
     pub guest_vram: bool,
@@ -107,6 +111,7 @@ impl Default for Config {
         Config {
             venus: false,
             vrend: false,
+            native_context: false,
             guest_vram: false,
             video: false,
             linear_shared: true,
@@ -129,6 +134,8 @@ pub enum CapsetId {
     Virgl2,
     /// Vulkan, over the venus wire.
     Venus,
+    /// A DRM native context: the guest's GPU driver, run against the host kernel's.
+    Drm,
     /// A capset id this build has no name for.
     ///
     /// Not a rejection: a guest binding a renderer we do not serve still gets its context, and
@@ -156,7 +163,7 @@ impl core::fmt::Debug for UnnamedCapset {
 impl CapsetId {
     /// The capset a virtio-gpu id names.
     ///
-    /// Total, and the only way to reach [`CapsetId::Unknown`]. The three ids are virtio-gpu's own
+    /// Total, and the only way to reach [`CapsetId::Unknown`]. The ids are virtio-gpu's own
     /// numbers and live here rather than beside the C header's spelling of them, because they are
     /// the protocol's and would outlive the shim.
     pub fn from_raw(id: u8) -> CapsetId {
@@ -164,6 +171,7 @@ impl CapsetId {
             1 => CapsetId::Virgl,
             2 => CapsetId::Virgl2,
             4 => CapsetId::Venus,
+            6 => CapsetId::Drm,
             other => CapsetId::Unknown(UnnamedCapset(other)),
         }
     }

@@ -53,8 +53,8 @@ fn capset_of(raw: u32) -> CapsetId {
 
 /// Decode `virgl_renderer_init`'s flag word into what the renderer is being asked to be.
 ///
-/// Five of the eleven flags reach the renderer. The rest choose a winsys (EGL, surfaceless,
-/// DRM) or a threading model we implement unconditionally (`THREAD_SYNC`,
+/// Six of the eleven flags reach the renderer. The rest choose a winsys (EGL, surfaceless) or a
+/// threading model we implement unconditionally (`THREAD_SYNC`,
 /// `ASYNC_FENCE_CB`, `RENDER_SERVER`) -- none of them is a question the renderer answers, so none
 /// of them is carried inward.
 ///
@@ -65,6 +65,7 @@ fn config_of(flags: c_int) -> Config {
     Config {
         venus: flags & abi::VENUS != 0,
         vrend: flags & abi::NO_VIRGL == 0,
+        native_context: flags & abi::DRM != 0,
         guest_vram: flags & abi::USE_GUEST_VRAM != 0,
         video: flags & abi::USE_VIDEO != 0,
         // No flag carries it, so it takes the Rust default and `virgl_renderer_init` lets the
@@ -272,7 +273,8 @@ fn errno(e: renderer::Error) -> c_int {
         | MalformedSync(_)
         | JournalRefused(_)
         | ClassicRefused(_)
-        | ClaimRefused(_) => EINVAL,
+        | ClaimRefused(_)
+        | Native(_) => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
         OverBudget(_) => -libc::ENOMEM,
         NotExportable => -libc::EINVAL,
@@ -3110,6 +3112,7 @@ mod tests {
             Config {
                 venus: false,
                 vrend: true,
+                native_context: false,
                 guest_vram: false,
                 video: false,
                 linear_shared: true,
@@ -3119,12 +3122,18 @@ mod tests {
         );
 
         // Every flag that means something, and one that does not, to show it changes nothing.
-        let all = abi::VENUS | abi::NO_VIRGL | abi::USE_GUEST_VRAM | abi::USE_VIDEO | abi::USE_EGL;
+        let all = abi::VENUS
+            | abi::NO_VIRGL
+            | abi::DRM
+            | abi::USE_GUEST_VRAM
+            | abi::USE_VIDEO
+            | abi::USE_EGL;
         assert_eq!(
             config_of(all),
             Config {
                 venus: true,
                 vrend: false,
+                native_context: true,
                 guest_vram: true,
                 video: true,
                 linear_shared: true,
@@ -3136,6 +3145,7 @@ mod tests {
         // One at a time, so a bit read for the wrong field cannot hide behind another.
         assert!(config_of(abi::VENUS).venus);
         assert!(!config_of(abi::NO_VIRGL).vrend, "NO_VIRGL means vrend is absent");
+        assert!(config_of(abi::DRM).native_context);
         assert!(config_of(abi::USE_GUEST_VRAM).guest_vram);
         assert!(config_of(abi::USE_VIDEO).video);
         assert_eq!(config_of(abi::USE_GLES).host_gl, HostGl::Gles, "USE_GLES names GLES");

@@ -52,7 +52,13 @@ vaapi = ["dep:cros-libva"]
 # Arm the classic command recorder (`src/trace.rs`) from `LIMINA_VREND_TRACE`. Off by default: an
 # armed environment then says it records nothing.
 trace = ["dep:nix"]
-default = ["vaapi"]
+
+# DRM native contexts (`src/drm/`, `docs/native-context.md`): the guest's own GPU driver, run
+# against the host kernel's. `drm` is the shared layer, and each backend its own feature. Linux
+# only; no effect elsewhere.
+drm = []
+drm-amdgpu = ["drm"]
+default = ["vaapi", "drm-amdgpu"]
 
 [dependencies]
 bumpalo = "3.20"

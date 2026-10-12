@@ -102,6 +102,15 @@ pub enum Error {
     JournalRefused(&'static str),
     /// The host memory budget refused memory a context asked the host to mint.
     OverBudget(crate::budget::Refused),
+    /// A native context refused what the guest asked of it, for the reason given.
+    Native(crate::drm::Refused),
+}
+
+/// A native context's refusal, said where the guest's operator will see it, as the renderer's
+/// error. Not under [`crate::REFUSED`]: the context is not finished, only the submission.
+fn native_refused(ctx: ContextId, r: crate::drm::Refused) -> Error {
+    eprintln!("[virglrs] ctx {ctx}: native: {r}");
+    Error::Native(r)
 }
 
 /// A read or a write of an allocation's bytes, in the renderer's vocabulary. One function for
@@ -178,6 +187,7 @@ impl std::fmt::Display for Error {
             Error::MalformedContent(m) => return write!(f, "the contents were refused: {m}"),
             Error::MalformedSync(m) => return write!(f, "the sync state was refused: {m}"),
             Error::JournalRefused(why) => return write!(f, "the journal was refused: {why}"),
+            Error::Native(r) => return write!(f, "the native context refused: {r}"),
         };
         f.write_str(s)
     }
@@ -603,6 +613,7 @@ pub struct Context {
 pub enum Bound {
     Classic(ClassicCtx),
     Venus(VenusCtx),
+    Native(NativeCtx),
     /// A capset this build serves with nothing: the context exists and answers no command.
     Unserved,
 }
@@ -639,6 +650,16 @@ impl VenusCtx {
     }
 }
 
+/// A DRM native context; see [`Bound`]. Only [`Renderer::bound`] makes one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeCtx(ContextId);
+
+impl NativeCtx {
+    pub fn id(self) -> ContextId {
+        self.0
+    }
+}
+
 /// One capset, as the guest reads it: which one decides both its layout and the version a
 /// caller may ask for.
 // A capset is built once per request and copied straight out to the caller's buffer; the size
@@ -649,6 +670,7 @@ pub enum Capset {
     Venus(venus::capset::Capset),
     Virgl(vrend::caps::CapsV1),
     Virgl2(vrend::caps::CapsV2),
+    Drm(crate::drm::Capset),
 }
 
 impl Capset {
@@ -658,6 +680,7 @@ impl Capset {
             Capset::Venus(_) => CapsetId::Venus,
             Capset::Virgl(_) => CapsetId::Virgl,
             Capset::Virgl2(_) => CapsetId::Virgl2,
+            Capset::Drm(_) => CapsetId::Drm,
         }
     }
 
@@ -678,6 +701,7 @@ impl Capset {
             CapsetId::Virgl2 => {
                 (vrend::caps::VIRGL2_VERSION, size_of::<vrend::caps::CapsV2>() as u32)
             }
+            CapsetId::Drm => (crate::drm::capset::VERSION, size_of::<crate::drm::Capset>() as u32),
             CapsetId::Unknown(_) => return None,
         };
         Some((version, size))
@@ -693,6 +717,7 @@ impl Capset {
             Capset::Venus(c) => c.as_bytes(),
             Capset::Virgl(c) => c.as_bytes(),
             Capset::Virgl2(c) => c.as_bytes(),
+            Capset::Drm(c) => c.as_bytes(),
         }
     }
 }
@@ -717,6 +742,8 @@ pub struct Renderer {
     venus: Option<venus::vkr::Vkr>,
     /// The classic renderer, likewise.
     vrend: Option<vrend::vrend::Vrend>,
+    /// DRM native contexts, present when asked for and the host has a GPU with a backend.
+    native: Option<crate::drm::Native>,
     /// limina's trace knobs, read once here and handed to the classic renderer with the rest.
     traces: vrend::debug::Traces,
     /// `VIRGLRS_DEBUG`'s switches, read once here and handed to every thread that logs by them.
@@ -777,6 +804,14 @@ impl Renderer {
         let venus = config.venus.then(|| {
             venus::vkr::Vkr::new(config.clone(), resources.clone(), &budget, fences.handle())
         });
+        let native = config.native_context.then(crate::drm::Native::probe).flatten();
+        match (&native, config.native_context) {
+            (Some(n), _) => eprintln!("[virglrs] native contexts: {}", n.describe()),
+            (None, true) => eprintln!(
+                "[virglrs] native contexts were asked for, and no GPU here has a backend in this build"
+            ),
+            (None, false) => {}
+        }
         Ok(Renderer {
             config,
             resources: Arc::clone(&resources),
@@ -785,6 +820,7 @@ impl Renderer {
             venus,
             budget,
             vrend,
+            native,
             traces,
             debug,
             fences,
@@ -823,6 +859,7 @@ impl Renderer {
             }
             CapsetId::Virgl => self.vrend.as_ref().map(|v| Capset::Virgl(v.caps().v1())),
             CapsetId::Virgl2 => self.vrend.as_ref().map(|v| Capset::Virgl2(*v.caps())),
+            CapsetId::Drm => self.native.as_ref().map(|n| Capset::Drm(n.capset())),
             CapsetId::Unknown(_) => None,
         }
     }
@@ -912,6 +949,20 @@ impl Renderer {
                     Bound::Classic(_) => HostShm::mint(handle, desc.size, |size| {
                         Ok(crate::budget::Classic::open(&self.budget).charge("host shm", size))
                     })?,
+                    // A native context's one minted blob is its response region, which it takes a
+                    // share of before the resource exists: a region it refuses is never a resource.
+                    Bound::Native(n) => {
+                        let native = self.native.as_mut().ok_or(Error::RendererAbsent)?;
+                        let shm = HostShm::mint(handle, desc.size, |size| {
+                            Ok(crate::budget::Classic::open(&self.budget)
+                                .charge("native response region", size))
+                        })?;
+                        native
+                            .attach_region(n.id(), Arc::clone(&shm.map), desc.size, desc.blob_flags)
+                            .ok_or(Error::NoContext)?
+                            .map_err(|r| native_refused(n.id(), r))?;
+                        shm
+                    }
                     Bound::Unserved => return Err(Error::RendererUnimplemented),
                 };
                 BlobStorage::Minted(shm)
@@ -923,6 +974,8 @@ impl Renderer {
                 // A context whose capset names no renderer we have holds nothing, so its ids
                 // name nothing either.
                 Bound::Unserved => return Err(Error::RendererUnimplemented),
+                // Buffers arrive with `GEM_NEW`, which is not served yet.
+                Bound::Native(_) => return Err(Error::RendererUnimplemented),
                 // The id is a `VkDeviceMemory` the guest allocated. Every way this can fail is
                 // a distinct `Error` and the caller is told which; the C ABI's single errno for
                 // all of them is `ffi.rs`'s problem and not this function's.
@@ -1222,6 +1275,14 @@ impl Renderer {
                     return Err(Error::RendererAbsent);
                 }
             }
+            Bound::Native(n) => {
+                if let Some(native) = self.native.as_mut()
+                    && let Err(r) = native.context_create(n.id(), name)
+                {
+                    self.contexts.remove(&id);
+                    return Err(native_refused(id, r));
+                }
+            }
             Bound::Unserved => {}
         }
         Ok(())
@@ -1243,6 +1304,11 @@ impl Renderer {
                 if let Some(v) = self.vrend.as_mut() {
                     let table = self.resources.read().expect("the resource lock is never poisoned");
                     v.context_destroy(ctx, &*table);
+                }
+            }
+            Bound::Native(n) => {
+                if let Some(native) = self.native.as_mut() {
+                    native.context_destroy(n.id());
                 }
             }
             Bound::Unserved => {}
@@ -1432,6 +1498,15 @@ impl Renderer {
                     Some(Err(_fault)) => Ok(Submitted::Poisoned),
                 }
             }
+            // A refused request drops the rest of its submission and nothing else: the context
+            // stays open, as the C leaves it.
+            Bound::Native(n) => {
+                let native = self.native.as_mut().ok_or(Error::RendererAbsent)?;
+                match native.submit(n.id(), buf).ok_or(Error::NoContext)? {
+                    Ok(()) => Ok(Submitted::Done),
+                    Err(r) => Err(native_refused(n.id(), r)),
+                }
+            }
             Bound::Unserved => Err(Error::RendererUnimplemented),
         }
     }
@@ -1450,7 +1525,7 @@ impl Renderer {
     ) -> Result<Submitted, Error> {
         match self.bound(ctx)? {
             Bound::Venus(ctx) => self.venus_mut()?.resume(ctx, buf, answered).map_err(venus_error),
-            Bound::Classic(_) => Err(Error::Poisoned),
+            Bound::Classic(_) | Bound::Native(_) => Err(Error::Poisoned),
             Bound::Unserved => Err(Error::RendererUnimplemented),
         }
     }
@@ -1514,6 +1589,7 @@ impl Renderer {
         Ok(match c.capset {
             CapsetId::Virgl | CapsetId::Virgl2 => Bound::Classic(ClassicCtx(ctx)),
             CapsetId::Venus => Bound::Venus(VenusCtx(ctx)),
+            CapsetId::Drm => Bound::Native(NativeCtx(ctx)),
             CapsetId::Unknown(_) => Bound::Unserved,
         })
     }
@@ -1523,7 +1599,7 @@ impl Renderer {
     fn classic_ctx(&self, ctx: ContextId) -> Result<ClassicCtx, Error> {
         match self.bound(ctx)? {
             Bound::Classic(c) => Ok(c),
-            Bound::Venus(_) | Bound::Unserved => Err(Error::NoContext),
+            Bound::Venus(_) | Bound::Native(_) | Bound::Unserved => Err(Error::NoContext),
         }
     }
 
@@ -1531,7 +1607,7 @@ impl Renderer {
     fn venus_ctx(&self, ctx: ContextId) -> Result<VenusCtx, Error> {
         match self.bound(ctx)? {
             Bound::Venus(c) => Ok(c),
-            Bound::Classic(_) | Bound::Unserved => Err(Error::NoContext),
+            Bound::Classic(_) | Bound::Native(_) | Bound::Unserved => Err(Error::NoContext),
         }
     }
 
@@ -1557,7 +1633,8 @@ impl Renderer {
         match self.bound(ctx).ok()? {
             Bound::Classic(c) => self.vrend.as_mut()?.journal_export(c),
             Bound::Venus(c) => self.venus.as_ref()?.journal_export(c),
-            Bound::Unserved => None,
+            // A native context keeps no journal: its state is the kernel's.
+            Bound::Native(_) | Bound::Unserved => None,
         }
     }
 
@@ -1576,7 +1653,7 @@ impl Renderer {
             Bound::Venus(c) => {
                 ("venus", self.venus_mut()?.journal_restore(c, bytes).map_err(venus_error))
             }
-            Bound::Unserved => return Err(Error::RendererUnimplemented),
+            Bound::Native(_) | Bound::Unserved => return Err(Error::RendererUnimplemented),
         };
         restored.inspect_err(|e| {
             // The blob has been through a snapshot file since it was written. Saying which way it
@@ -1598,7 +1675,7 @@ impl Renderer {
                 .replay_begin(c)
                 .map_err(replay_error),
             Bound::Venus(c) => self.venus_mut()?.replay_begin(c).map_err(venus_error),
-            Bound::Unserved => Err(Error::RendererUnimplemented),
+            Bound::Native(_) | Bound::Unserved => Err(Error::RendererUnimplemented),
         }
     }
 
@@ -1614,7 +1691,7 @@ impl Renderer {
                 .venus_mut()?
                 .replay_upto(c, crate::venus::journal::Seq(upto))
                 .map_err(venus_error),
-            Bound::Unserved => Err(Error::RendererUnimplemented),
+            Bound::Native(_) | Bound::Unserved => Err(Error::RendererUnimplemented),
         }
     }
 
@@ -1628,7 +1705,7 @@ impl Renderer {
                 .replay_end(c)
                 .map_err(replay_error),
             Bound::Venus(c) => self.venus_mut()?.replay_end(c).map_err(venus_error),
-            Bound::Unserved => Err(Error::RendererUnimplemented),
+            Bound::Native(_) | Bound::Unserved => Err(Error::RendererUnimplemented),
         }
     }
 

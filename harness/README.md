@@ -1416,6 +1416,27 @@ structurally cannot do now that it compiles virglrs in. There is already a QEMU 
 goiaba, so the shape is known. **Deliberately deferred**: the C leg boots today, and rebuilding
 the rig is a larger change than anything currently waiting on it.
 
+## Native contexts, by boot (banana)
+
+DRM native contexts (`docs/native-context.md`) have no replay: the commands are a kernel driver's,
+so a recording scores only the GPU it was made on. They are scored by booting a guest on banana,
+the AMD Strix Point host, under QEMU 11.1 with `drm_native_context=on`, on both legs. The C leg is
+upstream at the manifest's pin built with `-Ddrm-renderers=amdgpu-experimental`, and the guest's
+Mesa has `-Damdgpu-virtio=true`, which Fedora's does not. The rig lives outside the tree, in
+`/home/claude/vm` there.
+
+- **The capset, byte for byte.** The guest reads capset 6 through `DRM_IOCTL_VIRTGPU_GET_CAPS`,
+  and the two legs' bytes must be identical. They carry libdrm_amdgpu's own derivation of the
+  device (`amdgpu_gpu_info`, the marketing name, the 32-bit address range), and the guest's Mesa
+  configures itself from them. Measured 2026-10-12: identical, 592 bytes, 61 of them non-zero.
+- **The renderer string, then the pixels.** kmscube on the guest's KMS names `radeonsi` directly
+  when native context is in use and `virgl (...)` when the guest fell back to classic, and the
+  captured frame is read.
+
+The control is Fedora's own libvirglrenderer, built without any native-context backend: asked for
+one, it fails its init, QEMU turns 3D off, and the guest has no render node at all. A gate that
+passes on that leg is not reading what it claims to.
+
 ## Layer 0 — the ABI itself (`abi/`)
 
 `abi-fixture.sh` pins two files and checks a build against them: `symbols.txt`, the symbols a

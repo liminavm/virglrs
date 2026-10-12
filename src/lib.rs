@@ -67,6 +67,7 @@ pub mod decode;
 #[cfg(not(target_os = "macos"))]
 #[allow(unsafe_code)]
 pub mod dmabuf;
+pub mod drm;
 pub mod fence;
 #[allow(unsafe_code)]
 pub mod ffi;

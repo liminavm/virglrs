@@ -144,11 +144,13 @@ The C has two holes this closes at the boundary:
 
 - `VIRGL_RENDERER_DRM` becomes `Config::native_context`.
 - Capset 6 (`DRM`) becomes `CapsetId::Drm` and a `Capset::Drm` arm.
-- The device comes from the VMM's `get_drm_fd` callback when it gives one; QEMU 11.1 does not. If
-  it doesn't, it is the render node the renderer already resolved for its shared buffers, so
-  native, classic and venus resources live on one device and cross-context import never crosses
-  devices. Only with no vrend is a node picked here: the first one whose driver has a backend. In
-  the Rust API that is an optional owned fd in `Config`, not a callback.
+- `Config::native_context` asks for native contexts; the device is the first render node whose
+  driver has a backend, as the C's `drmOpenWithType` finds it. Before cross-context import lands
+  it becomes the node the renderer already resolved for its shared buffers, so native, classic and
+  venus resources live on one device. A VMM's own fd (`get_drm_fd`, which QEMU 11.1 does not
+  give) would arrive as an optional owned fd in `Config`, not a callback.
+- Asked for on a host with no such GPU, the renderer serves everything else and says why not this.
+  The C fails its whole init instead, taking classic and venus with it.
 - `resource_map_fixed` stays refused: QEMU 11.1 falls back to `resource_map` on `-EOPNOTSUPP`.
 - In-fences (`submit_cmd2`, the C's `supports_fence_sharing`) are deferred: QEMU 11.1 never calls
   `submit_cmd2`.
