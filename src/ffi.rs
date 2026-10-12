@@ -2251,7 +2251,7 @@ pub extern "C" fn virgl_renderer_limina_replay_end(ctx_id: u32) -> c_int {
         return EINVAL;
     };
     with(EINVAL, |r| match r.replay_end(ctx) {
-        Ok(()) => 0,
+        Ok(_) => 0,
         Err(e) => errno(e),
     })
 }
