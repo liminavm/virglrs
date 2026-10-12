@@ -496,6 +496,28 @@ pixels with no error. Neither is servable on any host -- the slice-group map is 
 renderer never sees, and iHD decodes no FMO -- so the fix is in limina's guest Mesa: copy the
 three fields, and the renderer refuses the stream instead of decoding it wrong.
 
+**What fluster still fails on goiaba** (538 of 587, pinned in
+`harness/fluster/fixtures/results.va.txt`), beside the FMO streams above:
+
+- *HEVC Main10 and `PICSIZE` (15 vectors).* The guest refuses them: only HEVC Main is
+  advertised. Serving them means advertising Main10 and backing 10-bit (P010) decode targets
+  through the decode, delivery and capset paths.
+- *VP9 mid-stream resolution change* (the `resize` vectors). VP9 lets a frame predict from
+  references of another size, so what is owed is a context and surfaces that follow the frame's
+  extent without dropping the references the next frame names; whether iHD scales them is
+  untested.
+- *VP9 `svc_1280x720_3`, and the profile-1 4:2:2 and 4:4:4 streams.* Profile 1 is advertised by
+  nobody here; SVC is unattributed.
+- *H.264 SP slices* (`SP1_BT_A`, `sp2_bt_b`): Extended profile, refused by the guest, and
+  absent from VA-API's profile list.
+
+**The macOS H.264 and HEVC replays do not match their pins.** `vrend-replay.sh` on
+`harness/vm/captures/vrend-h264.bin` against `fixtures/vrend-h264.score` (and HEVC likewise)
+fails on the Mac with 132 submits replayed against the pin's 2238, identically before and after
+773d18f, so no decode change caused it; `vrend-vp9stock` matches. The local captures date from
+2026-09-04. The cause is not established: a capture older than its pin is the first thing to
+rule out.
+
 ## Missing infrastructure
 
 **There is no CI** (no `.github`, no `.gitlab-ci.yml`). Two hosts and no CI means macOS regresses
