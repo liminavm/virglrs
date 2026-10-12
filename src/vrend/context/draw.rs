@@ -1635,6 +1635,12 @@ impl Context {
         // loop skipped still leaves the level already recorded for it alone rather than zeroing it.
         let mut levels_out = [0 as GLint; 32];
         let mut levels_used = 0usize;
+        // What a unit the loop bound now holds: a texture's storage and the object it samples
+        // it through, or `None` for something that is not a texture's.
+        type Holds = Option<(Arc<resource::Texture>, TextureName)>;
+        // Per unit, for the units to keep once the loop's borrow of them ends; `None` for a unit
+        // the loop did not bind.
+        let mut rebound: [Option<Holds>; 32] = [const { None }; 32];
         while mask != 0 {
             let i = mask.trailing_zeros();
             mask &= mask - 1;
@@ -1648,7 +1654,30 @@ impl Context {
             if let Some(view) = view {
                 host.refresh_guest_pixels(view.resource);
             }
-            if dirty.contains(i)
+            let shadow = shadow_mask & (1 << i) != 0;
+            // What the unit is to sample, from the storage the view's handle names now: the
+            // texture, and the object to sample it through. Asked whether the unit is marked or
+            // not, because what the handle names can change with nothing marking it -- and a
+            // unit still holding what it was bound to before samples storage that is gone.
+            let sampled = view.and_then(|view| {
+                let res = host.bound_resource(view.resource)?;
+                let Storage::Texture(t) = &res.storage else {
+                    return None;
+                };
+                // A key that has no object over this storage samples nothing; `View::sampled`
+                // said why when it was first asked.
+                let name = view
+                    .sampled(gl, host.features, host.formats, res, shadow)
+                    .ok()
+                    .map(|name| name.unwrap_or(t.name));
+                Some((t, name))
+            });
+            let moved = match &sampled {
+                Some((t, Some(name))) => !sub.units[s].holds(i, t, *name),
+                Some((_, None)) => true,
+                None => false,
+            };
+            if (dirty.contains(i) || moved)
                 && let Some(view) = view
             {
                 gl.active_texture(next_sampler_id);
@@ -1656,25 +1685,26 @@ impl Context {
                     gl.uniform_1i(loc, next_sampler_id.uniform_value());
                 }
                 let res = host.bound_resource(view.resource);
-                if shadow_mask & (1 << i) != 0 {
+                // A view sharing the texture's object asks its state of the texture, which the
+                // set did for the texture the handle named then.
+                if moved
+                    && let Some((t, Some(name))) = &sampled
+                    && *name == t.name
+                {
+                    view.share(gl, host.features, t);
+                }
+                if shadow {
                     // A depth texture read through a shadow sampler compares, and the
-                    // luminance-style swizzles must not apply: the texture goes back to
-                    // identity and the view's swizzle becomes a mask and an add.
-                    if let Some(res) = res
-                        && let Storage::Texture(t) = &res.storage
+                    // luminance-style swizzles must not apply: the object bound is the one
+                    // without the view's swizzle, and the swizzle becomes a mask and an add. A
+                    // view sharing the texture's object resets the texture's own.
+                    if let Some((t, Some(name))) = &sampled
+                        && *name == t.name
                     {
-                        // The object the unit will bind, which is the view's own whenever it
-                        // has one. Resetting the base texture instead would leave the swizzle
-                        // standing on what is actually sampled, and clear it on a texture no
-                        // one asked about.
-                        let (name, target) = match view.view {
-                            Some(name) => (name, view.target),
-                            None => (t.name, t.target),
-                        };
-                        gl.bind_texture(target, Some(name));
+                        gl.bind_texture(t.target, Some(t.name));
                         for (c, sw) in [GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA].iter().enumerate() {
                             gl.tex_parameter_i(
-                                target,
+                                t.target,
                                 GL_TEXTURE_SWIZZLE_R + c as GLenum,
                                 *sw as GLint,
                             );
@@ -1693,17 +1723,25 @@ impl Context {
                 if let Some(res) = res {
                     let (id, target, is_buffer, multisampled) = match &res.storage {
                         Storage::Buffer { tbo, .. } => (*tbo, GL_TEXTURE_BUFFER, true, false),
-                        Storage::Texture(t) => (
-                            Some(view.view.unwrap_or(t.name)),
+                        Storage::Texture(_) => (
+                            sampled.as_ref().and_then(|(_, name)| *name),
                             view.target,
                             false,
                             res.args.nr_samples > 1,
                         ),
                         _ => (None, view.target, false, false),
                     };
-                    if let Some(id) = id {
-                        gl.bind_texture(target, Some(id));
+                    match (id, &res.storage) {
+                        (Some(id), _) => gl.bind_texture(target, Some(id)),
+                        // An object refused for this storage: the unit is emptied rather than
+                        // left sampling what it held.
+                        (None, Storage::Texture(_)) => gl.bind_texture(target, None),
+                        (None, _) => {}
                     }
+                    rebound[i as usize] = Some(match (&sampled, id) {
+                        (Some((t, Some(_))), Some(id)) => Some((Arc::clone(t), id)),
+                        _ => None,
+                    });
                     // vrend_apply_sampler_state, the sampler-objects leg: a buffer or
                     // multisampled texture takes no sampler.
                     if !is_buffer && !multisampled {
@@ -1747,6 +1785,11 @@ impl Context {
             }
         }
         sub.units[s].bound();
+        for (slot, bound) in rebound.iter().enumerate() {
+            if let Some(bound) = bound {
+                sub.units[s].record(slot as u32, bound.as_ref().map(|(t, n)| (t, *n)));
+            }
+        }
         // A later glBindTexture for another reason must not disturb the units just bound.
         gl.active_texture(TextureUnit::at(max_units.saturating_sub(1)));
         next_sampler_id

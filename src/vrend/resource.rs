@@ -1237,6 +1237,11 @@ pub struct Texture {
     /// too. The lock is uncontended -- a renderer's classic side is one thread -- and buys the
     /// share the `Send` a `RefCell` would cost it.
     views: Mutex<BTreeMap<ViewKey, TextureName>>,
+    /// The sampler views' own objects over this texture, one per distinct [`SamplerKey`], and
+    /// `Ok(None)` for a key that samples the texture itself. Here for the reason `views` is: a
+    /// view names its resource by handle, so the object it samples through is a fact about the
+    /// storage the handle names now, and goes with that storage when it goes.
+    samplers: Mutex<BTreeMap<SamplerKey, Result<Option<TextureName>, Unviewable>>>,
     /// A decoded picture on its way into this texture, when it is a decode target. Settled by
     /// whatever reads or writes the texture first; see [`video::pending`].
     pub decode: video::pending::Slot,
@@ -1247,14 +1252,42 @@ pub struct Texture {
 /// always spans the resource's whole mip chain -- and neither is anything the guest sets on the
 /// view object afterwards, because nothing does. That makes two surfaces with the same key the
 /// same view, which is why the resource can own it.
-///
-/// A *sampler* view has no such key: its swizzle, depth/stencil read mode and sRGB decode live on
-/// the view object itself and are not derivable from the resource, so those stay where they are.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct ViewKey {
     pub format: Format,
     pub first_layer: u32,
     pub layers: u32,
+}
+
+/// What a sampler view asks of its texture, as the guest asked it: the GL target it samples
+/// through, the format it reads in, its level and layer ranges as they arrived (a plane index
+/// among them), and its swizzle after the format table's. Everything the object it samples
+/// through is minted with follows from this and the texture -- the swizzle, the depth/stencil
+/// read mode and the sRGB decode set on it included -- so two views with one key sample through
+/// one object, and the texture can own it.
+///
+/// It is the request and not the answer on purpose. How the object is made -- a texture view, a
+/// second import of the texture's image, a plane's image, or no object at all -- is decided by
+/// the storage, so a key minted again over other storage under the same handle is answered for
+/// that storage.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct SamplerKey {
+    pub target: GLenum,
+    pub format: Format,
+    pub first_level: u32,
+    pub last_level: u32,
+    pub first_layer: u32,
+    pub last_layer: u32,
+    pub swizzle: [GLint; 4],
+}
+
+/// Why a [`SamplerKey`] has no object over a texture: a level or layer range past the texture's
+/// own, or a format the host has no texture of. Asked of the driver, either would leave the
+/// context in GL error for the rest of its life.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unviewable {
+    Range,
+    Format(Format),
 }
 
 /// A texture that is a *copy* of a blob's pages, and the layout it is copied at.
@@ -1690,6 +1723,7 @@ impl Texture {
             pixels: Pixels::Own,
             planes: None,
             views: Mutex::default(),
+            samplers: Mutex::default(),
             decode: video::pending::Slot::default(),
         }
     }
@@ -1758,6 +1792,18 @@ impl Texture {
         })
     }
 
+    /// The object a sampler view with `key` samples this texture through: `Ok(None)` for the
+    /// texture itself, and `mint`'s answer, kept, the first time the key is asked for.
+    pub fn sampler(
+        &self,
+        key: SamplerKey,
+        mint: impl FnOnce() -> Result<Option<TextureName>, Unviewable>,
+    ) -> Result<Option<TextureName>, Unviewable> {
+        let mut samplers =
+            self.samplers.lock().expect("the classic side never panics under this lock");
+        *samplers.entry(key).or_insert_with(mint)
+    }
+
     /// The render-target view for `key`, if it has already been minted. Every surface mints its
     /// view at creation, so an attach only ever reads one back.
     pub fn view_texture(&self, key: ViewKey) -> Option<TextureName> {
@@ -1769,6 +1815,11 @@ impl Texture {
     pub fn destroy(self, gl: &Gl) {
         for v in self.views.into_inner().expect("the classic side never panics under this lock") {
             gl.delete_texture(v.1);
+        }
+        let samplers =
+            self.samplers.into_inner().expect("the classic side never panics under this lock");
+        for name in samplers.into_values().filter_map(|s| s.ok().flatten()) {
+            gl.delete_texture(name);
         }
         // The conversion pass's textures over the plane images. The images themselves, and the
         // surface they share, go with the `Planes` this consumes.
@@ -2564,6 +2615,7 @@ fn alloc_texture(
             pixels: Pixels::Minted(image),
             planes,
             views: Mutex::default(),
+            samplers: Mutex::default(),
             decode: video::pending::Slot::default(),
         })));
     }
@@ -2683,6 +2735,7 @@ fn alloc_texture(
         pixels,
         planes,
         views: Mutex::default(),
+        samplers: Mutex::default(),
         decode: video::pending::Slot::default(),
     })))
 }

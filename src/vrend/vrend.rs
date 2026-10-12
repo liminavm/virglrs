@@ -5020,8 +5020,14 @@ mod tests {
     /// renderer is made to lack. `stream_output` is the vertex shader's, and `draw` replaces the
     /// one triangle drawn. `texel_limit` lowers the renderer's texture-buffer texel limit, which
     /// GL's own is far past anything a test wants to allocate.
+    ///
+    /// `sub_contexts` draws everything twice, from two sub-contexts, each over its own half of the
+    /// target: sub-context 0 the left, 1 the right. `swap` frees a resource between the first draw
+    /// and the redraws and makes it again under the same handle; see [`Swap`].
     #[derive(Default)]
     struct More<'a> {
+        sub_contexts: bool,
+        swap: Option<Swap<'a>>,
         stream_output: Option<crate::vrend::proto::StreamOutput>,
         draw: Option<crate::vrend::proto::Draw>,
         pages: Vec<(ResourceHandle, &'a std::cell::RefCell<Vec<u8>>)>,
@@ -5036,6 +5042,15 @@ mod tests {
         texel_limit: Option<u32>,
     }
 
+    /// A resource the renderer's table lets go of once the first draw has run, made again under
+    /// the same handle with `args` before the redraws. The stream before and after are two
+    /// submissions, and `seen` is the target as the first one left it.
+    struct Swap<'a> {
+        resource: ResourceHandle,
+        args: resource::Args,
+        seen: &'a std::cell::RefCell<Vec<u8>>,
+    }
+
     /// Draw `d` into a fresh target and read the target back. `Ok(None)` is a host without
     /// tessellation asked to tessellate, which refuses the evaluation shader as it never told the
     /// guest it could.
@@ -5044,8 +5059,8 @@ mod tests {
         use crate::vrend::pipe::{LogicOp, PrimType};
         use crate::vrend::proto::{
             BlendState, Box3, Command, Draw, Object, ObjectType, RtBlend, ShaderChunk,
-            ShaderCreate, ShaderKind, StreamOutput, Surface, TessDraw, Transfer, VertexBuffer,
-            VertexElement, Viewport,
+            ShaderCreate, ShaderKind, StreamOutput, SubContextId, Surface, TessDraw, Transfer,
+            VertexBuffer, VertexElement, Viewport,
         };
         let _display = crate::vrend::one_display_at_a_time();
         struct Discard;
@@ -5088,12 +5103,13 @@ mod tests {
             Box::new(Discard),
             crate::vrend::debug::Switches::default(),
         );
+        let condemned = crate::vrend::resource::Condemned::default();
         let mut v = Vrend::new(
             Config { host_gl: d.host_gl, ..Config::default() },
             &crate::budget::Budget::with_cap(None, false),
             retire.handle(),
             None,
-            crate::vrend::resource::Condemned::default(),
+            condemned.clone(),
             crate::vrend::debug::Traces::default(),
             crate::vrend::debug::Switches::default(),
         )
@@ -5174,95 +5190,111 @@ mod tests {
             })
         }
         let writes = RtBlend { equation: None, colormask: 0xf };
-        let mut commands = vec![
-            Command::ResourceInlineWrite {
-                transfer: Transfer {
-                    resource: vertices,
-                    level: 0,
-                    usage: 0,
-                    stride: 0,
-                    layer_stride: 0,
-                    region: Box3 { x: 0, y: 0, z: 0, width: 48, height: 1, depth: 1 },
+        let sub_contexts = d.more.is_some_and(|m| m.sub_contexts);
+        let subs: u32 = if sub_contexts { 2 } else { 1 };
+        // The whole target, or one sub-context's half of it.
+        let viewport = |sub: u32| match sub_contexts {
+            false => Viewport { scale: [8.0, 8.0, 0.5], translate: [8.0, 8.0, 0.5] },
+            true => {
+                Viewport { scale: [4.0, 8.0, 0.5], translate: [4.0 + 8.0 * sub as f32, 8.0, 0.5] }
+            }
+        };
+        let mut commands = Vec::new();
+        for sub in 0..subs {
+            if sub > 0 {
+                commands.push(Command::CreateSubCtx(SubContextId(sub)));
+            }
+            if sub_contexts {
+                commands.push(Command::SetSubCtx(SubContextId(sub)));
+            }
+            let mut setup = vec![
+                Command::ResourceInlineWrite {
+                    transfer: Transfer {
+                        resource: vertices,
+                        level: 0,
+                        usage: 0,
+                        stride: 0,
+                        layer_stride: 0,
+                        region: Box3 { x: 0, y: 0, z: 0, width: 48, height: 1, depth: 1 },
+                    },
+                    data: &corners,
                 },
-                data: &corners,
-            },
-            Command::CreateObject {
-                handle: o(1),
-                object: shader(ShaderStage::Vertex, &vs, &vs_stream_output),
-            },
-            Command::CreateObject {
-                handle: o(3),
-                object: shader(ShaderStage::Fragment, &fs, &vs_stream_output),
-            },
-            Command::BindShader { stage: ShaderStage::Vertex, handle: Some(o(1)) },
-            Command::BindShader { stage: ShaderStage::Fragment, handle: Some(o(3)) },
-        ];
-        if d.tess.is_some() {
-            commands.extend([
                 Command::CreateObject {
-                    handle: o(2),
-                    object: shader(ShaderStage::TessEval, &tes, &vs_stream_output),
+                    handle: o(1),
+                    object: shader(ShaderStage::Vertex, &vs, &vs_stream_output),
                 },
-                Command::BindShader { stage: ShaderStage::TessEval, handle: Some(o(2)) },
-            ]);
-        }
-        commands.extend([
-            Command::CreateObject {
-                handle: o(4),
-                object: Object::VertexElements(vec![VertexElement {
-                    src_offset: 0,
-                    instance_divisor: 0,
-                    vertex_buffer_index: 0,
-                    src_format: format(31),
+                Command::CreateObject {
+                    handle: o(3),
+                    object: shader(ShaderStage::Fragment, &fs, &vs_stream_output),
+                },
+                Command::BindShader { stage: ShaderStage::Vertex, handle: Some(o(1)) },
+                Command::BindShader { stage: ShaderStage::Fragment, handle: Some(o(3)) },
+            ];
+            if d.tess.is_some() {
+                setup.extend([
+                    Command::CreateObject {
+                        handle: o(2),
+                        object: shader(ShaderStage::TessEval, &tes, &vs_stream_output),
+                    },
+                    Command::BindShader { stage: ShaderStage::TessEval, handle: Some(o(2)) },
+                ]);
+            }
+            setup.extend([
+                Command::CreateObject {
+                    handle: o(4),
+                    object: Object::VertexElements(vec![VertexElement {
+                        src_offset: 0,
+                        instance_divisor: 0,
+                        vertex_buffer_index: 0,
+                        src_format: format(31),
+                    }]),
+                },
+                Command::BindObject { kind: ObjectType::VertexElements, handle: Some(o(4)) },
+                Command::SetVertexBuffers(vec![VertexBuffer {
+                    stride: 16,
+                    offset: 0,
+                    resource: Some(vertices),
                 }]),
-            },
-            Command::BindObject { kind: ObjectType::VertexElements, handle: Some(o(4)) },
-            Command::SetVertexBuffers(vec![VertexBuffer {
-                stride: 16,
-                offset: 0,
-                resource: Some(vertices),
-            }]),
-            Command::CreateObject {
-                handle: o(5),
-                object: Object::Blend(BlendState {
-                    independent_blend_enable: false,
-                    logicop_enable: d.logicop.is_some(),
-                    dither: false,
-                    alpha_to_coverage: false,
-                    alpha_to_one: false,
-                    logicop_func: d.logicop.unwrap_or(LogicOp::Copy),
-                    rt: [writes; 8],
-                    advanced: None,
-                }),
-            },
-            Command::BindObject { kind: ObjectType::Blend, handle: Some(o(5)) },
-            Command::CreateObject {
-                handle: o(6),
-                object: Object::Surface(Surface {
-                    resource: target,
-                    format: target_format,
-                    first_element_or_level: 0,
-                    last_element_or_layers: 0,
-                    samples: 0,
-                }),
-            },
-            Command::SetFramebufferState { zsurf: None, cbufs: vec![Some(o(6))] },
-            Command::SetViewportState {
-                start_slot: 0,
-                viewports: vec![Viewport { scale: [8.0, 8.0, 0.5], translate: [8.0, 8.0, 0.5] }],
-            },
-            Command::Clear {
-                buffers: 1 << 2,
-                color: d.clear.map(f32::to_bits),
-                depth: 0.0,
-                stencil: 0,
-            },
-        ]);
-        if let Some(level) = d.tess {
-            commands.push(Command::SetTessState([level; 6]));
-        }
-        for (stage, data) in &consts {
-            commands.push(Command::SetConstantBuffer { stage: *stage, index: 0, data });
+                Command::CreateObject {
+                    handle: o(5),
+                    object: Object::Blend(BlendState {
+                        independent_blend_enable: false,
+                        logicop_enable: d.logicop.is_some(),
+                        dither: false,
+                        alpha_to_coverage: false,
+                        alpha_to_one: false,
+                        logicop_func: d.logicop.unwrap_or(LogicOp::Copy),
+                        rt: [writes; 8],
+                        advanced: None,
+                    }),
+                },
+                Command::BindObject { kind: ObjectType::Blend, handle: Some(o(5)) },
+                Command::CreateObject {
+                    handle: o(6),
+                    object: Object::Surface(Surface {
+                        resource: target,
+                        format: target_format,
+                        first_element_or_level: 0,
+                        last_element_or_layers: 0,
+                        samples: 0,
+                    }),
+                },
+                Command::SetFramebufferState { zsurf: None, cbufs: vec![Some(o(6))] },
+                Command::SetViewportState { start_slot: 0, viewports: vec![viewport(sub)] },
+                Command::Clear {
+                    buffers: 1 << 2,
+                    color: d.clear.map(f32::to_bits),
+                    depth: 0.0,
+                    stencil: 0,
+                },
+            ]);
+            if let Some(level) = d.tess {
+                setup.push(Command::SetTessState([level; 6]));
+            }
+            for (stage, data) in &consts {
+                setup.push(Command::SetConstantBuffer { stage: *stage, index: 0, data });
+            }
+            commands.extend(setup);
         }
         let draw = d.fs.is_some();
         let indirect = d.more.and_then(|m| m.indirect);
@@ -5292,24 +5324,63 @@ mod tests {
                 indirect,
             })
         };
-        if let Some(m) = d.more {
-            commands.extend(m.before.iter().cloned());
+        // A round of commands, then the draw, in every sub-context in turn.
+        fn in_each<'c>(
+            commands: &mut Vec<Command<'c>>,
+            round: &[Command<'c>],
+            draw: Option<&dyn Fn() -> Command<'c>>,
+            subs: u32,
+        ) {
+            for sub in 0..subs {
+                if subs > 1 {
+                    commands.push(Command::SetSubCtx(SubContextId(sub)));
+                }
+                commands.extend(round.iter().cloned());
+                commands.extend(draw.map(|d| d()));
+            }
         }
-        commands.extend(draw.then(draw_vbo));
+        in_each(
+            &mut commands,
+            d.more.map_or(&[][..], |m| &m.before),
+            draw.then_some(&draw_vbo),
+            subs,
+        );
+        let mut redrawn = Vec::new();
         for round in d.more.map_or(&[][..], |m| &m.redraws) {
-            commands.extend(round.iter().cloned());
-            commands.push(draw_vbo());
+            in_each(&mut redrawn, round, Some(&draw_vbo), subs);
         }
         if let Some(m) = d.more {
-            commands.extend(m.after.iter().cloned());
+            redrawn.extend(m.after.iter().cloned());
         }
-        let mut wire = Vec::new();
-        for c in &commands {
-            encode(c, &mut wire);
-        }
+        let wire = |commands: &[Command<'_>]| {
+            let mut wire = Vec::new();
+            for c in commands {
+                encode(c, &mut wire);
+            }
+            wire
+        };
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
         v.context_create(ctx, &guest).expect("a context");
-        let ran = v.submit(ctx, &wire, &guest).expect("the context is here");
+        let ran = match d.more.and_then(|m| m.swap.as_ref()) {
+            None => {
+                commands.append(&mut redrawn);
+                v.submit(ctx, &wire(&commands), &guest).expect("the context is here")
+            }
+            Some(swap) => match v
+                .submit(ctx, &wire(&commands), &guest)
+                .expect("the context is here")
+            {
+                Ok(()) => {
+                    *swap.seen.borrow_mut() =
+                        v.cursor_contents(target).expect("a 16x16 2D texture reads back").pixels;
+                    drop(crate::vrend::resource::Claim::new(swap.resource, &condemned));
+                    v.resource_create(swap.resource, swap.args)
+                        .expect("the resource again, under the handle it was freed from");
+                    v.submit(ctx, &wire(&redrawn), &guest).expect("the context is here")
+                }
+                Err(e) => Err(e),
+            },
+        };
         let out = match ran {
             Err(Fault::Shader { cmd: crate::vrend::proto::Cmd::CreateObject, .. })
                 if d.tess.is_some() && !tessellates =>
@@ -8823,6 +8894,160 @@ mod tests {
             "a view made over a texture does not bind a buffer: {refused:?}"
         );
         v.context_destroy(ctx, &AllAttached);
+    }
+
+    /// A sampler view names its resource by handle, so what it samples is the storage the handle
+    /// names when the draw runs -- not the storage it was made over, and not what the unit had
+    /// bound before. Here the texture under the handle is freed and made again between two draws,
+    /// in each of two sub-contexts, with the views left bound: a private view (its swizzle exchanges
+    /// red and blue) and a shared one. Every draw after the swap reads the new texel through
+    /// both, the private view still swizzled. A view object minted over the old storage, or a
+    /// unit left holding the old name, reads the old texel or nothing.
+    #[test]
+    fn a_bound_view_samples_the_storage_its_handle_names_at_the_draw() {
+        use crate::vrend::pipe::{CompareFunc, MipFilter, Swizzle, TexFilter, TexWrap};
+        use crate::vrend::proto::{Box3, Command, Object, SamplerState, SamplerView, Transfer};
+        // The private view's red and blue land in x and z, the shared view's green and alpha in
+        // y and w.
+        const FS: &str = "FRAG\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SAMP[1]\n\
+                          DCL SVIEW[0], 2D, FLOAT\nDCL SVIEW[1], 2D, FLOAT\nDCL TEMP[0..1]\n\
+                          IMM[0] FLT32 { 0.5, 0.5, 0.0, 0.0 }\n  \
+                          0: TEX TEMP[0], IMM[0], SAMP[0], 2D\n  \
+                          1: TEX TEMP[1], IMM[0], SAMP[1], 2D\n  2: MOV OUT[0].xz, TEMP[0]\n  \
+                          3: MOV OUT[0].yw, TEMP[1]\n  4: END\n";
+        let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
+        let rgba8 = super::super::proto::Format::from_wire(67).expect("R8G8B8A8_UNORM");
+        let tex = ResourceHandle::new(10).expect("a resource handle is non-zero");
+        let args = resource::Args {
+            target: TextureTarget::Texture2d,
+            format: rgba8,
+            bind: resource::Bind::SAMPLER_VIEW,
+            width: 1,
+            height: 1,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags(0),
+        };
+        let (old, new) = ([0x40u8, 0x80, 0xc0, 0xff], [0x10u8, 0x20, 0x30, 0xff]);
+        // What the shader writes for a texel: red and blue exchanged.
+        let drawn = |t: [u8; 4]| [t[2], t[1], t[0], t[3]];
+        let (old_word, new_word) = ([u32::from_le_bytes(old)], [u32::from_le_bytes(new)]);
+        let write = |data| Command::ResourceInlineWrite {
+            transfer: Transfer {
+                resource: tex,
+                level: 0,
+                usage: 0,
+                stride: 0,
+                layer_stride: 0,
+                region: Box3 { x: 0, y: 0, z: 0, width: 1, height: 1, depth: 1 },
+            },
+            data,
+        };
+        let view = |swizzle| {
+            Object::SamplerView(SamplerView {
+                resource: tex,
+                format: rgba8,
+                target: TextureTarget::Texture2d,
+                first_element_or_layers: 0,
+                last_element_or_levels: 0,
+                swizzle,
+            })
+        };
+        let state = Object::SamplerState(SamplerState {
+            wrap_s: TexWrap::ClampToEdge,
+            wrap_t: TexWrap::ClampToEdge,
+            wrap_r: TexWrap::ClampToEdge,
+            min_img_filter: TexFilter::Nearest,
+            min_mip_filter: MipFilter::None,
+            mag_img_filter: TexFilter::Nearest,
+            compare_mode: false,
+            compare_func: CompareFunc::LessEqual,
+            seamless_cube_map: false,
+            max_anisotropy: 0,
+            lod_bias: 0.0,
+            min_lod: 0.0,
+            max_lod: 0.0,
+            border_color: [0; 4],
+        });
+        let fs = ShaderStage::Fragment;
+        let mut viewed = 0;
+        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+            viewed += usize::from(host_has(host_gl, Feature::texture_view));
+            let seen = std::cell::RefCell::new(Vec::new());
+            let more = More {
+                resources: vec![(tex, args)],
+                before: vec![
+                    write(&old_word),
+                    Command::CreateObject {
+                        handle: o(20),
+                        object: view([Swizzle::Z, Swizzle::Y, Swizzle::X, Swizzle::W]),
+                    },
+                    Command::CreateObject {
+                        handle: o(21),
+                        object: view([Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W]),
+                    },
+                    Command::CreateObject { handle: o(22), object: state.clone() },
+                    Command::SetSamplerViews {
+                        stage: fs,
+                        start_slot: 0,
+                        views: vec![Some(o(20)), Some(o(21))],
+                    },
+                    Command::BindSamplerStates {
+                        stage: fs,
+                        start_slot: 0,
+                        states: vec![Some(o(22)); 2],
+                    },
+                ],
+                redraws: vec![vec![write(&new_word)]],
+                sub_contexts: true,
+                swap: Some(Swap { resource: tex, args, seen: &seen }),
+                ..Default::default()
+            };
+            let pixels = draw_over_target(OneDraw {
+                host_gl,
+                format: "R8G8B8A8_UNORM",
+                vs: None,
+                fs: Some(FS),
+                consts: &[],
+                clear: [0.0; 4],
+                logicop: None,
+                tess: None,
+                pipeline: None,
+                more: Some(&more),
+            })
+            .unwrap_or_else(|e| panic!("{host_gl:?}: the draws run: {e:?}"))
+            .expect("no tessellation asked for");
+            // Row-major 16x16: sub-context 0 drew columns 0..8, sub-context 1 columns 8..16.
+            let half = |pixels: &[u8], sub: usize| -> Vec<[u8; 4]> {
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| (i % 16) / 8 == sub)
+                    .map(|(_, p)| *p)
+                    .collect()
+            };
+            for sub in 0..2 {
+                let before = half(&seen.borrow(), sub);
+                assert!(
+                    before.iter().all(|p| *p == drawn(old)),
+                    "{host_gl:?}: sub-context {sub} reads the first texture before the swap: {:?}",
+                    before[0]
+                );
+                let after = half(&pixels, sub);
+                assert!(
+                    after.iter().all(|p| *p == drawn(new)),
+                    "{host_gl:?}: sub-context {sub} reads the texture its handle names now, \
+                     {:?}: {:?}",
+                    drawn(new),
+                    after[0]
+                );
+            }
+        }
+        assert!(viewed > 0, "the premise: some host takes the private view by glTextureView");
     }
 
     /// A read from the control queue -- here the texture a scanout is flushed from -- waits for

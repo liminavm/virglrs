@@ -5,6 +5,7 @@
 //! slots the next draw has to bind again.
 
 use super::*;
+use std::sync::Weak;
 
 /// The view in a slot, the sampler state in the same slot, and whether the unit they make up
 /// must be re-bound, as one value.
@@ -20,11 +21,21 @@ use super::*;
 /// key selection reads every view, and never marked, because no draw binds it. Sampler slots are
 /// bounded to the units by the decoder, so a sampler slot the mask cannot hold is a host bug and
 /// the mask says so.
+///
+/// A mark is not the only reason to bind again. A view names its resource by handle, and what the
+/// handle names can change under a view that has not moved -- the texture freed and made again,
+/// or its storage replaced -- with nothing marking the unit. So each unit also keeps what the
+/// draw last bound in it, and a draw that resolves something else binds again ([`Units::holds`]).
 #[derive(Default)]
 pub struct Units {
     views: BTreeMap<u32, ObjectHandle>,
     samplers: BTreeMap<u32, ObjectHandle>,
     dirty: Dirty<MAX_SAMPLERS>,
+    /// What each unit was last bound to: the texture whose storage it samples, and the object
+    /// it samples it through. Weak, because a unit must not keep a texture alive; and the
+    /// texture is part of it, not only the name, because a freed name is the driver's to hand
+    /// out again and the next texture may well be given it.
+    bound: [Option<(Weak<Texture>, TextureName)>; MAX_SAMPLERS],
     /// When a set or a bind last changed this stage's units: where a rebuild of them sits in
     /// the journal. Every object they hold was created before it, because a set is how it got in.
     touched: Seq,
@@ -95,6 +106,20 @@ impl Units {
     /// The draw bound every marked unit; nothing is owed until the next change.
     pub fn bound(&mut self) {
         self.dirty.clear();
+    }
+
+    /// Whether unit `slot` was last bound to `name` over `texture`'s storage: when it was not,
+    /// the draw binds it again, marked or not.
+    pub fn holds(&self, slot: u32, texture: &Arc<Texture>, name: TextureName) -> bool {
+        self.bound[slot as usize]
+            .as_ref()
+            .is_some_and(|(t, n)| *n == name && std::ptr::eq(t.as_ptr(), Arc::as_ptr(texture)))
+    }
+
+    /// The draw bound unit `slot` to `name` over `texture`'s storage, or to something that is not
+    /// a texture's.
+    pub fn record(&mut self, slot: u32, bound: Option<(&Arc<Texture>, TextureName)>) {
+        self.bound[slot as usize] = bound.map(|(t, n)| (Arc::downgrade(t), n));
     }
 
     /// Whether `slot` already holds `view`, which is what lets a binder skip the GL work.
