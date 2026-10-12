@@ -2313,6 +2313,11 @@ fn plane_format(a: &Args) -> Option<PixelFormat> {
 /// storage, which every consumer but another driver's import reads as before.
 #[cfg(target_os = "macos")]
 fn plane_image(winsys: &Winsys, budget: &Classic, a: &Args, format: PixelFormat) -> Option<Image> {
+    // A host GL that refused a plane surface refuses them all; minting one per plane of every
+    // decoder pool slot just to free it again is the whole cost of asking.
+    if winsys.plane_surface_said.only_refused() {
+        return None;
+    }
     let surface = match Surface::plain(a.width, a.height, format) {
         Ok(s) => s,
         Err(e) => {
