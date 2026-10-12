@@ -271,7 +271,7 @@ fn errno(e: renderer::Error) -> c_int {
         | ClassicRefused(_)
         | ClaimRefused(_) => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
-        OverBudget(_) => -libc::ENOMEM,
+        OverBudget(_) | SurfaceRefused => -libc::ENOMEM,
         NotExportable => -libc::EINVAL,
         // The C answers a readback it cannot serve with a bare -1, and the VMM tells it apart
         // from an errno.
