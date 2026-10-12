@@ -71,8 +71,10 @@ query's work is finished on the submitting thread when the fence is taken.
 
 Not compiled today, or not needed once the C fork is gone:
 
-- `src/drm/` native contexts, GLX winsys, GBM/minigbm, `mman_win32`, `vtest/`,
-  `perf-testing/`, the Linux `virgl_video.c` libva backend.
+- GLX winsys, GBM/minigbm, `mman_win32`, `vtest/`, `perf-testing/`, the Linux
+  `virgl_video.c` libva backend.
+
+`src/drm/` native contexts are ported, not deleted, on Linux only: see `docs/native-context.md`.
 - **The process-mode render server.** In thread mode, `proxy/` + `server/` (5k
   lines) marshal commands over a socketpair between threads of the same process for
   no reason but upstream's fork model. Rust accepts `RENDER_SERVER` at the ABI and
