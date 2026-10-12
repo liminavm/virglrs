@@ -523,7 +523,11 @@ rule out.
 goiaba's iris passes it. Chased after the native-context work:
 
 - `vrend::vrend::tests::pipeline_statistics_and_overflow_queries_count_where_the_host_has_them` --
-  on the desktop flavour, the counted value is 1 where the test expects 0.
+  the stream-out overflow query reads 1 with no transform feedback bound. It is radeonsi's: a
+  bare EGL program reproduces it on banana (Mesa 26.2.4) and not on goiaba's iris, and only
+  while a `PRIMITIVES_GENERATED` query is open beside it -- the overflow query alone reads 0. The
+  renderer issues `GL_TRANSFORM_FEEDBACK_OVERFLOW` as the C does, so both legs answer a guest
+  the same wrong value.
 
 ## Missing infrastructure
 
