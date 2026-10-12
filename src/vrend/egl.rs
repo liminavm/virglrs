@@ -270,6 +270,13 @@ impl Said {
         let latch = if ok { &self.yes } else { &self.no };
         !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Whether the driver has refused and never accepted: since it answers the same way every
+    /// time, asking again would only redo the work that ends in the same refusal.
+    pub fn only_refused(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.no.load(Relaxed) && !self.yes.load(Relaxed)
+    }
 }
 
 /// An EGL context on the winsys's display. Destroyed with it; cannot outlive the display.
@@ -1410,6 +1417,18 @@ fn adoption_refusal(binds_egl_images: bool, imports_descriptors: bool) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal stops the asking only while nothing was accepted: a driver that said yes once
+    /// can say yes again, and a refusal after it is that one case's, not the driver's.
+    #[test]
+    fn only_a_refusal_with_no_acceptance_stops_the_asking() {
+        let said = Said::default();
+        assert!(!said.only_refused(), "nothing answered yet");
+        said.first(false);
+        assert!(said.only_refused());
+        said.first(true);
+        assert!(!said.only_refused(), "accepted once");
+    }
 
     // What a stubbed `eglExportDMABUFImageMESA` pair will answer. Thread-local because the two
     // are plain `extern "C"` pointers with nowhere to carry a receiver, and one test per thread

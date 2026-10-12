@@ -3331,7 +3331,7 @@ mod tests {
         )
         .expect("a one-channel scanout");
 
-        let (_, shape) = r.resource_surface_port(luma).expect("the luma plane is a surface");
+        let (_, shape) = r.resource_surface_port(luma).expect("the luma plane is a surface (needs a host GL that takes R8 and RG8 IOSurfaces, which stock Mesa does not)");
         assert_eq!(
             (shape.width, shape.height, shape.format),
             (100, 16, crate::surface::PixelFormat::R8)
@@ -3384,7 +3384,10 @@ mod tests {
         };
         r.resource_create(luma, args, Vec::new()).expect("a luma plane");
         r.ctx_attach_resource(ctx, luma);
-        assert!(r.resource_surface_port(luma).is_ok(), "the plane is a surface");
+        assert!(
+            r.resource_surface_port(luma).is_ok(),
+            "the plane is a surface (needs a host GL that takes R8 and RG8 IOSurfaces, which stock Mesa does not)"
+        );
 
         let pixel = |x: u32, y: u32| (x * 3 + y * 7) as u8;
         let bytes: Vec<u8> = (0..H).flat_map(|y| (0..W).map(move |x| pixel(x, y))).collect();
@@ -3503,7 +3506,7 @@ mod tests {
         let wire: Vec<u8> = wire.iter().flat_map(|d| d.to_le_bytes()).collect();
         assert!(matches!(r.submit_cmd(ctx, &wire), Ok(Submitted::Done)), "accepted");
 
-        let (_, shape) = r.resource_surface_port(luma).expect("the luma plane is now a surface");
+        let (_, shape) = r.resource_surface_port(luma).expect("the luma plane is now a surface (needs a host GL that takes R8 and RG8 IOSurfaces, which stock Mesa does not)");
         assert_eq!(
             (shape.width, shape.height, shape.format),
             (W, H, crate::surface::PixelFormat::R8)
