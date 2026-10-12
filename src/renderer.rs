@@ -3284,12 +3284,27 @@ mod tests {
     /// as players make them: a plain R8 luma and RG8 chroma texture, attached to the context.
     #[cfg(target_os = "macos")]
     fn video_planes(w: u32, h: u32) -> (Renderer, ContextId, ResourceHandle, ResourceHandle) {
-        use crate::vrend::resource::Bind;
         let mut r =
             Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
                 .expect("vrend comes up");
         let ctx = ContextId::new(1).unwrap();
         r.context_create(ctx, CapsetId::Virgl, "va".into()).expect("a context");
+        let (luma, chroma) = (ResourceHandle::new(1).unwrap(), ResourceHandle::new(2).unwrap());
+        add_video_planes(&mut r, ctx, (w, h), luma, chroma);
+        (r, ctx, luma, chroma)
+    }
+
+    /// The planes of a `w` x `h` 4:2:0 picture, made as [`video_planes`] makes them under
+    /// `luma` and `chroma` and attached to `ctx`.
+    #[cfg(target_os = "macos")]
+    fn add_video_planes(
+        r: &mut Renderer,
+        ctx: ContextId,
+        (w, h): (u32, u32),
+        luma: ResourceHandle,
+        chroma: ResourceHandle,
+    ) {
+        use crate::vrend::resource::Bind;
         let plane = |format, width, height| ClassicArgs {
             target: crate::vrend::pipe::TextureTarget::Texture2d,
             format,
@@ -3302,13 +3317,11 @@ mod tests {
             nr_samples: 0,
             flags: crate::vrend::resource::ResourceFlags::default(),
         };
-        let (luma, chroma) = (ResourceHandle::new(1).unwrap(), ResourceHandle::new(2).unwrap());
         r.resource_create(luma, plane(format_named("R8_UNORM"), w, h), Vec::new()).expect("luma");
         r.resource_create(chroma, plane(format_named("R8G8_UNORM"), w / 2, h / 2), Vec::new())
             .expect("chroma");
         r.ctx_attach_resource(ctx, luma);
         r.ctx_attach_resource(ctx, chroma);
-        (r, ctx, luma, chroma)
     }
 
     /// CREATE_VIDEO_BUFFER `handle` for a `w` x `h` 4:2:0 picture over `luma` and `chroma`.
@@ -3354,6 +3367,31 @@ mod tests {
                 "the {name} plane kept its plain texture"
             );
         }
+    }
+
+    /// A host GL that takes one plane format and refuses the other is asked for the refused one
+    /// once: it answers the same way every time, and asking again only mints a surface to free
+    /// it. The accepted format goes on being asked, and goes on being a surface.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refused_plane_format_is_not_asked_for_again_when_the_other_is_taken() {
+        use crate::surface::PixelFormat;
+        use crate::vrend::resource::plane_faults;
+        let _display = crate::vrend::one_display_at_a_time();
+        plane_faults::refuse(PixelFormat::Rg8);
+        let (mut r, ctx, luma, chroma) = video_planes(112, 16);
+        create_video_buffer(&mut r, ctx, 1, (112, 16), luma, chroma);
+        let (luma2, chroma2) = (ResourceHandle::new(3).unwrap(), ResourceHandle::new(4).unwrap());
+        add_video_planes(&mut r, ctx, (112, 16), luma2, chroma2);
+        create_video_buffer(&mut r, ctx, 2, (112, 16), luma2, chroma2);
+        assert_eq!(plane_faults::asked(PixelFormat::R8), 2, "the taken format, once per buffer");
+        assert_eq!(plane_faults::asked(PixelFormat::Rg8), 1, "the refused format, once");
+        assert!(r.resource_surface_port(luma2).is_ok(), "the second luma plane is a surface");
+        assert_eq!(
+            r.resource_surface_port(chroma2).err(),
+            Some(Error::NotExportable),
+            "the second chroma plane stays plain"
+        );
     }
 
     /// A host GL that takes no plane surface leaves a video buffer's planes as they were made:

@@ -250,9 +250,10 @@ pub struct Winsys {
     linear: Option<std::sync::Mutex<crate::gbm::Allocator>>,
     /// Which of [`Winsys::linear_surface`]'s two answers has been reported.
     pub linear_said: Said,
-    /// Which of the host GL's two answers to a video plane's surface has been reported.
+    /// Which of the host GL's two answers to a video plane's surface has been reported, for each
+    /// plane format.
     #[cfg(target_os = "macos")]
-    pub plane_surface_said: Said,
+    pub plane_surface_said: PlaneSaid,
 }
 
 /// Whether a driver's answer to a question it answers the same way every time has been reported
@@ -277,6 +278,29 @@ impl Said {
     pub fn only_refused(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         self.no.load(Relaxed) && !self.yes.load(Relaxed)
+    }
+}
+
+/// A [`Said`] for each video plane format. A host GL answers each format the same way every
+/// time, but not necessarily the same way as the other: one latch for both would let an accepted
+/// R8 hide a refused RG8, which would then be minted and freed for every plane.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+pub struct PlaneSaid {
+    r8: Said,
+    rg8: Said,
+}
+
+#[cfg(target_os = "macos")]
+impl PlaneSaid {
+    /// The latch for the plane format `format`.
+    pub fn of(&self, format: crate::surface::PixelFormat) -> &Said {
+        use crate::surface::PixelFormat;
+        match format {
+            PixelFormat::R8 => &self.r8,
+            PixelFormat::Rg8 => &self.rg8,
+            other => unreachable!("{other:?} is no video plane format"),
+        }
     }
 }
 
@@ -743,7 +767,7 @@ impl Winsys {
             linear: None,
             linear_said: Said::default(),
             #[cfg(target_os = "macos")]
-            plane_surface_said: Said::default(),
+            plane_surface_said: PlaneSaid::default(),
         })
     }
 
@@ -815,7 +839,7 @@ impl Winsys {
                 linear: None,
                 linear_said: Said::default(),
                 #[cfg(target_os = "macos")]
-                plane_surface_said: Said::default(),
+                plane_surface_said: PlaneSaid::default(),
             },
             ctx0,
             version_made,
