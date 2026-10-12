@@ -253,7 +253,7 @@ pub enum Source<'a> {
 /// and the resource it was bound to.
 #[cfg(all(target_os = "linux", feature = "drm"))]
 pub struct Object {
-    pub gem: sys::Gem,
+    pub gem: Arc<sys::Gem>,
     /// What the guest asked for, which is what a mapping covers.
     pub size: u64,
     pub write_combining: bool,

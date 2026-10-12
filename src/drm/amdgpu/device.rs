@@ -378,7 +378,7 @@ impl Amdgpu {
                 map_size: req.vm_map_size,
                 ..Default::default()
             };
-            match self.device.amdgpu_gem_va(object.as_ref().map(|o| &o.gem), va) {
+            match self.device.amdgpu_gem_va(object.as_ref().map(|o| &*o.gem), va) {
                 Ok(()) => 0,
                 Err(e) => -errno(&e),
             }
@@ -518,7 +518,7 @@ impl Amdgpu {
 
         let signalled = self.device.syncobj_create().map_err(|e| Refused::Kernel(errno(&e)))?;
         let gems: Option<Vec<(&sys::Gem, u32)>> =
-            bo_list.as_ref().map(|l| l.iter().map(|(o, p)| (&o.gem, *p)).collect());
+            bo_list.as_ref().map(|l| l.iter().map(|(o, p)| (&*o.gem, *p)).collect());
         // In the guest's order, as the C passes them; the output syncobj last.
         let mut chunks = Vec::with_capacity(descs.len() + 1);
         let (mut ib, mut dep) = (ibs.iter(), deps.iter());
@@ -774,9 +774,9 @@ impl Backend for Amdgpu {
 
     /// The C imports the buffer's dma-buf whenever the context has no name for it. Here the copy
     /// already on this file is reused first -- the original, when the guest closed and reopened
-    /// the buffer in the context that made it, or an earlier import -- because importing a buffer
-    /// a file already holds hands back the handle it already has, and two owners would close it
-    /// twice.
+    /// the buffer in the context that made it, or an earlier import -- so a resource keeps one
+    /// copy per file. Storage some other resource also names, which the VMM can make by importing
+    /// one dma-buf twice, shares the file's handle through the import (see `Device::import_dmabuf`).
     ///
     /// Storage another renderer holds -- a classic texture's buffer, a venus allocation -- arrives
     /// as its dma-buf and is imported the same way.
@@ -1066,9 +1066,10 @@ mod tests {
     }
 
     /// The kernel answers a re-import of a buffer this file already holds with the handle it
-    /// already has; the import is refused, not handed a second owner that would close it twice.
+    /// already has; the import shares that handle's owner, and the handle closes when the last
+    /// sharer goes.
     #[test]
-    fn a_buffer_reimported_into_its_own_file_is_refused_not_owned_twice() {
+    fn a_buffer_reimported_into_its_own_file_shares_its_owner() {
         let Some(probed) = Probed::find() else {
             eprintln!("SKIPPED: no amdgpu device on this host");
             return;
@@ -1083,11 +1084,19 @@ mod tests {
             })
             .unwrap();
         let fd = gem.export().unwrap();
-        let again = device.import_dmabuf(std::os::fd::AsFd::as_fd(&fd));
-        assert_eq!(again.err().and_then(|e| e.raw_os_error()), Some(libc::EEXIST));
+        let again = device.import_dmabuf(std::os::fd::AsFd::as_fd(&fd)).unwrap();
+        assert!(Arc::ptr_eq(&again, &gem), "one handle, one owner");
         let other = Arc::new(Device::open(&probed.node).unwrap());
         let imported = other.import_dmabuf(std::os::fd::AsFd::as_fd(&fd)).unwrap();
-        drop((gem, imported));
+        assert!(!Arc::ptr_eq(&imported, &gem) && imported.is_in(&other));
+        // The first holder going leaves the handle open for the other.
+        drop(gem);
+        again.export().expect("the handle is still open");
+        drop(again);
+        // Closed now: the same buffer comes back as a new owner.
+        let fresh = device.import_dmabuf(std::os::fd::AsFd::as_fd(&fd)).unwrap();
+        assert_eq!(Arc::strong_count(&fresh), 1);
+        drop((fresh, imported));
         eprintln!("RAN: re-import on {}", probed.describe());
     }
 
@@ -1129,11 +1138,19 @@ mod tests {
         assert!(in_a.gem.is_in(&a.device));
         b.attach(one, foreign(&mut imports, &gem)).unwrap();
         assert_eq!(imports.copies.len(), 2, "one copy per file");
-        // A second handle on the same storage in a file that has it reuses the copy, where a
-        // second import would be refused as a second owner.
+        // A second handle on the same resource in a file that has it reuses the copy.
         a.attach(two, foreign(&mut imports, &gem)).unwrap();
         assert_eq!(imports.copies.len(), 2);
         assert!(Arc::ptr_eq(&a.bound[&two].upgrade().unwrap(), &in_a));
+        // A second resource on the same storage -- the VMM may import one dma-buf twice -- has
+        // its own copy in a file that holds the buffer already, sharing the one handle.
+        let mut twin = Imports::default();
+        let three = ResourceHandle::new(3).unwrap();
+        a.attach(three, foreign(&mut twin, &gem)).unwrap();
+        let twin_in_a = a.bound[&three].upgrade().unwrap();
+        assert!(!Arc::ptr_eq(&twin_in_a, &in_a) && Arc::ptr_eq(&twin_in_a.gem, &in_a.gem));
+        drop((twin_in_a, twin));
+        in_a.gem.export().expect("the first resource's handle outlives the second resource");
         drop(in_a);
         drop(imports);
         assert!(a.bound[&one].upgrade().is_none(), "the context's name dies with the resource");

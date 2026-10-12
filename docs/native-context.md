@@ -153,8 +153,10 @@ The C has holes this closes at the boundary:
   bind refuses a blob past the buffer's last page; the guest's kernel rounds a blob up to a page,
   and the host's allocated the same page.
 - Importing a buffer into a device file that already holds it hands back the handle it already
-  has. libdrm counts that; here the sys layer refuses the second owner, so no handle is ever
-  closed twice.
+  has, which one close frees. libdrm counts references to it; here each file's table maps a
+  handle to the one `Gem` that owns it, a second import shares that owner, and the last sharer
+  closes it. The guest cannot make two resources of one buffer (a blob is exported once, as in
+  the C), but the VMM can import one dma-buf twice.
 
 ## The C ABI
 

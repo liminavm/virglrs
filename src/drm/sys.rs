@@ -25,7 +25,7 @@ use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 /// `_IOC` as Linux encodes it on every architecture this builds for: direction in the top two
@@ -147,11 +147,12 @@ pub struct Version {
 pub struct Device {
     fd: OwnedFd,
     path: PathBuf,
-    /// The GEM handles a `Gem` owns in this file. A handle is closed once however many times the
-    /// kernel handed it out, and it hands an existing one out again for a buffer the file already
-    /// holds; this is what refuses a second owner of one. Held across every call that makes or
-    /// closes a handle, so a number cannot be closed and reissued between the check and the use.
-    live: Mutex<std::collections::BTreeSet<u32>>,
+    /// The `Gem` that owns each handle in this file. A handle is closed once however many times
+    /// the kernel handed it out, and it hands an existing one out again for a buffer the file
+    /// already holds; this is how a second import shares the owner instead of becoming another.
+    /// Held across every call that makes or closes a handle, so a number cannot be closed and
+    /// reissued between the lookup and the use.
+    live: Mutex<std::collections::BTreeMap<u32, Weak<Gem>>>,
 }
 
 impl Device {
@@ -225,15 +226,17 @@ impl Device {
 
     /// `DRM_AMDGPU_GEM_CREATE`: a new buffer, as the guest described it. The kernel checks every
     /// field; nothing here can make it allocate outside this file's own accounting.
-    pub fn amdgpu_gem_create(self: &Arc<Self>, args: AmdgpuGemCreate) -> io::Result<Gem> {
+    pub fn amdgpu_gem_create(self: &Arc<Self>, args: AmdgpuGemCreate) -> io::Result<Arc<Gem>> {
         let mut live = self.live.lock().expect("the handle set is never held across a panic");
         let mut arg = args;
         // SAFETY: `arg` is the union's `in` half, as large as the union, and holds no pointer.
         unsafe { self.ioctl(DRM_IOCTL_AMDGPU_GEM_CREATE, &mut arg) }?;
         // The kernel answers in `out`, whose `handle` overlays the first word.
         let handle = arg.bo_size as u32;
-        assert!(live.insert(handle), "a new buffer has a new handle");
-        Ok(Gem { device: Arc::clone(self), handle })
+        // A handle still in the table is still open, so the kernel cannot have issued it again.
+        let gem = Arc::new(Gem { device: Arc::clone(self), handle });
+        assert!(live.insert(handle, Arc::downgrade(&gem)).is_none(), "a new buffer, a new handle");
+        Ok(gem)
     }
 
     /// `DRM_AMDGPU_VM`: reserve this file a VMID of its own, or give it back.
@@ -268,20 +271,22 @@ impl Device {
     /// A dma-buf made a buffer in this file.
     ///
     /// The kernel answers a buffer this file already has a handle for with that same handle, and
-    /// a GEM handle is closed once however many times it was handed out: the caller must not
-    /// import what this file already holds, or two `Gem`s would close one handle.
+    /// a GEM handle is closed once however many times it was handed out. So a buffer the file
+    /// already holds comes back as the `Gem` that owns it, shared; whoever drops it last closes it.
     ///
-    /// That case is refused here, with `EEXIST`, whatever the caller checked: the handle stays
-    /// with the owner it already has.
-    pub fn import_dmabuf(self: &Arc<Self>, fd: BorrowedFd<'_>) -> io::Result<Gem> {
+    /// An owner whose last reference is gone but whose drop has not yet taken the table still
+    /// holds an open handle. The new `Gem` takes the handle over, and that drop leaves it alone.
+    pub fn import_dmabuf(self: &Arc<Self>, fd: BorrowedFd<'_>) -> io::Result<Arc<Gem>> {
         let mut live = self.live.lock().expect("the handle set is never held across a panic");
         let mut arg = DrmPrimeHandle { handle: 0, flags: 0, fd: fd.as_raw_fd() };
         // SAFETY: a `drm_prime_handle` with no pointer, naming a descriptor borrowed for the call.
         unsafe { self.ioctl(DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut arg) }?;
-        if !live.insert(arg.handle) {
-            return Err(io::Error::from_raw_os_error(libc::EEXIST));
+        if let Some(owner) = live.get(&arg.handle).and_then(Weak::upgrade) {
+            return Ok(owner);
         }
-        Ok(Gem { device: Arc::clone(self), handle: arg.handle })
+        let gem = Arc::new(Gem { device: Arc::clone(self), handle: arg.handle });
+        live.insert(arg.handle, Arc::downgrade(&gem));
+        Ok(gem)
     }
 
     /// A syncobj, for a submission to signal.
@@ -496,7 +501,13 @@ impl Drop for Gem {
     fn drop(&mut self) {
         let mut live =
             self.device.live.lock().expect("the handle set is never held across a panic");
-        assert!(live.remove(&self.handle), "a live handle is in the set");
+        let entry = live.get(&self.handle).expect("an open handle is in the table");
+        if !std::ptr::eq(entry.as_ptr(), self) {
+            // An import took the handle over while this was on its way out: it is that `Gem`'s
+            // to close now.
+            return;
+        }
+        live.remove(&self.handle);
         let mut arg = DrmGemClose { handle: self.handle, pad: 0 };
         // SAFETY: a `drm_gem_close` with no pointer, naming a handle this value owns and nothing
         // else closes.
