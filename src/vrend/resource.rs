@@ -877,7 +877,9 @@ impl Shadow {
     }
 }
 
-/// What backs a resource. Exactly one for its whole life.
+/// What backs a resource. One at a time: a video plane's plain texture is replaced once, by a
+/// texture over a surface, when the guest makes the plane part of a video buffer
+/// ([`Resource::promote_to_surface`]); nothing else changes a resource's storage.
 pub enum Storage {
     /// `VIRGL_BIND_STAGING`: the guest's pages and nothing on the host.
     Guest,
@@ -1640,6 +1642,71 @@ impl Resource {
         addr.is_some()
     }
 
+    /// Back a video plane by a surface of its own instead of its plain texture, so another driver
+    /// can import what is decoded into it. A guest's decoder makes its planes plain textures
+    /// unless asked for exportable memory, which players do not ask for; the video buffer naming
+    /// them is the first moment they are known to be planes.
+    ///
+    /// Only a plane nothing else holds yet -- a fresh one, as a video buffer's planes are when
+    /// it is made -- and only where the host GL takes the plane's format as a surface: anything
+    /// else keeps the storage it has, and `false` says so. The old pixels are copied across, so
+    /// the swap is right even for a plane already written.
+    #[cfg(target_os = "macos")]
+    pub fn promote_to_surface(
+        &mut self,
+        gl: &Gl,
+        winsys: &Winsys,
+        features: &Features,
+        formats: &Table,
+        budget: &Classic,
+    ) -> bool {
+        let Storage::Texture(old) = &self.storage else {
+            return false;
+        };
+        let Some(format) = plane_format(&self.args) else {
+            return false;
+        };
+        if !matches!(old.pixels, Pixels::Own)
+            || old.planes.is_some()
+            || Arc::strong_count(old) != 1
+            || !features.adopts_iosurfaces()
+            || !features.has(Feature::copy_image)
+        {
+            return false;
+        }
+        let a = &self.args;
+        let Some(image) = plane_image(winsys, budget, a, format) else {
+            return false;
+        };
+        let target = old.target;
+        let Ok(Storage::Texture(new)) =
+            alloc_texture(gl, winsys, features, formats, a, target, Some(image), None)
+        else {
+            return false;
+        };
+        gl.drain_errors();
+        let (w, h) = (a.width as GLsizei, a.height as GLsizei);
+        gl.copy_image_sub_data(old.name, target, 0, [0; 3], new.name, target, 0, [0; 3], [w, h, 1]);
+        let err = gl.drain_errors();
+        if err != GL_NO_ERROR {
+            eprintln!(
+                "[virglrs] vrend: copying a {}x{} {} plane into its surface: GL error {err:#x}",
+                a.width,
+                a.height,
+                a.format.name()
+            );
+        }
+        let Storage::Texture(old) = std::mem::replace(&mut self.storage, Storage::Texture(new))
+        else {
+            unreachable!("the storage was a texture a moment ago");
+        };
+        match Arc::try_unwrap(old) {
+            Ok(old) => old.destroy(gl),
+            Err(_) => unreachable!("a plane nothing else holds, checked above"),
+        }
+        true
+    }
+
     /// Delete what only this resource holds. Texture storage a framebuffer is still attached to
     /// is handed back instead: the caller keeps it until the last attachment lets go.
     #[must_use = "texture storage still attached somewhere has to be kept, not dropped"]
@@ -2225,6 +2292,67 @@ fn mint_surface(
     imaged.ok()
 }
 
+/// The pixel format a video plane's surface takes: one or two 8-bit channels, single-level,
+/// single-sample 2D, whatever its binds. What makes it a plane is the video buffer naming it,
+/// which the caller has seen.
+#[cfg(target_os = "macos")]
+fn plane_format(a: &Args) -> Option<PixelFormat> {
+    if a.target != TextureTarget::Texture2d || a.last_level != 0 || a.nr_samples > 1 || a.depth != 1
+    {
+        return None;
+    }
+    match a.format.name() {
+        "R8_UNORM" => Some(PixelFormat::R8),
+        "R8G8_UNORM" => Some(PixelFormat::Rg8),
+        _ => None,
+    }
+}
+
+/// A video plane's surface, as an image a texture can take for storage. `None`, reported once
+/// per answer, when the system or the host GL will not make one: the plane then keeps GL
+/// storage, which every consumer but another driver's import reads as before.
+#[cfg(target_os = "macos")]
+fn plane_image(winsys: &Winsys, budget: &Classic, a: &Args, format: PixelFormat) -> Option<Image> {
+    let surface = match Surface::plain(a.width, a.height, format) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[virglrs] vrend: no IOSurface for a {}x{} {} plane ({e:?}); it keeps GL storage",
+                a.width,
+                a.height,
+                a.format.name()
+            );
+            return None;
+        }
+    };
+    let charge = budget.charge("IOSurface", surface.alloc_size());
+    match winsys.image_from_surface(Arc::new(Charged::new(surface, charge))) {
+        Ok(image) => {
+            if winsys.plane_surface_said.first(true) {
+                eprintln!(
+                    "[virglrs] vrend: video planes are IOSurfaces (first: {}x{} {}, IOSurface id \
+                     {}); other drivers can import them",
+                    a.width,
+                    a.height,
+                    a.format.name(),
+                    image.surface().id().0
+                );
+            }
+            Some(image)
+        }
+        Err(e) => {
+            if winsys.plane_surface_said.first(false) {
+                eprintln!(
+                    "[virglrs] vrend: the host GL takes no {} IOSurface ({e}); video planes keep \
+                     GL storage, and other drivers cannot import them",
+                    a.format.name()
+                );
+            }
+            None
+        }
+    }
+}
+
 /// The pixel format a resource's presentable storage takes, or `None` for a resource that gets
 /// none: a scanout or a shared buffer, single-level, single-sample and 2D, in one of the four
 /// 32-bit formats both an IOSurface and a dma-buf name -- or a shared one- or two-channel 8-bit
@@ -2273,6 +2401,9 @@ fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args
         // and credited on every `SHARED` create for nothing.
         return None;
     }
+    if matches!(format, PixelFormat::R8 | PixelFormat::Rg8) {
+        return plane_image(winsys, budget, a, format);
+    }
     let surface = match Surface::plain(a.width, a.height, format) {
         Ok(s) => s,
         Err(e) => {
@@ -2292,18 +2423,6 @@ fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args
     let charge = budget.charge("IOSurface", surface.alloc_size());
     match winsys.image_from_surface(Arc::new(Charged::new(surface, charge))) {
         Ok(image) => {
-            if matches!(format, PixelFormat::R8 | PixelFormat::Rg8)
-                && winsys.plane_surface_said.first(true)
-            {
-                eprintln!(
-                    "[virglrs] vrend: shared video planes are IOSurfaces (first: {}x{} {}, \
-                     IOSurface id {}); other drivers can import them",
-                    a.width,
-                    a.height,
-                    a.format.name(),
-                    image.surface().id().0
-                );
-            }
             if scanout {
                 eprintln!(
                     "[virglrs] vrend: iosurface scanout: {}x{} {} (IOSurface id {}); renders \
@@ -2315,19 +2434,6 @@ fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args
                 );
             }
             Some(image)
-        }
-        // A video plane's one- and two-channel formats are newer to the host GL than the
-        // compositor's: one that predates them keeps the plane in GL storage, which every
-        // consumer but another driver's import reads as before.
-        Err(e) if matches!(format, PixelFormat::R8 | PixelFormat::Rg8) => {
-            if winsys.plane_surface_said.first(false) {
-                eprintln!(
-                    "[virglrs] vrend: the host GL takes no {} IOSurface ({e}); shared video \
-                     planes keep GL storage, and other drivers cannot import them",
-                    a.format.name()
-                );
-            }
-            None
         }
         // The driver said it imports IOSurfaces and then would not import one of the formats
         // and extents it accepts. That is the host contradicting itself, not the guest asking

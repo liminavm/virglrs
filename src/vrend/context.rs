@@ -736,6 +736,15 @@ impl Objects {
         }
     }
 
+    /// The sampler views of `resource` that took a private texture object of their own.
+    #[cfg(target_os = "macos")]
+    fn private_views_of(&mut self, resource: ResourceHandle) -> impl Iterator<Item = &mut View> {
+        self.live.values_mut().filter_map(move |(_, o)| match o {
+            Object::SamplerView(v) if v.resource == resource && v.view.is_some() => Some(v),
+            _ => None,
+        })
+    }
+
     /// Every live object's create, for the export to order against everything else.
     pub fn retained(&self) -> impl Iterator<Item = &Retained> {
         self.live.values().map(|(at, _)| at)
@@ -5144,6 +5153,10 @@ impl Context {
             return video_result(cmd, self.video.create_buffer(at, target, destination));
         }
 
+        #[cfg(target_os = "macos")]
+        for &plane in planes {
+            self.promote_plane(host, cmd, plane)?;
+        }
         let mut resolved = Vec::with_capacity(planes.len());
         for &plane in planes {
             let resource = host.resource(cmd, plane)?;
@@ -5170,6 +5183,44 @@ impl Context {
             cmd,
             self.video.create_buffer(at, target, video::Destination::PerPlane(resolved)),
         )
+    }
+
+    /// Make a video buffer's plane a surface ([`resource::Resource::promote_to_surface`]) before
+    /// the buffer takes hold of its texture. The views the current sub-context made of the plane
+    /// with a private texture object -- Mesa makes them just before the buffer, a one-channel
+    /// plane's broadcasting swizzle being what makes them private -- were made over the plain
+    /// texture, so each is made again over the surface, as a second import of its image.
+    #[cfg(target_os = "macos")]
+    fn promote_plane(
+        &mut self,
+        host: &mut Host<'_>,
+        cmd: Cmd,
+        plane: ResourceHandle,
+    ) -> Result<(), Fault> {
+        let (gl, winsys, features, formats, budget) =
+            (host.gl, host.winsys, host.features, host.formats, host.budget);
+        let resource = host.resource_mut(cmd, plane)?;
+        if !resource.promote_to_surface(gl, winsys, features, formats, budget) {
+            return Ok(());
+        }
+        let image = host
+            .resource(cmd, plane)?
+            .texture()
+            .and_then(|t| t.minted())
+            .expect("a promoted plane's texture is over its surface");
+        for view in self.sub_mut().objects.private_views_of(plane) {
+            let old = view.view.take().expect("a private view");
+            gl.delete_texture(old);
+            let name = gl.gen_texture();
+            gl.bind_texture(view.target, Some(name));
+            gl.egl_image_target_texture_2d(view.target, image);
+            for (i, s) in view.gl_swizzle.iter().enumerate() {
+                gl.tex_parameter_i(view.target, GL_TEXTURE_SWIZZLE_R + i as GLenum, *s);
+            }
+            gl.bind_texture(view.target, None);
+            view.view = Some(name);
+        }
+        Ok(())
     }
 
     /// DECODE_BITSTREAM: read the descriptor and the bitstream out of the guest's own pages.
