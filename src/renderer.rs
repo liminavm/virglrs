@@ -3527,6 +3527,91 @@ mod tests {
         assert_eq!(wrong, 0, "the write landed in the surface");
     }
 
+    /// The format named `name`, by its description.
+    #[cfg(target_os = "macos")]
+    fn format_named(name: &str) -> crate::vrend::proto::Format {
+        (0..1024)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.describe().is_some_and(|d| d.name == name))
+            .unwrap_or_else(|| panic!("no format {name}"))
+    }
+
+    /// A vrend renderer with one context, holding the planes of a `w` x `h` 4:2:0 picture made
+    /// as players make them: a plain R8 luma and RG8 chroma texture, attached to the context.
+    #[cfg(target_os = "macos")]
+    fn video_planes(w: u32, h: u32) -> (Renderer, ContextId, ResourceHandle, ResourceHandle) {
+        use crate::vrend::resource::Bind;
+        let mut r =
+            Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
+                .expect("vrend comes up");
+        let ctx = ContextId::new(1).unwrap();
+        r.context_create(ctx, CapsetId::Virgl, "va".into()).expect("a context");
+        let plane = |format, width, height| ClassicArgs {
+            target: crate::vrend::pipe::TextureTarget::Texture2d,
+            format,
+            bind: Bind(Bind::SAMPLER_VIEW.0 | Bind::RENDER_TARGET.0),
+            width,
+            height,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: crate::vrend::resource::ResourceFlags::default(),
+        };
+        let (luma, chroma) = (ResourceHandle::new(1).unwrap(), ResourceHandle::new(2).unwrap());
+        r.resource_create(luma, plane(format_named("R8_UNORM"), w, h), Vec::new()).expect("luma");
+        r.resource_create(chroma, plane(format_named("R8G8_UNORM"), w / 2, h / 2), Vec::new())
+            .expect("chroma");
+        r.ctx_attach_resource(ctx, luma);
+        r.ctx_attach_resource(ctx, chroma);
+        (r, ctx, luma, chroma)
+    }
+
+    /// CREATE_VIDEO_BUFFER `handle` for a `w` x `h` 4:2:0 picture over `luma` and `chroma`.
+    #[cfg(target_os = "macos")]
+    fn create_video_buffer(
+        r: &mut Renderer,
+        ctx: ContextId,
+        handle: u32,
+        (w, h): (u32, u32),
+        luma: ResourceHandle,
+        chroma: ResourceHandle,
+    ) {
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::{Command, VideoBuffer, VideoBufferHandle};
+        let mut wire = Vec::new();
+        encode(
+            &Command::CreateVideoBuffer(VideoBuffer {
+                handle: VideoBufferHandle(handle),
+                format: format_named("Y8_U8V8_420_UNORM").wire(),
+                width: w,
+                height: h,
+                planes: vec![luma, chroma],
+            }),
+            &mut wire,
+        );
+        let wire: Vec<u8> = wire.iter().flat_map(|d| d.to_le_bytes()).collect();
+        assert!(matches!(r.submit_cmd(ctx, &wire), Ok(Submitted::Done)), "accepted");
+    }
+
+    /// A plane whose copy into its new surface fails keeps the storage it has: the surface would
+    /// hold none of the plane's pixels, and the swap would report success for a plane it emptied.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_plane_whose_copy_into_its_surface_fails_keeps_its_storage() {
+        let _display = crate::vrend::one_display_at_a_time();
+        crate::vrend::resource::plane_faults::fail_copies();
+        let (mut r, ctx, luma, chroma) = video_planes(112, 16);
+        create_video_buffer(&mut r, ctx, 1, (112, 16), luma, chroma);
+        for (name, plane) in [("luma", luma), ("chroma", chroma)] {
+            assert_eq!(
+                r.resource_surface_port(plane).err(),
+                Some(Error::NotExportable),
+                "the {name} plane kept its plain texture"
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn an_embedders_surface_is_adopted_by_vrend_and_lent_to_venus() {
