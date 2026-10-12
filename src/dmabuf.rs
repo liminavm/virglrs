@@ -75,10 +75,6 @@ pub enum PixelFormat {
     Bgra,
     /// 32-bit RGBA. The same bytes in the other order.
     Rgba,
-    /// One 8-bit channel: a shared video picture's luma plane.
-    R8,
-    /// Two interleaved 8-bit channels: its chroma plane.
-    Rg8,
 }
 
 impl PixelFormat {
@@ -87,17 +83,14 @@ impl PixelFormat {
         match self {
             PixelFormat::Bgra => DRM_FORMAT_ARGB8888,
             PixelFormat::Rgba => DRM_FORMAT_ABGR8888,
-            PixelFormat::R8 => u32::from_le_bytes(*b"R8  "),
-            PixelFormat::Rg8 => u32::from_le_bytes(*b"GR88"),
         }
     }
 
-    /// Bytes one pixel occupies.
+    /// Bytes one pixel occupies. Both variants are four; the method exists so a format added
+    /// later cannot be assumed to be.
     pub fn bytes_per_pixel(self) -> u32 {
         match self {
             PixelFormat::Bgra | PixelFormat::Rgba => 4,
-            PixelFormat::R8 => 1,
-            PixelFormat::Rg8 => 2,
         }
     }
 
