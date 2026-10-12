@@ -1943,19 +1943,35 @@ impl Renderer {
     /// own storage and closing one does not close the other. Handing over the renderer's own
     /// would make every export the last one.
     ///
+    /// The layout is `None` for a descriptor nobody has described yet: a venus allocation the
+    /// driver laid out as a buffer, whose shape arrives only with the guest's `SET_TYPE`, or a
+    /// dma-buf the VMM imported. The bytes are still exportable -- a VMM that takes its layout
+    /// from the guest's scanout command needs nothing more -- and a caller that does need one is
+    /// told there is none rather than handed a plausible one.
+    ///
     /// `Err(NotExportable)` is the answer on a host that mints storage instead of exporting it,
-    /// and for a resource that has no presentable storage at all. Neither is a failure to report:
-    /// the caller asked how this could be exported and was told it could not, which is what it
-    /// has to handle anyway. `Err(NoResource)` is the other answer, about the question rather than
+    /// and for a resource that has no descriptor at all. Neither is a failure to report: the
+    /// caller asked how this could be exported and was told it could not, which is what it has
+    /// to handle anyway. `Err(NoResource)` is the other answer, about the question rather than
     /// the resource: the handle names nothing.
     pub fn resource_export(
         &mut self,
         handle: ResourceHandle,
-    ) -> Result<(std::os::fd::OwnedFd, FdType, crate::surface::Layout), Error> {
+    ) -> Result<(std::os::fd::OwnedFd, FdType, Option<crate::surface::Layout>), Error> {
         self.with_resource(handle, |_| ()).ok_or(Error::NoResource)?;
-        self.with_surface(handle, |surface| {
-            let (fd, layout) = surface.export()?;
-            Some((fd, FdType::DmaBuf, layout))
+        // A surface first: a classic resource's lives in vrend, and so does the one `SET_TYPE`
+        // describes over an undescribed descriptor -- either way it is the one with a layout.
+        let described = self
+            .with_surface(handle, |surface| {
+                let (fd, layout) = surface.export()?;
+                Some((fd, FdType::DmaBuf, Some(layout)))
+            })
+            .flatten();
+        if let Some(it) = described {
+            return Ok(it);
+        }
+        self.with_resource_dmabuf(handle, |fd, layout| {
+            Some((fd.try_clone_to_owned().ok()?, FdType::DmaBuf, layout.cloned()))
         })
         .flatten()
         .ok_or(Error::NotExportable)
@@ -1964,12 +1980,13 @@ impl Renderer {
     /// The dma-buf a resource holds for as long as it stands, lent to `f` with the driver's
     /// layout when there is one: the descriptor a venus allocation's storage is, or one the VMM
     /// imported. `None` for every other resource -- guest pages, pages this renderer minted, a
-    /// descriptor of another kind, and a classic texture, whose storage is vrend's.
+    /// descriptor of another kind, and a classic texture, whose storage is vrend's and travels
+    /// through [`Self::resource_export`].
     ///
     /// Lent and not duplicated, because this is the answer to "which buffer is this resource"
     /// and not a reference to take away: the C ABI hands the number out under the contract that
     /// it stays valid until the resource is unreferenced, and the share the resource holds is
-    /// what keeps that true.
+    /// what keeps that true. A caller that wants its own reference exports one.
     pub fn with_resource_dmabuf<T>(
         &self,
         handle: ResourceHandle,
@@ -3052,15 +3069,16 @@ mod tests {
         );
     }
 
-    /// A venus blob whose storage is a descriptor nobody has described lends that descriptor --
-    /// the C's `res->fd`.
+    /// A venus blob whose storage is a descriptor nobody has described lends that descriptor and
+    /// exports a second reference to it -- the two answers the C gives from `res->fd`.
     ///
-    /// It is what QEMU imports a venus scanout from, read once at blob create; with no answer
-    /// there it imported whatever its stack held, and kmscube on zink over venus put nothing on
-    /// the screen.
+    /// The lent one is what QEMU imports a venus scanout from, read once at blob create; with no
+    /// answer there it imported whatever its stack held, and kmscube on zink over venus put
+    /// nothing on the screen. The export is what `export_blob` hands on, with no layout because
+    /// the guest has not given one, rather than refusing as if there were no buffer.
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn an_undescribed_descriptor_is_lent() {
+    fn an_undescribed_descriptor_is_lent_and_exported_without_a_layout() {
         use crate::budget::Account;
         use crate::venus::driver::Storage;
         use std::os::fd::AsRawFd;
@@ -3094,6 +3112,15 @@ mod tests {
             Some((held, false)),
             "the storage's own descriptor, lent, and no layout claimed for it"
         );
+        let (fd, kind, layout) = r.resource_export(blob).expect("a descriptor exports");
+        assert_eq!(kind, FdType::DmaBuf);
+        assert!(layout.is_none(), "the guest has said nothing about its shape");
+        assert_ne!(fd.as_raw_fd(), held, "a second reference, so closing it closes nothing held");
+        let inode = |fd| {
+            let path = format!("/proc/self/fd/{fd}");
+            std::fs::metadata(path).map(|m| std::os::unix::fs::MetadataExt::ino(&m)).unwrap()
+        };
+        assert_eq!(inode(fd.as_raw_fd()), inode(held), "to the same buffer");
     }
 
     /// The VMM publishes a blob by asking where it lives, and it asks *after* the create --

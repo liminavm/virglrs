@@ -705,11 +705,14 @@ fn export_query(q: &mut abi::ExportQuery) -> c_int {
     // answered as one that cannot export.
     let exported = with(Err(renderer::Error::NoResource), |r| r.resource_export(handle));
     let (fd, layout) = match exported {
-        Ok((fd, _, layout)) => (fd, layout),
+        Ok((fd, _, Some(layout))) => (fd, layout),
         // The resource has to exist whatever the answer is about it, and a caller asking about
         // one that does not is a different mistake from one asking about one that cannot export.
         Err(renderer::Error::NoResource) => return EINVAL,
-        Err(_) => {
+        // A descriptor nobody has described is the C's untyped blob: exported whole through
+        // `virgl_renderer_resource_export_blob`, and answered here as the C answers it, because
+        // this structure is a layout and there is none to give.
+        Ok((_, _, None)) | Err(_) => {
             // Not exportable, said the way the header says it. The descriptor slot stays `-1`
             // and the caller is told no layout is being claimed rather than a plausible one.
             if q.in_export_fds != 0 {

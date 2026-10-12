@@ -52,12 +52,15 @@ None may be carried across.
   from it, under the layout the guest's `SET_SCANOUT_BLOB` gives. `-1` where there is no
   dma-buf -- the C also reports shm and opaque descriptors there, which its one reader would
   import as dma-bufs.
-- `virgl_renderer_resource_export_blob` exports for real: the blob's share of `Storage::Texture`
-  *is* the descriptor on this host, so `BlobStorage` needed no fd-holding variant after all. It
-  answers `EINVAL` where there is no descriptor to hand back, which is every host that mints
-  rather than exports.
+- `virgl_renderer_resource_export_blob` exports for real: a duplicate of that same descriptor,
+  whether it is a `Storage::Texture` surface or a `Storage::Exported` one nobody has described,
+  so `BlobStorage` needed no fd-holding variant after all. It answers `EINVAL` where there is no
+  descriptor to hand back, which is every host that mints rather than exports.
 - `execute`'s `EXPORT_QUERY` answers fourcc, modifier, per-plane stride and offset, and one
-  duplicated fd per plane, from that same descriptor.
+  duplicated fd per plane, from that same descriptor once something has given it a layout: the
+  driver, for a surface, or the guest's `PIPE_RESOURCE_SET_TYPE`. Before that it answers as the
+  C answers an untyped blob -- not exportable when asked how, refused when asked for fds --
+  because the structure is a layout and there is none to give.
 - `virgl_renderer_get_fd_for_texture`/`2` stay refused. Not for want of the machinery: `tex_id` is
   a GL name, so only a VMM sharing this renderer's context could call them, and none does —
   QEMU's `virtio-gpu-gl` module imports 28 of these entry points and neither of these two.
@@ -469,15 +472,6 @@ with `EGL_BAD_MATCH`, so the failure is an importer's refusal and not a picture 
 wrong bytes -- and a refusal by construction rather than by luck, because such a layout is the
 guest's driver's answer about a guest's image and is offered as
 [`Adoptable::Exported`](../src/surface.rs), whose refusals are refused.
-
-**An exported blob is not exportable onward.** A venus allocation that came back as
-`Storage::Exported` -- Mesa's WSI buffer, and every declared export with no shape -- has a real
-dma-buf descriptor and still answers `NotExportable` to `resource_export`, `export_blob` and the
-`EXPORT_QUERY` structure. The descriptor is right there; what is missing is the code to hand it
-onward with the guest's layout, which only arrives at `PIPE_RESOURCE_SET_TYPE`. Nothing on this
-host asks yet -- rutabaga calls `export_blob` per blob create and takes the refusal -- so this is
-a VMM that wants to pass a client's window buffer to a compositor outside the guest, and it will
-be an unexplained blank window when it does.
 
 **Shared buffers are linear by default.** A guest that presents through virtio-gpu KMS can scan
 out `LINEAR` and nothing else, and a venus context importing a classic buffer must be told its
