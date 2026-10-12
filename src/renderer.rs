@@ -3421,6 +3421,109 @@ mod tests {
         assert_eq!(wrong, 0, "every byte of the plane as written");
     }
 
+    /// A video surface's planes are plain textures when made -- ffmpeg and GStreamer ask for no
+    /// exportable memory -- and become surfaces when the guest makes them a video buffer, so a
+    /// player's frames can be imported by another driver. A write after that lands in the
+    /// surface.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_video_buffers_planes_become_surfaces() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::{Box3, Command, Transfer, VideoBuffer, VideoBufferHandle};
+        use crate::vrend::resource::Bind;
+        const W: u32 = 112;
+        const H: u32 = 16;
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut r =
+            Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
+                .expect("vrend comes up");
+        let ctx = ContextId::new(1).unwrap();
+        r.context_create(ctx, CapsetId::Virgl, "va".into()).expect("a context");
+        let by_name = |name: &str| {
+            (0..1024)
+                .filter_map(crate::vrend::proto::Format::from_wire)
+                .find(|f| f.describe().is_some_and(|d| d.name == name))
+                .unwrap_or_else(|| panic!("no format {name}"))
+        };
+        let plane = |format, width, height| ClassicArgs {
+            target: crate::vrend::pipe::TextureTarget::Texture2d,
+            format,
+            bind: Bind(Bind::SAMPLER_VIEW.0 | Bind::RENDER_TARGET.0),
+            width,
+            height,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: crate::vrend::resource::ResourceFlags::default(),
+        };
+        let (luma, chroma) = (ResourceHandle::new(1).unwrap(), ResourceHandle::new(2).unwrap());
+        r.resource_create(luma, plane(by_name("R8_UNORM"), W, H), Vec::new()).expect("luma");
+        r.resource_create(chroma, plane(by_name("R8G8_UNORM"), W / 2, H / 2), Vec::new())
+            .expect("chroma");
+        r.ctx_attach_resource(ctx, luma);
+        r.ctx_attach_resource(ctx, chroma);
+        assert_eq!(
+            r.resource_surface_port(luma).err(),
+            Some(Error::NotExportable),
+            "plain at first"
+        );
+
+        let pixel = |x: u32, y: u32| (x * 5 + y * 3) as u8;
+        let bytes: Vec<u8> = (0..H).flat_map(|y| (0..W).map(move |x| pixel(x, y))).collect();
+        let words: Vec<u32> = bytes
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().expect("whole words")))
+            .collect();
+        let mut wire = Vec::new();
+        encode(
+            &Command::CreateVideoBuffer(VideoBuffer {
+                handle: VideoBufferHandle(1),
+                format: by_name("Y8_U8V8_420_UNORM").wire(),
+                width: W,
+                height: H,
+                planes: vec![luma, chroma],
+            }),
+            &mut wire,
+        );
+        encode(
+            &Command::ResourceInlineWrite {
+                transfer: Transfer {
+                    resource: luma,
+                    level: 0,
+                    usage: 0,
+                    stride: 0,
+                    layer_stride: 0,
+                    region: Box3 { x: 0, y: 0, z: 0, width: W as i32, height: H as i32, depth: 1 },
+                },
+                data: &words,
+            },
+            &mut wire,
+        );
+        let wire: Vec<u8> = wire.iter().flat_map(|d| d.to_le_bytes()).collect();
+        assert!(matches!(r.submit_cmd(ctx, &wire), Ok(Submitted::Done)), "accepted");
+
+        let (_, shape) = r.resource_surface_port(luma).expect("the luma plane is now a surface");
+        assert_eq!(
+            (shape.width, shape.height, shape.format),
+            (W, H, crate::surface::PixelFormat::R8)
+        );
+        let (_, shape) =
+            r.resource_surface_port(chroma).expect("the chroma plane is now a surface");
+        assert_eq!(
+            (shape.width, shape.height, shape.format),
+            (W / 2, H / 2, crate::surface::PixelFormat::Rg8)
+        );
+        let pitch = r.resource_surface_port(luma).expect("a surface").1.bytes_per_row as usize;
+        let mut read = vec![0u8; pitch * H as usize];
+        assert_eq!(r.resource_read_surface(luma, &mut read, pitch, H), Some(H), "every row");
+        let wrong = (0..H)
+            .flat_map(|y| (0..W).map(move |x| (x, y)))
+            .filter(|&(x, y)| read[y as usize * pitch + x as usize] != pixel(x, y))
+            .count();
+        assert_eq!(wrong, 0, "the write landed in the surface");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn an_embedders_surface_is_adopted_by_vrend_and_lent_to_venus() {
