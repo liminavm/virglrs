@@ -11807,6 +11807,13 @@ impl Storage {
         Storage::pages(map, charge, NoSurface::NotDedicated)
     }
 
+    /// A share over a descriptor of `len` bytes, charged to `account`, for the same tests.
+    #[cfg(all(test, not(target_os = "macos")))]
+    pub(crate) fn exported_for_test(len: usize, account: &Account) -> Storage {
+        let charge = account.try_charge("exported", len as u64).expect("no cap");
+        Storage::exported(crate::dmabuf::descriptor_for_test(len), charge)
+    }
+
     /// A share over a descriptor of the driver's own allocation.
     #[cfg(not(target_os = "macos"))]
     fn exported(descriptor: crate::dmabuf::Descriptor, charge: Charge) -> Storage {
@@ -11956,6 +11963,27 @@ impl Storage {
             // out loud at the import, because a guest reaching it is telling us the
             // declared-export gate is in the wrong place.
             Storage::Heap(_) => None,
+        }
+    }
+
+    /// The dma-buf this storage is, borrowed, with the driver's layout when the driver gave one.
+    ///
+    /// Not [`Storage::importable`]: that asks what a second *driver* may be handed, and a
+    /// surface with a host address answers it with the address. This asks what a *process* may
+    /// be lent, which is the descriptor whatever else the storage also has. `None` for pages,
+    /// which are no buffer the kernel can name, and for an IOSurface, which a Mach port names.
+    pub fn descriptor(
+        &self,
+    ) -> Option<(std::os::fd::BorrowedFd<'_>, Option<&crate::surface::Layout>)> {
+        match self {
+            #[cfg(not(target_os = "macos"))]
+            Storage::Texture(m) => Some((m.surface().fd(), Some(m.surface().layout()))),
+            #[cfg(target_os = "macos")]
+            Storage::Texture(_) => None,
+            // The layout is the guest's to give, at the command that types the resource.
+            #[cfg(not(target_os = "macos"))]
+            Storage::Exported(d) => Some((d.it().fd(), None)),
+            Storage::Linear(_) | Storage::Heap(_) => None,
         }
     }
 

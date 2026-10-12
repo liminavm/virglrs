@@ -775,6 +775,13 @@ impl crate::surface::Held for Described {
     }
 }
 
+/// A descriptor over `len` bytes of ordinary shared memory, for a test outside this module that
+/// needs storage holding a real descriptor -- see the `memfd` the tests here use.
+#[cfg(test)]
+pub(crate) fn descriptor_for_test(len: usize) -> Descriptor {
+    Descriptor::exported(tests::memfd(len)).expect("a sized buffer")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,7 +798,7 @@ mod tests {
     /// without a Vulkan driver. It is a real dma-buf in every respect this module can observe --
     /// an fd that maps -- which is the point: the parts under test are the arithmetic and the
     /// refusals, and neither is about where the fd came from.
-    fn memfd(len: usize) -> OwnedFd {
+    pub(crate) fn memfd(len: usize) -> OwnedFd {
         use std::os::fd::FromRawFd;
         // SAFETY: a NUL-terminated literal and no flags; the descriptor returned is fresh and
         // owned by nothing else, so wrapping it is its only owner.

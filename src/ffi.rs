@@ -1189,6 +1189,17 @@ pub extern "C" fn virgl_renderer_resource_detach_iov(
     });
 }
 
+/// What a resource is, for a VMM about to display it.
+///
+/// `fd` is the dma-buf the resource's storage is, *lent*: the C's `info->fd = res->fd`, which the
+/// resource goes on owning until it is unreferenced. QEMU reads it once at blob create, keeps the
+/// number as the blob's scanout buffer and never closes it, so handing out a duplicate here would
+/// leak one descriptor per blob -- it is a borrow by contract, not by oversight. `-1` where there
+/// is no dma-buf, which is also where the C differs: it reports an shm or opaque descriptor in the
+/// same field, and the field's one reader imports it as a dma-buf.
+///
+/// Every field is written. A VMM may hand in an uninitialised struct -- QEMU's blob create does
+/// -- and a field left alone is then whatever was on its stack, read back as an answer.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_get_info(
     res_handle: c_int,
@@ -1221,6 +1232,13 @@ pub extern "C" fn virgl_renderer_resource_get_info(
         // The texture is asked for outside `with_resource`: it lives in vrend's table, not the
         // resource record, and the borrow above ends before this one starts.
         let tex_id = r.classic_texture(handle).map_or(0, |name| name.raw());
+        let (fd, drm_fourcc) = {
+            use std::os::fd::AsRawFd;
+            r.with_resource_dmabuf(handle, |fd, layout| {
+                (fd.as_raw_fd(), layout.map_or(0, |l| l.fourcc as c_int))
+            })
+            .unwrap_or((-1, 0))
+        };
         // Written on every path that reports success, including the one that could describe
         // nothing. Reporting success over memory this never touched would leave the caller
         // reading whatever was in its struct before the call and believing this put it there.
@@ -1237,11 +1255,13 @@ pub extern "C" fn virgl_renderer_resource_get_info(
         if log {
             eprintln!(
                 "[virglrs] resource {res_handle} get_info: format={virgl_format} \
-                 {width}x{height}x{depth} flags={flags:#x} stride={stride} tex_id={tex_id}"
+                 {width}x{height}x{depth} flags={flags:#x} stride={stride} tex_id={tex_id} \
+                 fourcc={drm_fourcc:#x} fd={fd}"
             );
         }
-        // SAFETY: caller-provided out-pointer, checked non-null; only the C's first eight
-        // fields are written, which every version of the struct has.
+        // SAFETY: caller-provided out-pointer, checked non-null, to the struct as the C's 1.x
+        // header lays it out -- the C writes all ten fields under the same soname, so a caller
+        // with room for fewer would be overrun by the reference implementation too.
         unsafe {
             (*info).handle = res_handle as u32;
             (*info).virgl_format = virgl_format;
@@ -1251,6 +1271,8 @@ pub extern "C" fn virgl_renderer_resource_get_info(
             (*info).flags = flags & ResourceFlags::Y_0_TOP.0;
             (*info).tex_id = tex_id;
             (*info).stride = stride;
+            (*info).drm_fourcc = drm_fourcc;
+            (*info).fd = fd;
         }
         0
     })

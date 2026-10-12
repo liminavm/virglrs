@@ -47,6 +47,11 @@ None may be carried across.
 
 ## Where the ABI stands
 
+- `virgl_renderer_resource_get_info` lends the descriptor a blob's storage holds as `fd`, as the
+  C lends `res->fd`: QEMU reads it once at blob create and imports every scanout of that blob
+  from it, under the layout the guest's `SET_SCANOUT_BLOB` gives. `-1` where there is no
+  dma-buf -- the C also reports shm and opaque descriptors there, which its one reader would
+  import as dma-bufs.
 - `virgl_renderer_resource_export_blob` exports for real: the blob's share of `Storage::Texture`
   *is* the descriptor on this host, so `BlobStorage` needed no fd-holding variant after all. It
   answers `EINVAL` where there is no descriptor to hand back, which is every host that mints

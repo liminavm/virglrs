@@ -1961,6 +1961,31 @@ impl Renderer {
         .ok_or(Error::NotExportable)
     }
 
+    /// The dma-buf a resource holds for as long as it stands, lent to `f` with the driver's
+    /// layout when there is one: the descriptor a venus allocation's storage is, or one the VMM
+    /// imported. `None` for every other resource -- guest pages, pages this renderer minted, a
+    /// descriptor of another kind, and a classic texture, whose storage is vrend's.
+    ///
+    /// Lent and not duplicated, because this is the answer to "which buffer is this resource"
+    /// and not a reference to take away: the C ABI hands the number out under the contract that
+    /// it stays valid until the resource is unreferenced, and the share the resource holds is
+    /// what keeps that true.
+    pub fn with_resource_dmabuf<T>(
+        &self,
+        handle: ResourceHandle,
+        f: impl FnOnce(std::os::fd::BorrowedFd<'_>, Option<&crate::surface::Layout>) -> T,
+    ) -> Option<T> {
+        self.with_resource(handle, |r| match &r.backing {
+            Backing::Blob { storage: BlobStorage::Shared { storage, .. }, .. } => {
+                storage.descriptor().map(|(fd, layout)| f(fd, layout))
+            }
+            Backing::Imported { desc, fd, .. } if desc.fd_type == FdType::DmaBuf => {
+                Some(f(fd.as_fd(), None))
+            }
+            Backing::Blob { .. } | Backing::Classic { .. } | Backing::Imported { .. } => None,
+        })?
+    }
+
     /// The surface a classic resource is presented from, when vrend gave it one. Asked of vrend,
     /// which owns the resource's host side, rather than mirrored in the table: the surface lives
     /// and dies with the texture whose storage it is.
@@ -3020,6 +3045,54 @@ mod tests {
         assert_eq!(
             r.resource_export(ResourceHandle::new(2).unwrap()).err(),
             Some(Error::NoResource)
+        );
+        assert!(
+            r.with_resource_dmabuf(blob, |_, _| ()).is_none(),
+            "and none to lend: the VMM is told -1, never a number left on its stack"
+        );
+    }
+
+    /// A venus blob whose storage is a descriptor nobody has described lends that descriptor --
+    /// the C's `res->fd`.
+    ///
+    /// It is what QEMU imports a venus scanout from, read once at blob create; with no answer
+    /// there it imported whatever its stack held, and kmscube on zink over venus put nothing on
+    /// the screen.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_undescribed_descriptor_is_lent() {
+        use crate::budget::Account;
+        use crate::venus::driver::Storage;
+        use std::os::fd::AsRawFd;
+
+        let mut r = renderer(Config::default());
+        let account = Account::for_test(None);
+        let storage = Storage::exported_for_test(4096, &account);
+        let (held, _) = storage.descriptor().expect("a descriptor is a descriptor");
+        let held = held.as_raw_fd();
+        let blob = ResourceHandle::new(1).unwrap();
+        let ctx = ContextId::new(1).unwrap();
+        r.insert(
+            blob,
+            Backing::Blob {
+                desc: BlobDesc {
+                    blob_flags: 1,
+                    source: BlobSource::InContext { ctx, id: BlobId(1) },
+                    size: 4096,
+                },
+                storage: BlobStorage::Shared {
+                    storage,
+                    published: Published::Descriptor,
+                    from: Exporter { ctx: ContextKey::for_test(ctx), key: any_key() },
+                },
+            },
+            Vec::new(),
+        );
+
+        assert_eq!(
+            r.with_resource_dmabuf(blob, |fd, layout| (fd.as_raw_fd(), layout.is_some())),
+            Some((held, false)),
+            "the storage's own descriptor, lent, and no layout claimed for it"
         );
     }
 
