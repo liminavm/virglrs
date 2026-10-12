@@ -187,7 +187,7 @@ match sites refuse it as they refuse an unserved context today.
 - **Layout:** `uapi.rs` against the C headers, on every host.
 - **Boot, on banana** (`harness/README.md` gains the rig): `cube.sh` with the guest's renderer line
   naming `radeonsi`, not `virgl (...)`, on both legs; the capset bytes from the guest compared
-  between legs; then RADV (vkcube), then glmark2 and a GNOME session. Every gate is armed against
+  between legs; then RADV (vkmark on KMS), then glmark2 and a GNOME session. Every gate is armed against
   Fedora's stock renderer, which offers no native context, so a boot that quietly fell back to
   classic virgl cannot pass.
 

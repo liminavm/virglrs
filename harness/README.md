@@ -1438,6 +1438,11 @@ Mesa has `-Damdgpu-virtio=true`, which Fedora's does not. The rig lives outside 
   and its buffers cross from the guest's GBM into RADV. `vkcube --wsi display` cannot score this:
   RADV on a virtio render node has no display to offer, on either leg. Measured 2026-10-12, cube
   for 20 s: virglrs 5938 and 6090 fps, C 6206, the cube on screen.
+- **A GNOME session.** `desktop.sh` boots the leg, isolates `graphical.target` (gdm autologin;
+  the guest's default stays multi-user so kmscube keeps the display) and captures the shell. The
+  renderer line from `eglinfo -p wayland` must name `radeonsi`. A user's first login shows a
+  welcome dialog, so compare a second boot of each leg. Measured 2026-10-12: virglrs and C
+  differ in 66 pixels, all in the clock's minute digit.
 - **glmark2 `--validate` is not a correctness score here.** `glmark2-es2-drm` runs fullscreen at
   the KMS mode, and its references are for a fixed size, so most scenes read `Failure` on both
   legs alike. Compare the two legs' lists, never one list against all-pass.
