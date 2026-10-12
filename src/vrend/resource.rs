@@ -2292,6 +2292,18 @@ fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args
     let charge = budget.charge("IOSurface", surface.alloc_size());
     match winsys.image_from_surface(Arc::new(Charged::new(surface, charge))) {
         Ok(image) => {
+            if matches!(format, PixelFormat::R8 | PixelFormat::Rg8)
+                && winsys.plane_surface_said.first(true)
+            {
+                eprintln!(
+                    "[virglrs] vrend: shared video planes are IOSurfaces (first: {}x{} {}, \
+                     IOSurface id {}); other drivers can import them",
+                    a.width,
+                    a.height,
+                    a.format.name(),
+                    image.surface().id().0
+                );
+            }
             if scanout {
                 eprintln!(
                     "[virglrs] vrend: iosurface scanout: {}x{} {} (IOSurface id {}); renders \
