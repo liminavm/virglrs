@@ -2312,6 +2312,17 @@ impl Renderer {
         })?
     }
 
+    /// Whether END_FRAME into context `ctx`'s video target `handle` would wait for the picture,
+    /// or `None` for a context or target vrend does not have.
+    #[cfg(all(test, target_os = "macos"))]
+    fn video_settles_at_end_frame(
+        &self,
+        ctx: ContextId,
+        handle: crate::vrend::proto::VideoBufferHandle,
+    ) -> Option<bool> {
+        self.vrend.as_ref()?.video_settles_at_end_frame(ctx, handle)
+    }
+
     /// Copy a scanout resource's presented pixels into a caller's buffer, `stride` bytes per row.
     ///
     /// The headless display sink's only way to see a frame: a venus scanout blob has no CPU
@@ -3610,6 +3621,78 @@ mod tests {
                 "the {name} plane kept its plain texture"
             );
         }
+    }
+
+    /// A host GL that takes no plane surface leaves a video buffer's planes as they were made:
+    /// plain textures, written and read back as before, and a decode into them that END_FRAME
+    /// does not wait for. This is the path every stock guest takes on such a host.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_host_gl_refusing_plane_surfaces_leaves_the_planes_plain() {
+        use crate::abi::{GuestIov, VmmPtr};
+        use crate::surface::PixelFormat;
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::{Box3, Command, Transfer, VideoBufferHandle};
+        use crate::vrend::resource::plane_faults;
+        const W: u32 = 112;
+        const H: u32 = 16;
+        let _display = crate::vrend::one_display_at_a_time();
+        plane_faults::refuse(PixelFormat::R8);
+        plane_faults::refuse(PixelFormat::Rg8);
+        let (mut r, ctx, luma, chroma) = video_planes(W, H);
+        create_video_buffer(&mut r, ctx, 1, (W, H), luma, chroma);
+        assert_eq!(plane_faults::asked(PixelFormat::R8), 1, "the host GL was asked, and refused");
+        for (name, plane) in [("luma", luma), ("chroma", chroma)] {
+            assert_eq!(
+                r.resource_surface_port(plane).err(),
+                Some(Error::NotExportable),
+                "the {name} plane is still a plain texture"
+            );
+        }
+        assert_eq!(
+            r.video_settles_at_end_frame(ctx, VideoBufferHandle(1)),
+            Some(false),
+            "a decode into plain planes lands without END_FRAME waiting for it"
+        );
+
+        let pixel = |x: u32, y: u32| (x * 7 + y * 11) as u8;
+        let bytes: Vec<u8> = (0..H).flat_map(|y| (0..W).map(move |x| pixel(x, y))).collect();
+        let words: Vec<u32> = bytes
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().expect("whole words")))
+            .collect();
+        let region = Box3 { x: 0, y: 0, z: 0, width: W as i32, height: H as i32, depth: 1 };
+        let mut wire = Vec::new();
+        encode(
+            &Command::ResourceInlineWrite {
+                transfer: Transfer {
+                    resource: luma,
+                    level: 0,
+                    usage: 0,
+                    stride: 0,
+                    layer_stride: 0,
+                    region,
+                },
+                data: &words,
+            },
+            &mut wire,
+        );
+        let wire: Vec<u8> = wire.iter().flat_map(|d| d.to_le_bytes()).collect();
+        assert!(matches!(r.submit_cmd(ctx, &wire), Ok(Submitted::Done)), "the write is taken");
+
+        let mut read = vec![0u8; (W * H) as usize];
+        let iov = vec![GuestIov { base: VmmPtr(read.as_mut_ptr().cast()), len: read.len() }];
+        let info = transfer::Info {
+            level: 0,
+            stride: W,
+            layer_stride: 0,
+            offset: 0,
+            region,
+            synchronized: false,
+        };
+        r.transfer(luma, Some(ctx), transfer::Direction::ToGuest, &info, iov)
+            .expect("the plain plane reads back");
+        assert_eq!(read, bytes, "and reads back what was written");
     }
 
     #[cfg(target_os = "macos")]
