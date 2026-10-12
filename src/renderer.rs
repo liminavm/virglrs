@@ -390,6 +390,16 @@ pub enum Caching {
     WriteCombining,
 }
 
+/// How a surface handed to an embedder is laid out, as its importer needs it.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SurfaceShape {
+    pub width: u32,
+    pub height: u32,
+    pub format: crate::surface::PixelFormat,
+    pub bytes_per_row: u32,
+}
+
 /// A blob resource's home in this process, as a VMM needs it to publish the blob to its guest.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct HostMapping {
@@ -1955,6 +1965,31 @@ impl Renderer {
         Some(f(surface))
     }
 
+    /// A send right to the surface a resource is presented from, with its shape, for an embedder
+    /// whose own renderer imports it: the same pages, whichever of vrend, venus or the embedder
+    /// made them.
+    ///
+    /// Only single-plane 32-bit surfaces. `Err(NotExportable)` for a resource with no surface or
+    /// another kind of one, `Err(NoResource)` when the handle names nothing.
+    #[cfg(target_os = "macos")]
+    pub fn resource_surface_port(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> Result<(crate::metal::SurfacePort, SurfaceShape), Error> {
+        self.with_resource(handle, |_| ()).ok_or(Error::NoResource)?;
+        self.with_surface(handle, |surface| {
+            let shape = SurfaceShape {
+                width: surface.width(),
+                height: surface.height(),
+                format: surface.pixel_format()?,
+                bytes_per_row: surface.bytes_per_row(),
+            };
+            Some((surface.port()?, shape))
+        })
+        .flatten()
+        .ok_or(Error::NotExportable)
+    }
+
     /// A descriptor of a resource's storage, for a VMM that composites by importing rather than
     /// by reading an address.
     ///
@@ -2918,6 +2953,59 @@ mod tests {
     /// A surface minted for the embedder is a texture's storage to a classic context that attaches
     /// and types it, and a share to a venus one: the embedder's renderer and both of ours meet in
     /// the same pages, with no copy between them.
+    /// Whichever renderer made a resource's surface, the embedder can have it to import: a gbm
+    /// buffer vrend minted one for, and one the embedder minted itself. A resource with GL storage
+    /// has none to give.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_resources_surface_goes_to_the_embedder_with_its_shape() {
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut r =
+            Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
+                .expect("vrend comes up");
+        let args = |bind| ClassicArgs {
+            target: crate::vrend::pipe::TextureTarget::Texture2d,
+            format: crate::vrend::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM"),
+            bind,
+            width: 64,
+            height: 8,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: crate::vrend::resource::ResourceFlags::default(),
+        };
+        let shared = ResourceHandle::new(1).unwrap();
+        let embedded = ResourceHandle::new(2).unwrap();
+        let plain = ResourceHandle::new(3).unwrap();
+        r.resource_create(shared, args(crate::vrend::resource::Bind::SHARED), Vec::new())
+            .expect("a shared resource");
+        r.resource_create_surface(embedded, 32, 4, crate::surface::PixelFormat::Rgba, 256)
+            .expect("an embedder's surface");
+        r.resource_create(plain, args(crate::vrend::resource::Bind::SAMPLER_VIEW), Vec::new())
+            .expect("a texture");
+
+        let id = r.resource_surface_id(shared).expect("vrend minted a surface for gbm's buffer");
+        let (port, shape) = r.resource_surface_port(shared).expect("the embedder gets it");
+        assert!(port.resolves_to(id.0), "the surface vrend renders into");
+        assert_eq!(shape.width, 64);
+        assert_eq!(shape.height, 8);
+        assert_eq!(shape.format, crate::surface::PixelFormat::Bgra);
+        assert!(shape.bytes_per_row >= 64 * 4, "a whole row");
+
+        let (_, shape) = r.resource_surface_port(embedded).expect("its own surface comes back");
+        assert_eq!(
+            (shape.width, shape.height, shape.format, shape.bytes_per_row),
+            (32, 4, crate::surface::PixelFormat::Rgba, 256)
+        );
+
+        assert_eq!(r.resource_surface_port(plain).err(), Some(Error::NotExportable));
+        assert_eq!(
+            r.resource_surface_port(ResourceHandle::new(9).unwrap()).err(),
+            Some(Error::NoResource)
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn an_embedders_surface_is_adopted_by_vrend_and_lent_to_venus() {

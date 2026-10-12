@@ -792,6 +792,17 @@ impl Surface {
         }
     }
 
+    /// The 32-bit layout of a single-plane surface, or `None` for a planar one or any other
+    /// pixel format.
+    pub fn pixel_format(&self) -> Option<PixelFormat> {
+        if self.plane_count() != 0 {
+            return None;
+        }
+        // SAFETY: a read-only query of the live surface this type owns.
+        let code = unsafe { IOSurfaceGetPixelFormat(self.as_ref()) };
+        [PixelFormat::Bgra, PixelFormat::Rgba].into_iter().find(|f| f.fourcc() == code)
+    }
+
     /// How many planes the surface has. Zero for a surface that is not planar.
     pub fn plane_count(&self) -> u32 {
         // SAFETY: a read-only query of the live surface this type owns.
