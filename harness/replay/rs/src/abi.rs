@@ -15,6 +15,7 @@
 //! covers the other half: it refuses a library missing a symbol it needs.
 
 use std::ffi::{c_char, c_int, c_void, CString};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
 
 /// `struct virgl_renderer_callbacks`, callbacks version 4.
@@ -43,6 +44,25 @@ pub struct CreateBlobArgs {
     pub iovecs: *const libc::iovec,
     pub num_iovs: u32,
 }
+
+/// `struct virgl_renderer_resource_info`, as the 1.x header lays it out.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ResourceInfo {
+    pub handle: u32,
+    pub virgl_format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub flags: u32,
+    pub tex_id: u32,
+    pub stride: u32,
+    pub drm_fourcc: c_int,
+    pub fd: c_int,
+}
+
+/// `VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF`.
+pub const BLOB_FD_TYPE_DMABUF: u32 = 1;
 
 pub const FLAG_THREAD_SYNC: c_int = 2;
 pub const FLAG_VENUS: c_int = 1 << 6;
@@ -124,6 +144,10 @@ syms! {
         = "virgl_renderer_resource_map",
     resource_get_iosurface_id: extern "C" fn(u32, *mut u32) -> c_int
         = "virgl_renderer_resource_get_iosurface_id",
+    resource_get_info: extern "C" fn(c_int, *mut ResourceInfo) -> c_int
+        = "virgl_renderer_resource_get_info",
+    resource_export_blob: extern "C" fn(u32, *mut u32, *mut c_int) -> c_int
+        = "virgl_renderer_resource_export_blob",
     resource_read_iosurface: extern "C" fn(u32, *mut c_void, u32, u32) -> c_int
         = "virgl_renderer_resource_read_iosurface",
 }
@@ -383,6 +407,77 @@ impl Renderer {
     ///
     /// The id is for deciding *that* it is backed, never for pinning: an id is host-private,
     /// recycled the instant its surface dies, and free to change across a snapshot restore.
+    /// Whether `get_info` describes a resource whole and lends the buffer `export_blob` exports.
+    ///
+    /// A VMM hands `get_info` an uninitialised struct -- QEMU's blob create does -- and takes the
+    /// scanout buffer from its `fd`, so a field the renderer leaves alone is read back as an
+    /// answer. The struct goes in poisoned, and every field must come back written. Then the two
+    /// calls must agree about the one buffer: `fd` is lent and names the same dma-buf a successful
+    /// `export_blob` hands over a reference to, and is -1 when there is none to hand over.
+    ///
+    /// `Ok(true)` when the two agreed on a buffer, `Ok(false)` when both said there is none.
+    pub fn info_agrees_with_export(&self, res_id: u32) -> Result<bool, String> {
+        const POISON: u32 = 0xa5a5_a5a5;
+        let p = POISON as c_int;
+        let mut info = ResourceInfo {
+            handle: POISON,
+            virgl_format: POISON,
+            width: POISON,
+            height: POISON,
+            depth: POISON,
+            flags: POISON,
+            tex_id: POISON,
+            stride: POISON,
+            drm_fourcc: p,
+            fd: p,
+        };
+        let rc = (self.syms.resource_get_info)(res_id as c_int, &mut info);
+        if rc != 0 {
+            return Err(format!("get_info refused a live resource: {rc}"));
+        }
+        let words = [
+            info.handle,
+            info.virgl_format,
+            info.width,
+            info.height,
+            info.depth,
+            info.flags,
+            info.tex_id,
+            info.stride,
+            info.drm_fourcc as u32,
+            info.fd as u32,
+        ];
+        if words.contains(&POISON) {
+            return Err(format!("get_info left a field unwritten: {info:?}"));
+        }
+        let mut fd_type = 0u32;
+        let mut exported: c_int = -1;
+        let exported = match (self.syms.resource_export_blob)(res_id, &mut fd_type, &mut exported) {
+            // SAFETY: on success the descriptor is a new reference the caller owns, by the ABI's
+            // contract; owning it here is what closes it.
+            0 => Some((fd_type, unsafe { OwnedFd::from_raw_fd(exported) })),
+            _ => None,
+        };
+        match exported {
+            Some((BLOB_FD_TYPE_DMABUF, own)) => {
+                if info.fd < 0 {
+                    return Err("exports a dma-buf and lends none".into());
+                }
+                if info.fd == own.as_raw_fd() {
+                    return Err("lent the descriptor it just handed over".into());
+                }
+                match (buffer_of(info.fd), buffer_of(own.as_raw_fd())) {
+                    (Some(lent), Some(given)) if lent == given => Ok(true),
+                    (lent, given) => {
+                        Err(format!("lends {lent:?} and exports {given:?}, not one buffer"))
+                    }
+                }
+            }
+            _ if info.fd >= 0 => Err(format!("lends fd {} and exports no dma-buf", info.fd)),
+            _ => Ok(false),
+        }
+    }
+
     pub fn iosurface_id(&self, res_id: u32) -> Option<u32> {
         let mut id = 0u32;
         match (self.syms.resource_get_iosurface_id)(res_id, &mut id) {
@@ -406,4 +501,16 @@ impl Renderer {
     pub fn read_iosurface(&self, res_id: u32, buf: &mut [u8], stride: u32, height: u32) -> c_int {
         (self.syms.resource_read_iosurface)(res_id, buf.as_mut_ptr().cast(), stride, height)
     }
+}
+
+/// The kernel object a descriptor names, as `(st_dev, st_ino)`; `None` for one that is not open.
+fn buffer_of(fd: c_int) -> Option<(libc::dev_t, libc::ino_t)> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `st` is a local the call fills on success, and read only then.
+    if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `fstat` returned 0, so it wrote the struct.
+    let st = unsafe { st.assume_init() };
+    Some((st.st_dev, st.st_ino))
 }

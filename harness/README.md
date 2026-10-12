@@ -121,6 +121,15 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   context numbers its own from one. It runs by default under `--renderer rs`; `--no-rebuild` opts
   out, and asking for it under `--renderer c` is refused (`journal_held` is a virglrs extension).
 
+  Every blob it creates is also asked `virgl_renderer_resource_get_info` over a poisoned struct:
+  every field must come back written, and the `fd` it lends must name the same buffer a
+  successful dma-buf `export_blob` hands over, or be -1 when there is none. QEMU reads that `fd`
+  out of an uninitialised struct as the blob's scanout buffer. A disagreement fails the run and,
+  like the rebuild gate, stays out of the score text; the run ends with a `get_info:` line
+  counting the blobs checked and those that lent a dma-buf. No corpus in the set lends one
+  (macOS storage is IOSurfaces, and the macOS recordings' exports park on anv), so today the
+  check scores the written-fields half; the agreement half waits for a Linux venus corpus.
+
   **Where it runs is the difference between a gate and a green light.** A capture of a workload
   that exits carries the guest's own teardown, so at end of stream the context has destroyed
   everything it built and its journal is empty — a gate there finds nothing to compare and passes.

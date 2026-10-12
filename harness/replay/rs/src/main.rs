@@ -158,6 +158,13 @@ struct Tally {
     /// Contexts whose journal rebuilt into the same journal, and those that did not.
     rebuild_ok: u64,
     rebuild_fail: u64,
+    /// Blobs `get_info` described with a field unwritten, or whose lent descriptor disagreed
+    /// with `export_blob`; see `Renderer::info_agrees_with_export`.
+    info_fail: u64,
+    /// Blobs `get_info` was checked on, and those of them that lent a dma-buf -- said at the end,
+    /// so a run whose check never met a descriptor does not read as one that passed it.
+    info_checked: u64,
+    info_lent: u64,
     cmd_ok: u64,
     cmd_fail: u64,
     ctl_ok: u64,
@@ -183,7 +190,7 @@ impl Tally {
     /// produce the same score file as one that was never asked to run it -- otherwise turning the
     /// gate on would force every pinned fixture to be re-recorded.
     fn failed(&self) -> u64 {
-        self.prologue_fail + self.cmd_fail + self.ctl_fail + self.rebuild_fail
+        self.prologue_fail + self.cmd_fail + self.ctl_fail + self.rebuild_fail + self.info_fail
     }
 }
 
@@ -435,6 +442,16 @@ impl<'a> Replay<'a> {
                     num_iovs: iov_count,
                 };
                 let rc = self.r.create_blob(&args);
+                if rc == 0 {
+                    self.tally.info_checked += 1;
+                    match self.r.info_agrees_with_export(*res_handle) {
+                        Ok(lent) => self.tally.info_lent += u64::from(lent),
+                        Err(why) => {
+                            eprintln!("FAIL get_info res={res_handle}: {why}");
+                            self.tally.info_fail += 1;
+                        }
+                    }
+                }
                 if rc == 0 && self.r.iosurface_id(*res_handle).is_some() {
                     self.iosurf.entry(*ctx_id).or_default().insert(*res_handle);
                 }
@@ -1397,12 +1414,20 @@ fn main() -> ExitCode {
 
     let score = score_text(&t, &census);
     print!("{score}");
+    eprintln!(
+        "get_info: {} blobs checked, {} lent a dma-buf, {} disagreed",
+        t.info_checked, t.info_lent, t.info_fail
+    );
 
     // What makes the run fail. Normally every failure the tally counted. With `--expect-lines`
     // the pinned lines carry the prologue, command and ctl failures -- the fixture refuses one
-    // that does not pin them -- so the fixture is what judges those, and `rebuild_fail`, which
-    // the score text deliberately does not carry, is the one that stays fatal on its own.
-    let mut ok = if args.expect_lines.is_some() { t.rebuild_fail == 0 } else { t.failed() == 0 };
+    // that does not pin them -- so the fixture is what judges those, and `rebuild_fail` and
+    // `info_fail`, which the score text deliberately does not carry, stay fatal on their own.
+    let mut ok = if args.expect_lines.is_some() {
+        t.rebuild_fail + t.info_fail == 0
+    } else {
+        t.failed() == 0
+    };
 
     if let Some(path) = &args.score {
         if let Err(e) = std::fs::write(path, &score) {
