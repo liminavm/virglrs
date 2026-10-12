@@ -1842,8 +1842,11 @@ impl Renderer {
         }
     }
 
-    /// Finish rebuilding a context, and start whatever the journal built.
-    pub fn replay_end(&mut self, ctx: ContextId) -> Result<(), Error> {
+    /// Finish rebuilding a context, and start whatever the journal built. Answers how many of
+    /// the journal's commands the rebuild lost, each named in the log: the ones it fed and could
+    /// not use, plus the ones it was handed and never fed. Zero is a whole restore, on either
+    /// leg; anything else is a context that is not the one the journal recorded.
+    pub fn replay_end(&mut self, ctx: ContextId) -> Result<u64, Error> {
         match self.bound(ctx)? {
             Bound::Classic(c) => self
                 .vrend
@@ -3866,6 +3869,92 @@ mod tests {
         let again: Vec<u8> = pattern.iter().map(|b| !b).collect();
         r.resource_write_surface(window, &again, PITCH, H).expect("written through vrend's share");
         assert_eq!(read(&mut r), again);
+    }
+
+    /// A restore that leaves out a resource a classic context's journal names says how many of
+    /// its commands it dropped, so the VMM can refuse the restore there rather than at the next
+    /// frame; one that re-creates it drops nothing. The resource is an embedder's surface, the
+    /// one kind of resource the VMM, not the guest's commands, must put back.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_replay_counts_what_a_missing_surface_cost_it() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::pipe::{Swizzle, TextureTarget};
+        use crate::vrend::proto::{Command, Object, SamplerView};
+
+        let _display = crate::vrend::one_display_at_a_time();
+        let compositor = ContextId::new(1).unwrap();
+        let window = ResourceHandle::new(1).unwrap();
+        let shape = SurfaceShape {
+            width: 64,
+            height: 8,
+            format: crate::surface::PixelFormat::Bgra,
+            bytes_per_row: 256,
+        };
+        let fresh = |with_surface: bool| {
+            let mut r =
+                Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
+                    .expect("vrend comes up");
+            r.context_create(compositor, CapsetId::Virgl, "compositor".into()).expect("a context");
+            if with_surface {
+                r.resource_create_surface(window, shape).expect("a surface");
+                r.ctx_attach_resource(compositor, window);
+            }
+            r
+        };
+        let mut live = fresh(true);
+        let mut wire = Vec::new();
+        encode(
+            &Command::PipeResourceSetType {
+                resource: window,
+                format: crate::vrend::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM"),
+                bind: crate::vrend::resource::Bind::SAMPLER_VIEW.0,
+                width: 64,
+                height: 8,
+                usage: 0,
+                modifier: 0,
+                planes: vec![crate::vrend::proto::Plane { stride: 256, offset: 0 }],
+            },
+            &mut wire,
+        );
+        encode(
+            &Command::CreateObject {
+                handle: crate::vrend::proto::ObjectHandle::new(5).unwrap(),
+                object: Object::SamplerView(SamplerView {
+                    resource: window,
+                    format: crate::vrend::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM"),
+                    target: TextureTarget::Texture2d,
+                    first_element_or_layers: 0,
+                    last_element_or_levels: 0,
+                    swizzle: [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+                }),
+            },
+            &mut wire,
+        );
+        let bytes: Vec<u8> = wire.iter().flat_map(|d| d.to_le_bytes()).collect();
+        assert!(matches!(live.submit_cmd(compositor, &bytes), Ok(Submitted::Done)));
+        let journal = live.journal_export(compositor).expect("a classic context journals");
+        drop(live);
+
+        let replay = |r: &mut Renderer| {
+            r.replay_begin(compositor).expect("rebuilding");
+            r.journal_restore(compositor, &journal).expect("the journal reads");
+            r.replay_upto(compositor, u64::MAX).expect("a dropped command does not poison");
+            r.replay_end(compositor).expect("the context is here")
+        };
+        let mut lossy = fresh(false);
+        assert!(replay(&mut lossy) > 0, "the commands that named the surface are counted");
+        drop(lossy);
+        let mut whole = fresh(true);
+        assert_eq!(replay(&mut whole), 0, "with the surface back, nothing is dropped");
+        drop(whole);
+        let mut early = fresh(true);
+        early.replay_begin(compositor).expect("rebuilding");
+        early.journal_restore(compositor, &journal).expect("the journal reads");
+        assert!(
+            early.replay_end(compositor).expect("the context is here") > 0,
+            "entries handed over and never fed are lost too"
+        );
     }
 
     /// A surface minted for the embedder is a texture's storage to a classic context that attaches

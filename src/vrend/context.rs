@@ -1897,16 +1897,17 @@ impl Context {
     /// genuinely cannot be rebuilt, or a gap in what the recorder kept -- and the two look
     /// identical from here, so the only way to tell them apart is to name them and go and look.
     ///
-    /// Returns how many commands were dropped.
+    /// Returns what the rebuild lost: the commands it dropped, plus the entries it was handed and
+    /// never fed.
     pub fn replay_end(&mut self) -> u64 {
         let Some(r) = self.replay.take() else { return 0 };
-        let left = r.entries.len().saturating_sub(r.fed);
+        let left = r.entries.len().saturating_sub(r.fed) as u64;
         if left > 0 {
             eprintln!("[virglrs] vrend: replay ended with {left} entries never fed");
         }
         let total: u64 = r.dropped.values().sum();
         if total == 0 {
-            return 0;
+            return left;
         }
         eprintln!(
             "[virglrs] vrend: replay could not use {total} of {} retained commands:",
@@ -1915,7 +1916,7 @@ impl Context {
         for (cmd, n) in &r.dropped {
             eprintln!("[virglrs]   {n:>6}  {cmd}");
         }
-        total
+        total + left
     }
 
     /// What the current sub-context has bound at `stage`: the handle of a shader bound from the

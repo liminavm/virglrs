@@ -218,6 +218,9 @@ struct Replay {
     /// counts, and a feed that resumed from the wrong one would replay a command twice. Popping
     /// from the front makes "what is left" and "where we are" the same fact.
     restoring: VecDeque<journal::Parsed>,
+    /// [`Context::replay_ghosted`] when the span opened, so the span's own loss is the
+    /// difference: a context restored twice must not count the first restore's holes again.
+    ghosted_at_begin: u64,
 }
 
 /// A journal was fed to a context that is not being rebuilt. The VMM's mistake, never a guest's:
@@ -587,13 +590,18 @@ impl Context {
     /// A begin inside a span is the same span: what a restore already handed over stays, as the
     /// C's `ctx->replaying = true` leaves everything else alone.
     pub fn replay_begin(&mut self) {
-        self.replay.get_or_insert_with(Replay::default);
+        let ghosted_at_begin = self.replay_ghosted;
+        self.replay.get_or_insert_with(|| Replay { ghosted_at_begin, ..Replay::default() });
     }
 
     /// Leave replay mode. The rings the journal built are started by the caller straight after,
     /// which is the C's loop at the end of `vkr_renderer_replay_end`.
-    pub fn replay_end(&mut self) {
-        let Some(r) = self.replay.take() else { return };
+    ///
+    /// Returns what this span lost: the commands it dropped because their objects could not be
+    /// rebuilt, plus the entries it was handed and never fed. Zero is a whole restore; anything
+    /// else is a context that is not the one snapshotted, whatever the feed answered.
+    pub fn replay_end(&mut self) -> u64 {
+        let Some(r) = self.replay.take() else { return 0 };
         if !r.restoring.is_empty() {
             eprintln!(
                 "[virglrs] ctx {}: replay ended with {} entries never fed",
@@ -601,6 +609,7 @@ impl Context {
                 r.restoring.len()
             );
         }
+        self.replay_ghosted - r.ghosted_at_begin + r.restoring.len() as u64
     }
 
     /// Whether this context is being rebuilt from a journal rather than driven by a guest.
@@ -715,6 +724,9 @@ impl Context {
                     entry.seq,
                     restoring.len()
                 );
+                // Back in the span, so `replay_end` counts what was abandoned as never fed.
+                self.replay.as_mut().expect("no command ends the replay it is fed in").restoring =
+                    restoring;
                 return Ok(false);
             }
         }
@@ -7689,6 +7701,58 @@ mod tests {
         let mut got = [0u8; 4];
         assert!(t.1.copy_out(WINDOW, &mut got));
         assert_eq!(got, [0; 4], "and no reply was written for it");
+    }
+
+    /// A replay answers what it lost: a command its ghost absorbed is counted, from the span's own
+    /// begin, so a context restored twice does not count the first restore's holes again.
+    #[test]
+    fn a_replay_counts_the_commands_its_ghosts_absorbed() {
+        const WINDOW: usize = 0x21000;
+        const GHOST: u64 = 7;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let todo = Unimplemented::default();
+        let mut ctx = Context::new(
+            ContextKey::for_test(ContextId::new(1).unwrap()),
+            &Budget::with_cap(None, false),
+            String::new(),
+        );
+        ctx.objects.borrow_mut().add_ghost(ObjectId(GHOST));
+        ctx.replay_begin();
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire_cache_data(GHOST, 0));
+        assert!(ctx.submit(&batch, &todo, &g, &t).ran(), "absorbed, not poisoned");
+        assert_eq!(ctx.replay_end(), 1, "the absorbed command is the replay's loss");
+        ctx.replay_begin();
+        assert_eq!(ctx.replay_end(), 0, "a later span does not count it again");
+    }
+
+    /// A replay ended before its journal was fed answers the entries it never fed: the world they
+    /// would have built is missing as surely as a dropped command's.
+    #[test]
+    fn a_replay_ended_unfed_counts_what_it_was_handed() {
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let todo = Unimplemented::default();
+        let mut ctx = Context::new(
+            ContextKey::for_test(ContextId::new(1).unwrap()),
+            &Budget::with_cap(None, false),
+            String::new(),
+        );
+        ctx.replay_begin();
+        assert!(ctx.submit(&wire_create_ring(7, &ring_info()), &todo, &g, &t).ran());
+        let blob = ctx.journal_export().expect("a ring to rebuild");
+
+        let mut back = Context::new(
+            ContextKey::for_test(ContextId::new(1).unwrap()),
+            &Budget::with_cap(None, false),
+            String::new(),
+        );
+        back.replay_begin();
+        let handed = back.journal_restore(&blob).expect("the blob parses");
+        assert!(handed > 0, "the journal holds the ring's create");
+        assert_eq!(back.replay_end(), handed as u64, "every entry handed over and never fed");
     }
 
     /// A command that replies without moving the reply position, for the tests about where a

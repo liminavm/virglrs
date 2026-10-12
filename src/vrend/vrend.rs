@@ -717,10 +717,10 @@ impl Vrend {
         })
     }
 
-    /// Finish rebuilding a classic context, and report what it could not use.
-    pub fn replay_end(&mut self, ctx: ClassicCtx) -> Result<(), ReplayRefused> {
-        self.contexts.get_mut(&ctx.id()).ok_or(ReplayRefused::NoContext)?.replay_end();
-        Ok(())
+    /// Finish rebuilding a classic context, and report what it lost: how many retained commands
+    /// it dropped or was never fed.
+    pub fn replay_end(&mut self, ctx: ClassicCtx) -> Result<u64, ReplayRefused> {
+        Ok(self.contexts.get_mut(&ctx.id()).ok_or(ReplayRefused::NoContext)?.replay_end())
     }
 
     // ---- contexts ----
@@ -4804,6 +4804,52 @@ mod tests {
             assert_eq!(refused, Err(expected), "context {id}");
             v.context_destroy(ctx, &NoGuest);
         }
+    }
+
+    /// A classic replay ended before its journal was fed answers the entries it never fed, so a
+    /// VMM that stops feeding early does not read a whole restore.
+    #[test]
+    fn a_classic_replay_ended_unfed_counts_what_it_was_handed() {
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+        v.context_create(ctx, &NoGuest).expect("a context");
+        v.submit(ctx, &[(1 << 16) | 29, 1], &NoGuest)
+            .expect("the context is here")
+            .expect("a sub-context");
+        let journal = v.journal_export(ctx).expect("a live context exports its journal");
+        v.context_destroy(ctx, &NoGuest);
+
+        v.context_create(ctx, &NoGuest).expect("a fresh context to rebuild");
+        v.replay_begin(ctx).expect("the context is here");
+        let handed = v.journal_restore(ctx, &journal).expect("the journal reads");
+        assert!(handed > 0, "a context with a sub-context retains something");
+        assert_eq!(
+            v.replay_end(ctx),
+            Ok(handed as u64),
+            "every entry handed over and never fed is lost"
+        );
+        v.context_destroy(ctx, &NoGuest);
     }
 
     /// A second `replay_begin` keeps the span open with the journal the first was handed,

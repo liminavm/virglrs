@@ -615,16 +615,17 @@ impl Vkr {
         out
     }
 
-    /// Leave replay mode, and start every ring the journal built.
+    /// Leave replay mode, and start every ring the journal built. Answers what the rebuild lost:
+    /// see [`Context::replay_end`].
     ///
     /// The order matters and matches the C: the rings start first, then `replaying` clears. A ring
     /// promoted here resumes at the head its snapshot restored, not at the start of its buffer.
-    pub fn replay_end(&mut self, ctx: VenusCtx) -> Result<(), Error> {
-        self.with_context_mut(ctx, Context::replay_end).ok_or(Error::NoContext)?;
+    pub fn replay_end(&mut self, ctx: VenusCtx) -> Result<u64, Error> {
+        let lost = self.with_context_mut(ctx, Context::replay_end).ok_or(Error::NoContext)?;
         // After the flag clears, not before: promotion refuses to start a ring while the context
         // is still replaying, which is the single check both paths go through.
         self.promote(ctx.id());
-        Ok(())
+        Ok(lost)
     }
 }
 
@@ -1463,7 +1464,29 @@ mod tests {
         v.replay_begin(ctx_id()).expect("replay began again");
         assert_eq!(v.journal_restore(ctx_id(), &blob), Ok(1), "inside a span the journal is taken");
         assert_eq!(v.replay_upto(ctx_id(), Seq(u64::MAX)), Ok(()), "inside a span it is fed");
+        assert_eq!(v.replay_end(ctx_id()), Ok(0), "fed whole, the rebuild lost nothing");
+
+        v.context_destroy(ctx_id());
+    }
+
+    /// `replay_end` answers what the rebuild lost, and a journal handed over and never fed is
+    /// lost: a VMM that stops feeding early must not read a whole restore.
+    #[test]
+    fn a_venus_replay_ended_unfed_answers_what_it_lost() {
+        let (mut v, _map) = vkr();
+        v.replay_begin(ctx_id()).expect("replay began");
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+        let blob = v.journal_export(ctx_id()).expect("a ring to rebuild");
         v.replay_end(ctx_id()).expect("replay ended");
+        v.context_destroy(ctx_id());
+
+        v.context_create(ctx_id(), String::new());
+        v.replay_begin(ctx_id()).expect("replay began again");
+        assert_eq!(v.journal_restore(ctx_id(), &blob), Ok(1));
+        assert_eq!(v.replay_end(ctx_id()), Ok(1), "the entry never fed is the rebuild's loss");
 
         v.context_destroy(ctx_id());
     }
