@@ -139,8 +139,9 @@ impl VideoCaps {
     /// One advertised decode entry.
     ///
     /// Everything this build does not vary is fixed here rather than repeated at call sites:
-    /// bitstream is the only entrypoint, nothing is interlaced (the serializers refuse field
-    /// coding), and there are no stacked frames or temporal layers.
+    /// bitstream is the only entrypoint, no buffer is interlaced (a field-coded stream decodes
+    /// into a frame target, on a backend that serves one at all), and there are no stacked
+    /// frames or temporal layers.
     pub fn decode(profile: video::Profile, max_level: u32) -> VideoCaps {
         /// `PIPE_VIDEO_ENTRYPOINT_BITSTREAM`.
         const BITSTREAM: u32 = 1;

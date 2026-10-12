@@ -26,7 +26,7 @@ use std::sync::{Arc, Weak};
 use cros_libva as va;
 
 use super::{Backend, Delivery, Destination, Identity, Layout, Lookup, Shape, TargetFormat};
-use super::{HevcSource, h264_slice, h265_slice, pending, vp9};
+use super::{H264Source, HevcSource, h264_slice, h265_slice, pending, vp9};
 use crate::decode::{Imaged, Picture, PixelFormat};
 use crate::surface::{Held, PlaneLayout, PlaneLayouts};
 use crate::vrend::egl::{Importer, Plane};
@@ -108,6 +108,16 @@ enum Params {
         width: u32,
         height: u32,
     },
+}
+
+/// What an H.264 frame is decoded from here: the descriptor, read whole.
+pub(super) type H264Input = Arc<h264_slice::Picture>;
+
+/// Read the descriptor. Never `None`, as for HEVC: the slices are read when the frame is decoded,
+/// and a stream they cannot be described for is refused there.
+pub(super) fn h264_input(source: H264Source<'_>) -> Result<Option<H264Input>, String> {
+    let decoding = h264_slice::Decoding::read(source.descriptor);
+    Ok(Some(Arc::new(h264_slice::Picture { desc: source.desc, decoding })))
 }
 
 /// What an HEVC frame is decoded from here: the descriptor, read whole.
@@ -200,7 +210,7 @@ impl Backend for Host {
                 frame: frame.clone(),
                 refs: std::array::from_fn(|slot| resolve(frame.refs[slot])),
             },
-            Shape::H264 { picture, width, height, .. } => Params::H264 {
+            Shape::H264 { input: picture, width, height, .. } => Params::H264 {
                 picture: Arc::clone(picture),
                 dpb: picture.decoding.dpb.iter().map(|r| resolve(r.buffer)).collect(),
                 width: *width,
@@ -640,12 +650,20 @@ fn decode_h264(
     let reference_frames: [va::PictureH264; 16] = std::array::from_fn(|i| {
         if i < dec.dpb.len() { reference(i) } else { None }.unwrap_or_else(invalid)
     });
+    // A field picture names its own field, and VA-API takes the field from these flags: a
+    // bottom field described without `BOTTOM` is decoded as the top one. The other field's
+    // order count is not this picture's, and goes as zero.
+    let (field_flag, [top_poc, bottom_poc]) = match (desc.field_pic, dec.bottom_field) {
+        (false, _) => (0, dec.field_order_cnt),
+        (true, false) => (TOP, [dec.field_order_cnt[0], 0]),
+        (true, true) => (BOTTOM, [0, dec.field_order_cnt[1]]),
+    };
     let current = va::PictureH264::new(
         surface.id(),
         dec.frame_num,
-        if dec.is_reference { SHORT } else { 0 },
-        dec.field_order_cnt[0],
-        dec.field_order_cnt[1],
+        field_flag | if dec.is_reference { SHORT } else { 0 },
+        top_poc,
+        bottom_poc,
     );
 
     let mbs = |n: u32| n.div_ceil(16);
@@ -710,8 +728,20 @@ fn decode_h264(
     for slice in &slices {
         let h = &slice.header;
         let lists = h264_slice::ref_lists(h, dec, desc).map_err(Failure::H264)?;
-        let list =
-            |l: usize| lists[l].map(|entry| entry.and_then(reference).unwrap_or_else(invalid));
+        // A frame entry is the DPB's entry as it stands; a field entry names one field of it,
+        // with that field's flag and order count and not the other's.
+        let named = |entry: h264_slice::ListEntry| {
+            let Some(field) = entry.field else { return reference(entry.slot) };
+            let r = &dec.dpb[entry.slot];
+            let id = dpb_surfaces.get(entry.slot).copied().flatten()?;
+            let kind = if r.long_term { LONG } else { SHORT };
+            let (flag, [top, bottom]) = match field {
+                h264_slice::Parity::Top => (TOP, [r.field_order_cnt[0], 0]),
+                h264_slice::Parity::Bottom => (BOTTOM, [0, r.field_order_cnt[1]]),
+            };
+            Some(va::PictureH264::new(id, r.frame_idx, kind | flag, top, bottom))
+        };
+        let list = |l: usize| lists[l].map(|entry| entry.and_then(named).unwrap_or_else(invalid));
         let blank = h264_slice::ListWeights {
             luma_flag: false,
             luma_weight: [0; 32],

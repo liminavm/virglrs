@@ -421,37 +421,19 @@ impl Gate {
 /// bitstream and takes its extent from the codec -- and the three answers the rest of the frame
 /// needs are asked for by name rather than each caller knowing which codec it has.
 #[derive(Clone)]
-#[cfg_attr(
-    va,
-    expect(
-        dead_code,
-        reason = "VA-API is not handed parameter sets; they feed the session backend"
-    )
-)]
-#[cfg_attr(
-    not(va),
-    expect(dead_code, reason = "the parsed picture is VA-API's; the session backend takes sets")
-)]
 enum Shape {
     /// Boxed: the descriptor is read whole, for a backend that hands every field to the driver.
     Vp9(Box<vp9::Frame>),
-    /// H.264: the parameter sets the last descriptor was written into, and whether an IDR slice
-    /// has turned up in the access unit so far.
+    /// H.264: what the backend decodes the frame from (`backend::H264Input`) -- the parameter
+    /// sets the last descriptor was written into for a session, the descriptor read whole for
+    /// VA-API -- and whether an IDR slice has turned up in the access unit so far.
     ///
     /// The sets are kept rather than the descriptor they came from because they *are* the
     /// session's configuration -- keeping the descriptor would leave two places holding one
-    /// fact, and the one the session was built from would be the derived copy.
-    ///
-    /// `picture` is the descriptor itself, read whole, for a backend that is handed it field by
-    /// field rather than a bitstream. The sets are still written on every host: a stream they
-    /// cannot be written for is one outside the profiles advertised, and is refused alike.
-    H264 {
-        sets: h264::ParameterSets,
-        picture: Arc<h264_slice::Picture>,
-        key: bool,
-        width: u32,
-        height: u32,
-    },
+    /// fact, and the one the session was built from would be the derived copy. What the sets
+    /// cannot say -- field coding, slice groups -- is refused by the backend that needs them, not
+    /// by one that is handed the descriptor's fields.
+    H264 { input: backend::H264Input, key: bool, width: u32, height: u32 },
     /// HEVC: what the backend decodes the frame from (`backend::HevcInput`) -- the three
     /// parameter sets for a session, the descriptor read whole for VA-API. Key-ness comes from
     /// the descriptor rather than from the bitstream: `IDRPicFlag` and `RAPPicFlag` are on the
@@ -462,7 +444,14 @@ enum Shape {
     ///
     /// Boxed: the descriptor is a kilobyte, and every open frame would otherwise carry that much
     /// whatever its codec.
-    Av1 { desc: Box<av1::FrameDesc>, config: Vec<u8>, key: bool, width: u32, height: u32 },
+    Av1 {
+        desc: Box<av1::FrameDesc>,
+        #[cfg_attr(va, expect(dead_code, reason = "VA-API decodes AV1 in software, sessionless"))]
+        config: Vec<u8>,
+        key: bool,
+        width: u32,
+        height: u32,
+    },
 }
 
 impl Shape {
@@ -981,6 +970,20 @@ impl Locked<'_> {
             Locked::Software(picture) => picture.plane(index),
         }
     }
+}
+
+/// What an H.264 frame's backend input is built from: the descriptor, raw and read, and the
+/// frame's slices so far.
+struct H264Source<'a> {
+    #[cfg_attr(not(va), expect(dead_code, reason = "only VA-API reads the descriptor whole"))]
+    descriptor: &'a [u8],
+    desc: h264::PictureDesc,
+    #[cfg_attr(va, expect(dead_code, reason = "VA-API reads the slices when it decodes"))]
+    accumulated: &'a [u8],
+    #[cfg_attr(va, expect(dead_code, reason = "VA-API is handed the descriptor's fields"))]
+    extent: (u32, u32),
+    #[cfg_attr(va, expect(dead_code, reason = "VA-API is handed the descriptor's fields"))]
+    profile: h264::H264Profile,
 }
 
 /// What an HEVC frame's backend input is built from: the descriptor, raw and read, and the
@@ -2001,33 +2004,27 @@ impl Video {
                 *shape = Some(Shape::Vp9(Box::new(vp9::Frame::read(descriptor, width, height))));
             }
             Kind::H264(h264_profile) => {
-                let h264_profile = *h264_profile;
-                // Nothing on the wire says which `pic_parameter_set_id` the guest's slices
-                // reference, so it is read back out of them -- and until one arrives there is
-                // nothing to guess with: a PPS bearing an id the slices do not use is simply not
-                // found, and the frame decodes as nothing. A call that carried only a fragment
-                // leaves the shape alone and waits.
-                let Some(pps_id) = h264::slice_pps_id(accumulated) else {
-                    return Ok(());
+                let source = H264Source {
+                    descriptor,
+                    desc: h264::PictureDesc::read(descriptor),
+                    accumulated,
+                    extent: (width, height),
+                    profile: *h264_profile,
                 };
-                let desc = h264::PictureDesc::read(descriptor);
-                let sets = match desc.parameter_sets(width, height, h264_profile, pps_id) {
-                    Ok(sets) => sets,
-                    // A stream this build's serializer has no parameter set for. The guest chose
-                    // H.264 from a capset that advertises progressive 8-bit 4:2:0 only, so this
-                    // is a stream outside what it was offered -- but one bad frame is not one bad
-                    // context, and the next may be inside it again.
+                let input = match backend::h264_input(source) {
+                    Ok(Some(input)) => input,
+                    // Nothing to describe the frame with yet: this call carried only a fragment.
+                    Ok(None) => return Ok(()),
+                    // One bad frame is not one bad context, and the next may be served again.
                     Err(why) => {
-                        eprintln!("[virglrs] video codec {handle}: no H.264 parameter set ({why})");
+                        eprintln!("[virglrs] video codec {handle}: H.264 frame refused ({why})");
                         return Err(Refusal::HostRefusedFrame);
                     }
                 };
                 // Sticky across the calls that make up one access unit: an IDR seen in an earlier
                 // fragment is still an IDR in this frame.
                 let key = shape.as_ref().is_some_and(Shape::key) || h264::has_idr(accumulated);
-                let decoding = h264_slice::Decoding::read(descriptor);
-                let picture = Arc::new(h264_slice::Picture { desc, decoding });
-                *shape = Some(Shape::H264 { sets, picture, key, width, height });
+                *shape = Some(Shape::H264 { input, key, width, height });
             }
             Kind::Hevc { profile: hevc_profile, ref_pic_sets } => {
                 let desc = h265::PictureDesc::read(descriptor);
@@ -2403,16 +2400,14 @@ mod tests {
         assert_eq!(vp9.extent(), (320, 240));
         assert_eq!(vp9.access_unit(vec![1, 2, 3]), Some(vec![1, 2, 3]));
 
-        let h264 = Shape::H264 {
-            sets: h264::ParameterSets { sps: vec![0x67, 0x42], pps: vec![0x68, 0xce] },
-            picture: Arc::new(h264_slice::Picture {
-                desc: h264::PictureDesc::read(&[]),
-                decoding: h264_slice::Decoding::read(&[]),
-            }),
-            key: false,
-            width: 176,
-            height: 144,
-        };
+        #[cfg(not(va))]
+        let input = h264::ParameterSets { sps: vec![0x67, 0x42], pps: vec![0x68, 0xce] };
+        #[cfg(va)]
+        let input = Arc::new(h264_slice::Picture {
+            desc: h264::PictureDesc::read(&[]),
+            decoding: h264_slice::Decoding::read(&[]),
+        });
+        let h264 = Shape::H264 { input, key: false, width: 176, height: 144 };
         assert!(!h264.key());
         assert_eq!(h264.extent(), (176, 144));
         // Annex-B in, AVCC out for VideoToolbox: one four-byte length in place of the start

@@ -1231,7 +1231,8 @@ parameter set agrees with itself perfectly.
 [fluster](https://github.com/fluendo/fluster) closes that. It runs the standards bodies' own
 conformance vectors and checks each decoded stream against the **md5 the standards body
 published**, which is the only absolute oracle in this tree. `setup.sh` materializes it and the
-vectors host-side; `fluster.sh [c|rs|diff]` scores them; `diff` is the gate.
+vectors host-side; `fluster.sh [c|rs|diff]` scores them; `diff` is the gate, and on Linux `rs`
+against `fixtures/results.va.txt` is.
 
 It does not replace the differential, because absolute is not the same as achievable here. This
 host advertises HEVC Main and no Main10, and VP9 Profile 0 and nothing else, so streams fail for
@@ -1265,8 +1266,13 @@ of a VA element -- the same as a host with no video silicon. So the script asser
 rather than only that it loaded, and refuses a boot where QEMU says it could not initialise the
 renderer.
 
-**Measured on goiaba (Intel Ice Lake, RPM Fusion's iHD), rs leg: 485 of 587**: 275 of 305 VP9
-vectors, 78 of 135 H.264 (VideoToolbox passes 71) and 132 of 147 HEVC (VideoToolbox passes 12).
+With no C leg to diff against, the rs leg's own verdicts are the Linux pin: `fluster.sh rs` diffs
+them against `fixtures/results.va.txt`, and `rs --record` writes it. A vector that starts matching
+its md5 is re-recorded with the commit that made it; one that stops is a regression, unless the
+host's VA driver moved under it.
+
+**Measured on goiaba (Intel Ice Lake, RPM Fusion's iHD), rs leg: 537 of 587**: 275 of 305 VP9
+vectors, 130 of 135 H.264 (VideoToolbox passes 71) and 132 of 147 HEVC (VideoToolbox passes 12).
 
 HEVC's 15 failures are the 11 Main10 streams and the four `PICSIZE` streams, all of which the
 guest refuses before they reach the renderer: only Main is advertised. Armed: emptying every
@@ -1274,12 +1280,14 @@ slice's reference lists takes HEVC to 27. The four `SLIST` vectors and `VPSSPSPP
 ones that catch the scaling lists going to the driver in the order mesa's frontend stored
 them.
 
-H.264's failures are the field-coded and MBAFF streams, which are refused, as they are on
-macOS; the PAFF streams' frame pictures, whose references were refused field pictures; and the
-SP-slice and FMO streams, which the guest refuses before they reach the renderer. None is VA's
-alone. `BASQP1_Sony_C` is the vector that holds an emulation-prevention byte inside a slice
-header: it fails if the slice data offset is counted in raw bits rather than RBSP bits. Armed:
-emptying every slice's reference lists takes H.264 to 21, the intra-only streams.
+H.264's five failures are the SP-slice and FMO streams (`SP1_BT_A`, `sp2_bt_b`, `FM*`), which the
+guest refuses before they reach the renderer. The field-coded, PAFF and MBAFF streams decode:
+VA-API is handed the descriptor's fields and needs no parameter set, so only VideoToolbox, which
+does, refuses them. `BASQP1_Sony_C` is the vector that holds an emulation-prevention byte inside a
+slice header: it fails if the slice data offset is counted in raw bits rather than RBSP bits.
+Armed: emptying every slice's reference lists takes H.264 to 21, the intra-only streams; refusing
+field pictures' lists fails the field and PAFF streams and leaves MBAFF, whose pictures are
+frames, passing.
 
 VP9's every failure also fails on
 macOS's VideoToolbox: the `resize` vectors, `vp90-2-16-intra-only`, `vp90-2-22-svc_1280x720_3`, and

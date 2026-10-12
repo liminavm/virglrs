@@ -8,7 +8,7 @@
 //! declare for it, so everything here is in those terms: the unit is the re-framed access unit,
 //! and the session is keyed on the parameter sets the descriptors were turned back into.
 
-use super::{Backend, Delivery, HevcSource, Lookup, Shape, h265, pending};
+use super::{Backend, Delivery, H264Source, HevcSource, Lookup, Shape, h264, h265, pending};
 use crate::decode::{Configuration, Picture, PixelFormat, Session, SessionKey};
 use crate::vrend::proto::VideoCodecHandle;
 
@@ -40,6 +40,26 @@ pub(super) fn reframe(bitstream: Vec<u8>) -> Option<Vec<u8>> {
     super::h264::annexb_to_avcc(&bitstream)
 }
 
+/// What an H.264 frame is decoded from here: the two parameter sets the session is keyed on.
+pub(super) type H264Input = h264::ParameterSets;
+
+/// Write the frame's parameter sets, or `None` while no slice header has arrived to say which
+/// PPS the frame uses.
+///
+/// Nothing on the wire says which `pic_parameter_set_id` the guest's slices reference, so it is
+/// read back out of them -- and until one arrives there is nothing to guess with: a PPS bearing an
+/// id the slices do not use is simply not found, and the frame decodes as nothing. A stream the
+/// sets cannot be written for -- field coding, slice groups -- is refused.
+pub(super) fn h264_input(source: H264Source<'_>) -> Result<Option<H264Input>, String> {
+    let H264Source { desc, accumulated, extent: (width, height), profile, .. } = source;
+    let Some(pps_id) = h264::slice_pps_id(accumulated) else {
+        return Ok(None);
+    };
+    desc.parameter_sets(width, height, profile, pps_id)
+        .map(Some)
+        .map_err(|why| format!("no parameter set: {why}"))
+}
+
 /// What an HEVC frame is decoded from here: the three parameter sets the session is keyed on.
 pub(super) type HevcInput = h265::ParameterSets;
 
@@ -69,7 +89,9 @@ impl Shape {
             Shape::Vp9(frame) => {
                 Configuration::vp9(frame.profile, frame.bit_depth, frame.subsampling())
             }
-            Shape::H264 { sets, .. } => Configuration::h264(sets.sps.clone(), sets.pps.clone()),
+            Shape::H264 { input: sets, .. } => {
+                Configuration::h264(sets.sps.clone(), sets.pps.clone())
+            }
             Shape::Hevc { input: sets, .. } => {
                 Configuration::hevc(sets.vps.clone(), sets.sps.clone(), sets.pps.clone())
             }

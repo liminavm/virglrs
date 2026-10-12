@@ -204,6 +204,8 @@ pub struct SliceHeader {
     pub slice_type: SliceType,
     pub frame_num: u32,
     pub field_pic: bool,
+    /// Which field a field picture is; false for a frame.
+    pub bottom_field: bool,
     pub direct_spatial_mv_pred: bool,
     pub num_ref_idx_active_minus1: [u8; 2],
     pub modifications: [Vec<Modification>; 2],
@@ -286,11 +288,11 @@ fn read_header(nal: &[u8], desc: &PictureDesc) -> Result<SliceHeader, Refused> {
         read!(r.u(2), "colour_plane_id");
     }
     let frame_num = read!(r.u(u32::from(desc.log2_max_frame_num_minus4) + 4), "frame_num");
-    let mut field_pic = false;
+    let (mut field_pic, mut bottom_field) = (false, false);
     if !desc.frame_mbs_only {
         field_pic = read!(r.u(1), "field_pic_flag") != 0;
         if field_pic {
-            read!(r.u(1), "bottom_field_flag");
+            bottom_field = read!(r.u(1), "bottom_field_flag") != 0;
         }
     }
     if idr {
@@ -395,6 +397,7 @@ fn read_header(nal: &[u8], desc: &PictureDesc) -> Result<SliceHeader, Refused> {
         slice_type,
         frame_num,
         field_pic,
+        bottom_field,
         direct_spatial_mv_pred,
         num_ref_idx_active_minus1: active,
         modifications,
@@ -490,68 +493,190 @@ fn skip_dec_ref_pic_marking(r: &mut Reader<'_>, idr: bool) -> Result<(), Refused
     Err(Refused::OutOfRange("the number of memory management operations"))
 }
 
-/// The two reference lists for one slice of a frame picture, as indices into the DPB: the
-/// initial lists of 8.2.4.2, cut to the slice's active counts, then modified as 8.2.4.3 says.
+/// A field of a reference frame: which one a field picture's list names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parity {
+    Top,
+    Bottom,
+}
+
+impl Parity {
+    fn other(self) -> Parity {
+        match self {
+            Parity::Top => Parity::Bottom,
+            Parity::Bottom => Parity::Top,
+        }
+    }
+}
+
+/// One entry of a reference list: a DPB slot, and for a field picture which of its fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListEntry {
+    pub slot: usize,
+    /// `None` for a frame picture's entry, which names both fields.
+    pub field: Option<Parity>,
+}
+
+impl Reference {
+    /// Whether this entry's field of `parity` is a reference.
+    fn has(&self, parity: Parity) -> bool {
+        match parity {
+            Parity::Top => self.top,
+            Parity::Bottom => self.bottom,
+        }
+    }
+
+    /// A field picture's order count for an entry: the lesser of its fields that are references
+    /// (8.2.4.2.4), since a field that is not one is not in the list.
+    fn field_poc(&self) -> i32 {
+        match (self.top, self.bottom) {
+            (true, false) => self.field_order_cnt[0],
+            (false, true) => self.field_order_cnt[1],
+            _ => self.poc(),
+        }
+    }
+}
+
+/// Split a list of reference frames into fields, alternating parity starting with `first`
+/// (8.2.4.2.5). A frame contributes a field only if that field is a reference; when one parity
+/// runs out, the other's remaining fields follow in the frames' order.
+fn alternate(frames: &[usize], dpb: &[Reference], first: Parity) -> Vec<ListEntry> {
+    let of = |parity: Parity| -> Vec<ListEntry> {
+        frames
+            .iter()
+            .filter(|&&i| dpb[i].has(parity))
+            .map(|&slot| ListEntry { slot, field: Some(parity) })
+            .collect()
+    };
+    let (same, other) = (of(first), of(first.other()));
+    let mut out = Vec::with_capacity(same.len() + other.len());
+    let (mut a, mut b) = (same.into_iter(), other.into_iter());
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return out,
+            (x, y) => out.extend(x.into_iter().chain(y)),
+        }
+    }
+}
+
+/// The two reference lists for one slice, as DPB entries: the initial lists of 8.2.4.2, cut to
+/// the slice's active counts, then modified as 8.2.4.3 says. A frame picture's lists name frames;
+/// a field picture's name fields, numbered and ordered as 8.2.4.2.2, 8.2.4.2.4 and 8.2.4.2.5 say.
 /// `None` is an entry with no reference picture.
 pub fn ref_lists(
     header: &SliceHeader,
     decoding: &Decoding,
     desc: &PictureDesc,
-) -> Result<[[Option<usize>; 32]; 2], Refused> {
-    if header.field_pic {
-        return Err(Refused::Unsupported("field pictures"));
-    }
+) -> Result<[[Option<ListEntry>; 32]; 2], Refused> {
     let max_frame_num = 1i64 << (u32::from(desc.log2_max_frame_num_minus4) + 4);
     let curr = i64::from(header.frame_num);
     // FrameNumWrap (8-27), which is PicNum for a frame.
-    let pic_num = |r: &Reference| {
+    let frame_num_wrap = |r: &Reference| {
         let n = i64::from(r.frame_idx);
         if n > curr { n - max_frame_num } else { n }
     };
     let dpb = &decoding.dpb;
-    let usable = |i: &usize| dpb[*i].is_frame();
+    let field =
+        header.field_pic.then_some(if header.bottom_field { Parity::Bottom } else { Parity::Top });
+    // A frame picture predicts from frames, both of whose fields are references; a field
+    // picture from any entry with a field that is one.
+    let usable = |i: &usize| match field {
+        None => dpb[*i].is_frame(),
+        Some(_) => dpb[*i].top || dpb[*i].bottom,
+    };
     let mut short: Vec<usize> =
         (0..dpb.len()).filter(usable).filter(|&i| !dpb[i].long_term).collect();
     let mut long: Vec<usize> =
         (0..dpb.len()).filter(usable).filter(|&i| dpb[i].long_term).collect();
     long.sort_by_key(|&i| dpb[i].frame_idx);
 
-    let initial: [Vec<usize>; 2] = match header.slice_type {
+    // The frame-ordered lists of 8.2.4.2.1 to .4: short-term then long-term for frames, the two
+    // kept apart for fields so each can be split into fields on its own.
+    let (short_lists, lists): ([Vec<usize>; 2], usize) = match header.slice_type {
         SliceType::P | SliceType::Sp => {
-            short.sort_by_key(|&i| std::cmp::Reverse(pic_num(&dpb[i])));
-            [short.into_iter().chain(long.iter().copied()).collect(), Vec::new()]
+            short.sort_by_key(|&i| std::cmp::Reverse(frame_num_wrap(&dpb[i])));
+            ([short, Vec::new()], 1)
         }
         SliceType::B => {
-            let poc = decoding.field_order_cnt[0].min(decoding.field_order_cnt[1]);
-            let mut before: Vec<usize> =
-                short.iter().copied().filter(|&i| dpb[i].poc() < poc).collect();
+            let (poc_of, poc): (fn(&Reference) -> i32, i32) = match field {
+                None => {
+                    (Reference::poc, decoding.field_order_cnt[0].min(decoding.field_order_cnt[1]))
+                }
+                Some(p) => (Reference::field_poc, decoding.field_order_cnt[p as usize]),
+            };
+            // A frame list takes what is strictly before the current picture first; a field
+            // list what is at or before it, since the other field of the current frame may share
+            // its order count.
+            let before_current = |i: &usize| match field {
+                None => poc_of(&dpb[*i]) < poc,
+                Some(_) => poc_of(&dpb[*i]) <= poc,
+            };
+            let mut before: Vec<usize> = short.iter().copied().filter(before_current).collect();
             let mut after: Vec<usize> =
-                short.iter().copied().filter(|&i| dpb[i].poc() > poc).collect();
-            before.sort_by_key(|&i| std::cmp::Reverse(dpb[i].poc()));
-            after.sort_by_key(|&i| dpb[i].poc());
-            let l0: Vec<usize> = before.iter().chain(&after).chain(&long).copied().collect();
-            let mut l1: Vec<usize> = after.iter().chain(&before).chain(&long).copied().collect();
-            if l1.len() > 1 && l1 == l0 {
-                l1.swap(0, 1);
+                short.iter().copied().filter(|i| !before_current(i)).collect();
+            if field.is_none() {
+                // A frame at the current POC is neither before nor after it.
+                after.retain(|&i| poc_of(&dpb[i]) > poc);
             }
-            [l0, l1]
+            before.sort_by_key(|&i| std::cmp::Reverse(poc_of(&dpb[i])));
+            after.sort_by_key(|&i| poc_of(&dpb[i]));
+            let l0 = before.iter().chain(&after).copied().collect();
+            let l1 = after.iter().chain(&before).copied().collect();
+            ([l0, l1], 2)
         }
-        SliceType::I | SliceType::Si => [Vec::new(), Vec::new()],
+        SliceType::I | SliceType::Si => ([Vec::new(), Vec::new()], 0),
     };
+    let mut initial: [Vec<ListEntry>; 2] = [Vec::new(), Vec::new()];
+    for (list, frames) in short_lists.iter().enumerate().take(lists) {
+        initial[list] = match field {
+            None => {
+                frames.iter().chain(&long).map(|&slot| ListEntry { slot, field: None }).collect()
+            }
+            Some(p) => {
+                let mut fields = alternate(frames, dpb, p);
+                fields.extend(alternate(&long, dpb, p));
+                fields
+            }
+        };
+    }
+    if lists == 2 && initial[1].len() > 1 && initial[1] == initial[0] {
+        initial[1].swap(0, 1);
+    }
+
+    // 8.2.4.3.1 and .2: a frame's PicNum is its FrameNumWrap; a field's is twice that, plus
+    // one for the current field's own parity -- and the same for long-term numbers.
+    let (max_pic_num, curr_pic_num) = match field {
+        None => (max_frame_num, curr),
+        Some(_) => (2 * max_frame_num, 2 * curr + 1),
+    };
+    let pic_num = |e: &ListEntry, base: i64| match (field, e.field) {
+        (Some(current), Some(f)) => 2 * base + i64::from(f == current),
+        _ => base,
+    };
+    let entries_of = |long_term: bool| -> Vec<ListEntry> {
+        (0..dpb.len())
+            .filter(usable)
+            .filter(|&i| dpb[i].long_term == long_term)
+            .flat_map(|slot| match field {
+                None => vec![ListEntry { slot, field: None }],
+                Some(_) => [Parity::Top, Parity::Bottom]
+                    .into_iter()
+                    .filter(|&f| dpb[slot].has(f))
+                    .map(|f| ListEntry { slot, field: Some(f) })
+                    .collect(),
+            })
+            .collect()
+    };
+    let (short_entries, long_entries) = (entries_of(false), entries_of(true));
 
     let mut out = [[None; 32]; 2];
-    let lists = match header.slice_type {
-        SliceType::B => 2,
-        SliceType::P | SliceType::Sp => 1,
-        SliceType::I | SliceType::Si => 0,
-    };
     for list in 0..lists {
         let n = usize::from(header.num_ref_idx_active_minus1[list]) + 1;
         // One longer than the list while it is modified (8.2.4.3.1), then cut back.
-        let mut entries: Vec<Option<usize>> =
+        let mut entries: Vec<Option<ListEntry>> =
             (0..=n).map(|i| initial[list].get(i).copied()).collect();
         entries[n] = None;
-        let mut pred = curr;
+        let mut pred = curr_pic_num;
         for (ref_idx, m) in header.modifications[list].iter().enumerate() {
             if ref_idx >= n {
                 return Err(Refused::OutOfRange("the number of list modifications"));
@@ -565,17 +690,22 @@ pub fn ref_lists(
                         pred + delta
                     };
                     if no_wrap < 0 {
-                        no_wrap += max_frame_num;
-                    } else if no_wrap >= max_frame_num {
-                        no_wrap -= max_frame_num;
+                        no_wrap += max_pic_num;
+                    } else if no_wrap >= max_pic_num {
+                        no_wrap -= max_pic_num;
                     }
                     pred = no_wrap;
-                    let wanted = if no_wrap > curr { no_wrap - max_frame_num } else { no_wrap };
-                    (0..dpb.len())
-                        .find(|&i| usable(&i) && !dpb[i].long_term && pic_num(&dpb[i]) == wanted)
+                    let wanted =
+                        if no_wrap > curr_pic_num { no_wrap - max_pic_num } else { no_wrap };
+                    short_entries
+                        .iter()
+                        .find(|e| pic_num(e, frame_num_wrap(&dpb[e.slot])) == wanted)
+                        .copied()
                 }
-                Modification::LongTerm(num) => (0..dpb.len())
-                    .find(|&i| usable(&i) && dpb[i].long_term && dpb[i].frame_idx == num),
+                Modification::LongTerm(num) => long_entries
+                    .iter()
+                    .find(|e| pic_num(e, i64::from(dpb[e.slot].frame_idx)) == i64::from(num))
+                    .copied(),
             }
             .ok_or(Refused::NoSuchReference)?;
             entries.insert(ref_idx, Some(target));
@@ -622,6 +752,7 @@ mod tests {
             slice_type,
             frame_num,
             field_pic: false,
+            bottom_field: false,
             direct_spatial_mv_pred: false,
             num_ref_idx_active_minus1: active,
             modifications: [Vec::new(), Vec::new()],
@@ -639,6 +770,11 @@ mod tests {
         PictureDesc::read(&[])
     }
 
+    /// A frame entry of a frame picture's list.
+    fn f(slot: usize) -> Option<ListEntry> {
+        Some(ListEntry { slot, field: None })
+    }
+
     /// 8.2.4.2.1: a P slice's list is the short-term frames by descending PicNum -- frame_num
     /// wrapped below the current one -- then the long-term ones by ascending LongTermPicNum.
     #[test]
@@ -654,7 +790,7 @@ mod tests {
         ];
         let lists =
             ref_lists(&header(SliceType::P, 2, [4, 0]), &decoding(0, dpb), &desc()).unwrap();
-        assert_eq!(&lists[0][..6], &[Some(0), Some(2), Some(1), Some(4), Some(3), None]);
+        assert_eq!(&lists[0][..6], &[f(0), f(2), f(1), f(4), f(3), None]);
         assert!(lists[1].iter().all(Option::is_none));
     }
 
@@ -665,14 +801,14 @@ mod tests {
         let dpb = vec![frame(1, 0, 0, false), frame(2, 1, 8, false), frame(3, 2, 4, false)];
         let lists = ref_lists(&header(SliceType::B, 3, [2, 2]), &decoding(6, dpb.clone()), &desc())
             .unwrap();
-        assert_eq!(&lists[0][..3], &[Some(2), Some(0), Some(1)]);
-        assert_eq!(&lists[1][..3], &[Some(1), Some(2), Some(0)]);
+        assert_eq!(&lists[0][..3], &[f(2), f(0), f(1)]);
+        assert_eq!(&lists[1][..3], &[f(1), f(2), f(0)]);
 
         // Everything before the current picture: the lists come out equal, and list 1 swaps.
         let lists =
             ref_lists(&header(SliceType::B, 3, [1, 1]), &decoding(10, dpb), &desc()).unwrap();
-        assert_eq!(&lists[0][..2], &[Some(1), Some(2)]);
-        assert_eq!(&lists[1][..2], &[Some(2), Some(1)]);
+        assert_eq!(&lists[0][..2], &[f(1), f(2)]);
+        assert_eq!(&lists[1][..2], &[f(2), f(1)]);
     }
 
     /// 8.2.4.3.1: a modification moves the named picture to the front and removes its later
@@ -684,10 +820,100 @@ mod tests {
         // 4 - (2 + 1) = 1: frame_num 1 first. Then 1 + (0 + 1) = 2: frame_num 2 second.
         h.modifications[0] = vec![Modification::Subtract(2), Modification::Add(0)];
         let lists = ref_lists(&h, &decoding(0, dpb.clone()), &desc()).unwrap();
-        assert_eq!(&lists[0][..3], &[Some(2), Some(1), Some(0)]);
+        assert_eq!(&lists[0][..3], &[f(2), f(1), f(0)]);
 
         h.modifications[0] = vec![Modification::Subtract(9)];
         assert_eq!(ref_lists(&h, &decoding(0, dpb), &desc()), Err(Refused::NoSuchReference));
+    }
+
+    /// A reference with only some of its fields marked, for field-picture lists.
+    fn fields(
+        slot_frame_idx: u32,
+        top: bool,
+        bottom: bool,
+        poc: [i32; 2],
+        long: bool,
+    ) -> Reference {
+        Reference {
+            buffer: 0,
+            frame_idx: slot_frame_idx,
+            long_term: long,
+            top,
+            bottom,
+            field_order_cnt: poc,
+        }
+    }
+
+    fn top(slot: usize) -> Option<ListEntry> {
+        Some(ListEntry { slot, field: Some(Parity::Top) })
+    }
+
+    fn bottom(slot: usize) -> Option<ListEntry> {
+        Some(ListEntry { slot, field: Some(Parity::Bottom) })
+    }
+
+    fn field_header(
+        slice_type: SliceType,
+        frame_num: u32,
+        bottom: bool,
+        active: [u8; 2],
+    ) -> SliceHeader {
+        let mut h = header(slice_type, frame_num, active);
+        h.field_pic = true;
+        h.bottom_field = bottom;
+        h
+    }
+
+    /// 8.2.4.2.2 and 8.2.4.2.5: a P field's list takes the short-term frames by descending
+    /// FrameNumWrap and splits them into fields, alternating parity from the current field's own
+    /// and skipping a field that is not a reference; the long-term frames follow, split the same.
+    /// Then 8.2.4.3: a field's PicNum is twice its FrameNumWrap, plus one for the current
+    /// parity, against a CurrPicNum of twice frame_num plus one.
+    #[test]
+    fn a_p_field_list_alternates_parity_and_numbers_fields() {
+        let dpb = vec![
+            fields(2, true, true, [0, 1], false),
+            fields(1, true, false, [0, 0], false),
+            fields(0, false, true, [0, 0], false),
+            fields(0, true, true, [0, 1], true),
+        ];
+        let d = decoding(0, dpb);
+        let lists = ref_lists(&field_header(SliceType::P, 3, false, [5, 0]), &d, &desc()).unwrap();
+        assert_eq!(
+            &lists[0][..7],
+            &[top(0), bottom(0), top(1), bottom(2), top(3), bottom(3), None]
+        );
+
+        // CurrPicNum 7. 7 - 4 = 3 is frame 1's top field (2 * 1 + 1); 3 + 1 = 4 is frame 2's
+        // bottom field (2 * 2, the other parity).
+        let mut h = field_header(SliceType::P, 3, false, [3, 0]);
+        h.modifications[0] = vec![Modification::Subtract(3), Modification::Add(0)];
+        let lists = ref_lists(&h, &d, &desc()).unwrap();
+        assert_eq!(&lists[0][..4], &[top(1), bottom(0), top(0), bottom(2)]);
+
+        // LongTermPicNum 0 is the other parity's field of long-term frame index 0.
+        h.modifications[0] = vec![Modification::LongTerm(0)];
+        let lists = ref_lists(&h, &d, &desc()).unwrap();
+        assert_eq!(&lists[0][..4], &[bottom(3), top(0), bottom(0), top(1)]);
+    }
+
+    /// 8.2.4.2.4: a B field orders the frames by the order count of their reference fields
+    /// around the current field's own -- at or before it first for list 0, after it first for
+    /// list 1 -- and then splits each list into fields, alternating parity from its own. The
+    /// first field of the current frame is in the DPB, with only that field a reference.
+    #[test]
+    fn b_field_lists_order_around_the_current_fields_poc() {
+        let dpb = vec![
+            fields(0, true, true, [4, 5], false),
+            fields(2, true, true, [12, 13], false),
+            fields(3, true, false, [8, 0], false),
+        ];
+        let mut d = decoding(0, dpb);
+        d.field_order_cnt = [8, 9];
+        let h = field_header(SliceType::B, 3, true, [4, 4]);
+        let lists = ref_lists(&h, &d, &desc()).unwrap();
+        assert_eq!(&lists[0][..5], &[bottom(0), top(2), bottom(1), top(0), top(1)]);
+        assert_eq!(&lists[1][..5], &[bottom(1), top(1), bottom(0), top(2), top(0)]);
     }
 
     /// The header reader stops where slice data starts, and says where in RBSP bits.
