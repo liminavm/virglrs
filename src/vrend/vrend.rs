@@ -9000,9 +9000,11 @@ mod tests {
     /// names when the draw runs -- not the storage it was made over, and not what the unit had
     /// bound before. Here the texture under the handle is freed and made again between two draws,
     /// in each of two sub-contexts, with the views left bound: a private view (its swizzle exchanges
-    /// red and blue) and a shared one. Every draw after the swap reads the new texel through
-    /// both, the private view still swizzled. A view object minted over the old storage, or a
-    /// unit left holding the old name, reads the old texel or nothing.
+    /// red and blue) and a second view, shared or with a private object of its own. Every draw
+    /// after the swap reads the new texel through both, the private view still swizzled. A view
+    /// object minted over the old storage, or a unit left holding the old name, reads the old
+    /// texel or nothing -- and so does the first unit when minting the second view's object in
+    /// the same draw unbinds it.
     #[test]
     fn a_bound_view_samples_the_storage_its_handle_names_at_the_draw() {
         use crate::vrend::pipe::{CompareFunc, MipFilter, Swizzle, TexFilter, TexWrap};
@@ -9073,7 +9075,14 @@ mod tests {
         });
         let fs = ShaderStage::Fragment;
         let mut viewed = 0;
-        for host_gl in [HostGl::Gles, HostGl::Desktop] {
+        // The second view's swizzle reads the same texel either way: the identity shares the
+        // texture's object, and an alpha of one -- which the texel has -- needs one of its own.
+        let second = [
+            [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+            [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::One],
+        ];
+        let runs = [HostGl::Gles, HostGl::Desktop].into_iter().flat_map(|g| second.map(|s| (g, s)));
+        for (host_gl, second) in runs {
             viewed += usize::from(host_has(host_gl, Feature::texture_view));
             let seen = std::cell::RefCell::new(Vec::new());
             let more = More {
@@ -9084,10 +9093,7 @@ mod tests {
                         handle: o(20),
                         object: view([Swizzle::Z, Swizzle::Y, Swizzle::X, Swizzle::W]),
                     },
-                    Command::CreateObject {
-                        handle: o(21),
-                        object: view([Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W]),
-                    },
+                    Command::CreateObject { handle: o(21), object: view(second) },
                     Command::CreateObject { handle: o(22), object: state.clone() },
                     Command::SetSamplerViews {
                         stage: fs,
@@ -9134,14 +9140,15 @@ mod tests {
                 let before = half(&seen.borrow(), sub);
                 assert!(
                     before.iter().all(|p| *p == drawn(old)),
-                    "{host_gl:?}: sub-context {sub} reads the first texture before the swap: {:?}",
+                    "{host_gl:?}, second view {second:?}: sub-context {sub} reads the first \
+                     texture before the swap: {:?}",
                     before[0]
                 );
                 let after = half(&pixels, sub);
                 assert!(
                     after.iter().all(|p| *p == drawn(new)),
-                    "{host_gl:?}: sub-context {sub} reads the texture its handle names now, \
-                     {:?}: {:?}",
+                    "{host_gl:?}, second view {second:?}: sub-context {sub} reads the texture \
+                     its handle names now, {:?}: {:?}",
                     drawn(new),
                     after[0]
                 );

@@ -1611,7 +1611,6 @@ impl Context {
         mut next_sampler_id: TextureUnit,
     ) -> TextureUnit {
         let gl = host.gl;
-        let max_units = host.limits.max_texture_units;
         let s = stage.index();
         // Borrowed, never cloned. The loop below only reads this sub-context -- its views, its
         // objects, its samplers -- and mutates nothing, so the program's location tables can stay
@@ -1667,7 +1666,7 @@ impl Context {
                 // A key that has no object over this storage samples nothing; `View::sampled`
                 // said why when it was first asked.
                 let name = view
-                    .sampled(gl, host.features, host.formats, res, shadow)
+                    .sampled(gl, host.features, host.formats, res, shadow, host.scratch_unit())
                     .ok()
                     .map(|name| name.unwrap_or(t.name));
                 Some((t, name))
@@ -1791,7 +1790,7 @@ impl Context {
             }
         }
         // A later glBindTexture for another reason must not disturb the units just bound.
-        gl.active_texture(TextureUnit::at(max_units.saturating_sub(1)));
+        gl.active_texture(host.scratch_unit());
         next_sampler_id
     }
 

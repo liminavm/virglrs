@@ -169,6 +169,13 @@ fn whole_source(src: &PixelSource<'_>) -> Option<Vec<u8>> {
 }
 
 impl Host<'_> {
+    /// The texture unit nothing samples through: the last one. A draw leaves it active once its
+    /// units are bound, and whatever binds a texture for its own purposes does it here, so that
+    /// a unit a draw bound is not disturbed.
+    pub fn scratch_unit(&self) -> TextureUnit {
+        TextureUnit::at(self.limits.max_texture_units.saturating_sub(1))
+    }
+
     fn make_current(&mut self, sub: SubContextId, gl_ctx: &egl::Context) {
         self.current
             .switch_to(self.winsys, gl_ctx, GlContext::Sub(self.ctx, sub))
@@ -652,7 +659,8 @@ impl View {
     /// The object this view samples `res` through, `res` being whatever its handle names now:
     /// `Ok(None)` for the texture itself, or for storage that is not a texture. `identity` asks
     /// for the object without the view's swizzle, which is what a shadow sampler reads -- the
-    /// swizzle becomes a mask and an add in the shader instead.
+    /// swizzle becomes a mask and an add in the shader instead. An object minted here is minted on
+    /// `scratch` (see `mint_sampler`), which is left the active unit.
     pub fn sampled(
         &self,
         gl: &Gl,
@@ -660,6 +668,7 @@ impl View {
         formats: &Table,
         res: &Resource,
         identity: bool,
+        scratch: TextureUnit,
     ) -> Result<Option<TextureName>, Unviewable> {
         let (Some(mut key), Storage::Texture(t)) = (self.key, &res.storage) else {
             return Ok(None);
@@ -668,7 +677,8 @@ impl View {
             key.swizzle = IDENTITY_SWIZZLE;
         }
         t.sampler(key, || {
-            let minted = mint_sampler(gl, features, formats, res, self.resource, key, false);
+            let minted =
+                mint_sampler(gl, features, formats, res, self.resource, key, scratch, false);
             // The create minted this key over the storage the handle named then, so a key that
             // misfits now is one over storage made since under the same handle. Said once: the
             // answer is kept, as the object would have been.
@@ -3036,6 +3046,7 @@ impl Context {
         let gl = host.gl;
         // `LIMINA_GL_TRACE`: see `mint_sampler`.
         let gl_trace = host.traces.gl;
+        let scratch = host.scratch_unit();
         let features = host.features;
         let formats = host.formats;
         let res = host.resource(cmd, v.resource)?;
@@ -3146,7 +3157,9 @@ impl Context {
             // fault on the command that asked for it.
             let texture = res.texture().expect("a view of a texture is a view of its storage");
             texture
-                .sampler(k, || mint_sampler(gl, features, formats, res, v.resource, k, gl_trace))
+                .sampler(k, || {
+                    mint_sampler(gl, features, formats, res, v.resource, k, scratch, gl_trace)
+                })
                 .map_err(|why| match why {
                     Unviewable::Range => {
                         Fault::OutOfRange { cmd, what: "sampler view layers or levels" }
@@ -3378,10 +3391,15 @@ fn view_route(n: ViewNeed) -> Route {
 /// The object a sampler view with `key` samples `res` through, which is its texture's storage:
 /// `Ok(None)` for the texture itself. Run once per key and texture, by [`resource::Texture::sampler`].
 ///
+/// Minting binds the new object to make it, so it is done on `scratch`, the unit nothing samples
+/// through ([`Host::scratch_unit`]), which is left active: a draw mints while it binds its units,
+/// and minting on the unit it bound last would leave that unit sampling nothing.
+///
 /// `trace` is `LIMINA_GL_TRACE`, and names which call in here left a GL error, which the fault
 /// cannot: the check that poisons runs once the whole command is done, so it knows the command and
 /// not the call. NOTE that draining here CONSUMES the error, so a traced run does not poison on it
 /// -- the trace is for finding the call, never for deciding whether there was one.
+#[allow(clippy::too_many_arguments)]
 fn mint_sampler(
     gl: &Gl,
     features: &Features,
@@ -3389,8 +3407,10 @@ fn mint_sampler(
     res: &Resource,
     handle: ResourceHandle,
     key: SamplerKey,
+    scratch: TextureUnit,
     trace: bool,
 ) -> Result<Option<TextureName>, Unviewable> {
+    gl.active_texture(scratch);
     let probe = |what: &str| {
         if trace {
             let e = gl.drain_errors();
@@ -4311,10 +4331,12 @@ impl Context {
             }
             let key_changed = bits_at(sub, slot) != view.key_bits();
             let (gl, features, formats) = (host.gl, host.features, host.formats);
+            let scratch = host.scratch_unit();
             let mut buffer_view = false;
             let res = host.resource_mut(cmd, view.resource)?;
             // A view sharing the texture's object is answered the texture itself.
-            let shares = matches!(view.sampled(gl, features, formats, res, false), Ok(None));
+            let shares =
+                matches!(view.sampled(gl, features, formats, res, false, scratch), Ok(None));
             match (&mut res.storage, &view.span) {
                 (Storage::Texture(t), Span::Levels { .. }) if shares => view.share(gl, features, t),
                 (Storage::Texture(_), Span::Levels { .. }) => {}
