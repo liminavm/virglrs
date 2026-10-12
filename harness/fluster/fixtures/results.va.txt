@@ -549,7 +549,7 @@ VP9-TEST-VECTORS GStreamer-VP9-VA vp90-2-14-resize-fp-tiles-8-2.webm Success
 VP9-TEST-VECTORS GStreamer-VP9-VA vp90-2-14-resize-fp-tiles-8-4.webm Success
 VP9-TEST-VECTORS GStreamer-VP9-VA vp90-2-15-segkey.webm Success
 VP9-TEST-VECTORS GStreamer-VP9-VA vp90-2-15-segkey_adpq.webm Success
-VP9-TEST-VECTORS GStreamer-VP9-VA vp90-2-16-intra-only.webm Fail
+VP9-TEST-VECTORS GStreamer-VP9-VA vp90-2-16-intra-only.webm Success
 VP9-TEST-VECTORS GStreamer-VP9-VA vp90-2-17-show-existing-frame.webm Success
 VP9-TEST-VECTORS GStreamer-VP9-VA vp90-2-18-resize.ivf Fail
 VP9-TEST-VECTORS GStreamer-VP9-VA vp90-2-19-skip-01.webm Success

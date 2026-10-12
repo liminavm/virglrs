@@ -1271,7 +1271,7 @@ them against `fixtures/results.va.txt`, and `rs --record` writes it. A vector th
 its md5 is re-recorded with the commit that made it; one that stops is a regression, unless the
 host's VA driver moved under it.
 
-**Measured on goiaba (Intel Ice Lake, RPM Fusion's iHD), rs leg: 537 of 587**: 275 of 305 VP9
+**Measured on goiaba (Intel Ice Lake, RPM Fusion's iHD), rs leg: 538 of 587**: 276 of 305 VP9
 vectors, 130 of 135 H.264 (VideoToolbox passes 71) and 132 of 147 HEVC (VideoToolbox passes 12).
 
 HEVC's 15 failures are the 11 Main10 streams and the four `PICSIZE` streams, all of which the
@@ -1296,9 +1296,12 @@ field pictures' lists fails the field and PAFF streams and leaves MBAFF, whose p
 frames, passing.
 
 VP9's every failure also fails on
-macOS's VideoToolbox: the `resize` vectors, `vp90-2-16-intra-only`, `vp90-2-22-svc_1280x720_3`, and
+macOS's VideoToolbox: the `resize` vectors, `vp90-2-22-svc_1280x720_3`, and
 the profile-1 4:2:2 and 4:4:4 streams nobody advertises. The 8- to 66-pixel `vp90-2-02-size-*`
-family and the odd `vp90-2-11-size-*` that VideoToolbox fails decode here. Armed: handing the
+family and the odd `vp90-2-11-size-*` that VideoToolbox fails decode here, and so does
+`vp90-2-16-intra-only`, which opens with intra-only frames: the gate that drops frames until a
+codec has references admits a VP9 frame that predicts from nothing or only from targets decoded
+since. Armed: handing the
 driver an empty slot for every reference takes it to 1/305.
 
 `-t 120` rather than fluster's default 30 seconds, because a `Timeout` is a verdict about the

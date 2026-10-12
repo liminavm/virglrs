@@ -37,7 +37,7 @@ use vaapi as backend;
 
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::egl::{Importer, Winsys};
 use super::features::{Feature, Features};
@@ -321,7 +321,6 @@ pub struct Identity(());
 pub struct Buffer {
     /// The create that made this target, kept so a rebuild can make it again. See [`Codec`].
     retained: Retained,
-    #[cfg_attr(not(va), expect(dead_code, reason = "only VA-API keeps storage per target"))]
     identity: Arc<Identity>,
     pub format: Layout,
     pub width: u32,
@@ -363,6 +362,11 @@ impl Buffer {
 /// snapshot restore, where the guest keeps sending inter frames and every one of them has to be
 /// dropped until the stream's next key frame.
 ///
+/// What the gate drops is a frame that predicts from a picture this codec does not have, and VP9
+/// says per frame what that is. An intra-only frame predicts from nothing, and a stream may open
+/// with them (fluster's `vp90-2-16-intra-only`), so it decodes, as does an inter frame whose three
+/// references all name targets decoded since. The other codecs are gated on key-ness alone.
+///
 /// The three things the C keeps separately -- a flag, a count and a frozen target -- are one
 /// value here because they only mean anything together: a drop count is noise while seeded, and
 /// a freeze source outliving the wait is a picture nothing will ever copy again.
@@ -382,15 +386,48 @@ enum Gate {
         /// something has to go and clear -- which is exactly what the C's file-scope table of
         /// live codecs exists to do.
         freeze: Option<Arc<Buffer>>,
+        /// The targets decoded into while waiting, by frames that predict from nothing or only
+        /// from such targets. A frame predicting only from these decodes; a target destroyed
+        /// since no longer upgrades, and one a later frame was dropped into is taken out.
+        decoded: Vec<Weak<Identity>>,
     },
 }
 
+/// What a frame predicts from, as far as the gate is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prediction {
+    /// A key frame: predicts from nothing, and re-seeds every reference.
+    Reseeds,
+    /// Predicts from nothing, and re-seeds only what it refreshes: a VP9 intra-only frame.
+    Nothing,
+    /// Predicts from the targets these handles name: a VP9 inter frame's three references.
+    From([u32; 3]),
+    /// Predicts from references the gate cannot name.
+    Unknown,
+}
+
 impl Gate {
-    /// Whether a frame of this key-ness decodes, updating the gate.
-    fn admits(&mut self, key: bool, codec: VideoCodecHandle) -> bool {
-        match self {
-            Gate::Seeded => true,
-            Gate::AwaitingKey { dropped, .. } if key => {
+    /// Whether a frame decodes, updating the gate.
+    ///
+    /// `target` is the frame's own target, and `refs` its references resolved to the targets
+    /// they name -- `None` for a handle that names none -- for a [`Prediction::From`].
+    fn admits(
+        &mut self,
+        prediction: Prediction,
+        target: &Arc<Identity>,
+        refs: [Option<&Arc<Identity>>; 3],
+        codec: VideoCodecHandle,
+    ) -> bool {
+        let Gate::AwaitingKey { dropped, decoded, .. } = self else {
+            return true;
+        };
+        // A target counts only while it holds what was decoded into it: one a frame was later
+        // dropped into holds the frozen picture instead.
+        let was_decoded = |r: Option<&Arc<Identity>>| {
+            r.is_some_and(|r| decoded.iter().any(|d| d.as_ptr() == Arc::as_ptr(r)))
+        };
+        let admitted = match prediction {
+            Prediction::Reseeds => {
                 if *dropped > 0 {
                     eprintln!(
                         "[virglrs] video codec {codec}: re-seeded by a key frame after dropping \
@@ -398,19 +435,25 @@ impl Gate {
                     );
                 }
                 *self = Gate::Seeded;
-                true
+                return true;
             }
-            Gate::AwaitingKey { dropped, .. } => {
-                if *dropped == 0 {
-                    eprintln!(
-                        "[virglrs] video codec {codec}: no reference pictures yet; dropping \
-                         inter frames until the stream's next key frame"
-                    );
-                }
-                *dropped += 1;
-                false
-            }
+            Prediction::Nothing => true,
+            Prediction::From(_) => refs.into_iter().all(was_decoded),
+            Prediction::Unknown => false,
+        };
+        decoded.retain(|d| d.strong_count() > 0 && d.as_ptr() != Arc::as_ptr(target));
+        if admitted {
+            decoded.push(Arc::downgrade(target));
+            return true;
         }
+        if *dropped == 0 {
+            eprintln!(
+                "[virglrs] video codec {codec}: no reference pictures yet; dropping inter frames \
+                 until the stream's next key frame"
+            );
+        }
+        *dropped += 1;
+        false
     }
 }
 
@@ -460,6 +503,26 @@ impl Shape {
         match self {
             Shape::Vp9(frame) => frame.key(),
             Shape::H264 { key, .. } | Shape::Hevc { key, .. } | Shape::Av1 { key, .. } => *key,
+        }
+    }
+
+    /// What this frame predicts from, for the gate that drops frames until there is something
+    /// to predict from. VP9 says per frame, in the descriptor; the other codecs are gated on
+    /// key-ness alone.
+    fn prediction(&self) -> Prediction {
+        match self {
+            _ if self.key() => Prediction::Reseeds,
+            Shape::Vp9(frame) if frame.pic_fields.intra_only() != 0 => Prediction::Nothing,
+            Shape::Vp9(frame) => {
+                let p = frame.pic_fields;
+                let slot = |i: u32| frame.refs[i as usize];
+                Prediction::From([
+                    slot(p.last_ref_frame()),
+                    slot(p.golden_ref_frame()),
+                    slot(p.alt_ref_frame()),
+                ])
+            }
+            Shape::H264 { .. } | Shape::Hevc { .. } | Shape::Av1 { .. } => Prediction::Unknown,
         }
     }
 
@@ -1831,7 +1894,7 @@ impl Video {
             width,
             height,
             // Nothing has been decoded, so there are no reference pictures.
-            gate: Gate::AwaitingKey { dropped: 0, freeze: None },
+            gate: Gate::AwaitingKey { dropped: 0, freeze: None, decoded: Vec::new() },
             nothing_to_decode: 0,
             frame: Frame::Idle,
             decoder: Decoder::default(),
@@ -2127,7 +2190,18 @@ impl Video {
             codec.gate.freeze(&buffer, gl, features, handle);
             return Ok(());
         };
-        if !codec.gate.admits(shape.key(), handle) {
+        let prediction = shape.prediction();
+        let named = |handle: u32| {
+            (handle != 0)
+                .then(|| buffers.get(&VideoBufferHandle(handle)))
+                .flatten()
+                .map(|buffer| &buffer.identity)
+        };
+        let refs = match prediction {
+            Prediction::From(handles) => handles.map(named),
+            Prediction::Reseeds | Prediction::Nothing | Prediction::Unknown => [None; 3],
+        };
+        if !codec.gate.admits(prediction, &buffer.identity, refs, handle) {
             codec.gate.freeze(&buffer, gl, features, handle);
             return Ok(());
         }
@@ -2159,7 +2233,7 @@ impl Gate {
         features: &Features,
         codec: VideoCodecHandle,
     ) {
-        let Gate::AwaitingKey { freeze, dropped } = self else {
+        let Gate::AwaitingKey { freeze, dropped, .. } = self else {
             return;
         };
         match freeze {
@@ -2389,6 +2463,66 @@ mod tests {
             assert_eq!(list.contains(&profile), support.decodes(profile.codec()));
         }
         assert!(list.contains(&Profile::Av1Main));
+    }
+
+    /// A codec with no references yet decodes what predicts from nothing -- a key frame, or a
+    /// VP9 intra-only frame -- and a VP9 inter frame whose three references are all targets
+    /// decoded into since. Anything else is dropped, and a target dropped into stops counting.
+    #[test]
+    fn the_gate_admits_what_predicts_only_from_decoded_targets() {
+        let codec = VideoCodecHandle(1);
+        let mut gate = Gate::AwaitingKey { dropped: 0, freeze: None, decoded: Vec::new() };
+        let [a, b, c] = std::array::from_fn(|_| Arc::new(Identity(())));
+        let from = Prediction::From([1, 2, 3]);
+
+        // Nothing decoded: an inter frame and an unnamed one are dropped.
+        assert!(!gate.admits(from, &a, [Some(&a), Some(&a), Some(&a)], codec));
+        assert!(!gate.admits(Prediction::Unknown, &a, [None; 3], codec));
+        // An intra-only frame into `a` decodes, and then one predicting only from `a` does.
+        assert!(gate.admits(Prediction::Nothing, &a, [None; 3], codec));
+        assert!(gate.admits(from, &b, [Some(&a), Some(&a), Some(&a)], codec));
+        assert!(gate.admits(from, &c, [Some(&a), Some(&b), Some(&b)], codec));
+        // A reference naming no target, or one never decoded into, is not one to predict from.
+        assert!(!gate.admits(from, &c, [Some(&a), None, Some(&b)], codec));
+        let never = Arc::new(Identity(()));
+        assert!(!gate.admits(from, &b, [Some(&never), Some(&a), Some(&a)], codec));
+        // That drop was into `b`, which now holds the frozen picture rather than a decoded one.
+        assert!(!gate.admits(from, &c, [Some(&a), Some(&b), Some(&a)], codec));
+        assert!(matches!(gate, Gate::AwaitingKey { dropped: 5, .. }));
+
+        // A destroyed target's entry goes at the next frame, rather than accumulating for as
+        // long as the codec waits.
+        drop(a);
+        assert!(gate.admits(Prediction::Nothing, &c, [None; 3], codec));
+        let Gate::AwaitingKey { decoded, .. } = &gate else { panic!("still waiting") };
+        assert_eq!(decoded.len(), 1, "only `c` is left");
+
+        // A key frame seeds everything, and every frame decodes from then on.
+        assert!(gate.admits(Prediction::Reseeds, &b, [None; 3], codec));
+        assert!(matches!(gate, Gate::Seeded));
+        assert!(gate.admits(Prediction::Unknown, &b, [None; 3], codec));
+    }
+
+    /// A VP9 frame says what it predicts from: a key frame re-seeds, an intra-only frame
+    /// predicts from nothing, and an inter frame from the three slots its fields index.
+    #[test]
+    fn a_vp9_frame_names_its_references() {
+        let mut inter = vp9::test_frame(false, 64, 64);
+        inter.refs = [10, 11, 12, 13, 14, 15, 16, 17];
+        // last 2, golden 5, alt 7.
+        inter.pic_fields = vp9::PicFields(inter.pic_fields.0 | (2 << 19) | (5 << 23) | (7 << 27));
+        assert_eq!(
+            Shape::Vp9(Box::new(inter.clone())).prediction(),
+            Prediction::From([12, 15, 17])
+        );
+
+        let mut intra = inter;
+        intra.pic_fields = vp9::PicFields(intra.pic_fields.0 | (1 << 5));
+        assert_eq!(intra.pic_fields.intra_only(), 1, "bit 5 is intra_only");
+        assert_eq!(Shape::Vp9(Box::new(intra)).prediction(), Prediction::Nothing);
+
+        let key = vp9::test_frame(true, 64, 64);
+        assert_eq!(Shape::Vp9(Box::new(key)).prediction(), Prediction::Reseeds);
     }
 
     /// A frame's shape answers for its own codec: VP9 is handed on as it arrived, H.264 is
