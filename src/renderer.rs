@@ -1013,20 +1013,20 @@ impl Renderer {
         Ok(())
     }
 
-    /// Mint a surface for the embedder and file it as a resource: see [`Backing::Embedder`].
+    /// Mint a surface of `shape` for the embedder and file it as a resource: see
+    /// [`Backing::Embedder`].
     ///
-    /// The surface's rows are `bytes_per_row` apart exactly, or it is refused: the embedder's
-    /// renderer lays its texture over these bytes at the pitch the guest was told, so a surface
-    /// IOSurface laid out its own way would shear. The port is the embedder's to send on.
+    /// The surface's rows are `shape.bytes_per_row` apart exactly, or it is refused: the
+    /// embedder's renderer lays its texture over these bytes at the pitch the guest was told, so
+    /// a surface IOSurface laid out its own way would shear. The port is the embedder's to send
+    /// on.
     #[cfg(target_os = "macos")]
     pub fn resource_create_surface(
         &mut self,
         handle: ResourceHandle,
-        width: u32,
-        height: u32,
-        format: crate::surface::PixelFormat,
-        bytes_per_row: u32,
+        shape: SurfaceShape,
     ) -> Result<crate::metal::SurfacePort, Error> {
+        let SurfaceShape { width, height, format, bytes_per_row } = shape;
         self.free_handle(handle)?;
         let surface = crate::metal::Surface::scanout(width, height, format, bytes_per_row)
             .map_err(|e| {
@@ -2991,8 +2991,16 @@ mod tests {
         let plain = ResourceHandle::new(3).unwrap();
         r.resource_create(shared, args(crate::vrend::resource::Bind::SHARED), Vec::new())
             .expect("a shared resource");
-        r.resource_create_surface(embedded, 32, 4, crate::surface::PixelFormat::Rgba, 256)
-            .expect("an embedder's surface");
+        r.resource_create_surface(
+            embedded,
+            SurfaceShape {
+                width: 32,
+                height: 4,
+                format: crate::surface::PixelFormat::Rgba,
+                bytes_per_row: 256,
+            },
+        )
+        .expect("an embedder's surface");
         r.resource_create(plain, args(crate::vrend::resource::Bind::SAMPLER_VIEW), Vec::new())
             .expect("a texture");
 
@@ -3487,10 +3495,27 @@ mod tests {
 
         let window = ResourceHandle::new(1).unwrap();
         let port = r
-            .resource_create_surface(window, 64, 8, crate::surface::PixelFormat::Bgra, 256)
+            .resource_create_surface(
+                window,
+                SurfaceShape {
+                    width: 64,
+                    height: 8,
+                    format: crate::surface::PixelFormat::Bgra,
+                    bytes_per_row: 256,
+                },
+            )
             .expect("a surface at the pitch asked");
         assert_eq!(
-            r.resource_create_surface(window, 64, 8, crate::surface::PixelFormat::Bgra, 256).err(),
+            r.resource_create_surface(
+                window,
+                SurfaceShape {
+                    width: 64,
+                    height: 8,
+                    format: crate::surface::PixelFormat::Bgra,
+                    bytes_per_row: 256,
+                }
+            )
+            .err(),
             Some(Error::ResourceExists),
             "the handle is taken"
         );
@@ -3532,7 +3557,16 @@ mod tests {
 
         let refused = ResourceHandle::new(2).unwrap();
         assert_eq!(
-            r.resource_create_surface(refused, 64, 8, crate::surface::PixelFormat::Bgra, 0).err(),
+            r.resource_create_surface(
+                refused,
+                SurfaceShape {
+                    width: 64,
+                    height: 8,
+                    format: crate::surface::PixelFormat::Bgra,
+                    bytes_per_row: 0,
+                }
+            )
+            .err(),
             Some(Error::SurfaceRefused),
             "a surface with no pitch is refused"
         );
