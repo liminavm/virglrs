@@ -8,6 +8,7 @@
 #   fluster.sh rs             virglrs
 #   fluster.sh diff           both, and diff what they decoded  <- the gate
 #   fluster.sh diff --record  record the pin
+#   fluster.sh rs --record    record the VA pin, on a Linux host
 #
 # WHAT THIS ADDS OVER THE THREE VIDEO CORPORA. `vrend-h264.score` and its siblings are one clip
 # per codec, scored by agreement with the C. These are the official conformance vectors, scored
@@ -31,6 +32,9 @@ UPSTREAM="$HERE/upstream"
 RESOURCES="$HERE/resources"
 OUT="${TMPDIR:-/tmp}/virglrs-fluster"
 PIN="$HERE/fixtures/results.txt"
+# A Linux host has no C leg to diff against -- upstream's VA path refuses a non-Mesa driver -- so
+# the rs leg's own verdicts are pinned there, against the published md5s, and `rs` diffs them.
+VA_PIN="$HERE/fixtures/results.va.txt"
 PORT="${FLUSTER_SSH_PORT:-2299}"
 # scp spells the port -P; two lists rather than rewriting one, so neither can drift.
 SSH_COMMON=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
@@ -299,8 +303,30 @@ REDUCE_PY
 }
 
 case "${1:-diff}" in
-  c|rs)
-    run_leg "$1" ;;
+  c)
+    run_leg c ;;
+  rs)
+    run_leg rs || exit 1
+    [ "$(uname -s)" = Linux ] || exit 0
+    if [ "${2:-}" = "--record" ]; then
+        [ -z "$VECTORS" ] || { echo "refusing to record a pin from a FLUSTER_VECTORS subset" >&2; exit 1; }
+        [ -z "$NV12" ] || { echo "refusing to record a pin from a FLUSTER_NV12 run" >&2; exit 1; }
+        cp "$OUT/rs.txt" "$VA_PIN"
+        echo "recorded $VA_PIN"
+        exit 0
+    fi
+    [ -z "$VECTORS" ] || exit 0
+    [ -f "$VA_PIN" ] || { echo "no pin at $VA_PIN -- record one with: fluster.sh rs --record" >&2; exit 1; }
+    echo "=== against the VA pin ==="
+    # Every line is a vector that started or stopped matching its published md5. One that started
+    # is a gap closed and is re-recorded with the commit that closed it; one that stopped is a
+    # regression, unless the host's VA driver moved under it.
+    if diff -u "$VA_PIN" "$OUT/rs.txt"; then
+        echo "matches $VA_PIN"
+    else
+        exit 1
+    fi
+    ;;
   diff)
     run_leg c  || exit 1
     run_leg rs || exit 1
