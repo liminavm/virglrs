@@ -641,8 +641,8 @@ impl Surface {
     /// Rows and bytes are clamped to what the plane holds. A source larger than the plane is a
     /// source for a different picture; copying all of it would run off the end.
     ///
-    /// `false` if the plane is not there, the surface will not lock, or `src` is short of the
-    /// rows it claims.
+    /// `false` if the plane is not there, the surface will not lock or has no address for it, or
+    /// `src` is short of the rows it claims.
     pub fn write_plane(
         &self,
         plane: u32,
@@ -689,8 +689,8 @@ impl Surface {
             }
             // SAFETY: balanced against the lock above, with the same options.
             IOSurfaceUnlock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut());
+            !base.is_null()
         }
-        true
     }
 
     /// Copy one plane of another surface into the same plane of this one.
@@ -700,7 +700,8 @@ impl Surface {
     /// surfaces and touches no GL. The rows and the row length are clamped to what *both* planes
     /// hold, so a pair the caller has not matched up truncates rather than running off either.
     ///
-    /// `false` if either plane is missing or either surface will not lock.
+    /// `false` if either plane is missing, or either surface will not lock or has no address for
+    /// it.
     pub fn copy_plane_from(&self, src: &Surface, plane: u32) -> bool {
         let (Some((src_shape, src_pitch)), Some((dst_shape, dst_pitch))) =
             (src.plane(plane), self.plane(plane))
@@ -746,8 +747,8 @@ impl Surface {
             // SAFETY: both balanced against the locks above, with the same options.
             IOSurfaceUnlock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut());
             IOSurfaceUnlock(src.as_ref(), LOCK_READ_ONLY, core::ptr::null_mut());
+            !from.is_null() && !to.is_null()
         }
-        true
     }
 
     /// Fill one plane with a single byte.
