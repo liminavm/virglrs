@@ -672,8 +672,9 @@ impl Backend for Amdgpu {
             return Err(Refused::ResourceBound(handle.get()));
         }
         let object = self.pending.get(&blob).ok_or(Refused::NoSuchBlob(blob as u64))?;
-        if size > object.size {
-            return Err(Refused::BlobTooLarge { asked: size, have: object.size });
+        let have = object.extent().map_or(0, |e| e as u64);
+        if size > have {
+            return Err(Refused::BlobTooLarge { asked: size, have });
         }
         let dmabuf = if flags & BLOB_FLAG_USE_SHAREABLE != 0 {
             Some(object.gem.export().map_err(|e| Refused::Kernel(errno(&e)))?)
@@ -821,6 +822,20 @@ mod tests {
         let (addr, len) = buffer.host_mapping().expect("GTT maps");
         assert!(addr != 0 && len == 64 << 10);
         assert!(!buffer.write_combining(), "GTT without USWC is cached");
+
+        // RADV makes buffers smaller than a page, and the guest's kernel rounds the blob up to
+        // one: the blob covers the page the kernel allocated, and no more.
+        let small = GemNewReq { blob_id: 8, alloc_size: 960, ..gem_new };
+        ctx.submit(bytemuck::bytes_of(&GemNewReq { hdr: hdr(cmd::GEM_NEW, 56, 2, 0), ..small }))
+            .unwrap();
+        let page = crate::guest_mem::page_round(1).unwrap() as u64;
+        let res8 = ResourceHandle::new(8).unwrap();
+        assert_eq!(
+            ctx.get_blob(res8, BlobId(8), 2 * page, 1).err(),
+            Some(Refused::BlobTooLarge { asked: 2 * page, have: page })
+        );
+        let small = ctx.get_blob(res8, BlobId(8), page, 1).expect("a page of a sub-page buffer");
+        assert_eq!(small.host_mapping().map(|(_, len)| len), Some(page), "the whole page maps");
 
         let rsp_off = 256u32;
         assert!(region.store_u32(proto::shmem::LEN + rsp_off as usize, 8));

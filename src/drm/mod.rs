@@ -181,7 +181,7 @@ impl Buffer {
         return self
             .map
             .get_or_init(|| {
-                let len = usize::try_from(self.object.size).ok()?;
+                let len = self.object.extent()?;
                 self.object
                     .gem
                     .amdgpu_mmap(len)
@@ -235,6 +235,16 @@ pub struct Object {
     /// What the buffer is counted as, for as long as it lives. An import is the same memory
     /// again, and is not counted twice.
     pub _charge: Option<crate::budget::Charge>,
+}
+
+#[cfg(all(target_os = "linux", feature = "drm"))]
+impl Object {
+    /// How much memory the buffer has: what the guest asked for, in whole pages, as the kernel
+    /// allocates it. The guest's kernel rounds a blob the same way, so this is what a blob of the
+    /// buffer may cover and what a mapping of it spans.
+    pub fn extent(&self) -> Option<usize> {
+        usize::try_from(self.size).ok().and_then(crate::guest_mem::page_round)
+    }
 }
 
 /// The native-context root: the backend this host has, its capset, and the contexts open on it.
