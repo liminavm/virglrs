@@ -207,6 +207,11 @@ pub enum PixelFormat {
     /// image was created in -- the surface describes its own channel order, so presenting one is
     /// no more work than the other, and swapping to a canonical one would mean a copy per frame.
     Rgba,
+    /// One 8-bit channel: the luma plane of a picture a guest's video decoder shares plane by
+    /// plane, each plane a resource of its own. Never a scanout.
+    R8,
+    /// Two interleaved 8-bit channels: that picture's chroma plane. Never a scanout.
+    Rg8,
 }
 
 impl PixelFormat {
@@ -215,6 +220,8 @@ impl PixelFormat {
         match self {
             PixelFormat::Bgra => u32::from_be_bytes(*b"BGRA"),
             PixelFormat::Rgba => u32::from_be_bytes(*b"RGBA"),
+            PixelFormat::R8 => u32::from_be_bytes(*b"L008"),
+            PixelFormat::Rg8 => u32::from_be_bytes(*b"2C08"),
         }
     }
 
@@ -222,6 +229,8 @@ impl PixelFormat {
     fn bytes_per_element(self) -> u32 {
         match self {
             PixelFormat::Bgra | PixelFormat::Rgba => 4,
+            PixelFormat::R8 => 1,
+            PixelFormat::Rg8 => 2,
         }
     }
 
@@ -230,6 +239,8 @@ impl PixelFormat {
         match self {
             PixelFormat::Bgra => 80, // MTLPixelFormatBGRA8Unorm
             PixelFormat::Rgba => 70, // MTLPixelFormatRGBA8Unorm
+            PixelFormat::R8 => 10,   // MTLPixelFormatR8Unorm
+            PixelFormat::Rg8 => 30,  // MTLPixelFormatRG8Unorm
         }
     }
 
@@ -792,15 +803,17 @@ impl Surface {
         }
     }
 
-    /// The 32-bit layout of a single-plane surface, or `None` for a planar one or any other
-    /// pixel format.
+    /// The layout of a single-plane surface, or `None` for a planar one or any other pixel
+    /// format.
     pub fn pixel_format(&self) -> Option<PixelFormat> {
         if self.plane_count() != 0 {
             return None;
         }
         // SAFETY: a read-only query of the live surface this type owns.
         let code = unsafe { IOSurfaceGetPixelFormat(self.as_ref()) };
-        [PixelFormat::Bgra, PixelFormat::Rgba].into_iter().find(|f| f.fourcc() == code)
+        [PixelFormat::Bgra, PixelFormat::Rgba, PixelFormat::R8, PixelFormat::Rg8]
+            .into_iter()
+            .find(|f| f.fourcc() == code)
     }
 
     /// How many planes the surface has. Zero for a surface that is not planar.

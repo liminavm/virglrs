@@ -250,6 +250,8 @@ pub struct Winsys {
     linear: Option<std::sync::Mutex<crate::gbm::Allocator>>,
     /// Which of [`Winsys::linear_surface`]'s two answers has been reported.
     pub linear_said: Said,
+    /// Whether the host GL's refusal of a video plane's surface has been reported.
+    pub plane_surface_said: Said,
 }
 
 /// Whether a driver's answer to a question it answers the same way every time has been reported
@@ -732,6 +734,7 @@ impl Winsys {
             #[cfg(not(target_os = "macos"))]
             linear: None,
             linear_said: Said::default(),
+            plane_surface_said: Said::default(),
         })
     }
 
@@ -802,6 +805,7 @@ impl Winsys {
                 #[cfg(not(target_os = "macos"))]
                 linear: None,
                 linear_said: Said::default(),
+                plane_surface_said: Said::default(),
             },
             ctx0,
             version_made,

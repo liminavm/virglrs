@@ -3006,6 +3006,81 @@ mod tests {
         );
     }
 
+    /// A guest's video decoder shares its picture plane by plane, each plane a resource of its
+    /// own: a shared luma plane and a shared chroma plane each go to the embedder as a surface in
+    /// that plane's own format, so another driver can import them. A plane nobody shares keeps
+    /// GL storage, as does a one-channel scanout, which no compositor makes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_shared_video_plane_goes_to_the_embedder_as_a_surface_of_its_own() {
+        use crate::vrend::resource::Bind;
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut r =
+            Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
+                .expect("vrend comes up");
+        let by_name = |name: &str| {
+            (0..1024)
+                .filter_map(crate::vrend::proto::Format::from_wire)
+                .find(|f| f.describe().is_some_and(|d| d.name == name))
+                .unwrap_or_else(|| panic!("no format {name}"))
+        };
+        let args = |format, bind, width, height| ClassicArgs {
+            target: crate::vrend::pipe::TextureTarget::Texture2d,
+            format,
+            bind,
+            width,
+            height,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: crate::vrend::resource::ResourceFlags::default(),
+        };
+        let (luma, chroma, private, scanout) = (
+            ResourceHandle::new(1).unwrap(),
+            ResourceHandle::new(2).unwrap(),
+            ResourceHandle::new(3).unwrap(),
+            ResourceHandle::new(4).unwrap(),
+        );
+        let decoded = Bind::SAMPLER_VIEW.0 | Bind::RENDER_TARGET.0;
+        r.resource_create(
+            luma,
+            args(by_name("R8_UNORM"), Bind(decoded | Bind::SHARED.0), 100, 16),
+            vec![],
+        )
+        .expect("a luma plane");
+        r.resource_create(
+            chroma,
+            args(by_name("R8G8_UNORM"), Bind(decoded | Bind::SHARED.0), 50, 8),
+            vec![],
+        )
+        .expect("a chroma plane");
+        r.resource_create(private, args(by_name("R8_UNORM"), Bind(decoded), 100, 16), vec![])
+            .expect("an unshared plane");
+        r.resource_create(
+            scanout,
+            args(by_name("R8_UNORM"), Bind(decoded | Bind::SCANOUT.0), 100, 16),
+            vec![],
+        )
+        .expect("a one-channel scanout");
+
+        let (_, shape) = r.resource_surface_port(luma).expect("the luma plane is a surface");
+        assert_eq!(
+            (shape.width, shape.height, shape.format),
+            (100, 16, crate::surface::PixelFormat::R8)
+        );
+        assert!(shape.bytes_per_row >= 100, "a whole row");
+        let (_, shape) = r.resource_surface_port(chroma).expect("the chroma plane is a surface");
+        assert_eq!(
+            (shape.width, shape.height, shape.format),
+            (50, 8, crate::surface::PixelFormat::Rg8)
+        );
+        assert!(shape.bytes_per_row >= 100, "a whole row");
+
+        assert_eq!(r.resource_surface_port(private).err(), Some(Error::NotExportable));
+        assert_eq!(r.resource_surface_port(scanout).err(), Some(Error::NotExportable));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn an_embedders_surface_is_adopted_by_vrend_and_lent_to_venus() {

@@ -2227,7 +2227,8 @@ fn mint_surface(
 
 /// The pixel format a resource's presentable storage takes, or `None` for a resource that gets
 /// none: a scanout or a shared buffer, single-level, single-sample and 2D, in one of the four
-/// 32-bit formats both an IOSurface and a dma-buf name.
+/// 32-bit formats both an IOSurface and a dma-buf name -- or a shared one- or two-channel 8-bit
+/// video plane.
 ///
 /// One gate for both hosts, because what a resource is *for* does not change with the host: a
 /// resource given a surface on one is the one that carries a descriptor on the other. Two copies
@@ -2244,6 +2245,10 @@ fn presentable_format(a: &Args) -> Option<PixelFormat> {
     match a.format.name() {
         "B8G8R8A8_UNORM" | "B8G8R8X8_UNORM" => Some(PixelFormat::Bgra),
         "R8G8B8A8_UNORM" | "R8G8B8X8_UNORM" => Some(PixelFormat::Rgba),
+        // The planes of a video picture a guest's decoder shares plane by plane: shared to be
+        // imported by another driver, and no compositor scans one out.
+        "R8_UNORM" if a.bind.has(Bind::SHARED) => Some(PixelFormat::R8),
+        "R8G8_UNORM" if a.bind.has(Bind::SHARED) => Some(PixelFormat::Rg8),
         _ => None,
     }
 }
@@ -2255,8 +2260,8 @@ fn presentable_format(a: &Args) -> Option<PixelFormat> {
 /// as surfaces so that the first is presented from without a copy and the second can be imported
 /// at all -- KosmicKrisp imports storage and cannot produce it, so there is nothing to export.
 ///
-/// Only a single-level, single-sample 2D texture in a 32-bit format IOSurface and Metal both
-/// name. Anything else keeps ordinary GL storage and the CPU readback path, as does a surface
+/// Only a single-level, single-sample 2D texture in a format IOSurface and Metal both name (see
+/// [`presentable_format`]). Anything else keeps ordinary GL storage and the CPU readback path, as does a surface
 /// the system or the driver refuses: the fallback is never removed, only reported.
 #[cfg(target_os = "macos")]
 fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args) -> Option<Image> {
@@ -2298,6 +2303,19 @@ fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args
                 );
             }
             Some(image)
+        }
+        // A video plane's one- and two-channel formats are newer to the host GL than the
+        // compositor's: one that predates them keeps the plane in GL storage, which every
+        // consumer but another driver's import reads as before.
+        Err(e) if matches!(format, PixelFormat::R8 | PixelFormat::Rg8) => {
+            if winsys.plane_surface_said.first(false) {
+                eprintln!(
+                    "[virglrs] vrend: the host GL takes no {} IOSurface ({e}); shared video \
+                     planes keep GL storage, and other drivers cannot import them",
+                    a.format.name()
+                );
+            }
+            None
         }
         // The driver said it imports IOSurfaces and then would not import one of the formats
         // and extents it accepts. That is the host contradicting itself, not the guest asking
