@@ -251,6 +251,7 @@ pub struct Winsys {
     /// Which of [`Winsys::linear_surface`]'s two answers has been reported.
     pub linear_said: Said,
     /// Which of the host GL's two answers to a video plane's surface has been reported.
+    #[cfg(target_os = "macos")]
     pub plane_surface_said: Said,
 }
 
@@ -741,6 +742,7 @@ impl Winsys {
             #[cfg(not(target_os = "macos"))]
             linear: None,
             linear_said: Said::default(),
+            #[cfg(target_os = "macos")]
             plane_surface_said: Said::default(),
         })
     }
@@ -812,6 +814,7 @@ impl Winsys {
                 #[cfg(not(target_os = "macos"))]
                 linear: None,
                 linear_said: Said::default(),
+                #[cfg(target_os = "macos")]
                 plane_surface_said: Said::default(),
             },
             ctx0,

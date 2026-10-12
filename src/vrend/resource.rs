@@ -2487,8 +2487,7 @@ pub mod plane_faults {
 
 /// The pixel format a resource's presentable storage takes, or `None` for a resource that gets
 /// none: a scanout or a shared buffer, single-level, single-sample and 2D, in one of the four
-/// 32-bit formats both an IOSurface and a dma-buf name -- or a shared one- or two-channel 8-bit
-/// video plane.
+/// 32-bit formats both an IOSurface and a dma-buf name.
 ///
 /// One gate for both hosts, because what a resource is *for* does not change with the host: a
 /// resource given a surface on one is the one that carries a descriptor on the other. Two copies
@@ -2505,10 +2504,6 @@ fn presentable_format(a: &Args) -> Option<PixelFormat> {
     match a.format.name() {
         "B8G8R8A8_UNORM" | "B8G8R8X8_UNORM" => Some(PixelFormat::Bgra),
         "R8G8B8A8_UNORM" | "R8G8B8X8_UNORM" => Some(PixelFormat::Rgba),
-        // The planes of a video picture a guest's decoder shares plane by plane: shared to be
-        // imported by another driver, and no compositor scans one out.
-        "R8_UNORM" if a.bind.has(Bind::SHARED) => Some(PixelFormat::R8),
-        "R8G8_UNORM" if a.bind.has(Bind::SHARED) => Some(PixelFormat::Rg8),
         _ => None,
     }
 }
@@ -2520,12 +2515,19 @@ fn presentable_format(a: &Args) -> Option<PixelFormat> {
 /// as surfaces so that the first is presented from without a copy and the second can be imported
 /// at all -- KosmicKrisp imports storage and cannot produce it, so there is nothing to export.
 ///
-/// Only a single-level, single-sample 2D texture in a format IOSurface and Metal both name (see
-/// [`presentable_format`]). Anything else keeps ordinary GL storage and the CPU readback path, as does a surface
-/// the system or the driver refuses: the fallback is never removed, only reported.
+/// Only a single-level, single-sample 2D texture in a 32-bit format IOSurface and Metal both
+/// name (see [`presentable_format`]), or a shared video plane (see [`plane_format`]): the planes
+/// of a picture a guest's decoder shares plane by plane, to be imported by another driver. Only
+/// this host mints them; the exporting host has no importer that wants them. Anything else keeps
+/// ordinary GL storage and the CPU readback path, as does a surface the system or the driver
+/// refuses: the fallback is never removed, only reported.
 #[cfg(target_os = "macos")]
 fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args) -> Option<Image> {
-    let format = presentable_format(a)?;
+    let plane = if a.bind.has(Bind::SHARED) { plane_format(a) } else { None };
+    let format = match plane {
+        Some(format) => format,
+        None => presentable_format(a)?,
+    };
     let scanout = a.bind.has(Bind::SCANOUT);
     if !features.adopts_iosurfaces() {
         // Known at init and reported there; the resource keeps ordinary GL storage. Ahead of the
@@ -2533,7 +2535,7 @@ fn mint_surface(winsys: &Winsys, features: &Features, budget: &Classic, a: &Args
         // and credited on every `SHARED` create for nothing.
         return None;
     }
-    if matches!(format, PixelFormat::R8 | PixelFormat::Rg8) {
+    if plane.is_some() {
         return plane_image(winsys, budget, a, format);
     }
     let surface = match Surface::plain(a.width, a.height, format) {
