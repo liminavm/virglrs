@@ -48,6 +48,15 @@ unsafe extern "C" {
         format: u32,
         flags: u32,
     ) -> *mut GbmBo;
+    fn gbm_bo_create_with_modifiers2(
+        gbm: *mut GbmDevice,
+        width: u32,
+        height: u32,
+        format: u32,
+        modifiers: *const u64,
+        count: u32,
+        flags: u32,
+    ) -> *mut GbmBo;
     fn gbm_bo_destroy(bo: *mut GbmBo);
     fn gbm_bo_get_fd(bo: *mut GbmBo) -> c_int;
     fn gbm_bo_get_stride(bo: *mut GbmBo) -> u32;
@@ -141,8 +150,28 @@ impl Allocator {
         if unsafe { gbm_device_is_format_supported(self.device, fourcc, flags) } == 0 {
             return Err(NoBuffer::Unsupported { fourcc });
         }
-        // SAFETY: as above; the extent is the caller's and GBM refuses one it cannot make.
-        let bo = unsafe { gbm_bo_create(self.device, width, height, fourcc, flags) };
+        // `LINEAR` is asked for by name, so the driver labels what it made. The flag alone gets
+        // a linear buffer from every driver, but one that allocates without modifiers (radeonsi)
+        // then reports `DRM_FORMAT_MOD_INVALID` for it, and an unlabelled buffer is refused below.
+        let linear = crate::surface::DRM_FORMAT_MOD_LINEAR;
+        // SAFETY: as above; `linear` is one modifier, live for the call, and the extent is the
+        // caller's, which GBM refuses if it cannot make it.
+        let mut bo = unsafe {
+            gbm_bo_create_with_modifiers2(
+                self.device,
+                width,
+                height,
+                fourcc,
+                &linear,
+                1,
+                GBM_BO_USE_RENDERING,
+            )
+        };
+        if bo.is_null() {
+            // A driver that takes no modifier list at all: the flag is its only way to be asked.
+            // SAFETY: as above.
+            bo = unsafe { gbm_bo_create(self.device, width, height, fourcc, flags) };
+        }
         if bo.is_null() {
             return Err(NoBuffer::Create);
         }

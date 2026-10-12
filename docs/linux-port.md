@@ -518,14 +518,10 @@ fails on the Mac with 132 submits replayed against the pin's 2238, identically b
 2026-09-04. The cause is not established: a capture older than its pin is the first thing to
 rule out.
 
-**Three vrend unit tests fail on radeonsi** (banana: Radeon 890M, Fedora 44, Mesa 26.2.4), at
+**Two vrend unit tests fail on radeonsi** (banana: Radeon 890M, Fedora 44, Mesa 26.2.4), at
 9e4906b and identically at its parent, so no native-context change caused them. The suite on
 goiaba's iris passes them all. Chased after the native-context work:
 
-- `vrend::egl::tests::a_linear_shared_buffer_is_rendered_into_as_rows` -- GBM answers a linear
-  BGRA render target with `DRM_FORMAT_MOD_INVALID` (`NotLinear { modifier: 0xffffffffffffff }`),
-  where iris reports `DRM_FORMAT_MOD_LINEAR`. Whether radeonsi's buffer is linear and merely
-  unlabelled, or tiled, decides whether the check or the allocation is wrong.
 - `vrend::vrend::tests::an_advanced_blend_equation_blends_the_draw` -- on the GLES flavour, red
   multiplied over grey reads `[192, 0, 0, 255]`.
 - `vrend::vrend::tests::pipeline_statistics_and_overflow_queries_count_where_the_host_has_them` --
