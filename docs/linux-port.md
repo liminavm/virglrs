@@ -488,6 +488,14 @@ QEMU raises its own soft `RLIMIT_NOFILE` to the hard cap (524288 there, against 
 no descriptor at all. A VMM that leaves the soft limit at 1024 would meet it: about 15
 descriptors a window over a 106-descriptor desktop puts the ceiling near 60 windows.
 
+**An H.264 FMO stream reaches the renderer as Baseline.** Mesa's VA frontend leaves the
+slice-group fields out of the picture description (`picture_h264.c` has them commented out), so
+`num_slice_groups_minus1` is always 0 on the wire and the slice reader's refusal of slice groups
+cannot fire. Fluster's `FM1_FT_E` then fails every picture in iHD and `FM1_BT_B` decodes to wrong
+pixels with no error. Neither is servable on any host -- the slice-group map is in a PPS the
+renderer never sees, and iHD decodes no FMO -- so the fix is in limina's guest Mesa: copy the
+three fields, and the renderer refuses the stream instead of decoding it wrong.
+
 ## Missing infrastructure
 
 **There is no CI** (no `.github`, no `.gitlab-ci.yml`). Two hosts and no CI means macOS regresses
