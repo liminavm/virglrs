@@ -76,13 +76,16 @@ back from it.
 **A buffer is a `Gem`, shared by whoever uses it.** A buffer created by `GEM_NEW` is pending,
 held by the context under its `blob_id`, until `get_blob` binds it to a resource. From then on:
 
-- the context names it in **one** map, resource to `Gem`, which is where `CS_SUBMIT` resolves the
-  resource ids in a buffer list. A buffer the context created enters that map at bind; a buffer
-  another context created enters it at attach, imported from its dma-buf onto this context's file,
-  as the C does. Either way it is one lookup and one kind of entry. Detach, and resource
-  destruction through the renderer's existing `attached` funnel, remove it.
-- the resource's storage, a new `BlobStorage` arm, holds a share of the **same** `Gem`, for
-  mapping and export. It is not a second record of the buffer, it is a second owner of one.
+- the resource's storage, a `BlobStorage::Native` arm, owns it, for mapping and export.
+- the context names it in **one** map, resource to a weak reference, which is where `BO_VA_OP`
+  and `CS_SUBMIT` resolve a resource id. A buffer the context created enters that map at bind; a
+  buffer another context created enters it at attach, imported from its dma-buf onto this
+  context's file, as the C does. Either way it is one lookup and one kind of entry. A detach
+  removes the name, and a resource that is gone stops resolving on its own: there is no purge to
+  remember at the unref.
+
+The bind refuses a blob larger than its buffer. The C does not check, and maps the buffer's size
+for a blob of any size.
 
 The storage holds the `Gem`, not a dma-buf, because most of radeonsi's buffers cannot be exported
 at all: the kernel refuses a dma-buf for a buffer created `VM_ALWAYS_VALID`
@@ -94,9 +97,11 @@ One consequence, chosen rather than inherited: a resource that outlives its cont
 context's render-node file, and so its GPU VM, open until the resource dies. The C closes the file
 at context destroy and leaves the resource naming a handle on a closed file.
 
-**Pending buffers are bounded.** A guest that creates buffers and never binds them pins host
-memory until the context dies, in the C. Pending buffers are charged to the context's budget like
-any other host allocation.
+**Buffers are counted.** A buffer is charged to the renderer's budget from `GEM_NEW` until its
+last owner drops it, as classic's driver memory is: counted, never refused, because the kernel has
+allocated it by the time there is a size to count. A guest that creates buffers and never binds
+them still pins memory until its context dies, as in the C; a per-context account that can refuse
+is open below.
 
 ## Fences
 
@@ -184,6 +189,8 @@ match sites refuse it as they refuse an unserved context today.
 4. The remaining commands, cross-context import: RADV, glmark2, a desktop.
 
 ## Open
+
+- Refusing buffers over budget. It needs a per-context account, which today only venus mints.
 
 - The `CS_QUERY_FENCE_STATUS` bound. Recommended: one second, the most the guest's driver asks
   for, so no guest that Mesa ships is changed by it, and a hostile one stalls its device for at

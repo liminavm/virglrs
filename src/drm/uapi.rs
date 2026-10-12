@@ -187,6 +187,39 @@ pub struct AmdgpuHeapInfo {
     pub max_allocation: u64,
 }
 
+/// `union drm_amdgpu_gem_create`, as its `in` half; the kernel answers the new handle in the first
+/// word, which is `out.handle`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuGemCreate {
+    pub bo_size: u64,
+    pub alignment: u64,
+    pub domains: u64,
+    pub domain_flags: u64,
+}
+
+/// `struct drm_amdgpu_gem_va`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
+pub struct AmdgpuGemVa {
+    pub handle: u32,
+    pub _pad: u32,
+    pub operation: u32,
+    pub flags: u32,
+    pub va_address: u64,
+    pub offset_in_bo: u64,
+    pub map_size: u64,
+}
+
+/// `AMDGPU_VA_OP_*`, the operations `DRM_AMDGPU_GEM_VA` knows; libdrm refuses any other before
+/// asking.
+pub const AMDGPU_VA_OP_MAP: u32 = 1;
+pub const AMDGPU_VA_OP_REPLACE: u32 = 4;
+/// `AMDGPU_GEM_DOMAIN_GTT`: system memory the GPU reaches through its page tables.
+pub const AMDGPU_GEM_DOMAIN_GTT: u32 = 0x2;
+/// `AMDGPU_GEM_CREATE_CPU_GTT_USWC`: GTT the CPU maps write-combined.
+pub const AMDGPU_GEM_CREATE_CPU_GTT_USWC: u64 = 1 << 2;
+
 // Sizes from the headers, computed by hand from their field lists and pinned here: a field added
 // or reordered without the header saying so is caught before anything reaches the kernel.
 const _: () = {
@@ -201,4 +234,6 @@ const _: () = {
     assert!(std::mem::offset_of!(AmdgpuGpuInfo, pci_rev_id) == 412);
     assert!(size_of::<AmdgpuBufferSizeAlignments>() == 16);
     assert!(size_of::<AmdgpuHeapInfo>() == 24);
+    assert!(size_of::<AmdgpuGemCreate>() == 32);
+    assert!(size_of::<AmdgpuGemVa>() == 40);
 };

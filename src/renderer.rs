@@ -348,6 +348,9 @@ pub enum BlobStorage {
     /// resource stands, including after the context that minted them is gone. `published` is what
     /// the exporter could offer, decided at the export.
     Shared { storage: Storage, published: Published, from: Exporter },
+    /// A share of a buffer a native context made. The context names it for its commands; this
+    /// keeps it for mapping and export, and keeps it alive past the context.
+    Native(crate::drm::Buffer),
 }
 
 /// What a shared blob offers the guest: an address to map, or a buffer to share and no address.
@@ -498,6 +501,16 @@ impl venus::ring::ShmResources for crate::Map<ResourceHandle, Resource> {
                 // A share resolves for anyone holding it: no table is asked.
                 BlobStorage::Shared { storage, .. } => Some(ResourceBytes::Shared(storage.clone())),
                 BlobStorage::Minted(_) => unreachable!("answered as shared memory above"),
+                // Another context reaches a native buffer through its dma-buf, which the
+                // import is the native context's to make.
+                BlobStorage::Native(_) => {
+                    eprintln!(
+                        "[virglrs] ctx {}: resource {handle:?} is a native buffer, which only its \
+                         own context can use",
+                        ctx.get(),
+                    );
+                    None
+                }
                 BlobStorage::Guest => {
                     eprintln!(
                         "[virglrs] ctx {}: resource {handle:?} is a blob with no host storage",
@@ -569,6 +582,7 @@ impl Guest for crate::Map<ResourceHandle, Resource> {
             // and the texture's storage becomes it, so reading its bytes here would mint exactly
             // the copy the adopt exists to avoid.
             BlobStorage::Shared { storage, .. } => storage.pixels(),
+            BlobStorage::Native(_) => None,
         }
     }
 }
@@ -804,7 +818,7 @@ impl Renderer {
         let venus = config.venus.then(|| {
             venus::vkr::Vkr::new(config.clone(), resources.clone(), &budget, fences.handle())
         });
-        let native = config.native_context.then(crate::drm::Native::probe).flatten();
+        let native = config.native_context.then(|| crate::drm::Native::probe(&budget)).flatten();
         match (&native, config.native_context) {
             (Some(n), _) => eprintln!("[virglrs] native contexts: {}", n.describe()),
             (None, true) => eprintln!(
@@ -974,8 +988,15 @@ impl Renderer {
                 // A context whose capset names no renderer we have holds nothing, so its ids
                 // name nothing either.
                 Bound::Unserved => return Err(Error::RendererUnimplemented),
-                // Buffers arrive with `GEM_NEW`, which is not served yet.
-                Bound::Native(_) => return Err(Error::RendererUnimplemented),
+                // The id is the one the guest gave a buffer in `GEM_NEW`.
+                Bound::Native(n) => {
+                    let native = self.native.as_mut().ok_or(Error::RendererAbsent)?;
+                    let buffer = native
+                        .get_blob(n.id(), handle, id, desc.size, desc.blob_flags)
+                        .ok_or(Error::NoContext)?
+                        .map_err(|r| native_refused(n.id(), r))?;
+                    BlobStorage::Native(buffer)
+                }
                 // The id is a `VkDeviceMemory` the guest allocated. Every way this can fail is
                 // a distinct `Error` and the caller is told which; the C ABI's single errno for
                 // all of them is `ffi.rs`'s problem and not this function's.
@@ -1384,6 +1405,12 @@ impl Renderer {
 
     pub fn ctx_detach_resource(&mut self, ctx: ContextId, handle: ResourceHandle) {
         self.with_resource_mut(handle, |r| r.attached.retain(|c| *c != ctx));
+        // A native context names the buffer for its commands until the guest closes it there.
+        if let Ok(Bound::Native(n)) = self.bound(ctx)
+            && let Some(native) = self.native.as_mut()
+        {
+            native.detach(n.id(), handle);
+        }
     }
 
     // ---- fences ----
@@ -2047,8 +2074,23 @@ impl Renderer {
         if let Some(it) = described {
             return Ok(it);
         }
-        self.with_resource_dmabuf(handle, |fd, layout| {
-            Some((fd.try_clone_to_owned().ok()?, FdType::DmaBuf, layout.cloned()))
+        let held = self
+            .with_resource_dmabuf(handle, |fd, layout| {
+                Some((fd.try_clone_to_owned().ok()?, FdType::DmaBuf, layout.cloned()))
+            })
+            .flatten();
+        if let Some(it) = held {
+            return Ok(it);
+        }
+        // A native buffer the guest did not share at the create is exported when asked, as the
+        // C's `export_opaque_handle` does. Most of radeonsi's cannot be, and the kernel says so.
+        self.with_resource(handle, |r| match &r.backing {
+            Backing::Blob { storage: BlobStorage::Native(b), .. } => b
+                .export()
+                .inspect_err(|e| eprintln!("[virglrs] resource {handle}: no dma-buf: {e}"))
+                .ok()
+                .map(|fd| (fd, FdType::DmaBuf, None)),
+            Backing::Blob { .. } | Backing::Classic { .. } | Backing::Imported { .. } => None,
         })
         .flatten()
         .ok_or(Error::NotExportable)
@@ -2075,6 +2117,9 @@ impl Renderer {
             }
             Backing::Imported { desc, fd, .. } if desc.fd_type == FdType::DmaBuf => {
                 Some(f(fd.as_fd(), None))
+            }
+            Backing::Blob { storage: BlobStorage::Native(b), .. } => {
+                b.descriptor().map(|fd| f(fd, None))
             }
             Backing::Blob { .. } | Backing::Classic { .. } | Backing::Imported { .. } => None,
         })?
@@ -2346,6 +2391,16 @@ impl Renderer {
                 // and the guest was told so at the create.
                 BlobStorage::Shared { published: Published::Descriptor, .. } => None,
                 BlobStorage::Guest => None,
+                // The buffer's own extent, which covers the blob: the bind refused one it did not.
+                BlobStorage::Native(b) => b.host_mapping().map(|(addr, size)| HostMapping {
+                    addr,
+                    size,
+                    caching: if b.write_combining() {
+                        Caching::WriteCombining
+                    } else {
+                        Caching::Cached
+                    },
+                }),
             },
             // A classic resource is mappable only when something took its mapping, which only
             // the blob claim does. Asked of vrend rather than kept here: vrend owns the buffer,

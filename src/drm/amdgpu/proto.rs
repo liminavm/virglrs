@@ -48,7 +48,41 @@ pub struct QueryInfoReq {
     pub info: AmdgpuInfo,
 }
 
+/// `struct amdgpu_ccmd_gem_new_req`: a buffer, to be bound to a resource under `blob_id`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct GemNewReq {
+    pub hdr: ReqHeader,
+    pub blob_id: u64,
+    pub alloc_size: u64,
+    pub phys_alignment: u64,
+    pub preferred_heap: u32,
+    pub pad: u32,
+    pub flags: u64,
+}
+
+/// `struct amdgpu_ccmd_bo_va_op_req`: a `DRM_AMDGPU_GEM_VA` on a resource's buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct BoVaOpReq {
+    pub hdr: ReqHeader,
+    pub va: u64,
+    pub vm_map_size: u64,
+    /// `AMDGPU_VM_PAGE_*`, for the kernel.
+    pub flags: u64,
+    /// `AMDGPU_CCMD_BO_VA_OP_*`, for the host.
+    pub flags2: u64,
+    pub offset: u64,
+    pub res_id: u32,
+    pub op: u32,
+}
+
+/// `AMDGPU_CCMD_BO_VA_OP_SPARSE_BO`: the range is mapped to no buffer.
+pub const BO_VA_OP_SPARSE_BO: u64 = 1;
+
 const _: () = {
     assert!(size_of::<QueryInfoReq>() == 48);
+    assert!(size_of::<GemNewReq>() == 56);
+    assert!(size_of::<BoVaOpReq>() == 64);
     assert!(shmem::VIS_VRAM + size_of::<crate::drm::uapi::AmdgpuHeapInfo>() == shmem::LEN);
 };

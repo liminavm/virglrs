@@ -22,7 +22,7 @@ pub mod sys;
 pub mod uapi;
 
 use crate::guest_mem::GuestMap;
-use crate::ids::ContextId;
+use crate::ids::{BlobId, ContextId, ResourceHandle};
 use std::sync::Arc;
 
 pub use capset::Capset;
@@ -58,6 +58,23 @@ pub enum Refused {
     ResponseTooLarge(u32),
     /// The host could not open a device for the context; the error is the kernel's.
     NoDevice(i32),
+    /// A blob id the guest cannot have made: zero, or wider than the protocol's 32 bits.
+    BlobId(u64),
+    /// A buffer under a blob id that already has one waiting to be bound.
+    BlobIdInUse(u64),
+    /// No buffer waits under that blob id.
+    NoSuchBlob(u64),
+    /// A buffer is already bound to that resource in this context.
+    ResourceBound(u32),
+    /// No buffer is bound to that resource in this context.
+    NoBuffer(u32),
+    /// A blob larger than the buffer it would publish.
+    BlobTooLarge { asked: u64, have: u64 },
+    /// A field the protocol reserves was not zero, or a flag it does not define was set.
+    Reserved(u64),
+    /// The kernel refused a command the protocol answers by dropping the submission; the error is
+    /// the kernel's.
+    Kernel(i32),
 }
 
 impl std::fmt::Display for Refused {
@@ -81,14 +98,120 @@ impl std::fmt::Display for Refused {
             Refused::NoDevice(e) => {
                 write!(f, "no device: {}", std::io::Error::from_raw_os_error(*e))
             }
+            Refused::BlobId(id) => write!(f, "blob id {id:#x} is not one a guest makes"),
+            Refused::BlobIdInUse(id) => write!(f, "blob id {id} already has a buffer waiting"),
+            Refused::NoSuchBlob(id) => write!(f, "no buffer waits under blob id {id}"),
+            Refused::ResourceBound(r) => write!(f, "resource {r} already has a buffer"),
+            Refused::NoBuffer(r) => write!(f, "resource {r} has no buffer in this context"),
+            Refused::BlobTooLarge { asked, have } => {
+                write!(f, "a {asked}-byte blob of a {have}-byte buffer")
+            }
+            Refused::Reserved(v) => write!(f, "a reserved field or flag is set: {v:#x}"),
+            Refused::Kernel(e) => {
+                write!(f, "the kernel refused: {}", std::io::Error::from_raw_os_error(*e))
+            }
         }
     }
+}
+
+/// A buffer a native context made, as a resource holds it: a share of the buffer, and its mapping
+/// in this process when the guest asked for one.
+///
+/// A second owner of the buffer, not a record of it: the context that made it holds a share too,
+/// and the buffer lives until both let go. A resource can outlive its context, and its buffer then
+/// keeps the context's device file open, which is what a handle into that file needs.
+pub struct Buffer {
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    object: Arc<Object>,
+    /// Made the first time the VMM asks, as the C maps at `resource_map`: most buffers are never
+    /// mapped, and one the CPU cannot reach refuses it. A refusal is kept as the answer.
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    map: std::sync::OnceLock<Option<sys::Mapping>>,
+    /// The dma-buf the guest asked for at the create, when it did.
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    dmabuf: Option<std::os::fd::OwnedFd>,
+    #[cfg(not(all(target_os = "linux", feature = "drm")))]
+    _never: std::convert::Infallible,
+}
+
+impl Buffer {
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    fn new(object: Arc<Object>, dmabuf: Option<std::os::fd::OwnedFd>) -> Buffer {
+        Buffer { object, map: std::sync::OnceLock::new(), dmabuf }
+    }
+
+    /// Where the buffer is mapped in this process, and how far: mapped now if it was not yet.
+    /// `None` when the kernel will not map it, which it says once.
+    pub fn host_mapping(&self) -> Option<(usize, u64)> {
+        #[cfg(all(target_os = "linux", feature = "drm"))]
+        return self
+            .map
+            .get_or_init(|| {
+                let len = usize::try_from(self.object.size).ok()?;
+                self.object
+                    .gem
+                    .amdgpu_mmap(len)
+                    .inspect_err(|e| {
+                        eprintln!("[virglrs] native: a {len}-byte buffer will not map: {e}")
+                    })
+                    .ok()
+            })
+            .as_ref()
+            .map(|m| (m.addr(), m.len() as u64));
+        #[cfg(not(all(target_os = "linux", feature = "drm")))]
+        match self._never {}
+    }
+
+    /// Whether the host maps the buffer write-combined, so the guest must not read it back
+    /// through a cache. Everything but GTT the guest did not ask write-combined is.
+    pub fn write_combining(&self) -> bool {
+        #[cfg(all(target_os = "linux", feature = "drm"))]
+        return self.object.write_combining;
+        #[cfg(not(all(target_os = "linux", feature = "drm")))]
+        match self._never {}
+    }
+
+    /// The dma-buf the guest asked to share the buffer as, lent for as long as the resource.
+    pub fn descriptor(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        #[cfg(all(target_os = "linux", feature = "drm"))]
+        return self.dmabuf.as_ref().map(std::os::fd::AsFd::as_fd);
+        #[cfg(not(all(target_os = "linux", feature = "drm")))]
+        match self._never {}
+    }
+
+    /// A dma-buf of the buffer, made now: the C's one-time export of a buffer the guest did not
+    /// ask to share at the create. Most of radeonsi's buffers refuse it, in the kernel: a buffer
+    /// created always-valid in its context's address space cannot leave it.
+    pub fn export(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        #[cfg(all(target_os = "linux", feature = "drm"))]
+        return self.object.gem.export();
+        #[cfg(not(all(target_os = "linux", feature = "drm")))]
+        match self._never {}
+    }
+}
+
+/// A kernel buffer and what was known of it when it was made. Shared by the context that made it
+/// and the resource it was bound to.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+pub struct Object {
+    pub gem: sys::Gem,
+    /// What the guest asked for, which is what a mapping covers.
+    pub size: u64,
+    pub write_combining: bool,
+    /// What the buffer is counted as, for as long as it lives.
+    pub _charge: crate::budget::Charge,
 }
 
 /// The native-context root: the backend this host has, its capset, and the contexts open on it.
 pub struct Native {
     host: Host,
     contexts: crate::Map<ContextId, context::Context>,
+    /// What the buffers contexts make are counted against.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "drm-amdgpu")),
+        expect(dead_code, reason = "no backend makes buffers")
+    )]
+    budget: Arc<crate::budget::Budget>,
 }
 
 /// The backend found at probe, and how to open a device for a new context.
@@ -102,10 +225,18 @@ impl Native {
     ///
     /// `None` is a host with no such GPU, or a build or platform with no backend: the renderer
     /// then serves no native context, and the capset is not offered.
-    pub fn probe() -> Option<Native> {
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "drm-amdgpu")),
+        expect(unused_variables, reason = "no backend, so nothing to count")
+    )]
+    pub fn probe(budget: &Arc<crate::budget::Budget>) -> Option<Native> {
         #[cfg(all(target_os = "linux", feature = "drm-amdgpu"))]
         if let Some(p) = amdgpu::Probed::find() {
-            return Some(Native { host: Host::Amdgpu(p), contexts: Default::default() });
+            return Some(Native {
+                host: Host::Amdgpu(p),
+                contexts: Default::default(),
+                budget: Arc::clone(budget),
+            });
         }
         None
     }
@@ -140,7 +271,7 @@ impl Native {
     fn open(&self, name: &str) -> Result<Box<dyn context::Backend>, Refused> {
         match self.host {
             #[cfg(all(target_os = "linux", feature = "drm-amdgpu"))]
-            Host::Amdgpu(ref p) => Ok(Box::new(p.open(name)?)),
+            Host::Amdgpu(ref p) => Ok(Box::new(p.open(name, &self.budget)?)),
         }
     }
 
@@ -161,6 +292,26 @@ impl Native {
         flags: u32,
     ) -> Option<Result<(), Refused>> {
         Some(self.contexts.get_mut(&id)?.attach_region(map, size, flags))
+    }
+
+    /// Bind the buffer `ctx` made under `blob` to resource `handle`, and hand the resource its
+    /// share. `size` and `flags` are the blob's, as the guest asked for it.
+    pub fn get_blob(
+        &mut self,
+        ctx: ContextId,
+        handle: ResourceHandle,
+        blob: BlobId,
+        size: u64,
+        flags: u32,
+    ) -> Option<Result<Buffer, Refused>> {
+        Some(self.contexts.get_mut(&ctx)?.get_blob(handle, blob, size, flags))
+    }
+
+    /// `ctx` detached `handle`: the guest closed it there. The resource keeps its share.
+    pub fn detach(&mut self, ctx: ContextId, handle: ResourceHandle) {
+        if let Some(c) = self.contexts.get_mut(&ctx) {
+            c.forget(handle);
+        }
     }
 
     pub fn context_name(&self, id: ContextId) -> Option<&str> {

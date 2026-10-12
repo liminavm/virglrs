@@ -5,20 +5,30 @@
 //! way libdrm_amdgpu describes it, and the per-context device a guest's commands run against.
 
 use super::ids;
-use super::proto::{self, QueryInfoReq, cmd};
-use crate::drm::Refused;
+use super::proto::{self, BoVaOpReq, GemNewReq, QueryInfoReq, cmd};
 use crate::drm::capset::{Capset, DriverVersion};
 use crate::drm::context::{Backend, Reply};
 use crate::drm::region::ResponseRegion;
 use crate::drm::sys::{self, Device};
 use crate::drm::uapi::{
-    AMDGPU_FAMILY_AI, AMDGPU_FAMILY_CI, AMDGPU_HW_IP_NUM, AMDGPU_IDS_FLAGS_FUSION,
-    AmdgpuBufferSizeAlignments, AmdgpuDeviceInfo, AmdgpuGpuInfo, AmdgpuHeapInfo, AmdgpuHwIpInfo,
-    query,
+    AMDGPU_FAMILY_AI, AMDGPU_FAMILY_CI, AMDGPU_GEM_CREATE_CPU_GTT_USWC, AMDGPU_GEM_DOMAIN_GTT,
+    AMDGPU_HW_IP_NUM, AMDGPU_IDS_FLAGS_FUSION, AMDGPU_VA_OP_MAP, AMDGPU_VA_OP_REPLACE,
+    AmdgpuBufferSizeAlignments, AmdgpuDeviceInfo, AmdgpuGemCreate, AmdgpuGemVa, AmdgpuGpuInfo,
+    AmdgpuHeapInfo, AmdgpuHwIpInfo, query,
 };
+use crate::drm::{Buffer, Object, Refused};
+use crate::ids::ResourceHandle;
 use bytemuck::Zeroable;
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, Weak};
+
+/// `VIRTGPU_BLOB_FLAG_USE_SHAREABLE`: the guest will share the blob, so it is exported now.
+const BLOB_FLAG_USE_SHAREABLE: u32 = 2;
+
+fn errno(e: &io::Error) -> i32 {
+    e.raw_os_error().unwrap_or(libc::EIO)
+}
 
 /// The amdgpu device this host has, as probed once at init.
 pub struct Probed {
@@ -57,9 +67,8 @@ impl Probed {
     }
 
     /// A device of the context's own, named after it for the kernel's accounting.
-    pub fn open(&self, name: &str) -> Result<Amdgpu, Refused> {
-        let errno = |e: io::Error| Refused::NoDevice(e.raw_os_error().unwrap_or(libc::EIO));
-        let device = Device::open(&self.node).map_err(errno)?;
+    pub fn open(&self, name: &str, budget: &Arc<crate::budget::Budget>) -> Result<Amdgpu, Refused> {
+        let device = Arc::new(Device::open(&self.node).map_err(|e| Refused::NoDevice(errno(&e)))?);
         // Best effort, as in the C, which ignores the result too: the name only labels the file
         // in the kernel's per-client statistics, and the kernel refuses names it does not like.
         if !name.is_empty()
@@ -71,7 +80,14 @@ impl Probed {
         if rings == 0 {
             return Err(Refused::NoDevice(libc::ENODEV));
         }
-        Ok(Amdgpu { device, rings, async_error: 0 })
+        Ok(Amdgpu {
+            device,
+            rings,
+            async_error: 0,
+            pending: Default::default(),
+            bound: Default::default(),
+            budget: crate::budget::Classic::open(budget),
+        })
     }
 }
 
@@ -197,14 +213,23 @@ fn rings(dev: &Device) -> u32 {
 
 /// One guest context's amdgpu device.
 pub struct Amdgpu {
-    device: Device,
+    device: Arc<Device>,
     /// The guest's ring indices run from 1 to this.
     #[allow(dead_code, reason = "fences arrive with command submission")]
     rings: u32,
     /// The count of failures the guest learns of through the response region's header. The host
     /// owns it: the guest can write that word, so it is stored there and never read back.
-    #[allow(dead_code, reason = "the first failing commands arrive with buffer creation")]
     async_error: u32,
+    /// Buffers `GEM_NEW` made that no resource has bound yet, by blob id. The context is their
+    /// only owner.
+    pending: crate::Map<u32, Object>,
+    /// The buffers bound to resources in this context, which is how the guest names a buffer in
+    /// every later command. The resource owns each: this names it, so a buffer whose resource is
+    /// gone stops resolving with no purge at the unref, and a detach is what removes the name.
+    bound: crate::Map<ResourceHandle, Weak<Object>>,
+    /// What a buffer is counted against. Counted, never refused, as classic's driver memory is:
+    /// the kernel has already allocated it by the time there is a size to count.
+    budget: crate::budget::Classic,
 }
 
 impl Amdgpu {
@@ -244,6 +269,114 @@ impl Amdgpu {
         for (at, heap) in self.heaps().into_iter().flatten() {
             region.write_header(at, bytemuck::bytes_of(&heap));
         }
+    }
+
+    /// Tell the guest a command with no answer failed. Stored, never incremented in place: the
+    /// count is the host's, and the region's word is the guest's to scribble on.
+    fn async_failure(&mut self, region: Option<&ResponseRegion>) {
+        self.async_error = self.async_error.wrapping_add(1);
+        if let Some(region) = region {
+            region.store_header_u32(proto::shmem::ASYNC_ERROR, self.async_error);
+        }
+    }
+
+    /// The buffer bound to `res_id` in this context, while its resource stands.
+    fn buffer(&self, res_id: u32) -> Option<Arc<Object>> {
+        self.bound.get(&ResourceHandle::new(res_id)?)?.upgrade()
+    }
+
+    /// `AMDGPU_CCMD_GEM_NEW`: a buffer, held under the guest's blob id until a resource binds it.
+    /// It has no answer; a failure is counted in `async_error`, and ends the submission.
+    fn gem_new(&mut self, req: &[u8], region: Option<&ResponseRegion>) -> Result<(), Refused> {
+        let req: GemNewReq = crate::drm::proto::decode(req);
+        let made = self.make(&req);
+        if made.is_err() {
+            self.async_failure(region);
+        }
+        made
+    }
+
+    fn make(&mut self, req: &GemNewReq) -> Result<(), Refused> {
+        if req.pad != 0 {
+            return Err(Refused::Reserved(req.pad as u64));
+        }
+        let blob = u32::try_from(req.blob_id)
+            .ok()
+            .filter(|&id| id != 0)
+            .ok_or(Refused::BlobId(req.blob_id))?;
+        if self.pending.contains_key(&blob) {
+            return Err(Refused::BlobIdInUse(req.blob_id));
+        }
+        let gem = self
+            .device
+            .amdgpu_gem_create(AmdgpuGemCreate {
+                bo_size: req.alloc_size,
+                alignment: req.phys_alignment,
+                domains: req.preferred_heap as u64,
+                domain_flags: req.flags,
+            })
+            .map_err(|e| Refused::Kernel(errno(&e)))?;
+        // Write-combined unless it is GTT the guest did not ask to be, as the C decides it.
+        let write_combining = req.preferred_heap != AMDGPU_GEM_DOMAIN_GTT
+            || req.flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC != 0;
+        let charge = self.budget.charge("native buffer", req.alloc_size);
+        self.pending
+            .insert(blob, Object { gem, size: req.alloc_size, write_combining, _charge: charge });
+        Ok(())
+    }
+
+    /// `AMDGPU_CCMD_BO_VA_OP`: map a range of the context's GPU address space to a resource's
+    /// buffer, or unmap it. The kernel's refusal is the guest's answer, and is also counted.
+    fn bo_va_op(
+        &mut self,
+        req: &[u8],
+        reply: &mut Reply<'_>,
+        region: Option<&ResponseRegion>,
+    ) -> Result<(), Refused> {
+        let req: BoVaOpReq = crate::drm::proto::decode(req);
+        let rsp = reply.stage(proto::RSP_HEADER)?;
+        if req.flags2 & !proto::BO_VA_OP_SPARSE_BO != 0 {
+            return Err(Refused::Reserved(req.flags2));
+        }
+        // The kernel's flags are 32 bits; libdrm drops the rest without a word, and a guest that
+        // set them asked for something no kernel offers.
+        let flags = u32::try_from(req.flags).map_err(|_| Refused::Reserved(req.flags))?;
+        let object = if req.flags2 & proto::BO_VA_OP_SPARSE_BO != 0 {
+            None
+        } else {
+            // The C's answer too: the guest may already have closed it.
+            Some(self.buffer(req.res_id).ok_or(Refused::NoBuffer(req.res_id))?)
+        };
+        // libdrm's own check, made before it asks.
+        let ret = if !(AMDGPU_VA_OP_MAP..=AMDGPU_VA_OP_REPLACE).contains(&req.op) {
+            -libc::EINVAL
+        } else {
+            let va = AmdgpuGemVa {
+                operation: req.op,
+                flags,
+                va_address: req.va,
+                offset_in_bo: req.offset,
+                map_size: req.vm_map_size,
+                ..Default::default()
+            };
+            match self.device.amdgpu_gem_va(object.as_ref().map(|o| &o.gem), va) {
+                Ok(()) => 0,
+                Err(e) => -errno(&e),
+            }
+        };
+        rsp[proto::RSP_RET..].copy_from_slice(&ret.to_le_bytes());
+        if ret != 0 {
+            eprintln!(
+                "[virglrs] native: va op {} on resource {} at {:#x}+{:#x} refused: {}",
+                req.op,
+                req.res_id,
+                req.va,
+                req.vm_map_size,
+                io::Error::from_raw_os_error(-ret),
+            );
+            self.async_failure(region);
+        }
+        Ok(())
     }
 
     /// `AMDGPU_CCMD_QUERY_INFO`: the guest's `DRM_AMDGPU_INFO`, run on its own device and answered
@@ -286,13 +419,13 @@ impl Backend for Amdgpu {
         command: u32,
         req: &[u8],
         reply: &mut Reply<'_>,
-        _region: Option<&ResponseRegion>,
+        region: Option<&ResponseRegion>,
     ) -> Result<(), Refused> {
         match command {
             cmd::QUERY_INFO => self.query_info(req, reply),
-            cmd::GEM_NEW
-            | cmd::BO_VA_OP
-            | cmd::CS_SUBMIT
+            cmd::GEM_NEW => self.gem_new(req, region),
+            cmd::BO_VA_OP => self.bo_va_op(req, reply, region),
+            cmd::CS_SUBMIT
             | cmd::SET_METADATA
             | cmd::BO_QUERY_INFO
             | cmd::CREATE_CTX
@@ -301,6 +434,41 @@ impl Backend for Amdgpu {
             | cmd::CS_QUERY_FENCE_STATUS => Err(Refused::Unserved(command)),
             other => Err(Refused::UnknownCommand(other)),
         }
+    }
+
+    /// The C's order: the resource must not already have a buffer here, the blob id must name a
+    /// pending one, and a shareable blob is exported now -- a buffer the kernel will not export
+    /// is refused before it leaves the pending set, so the guest can still bind it unshared.
+    fn get_blob(
+        &mut self,
+        handle: ResourceHandle,
+        blob: u32,
+        size: u64,
+        flags: u32,
+        region: Option<&ResponseRegion>,
+    ) -> Result<Buffer, Refused> {
+        if self.bound.get(&handle).is_some_and(|w| w.strong_count() > 0) {
+            return Err(Refused::ResourceBound(handle.get()));
+        }
+        let object = self.pending.get(&blob).ok_or(Refused::NoSuchBlob(blob as u64))?;
+        if size > object.size {
+            return Err(Refused::BlobTooLarge { asked: size, have: object.size });
+        }
+        let dmabuf = if flags & BLOB_FLAG_USE_SHAREABLE != 0 {
+            Some(object.gem.export().map_err(|e| Refused::Kernel(errno(&e)))?)
+        } else {
+            None
+        };
+        let object = Arc::new(self.pending.remove(&blob).expect("found above"));
+        self.bound.insert(handle, Arc::downgrade(&object));
+        if let Some(region) = region {
+            self.write_heaps(region);
+        }
+        Ok(Buffer::new(object, dmabuf))
+    }
+
+    fn forget(&mut self, handle: ResourceHandle) {
+        self.bound.remove(&handle);
     }
 }
 
@@ -321,6 +489,85 @@ mod tests {
         // A gfx11 APU: a low range under 128 TiB and a high range at the top of the address space.
         let d = info(0x7fff_ffff_f000, 0xffff_8000_0000_0000, 0xffff_ffff_ffff_f000);
         assert_eq!(address32_hi(&d), 0xffff_8000);
+    }
+
+    /// A buffer made, bound, mapped into the GPU address space and the host's, then detached --
+    /// against this host's amdgpu device. It says so when there is none, because a test that
+    /// passes by skipping reads exactly like one that ran.
+    #[test]
+    fn a_buffer_is_made_bound_mapped_and_forgotten_on_the_device() {
+        use crate::drm::context::Context;
+        use crate::drm::proto::ReqHeader;
+        use crate::guest_mem::GuestMap;
+        use crate::ids::BlobId;
+
+        let Some(probed) = Probed::find() else {
+            eprintln!("SKIPPED: no amdgpu device on this host");
+            return;
+        };
+        let budget = crate::budget::Budget::with_cap(None, false);
+        let mut ctx = Context::new("t".into(), Box::new(probed.open("t", &budget).unwrap()));
+        let region = Arc::new(GuestMap::anonymous(4096).unwrap());
+        ctx.attach_region(Arc::clone(&region), 4096, 1).unwrap();
+        let hdr =
+            |cmd, len: usize, seqno, rsp_off| ReqHeader { cmd, len: len as u32, seqno, rsp_off };
+
+        let gem_new = GemNewReq {
+            hdr: hdr(cmd::GEM_NEW, size_of::<GemNewReq>(), 1, 0),
+            blob_id: 7,
+            alloc_size: 64 << 10,
+            phys_alignment: 4096,
+            preferred_heap: AMDGPU_GEM_DOMAIN_GTT,
+            pad: 0,
+            flags: 0,
+        };
+        ctx.submit(bytemuck::bytes_of(&gem_new)).unwrap();
+        assert_eq!(region.load_u32(proto::shmem::ASYNC_ERROR), Some(0));
+        assert_eq!(
+            ctx.submit(bytemuck::bytes_of(&gem_new)).err(),
+            Some(Refused::BlobIdInUse(7)),
+            "a blob id is pending once"
+        );
+        assert_eq!(region.load_u32(proto::shmem::ASYNC_ERROR), Some(1), "and the guest is told");
+
+        let res = ResourceHandle::new(3).unwrap();
+        assert_eq!(
+            ctx.get_blob(res, BlobId(7), 128 << 10, 1).err(),
+            Some(Refused::BlobTooLarge { asked: 128 << 10, have: 64 << 10 })
+        );
+        let buffer = ctx.get_blob(res, BlobId(7), 64 << 10, 1).unwrap();
+        assert_eq!(
+            ctx.get_blob(res, BlobId(7), 64 << 10, 1).err(),
+            Some(Refused::ResourceBound(3))
+        );
+        let (addr, len) = buffer.host_mapping().expect("GTT maps");
+        assert!(addr != 0 && len == 64 << 10);
+        assert!(!buffer.write_combining(), "GTT without USWC is cached");
+
+        let rsp_off = 256u32;
+        assert!(region.store_u32(proto::shmem::LEN + rsp_off as usize, 8));
+        let va_op = |res_id, seqno| BoVaOpReq {
+            hdr: hdr(cmd::BO_VA_OP, size_of::<BoVaOpReq>(), seqno, rsp_off),
+            va: 1 << 40,
+            vm_map_size: 64 << 10,
+            flags: 0xe, // readable, writeable, executable
+            flags2: 0,
+            offset: 0,
+            res_id,
+            op: AMDGPU_VA_OP_MAP,
+        };
+        let ret_at = proto::shmem::LEN + rsp_off as usize + proto::RSP_RET;
+        ctx.submit(bytemuck::bytes_of(&va_op(3, 2))).unwrap();
+        assert_eq!(region.load_u32(ret_at), Some(0), "the kernel mapped it");
+        assert_eq!(region.load_u32(crate::drm::proto::shmem::SEQNO), Some(2));
+        ctx.submit(bytemuck::bytes_of(&va_op(3, 3))).unwrap();
+        assert_eq!(region.load_u32(ret_at), Some(-libc::EINVAL as u32), "a second map overlaps");
+        assert_eq!(region.load_u32(proto::shmem::ASYNC_ERROR), Some(2));
+
+        ctx.forget(res);
+        assert_eq!(ctx.submit(bytemuck::bytes_of(&va_op(3, 4))).err(), Some(Refused::NoBuffer(3)));
+        drop(buffer);
+        eprintln!("RAN: on {}", probed.describe());
     }
 
     #[test]

@@ -4,10 +4,11 @@
 //! One native context: its backend, its response region, and the framing that turns a submission
 //! into requests. What every backend shares, so a backend is only its commands.
 
-use super::Refused;
 use super::proto::{self, ReqHeader};
 use super::region::ResponseRegion;
+use super::{Buffer, Refused};
 use crate::guest_mem::GuestMap;
+use crate::ids::{BlobId, ResourceHandle};
 use std::sync::Arc;
 
 /// `VIRTGPU_BLOB_FLAG_USE_MAPPABLE`, which the response region must be created with and alone.
@@ -36,6 +37,20 @@ pub trait Backend: Send {
         reply: &mut Reply<'_>,
         region: Option<&ResponseRegion>,
     ) -> Result<(), Refused>;
+
+    /// Bind the buffer made under `blob` to `handle`, and give the resource its share. `size` is
+    /// the blob's, which the buffer must cover.
+    fn get_blob(
+        &mut self,
+        handle: ResourceHandle,
+        blob: u32,
+        size: u64,
+        flags: u32,
+        region: Option<&ResponseRegion>,
+    ) -> Result<Buffer, Refused>;
+
+    /// Let go of whatever buffer `handle` names in this context.
+    fn forget(&mut self, handle: ResourceHandle);
 }
 
 /// Where a request's answer is staged before the request is known to have succeeded.
@@ -92,6 +107,23 @@ impl Context {
         self.backend.region_attached(&region);
         self.region = Some(region);
         Ok(())
+    }
+
+    /// Bind a buffer this context made to a resource. A zero blob id is the response region,
+    /// which takes the other path; an id wider than 32 bits is one no guest could have made.
+    pub fn get_blob(
+        &mut self,
+        handle: ResourceHandle,
+        blob: BlobId,
+        size: u64,
+        flags: u32,
+    ) -> Result<Buffer, Refused> {
+        let id = u32::try_from(blob.0).ok().filter(|&id| id != 0).ok_or(Refused::BlobId(blob.0))?;
+        self.backend.get_blob(handle, id, size, flags, self.region.as_ref())
+    }
+
+    pub fn forget(&mut self, handle: ResourceHandle) {
+        self.backend.forget(handle);
     }
 
     /// Run a submission: requests back to back, each led by its header.
@@ -168,6 +200,17 @@ mod tests {
                 _ => Err(Refused::UnknownCommand(cmd)),
             }
         }
+        fn get_blob(
+            &mut self,
+            _handle: ResourceHandle,
+            blob: u32,
+            _size: u64,
+            _flags: u32,
+            _region: Option<&ResponseRegion>,
+        ) -> Result<Buffer, Refused> {
+            Err(Refused::NoSuchBlob(blob as u64))
+        }
+        fn forget(&mut self, _handle: ResourceHandle) {}
     }
 
     fn req(cmd: u32, seqno: u32, rsp_off: u32) -> Vec<u8> {
@@ -235,6 +278,15 @@ mod tests {
         assert_eq!(c.attach_region(Arc::clone(&map), 4096, 3), Err(Refused::RegionFlags(3)));
         c.attach_region(Arc::clone(&map), 4096, BLOB_FLAG_USE_MAPPABLE).unwrap();
         assert_eq!(c.attach_region(map, 4096, BLOB_FLAG_USE_MAPPABLE), Err(Refused::SecondRegion));
+    }
+
+    #[test]
+    fn a_blob_id_no_guest_makes_is_refused_before_the_backend() {
+        let (_map, mut c) = context();
+        let h = ResourceHandle::new(1).unwrap();
+        assert_eq!(c.get_blob(h, BlobId(0), 4096, 0).err(), Some(Refused::BlobId(0)));
+        assert_eq!(c.get_blob(h, BlobId(1 << 32), 4096, 0).err(), Some(Refused::BlobId(1 << 32)));
+        assert_eq!(c.get_blob(h, BlobId(5), 4096, 0).err(), Some(Refused::NoSuchBlob(5)));
     }
 
     #[test]
