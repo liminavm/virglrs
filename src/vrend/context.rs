@@ -5446,6 +5446,10 @@ impl Context {
             return video_result(cmd, self.video.create_buffer(at, target, destination));
         }
 
+        #[cfg(target_os = "macos")]
+        for &plane in planes {
+            self.promote_plane(host, cmd, plane)?;
+        }
         let mut resolved = Vec::with_capacity(planes.len());
         for &plane in planes {
             let resource = host.resource(cmd, plane)?;
@@ -5472,6 +5476,23 @@ impl Context {
             cmd,
             self.video.create_buffer(at, target, video::Destination::PerPlane(resolved)),
         )
+    }
+
+    /// Make a video buffer's plane a surface ([`resource::Resource::promote_to_surface`]) before
+    /// the buffer takes hold of its texture. The views made of the plane need nothing done: the
+    /// objects they sample through live on the texture, so they die with the old storage, and the
+    /// next bind in any context mints them over the surface.
+    #[cfg(target_os = "macos")]
+    fn promote_plane(
+        &mut self,
+        host: &mut Host<'_>,
+        cmd: Cmd,
+        plane: ResourceHandle,
+    ) -> Result<(), Fault> {
+        let (gl, winsys, features, formats, budget) =
+            (host.gl, host.winsys, host.features, host.formats, host.budget);
+        host.resource_mut(cmd, plane)?.promote_to_surface(gl, winsys, features, formats, budget);
+        Ok(())
     }
 
     /// DECODE_BITSTREAM: read the descriptor and the bitstream out of the guest's own pages.
