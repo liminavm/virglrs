@@ -5134,11 +5134,13 @@ mod tests {
     ///
     /// `sub_contexts` draws everything twice, from two sub-contexts, each over its own half of the
     /// target: sub-context 0 the left, 1 the right. `swap` frees a resource between the first draw
-    /// and the redraws and makes it again under the same handle; see [`Swap`].
+    /// and the redraws and makes it again under the same handle; see [`Swap`]. `between` runs
+    /// commands once at that point instead; see [`Between`].
     #[derive(Default)]
     struct More<'a> {
         sub_contexts: bool,
         swap: Option<Swap<'a>>,
+        between: Option<Between<'a>>,
         stream_output: Option<crate::vrend::proto::StreamOutput>,
         draw: Option<crate::vrend::proto::Draw>,
         pages: Vec<(ResourceHandle, &'a std::cell::RefCell<Vec<u8>>)>,
@@ -5160,6 +5162,17 @@ mod tests {
         resource: ResourceHandle,
         args: resource::Args,
         seen: &'a std::cell::RefCell<Vec<u8>>,
+    }
+
+    /// Commands run once between the first draw and the redraws, from the sub-context the first
+    /// draws left current -- for what is the context's and not a sub-context's, as a video buffer
+    /// is. The stream before and after are two submissions, and `seen` is the target as the
+    /// first one left it. `surfaced` is set, after the redraws, to whether vrend has given the
+    /// resource a surface.
+    struct Between<'a> {
+        commands: Vec<crate::vrend::proto::Command<'a>>,
+        seen: &'a std::cell::RefCell<Vec<u8>>,
+        surfaced: (ResourceHandle, &'a std::cell::Cell<bool>),
     }
 
     /// Draw `d` into a fresh target and read the target back. `Ok(None)` is a host without
@@ -5473,10 +5486,30 @@ mod tests {
         let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
         v.context_create(ctx, &guest).expect("a context");
         let ran = match d.more.and_then(|m| m.swap.as_ref()) {
-            None => {
-                commands.append(&mut redrawn);
-                v.submit(ctx, &wire(&commands), &guest).expect("the context is here")
-            }
+            None => match d.more.and_then(|m| m.between.as_ref()) {
+                None => {
+                    commands.append(&mut redrawn);
+                    v.submit(ctx, &wire(&commands), &guest).expect("the context is here")
+                }
+                Some(between) => {
+                    match v.submit(ctx, &wire(&commands), &guest).expect("the context is here") {
+                        Ok(()) => {
+                            *between.seen.borrow_mut() = v
+                                .cursor_contents(target)
+                                .expect("a 16x16 2D texture reads back")
+                                .pixels;
+                            let mut once = between.commands.clone();
+                            once.append(&mut redrawn);
+                            let ran =
+                                v.submit(ctx, &wire(&once), &guest).expect("the context is here");
+                            let (resource, surfaced) = between.surfaced;
+                            surfaced.set(v.resource_surface(resource).is_some());
+                            ran
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            },
             Some(swap) => match v
                 .submit(ctx, &wire(&commands), &guest)
                 .expect("the context is here")
@@ -9229,6 +9262,200 @@ mod tests {
         assert!(landing.is_landed(), "the read returned before the picture landed");
         assert!(!v.unsettled.any(), "the read left the picture pending");
         lander.join().expect("the lander finishes");
+    }
+
+    /// A video plane bound for sampling becomes a surface when the guest makes it a video buffer,
+    /// and every view of it samples the surface from then on. In each of two sub-contexts two
+    /// views of the luma plane are bound and drawn through; the video buffer then swaps the
+    /// plane's storage for a surface, which moves each view's private object from a texture view
+    /// of the plain storage to a second import of the surface's image, and a write and a draw
+    /// follow. All four bindings read the texel written into the surface. A unit left on the
+    /// object it had before reads what that object was over, which is gone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_bound_view_of_a_plane_samples_the_surface_it_becomes() {
+        use crate::vrend::pipe::Swizzle;
+        bound_plane_views_after_promotion([Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::One], 'x');
+    }
+
+    /// As [`every_bound_view_of_a_plane_samples_the_surface_it_becomes`], with the first view
+    /// broadcasting the plane's one channel, as Mesa's video compositor samples a luma plane: its
+    /// blue carries the texel. Fails on zink over KosmicKrisp: a second import of a surface's
+    /// image, given any swizzle but the identity, samples zero in every channel -- even
+    /// `R001`, which is what an R8 texture reads with no swizzle at all. The same swizzles over a
+    /// texture view of plain storage read right, which is the first draw here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "zink on KosmicKrisp samples zero through a swizzled second import of a surface"]
+    fn a_broadcasting_view_of_a_plane_samples_the_surface_it_becomes() {
+        use crate::vrend::pipe::Swizzle;
+        bound_plane_views_after_promotion([Swizzle::X, Swizzle::X, Swizzle::X, Swizzle::One], 'z');
+    }
+
+    /// Draw through two views of a 16x16 luma plane in each of two sub-contexts, make the plane
+    /// a video buffer's, write it again, and draw again. The first view has `swizzle` and its
+    /// channel `read` lands in red; the second is the identity and its red lands in green.
+    #[cfg(target_os = "macos")]
+    fn bound_plane_views_after_promotion(swizzle: [crate::vrend::pipe::Swizzle; 4], read: char) {
+        use crate::vrend::pipe::{CompareFunc, MipFilter, Swizzle, TexFilter, TexWrap};
+        use crate::vrend::proto::{
+            Box3, Command, Object, SamplerState, SamplerView, Transfer, VideoBuffer,
+            VideoBufferHandle,
+        };
+        let fs = format!(
+            "FRAG\nDCL OUT[0], COLOR\nDCL SAMP[0]\nDCL SAMP[1]\nDCL SVIEW[0], 2D, FLOAT\n\
+             DCL SVIEW[1], 2D, FLOAT\nDCL TEMP[0..1]\nIMM[0] FLT32 {{ 0.5, 0.5, 0.0, 1.0 }}\n  \
+             0: TEX TEMP[0], IMM[0], SAMP[0], 2D\n  1: TEX TEMP[1], IMM[0], SAMP[1], 2D\n  \
+             2: MOV OUT[0].x, TEMP[0].{read}{read}{read}{read}\n  \
+             3: MOV OUT[0].y, TEMP[1].xxxx\n  4: MOV OUT[0].zw, IMM[0].zzzw\n  5: END\n"
+        );
+        const W: u32 = 16;
+        const H: u32 = 16;
+        let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
+        let by_name = |name: &str| {
+            (0..1024)
+                .filter_map(super::super::proto::Format::from_wire)
+                .find(|f| f.describe().is_some_and(|d| d.name == name))
+                .unwrap_or_else(|| panic!("no format {name}"))
+        };
+        let (r8, rg8) = (by_name("R8_UNORM"), by_name("R8G8_UNORM"));
+        let (luma, chroma) = (
+            ResourceHandle::new(10).expect("a resource handle is non-zero"),
+            ResourceHandle::new(11).expect("a resource handle is non-zero"),
+        );
+        let plane = |format, width, height| resource::Args {
+            target: TextureTarget::Texture2d,
+            format,
+            bind: resource::Bind(resource::Bind::SAMPLER_VIEW.0 | resource::Bind::RENDER_TARGET.0),
+            width,
+            height,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags(0),
+        };
+        let (old, new) = (0x40u8, 0xc0u8);
+        let drawn = |t: u8| [t, t, 0, 0xff];
+        let fill = |t: u8| vec![u32::from_le_bytes([t; 4]); (W * H / 4) as usize];
+        let (old_words, new_words) = (fill(old), fill(new));
+        let write = |data| Command::ResourceInlineWrite {
+            transfer: Transfer {
+                resource: luma,
+                level: 0,
+                usage: 0,
+                stride: 0,
+                layer_stride: 0,
+                region: Box3 { x: 0, y: 0, z: 0, width: W as i32, height: H as i32, depth: 1 },
+            },
+            data,
+        };
+        let view = |swizzle| {
+            Object::SamplerView(SamplerView {
+                resource: luma,
+                format: r8,
+                target: TextureTarget::Texture2d,
+                first_element_or_layers: 0,
+                last_element_or_levels: 0,
+                swizzle,
+            })
+        };
+        let state = Object::SamplerState(SamplerState {
+            wrap_s: TexWrap::ClampToEdge,
+            wrap_t: TexWrap::ClampToEdge,
+            wrap_r: TexWrap::ClampToEdge,
+            min_img_filter: TexFilter::Nearest,
+            min_mip_filter: MipFilter::None,
+            mag_img_filter: TexFilter::Nearest,
+            compare_mode: false,
+            compare_func: CompareFunc::LessEqual,
+            seamless_cube_map: false,
+            max_anisotropy: 0,
+            lod_bias: 0.0,
+            min_lod: 0.0,
+            max_lod: 0.0,
+            border_color: [0; 4],
+        });
+        let stage = ShaderStage::Fragment;
+        let seen = std::cell::RefCell::new(Vec::new());
+        let surfaced = std::cell::Cell::new(false);
+        let more = More {
+            resources: vec![(luma, plane(r8, W, H)), (chroma, plane(rg8, W / 2, H / 2))],
+            before: vec![
+                write(&old_words),
+                Command::CreateObject { handle: o(20), object: view(swizzle) },
+                Command::CreateObject {
+                    handle: o(21),
+                    object: view([Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W]),
+                },
+                Command::CreateObject { handle: o(22), object: state },
+                Command::SetSamplerViews {
+                    stage,
+                    start_slot: 0,
+                    views: vec![Some(o(20)), Some(o(21))],
+                },
+                Command::BindSamplerStates { stage, start_slot: 0, states: vec![Some(o(22)); 2] },
+            ],
+            between: Some(Between {
+                commands: vec![Command::CreateVideoBuffer(VideoBuffer {
+                    handle: VideoBufferHandle(1),
+                    format: by_name("Y8_U8V8_420_UNORM").wire(),
+                    width: W,
+                    height: H,
+                    planes: vec![luma, chroma],
+                })],
+                seen: &seen,
+                surfaced: (luma, &surfaced),
+            }),
+            redraws: vec![vec![write(&new_words)]],
+            sub_contexts: true,
+            ..Default::default()
+        };
+        let pixels = draw_over_target(OneDraw {
+            host_gl: HostGl::Desktop,
+            format: "R8G8B8A8_UNORM",
+            vs: None,
+            fs: Some(&fs),
+            consts: &[],
+            clear: [0.0; 4],
+            logicop: None,
+            tess: None,
+            pipeline: None,
+            more: Some(&more),
+        })
+        .unwrap_or_else(|e| panic!("the draws run: {e:?}"))
+        .expect("no tessellation asked for");
+        assert!(
+            surfaced.get(),
+            "the plane became a surface (needs a host GL that takes R8 and RG8 IOSurfaces, which \
+             stock Mesa does not)"
+        );
+        // Row-major 16x16: sub-context 0 drew columns 0..8, sub-context 1 columns 8..16.
+        let half = |pixels: &[u8], sub: usize| -> Vec<[u8; 4]> {
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| (i % 16) / 8 == sub)
+                .map(|(_, p)| *p)
+                .collect()
+        };
+        for sub in 0..2 {
+            let before = half(&seen.borrow(), sub);
+            assert!(
+                before.iter().all(|p| *p == drawn(old)),
+                "sub-context {sub} reads the plain plane before it is a video buffer's: {:?}",
+                before[0]
+            );
+            let after = half(&pixels, sub);
+            assert!(
+                after.iter().all(|p| *p == drawn(new)),
+                "sub-context {sub} reads the surface the plane became, {:?}: {:?}",
+                drawn(new),
+                after[0]
+            );
+        }
     }
 
     /// A batch for a context at the fence-depth bound runs only once one of its fences has
