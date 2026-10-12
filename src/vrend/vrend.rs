@@ -4695,6 +4695,106 @@ mod tests {
         v.context_destroy(ctx, &NoGuest);
     }
 
+    /// A live command naming an object whose create the restore dropped still poisons -- the
+    /// context cannot serve what it lost -- but the fault says the restore lost it, where in the
+    /// journal and why, rather than reading as a guest that named an object it never made. Once
+    /// the guest destroys the handle, it is the guest's again, and so is a fault on it.
+    #[test]
+    fn a_handle_the_restore_lost_is_named_as_lost_when_the_guest_uses_it() {
+        use crate::vrend::context::{Fault, Lost};
+        use crate::vrend::encode::encode;
+        use crate::vrend::journal::{Entry, Step, serialize};
+        use crate::vrend::pipe::{ShaderStage, Swizzle};
+        use crate::vrend::proto::{Cmd, Command, Object, ObjectType, SamplerView};
+        use std::borrow::Cow;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        let retire = crate::fence::Retirement::start(
+            Box::new(Discard),
+            crate::vrend::debug::Switches::default(),
+        );
+        let mut v = Vrend::new(
+            Config::default(),
+            &crate::budget::Budget::with_cap(None, false),
+            retire.handle(),
+            None,
+            crate::vrend::resource::Condemned::default(),
+            crate::vrend::debug::Traces::default(),
+            crate::vrend::debug::Switches::default(),
+        )
+        .expect("vrend comes up");
+        let o = |n: u32| ObjectHandle::new(n).expect("non-zero");
+        let gone = ResourceHandle::new(28).expect("non-zero");
+        let mut create = Vec::new();
+        encode(
+            &Command::CreateObject {
+                handle: o(5),
+                object: Object::SamplerView(SamplerView {
+                    resource: gone,
+                    format: super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM"),
+                    target: TextureTarget::Texture2d,
+                    first_element_or_layers: 0,
+                    last_element_or_levels: 0,
+                    swizzle: [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W],
+                }),
+            },
+            &mut create,
+        );
+        let create = vec![create];
+        let journal = serialize(&[Entry {
+            seq: Seq(7),
+            step: Step::Feed { sub: 0, chunks: Cow::Borrowed(&create) },
+        }]);
+        let bind = |w: &mut Vec<u32>| {
+            encode(
+                &Command::SetSamplerViews {
+                    stage: ShaderStage::Fragment,
+                    start_slot: 0,
+                    views: vec![Some(o(5))],
+                },
+                w,
+            )
+        };
+        let mut used = Vec::new();
+        bind(&mut used);
+        let mut destroyed_then_used = Vec::new();
+        encode(
+            &Command::DestroyObject { kind: ObjectType::SamplerView, handle: o(5) },
+            &mut destroyed_then_used,
+        );
+        bind(&mut destroyed_then_used);
+
+        for (id, live) in [(1, &used), (2, &destroyed_then_used)] {
+            let ctx = ClassicCtx::for_test(ContextId::new(id).expect("a context id"));
+            v.context_create(ctx, &NoGuest).expect("a context");
+            v.replay_begin(ctx).expect("the context is here");
+            assert_eq!(v.journal_restore(ctx, &journal), Ok(1));
+            v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)).expect("a dropped create does not poison");
+            v.replay_end(ctx).expect("the context is here");
+            let refused = v.submit(ctx, live, &NoGuest).expect("the context is here");
+            let expected = if id == 1 {
+                Fault::LostAtRestore {
+                    cmd: Cmd::SetSamplerViews,
+                    handle: o(5),
+                    lost: Box::new(Lost {
+                        seq: Some(Seq(7)),
+                        why: Fault::IllegalResource { cmd: Cmd::CreateObject, handle: gone },
+                    }),
+                }
+            } else {
+                Fault::IllegalHandle { cmd: Cmd::SetSamplerViews, handle: o(5) }
+            };
+            assert_eq!(refused, Err(expected), "context {id}");
+            v.context_destroy(ctx, &NoGuest);
+        }
+    }
+
     /// A second `replay_begin` keeps the span open with the journal the first was handed,
     /// rather than starting over with an empty one.
     #[test]

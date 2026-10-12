@@ -443,6 +443,23 @@ pub enum Fault {
         cmd: Cmd,
         why: video::Refusal,
     },
+    /// [`Fault::IllegalHandle`] for a handle whose create a restore had to drop: the guest made
+    /// the object, and the host lost it rebuilding the context. Still a fault -- the context
+    /// cannot serve what it does not have, and a silent miss would render wrong -- but one that
+    /// says the restore is where to look, not the guest.
+    LostAtRestore {
+        cmd: Cmd,
+        handle: ObjectHandle,
+        lost: Box<Lost>,
+    },
+}
+
+/// A `CreateObject` a restore dropped, kept under the handle it would have made until the guest
+/// destroys or makes that handle again: where the journal had it, and why it could not be used.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Lost {
+    pub seq: Option<Seq>,
+    pub why: Fault,
 }
 
 impl fmt::Display for Fault {
@@ -452,6 +469,22 @@ impl fmt::Display for Fault {
             Fault::IllegalHandle { cmd, handle } => {
                 write!(f, "{}: no such object {handle}", cmd.name())
             }
+            Fault::LostAtRestore { cmd, handle, lost } => match lost.seq {
+                Some(seq) => write!(
+                    f,
+                    "{}: object {handle} was lost at restore: its CreateObject at seq {} was \
+                     dropped ({})",
+                    cmd.name(),
+                    seq.0,
+                    lost.why
+                ),
+                None => write!(
+                    f,
+                    "{}: object {handle} was lost at restore: its CreateObject was dropped ({})",
+                    cmd.name(),
+                    lost.why
+                ),
+            },
             Fault::IllegalResource { cmd, handle } => {
                 write!(f, "{}: no such resource {handle}", cmd.name())
             }
@@ -1006,6 +1039,11 @@ pub struct SubContext {
     /// current state *is* survives; how it got there is not worth keeping.
     state: crate::Map<StateKey, Retained>,
     long_shader: [Option<ObjectHandle>; ShaderStage::COUNT],
+    /// The creates a restore dropped, by the handle each would have made. Only ever filled by a
+    /// replay, and only to say what a later fault on the handle means (see [`Fault::LostAtRestore`]):
+    /// nothing looks an object up here, and a destroy or a create of the handle takes its entry
+    /// away, as it would have taken the object.
+    lost: BTreeMap<ObjectHandle, Lost>,
 
     blend: Option<BlendState>,
     /// Blend state reaches GL only at draw; this is what it last told GL, and what a clear
@@ -1114,6 +1152,7 @@ impl SubContext {
             created_at: Seq::default(),
             state: crate::Map::default(),
             long_shader: [None; ShaderStage::COUNT],
+            lost: BTreeMap::new(),
             unanswered: Vec::new(),
             blend: None,
             hw_blend: HwBlend::default(),
@@ -1631,9 +1670,9 @@ impl Context {
             let kind = framed.cmd.kind();
             // Read before the command is consumed. `CreateObject` is ten operations behind one
             // name, so a GL error attributed to the command alone does not say what failed.
-            let object = match &framed.cmd {
-                Command::CreateObject { object, .. } => Some(object.kind()),
-                _ => None,
+            let (object, creates) = match &framed.cmd {
+                Command::CreateObject { object, handle } => (Some(object.kind()), Some(*handle)),
+                _ => (None, None),
             };
             // Read before the command is consumed, recorded only if it ran: the journal holds
             // what this context accepted, never what it refused.
@@ -1655,8 +1694,15 @@ impl Context {
                 self.settle_bound(host);
             }
             if let Err(f) = self.run(host, framed.cmd, wire) {
-                if !self.dropped_in_replay(host.ctx, kind, &f) {
+                let Some(seq) = self.dropped_in_replay(host.ctx, kind, &f) else {
                     return self.poison(host.ctx, f);
+                };
+                // The guest made this object and will name it again; what it names then is the
+                // restore's loss, and the fault has to say so.
+                if let Some(handle) = creates
+                    && self.sub().objects.get(&handle).is_none()
+                {
+                    self.sub_mut().lost.insert(handle, Lost { seq, why: f });
                 }
                 // Any GL error a dropped command left is still its own. Left in the queue, the
                 // next command would answer for it -- and after the last retained command, that
@@ -1683,7 +1729,7 @@ impl Context {
             let err = host.gl.drain_errors();
             if err != GL_NO_ERROR {
                 let f = Fault::Gl { cmd: kind, error: err, object };
-                if !self.dropped_in_replay(host.ctx, kind, &f) {
+                if self.dropped_in_replay(host.ctx, kind, &f).is_none() {
                     return self.poison(host.ctx, f);
                 }
             }
@@ -1888,14 +1934,15 @@ impl Context {
         }
     }
 
-    /// Whether a fault is being dropped rather than poisoning, and count it if so.
-    fn dropped_in_replay(&mut self, ctx: ContextId, cmd: Cmd, f: &Fault) -> bool {
-        let Some(r) = self.replay.as_mut() else { return false };
+    /// Whether a fault is being dropped rather than poisoning, and count it if so: `Some` with the
+    /// journal position of the entry that carried it, `None` for a fault that poisons.
+    fn dropped_in_replay(&mut self, ctx: ContextId, cmd: Cmd, f: &Fault) -> Option<Option<Seq>> {
+        let r = self.replay.as_mut()?;
+        let at = r.fed.checked_sub(1).and_then(|i| r.entries.get(i)).map(|e| e.seq);
         // Said once per command kind, not once per drop: a rebuild that loses a thousand binds
         // to one missing object should not bury the other kinds it lost. The context and the
         // journal position are what lets the drop be matched against the live log.
         if !r.dropped.contains_key(cmd.name()) {
-            let at = r.fed.checked_sub(1).and_then(|i| r.entries.get(i)).map(|e| e.seq);
             match at {
                 Some(seq) => eprintln!(
                     "[virglrs] vrend: ctx {} replay dropped {} at seq {seq}: {f}",
@@ -1912,7 +1959,7 @@ impl Context {
             }
         }
         *r.dropped.entry(cmd.name()).or_insert(0) += 1;
-        true
+        Some(at)
     }
 
     /// What this context has retained, over every sub-context it owns.
@@ -2084,6 +2131,15 @@ impl Context {
     /// grepping for one of those two spellings reads the other renderer's fatal as silence. One
     /// marker is the difference between an oracle and a needle that is half right.
     fn poison(&mut self, ctx: ContextId, f: Fault) -> Result<(), Fault> {
+        // Every fault comes through here, so this is the one place a handle the restore lost is
+        // told apart from one the guest never made.
+        let f = match f {
+            Fault::IllegalHandle { cmd, handle } => match self.sub().lost.get(&handle) {
+                Some(lost) => Fault::LostAtRestore { cmd, handle, lost: Box::new(lost.clone()) },
+                None => Fault::IllegalHandle { cmd, handle },
+            },
+            f => f,
+        };
         eprintln!("{} vrend ctx {ctx}: {f}", crate::REFUSED);
         self.fault = Some(f.clone());
         Err(f)
@@ -2503,6 +2559,9 @@ impl Context {
 
     /// `vrend_renderer_object_destroy`: the type byte is ignored, a missing handle is nothing.
     fn destroy_object(&mut self, host: &mut Host<'_>, handle: ObjectHandle) {
+        // A create the restore lost goes the way the object would have: the handle is the
+        // guest's to make again, and a fault on it from here on is the guest's own.
+        self.sub_mut().lost.remove(&handle);
         if let Some((created, old)) = self.sub_mut().objects.remove(&handle) {
             self.on_object_gone(host, handle, created, old);
         }
