@@ -3348,6 +3348,79 @@ mod tests {
         assert_eq!(r.resource_surface_port(scanout).err(), Some(Error::NotExportable));
     }
 
+    /// A guest's VA driver writes a picture into its shared planes with ordinary transfers
+    /// (`vaPutImage`, a software decoder's output): the bytes land in the plane's surface, where
+    /// another driver importing it reads them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_write_into_a_shared_video_plane_lands_in_its_surface() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::{Box3, Command, Transfer};
+        use crate::vrend::resource::Bind;
+        const W: u32 = 100;
+        const H: u32 = 16;
+        let _display = crate::vrend::one_display_at_a_time();
+        let mut r =
+            Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
+                .expect("vrend comes up");
+        let ctx = ContextId::new(1).unwrap();
+        r.context_create(ctx, CapsetId::Virgl, "va".into()).expect("a context");
+        let format = (0..1024)
+            .filter_map(crate::vrend::proto::Format::from_wire)
+            .find(|f| f.describe().is_some_and(|d| d.name == "R8_UNORM"))
+            .expect("R8_UNORM");
+        let luma = ResourceHandle::new(1).unwrap();
+        let args = ClassicArgs {
+            target: crate::vrend::pipe::TextureTarget::Texture2d,
+            format,
+            bind: Bind(Bind::SAMPLER_VIEW.0 | Bind::RENDER_TARGET.0 | Bind::SHARED.0),
+            width: W,
+            height: H,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: crate::vrend::resource::ResourceFlags::default(),
+        };
+        r.resource_create(luma, args, Vec::new()).expect("a luma plane");
+        r.ctx_attach_resource(ctx, luma);
+        assert!(r.resource_surface_port(luma).is_ok(), "the plane is a surface");
+
+        let pixel = |x: u32, y: u32| (x * 3 + y * 7) as u8;
+        let bytes: Vec<u8> = (0..H).flat_map(|y| (0..W).map(move |x| pixel(x, y))).collect();
+        let words: Vec<u32> = bytes
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().expect("whole words")))
+            .collect();
+        let mut wire = Vec::new();
+        encode(
+            &Command::ResourceInlineWrite {
+                transfer: Transfer {
+                    resource: luma,
+                    level: 0,
+                    usage: 0,
+                    stride: 0,
+                    layer_stride: 0,
+                    region: Box3 { x: 0, y: 0, z: 0, width: W as i32, height: H as i32, depth: 1 },
+                },
+                data: &words,
+            },
+            &mut wire,
+        );
+        let wire: Vec<u8> = wire.iter().flat_map(|d| d.to_le_bytes()).collect();
+        assert!(matches!(r.submit_cmd(ctx, &wire), Ok(Submitted::Done)), "the write is accepted");
+
+        let pitch =
+            r.resource_surface_port(luma).expect("still a surface").1.bytes_per_row as usize;
+        let mut read = vec![0u8; pitch * H as usize];
+        assert_eq!(r.resource_read_surface(luma, &mut read, pitch, H), Some(H), "every row");
+        let wrong = (0..H)
+            .flat_map(|y| (0..W).map(move |x| (x, y)))
+            .filter(|&(x, y)| read[y as usize * pitch + x as usize] != pixel(x, y))
+            .count();
+        assert_eq!(wrong, 0, "every byte of the plane as written");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn an_embedders_surface_is_adopted_by_vrend_and_lent_to_venus() {
