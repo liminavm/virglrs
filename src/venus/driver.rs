@@ -18515,9 +18515,11 @@ mod tests {
         assert_eq!(pool_listed(&list(&samplers)), Ok(()), "a mutable size");
         assert!(pool_listed(&list(&dynamics)).is_err(), "a mutable size holding a dynamic buffer");
 
-        let four = [ub(0), ub(1), ub(2), ub(3)];
-        let (fits, too_big, push) = (layout(&[ub(0)]), layout(&four), {
-            let mut info = layout(&[ub(0)]);
+        // Named, not written inline: a layout holds a raw pointer to its bindings, and a
+        // temporary array would be gone before the layouts below are read.
+        let (one, four) = ([ub(0)], [ub(0), ub(1), ub(2), ub(3)]);
+        let (fits, too_big, push) = (layout(&one), layout(&four), {
+            let mut info = layout(&one);
             info.flags = VkDescriptorSetLayoutCreateFlags(1);
             info
         });
