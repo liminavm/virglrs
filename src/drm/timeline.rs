@@ -87,8 +87,12 @@ impl Timelines {
 
 impl Drop for Timelines {
     fn drop(&mut self) {
-        self.state.lock().expect("the timeline lock is never held across a panic").stop = true;
+        // Woken under the lock: the thread returns as soon as it sees `stop`, closing its end of
+        // the socket, so a wake-up sent after the lock is released can find no one to take it.
+        let mut st = self.state.lock().expect("the timeline lock is never held across a panic");
+        st.stop = true;
         self.kick();
+        drop(st);
         if let Some(t) = self.thread.take() {
             t.join().expect("the timeline thread does not panic");
         }
