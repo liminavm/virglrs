@@ -2142,18 +2142,24 @@ impl Renderer {
         if let Some(surface) = self.classic_surface(handle) {
             return Some(surface.id());
         }
-        let storage = self.resource_storage(handle)?;
-        match storage.surface() {
-            Ok(surface) => Some(surface.id()),
-            Err(why) => {
-                if storage.first_refusal() {
-                    eprintln!(
-                        "[virglrs] resource {}: has no surface to present -- {why}",
-                        handle.get()
-                    );
-                }
-                None
-            }
+        let id = self.resource_storage(handle)?.surface().ok().map(|s| s.id());
+        if id.is_none() {
+            self.note_no_surface(handle, "to present");
+        }
+        id
+    }
+
+    /// Says why a resource with storage of its own has none `for_what` a caller wanted: once per
+    /// storage, the first time anyone asks. The pages know which question their image failed at
+    /// allocation, and a caller refused here has otherwise only a black window or a bare error.
+    fn note_no_surface(&self, handle: ResourceHandle, for_what: &str) {
+        let Some(storage) = self.resource_storage(handle) else {
+            return;
+        };
+        if let Err(why) = storage.surface()
+            && storage.first_refusal()
+        {
+            eprintln!("[virglrs] resource {}: has no surface {for_what} -- {why}", handle.get());
         }
     }
 
@@ -2194,9 +2200,13 @@ impl Renderer {
         handle: ResourceHandle,
     ) -> Result<(crate::metal::SurfacePort, SurfaceShape), Error> {
         self.with_resource(handle, |_| ()).ok_or(Error::NoResource)?;
-        self.with_surface(handle, |surface| Some((surface.port()?, SurfaceShape::of(surface)?)))
-            .flatten()
-            .ok_or(Error::NotExportable)
+        let port = self
+            .with_surface(handle, |surface| Some((surface.port()?, SurfaceShape::of(surface)?)))
+            .flatten();
+        if port.is_none() {
+            self.note_no_surface(handle, "to import");
+        }
+        port.ok_or(Error::NotExportable)
     }
 
     /// Every surface [`Self::resource_create_surface`] minted, by resource, with its shape: what
