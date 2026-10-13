@@ -11,7 +11,7 @@ use super::proto::{
     cmd,
 };
 use crate::drm::capset::{Capset, DriverVersion};
-use crate::drm::context::{Backend, Reply};
+use crate::drm::context::{Backend, Reply, Waits};
 use crate::drm::region::ResponseRegion;
 use crate::drm::sys::{self, AmdgpuCtx, Chunk, Device};
 use crate::drm::uapi::{
@@ -28,10 +28,6 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-
-/// The longest a guest's fence query may block its context. See
-/// [`Amdgpu::query_fence_status`].
-const FENCE_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// libdrm's `AMDGPU_CS_MAX_RINGS`: the rings of one IP a fence query may name.
 const MAX_RINGS_PER_IP: u32 = 8;
@@ -669,18 +665,23 @@ impl Amdgpu {
     /// `AMDGPU_CCMD_CS_QUERY_FENCE_STATUS`: whether a submission has finished, waiting a while
     /// for it if the guest asked to.
     ///
-    /// The wait blocks this context's submissions, so it is bounded at [`FENCE_WAIT_BOUND`]: as
-    /// long as any guest Mesa asks for, RADV's idle wait included. A guest that asked for longer,
-    /// or forever, is told the work is still running and asks again. A deadline given in the
-    /// guest's own clock is read the same way, since the host's clock does not share its epoch.
-    fn query_fence_status(&mut self, req: &[u8], reply: &mut Reply<'_>) -> Result<(), Refused> {
+    /// The wait blocks the renderer, so it is held to what the submission has left of
+    /// [`Waits::BOUND`]: a guest that asked for longer, or forever, is told the work is still
+    /// running and asks again. A deadline is in the guest's clock, which the host's does not share,
+    /// so it is answered as a poll; no guest Mesa sends one.
+    fn query_fence_status(
+        &mut self,
+        req: &[u8],
+        reply: &mut Reply<'_>,
+        waits: &mut Waits,
+    ) -> Result<(), Refused> {
         let req: QueryFenceStatusReq = crate::drm::proto::decode(req);
         let rsp = reply.stage(proto::RSP_WITH_WORD)?;
         let ctx = self.gpu_contexts.get(&req.ctx_id).ok_or(Refused::NoGpuContext(req.ctx_id))?;
-        let timeout = if req.flags & proto::FENCE_TIMEOUT_IS_ABSOLUTE != 0 {
-            FENCE_WAIT_BOUND
+        let want = if req.flags & proto::FENCE_TIMEOUT_IS_ABSOLUTE != 0 {
+            std::time::Duration::ZERO
         } else {
-            std::time::Duration::from_nanos(req.timeout_ns).min(FENCE_WAIT_BOUND)
+            std::time::Duration::from_nanos(req.timeout_ns)
         };
         // libdrm's checks, then its shortcut for a submission that never was.
         let (ret, expired) = if req.ip_type >= AMDGPU_HW_IP_NUM || req.ring >= MAX_RINGS_PER_IP {
@@ -688,7 +689,9 @@ impl Amdgpu {
         } else if req.fence == 0 {
             (0, true)
         } else {
-            match ctx.wait_cs(req.ip_type, req.ip_instance, req.ring, req.fence, timeout) {
+            let wait =
+                |timeout| ctx.wait_cs(req.ip_type, req.ip_instance, req.ring, req.fence, timeout);
+            match waits.bounded(want, wait) {
                 Ok(busy) => (0, !busy),
                 Err(e) => (-errno(&e), false),
             }
@@ -739,6 +742,7 @@ impl Backend for Amdgpu {
         req: &[u8],
         reply: &mut Reply<'_>,
         region: Option<&ResponseRegion>,
+        waits: &mut Waits,
     ) -> Result<(), Refused> {
         match command {
             cmd::QUERY_INFO => self.query_info(req, reply),
@@ -750,7 +754,7 @@ impl Backend for Amdgpu {
             cmd::BO_QUERY_INFO => self.bo_query_info(req, reply),
             cmd::RESERVE_VMID => self.reserve_vmid(req, reply),
             cmd::SET_PSTATE => self.set_pstate(req, reply),
-            cmd::CS_QUERY_FENCE_STATUS => self.query_fence_status(req, reply),
+            cmd::CS_QUERY_FENCE_STATUS => self.query_fence_status(req, reply, waits),
             other => Err(Refused::UnknownCommand(other)),
         }
     }
@@ -1059,7 +1063,7 @@ mod tests {
         let started = std::time::Instant::now();
         ctx.submit(bytemuck::bytes_of(&fence(1, 0, 13))).unwrap();
         assert_eq!(region.load_u32(ret_at), Some(-libc::EINVAL as u32), "a fence never submitted");
-        assert!(started.elapsed() < FENCE_WAIT_BOUND, "refused, not waited for");
+        assert!(started.elapsed() < Waits::BOUND, "refused, not waited for");
         assert_eq!(
             ctx.submit(bytemuck::bytes_of(&QueryFenceStatusReq { ctx_id: 99, ..fence(1, 0, 14) }))
                 .err(),

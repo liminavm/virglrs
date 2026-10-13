@@ -12,6 +12,7 @@ use crate::guest_mem::GuestMap;
 use crate::ids::{BlobId, FenceId, ResourceHandle, RingIdx};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// `VIRTGPU_BLOB_FLAG_USE_MAPPABLE`, which the response region must be created with and alone.
 const BLOB_FLAG_USE_MAPPABLE: u32 = 1;
@@ -31,13 +32,14 @@ pub trait Backend: Send {
 
     /// Run one request. `req` is the whole request, header included, exactly as long as the guest
     /// said. An answer is staged through `reply`, and only a request that returns `Ok` has it
-    /// published.
+    /// published. Any wait the request asks for goes through `waits`.
     fn dispatch(
         &mut self,
         cmd: u32,
         req: &[u8],
         reply: &mut Reply<'_>,
         region: Option<&ResponseRegion>,
+        waits: &mut Waits,
     ) -> Result<(), Refused>;
 
     /// Bind the buffer made under `blob` to `handle`, and give the resource its share. `size` is
@@ -87,6 +89,34 @@ impl Reply<'_> {
         }
         assert!(self.staged.is_none(), "a request stages one answer");
         Ok(self.staged.insert(vec![0; len]))
+    }
+}
+
+/// What one submission may still spend blocked, across all its requests.
+///
+/// A submission runs on the renderer's thread, so a request that waits for the GPU stalls every
+/// context, not only its own. The guest names how long; the host decides how long it gets, and a
+/// submission of many waits gets no more than one.
+pub struct Waits {
+    left: Duration,
+}
+
+impl Waits {
+    /// The most one submission blocks: as long as any guest Mesa asks for, RADV's idle wait
+    /// included.
+    pub const BOUND: Duration = Duration::from_secs(1);
+
+    fn new() -> Waits {
+        Waits { left: Waits::BOUND }
+    }
+
+    /// Run `wait` with a timeout of `want`, or of what the submission has left if that is less,
+    /// and charge it for the time `wait` took.
+    pub fn bounded<T>(&mut self, want: Duration, wait: impl FnOnce(Duration) -> T) -> T {
+        let started = Instant::now();
+        let answer = wait(want.min(self.left));
+        self.left = self.left.saturating_sub(started.elapsed());
+        answer
     }
 }
 
@@ -171,6 +201,7 @@ impl Context {
     pub fn submit(&mut self, buf: &[u8]) -> Result<(), Refused> {
         let align = self.backend.alignment();
         let mut rest = buf;
+        let mut waits = Waits::new();
         while rest.len() >= proto::HEADER_LEN {
             let hdr: ReqHeader = proto::decode(rest);
             let len = hdr.len as usize;
@@ -181,7 +212,7 @@ impl Context {
                 return Err(Refused::ResponseOffset(hdr.rsp_off));
             }
             let (req, tail) = rest.split_at(len);
-            self.run(hdr, req)?;
+            self.run(hdr, req, &mut waits)?;
             rest = tail;
         }
         if !rest.is_empty() {
@@ -190,10 +221,10 @@ impl Context {
         Ok(())
     }
 
-    fn run(&mut self, hdr: ReqHeader, req: &[u8]) -> Result<(), Refused> {
+    fn run(&mut self, hdr: ReqHeader, req: &[u8], waits: &mut Waits) -> Result<(), Refused> {
         let region = self.region.as_ref();
         let mut reply = Reply { region, rsp_off: hdr.rsp_off, staged: None };
-        self.backend.dispatch(hdr.cmd, req, &mut reply, region)?;
+        self.backend.dispatch(hdr.cmd, req, &mut reply, region, waits)?;
         // A command with no answer may come before the region exists; it simply has nowhere to
         // say it finished.
         let Some(region) = region else { return Ok(()) };
@@ -228,6 +259,7 @@ mod tests {
             _req: &[u8],
             reply: &mut Reply<'_>,
             _region: Option<&ResponseRegion>,
+            _waits: &mut Waits,
         ) -> Result<(), Refused> {
             match cmd {
                 1 => {
@@ -324,6 +356,26 @@ mod tests {
         assert_eq!(c.attach_region(Arc::clone(&map), 4096, 3), Err(Refused::RegionFlags(3)));
         c.attach_region(Arc::clone(&map), 4096, BLOB_FLAG_USE_MAPPABLE).unwrap();
         assert_eq!(c.attach_region(map, 4096, BLOB_FLAG_USE_MAPPABLE), Err(Refused::SecondRegion));
+    }
+
+    /// Waits that would each take the whole bound share it: later ones are cut short, and once it
+    /// is spent a wait is a poll.
+    #[test]
+    fn a_submission_blocks_for_the_bound_however_many_waits_it_holds() {
+        let mut waits = Waits::new();
+        let step = Waits::BOUND * 2 / 5;
+        let granted: Vec<Duration> = (0..4)
+            .map(|_| {
+                waits.bounded(Duration::MAX, |timeout| {
+                    std::thread::sleep(timeout.min(step));
+                    timeout
+                })
+            })
+            .collect();
+        assert_eq!(granted[0], Waits::BOUND);
+        assert!(granted[1] <= Waits::BOUND - step, "{granted:?}");
+        assert!(granted[2] <= Waits::BOUND - 2 * step, "{granted:?}");
+        assert_eq!(granted[3], Duration::ZERO, "{granted:?}");
     }
 
     #[test]

@@ -149,11 +149,12 @@ The C has holes this closes at the boundary:
   request is refused `EBUSY` until the guest lets go. Any unprivileged client may do it. Here a
   guest reads the state and is answered `-EPERM` for setting it, unless `Config::native_pstate`
   (`VIRGLRS_NATIVE_PSTATE=1` under the C ABI) lets it; guest Mesa sets one only to profile.
-- `CS_QUERY_FENCE_STATUS` takes a guest-chosen timeout and blocks the submitting thread for it.
-  Refusing a non-zero timeout would break RADV, whose wait-idle sends one second, so the wait is
-  bounded at one second instead: no guest Mesa asks for more, and a hostile one stalls its own
-  context for at most that. An absolute deadline is in the guest's clock, which the host does not
-  share, and gets the same bound.
+- `CS_QUERY_FENCE_STATUS` takes a guest-chosen timeout and blocks the submitting thread for it,
+  which is the VMM's, so every context stalls with it. Refusing a non-zero timeout would break
+  RADV, whose wait-idle sends one second and is the only guest Mesa caller, so a submission's
+  waits share one second instead: no guest Mesa asks for more, and a guest asking for longer is
+  told the work is still running. An absolute deadline is in the guest's clock, which the host does
+  not share, and is answered as a poll; no guest Mesa sends one.
 - A blob larger than its buffer: the C maps the buffer's size whatever the blob claims. Here the
   bind refuses a blob past the buffer's last page; the guest's kernel rounds a blob up to a page,
   and the host's allocated the same page.
@@ -209,6 +210,10 @@ match sites refuse it as they refuse an unserved context today.
    resources: RADV, glmark2, a desktop.
 
 ## Open
+
+- A fence wait that does not block the renderer. `CS_QUERY_FENCE_STATUS` can still stall every
+  context for a second per submission; a wait that suspends the submission, as venus's driver
+  waits do, would stall none.
 
 - Refusing buffers over budget. It needs a per-context account, which today only venus mints.
 
