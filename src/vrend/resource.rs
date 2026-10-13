@@ -23,8 +23,9 @@ use super::video;
 use crate::budget::Charged;
 use crate::budget::{Charge, Classic};
 use crate::guest_mem::{Iov, PixelSource};
-use crate::ids::ResourceHandle;
+use crate::ids::{ContextId, ResourceHandle};
 use crate::surface::{Adoptable, Held, PixelFormat, PlanarFormat, Surface};
+use crate::vrend::context::Guest;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -500,17 +501,29 @@ impl Slots {
         &mut self.map
     }
 
-    /// The commands a rebuild must send before anything else: what described each claimed blob,
-    /// and what typed each attached one.
+    /// The commands `ctx`'s rebuild must send before anything else: what described each claimed
+    /// blob attached to it, and what typed each one.
     ///
-    /// It walks this table rather than a context's, because one table serves every context and no
-    /// single context can answer for it -- and it is a method here rather than a walk outside so
-    /// that reconciling comes first. A resource the guest has freed owes a rebuild nothing, and an
-    /// entry read before its claim was collected would put it in the preamble anyway.
-    pub fn preamble(&mut self) -> impl Iterator<Item = &Vec<u32>> {
+    /// Only what is attached to `ctx`: every command reaches a resource through
+    /// [`Guest::attached`](super::context::Guest::attached), so a context can neither use nor be
+    /// asked to type one it does not hold. Handing it the rest asked it to type resources it would
+    /// refuse as unknown -- which the global walk escaped only while some other context's attach
+    /// happened to run first, and a resource the VMM re-creates for its own ends never is.
+    /// A resource attached to several contexts is in each one's preamble; typing is first-wins,
+    /// so the later ones succeed and do nothing.
+    ///
+    /// A method here rather than a walk outside so that reconciling comes first. A resource the
+    /// guest has freed owes a rebuild nothing, and an entry read before its claim was collected
+    /// would put it in the preamble anyway.
+    pub fn preamble<'a>(
+        &'a mut self,
+        ctx: ContextId,
+        guest: &'a dyn Guest,
+    ) -> impl Iterator<Item = &'a Vec<u32>> {
         self.sync()
-            .values()
-            .filter_map(|s| s.resource())
+            .iter()
+            .filter(move |(handle, _)| guest.attached(ctx, **handle))
+            .filter_map(|(_, s)| s.resource())
             .flat_map(|r| r.described_by.as_ref().into_iter().chain(r.typed_by.as_ref()))
     }
 

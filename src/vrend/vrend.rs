@@ -619,14 +619,17 @@ impl Vrend {
     /// plus the type each live blob was given.
     ///
     /// The resources are counted here and not in `Context` because that is where they live -- one
-    /// table shared by every context, so no single context can answer for it.
-    pub fn journal_census(&mut self) -> Census {
+    /// table shared by every context, so no single context can answer for it. A blob's type is
+    /// counted once per context it is attached to, because that is how many journals export it:
+    /// the census is the bytes a snapshot carries, not the number of resources.
+    pub fn journal_census(&mut self, guest: &dyn Guest) -> Census {
         let mut c = Census::default();
-        for ctx in self.contexts.values() {
+        let Vrend { contexts, resources, .. } = self;
+        for (&id, ctx) in contexts.iter() {
             c += ctx.journal_census();
-        }
-        for wire in self.resources.preamble() {
-            c.add_wire(wire.len(), true);
+            for wire in resources.preamble(id, guest) {
+                c.add_wire(wire.len(), true);
+            }
         }
         c
     }
@@ -647,16 +650,18 @@ impl Vrend {
     /// `None` for a context that is not here. An empty journal still serializes: a context that
     /// built nothing is a fact worth restoring accurately, and the alternative -- answering
     /// "no journal" -- is what the VMM reads as "this context is not mine to rebuild".
-    pub fn journal_export(&mut self, ctx: ClassicCtx) -> Option<Vec<u8>> {
-        self.journal_of(ctx.id())
+    ///
+    /// `guest` says which resources the context holds: its preamble types those and no others.
+    pub fn journal_export(&mut self, ctx: ClassicCtx, guest: &dyn Guest) -> Option<Vec<u8>> {
+        self.journal_of(ctx.id(), guest)
     }
 
-    fn journal_of(&mut self, id: ContextId) -> Option<Vec<u8>> {
+    fn journal_of(&mut self, id: ContextId, guest: &dyn Guest) -> Option<Vec<u8>> {
         // Named separately, because one is read while the other is reconciled: a `&mut self`
         // method could not hold both.
         let Vrend { contexts, resources, .. } = self;
         let ctx = contexts.get(&id)?;
-        Some(crate::vrend::journal::serialize(&ctx.journal(resources.preamble())))
+        Some(crate::vrend::journal::serialize(&ctx.journal(resources.preamble(id, guest))))
     }
 
     /// Each live context's journal: how many bytes it exports, and how many entries those bytes
@@ -665,13 +670,16 @@ impl Vrend {
     /// The round-trip is the point. A census counts what was retained, which a serializer bug
     /// would leave untouched; parsing our own output back is the cheapest thing that actually
     /// exercises the format on a real world rather than on a fixture we wrote.
-    pub fn journal_report(&mut self) -> Vec<(ContextId, usize, Result<usize, &'static str>)> {
+    pub fn journal_report(
+        &mut self,
+        guest: &dyn Guest,
+    ) -> Vec<(ContextId, usize, Result<usize, &'static str>)> {
         // The ids are collected first: exporting one reconciles the resource table, which is a
         // borrow of this renderer that cannot be held while walking its contexts.
         let ids: Vec<ContextId> = self.contexts.keys().copied().collect();
         ids.into_iter()
             .filter_map(|id| {
-                let bytes = self.journal_of(id)?;
+                let bytes = self.journal_of(id, guest)?;
                 let read_back = crate::vrend::journal::parse(&bytes).map(|e| e.len());
                 Some((id, bytes.len(), read_back))
             })
@@ -4541,7 +4549,7 @@ mod tests {
         v.submit(ctx, &[(1 << 16) | 29, 1], &NoGuest)
             .expect("the context is here")
             .expect("a sub-context");
-        let journal = v.journal_export(ctx).expect("a live context exports its journal");
+        let journal = v.journal_export(ctx, &NoGuest).expect("a live context exports its journal");
         let entries = |bytes: &[u8]| crate::vrend::journal::parse(bytes).map(|e| e.len());
         let retained = entries(&journal).expect("this renderer reads its own journal");
         assert!(retained > 0, "a context with a sub-context retains something");
@@ -4567,7 +4575,8 @@ mod tests {
         );
         v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)).expect("and fed");
         v.replay_end(ctx).expect("the context is here");
-        let rebuilt = v.journal_export(ctx).expect("the rebuilt context exports its journal");
+        let rebuilt =
+            v.journal_export(ctx, &NoGuest).expect("the rebuilt context exports its journal");
         assert_eq!(
             entries(&rebuilt),
             Ok(retained),
@@ -4837,7 +4846,7 @@ mod tests {
         v.submit(ctx, &[(1 << 16) | 29, 1], &NoGuest)
             .expect("the context is here")
             .expect("a sub-context");
-        let journal = v.journal_export(ctx).expect("a live context exports its journal");
+        let journal = v.journal_export(ctx, &NoGuest).expect("a live context exports its journal");
         v.context_destroy(ctx, &NoGuest);
 
         v.context_create(ctx, &NoGuest).expect("a fresh context to rebuild");
@@ -4883,7 +4892,7 @@ mod tests {
         v.submit(ctx, &[(1 << 16) | 29, 1], &NoGuest)
             .expect("the context is here")
             .expect("a sub-context");
-        let journal = v.journal_export(ctx).expect("a live context exports its journal");
+        let journal = v.journal_export(ctx, &NoGuest).expect("a live context exports its journal");
         let entries = |bytes: &[u8]| crate::vrend::journal::parse(bytes).map(|e| e.len());
         let retained = entries(&journal).expect("this renderer reads its own journal");
         assert!(retained > 0, "a context with a sub-context retains something");
@@ -4895,7 +4904,8 @@ mod tests {
         v.replay_begin(ctx).expect("the context is here");
         v.replay_upto(ctx, &NoGuest, Seq(u64::MAX)).expect("the context is replaying");
         v.replay_end(ctx).expect("the context is here");
-        let rebuilt = v.journal_export(ctx).expect("the rebuilt context exports its journal");
+        let rebuilt =
+            v.journal_export(ctx, &NoGuest).expect("the rebuilt context exports its journal");
         assert_eq!(
             entries(&rebuilt),
             Ok(retained),
@@ -5032,7 +5042,8 @@ mod tests {
             "the dead view left its slot; the dead state's slot closed up"
         );
 
-        let journal = v.journal_export(ctx).expect("a live context exports its journal");
+        let journal =
+            v.journal_export(ctx, &AllAttached).expect("a live context exports its journal");
         v.context_destroy(ctx, &AllAttached);
         v.context_create(ctx, &AllAttached).expect("a fresh context to rebuild");
         v.replay_begin(ctx).expect("the context is here");
@@ -8895,7 +8906,7 @@ mod tests {
         };
         let live = seen(&v);
 
-        let journal = v.journal_export(ctx).expect("a live context exports its journal");
+        let journal = v.journal_export(ctx, &NoGuest).expect("a live context exports its journal");
         v.context_destroy(ctx, &NoGuest);
         v.context_create(ctx, &NoGuest).expect("a fresh context to rebuild");
         v.replay_begin(ctx).expect("the context is here");

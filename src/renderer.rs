@@ -1778,7 +1778,10 @@ impl Renderer {
     /// have rebuilt nothing and been told it succeeded.
     pub fn journal_export(&mut self, ctx: ContextId) -> Option<Vec<u8>> {
         match self.bound(ctx).ok()? {
-            Bound::Classic(c) => self.vrend.as_mut()?.journal_export(c),
+            Bound::Classic(c) => {
+                let table = self.resources.read().expect("the resource lock is never poisoned");
+                self.vrend.as_mut()?.journal_export(c, &*table)
+            }
             Bound::Venus(c) => self.venus.as_ref()?.journal_export(c),
             // A native context keeps no journal: its state is the kernel's.
             Bound::Native(_) | Bound::Unserved => None,
@@ -2038,12 +2041,14 @@ impl Renderer {
 
     /// Each classic context's journal size and entry count, round-tripped.
     pub fn vrend_journal_report(&mut self) -> Vec<(ContextId, usize, Result<usize, &'static str>)> {
-        self.vrend.as_mut().map(|v| v.journal_report()).unwrap_or_default()
+        let table = self.resources.read().expect("the resource lock is never poisoned");
+        self.vrend.as_mut().map(|v| v.journal_report(&*table)).unwrap_or_default()
     }
 
     /// What the classic renderer has retained for a rebuild.
     pub fn journal_census(&mut self) -> crate::vrend::journal::Census {
-        self.vrend.as_mut().map(|v| v.journal_census()).unwrap_or_default()
+        let table = self.resources.read().expect("the resource lock is never poisoned");
+        self.vrend.as_mut().map(|v| v.journal_census(&*table)).unwrap_or_default()
     }
 
     pub fn counts(&self) -> (usize, usize) {
@@ -3954,6 +3959,77 @@ mod tests {
         assert!(
             early.replay_end(compositor).expect("the context is here") > 0,
             "entries handed over and never fed are lost too"
+        );
+    }
+
+    /// A classic context's journal types only the resources attached to it. Another context
+    /// that never held the embedder's surface is rebuilt whole before the VMM has given the
+    /// surface back to its holder -- the order a restore runs in when the holder's journal is fed
+    /// last -- and the holder, rebuilt without the surface, still counts what that cost it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_replay_types_only_what_its_context_holds() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::Command;
+
+        let _display = crate::vrend::one_display_at_a_time();
+        let holder = ContextId::new(1).unwrap();
+        let other = ContextId::new(2).unwrap();
+        let window = ResourceHandle::new(1).unwrap();
+        let shape = SurfaceShape {
+            width: 64,
+            height: 8,
+            format: crate::surface::PixelFormat::Bgra,
+            bytes_per_row: 256,
+        };
+        let fresh = || {
+            let mut r =
+                Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
+                    .expect("vrend comes up");
+            r.context_create(holder, CapsetId::Virgl, "holder".into()).expect("a context");
+            r.context_create(other, CapsetId::Virgl, "other".into()).expect("a context");
+            r
+        };
+        let mut live = fresh();
+        live.resource_create_surface(window, shape).expect("a surface");
+        live.ctx_attach_resource(holder, window);
+        let mut wire = Vec::new();
+        encode(
+            &Command::PipeResourceSetType {
+                resource: window,
+                format: crate::vrend::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM"),
+                bind: crate::vrend::resource::Bind::SAMPLER_VIEW.0,
+                width: 64,
+                height: 8,
+                usage: 0,
+                modifier: 0,
+                planes: vec![crate::vrend::proto::Plane { stride: 256, offset: 0 }],
+            },
+            &mut wire,
+        );
+        let bytes: Vec<u8> = wire.iter().flat_map(|d| d.to_le_bytes()).collect();
+        assert!(matches!(live.submit_cmd(holder, &bytes), Ok(Submitted::Done)));
+        let holders = live.journal_export(holder).expect("a classic context journals");
+        let others = live.journal_export(other).expect("a classic context journals");
+        drop(live);
+
+        let replay = |r: &mut Renderer, ctx: ContextId, journal: &[u8]| {
+            r.replay_begin(ctx).expect("rebuilding");
+            r.journal_restore(ctx, journal).expect("the journal reads");
+            r.replay_upto(ctx, u64::MAX).expect("a dropped command does not poison");
+            r.replay_end(ctx).expect("the context is here")
+        };
+        let mut r = fresh();
+        r.resource_create_surface(window, shape).expect("the surface back");
+        assert_eq!(replay(&mut r, other, &others), 0, "nothing of the holder's is the other's");
+        r.ctx_attach_resource(holder, window);
+        assert_eq!(replay(&mut r, holder, &holders), 0, "the holder types its surface again");
+        drop(r);
+
+        let mut lossy = fresh();
+        assert!(
+            replay(&mut lossy, holder, &holders) > 0,
+            "a holder rebuilt without its surface counts the typing it lost"
         );
     }
 
