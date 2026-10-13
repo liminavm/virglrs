@@ -66,6 +66,8 @@ fn config_of(flags: c_int) -> Config {
         venus: flags & abi::VENUS != 0,
         vrend: flags & abi::NO_VIRGL == 0,
         native_context: flags & abi::DRM != 0,
+        // No flag carries it; `virgl_renderer_init` lets the environment turn it on.
+        native_pstate: false,
         guest_vram: flags & abi::USE_GUEST_VRAM != 0,
         video: flags & abi::USE_VIDEO != 0,
         // No flag carries it, so it takes the Rust default and `virgl_renderer_init` lets the
@@ -460,6 +462,9 @@ pub extern "C" fn virgl_renderer_init(
     // decoder on either renderer.
     let forced = !config.video && std::env::var("VIRGLRS_VIDEO").as_deref() == Ok("1");
     config.video |= forced;
+    // `VIRGLRS_NATIVE_PSTATE=1` is the only way a QEMU guest is let set the host GPU's power
+    // state. See `Config::native_pstate`.
+    config.native_pstate |= std::env::var("VIRGLRS_NATIVE_PSTATE").as_deref() == Ok("1");
     // The C reads the same switch from the environment (`VIRGL_GBM_LAYOUT_ENABLE`), and no VMM
     // has a flag for it, so it is read here under the C's name -- with the C's default inverted:
     // on unless set to `0`. See `Config::linear_shared`.
@@ -3115,6 +3120,7 @@ mod tests {
                 venus: false,
                 vrend: true,
                 native_context: false,
+                native_pstate: false,
                 guest_vram: false,
                 video: false,
                 linear_shared: true,
@@ -3136,6 +3142,7 @@ mod tests {
                 venus: true,
                 vrend: false,
                 native_context: true,
+                native_pstate: false,
                 guest_vram: true,
                 video: true,
                 linear_shared: true,

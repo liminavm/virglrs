@@ -278,6 +278,21 @@ pub struct Native {
         expect(dead_code, reason = "no backend has rings")
     )]
     fences: crate::fence::Handle,
+    /// Whether a context's guest may set its GPU's power state.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "drm-amdgpu")),
+        expect(dead_code, reason = "no backend has a power state")
+    )]
+    pstate: Pstate,
+}
+
+/// Who sets a GPU's stable power state. See [`crate::Config::native_pstate`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pstate {
+    /// The host: a guest may read the state, and is refused setting it.
+    Host,
+    /// The guest, for its own context, as the kernel lets any client.
+    Guest,
 }
 
 /// The backend found at probe, and how to open a device for a new context.
@@ -298,6 +313,7 @@ impl Native {
     pub fn probe(
         budget: &Arc<crate::budget::Budget>,
         fences: &crate::fence::Handle,
+        guest_pstate: bool,
     ) -> Option<Native> {
         #[cfg(all(target_os = "linux", feature = "drm-amdgpu"))]
         if let Some(p) = amdgpu::Probed::find() {
@@ -306,6 +322,7 @@ impl Native {
                 contexts: Default::default(),
                 budget: Arc::clone(budget),
                 fences: fences.clone(),
+                pstate: if guest_pstate { Pstate::Guest } else { Pstate::Host },
             });
         }
         None
@@ -342,7 +359,7 @@ impl Native {
     fn open(&self, id: ContextId, name: String) -> Result<context::Context, Refused> {
         let backend: Box<dyn context::Backend> = match self.host {
             #[cfg(all(target_os = "linux", feature = "drm-amdgpu"))]
-            Host::Amdgpu(ref p) => Box::new(p.open(&name, &self.budget)?),
+            Host::Amdgpu(ref p) => Box::new(p.open(&name, &self.budget, self.pstate)?),
         };
         #[cfg(all(target_os = "linux", feature = "drm"))]
         {

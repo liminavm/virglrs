@@ -144,6 +144,11 @@ The C has holes this closes at the boundary:
   Here that is a rejected request.
 - `SET_PSTATE` passes the guest's operation to `DRM_AMDGPU_CTX` as it came, so a guest can free a
   GPU context the host still holds. Only the two power-state operations reach the kernel here.
+- `SET_PSTATE` also lets a guest set the power state, and the kernel applies a context's to the
+  whole device: it pins the GPU's clocks for every process on the host, and any other client's
+  request is refused `EBUSY` until the guest lets go. Any unprivileged client may do it. Here a
+  guest reads the state and is answered `-EPERM` for setting it, unless `Config::native_pstate`
+  (`VIRGLRS_NATIVE_PSTATE=1` under the C ABI) lets it; guest Mesa sets one only to profile.
 - `CS_QUERY_FENCE_STATUS` takes a guest-chosen timeout and blocks the submitting thread for it.
   Refusing a non-zero timeout would break RADV, whose wait-idle sends one second, so the wait is
   bounded at one second instead: no guest Mesa asks for more, and a hostile one stalls its own

@@ -851,7 +851,7 @@ impl Renderer {
         });
         let native = config
             .native_context
-            .then(|| crate::drm::Native::probe(&budget, &fences.handle()))
+            .then(|| crate::drm::Native::probe(&budget, &fences.handle(), config.native_pstate))
             .flatten();
         match (&native, config.native_context) {
             (Some(n), _) => eprintln!("[virglrs] native contexts: {}", n.describe()),

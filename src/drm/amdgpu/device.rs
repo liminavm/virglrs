@@ -21,7 +21,7 @@ use crate::drm::uapi::{
     AmdgpuCsChunkIb, AmdgpuDeviceInfo, AmdgpuGemCreate, AmdgpuGemVa, AmdgpuGpuInfo, AmdgpuHeapInfo,
     AmdgpuHwIpInfo, chunk, query,
 };
-use crate::drm::{Buffer, Object, Refused, Source};
+use crate::drm::{Buffer, Object, Pstate, Refused, Source};
 use crate::ids::{ResourceHandle, RingIdx};
 use bytemuck::Zeroable;
 use std::io;
@@ -80,7 +80,12 @@ impl Probed {
     }
 
     /// A device of the context's own, named after it for the kernel's accounting.
-    pub fn open(&self, name: &str, budget: &Arc<crate::budget::Budget>) -> Result<Amdgpu, Refused> {
+    pub fn open(
+        &self,
+        name: &str,
+        budget: &Arc<crate::budget::Budget>,
+        pstate: Pstate,
+    ) -> Result<Amdgpu, Refused> {
         let device = Arc::new(Device::open(&self.node).map_err(|e| Refused::NoDevice(errno(&e)))?);
         // Best effort, as in the C, which ignores the result too: the name only labels the file
         // in the kernel's per-client statistics, and the kernel refuses names it does not like.
@@ -102,6 +107,7 @@ impl Probed {
             pending: Default::default(),
             bound: Default::default(),
             budget: crate::budget::Classic::open(budget),
+            pstate,
         })
     }
 }
@@ -249,6 +255,8 @@ pub struct Amdgpu {
     /// What a buffer is counted against. Counted, never refused, as classic's driver memory is:
     /// the kernel has already allocated it by the time there is a size to count.
     budget: crate::budget::Classic,
+    /// Whether `SET_PSTATE` may set the power state, or only read it.
+    pstate: Pstate,
 }
 
 impl Amdgpu {
@@ -629,6 +637,10 @@ impl Amdgpu {
     /// The C passes the guest's operation to `DRM_AMDGPU_CTX` as it came, so a guest naming
     /// `FREE_CTX` there frees a context the host still holds. Only the two power-state operations
     /// reach the kernel here; any other is answered `-EINVAL`.
+    ///
+    /// The kernel applies a context's power state to the whole device, for every process on the
+    /// host, so setting one is answered `-EPERM` unless the host let the guest
+    /// ([`Pstate::Guest`]).
     fn set_pstate(&mut self, req: &[u8], reply: &mut Reply<'_>) -> Result<(), Refused> {
         let req: SetPstateReq = crate::drm::proto::decode(req);
         let rsp = reply.stage(proto::RSP_WITH_WORD)?;
@@ -641,10 +653,13 @@ impl Amdgpu {
             crate::drm::uapi::AMDGPU_CTX_OP_SET_STABLE_PSTATE => Some(true),
             _ => None,
         };
-        let (ret, flags) = match set.map(|set| ctx.stable_pstate(set, req.flags)) {
+        let (ret, flags) = match set {
             None => (-libc::EINVAL, 0),
-            Some(Ok(flags)) => (0, flags),
-            Some(Err(e)) => (-errno(&e), 0),
+            Some(true) if self.pstate == Pstate::Host => (-libc::EPERM, 0),
+            Some(set) => match ctx.stable_pstate(set, req.flags) {
+                Ok(flags) => (0, flags),
+                Err(e) => (-errno(&e), 0),
+            },
         };
         rsp[proto::RSP_RET..][..4].copy_from_slice(&ret.to_le_bytes());
         rsp[proto::RSP_WORD..][..4].copy_from_slice(&flags.to_le_bytes());
@@ -885,7 +900,7 @@ mod tests {
             return;
         };
         let budget = crate::budget::Budget::with_cap(None, false);
-        let backend = probed.open("t", &budget).unwrap();
+        let backend = probed.open("t", &budget, Pstate::Host).unwrap();
         let retirement = crate::fence::Retirement::start(
             Box::new(NoFences),
             crate::vrend::debug::Switches::default(),
@@ -1014,6 +1029,14 @@ mod tests {
         };
         ctx.submit(bytemuck::bytes_of(&pstate)).unwrap();
         assert_eq!(region.load_u32(ret_at), Some(0), "the power state reads");
+        let set = SetPstateReq { op: crate::drm::uapi::AMDGPU_CTX_OP_SET_STABLE_PSTATE, ..pstate };
+        // `AMDGPU_CTX_STABLE_PSTATE_PEAK`, which would pin the host's clocks.
+        ctx.submit(bytemuck::bytes_of(&SetPstateReq { flags: 4, ..set })).unwrap();
+        assert_eq!(
+            region.load_u32(ret_at),
+            Some(-libc::EPERM as u32),
+            "the device's power state is the host's to set"
+        );
         let free_ctx = SetPstateReq { op: crate::drm::uapi::AMDGPU_CTX_OP_FREE_CTX, ..pstate };
         ctx.submit(bytemuck::bytes_of(&free_ctx)).unwrap();
         assert_eq!(region.load_u32(ret_at), Some(-libc::EINVAL as u32), "no other op reaches it");
@@ -1113,8 +1136,8 @@ mod tests {
             return;
         };
         let budget = crate::budget::Budget::with_cap(None, false);
-        let mut a = probed.open("a", &budget).unwrap();
-        let mut b = probed.open("b", &budget).unwrap();
+        let mut a = probed.open("a", &budget, Pstate::Host).unwrap();
+        let mut b = probed.open("b", &budget, Pstate::Host).unwrap();
         // The renderer that made it: a file of its own, as vrend's or venus's would be.
         let maker = Arc::new(Device::open(&probed.node).unwrap());
         let gem = maker

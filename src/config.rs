@@ -19,6 +19,11 @@ pub struct Config {
     /// capset is offered only then: asked for on a host with no such GPU, this serves the rest
     /// and says why not this.
     pub native_context: bool,
+    /// Let a native context's guest set its GPU's stable power state. Off by default: on amdgpu
+    /// the kernel applies it to the whole device, pinning its clocks for every process on the host
+    /// and refusing any other's request until the guest lets go. For profiling a guest on a host
+    /// that is the guest's alone. Reading the state is always served.
+    pub native_pstate: bool,
     /// The VMM cannot inject memory pages, so a blob must come from the guest's own heap. The
     /// guest reads this back out of the venus capset and allocates accordingly.
     pub guest_vram: bool,
@@ -112,6 +117,7 @@ impl Default for Config {
             venus: false,
             vrend: false,
             native_context: false,
+            native_pstate: false,
             guest_vram: false,
             video: false,
             linear_shared: true,
