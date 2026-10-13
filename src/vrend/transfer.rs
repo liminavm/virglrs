@@ -356,7 +356,7 @@ fn reverse_rows(data: &mut [u8], row: usize, n: usize) {
 }
 
 /// `vrend_swizzle_data_bgra`: swap the first and third byte of every four.
-fn swizzle_bgra(data: &mut [u8]) {
+pub(super) fn swizzle_bgra(data: &mut [u8]) {
     for px in data.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }

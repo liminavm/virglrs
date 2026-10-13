@@ -2716,6 +2716,11 @@ fn fill_texture(
             src.len(),
         );
     }
+    // GLES stores BGRA as RGBA and every transfer swaps the bytes on the way through; a fill is
+    // one more way in, and without the swap everything that samples it reads red as blue.
+    if entry.stores_bgra_as_rgba() {
+        super::transfer::swizzle_bgra(staging);
+    }
     // The binding is put back, not cleared. This runs inside the draw's sampler loop, before the
     // unit for this sampler is made active, so the unit that happens to be current belongs to
     // some earlier sampler -- and a sampler whose view was not dirty is never re-bound, so
