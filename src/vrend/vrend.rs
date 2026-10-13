@@ -6064,8 +6064,10 @@ mod tests {
             );
             let bytes = run(host_gl, 24).unwrap_or_else(|e| panic!("{host_gl:?}: {e:?}"));
             let word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+            // Per field: a real amount can hold an 0xaa byte, but not four of them in a row as
+            // often as a test runs.
             assert!(
-                bytes.iter().all(|&b| b != 0xaa),
+                (0..bytes.len() / 4).all(|i| word(i) != 0xaaaa_aaaa),
                 "{host_gl:?}: every field written: {bytes:?}"
             );
             assert_eq!(word(0) != 0, nvx, "{host_gl:?}: device memory where NVX reports it");
