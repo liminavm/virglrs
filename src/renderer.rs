@@ -420,6 +420,19 @@ pub struct SurfaceShape {
     pub bytes_per_row: u32,
 }
 
+#[cfg(target_os = "macos")]
+impl SurfaceShape {
+    /// The shape `surface` has, or `None` for a planar one, which has no single shape.
+    fn of(surface: &crate::surface::Surface) -> Option<SurfaceShape> {
+        Some(SurfaceShape {
+            width: surface.width(),
+            height: surface.height(),
+            format: surface.pixel_format()?,
+            bytes_per_row: surface.bytes_per_row(),
+        })
+    }
+}
+
 /// A blob resource's home in this process, as a VMM needs it to publish the blob to its guest.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct HostMapping {
@@ -2181,17 +2194,32 @@ impl Renderer {
         handle: ResourceHandle,
     ) -> Result<(crate::metal::SurfacePort, SurfaceShape), Error> {
         self.with_resource(handle, |_| ()).ok_or(Error::NoResource)?;
-        self.with_surface(handle, |surface| {
-            let shape = SurfaceShape {
-                width: surface.width(),
-                height: surface.height(),
-                format: surface.pixel_format()?,
-                bytes_per_row: surface.bytes_per_row(),
-            };
-            Some((surface.port()?, shape))
-        })
-        .flatten()
-        .ok_or(Error::NotExportable)
+        self.with_surface(handle, |surface| Some((surface.port()?, SurfaceShape::of(surface)?)))
+            .flatten()
+            .ok_or(Error::NotExportable)
+    }
+
+    /// Every surface [`Self::resource_create_surface`] minted, by resource, with its shape: what
+    /// an embedder snapshotting its own renderer needs to make them again.
+    ///
+    /// The shape is read from the surface, not kept beside it, so it goes when the resource goes
+    /// and an embedder holding only resource ids has nothing of its own to forget.
+    #[cfg(target_os = "macos")]
+    pub fn embedder_surfaces(&self) -> Vec<(ResourceHandle, SurfaceShape)> {
+        let table = self.resources.read().expect("the resource lock is never poisoned");
+        let mut surfaces: Vec<_> = table
+            .iter()
+            .filter_map(|(&handle, r)| match &r.backing {
+                Backing::Embedder { surface } => {
+                    let shape = SurfaceShape::of(surface.surface())
+                        .expect("an embedder surface is minted in a single-plane format");
+                    Some((handle, shape))
+                }
+                _ => None,
+            })
+            .collect();
+        surfaces.sort_by_key(|&(handle, _)| handle.get());
+        surfaces
     }
 
     /// A descriptor of a resource's storage, for a VMM that composites by importing rather than
@@ -4162,6 +4190,33 @@ mod tests {
             "a surface with no pitch is refused"
         );
         assert!(r.with_resource(refused, |_| ()).is_none(), "and leaves nothing behind");
+    }
+
+    /// The surfaces minted for the embedder are listed with the shapes they were made in, and
+    /// nothing else is: a resource that goes takes its row with it, with no one told.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_embedder_surfaces_are_the_ones_minted_for_it_while_they_live() {
+        let mut r = renderer(Config::default());
+        let shape = |format, width: u32, bytes_per_row| SurfaceShape {
+            width,
+            height: 8,
+            format,
+            bytes_per_row,
+        };
+        let window = ResourceHandle::new(3).unwrap();
+        let luma = ResourceHandle::new(1).unwrap();
+        let unminted = ResourceHandle::new(2).unwrap();
+        let window_shape = shape(crate::surface::PixelFormat::Bgra, 64, 256);
+        let luma_shape = shape(crate::surface::PixelFormat::R8, 64, 64);
+        r.resource_create_surface(window, window_shape).expect("a window surface");
+        r.resource_create_surface(luma, luma_shape).expect("a plane surface");
+        let guest = BlobDesc { blob_flags: 0, source: BlobSource::Guest, size: 4096 };
+        r.resource_create_blob(unminted, guest, Vec::new()).expect("a guest blob");
+
+        assert_eq!(r.embedder_surfaces(), vec![(luma, luma_shape), (window, window_shape)]);
+        r.resource_unref(window);
+        assert_eq!(r.embedder_surfaces(), vec![(luma, luma_shape)], "the window went with it");
     }
 
     #[cfg(target_os = "macos")]
