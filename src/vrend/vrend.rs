@@ -2799,6 +2799,108 @@ mod tests {
         v.context_destroy(ctx, &AllAttached);
     }
 
+    /// A BGRA blob with no surface, typed by `SET_TYPE` and filled from its pages, reads back as
+    /// the bytes the pages hold, on either flavour. GLES stores BGRA as RGBA and every transfer
+    /// swaps the bytes on the way through; a fill that does not swap them on the way in leaves the
+    /// texture's red and blue exchanged for everything that samples it, which is how a venus
+    /// window buffer composited with its colours swapped.
+    #[test]
+    fn a_bgra_blob_filled_from_its_pages_reads_back_as_its_pages() {
+        use crate::vrend::encode::encode;
+        use crate::vrend::proto::Command;
+        let _display = crate::vrend::one_display_at_a_time();
+        struct Discard;
+        impl crate::fence::FenceSink for Discard {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, _: FenceId) {}
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        struct Pages(Vec<crate::abi::GuestIov>);
+        impl Guest for Pages {
+            fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
+                true
+            }
+            fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+                None
+            }
+            fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
+                Some(PixelSource::Scattered(Iov::new(&self.0)))
+            }
+        }
+        const W: u32 = 4;
+        const H: u32 = 2;
+        let read_back = |host_gl| {
+            let retire = crate::fence::Retirement::start(
+                Box::new(Discard),
+                crate::vrend::debug::Switches::default(),
+            );
+            let mut v = Vrend::new(
+                Config { host_gl, ..Config::default() },
+                &crate::budget::Budget::with_cap(None, false),
+                retire.handle(),
+                None,
+                crate::vrend::resource::Condemned::default(),
+                crate::vrend::debug::Traces::default(),
+                crate::vrend::debug::Switches::default(),
+            )
+            .expect("vrend comes up");
+            // Every byte distinct, so a swap of any two channels shows.
+            let mut pixels: Vec<u8> = (0..(W * H * 4) as u8).collect();
+            let guest = Pages(vec![crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(pixels.as_mut_ptr().cast()),
+                len: pixels.len(),
+            }]);
+            let ctx = ClassicCtx::for_test(ContextId::new(1).expect("a context id"));
+            v.context_create(ctx, &guest).expect("a context");
+            let res = ResourceHandle::new(1).expect("a resource handle is non-zero");
+            v.resource_attach_blob(ctx, res, None);
+            let mut wire = Vec::new();
+            encode(
+                &Command::PipeResourceSetType {
+                    resource: res,
+                    format: super::super::proto::Format::from_wire(1).expect("B8G8R8A8_UNORM"),
+                    bind: resource::Bind::SAMPLER_VIEW.0,
+                    width: W,
+                    height: H,
+                    usage: 0,
+                    modifier: 0,
+                    planes: vec![crate::vrend::proto::Plane { stride: W * 4, offset: 0 }],
+                },
+                &mut wire,
+            );
+            v.submit(ctx, &wire, &guest).expect("the context is here").expect("typed");
+            let info = transfer::Info {
+                level: 0,
+                stride: W * 4,
+                layer_stride: W * H * 4,
+                offset: 0,
+                region: crate::vrend::proto::Box3 {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    width: W as i32,
+                    height: H as i32,
+                    depth: 1,
+                },
+                synchronized: false,
+            };
+            let mut read = vec![0xa5u8; pixels.len()];
+            let into = [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(read.as_mut_ptr().cast()),
+                len: read.len(),
+            }];
+            let into = Iov::new(&into);
+            v.transfer(None, res, None, transfer::Through::ToGuest(&into), &info)
+                .expect("the readback");
+            v.context_destroy(ctx, &guest);
+            (read, pixels)
+        };
+        let (read, pixels) = read_back(HostGl::Gles);
+        assert_eq!(read, pixels, "GLES reads back the pages it was filled from");
+        let (read, pixels) = read_back(HostGl::Desktop);
+        assert_eq!(read, pixels, "desktop GL reads back the pages it was filled from");
+    }
+
     /// A texture no framebuffer can read reads back into pages other than the ones it was written
     /// from: desktop GL through `glGetCompressedTexImage`, GLES by copying the blocks into an
     /// integer texture it can read. The answer from the pages the guest already holds is a
