@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use crate::ids::SurfaceId;
 use crate::surface::PlaneShape;
+use crate::vrend::formats::DrmFourcc;
 
 // ------------------------------------------------------------------ foreign
 
@@ -215,6 +216,29 @@ pub enum PixelFormat {
 }
 
 impl PixelFormat {
+    /// Every format, for a caller that has a code and wants the format it names.
+    const ALL: [PixelFormat; 4] =
+        [PixelFormat::Bgra, PixelFormat::Rgba, PixelFormat::R8, PixelFormat::Rg8];
+
+    /// The DRM fourcc a guest and an embedder name it by.
+    ///
+    /// One code per format, and [`PixelFormat::from_drm`] takes exactly these back, so a code
+    /// taken in is the code answered. An opaque `XR24` or `XB24` is refused rather than taken as
+    /// an alias: an alias is a code that comes back different from the one sent.
+    pub fn drm_fourcc(self) -> DrmFourcc {
+        match self {
+            PixelFormat::Bgra => DrmFourcc::new(*b"AR24"),
+            PixelFormat::Rgba => DrmFourcc::new(*b"AB24"),
+            PixelFormat::R8 => DrmFourcc::new(*b"R8  "),
+            PixelFormat::Rg8 => DrmFourcc::new(*b"GR88"),
+        }
+    }
+
+    /// The format a DRM fourcc names, or `None` for one no surface is minted in.
+    pub fn from_drm(code: DrmFourcc) -> Option<PixelFormat> {
+        Self::ALL.into_iter().find(|f| f.drm_fourcc() == code)
+    }
+
     /// The FourCC IOSurface names it by.
     fn fourcc(self) -> u32 {
         match self {
@@ -858,9 +882,7 @@ impl Surface {
         }
         // SAFETY: a read-only query of the live surface this type owns.
         let code = unsafe { IOSurfaceGetPixelFormat(self.as_ref()) };
-        [PixelFormat::Bgra, PixelFormat::Rgba, PixelFormat::R8, PixelFormat::Rg8]
-            .into_iter()
-            .find(|f| f.fourcc() == code)
+        PixelFormat::ALL.into_iter().find(|f| f.fourcc() == code)
     }
 
     /// How many planes the surface has. Zero for a surface that is not planar.
@@ -1384,6 +1406,27 @@ impl Drop for Number {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every format has one DRM code, the codes are the ones `drm_fourcc.h` gives, and each comes
+    /// back as the format it was taken from -- so an embedder that names a surface by code and is
+    /// answered by code never sees one change under it.
+    #[test]
+    fn a_drm_fourcc_names_one_format_and_comes_back_as_itself() {
+        let codes = [
+            (PixelFormat::Bgra, 0x3432_5241), // DRM_FORMAT_ARGB8888
+            (PixelFormat::Rgba, 0x3432_4241), // DRM_FORMAT_ABGR8888
+            (PixelFormat::R8, 0x2020_3852),   // DRM_FORMAT_R8
+            (PixelFormat::Rg8, 0x3838_5247),  // DRM_FORMAT_GR88
+        ];
+        assert_eq!(codes.len(), PixelFormat::ALL.len(), "every format is checked");
+        for (format, code) in codes {
+            assert_eq!(format.drm_fourcc().get(), code, "{format:?}");
+            assert_eq!(PixelFormat::from_drm(format.drm_fourcc()), Some(format), "{format:?}");
+        }
+        for opaque in [*b"XR24", *b"XB24"] {
+            assert_eq!(PixelFormat::from_drm(DrmFourcc::new(opaque)), None, "no alias");
+        }
+    }
 
     /// A planar surface is one allocation with every plane inside it, laid out as this side
     /// dictated -- which is the whole reason to ask for one rather than mint a surface per plane.
