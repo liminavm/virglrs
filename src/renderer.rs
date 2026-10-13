@@ -2181,6 +2181,8 @@ impl Renderer {
         handle: ResourceHandle,
     ) -> Result<(crate::metal::SurfacePort, SurfaceShape), Error> {
         self.with_resource(handle, |_| ()).ok_or(Error::NoResource)?;
+        // An importer refused here is a window that stays black; the pages know why.
+        let _ = self.resource_surface_id(handle);
         self.with_surface(handle, |surface| {
             let shape = SurfaceShape {
                 width: surface.width(),
