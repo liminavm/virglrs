@@ -75,7 +75,7 @@ pub enum Refused {
     /// A query asked for more than the C ever answers in one response.
     ResponseTooLarge(u32),
     /// The host could not open a device for the context; the error is the kernel's.
-    NoDevice(i32),
+    NoDevice(Errno),
     /// A blob id the guest cannot have made: zero, or wider than the protocol's 32 bits.
     BlobId(u64),
     /// A buffer under a blob id that already has one waiting to be bound.
@@ -101,7 +101,49 @@ pub enum Refused {
     Reserved(u64),
     /// The kernel refused a command the protocol answers by dropping the submission; the error is
     /// the kernel's.
-    Kernel(i32),
+    Kernel(Errno),
+}
+
+/// A kernel error, as a refusal carries it: comparable, which an `io::Error` is not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Errno(pub i32);
+
+impl Errno {
+    /// The kernel's error behind `e`, or `EIO` for one that came from no system call.
+    pub fn of(e: &std::io::Error) -> Errno {
+        Errno(e.raw_os_error().unwrap_or(libc::EIO))
+    }
+
+    /// How a response answers it: negated, as the kernel's ioctls return it.
+    pub fn answer(self) -> i32 {
+        -self.0
+    }
+}
+
+impl std::fmt::Display for Errno {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::io::Error::from_raw_os_error(self.0).fmt(f)
+    }
+}
+
+/// A blob id a native guest made: 32 bits and never zero, as the protocol has it. Only
+/// [`NativeBlob::new`] makes one, so every holder has a valid id.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct NativeBlob(std::num::NonZeroU32);
+
+impl NativeBlob {
+    /// The guest's `id`, refused when it is zero or wider than the protocol's 32 bits.
+    pub fn new(id: u64) -> Result<NativeBlob, Refused> {
+        u32::try_from(id)
+            .ok()
+            .and_then(std::num::NonZeroU32::new)
+            .map(NativeBlob)
+            .ok_or(Refused::BlobId(id))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get() as u64
+    }
 }
 
 impl std::fmt::Display for Refused {
@@ -122,9 +164,7 @@ impl std::fmt::Display for Refused {
             Refused::SecondRegion => f.write_str("a second response region"),
             Refused::RegionSize(n) => write!(f, "a response region of {n} bytes"),
             Refused::ResponseTooLarge(n) => write!(f, "a {n}-byte answer is too large"),
-            Refused::NoDevice(e) => {
-                write!(f, "no device: {}", std::io::Error::from_raw_os_error(*e))
-            }
+            Refused::NoDevice(e) => write!(f, "no device: {e}"),
             Refused::BlobId(id) => write!(f, "blob id {id:#x} is not one a guest makes"),
             Refused::BlobIdInUse(id) => write!(f, "blob id {id} already has a buffer waiting"),
             Refused::NoSuchBlob(id) => write!(f, "no buffer waits under blob id {id}"),
@@ -138,9 +178,7 @@ impl std::fmt::Display for Refused {
             Refused::TooManyChunks(n) => write!(f, "{n} chunks in one submission"),
             Refused::Chunk(id) => write!(f, "a malformed or unknown chunk {id}"),
             Refused::Reserved(v) => write!(f, "a reserved field or flag is set: {v:#x}"),
-            Refused::Kernel(e) => {
-                write!(f, "the kernel refused: {}", std::io::Error::from_raw_os_error(*e))
-            }
+            Refused::Kernel(e) => write!(f, "the kernel refused: {e}"),
         }
     }
 }
@@ -364,7 +402,7 @@ impl Native {
         #[cfg(all(target_os = "linux", feature = "drm"))]
         {
             let timelines = timeline::Timelines::start(id, backend.rings(), self.fences.clone())
-                .map_err(|e| Refused::NoDevice(e.raw_os_error().unwrap_or(libc::EIO)))?;
+                .map_err(|e| Refused::NoDevice(Errno::of(&e)))?;
             Ok(context::Context::new(name, backend, Some(timelines)))
         }
         #[cfg(not(all(target_os = "linux", feature = "drm")))]

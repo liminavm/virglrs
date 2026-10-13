@@ -7,7 +7,7 @@
 use super::proto::{self, ReqHeader};
 use super::region::ResponseRegion;
 use super::timeline::Timelines;
-use super::{Buffer, Refused, Source};
+use super::{Buffer, NativeBlob, Refused, Source};
 use crate::guest_mem::GuestMap;
 use crate::ids::{BlobId, FenceId, ResourceHandle, RingIdx};
 use std::os::fd::OwnedFd;
@@ -47,7 +47,7 @@ pub trait Backend: Send {
     fn get_blob(
         &mut self,
         handle: ResourceHandle,
-        blob: u32,
+        blob: NativeBlob,
         size: u64,
         flags: u32,
         region: Option<&ResponseRegion>,
@@ -181,8 +181,8 @@ impl Context {
         size: u64,
         flags: u32,
     ) -> Result<Buffer, Refused> {
-        let id = u32::try_from(blob.0).ok().filter(|&id| id != 0).ok_or(Refused::BlobId(blob.0))?;
-        self.backend.get_blob(handle, id, size, flags, self.region.as_ref())
+        let blob = NativeBlob::new(blob.0)?;
+        self.backend.get_blob(handle, blob, size, flags, self.region.as_ref())
     }
 
     pub fn attach(&mut self, handle: ResourceHandle, source: Source<'_>) -> Result<(), Refused> {
@@ -272,12 +272,12 @@ mod tests {
         fn get_blob(
             &mut self,
             _handle: ResourceHandle,
-            blob: u32,
+            blob: NativeBlob,
             _size: u64,
             _flags: u32,
             _region: Option<&ResponseRegion>,
         ) -> Result<Buffer, Refused> {
-            Err(Refused::NoSuchBlob(blob as u64))
+            Err(Refused::NoSuchBlob(blob.get()))
         }
         fn attach(&mut self, _handle: ResourceHandle, _source: Source<'_>) -> Result<(), Refused> {
             Ok(())

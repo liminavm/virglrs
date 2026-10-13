@@ -21,7 +21,7 @@ use crate::drm::uapi::{
     AmdgpuCsChunkIb, AmdgpuDeviceInfo, AmdgpuGemCreate, AmdgpuGemVa, AmdgpuGpuInfo, AmdgpuHeapInfo,
     AmdgpuHwIpInfo, chunk, query,
 };
-use crate::drm::{Buffer, Object, Pstate, Refused, Source};
+use crate::drm::{Buffer, Errno, NativeBlob, Object, Pstate, Refused, Source};
 use crate::ids::{ResourceHandle, RingIdx};
 use bytemuck::Zeroable;
 use std::io;
@@ -35,9 +35,9 @@ const MAX_RINGS_PER_IP: u32 = 8;
 /// `VIRTGPU_BLOB_FLAG_USE_SHAREABLE`: the guest will share the blob, so it is exported now.
 const BLOB_FLAG_USE_SHAREABLE: u32 = 2;
 
-fn errno(e: &io::Error) -> i32 {
-    e.raw_os_error().unwrap_or(libc::EIO)
-}
+/// The id the kernel gave a GPU context, which the guest names it by.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct GpuCtxId(u32);
 
 /// The amdgpu device this host has, as probed once at init.
 pub struct Probed {
@@ -82,7 +82,8 @@ impl Probed {
         budget: &Arc<crate::budget::Budget>,
         pstate: Pstate,
     ) -> Result<Amdgpu, Refused> {
-        let device = Arc::new(Device::open(&self.node).map_err(|e| Refused::NoDevice(errno(&e)))?);
+        let device =
+            Arc::new(Device::open(&self.node).map_err(|e| Refused::NoDevice(Errno::of(&e)))?);
         // Best effort, as in the C, which ignores the result too: the name only labels the file
         // in the kernel's per-client statistics, and the kernel refuses names it does not like.
         if !name.is_empty()
@@ -92,7 +93,7 @@ impl Probed {
         }
         let rings = rings(&device);
         if rings == 0 {
-            return Err(Refused::NoDevice(libc::ENODEV));
+            return Err(Refused::NoDevice(Errno(libc::ENODEV)));
         }
         Ok(Amdgpu {
             device,
@@ -234,7 +235,7 @@ pub struct Amdgpu {
     /// The guest's ring indices run from 1 to this.
     rings: u32,
     /// The GPU contexts the guest made, by the id the kernel gave each.
-    gpu_contexts: crate::Map<u32, AmdgpuCtx>,
+    gpu_contexts: crate::Map<GpuCtxId, AmdgpuCtx>,
     /// What each ring's newest submission signals, until a fence takes it. Index `i` is ring
     /// `i + 1`.
     last_submit: Vec<Option<OwnedFd>>,
@@ -243,7 +244,7 @@ pub struct Amdgpu {
     async_error: u32,
     /// Buffers `GEM_NEW` made that no resource has bound yet, by blob id. The context is their
     /// only owner.
-    pending: crate::Map<u32, Object>,
+    pending: crate::Map<NativeBlob, Object>,
     /// The buffers bound to resources in this context, which is how the guest names a buffer in
     /// every later command. The resource owns each: this names it, so a buffer whose resource is
     /// gone stops resolving with no purge at the unref, and a detach is what removes the name.
@@ -323,10 +324,7 @@ impl Amdgpu {
         if req.pad != 0 {
             return Err(Refused::Reserved(req.pad as u64));
         }
-        let blob = u32::try_from(req.blob_id)
-            .ok()
-            .filter(|&id| id != 0)
-            .ok_or(Refused::BlobId(req.blob_id))?;
+        let blob = NativeBlob::new(req.blob_id)?;
         if self.pending.contains_key(&blob) {
             return Err(Refused::BlobIdInUse(req.blob_id));
         }
@@ -338,7 +336,7 @@ impl Amdgpu {
                 domains: req.preferred_heap as u64,
                 domain_flags: req.flags,
             })
-            .map_err(|e| Refused::Kernel(errno(&e)))?;
+            .map_err(|e| Refused::Kernel(Errno::of(&e)))?;
         // Write-combined unless it is GTT the guest did not ask to be, as the C decides it.
         let write_combining = req.preferred_heap != AMDGPU_GEM_DOMAIN_GTT
             || req.flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC != 0;
@@ -384,7 +382,7 @@ impl Amdgpu {
             };
             match self.device.amdgpu_gem_va(object.as_ref().map(|o| &*o.gem), va) {
                 Ok(()) => 0,
-                Err(e) => -errno(&e),
+                Err(e) => Errno::of(&e).answer(),
             }
         };
         rsp[proto::RSP_RET..].copy_from_slice(&ret.to_le_bytes());
@@ -412,7 +410,7 @@ impl Amdgpu {
         }
         let ret = if req.flags & proto::CREATE_CTX_DESTROY != 0 {
             // Dropping it frees it. An id with no context is the guest's mistake, and is answered.
-            match self.gpu_contexts.remove(&req.priority_or_id) {
+            match self.gpu_contexts.remove(&GpuCtxId(req.priority_or_id)) {
                 Some(_) => 0,
                 None => -libc::EINVAL,
             }
@@ -421,10 +419,10 @@ impl Amdgpu {
                 Ok(ctx) => {
                     let id = ctx.id();
                     rsp[proto::CREATE_CTX_RSP_ID..][..4].copy_from_slice(&id.to_le_bytes());
-                    self.gpu_contexts.insert(id, ctx);
+                    self.gpu_contexts.insert(GpuCtxId(id), ctx);
                     0
                 }
-                Err(e) => -errno(&e),
+                Err(e) => Errno::of(&e).answer(),
             }
         };
         rsp[proto::RSP_RET..][..4].copy_from_slice(&ret.to_le_bytes());
@@ -452,7 +450,10 @@ impl Amdgpu {
         if head.ring_idx == 0 || head.ring_idx > self.rings {
             return Err(Refused::Ring(head.ring_idx));
         }
-        let ctx = self.gpu_contexts.get(&head.ctx_id).ok_or(Refused::NoGpuContext(head.ctx_id))?;
+        let ctx = self
+            .gpu_contexts
+            .get(&GpuCtxId(head.ctx_id))
+            .ok_or(Refused::NoGpuContext(head.ctx_id))?;
         let descs_at = size_of::<CsSubmitReq>();
         let data_at = descs_at + head.num_chunks as usize * size_of::<ChunkDesc>();
         let descs = req.get(descs_at..data_at).ok_or(Refused::Chunk(0))?;
@@ -520,7 +521,7 @@ impl Amdgpu {
             }
         }
 
-        let signalled = self.device.syncobj_create().map_err(|e| Refused::Kernel(errno(&e)))?;
+        let signalled = self.device.syncobj_create().map_err(|e| Refused::Kernel(Errno::of(&e)))?;
         let gems: Option<Vec<(&sys::Gem, u32)>> =
             bo_list.as_ref().map(|l| l.iter().map(|(o, p)| (&*o.gem, *p)).collect());
         // In the guest's order, as the C passes them; the output syncobj last.
@@ -553,7 +554,7 @@ impl Amdgpu {
                     head.ring_idx, head.ctx_id
                 );
                 self.async_failure(region);
-                Err(Refused::Kernel(errno(&e)))
+                Err(Refused::Kernel(Errno::of(&e)))
             }
         }
     }
@@ -574,7 +575,7 @@ impl Amdgpu {
             .ok_or(Refused::RequestLength(head.hdr.len))?;
         let ret = match object.gem.amdgpu_set_metadata(head.flags, head.tiling_info, data) {
             Ok(()) => 0,
-            Err(e) => -errno(&e),
+            Err(e) => Errno::of(&e).answer(),
         };
         rsp[proto::RSP_RET..].copy_from_slice(&ret.to_le_bytes());
         Ok(())
@@ -592,7 +593,7 @@ impl Amdgpu {
         let mut out: BoQueryInfoRsp = bytemuck::Zeroable::zeroed();
         out.ret = match self.buffer(req.res_id).map(|o| o.gem.amdgpu_query()) {
             None => -libc::EINVAL,
-            Some(Err(e)) => -errno(&e),
+            Some(Err(e)) => Errno::of(&e).answer(),
             // libdrm's own check on the kernel's answer.
             Some(Ok((_, meta))) if meta.data_size_bytes > proto::MAX_METADATA => -libc::EINVAL,
             Some(Ok((info, meta))) => {
@@ -622,7 +623,7 @@ impl Amdgpu {
         let reserve = req.flags & proto::RESERVE_VMID_UNRESERVE == 0;
         let ret = match self.device.amdgpu_reserve_vmid(reserve) {
             Ok(()) => 0,
-            Err(e) => -errno(&e),
+            Err(e) => Errno::of(&e).answer(),
         };
         rsp[proto::RSP_RET..].copy_from_slice(&ret.to_le_bytes());
         Ok(())
@@ -643,7 +644,10 @@ impl Amdgpu {
         if req.pad != 0 {
             return Err(Refused::Reserved(req.pad as u64));
         }
-        let ctx = self.gpu_contexts.get(&req.ctx_id).ok_or(Refused::NoGpuContext(req.ctx_id))?;
+        let ctx = self
+            .gpu_contexts
+            .get(&GpuCtxId(req.ctx_id))
+            .ok_or(Refused::NoGpuContext(req.ctx_id))?;
         let set = match req.op {
             crate::drm::uapi::AMDGPU_CTX_OP_GET_STABLE_PSTATE => Some(false),
             crate::drm::uapi::AMDGPU_CTX_OP_SET_STABLE_PSTATE => Some(true),
@@ -654,7 +658,7 @@ impl Amdgpu {
             Some(true) if self.pstate == Pstate::Host => (-libc::EPERM, 0),
             Some(set) => match ctx.stable_pstate(set, req.flags) {
                 Ok(flags) => (0, flags),
-                Err(e) => (-errno(&e), 0),
+                Err(e) => (Errno::of(&e).answer(), 0),
             },
         };
         rsp[proto::RSP_RET..][..4].copy_from_slice(&ret.to_le_bytes());
@@ -677,7 +681,10 @@ impl Amdgpu {
     ) -> Result<(), Refused> {
         let req: QueryFenceStatusReq = crate::drm::proto::decode(req);
         let rsp = reply.stage(proto::RSP_WITH_WORD)?;
-        let ctx = self.gpu_contexts.get(&req.ctx_id).ok_or(Refused::NoGpuContext(req.ctx_id))?;
+        let ctx = self
+            .gpu_contexts
+            .get(&GpuCtxId(req.ctx_id))
+            .ok_or(Refused::NoGpuContext(req.ctx_id))?;
         let want = if req.flags & proto::FENCE_TIMEOUT_IS_ABSOLUTE != 0 {
             std::time::Duration::ZERO
         } else {
@@ -693,7 +700,7 @@ impl Amdgpu {
                 |timeout| ctx.wait_cs(req.ip_type, req.ip_instance, req.ring, req.fence, timeout);
             match waits.bounded(want, wait) {
                 Ok(busy) => (0, !busy),
-                Err(e) => (-errno(&e), false),
+                Err(e) => (Errno::of(&e).answer(), false),
             }
         };
         rsp[proto::RSP_RET..][..4].copy_from_slice(&ret.to_le_bytes());
@@ -765,7 +772,7 @@ impl Backend for Amdgpu {
     fn get_blob(
         &mut self,
         handle: ResourceHandle,
-        blob: u32,
+        blob: NativeBlob,
         size: u64,
         flags: u32,
         region: Option<&ResponseRegion>,
@@ -773,13 +780,13 @@ impl Backend for Amdgpu {
         if self.bound.get(&handle).is_some_and(|w| w.strong_count() > 0) {
             return Err(Refused::ResourceBound(handle.get()));
         }
-        let object = self.pending.get(&blob).ok_or(Refused::NoSuchBlob(blob as u64))?;
+        let object = self.pending.get(&blob).ok_or(Refused::NoSuchBlob(blob.get()))?;
         let have = object.extent().map_or(0, |e| e as u64);
         if size > have {
             return Err(Refused::BlobTooLarge { asked: size, have });
         }
         let dmabuf = if flags & BLOB_FLAG_USE_SHAREABLE != 0 {
-            Some(object.gem.export().map_err(|e| Refused::Kernel(errno(&e)))?)
+            Some(object.gem.export().map_err(|e| Refused::Kernel(Errno::of(&e)))?)
         } else {
             None
         };
@@ -804,7 +811,7 @@ impl Backend for Amdgpu {
         if self.bound.get(&handle).is_some_and(|w| w.strong_count() > 0) {
             return Ok(());
         }
-        let kernel = |e: io::Error| Refused::Kernel(errno(&e));
+        let kernel = |e: io::Error| Refused::Kernel(Errno::of(&e));
         let object = match source {
             Source::Native(buffer) => {
                 let here = std::iter::once(&buffer.object)
@@ -1018,7 +1025,7 @@ mod tests {
             req
         };
         assert_eq!(ctx.submit(&submit(9, 6)).err(), Some(Refused::NoBuffer(9)));
-        assert_eq!(ctx.submit(&submit(3, 7)).err(), Some(Refused::Kernel(libc::EINVAL)));
+        assert_eq!(ctx.submit(&submit(3, 7)).err(), Some(Refused::Kernel(Errno(libc::EINVAL))));
         assert_eq!(region.load_u32(proto::shmem::ASYNC_ERROR), Some(3));
         assert_eq!(ctx.submit_fence(RingIdx(1), crate::ids::FenceId(1)), Ok(true));
         // The remaining commands, each answered by the kernel or by libdrm's own checks.
