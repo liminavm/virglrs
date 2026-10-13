@@ -4469,6 +4469,44 @@ mod tests {
         unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
     }
 
+    /// A descriptor to hand away, and the far end of its pipe, which says when it was closed.
+    ///
+    /// Asking whether the *number* is still open races every other test in the process: tests
+    /// run in parallel, and the moment the number is closed another open may reuse it. The far
+    /// end watches the open file itself, which no other test can reopen.
+    fn a_watched_descriptor() -> (OwnedFd, Watch) {
+        let mut fds = [0 as std::ffi::c_int; 2];
+        // SAFETY: `pipe` fills two ints at the pointer it is given; `fds` is exactly that.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "the test needs a pipe");
+        // SAFETY: `pipe` succeeded, so both are open descriptors this test owns, each once.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // SAFETY: `read` is open; `F_SETFL` only sets its status flags.
+        assert_eq!(unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) }, 0);
+        (write, Watch(read))
+    }
+
+    /// The read end of an [`a_watched_descriptor`] pipe.
+    struct Watch(OwnedFd);
+
+    impl Watch {
+        /// Whether every descriptor of the write end has been closed: an empty pipe then reads
+        /// end-of-file, where one still open would block.
+        fn closed(&self) -> bool {
+            let mut byte = 0u8;
+            // SAFETY: one byte into a one-byte buffer, from a descriptor this `Watch` owns.
+            let n = unsafe { libc::read(self.0.as_raw_fd(), (&raw mut byte).cast(), 1) };
+            match n {
+                0 => true,
+                -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock => {
+                    false
+                }
+                other => {
+                    panic!("nothing writes to the pipe, so a read gets EOF or EAGAIN: {other}")
+                }
+            }
+        }
+    }
+
     fn import_desc(size: u64) -> ImportDesc {
         ImportDesc { blob_mem: BlobMem::Host3d, fd_type: FdType::DmaBuf, size }
     }
@@ -4480,14 +4518,13 @@ mod tests {
     /// the process -- a VMM importing per frame runs out of them.
     #[test]
     fn unref_closes_the_descriptor_the_import_took() {
-        let fd = a_descriptor();
-        let raw = fd.as_raw_fd();
+        let (fd, watch) = a_watched_descriptor();
         let mut r = renderer(Config::default());
         let h = ResourceHandle::new(1).unwrap();
         r.resource_import(h, import_desc(4096), fd).expect("a fresh handle and a real size");
-        assert!(is_open(raw), "the resource holds the descriptor while it lives");
+        assert!(!watch.closed(), "the resource holds the descriptor while it lives");
         r.resource_unref(h);
-        assert!(!is_open(raw), "dropping the resource closes it");
+        assert!(watch.closed(), "dropping the resource closes it");
     }
 
     /// A refused import gives the descriptor back, still open.
@@ -4748,8 +4785,7 @@ mod tests {
 
     #[test]
     fn a_reset_frees_the_ids_and_the_memory_it_says_it_frees() {
-        let fd = a_descriptor();
-        let raw = fd.as_raw_fd();
+        let (fd, watch) = a_watched_descriptor();
         let mut r = renderer(Config::default());
         let ctx = ContextId::new(1).unwrap();
         let res = ResourceHandle::new(1).unwrap();
@@ -4762,7 +4798,7 @@ mod tests {
         r.reset();
 
         assert_eq!(r.counts(), (0, 0), "nothing survives a reset");
-        assert!(!is_open(raw), "and the memory a resource held goes with it");
+        assert!(watch.closed(), "and the memory a resource held goes with it");
         r.context_create(ctx, CapsetId::Virgl, "after".into())
             .expect("the id the reset freed is free");
     }
