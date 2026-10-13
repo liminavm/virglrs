@@ -501,10 +501,9 @@ impl Drop for Gem {
     fn drop(&mut self) {
         let mut live =
             self.device.live.lock().expect("the handle set is never held across a panic");
-        let entry = live.get(&self.handle).expect("an open handle is in the table");
-        if !std::ptr::eq(entry.as_ptr(), self) {
-            // An import took the handle over while this was on its way out: it is that `Gem`'s
-            // to close now.
+        // An import that took the handle over while this was on its way out made it that `Gem`'s
+        // to close, and that one may already have closed it and left the table.
+        if !live.get(&self.handle).is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self)) {
             return;
         }
         live.remove(&self.handle);
