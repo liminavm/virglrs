@@ -615,6 +615,20 @@ impl Vrend {
         (host, contexts)
     }
 
+    /// Why this host's GL would not make an R8 or an RG8 IOSurface a texture's storage, or `None`
+    /// when it takes both: what promoting a video plane to a surface needs. Stock Mesa refuses
+    /// them; the tests that are about a promoted plane ask this first and skip, saying so.
+    #[cfg(all(test, target_os = "macos"))]
+    pub fn plane_surface_refusal(&self) -> Option<String> {
+        use crate::surface::{PixelFormat, Surface};
+        [PixelFormat::R8, PixelFormat::Rg8].into_iter().find_map(|format| {
+            let made = Surface::plain(16, 16, format).map_err(|e| format!("{e:?}")).and_then(|s| {
+                self.winsys.image_from_surface(Arc::new(s)).map_err(|e| e.to_string())
+            });
+            made.err().map(|e| format!("the host GL takes no {format:?} IOSurface ({e})"))
+        })
+    }
+
     /// What has been retained for a rebuild: every live context's objects and current state,
     /// plus the type each live blob was given.
     ///
@@ -5666,6 +5680,18 @@ mod tests {
         v.features.has(feature)
     }
 
+    /// Whether a test about a promoted video plane must skip on this host, said loudly when it
+    /// must: see [`Vrend::plane_surface_refusal`].
+    #[cfg(target_os = "macos")]
+    fn skips_without_plane_surfaces(host_gl: HostGl, test: &str) -> bool {
+        let _display = crate::vrend::one_display_at_a_time();
+        let Some(why) = renderer(host_gl).plane_surface_refusal() else {
+            return false;
+        };
+        eprintln!("SKIPPED {test}: {why}; it needs a host GL that takes R8 and RG8 IOSurfaces");
+        true
+    }
+
     /// A buffer of `width` bytes: host memory for `Bind::CUSTOM`, a GL buffer otherwise.
     /// A renderer of `host_gl`, brought up to ask what it offers.
     fn renderer(host_gl: HostGl) -> Vrend {
@@ -9339,7 +9365,11 @@ mod tests {
     #[test]
     fn every_bound_view_of_a_plane_samples_the_surface_it_becomes() {
         use crate::vrend::pipe::Swizzle;
-        bound_plane_views_after_promotion([Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::One], 'x');
+        bound_plane_views_after_promotion(
+            "every_bound_view_of_a_plane_samples_the_surface_it_becomes",
+            [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::One],
+            'x',
+        );
     }
 
     /// As [`every_bound_view_of_a_plane_samples_the_surface_it_becomes`], with the first view
@@ -9351,14 +9381,25 @@ mod tests {
     #[test]
     fn a_broadcasting_view_of_a_plane_samples_the_surface_it_becomes() {
         use crate::vrend::pipe::Swizzle;
-        bound_plane_views_after_promotion([Swizzle::X, Swizzle::X, Swizzle::X, Swizzle::One], 'z');
+        bound_plane_views_after_promotion(
+            "a_broadcasting_view_of_a_plane_samples_the_surface_it_becomes",
+            [Swizzle::X, Swizzle::X, Swizzle::X, Swizzle::One],
+            'z',
+        );
     }
 
     /// Draw through two views of a 16x16 luma plane in each of two sub-contexts, make the plane
     /// a video buffer's, write it again, and draw again. The first view has `swizzle` and its
     /// channel `read` lands in red; the second is the identity and its red lands in green.
     #[cfg(target_os = "macos")]
-    fn bound_plane_views_after_promotion(swizzle: [crate::vrend::pipe::Swizzle; 4], read: char) {
+    fn bound_plane_views_after_promotion(
+        test: &str,
+        swizzle: [crate::vrend::pipe::Swizzle; 4],
+        read: char,
+    ) {
+        if skips_without_plane_surfaces(HostGl::Desktop, test) {
+            return;
+        }
         use crate::vrend::pipe::{CompareFunc, MipFilter, Swizzle, TexFilter, TexWrap};
         use crate::vrend::proto::{
             Box3, Command, Object, SamplerState, SamplerView, Transfer, VideoBuffer,
@@ -9487,11 +9528,7 @@ mod tests {
         })
         .unwrap_or_else(|e| panic!("the draws run: {e:?}"))
         .expect("no tessellation asked for");
-        assert!(
-            surfaced.get(),
-            "the plane became a surface (needs a host GL that takes R8 and RG8 IOSurfaces, which \
-             stock Mesa does not)"
-        );
+        assert!(surfaced.get(), "the plane became a surface");
         // Row-major 16x16: sub-context 0 drew columns 0..8, sub-context 1 columns 8..16.
         let half = |pixels: &[u8], sub: usize| -> Vec<[u8; 4]> {
             pixels

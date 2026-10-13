@@ -3354,6 +3354,12 @@ mod tests {
         let mut r =
             Renderer::new(Box::new(NoSink), Config { vrend: true, ..Config::default() }, None)
                 .expect("vrend comes up");
+        if skips_without_plane_surfaces(
+            &r,
+            "a_shared_video_plane_goes_to_the_embedder_as_a_surface_of_its_own",
+        ) {
+            return;
+        }
         let by_name = |name: &str| {
             (0..1024)
                 .filter_map(crate::vrend::proto::Format::from_wire)
@@ -3400,7 +3406,7 @@ mod tests {
         )
         .expect("a one-channel scanout");
 
-        let (_, shape) = r.resource_surface_port(luma).expect("the luma plane is a surface (needs a host GL that takes R8 and RG8 IOSurfaces, which stock Mesa does not)");
+        let (_, shape) = r.resource_surface_port(luma).expect("the luma plane is a surface");
         assert_eq!(
             (shape.width, shape.height, shape.format),
             (100, 16, crate::surface::PixelFormat::R8)
@@ -3434,6 +3440,12 @@ mod tests {
                 .expect("vrend comes up");
         let ctx = ContextId::new(1).unwrap();
         r.context_create(ctx, CapsetId::Virgl, "va".into()).expect("a context");
+        if skips_without_plane_surfaces(
+            &r,
+            "a_write_into_a_shared_video_plane_lands_in_its_surface",
+        ) {
+            return;
+        }
         let format = (0..1024)
             .filter_map(crate::vrend::proto::Format::from_wire)
             .find(|f| f.describe().is_some_and(|d| d.name == "R8_UNORM"))
@@ -3453,10 +3465,7 @@ mod tests {
         };
         r.resource_create(luma, args, Vec::new()).expect("a luma plane");
         r.ctx_attach_resource(ctx, luma);
-        assert!(
-            r.resource_surface_port(luma).is_ok(),
-            "the plane is a surface (needs a host GL that takes R8 and RG8 IOSurfaces, which stock Mesa does not)"
-        );
+        assert!(r.resource_surface_port(luma).is_ok(), "the plane is a surface");
 
         let pixel = |x: u32, y: u32| (x * 3 + y * 7) as u8;
         let bytes: Vec<u8> = (0..H).flat_map(|y| (0..W).map(move |x| pixel(x, y))).collect();
@@ -3511,6 +3520,9 @@ mod tests {
                 .expect("vrend comes up");
         let ctx = ContextId::new(1).unwrap();
         r.context_create(ctx, CapsetId::Virgl, "va".into()).expect("a context");
+        if skips_without_plane_surfaces(&r, "a_video_buffers_planes_become_surfaces") {
+            return;
+        }
         let by_name = |name: &str| {
             (0..1024)
                 .filter_map(crate::vrend::proto::Format::from_wire)
@@ -3575,7 +3587,7 @@ mod tests {
         let wire: Vec<u8> = wire.iter().flat_map(|d| d.to_le_bytes()).collect();
         assert!(matches!(r.submit_cmd(ctx, &wire), Ok(Submitted::Done)), "accepted");
 
-        let (_, shape) = r.resource_surface_port(luma).expect("the luma plane is now a surface (needs a host GL that takes R8 and RG8 IOSurfaces, which stock Mesa does not)");
+        let (_, shape) = r.resource_surface_port(luma).expect("the luma plane is now a surface");
         assert_eq!(
             (shape.width, shape.height, shape.format),
             (W, H, crate::surface::PixelFormat::R8)
@@ -3594,6 +3606,17 @@ mod tests {
             .filter(|&(x, y)| read[y as usize * pitch + x as usize] != pixel(x, y))
             .count();
         assert_eq!(wrong, 0, "the write landed in the surface");
+    }
+
+    /// Whether a test about a promoted video plane must skip on `r`'s host, said loudly when it
+    /// must: see [`crate::vrend::Vrend::plane_surface_refusal`].
+    #[cfg(target_os = "macos")]
+    fn skips_without_plane_surfaces(r: &Renderer, test: &str) -> bool {
+        let Some(why) = r.vrend.as_ref().expect("vrend").plane_surface_refusal() else {
+            return false;
+        };
+        eprintln!("SKIPPED {test}: {why}; it needs a host GL that takes R8 and RG8 IOSurfaces");
+        true
     }
 
     /// The format named `name`, by its description.
@@ -3705,6 +3728,12 @@ mod tests {
         let _display = crate::vrend::one_display_at_a_time();
         plane_faults::refuse(PixelFormat::Rg8);
         let (mut r, ctx, luma, chroma) = video_planes(112, 16);
+        if skips_without_plane_surfaces(
+            &r,
+            "a_refused_plane_format_is_not_asked_for_again_when_the_other_is_taken",
+        ) {
+            return;
+        }
         create_video_buffer(&mut r, ctx, 1, (112, 16), luma, chroma);
         let (luma2, chroma2) = (ResourceHandle::new(3).unwrap(), ResourceHandle::new(4).unwrap());
         add_video_planes(&mut r, ctx, (112, 16), luma2, chroma2);
