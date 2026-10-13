@@ -48,6 +48,10 @@ impl Timelines {
     /// Start the waiter for `ctx`'s `rings` hardware rings.
     pub fn start(ctx: ContextId, rings: u32, fences: Handle) -> std::io::Result<Timelines> {
         let (wake, woken) = UnixStream::pair()?;
+        // Neither end blocks: the thread drains until there is nothing left, and a wake-up sent
+        // to a full socket, which may be sent under the lock the thread needs before it drains
+        // again, finds one already pending.
+        wake.set_nonblocking(true)?;
         woken.set_nonblocking(true)?;
         let state = Arc::new(Mutex::new(State {
             rings: (0..rings).map(|_| VecDeque::new()).collect(),
@@ -202,6 +206,25 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "ring 1 overtook fence 1");
         (&first).write_all(&[1]).unwrap();
         assert_eq!([next(&rx), next(&rx), next(&rx)], [(1, 1), (1, 2), (1, 3)]);
+    }
+
+    /// The thread parked on the lock behind a full socket, as it is when the wake-ups outrun it:
+    /// stopping wakes it under that lock, and must not wait for the thread to drain.
+    #[test]
+    fn stopping_returns_with_the_wake_up_socket_full() {
+        let (_r, t, _rx) = start(1);
+        let (done, finished) = channel();
+        std::thread::spawn(move || {
+            let st = t.state.lock().unwrap();
+            // One wake-up, which the thread drains before it parks on the lock held here.
+            t.kick();
+            std::thread::sleep(Duration::from_millis(50));
+            while (&t.wake).write(&[1]).is_ok() {}
+            drop(st);
+            drop(t);
+            done.send(()).unwrap();
+        });
+        finished.recv_timeout(Duration::from_secs(5)).expect("stopping with a full socket returns");
     }
 
     #[test]
