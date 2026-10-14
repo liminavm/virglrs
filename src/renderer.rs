@@ -806,6 +806,10 @@ pub struct Renderer {
     traces: vrend::debug::Traces,
     /// `VIRGLRS_DEBUG`'s switches, read once here and handed to every thread that logs by them.
     debug: vrend::debug::Switches,
+    /// The copy rings of embedder surfaces, which no context owns: see
+    /// [`crate::venus::present_copy`].
+    #[cfg(target_os = "macos")]
+    embedder_copies: venus::present_copy::Ring,
     /// Retirement outlives whoever can still retire through it, including the classic fence waiter
     /// `vrend` owns -- a `fence::Handle` keeps the thread alive, so the order these fields are
     /// declared or dropped in does not decide whether a fence in flight is delivered.
@@ -884,6 +888,8 @@ impl Renderer {
             native,
             traces,
             debug,
+            #[cfg(target_os = "macos")]
+            embedder_copies: venus::present_copy::Ring::new(venus::present_copy::Knobs::from_env()),
             fences,
         })
     }
@@ -2576,6 +2582,9 @@ impl Renderer {
     /// The fence retires once the copy is done, and the surface returned is what to show. The
     /// copy lands in `scanout`'s own ring of surfaces. See [`crate::venus::present_copy`].
     ///
+    /// An embedder's surface is copied by the embedder's [`venus::present_copy::Copier`] instead,
+    /// and the fence retires when it says the copy is done; `NotOrderable` without one.
+    ///
     /// Refused -- nothing fenced -- when there is no ordered copy to take: `Busy` when every
     /// surface of that scanout's ring is still pending or on glass, which passes, and `NotOrderable`
     /// when the resource is not a venus scanout attached to one context or its context has other
@@ -2588,6 +2597,19 @@ impl Renderer {
         fence: FenceId,
     ) -> Result<crate::ids::SurfaceId, crate::venus::present_copy::CopyRefused> {
         use crate::venus::present_copy::CopyRefused;
+        if self.with_resource(handle, |r| matches!(r.backing, Backing::Embedder { .. }))
+            == Some(true)
+        {
+            // Rendered out of this process and finished before the flush: no queue here to order
+            // the copy on, and nothing to order it against. The embedder's GPU makes it.
+            let copier = venus::present_copy::copier().ok_or(CopyRefused::NotOrderable)?;
+            let src = self.resource_storage(handle).ok_or(CopyRefused::NotOrderable)?;
+            let job = self.embedder_copies.job(scanout, src)?;
+            let job = venus::present_copy::CopyJob::new(job, fence, self.fences.handle());
+            let target = job.target_id();
+            copier.copy(job);
+            return Ok(target);
+        }
         let attached =
             self.with_resource(handle, |r| r.attached.clone()).ok_or(CopyRefused::NotOrderable)?;
         let [ctx] = attached[..] else { return Err(CopyRefused::NotOrderable) };
@@ -2826,6 +2848,78 @@ mod tests {
 
     fn renderer(config: Config) -> Renderer {
         Renderer::new(Box::new(NoSink), config, None).expect("no vrend is asked for")
+    }
+
+    /// An embedder's surface is presented through a copy the embedder makes, into a surface of
+    /// the renderer's own, and its fence retires when the embedder says the copy is done -- or
+    /// when a copier drops the job unfinished, which must not strand the frame. With no copier it
+    /// is refused, and the caller presents the surface itself.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_embedder_surface_is_presented_through_the_embedders_copy() {
+        use crate::venus::present_copy::{Copier, CopyJob, CopyRefused, set_copier};
+        use std::sync::mpsc::{Sender, channel};
+
+        struct Presents(Sender<u64>);
+        impl FenceSink for Presents {
+            fn context_fence(&mut self, _: ContextId, _: RingIdx, _: FenceId) {}
+            fn present_fence(&mut self, fence: FenceId) {
+                let _ = self.0.send(fence.0);
+            }
+            fn global_fence(&mut self, _: ClientFenceId) {}
+        }
+        /// Hands each job to the test, on another thread, as an embedder's GPU would answer.
+        struct Later(std::sync::Mutex<Sender<CopyJob>>);
+        impl Copier for Later {
+            fn copy(&self, job: CopyJob) {
+                let _ = self.0.lock().unwrap().send(job);
+            }
+        }
+
+        let (tx, presents) = channel();
+        let mut r = Renderer::new(Box::new(Presents(tx)), Config::default(), None)
+            .expect("no vrend is asked for");
+        let surface = ResourceHandle::new(1).unwrap();
+        r.resource_create_surface(
+            surface,
+            SurfaceShape {
+                width: 64,
+                height: 8,
+                format: crate::surface::PixelFormat::Bgra,
+                bytes_per_row: 256,
+            },
+        )
+        .expect("an embedder's surface");
+        let scanout = crate::ids::ScanoutId(0);
+        let wait = std::time::Duration::from_secs(5);
+
+        set_copier(None);
+        assert_eq!(
+            r.resource_present_copy(surface, scanout, FenceId(1)),
+            Err(CopyRefused::NotOrderable),
+            "no copier, no copy"
+        );
+
+        let (jobs_tx, jobs) = channel();
+        set_copier(Some(Arc::new(Later(std::sync::Mutex::new(jobs_tx)))));
+        let own = r.resource_surface_id(surface).expect("its own surface");
+        let shown = r.resource_present_copy(surface, scanout, FenceId(7)).expect("a copy");
+        assert_ne!(shown, own, "the display is handed a copy, not the guest's surface");
+        let job = jobs.recv_timeout(wait).expect("the copier was asked");
+        assert_eq!(job.target_id(), shown);
+        assert!(job.source().is_some_and(|p| p.resolves_to(own.0)), "copied from the surface");
+        assert!(job.target().is_some_and(|p| p.resolves_to(shown.0)), "into what is shown");
+        assert!(
+            presents.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "the fence waits for the copy"
+        );
+        std::thread::spawn(move || job.finish(true)).join().unwrap();
+        assert_eq!(presents.recv_timeout(wait), Ok(7), "retired once the copy is done");
+
+        r.resource_present_copy(surface, scanout, FenceId(8)).expect("a second copy");
+        drop(jobs.recv_timeout(wait).expect("the copier was asked"));
+        assert_eq!(presents.recv_timeout(wait), Ok(8), "a dropped copy still retires");
+        set_copier(None);
     }
 
     /// A reset frees every handle, vrend's half of them included.

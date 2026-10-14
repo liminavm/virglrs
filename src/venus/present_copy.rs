@@ -24,6 +24,13 @@
 //! recently handed out, or while any process holds it in use -- the window server does, for a
 //! surface it is compositing.
 //!
+//! **An embedder's surface** (the Metal transport's scanouts, `Backing::Embedder`) is rendered
+//! out of this process, and its renderer finished the frame before the flush arrived: the guest
+//! waits for its work before it flushes. Its copy needs no ordering, only a GPU, and this crate
+//! has none to blit with, so the embedder installs one ([`set_copier`]). It is taken into a ring
+//! of the renderer's own, slots chosen as above, and the fence retires when the embedder says
+//! the copy is done: a guest held on its flush waits for one blit, not for the display.
+//!
 //! Two seams: `LIMINA_TEST_PRESENT_COPY_DELAY_MS` holds each copy back before it is submitted,
 //! which lets the guest's later submits land first -- the case above this cannot order -- and
 //! `LIMINA_PRESENT_COPY_TRACE` logs the first pixel of the guest's scanout as the flush arrives
@@ -31,11 +38,11 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use crate::ids::{ScanoutId, SurfaceId};
-use crate::metal::Surface;
+use crate::ids::{FenceId, ScanoutId, SurfaceId};
+use crate::metal::{Surface, SurfacePort};
 use crate::venus::driver::Storage;
 use crate::venus::driver::copier::Import;
 
@@ -212,6 +219,83 @@ impl Ring {
             if import.as_ref().is_some_and(&gone) {
                 *import = None;
             }
+        }
+    }
+}
+
+/// The embedder's GPU, which copies the surfaces this crate cannot: see the module docs.
+pub trait Copier: Send + Sync {
+    /// Copy `job`'s source into its target and [`CopyJob::finish`] it, from any thread, once the
+    /// copy is done. Must not block the caller: it is the thread that serves virtio-gpu.
+    fn copy(&self, job: CopyJob);
+}
+
+static COPIER: RwLock<Option<Arc<dyn Copier>>> = RwLock::new(None);
+
+/// Install the copier embedder surfaces are presented through, or take it out. Without one an
+/// embedder surface gets no copy.
+pub fn set_copier(copier: Option<Arc<dyn Copier>>) {
+    *COPIER.write().unwrap_or_else(|e| e.into_inner()) = copier;
+}
+
+pub(crate) fn copier() -> Option<Arc<dyn Copier>> {
+    COPIER.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// One embedder surface's copy, from the moment it is handed to the [`Copier`] until it is done.
+///
+/// Dropped without [`Self::finish`] -- a copier that lost it -- it still retires the fence: a
+/// frame parked on a fence that never comes is a scanout that never updates again. The slot
+/// then shows whatever it last held.
+pub struct CopyJob {
+    job: Option<Job>,
+    fence: FenceId,
+    retire: crate::fence::Handle,
+}
+
+impl CopyJob {
+    pub(crate) fn new(job: Job, fence: FenceId, retire: crate::fence::Handle) -> CopyJob {
+        CopyJob { job: Some(job), fence, retire }
+    }
+
+    fn job(&self) -> &Job {
+        self.job.as_ref().expect("a job is taken only by finish or drop")
+    }
+
+    /// A send right for the surface to copy from.
+    pub fn source(&self) -> Option<SurfacePort> {
+        self.job().src.surface().ok()?.port()
+    }
+
+    /// A send right for the surface to copy into.
+    pub fn target(&self) -> Option<SurfacePort> {
+        self.job().dst.surface.port()
+    }
+
+    /// The target's id, which the display will be asked to show.
+    pub fn target_id(&self) -> SurfaceId {
+        self.job().target()
+    }
+
+    /// The copy is done, or, when not `copied`, could not be made on the GPU: then it is made
+    /// on the CPU here, so the slot does not show a frame from long ago. Retires the fence.
+    pub fn finish(mut self, copied: bool) {
+        if let Some(job) = self.job.take() {
+            if copied {
+                trace(&job);
+            } else {
+                copy_on_cpu(&job);
+            }
+            self.retire.retire_present(self.fence);
+        }
+    }
+}
+
+impl Drop for CopyJob {
+    fn drop(&mut self) {
+        if self.job.take().is_some() {
+            eprintln!("[virglrs] present copy: a copier dropped a copy unfinished; retiring it");
+            self.retire.retire_present(self.fence);
         }
     }
 }
