@@ -47,6 +47,8 @@ make those calls safe to use from everywhere else:
 - `Gem`: a GEM handle on one `Device`, which closes itself on drop. It holds its `Device`, so a
   handle cannot outlive the file it is a number in.
 - `Syncobj` likewise; and a fence fd is an `OwnedFd`, never an `int`.
+- A release the kernel refuses aborts, except with `ENODEV`: an unplugged device answers every
+  call that way and frees what the file held when it closes, so that is logged once per device.
 - Each `ioctl` is a typed function taking those types: `gem_create(&Device, &GemCreate) -> Gem`,
   `cs_submit(&Device, &Submit) -> ...`. A backend never sees a raw fd, a raw handle or a pointer.
 

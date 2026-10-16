@@ -25,6 +25,7 @@ use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -153,13 +154,20 @@ pub struct Device {
     /// Held across every call that makes or closes a handle, so a number cannot be closed and
     /// reissued between the lookup and the use.
     live: Mutex<std::collections::BTreeMap<u32, Weak<Gem>>>,
+    /// Set once a release found the device gone, so the line saying so is written once.
+    gone: AtomicBool,
 }
 
 impl Device {
     pub fn open(path: &Path) -> io::Result<Device> {
         // `std` opens close-on-exec, which is what a descriptor no child should inherit wants.
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
-        Ok(Device { fd: file.into(), path: path.to_owned(), live: Mutex::default() })
+        Ok(Device {
+            fd: file.into(),
+            path: path.to_owned(),
+            live: Mutex::default(),
+            gone: AtomicBool::new(false),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -399,6 +407,22 @@ impl Device {
             }
         }
     }
+
+    /// Accept how releasing `what` went. A device that was unplugged answers every call with
+    /// `ENODEV`, and the kernel frees what the file held when it closes, so there is nothing left
+    /// to release; any other refusal is a host invariant broken.
+    fn released(&self, result: io::Result<()>, what: std::fmt::Arguments<'_>) {
+        let Err(e) = result else { return };
+        if e.raw_os_error() != Some(libc::ENODEV) {
+            panic!("{what} would not release: {e}");
+        }
+        if !self.gone.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[virglrs] native: {} is gone; what it held is freed when the file closes",
+                self.path.display()
+            );
+        }
+    }
 }
 
 /// A GEM handle in one device file, and the buffer it keeps alive. Closing it is dropping it.
@@ -510,11 +534,8 @@ impl Drop for Gem {
         let mut arg = DrmGemClose { handle: self.handle, pad: 0 };
         // SAFETY: a `drm_gem_close` with no pointer, naming a handle this value owns and nothing
         // else closes.
-        if let Err(e) = unsafe { self.device.ioctl(DRM_IOCTL_GEM_CLOSE, &mut arg) } {
-            // The handle came from this file and is closed once, here; the kernel refusing is a
-            // host invariant broken.
-            panic!("GEM handle {} would not close: {e}", self.handle);
-        }
+        let r = unsafe { self.device.ioctl(DRM_IOCTL_GEM_CLOSE, &mut arg) };
+        self.device.released(r, format_args!("GEM handle {}", self.handle));
     }
 }
 
@@ -614,9 +635,8 @@ impl Drop for AmdgpuCtx {
         let mut arg =
             AmdgpuCtxIn { op: AMDGPU_CTX_OP_FREE_CTX, ctx_id: self.id, ..Default::default() };
         // SAFETY: the union's `in` half with no pointer, naming a context this value owns.
-        if let Err(e) = unsafe { self.device.ioctl(DRM_IOCTL_AMDGPU_CTX, &mut arg) } {
-            panic!("GPU context {} would not free: {e}", self.id);
-        }
+        let r = unsafe { self.device.ioctl(DRM_IOCTL_AMDGPU_CTX, &mut arg) };
+        self.device.released(r, format_args!("GPU context {}", self.id));
     }
 }
 
@@ -646,9 +666,8 @@ impl Drop for Syncobj {
     fn drop(&mut self) {
         let mut arg = DrmSyncobjHandleOnly { handle: self.handle, flags_or_pad: 0 };
         // SAFETY: a `drm_syncobj_destroy` with no pointer, naming a syncobj this value owns.
-        if let Err(e) = unsafe { self.device.ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &mut arg) } {
-            panic!("syncobj {} would not destroy: {e}", self.handle);
-        }
+        let r = unsafe { self.device.ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &mut arg) };
+        self.device.released(r, format_args!("syncobj {}", self.handle));
     }
 }
 
@@ -747,5 +766,24 @@ mod tests {
         assert_eq!(DRM_IOCTL_SYNCOBJ_CREATE as u32, 0xc008_64bf);
         assert_eq!(DRM_IOCTL_SYNCOBJ_DESTROY as u32, 0xc008_64c0);
         assert_eq!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD as u32, 0xc010_64c1);
+    }
+
+    #[test]
+    fn a_release_on_an_unplugged_device_is_not_an_error() {
+        let device = Device::open(Path::new("/dev/null")).unwrap();
+        let gone = || Err(io::Error::from_raw_os_error(libc::ENODEV));
+        device.released(gone(), format_args!("GEM handle 1"));
+        device.released(gone(), format_args!("syncobj 2"));
+        assert!(device.gone.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[should_panic(expected = "GEM handle 1 would not release")]
+    fn any_other_refusal_to_release_is_a_broken_invariant() {
+        let device = Device::open(Path::new("/dev/null")).unwrap();
+        device.released(
+            Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            format_args!("GEM handle 1"),
+        );
     }
 }
