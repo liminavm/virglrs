@@ -5,15 +5,12 @@
 //! compiles, and what the renderer needs to know about it (`vrend_shader.c`).
 //!
 //! The translation is a faithful port of the C's string emitter, and the text it produces is
-//! held to the C's byte for byte (`harness/replay/fixtures/vrend-shaders.txt`): the corpus is
+//! held to the C's byte for byte (`harness/replay/fixtures/vrend-shaders*.txt`): the corpus is
 //! the oracle, and a difference in the GLSL is a bug here until the harness says otherwise.
-//! A typed intermediate form is a later change, gated on its own.
 //!
-//! Only the C's GLES leg is ported. This renderer drives a GLES 3.1 context and nothing else
-//! (`docs/design.md`), so the C's `use_gles`, `use_core_profile` and
-//! `use_explicit_locations` switches are fixed at true, true and false and do not appear in
-//! [`Config`]; the desktop branches they guarded are not here. A desktop context is its own gated
-//! change, and it brings its branches with it.
+//! Both of the C's dialects are ported: GLES ([`Dialect::Es`]) and desktop core profile
+//! ([`Dialect::Core`]), each held to its own fixture. The C's `use_explicit_locations` is fixed
+//! at false and does not appear in [`Config`].
 //!
 //! [`Key`] is what the renderer's state contributes to a translation -- the C's
 //! `vrend_shader_key`, which it fills from the bound framebuffer, blend, rasterizer and depth
