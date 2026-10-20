@@ -99,8 +99,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 - `make-teardown-corpus.py` — writes a synthetic classic corpus that destroys a program and a
   sub-context while the renderer still holds them (see `fixtures/teardown.score` below).
 - `make-ctx-reuse-corpus.py` — writes a version-3 classic corpus in which a faulted context is
-  destroyed and a new one created on its id (see `fixtures/ctx-reuse.score` below). It is not in
-  `corpora.toml` yet, so `vrend-replay.sh` cannot fetch it: run the script first.
+  destroyed and a new one created on its id (see `fixtures/ctx-reuse.score` below).
 - `make-sampler-corpus.py` — writes a synthetic classic corpus that changes only the sampler
   state between draws through one view, by a bind and then by a destroy (see
   `fixtures/sampler.score` below).

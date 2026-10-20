@@ -28,6 +28,12 @@ size = 5736
 generated = "harness/replay/make-compute-corpus.py"
 
 [[corpus]]
+name = "ctx-reuse.bin"
+sha256 = "f5b59c2222dfa94c7474b833279b59a3793b989f0d9b4a380acb0e984bff8d77"
+size = 36526
+generated = "harness/replay/make-ctx-reuse-corpus.py"
+
+[[corpus]]
 name = "flatshade.bin"
 sha256 = "f9020907ef1f7efe9c13b6d553fd22978dfe64de89fdd01f5d3d8d16829d8d2f"
 size = 1928
