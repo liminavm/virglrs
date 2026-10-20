@@ -54,10 +54,14 @@ def main() -> int:
         n = re.search(r"^TGSI received:\n", text[g:], re.M)
         end = g + n.start() if n else len(text)
         block = text[start:end]
-        # What follows the last block on stderr is the rest of the run's chatter; a block ends at
-        # its own trailing empty line.
-        tail = block.index("\n\n", g - start) + 2
-        out.append(block[:tail])
+        # What follows a block on stderr up to the next one is the run's chatter. The GLSL ends
+        # with `main`'s closing brace alone on its line, so the block ends after the last such
+        # line. Not at the first empty line: an IO block's declaration has one inside it, and
+        # cutting there truncated every shader that declares one -- in both legs' logs alike, so
+        # the truncated logs still diffed empty.
+        glsl = g - start
+        close = block.rindex("\n}\n", glsl) + 3
+        out.append(block[:close] + "\n")
         pos = end
     sys.stdout.write("".join(out))
     return 0
