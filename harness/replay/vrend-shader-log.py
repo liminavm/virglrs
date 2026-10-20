@@ -29,6 +29,7 @@ import re
 import sys
 
 PREFIX = re.compile(r"^limina-replay: ", re.M)
+RS_CHATTER = re.compile(r"^\[virglrs\] .*\n", re.M)
 MARK = re.compile(r"^(TGSI received:|GLSL:)\n?", re.M)
 
 
@@ -42,6 +43,9 @@ def main() -> int:
     # line follows "TGSI received:" on the same line, and the prefix lands wherever the next
     # fragment started.
     text = text.replace("limina-replay: ", "")
+    # The Rust leg's own warnings carry its prefix and can land inside a block -- the translator
+    # warns between printing the TGSI and the GLSL -- where no line of either starts with it.
+    text = RS_CHATTER.sub("", text)
     text = MARK.sub(r"\1\n", text)
     out = []
     pos = 0
