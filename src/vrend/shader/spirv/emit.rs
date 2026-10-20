@@ -22,7 +22,10 @@
 
 use std::collections::BTreeMap;
 
-use spirv::{BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel, Op, StorageClass};
+use spirv::{
+    BuiltIn, Capability, Decoration, Dim, ExecutionMode, ExecutionModel, ImageOperands, Op,
+    StorageClass,
+};
 
 use super::writer::{Function, Id, Module};
 use crate::vrend::pipe::ShaderStage;
@@ -32,7 +35,7 @@ use crate::vrend::shader::{Config, Info, Key, NUM_CLIP_PLANES, POLYGON_STIPPLE_S
 use crate::vrend::tgsi::info::OpType;
 use crate::vrend::tgsi::{
     self, Declaration, File, ImmType, Instruction, Interpolate, Location, Opcode, Processor,
-    Property, Semantic, Src, Token,
+    Property, ReturnType, Semantic, Src, Texture, Token,
 };
 
 /// Why the emitter would not write a shader: the first thing it met that it does not handle.
@@ -173,6 +176,17 @@ enum Sink {
     },
 }
 
+/// A sampler as declared: the target the instructions sample it as, its variable, and the type
+/// of what it returns.
+#[derive(Clone, Copy)]
+struct Sampler {
+    texture: Texture,
+    var: Id,
+    sampled_image: Id,
+    image: Id,
+    ret: Ty,
+}
+
 /// The structured construct an open `IF` or `UIF` is in.
 struct Selection {
     else_label: Id,
@@ -204,6 +218,10 @@ struct Emitter<'a> {
     write_all_cbufs: bool,
     /// The `VirglBlock`, declared on the first read of it.
     sysvals: Option<Id>,
+    /// Each sampler view's declared return type, by slot.
+    views: BTreeMap<u16, ReturnType>,
+    /// The samplers declared, by slot, at the first instruction to sample each.
+    samplers: BTreeMap<u16, Sampler>,
     ended: bool,
 }
 
@@ -312,6 +330,8 @@ impl<'a> Emitter<'a> {
             early_fragment_tests: false,
             write_all_cbufs: false,
             sysvals: None,
+            views: BTreeMap::new(),
+            samplers: BTreeMap::new(),
             ended: false,
         }
     }
@@ -384,7 +404,13 @@ impl<'a> Emitter<'a> {
             File::Input => self.declare_input(d),
             File::Output => self.declare_output(d),
             File::Address => decline("address registers"),
-            File::Sampler | File::SamplerView => decline("a sampler"),
+            File::Sampler => Ok(()),
+            File::SamplerView => {
+                for slot in d.first..=d.last {
+                    self.views.insert(slot, d.sampler_view.return_type[0]);
+                }
+                Ok(())
+            }
             File::Image => decline("an image"),
             File::Buffer => decline("a shader storage buffer"),
             File::Memory => decline("shared or global memory"),
@@ -550,6 +576,156 @@ impl<'a> Emitter<'a> {
         self.m.decorate(var, Decoration::Binding, &[Layout::VIRGL_BLOCK_BINDING]);
         self.sysvals = Some(var);
         var
+    }
+
+    /// The sampler `inst` samples through, declared as the target the instruction names on its
+    /// first use. The GLSL declares a sampler by the target its instructions name, too.
+    fn sampler(&mut self, inst: &Instruction) -> Result<Sampler> {
+        let src = inst.src[1];
+        if src.file != File::Sampler || src.indirect || !(0..32).contains(&src.index) {
+            return decline("a texture instruction naming no plain sampler");
+        }
+        let slot = src.index as u16;
+        let index = usize::from(slot);
+        let mut texture = inst.tex().texture;
+        if texture == Texture::Array2d
+            && Key::view_mask_get(&self.key.sampler_views_lower_array_mask, index)
+        {
+            texture = Texture::D2;
+        }
+        if Key::view_mask_get(&self.key.sampler_views_emulated_rect_mask, index) {
+            return decline("a rectangle emulated by a 2D texture");
+        }
+        if inst.tex().num_offsets != 0 {
+            return decline("a texel offset");
+        }
+        if let Some(s) = self.samplers.get(&slot) {
+            if s.texture != texture {
+                return decline("a sampler sampled as two targets");
+            }
+            return Ok(*s);
+        }
+        let (dim, arrayed) = match texture {
+            Texture::D2 => (Dim::Dim2D, false),
+            Texture::D3 => (Dim::Dim3D, false),
+            Texture::Cube => (Dim::DimCube, false),
+            Texture::Array2d => (Dim::Dim2D, true),
+            _ => return decline("a texture target this emitter does not sample"),
+        };
+        let Some(&ret) = self.views.get(&slot) else {
+            return decline("a sampler with no view declared");
+        };
+        let (ret, scalar) = match ret {
+            ReturnType::Sint => (Ty::Int, self.t.int),
+            ReturnType::Uint => (Ty::Uint, self.t.uint),
+            ReturnType::Float | ReturnType::Unorm | ReturnType::Snorm => (Ty::Float, self.t.float),
+        };
+        let image = self.m.type_image(scalar, dim, arrayed);
+        let sampled_image = self.m.type_sampled_image(image);
+        let ptr = self.m.type_pointer(StorageClass::UniformConstant, sampled_image);
+        let var = self.m.global_variable(ptr, StorageClass::UniformConstant);
+        // The draw path writes the unit to the location; the binding is only the initial value
+        // GL requires an opaque uniform in a module to carry.
+        let location = Layout::sampler_location(self.stage, u32::from(slot));
+        self.m.decorate(var, Decoration::Location, &[location]);
+        self.m.decorate(var, Decoration::Binding, &[u32::from(slot)]);
+        let s = Sampler { texture, var, sampled_image, image, ret };
+        self.samplers.insert(slot, s);
+        Ok(s)
+    }
+
+    /// `TEX`, `TXB`, `TXL`, `TXF` and `TXQ`, as `translate_tex` and `emit_txq` spell them for
+    /// the targets [`Emitter::sampler`] takes.
+    fn texture(&mut self, inst: &Instruction, num_consts: u32) -> Result<()> {
+        let s = self.sampler(inst)?;
+        let (ivec4, float, int) = (self.t.ivec4, self.t.float, self.t.int);
+        let result_ty = self.t.vec(s.ret);
+        // How many coordinate channels the target takes, layer included.
+        let n = match s.texture {
+            Texture::D2 => 2,
+            _ => 3,
+        };
+        let fragment = self.processor == Processor::Fragment;
+        match inst.opcode {
+            Opcode::Tex | Opcode::Txb | Opcode::Txl => {
+                let c = self.src(inst, 0, Ty::Float, num_consts)?;
+                let coord_ty = if n == 2 { self.t.vec2 } else { self.t.vec3 };
+                let lanes: Vec<u32> = (0..n).collect();
+                let coord = self.shuffle(coord_ty, c, c, &lanes);
+                let sampled = self.op(Op::Load, s.sampled_image, &[s.var]);
+                let mut words = vec![sampled.word(), coord.word()];
+                let op = match inst.opcode {
+                    Opcode::Txb if !fragment => {
+                        return decline("a biased lookup outside a fragment shader");
+                    }
+                    Opcode::Tex if fragment => Op::ImageSampleImplicitLod,
+                    // Outside a fragment shader there are no derivatives; GLSL's `texture()`
+                    // there samples level 0.
+                    Opcode::Tex => {
+                        let zero = self.float(0.0);
+                        words.extend([ImageOperands::LOD.bits(), zero.word()]);
+                        Op::ImageSampleExplicitLod
+                    }
+                    Opcode::Txb => {
+                        let bias =
+                            self.f.op(&mut self.m, Op::CompositeExtract, float, &[c.word(), 3]);
+                        words.extend([ImageOperands::BIAS.bits(), bias.word()]);
+                        Op::ImageSampleImplicitLod
+                    }
+                    _ => {
+                        let lod =
+                            self.f.op(&mut self.m, Op::CompositeExtract, float, &[c.word(), 3]);
+                        words.extend([ImageOperands::LOD.bits(), lod.word()]);
+                        Op::ImageSampleExplicitLod
+                    }
+                };
+                let r = self.f.op(&mut self.m, op, result_ty, &words);
+                self.store(inst, r, s.ret)
+            }
+            Opcode::Txf => {
+                if s.texture == Texture::Cube {
+                    return decline("a texel fetch from a cube");
+                }
+                let index = inst.src[1].index as usize;
+                if Key::view_mask_get(&self.key.sampler_views_lower_swizzle_mask, index) {
+                    return decline("a texel fetch through a lowered swizzle");
+                }
+                // The coordinate and level are integers in the register: `ivec2(src.xy)` of
+                // the unsigned words, and `int(src.w)`.
+                let c = self.src(inst, 0, Ty::Int, num_consts)?;
+                let ivec =
+                    if n == 2 { self.m.type_vector(int, 2) } else { self.m.type_vector(int, 3) };
+                let lanes: Vec<u32> = (0..n).collect();
+                let coord = self.shuffle(ivec, c, c, &lanes);
+                let lod = self.f.op(&mut self.m, Op::CompositeExtract, int, &[c.word(), 3]);
+                let sampled = self.op(Op::Load, s.sampled_image, &[s.var]);
+                let image = self.op(Op::Image, s.image, &[sampled]);
+                let words = [image.word(), coord.word(), ImageOperands::LOD.bits(), lod.word()];
+                let r = self.f.op(&mut self.m, Op::ImageFetch, result_ty, &words);
+                self.store(inst, r, s.ret)
+            }
+            Opcode::Txq => {
+                if s.texture != Texture::D2 {
+                    return decline("a size query of a target other than 2D");
+                }
+                if inst.dst[0].writemask & 0xc != 0 {
+                    return decline("a level-count query");
+                }
+                self.m.capability(Capability::ImageQuery);
+                // `textureSize(sampler, int(src.x))`, its two channels in x and y.
+                let c = self.src(inst, 0, Ty::Int, num_consts)?;
+                let lod = self.f.op(&mut self.m, Op::CompositeExtract, int, &[c.word(), 0]);
+                let sampled = self.op(Op::Load, s.sampled_image, &[s.var]);
+                let image = self.op(Op::Image, s.image, &[sampled]);
+                let ivec2 = self.m.type_vector(int, 2);
+                let size = self.op(Op::ImageQuerySizeLod, ivec2, &[image, lod]);
+                let zero = self.int(0);
+                let zero2 = self.m.constant_composite(ivec2, &[zero, zero]);
+                let r = self.shuffle(ivec4, size, zero2, &[0, 1, 2, 3]);
+                self.store(inst, r, Ty::Int)
+            }
+            _ => unreachable!("only the texture opcodes come here"),
+        }
     }
 
     // ---- operands -----------------------------------------------------------------------
@@ -1035,6 +1211,7 @@ impl<'a> Emitter<'a> {
                 self.f.label(merge);
                 Ok(())
             }
+            Tex | Txb | Txl | Txf | Txq => self.texture(inst, num_consts),
             End => {
                 if !self.flow.is_empty() {
                     return decline("an END inside an IF");
@@ -1262,8 +1439,11 @@ pub fn emit(
     }
     // What the draw path binds by name for a GLSL program and by number for this one; each is
     // also refused where it is declared, and this keeps the two from disagreeing.
-    if info.ubo_used_mask != 0 || info.samplers_used_mask != 0 {
-        return decline("a uniform buffer or a sampler");
+    if info.ubo_used_mask != 0 {
+        return decline("a uniform buffer");
+    }
+    if !info.sampler_arrays.is_empty() || info.shadow_samp_mask != 0 {
+        return decline("a sampler array or a shadow sampler");
     }
     if info.images_used_mask != 0 || info.ssbo_used_mask != 0 || info.reads_drawid {
         return decline("an image, a storage buffer or the draw id");
@@ -1286,6 +1466,12 @@ pub fn emit(
             Token::Property(p) => e.property(p)?,
             Token::Instruction(inst) => e.instruction(inst, num_consts)?,
         }
+    }
+    // The draw path writes a unit to every sampler the GLSL translation counted; a module that
+    // declared a different set would leave one unwritten or write to nothing.
+    let sampled = e.samplers.keys().fold(0u32, |mask, &slot| mask | 1 << slot);
+    if sampled != info.samplers_used_mask {
+        return decline("a sampler declared and never sampled");
     }
     e.finish(info)
 }

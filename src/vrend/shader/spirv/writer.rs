@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 
 use spirv::{
-    AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel,
+    AddressingModel, BuiltIn, Capability, Decoration, Dim, ExecutionMode, ExecutionModel,
     FunctionControl, MemoryModel, Op, StorageClass,
 };
 
@@ -35,12 +35,38 @@ impl Id {
 enum TypeKey {
     Void,
     Bool,
-    Int { width: u32, signed: bool },
-    Float { width: u32 },
-    Vector { component: Id, count: u32 },
-    Array { element: Id, length: Id },
-    Pointer { class: StorageClass, pointee: Id },
-    Function { ret: Id, params: Vec<Id> },
+    Int {
+        width: u32,
+        signed: bool,
+    },
+    Float {
+        width: u32,
+    },
+    Vector {
+        component: Id,
+        count: u32,
+    },
+    Array {
+        element: Id,
+        length: Id,
+    },
+    Pointer {
+        class: StorageClass,
+        pointee: Id,
+    },
+    Function {
+        ret: Id,
+        params: Vec<Id>,
+    },
+    /// A sampled (not storage) image of unknown format, neither depth nor multisampled.
+    Image {
+        sampled_type: Id,
+        dim: Dim,
+        arrayed: bool,
+    },
+    SampledImage {
+        image: Id,
+    },
 }
 
 /// One instruction's words appended to `out`: the word count and opcode, then the operands.
@@ -194,6 +220,15 @@ impl Module {
                 operands.extend(params.iter().map(|p| p.word()));
                 instruction(&mut self.globals, Op::TypeFunction, &operands);
             }
+            TypeKey::Image { sampled_type, dim, arrayed } => {
+                // Depth 0, not multisampled, sampled 1, format unknown.
+                let operands =
+                    [r, sampled_type.word(), *dim as u32, 0, u32::from(*arrayed), 0, 1, 0];
+                instruction(&mut self.globals, Op::TypeImage, &operands);
+            }
+            TypeKey::SampledImage { image } => {
+                instruction(&mut self.globals, Op::TypeSampledImage, &[r, image.word()]);
+            }
         }
         self.types.insert(key, id);
         id
@@ -224,6 +259,15 @@ impl Module {
         let uint = self.type_int(32, false);
         let length = self.constant(uint, &[length]);
         self.ty(TypeKey::Array { element, length })
+    }
+
+    /// An image sampled through a sampler, of `sampled_type` texels.
+    pub fn type_image(&mut self, sampled_type: Id, dim: Dim, arrayed: bool) -> Id {
+        self.ty(TypeKey::Image { sampled_type, dim, arrayed })
+    }
+
+    pub fn type_sampled_image(&mut self, image: Id) -> Id {
+        self.ty(TypeKey::SampledImage { image })
     }
 
     pub fn type_pointer(&mut self, class: StorageClass, pointee: Id) -> Id {

@@ -97,6 +97,12 @@ impl Layout {
         stage.index() as u32 * STAGE_LOCATIONS
     }
 
+    /// The location of a SPIR-V stage's sampler `slot`, past the room its constant array can
+    /// take (4096 `uvec4`, `MAX_CONSTS`).
+    pub fn sampler_location(stage: ShaderStage, slot: u32) -> u32 {
+        stage.index() as u32 * STAGE_LOCATIONS + 4096 + slot
+    }
+
     /// The location of a generic varying with semantic index `sid` in a SPIR-V program, which
     /// takes the separable numbering whether it is separable or not: a SPIR-V stage meets its
     /// neighbours only by location. `None` past 31, which the numbering has no room for.

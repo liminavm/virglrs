@@ -391,21 +391,30 @@ impl LinkedProgram {
     }
 
     /// What a program of SPIR-V modules declared by number, recorded where the draw path reads
-    /// a GLSL program's looked-up locations: each stage's constants at its fixed location, and
-    /// the `VirglBlock` at its fixed binding. The emitter refuses the uniform buffers, samplers,
-    /// images and storage buffers a module would need bound beyond those.
+    /// a GLSL program's looked-up locations: each stage's constants and samplers at their fixed
+    /// locations, and the `VirglBlock` at its fixed binding. The emitter refuses the uniform
+    /// buffers, shadow samplers, images and storage buffers a module would need bound beyond
+    /// those.
     fn bind_spirv_locs(&mut self, gl: &Gl, walk: &[&Linked<'_>]) {
+        use crate::vrend::shader::layout::Layout;
         for l in walk {
             let s = l.stage.index();
             if l.info.num_consts > 0 {
-                let at = crate::vrend::shader::layout::Layout::const_location(l.stage);
+                let at = Layout::const_location(l.stage);
                 self.const_location[s] = Some(UniformLocation::at(at));
                 self.num_consts[s] = l.info.num_consts as usize;
             }
+            let mask = l.info.samplers_used_mask;
+            self.sampler_locs[s] = (0..32)
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| Some(UniformLocation::at(Layout::sampler_location(l.stage, i))))
+                .collect();
+            self.shadow_samp_mask_locs[s] = vec![None; self.sampler_locs[s].len()];
+            self.shadow_samp_add_locs[s] = vec![None; self.sampler_locs[s].len()];
+            self.samplers_used_mask[s] = mask;
         }
         // Every vertex module reads the block on its way out (the y prescale).
-        self.virgl_block_bind =
-            Some(BindingPoint::at(crate::vrend::shader::layout::Layout::VIRGL_BLOCK_BINDING));
+        self.virgl_block_bind = Some(BindingPoint::at(Layout::VIRGL_BLOCK_BINDING));
         if self.sysval_buffer.is_none() {
             let buf = gl.gen_buffer();
             gl.bind_buffer(GL_UNIFORM_BUFFER, Some(buf));
