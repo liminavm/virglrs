@@ -10,15 +10,16 @@ pub mod writer;
 
 use std::collections::BTreeMap;
 
-/// The switch that turns SPIR-V programs on where the probe passed. Off by default until the
-/// path has been measured against GLSL.
+/// The switch that keeps every program GLSL where the probe passed: `VIRGLRS_SPIRV=0`. SPIR-V
+/// is the default wherever the host takes it.
 const ENV: &str = "VIRGLRS_SPIRV";
 
 /// Whether this renderer hands its programs over as SPIR-V, and what came of it: how many were
 /// linked each way, and why shaders stayed GLSL. Each reason is said once as it first appears,
-/// the running counts at every link, and the whole tally when the renderer goes. The counts are
-/// said as they change because a VM's worker is torn down by the guest's power-off without
-/// dropping anything, so a tally kept for the end would never be read there.
+/// the running counts each time the total reaches a power of two, and the whole tally when the
+/// renderer goes. The counts are said as they grow because a VM's worker is torn down by the
+/// guest's power-off without dropping anything, so a tally kept for the end would never be read
+/// there; powers of two keep a long session's log to a few dozen lines.
 #[derive(Debug, Default)]
 pub struct Use {
     enabled: bool,
@@ -29,16 +30,18 @@ pub struct Use {
 }
 
 impl Use {
-    /// SPIR-V programs where `probe` passed and `VIRGLRS_SPIRV=1` asks for them. `attrib_binding`
-    /// is whether the host binds vertex attributes by location, which is how a module's inputs
-    /// meet the draw's vertex arrays.
+    /// SPIR-V programs where `probe` passed, unless `VIRGLRS_SPIRV=0` turns them off.
+    /// `attrib_binding` is whether the host binds vertex attributes by location, which is how a
+    /// module's inputs meet the draw's vertex arrays.
     pub fn new(probe: &Result<(), String>, attrib_binding: bool) -> Use {
-        let asked = std::env::var(ENV).as_deref() == Ok("1");
-        let enabled = asked && probe.is_ok() && attrib_binding;
-        if asked && !enabled {
-            eprintln!("[virglrs] vrend: {ENV}=1, but this host cannot take SPIR-V programs");
+        let declined = std::env::var(ENV).as_deref() == Ok("0");
+        let enabled = !declined && probe.is_ok() && attrib_binding;
+        if declined {
+            eprintln!("[virglrs] vrend: SPIR-V programs off ({ENV}=0)");
         } else if enabled {
-            eprintln!("[virglrs] vrend: SPIR-V programs on ({ENV}=1)");
+            eprintln!("[virglrs] vrend: SPIR-V programs on");
+        } else {
+            eprintln!("[virglrs] vrend: this host cannot take SPIR-V programs; every one is GLSL");
         }
         Use { enabled, spirv_programs: 0, glsl_programs: 0, declined: BTreeMap::new(), failed: 0 }
     }
@@ -72,12 +75,12 @@ impl Use {
         } else {
             self.glsl_programs += 1;
         }
-        eprintln!(
-            "[virglrs] vrend: linked a program from {}; {} from SPIR-V and {} from GLSL so far",
-            if spirv { "SPIR-V" } else { "GLSL" },
-            self.spirv_programs,
-            self.glsl_programs
-        );
+        if (self.spirv_programs + self.glsl_programs).is_power_of_two() {
+            eprintln!(
+                "[virglrs] vrend: {} programs linked from SPIR-V and {} from GLSL so far",
+                self.spirv_programs, self.glsl_programs
+            );
+        }
     }
 }
 
