@@ -1484,13 +1484,23 @@ mod tests {
         assert!(failures.is_empty(), "shaders differing from the C: {failures:?}");
     }
 
-    /// A piglit session's shaders, every stage, translate to the C's GLSL, byte for byte: the
-    /// blocks both legs translated alike whose key their own GLSL reveals.
+    /// A piglit session's shaders, every stage, translate to the C's GLSL, byte for byte: every
+    /// block both legs translated alike, under the inputs it was recorded with.
     #[test]
     fn every_piglit_shader_translates_to_the_c_glsl() {
         let cfg = Config { glsl_version: 320, has_nopersective: true, ..corpus_cfg() };
         let failures = differing(&cfg, &fixture::piglit_blocks());
         assert!(failures.is_empty(), "shaders differing from the C: {failures:?}");
+    }
+
+    /// The piglit session on a desktop GL host translates as the Rust leg translated it when
+    /// the fixture was recorded. Not the C's output -- the C does not come up on desktop GL on
+    /// this host -- so it catches a change to the desktop translation, separable programs'
+    /// locations among it, and not a translation that was already wrong.
+    #[test]
+    fn every_desktop_piglit_shader_translates_as_recorded() {
+        let failures = differing(&corpus_cfg(), &fixture::desktop_rs_blocks());
+        assert!(failures.is_empty(), "shaders differing from the recording: {failures:?}");
     }
 
     /// The same corpus on a desktop GL host translates to the C's desktop GLSL, byte for byte:

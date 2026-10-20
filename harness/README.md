@@ -696,6 +696,16 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   under different state once the C refuses what the Rust accepts.
   `key_from_glsl` remains only for the two fixtures recorded before the inputs were logged:
   `vrend-shaders.txt`, from a GLES 3.1 host this one no longer is, and the desktop log from iris.
+  `vrend-shaders-desktop-rs.txt` is the same piglit session replayed under desktop GL
+  (`--flags 0x809`), and it is **not the C's**: the C leg does not come up on desktop GL on this
+  host (it crashes in initialisation), so the blocks are the Rust leg's own -- its
+  `VIRGLRS_DEBUG=shader` dump and GLSL, and its shader-exact text and inputs, from the same
+  replay. 1,944 distinct blocks: 1,148 vertex, 433 fragment, 122 geometry, 82
+  tessellation-control, 132 tessellation-evaluation and 27 compute; 128 of them are separable
+  stages declaring their varyings by location, which no C fixture has. It pins the desktop
+  translation against change -- a refactor that must not move the GLSL -- and says nothing about
+  whether that translation was right. Re-record it only for a change meant to move the desktop
+  GLSL, and say so in the commit.
   The test beside the GLES one holds the translator's desktop dialect to it; the live
   differential is the same replay, flags included, on the Rust side, where the Rust leg logs three variant blocks more than the C on either flavour, and none
   that differs.

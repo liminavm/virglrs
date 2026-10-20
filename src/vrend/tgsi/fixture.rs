@@ -9,7 +9,9 @@
 //! from what the guest sent; each of its blocks also carries the TGSI the Rust leg printed exactly
 //! (`VIRGLRS_DEBUG=shader-exact`) from the same replay, which is what the translator is given.
 //! The C's dump stays the parser's oracle. A fourth, in the same shape, holds a piglit session's
-//! shaders of every stage. The tests here hold the Rust side to those blocks.
+//! shaders of every stage. A fifth is not the C's at all: the same piglit session on a desktop
+//! GL host as the Rust leg translated it, pinned against regressions where this host has no C
+//! to record from. The tests here hold the Rust side to those blocks.
 
 #![cfg(test)]
 
@@ -21,6 +23,8 @@ const DESKTOP_LOG: &str =
 const CAPTURES_LOG: &str =
     include_str!("../../../harness/replay/fixtures/vrend-shaders-captures.txt");
 const PIGLIT_LOG: &str = include_str!("../../../harness/replay/fixtures/vrend-shaders-piglit.txt");
+const DESKTOP_RS_LOG: &str =
+    include_str!("../../../harness/replay/fixtures/vrend-shaders-desktop-rs.txt");
 
 /// One shader of the log: the C's TGSI dump, the exact text and the translation's other inputs
 /// where the log has them, and the GLSL.
@@ -66,6 +70,12 @@ pub fn piglit_blocks() -> Vec<Block> {
     blocks_of(PIGLIT_LOG)
 }
 
+/// The distinct shaders of the piglit session on a desktop GL host, as the Rust leg translated
+/// them: its own output, not the C's.
+pub fn desktop_rs_blocks() -> Vec<Block> {
+    blocks_of(DESKTOP_RS_LOG)
+}
+
 fn blocks_of(log: &'static str) -> Vec<Block> {
     log.split("TGSI received:\n")
         .skip(1)
@@ -103,6 +113,7 @@ fn the_corpus_has_its_shaders() {
     assert_eq!(desktop_blocks().len(), 30);
     assert_eq!(capture_blocks().len(), 151);
     assert_eq!(piglit_blocks().len(), 1935);
+    assert_eq!(desktop_rs_blocks().len(), 1944);
 }
 
 /// A dump is text `tgsi_text` reads back; parsing the C's dump and dumping the result must print
@@ -112,7 +123,7 @@ fn the_corpus_has_its_shaders() {
 #[test]
 fn every_corpus_dump_reads_back_and_prints_the_same() {
     let all = blocks().into_iter().chain(desktop_blocks()).chain(capture_blocks());
-    for (i, block) in all.chain(piglit_blocks()).enumerate() {
+    for (i, block) in all.chain(piglit_blocks()).chain(desktop_rs_blocks()).enumerate() {
         let shader = text::parse(block.input().as_bytes(), u32::MAX)
             .unwrap_or_else(|e| panic!("shader {i}: {e}"));
         let printed = dump::dump(&shader);
