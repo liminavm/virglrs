@@ -15,14 +15,16 @@ use std::collections::BTreeMap;
 const ENV: &str = "VIRGLRS_SPIRV";
 
 /// Whether this renderer hands its programs over as SPIR-V, and what came of it: how many were
-/// linked each way, and why shaders stayed GLSL. Each reason is said once as it first appears
-/// and the whole tally when the renderer goes, so a run says how much of it the path reached.
+/// linked each way, and why shaders stayed GLSL. Each reason is said once as it first appears,
+/// the running counts at every link, and the whole tally when the renderer goes. The counts are
+/// said as they change because a VM's worker is torn down by the guest's power-off without
+/// dropping anything, so a tally kept for the end would never be read there.
 #[derive(Debug, Default)]
 pub struct Use {
     enabled: bool,
     spirv_programs: u64,
     glsl_programs: u64,
-    declined: BTreeMap<&'static str, u64>,
+    declined: BTreeMap<emit::Decline, u64>,
     failed: u64,
 }
 
@@ -47,9 +49,9 @@ impl Use {
 
     /// A shader the emitter would not write.
     pub fn declined(&mut self, why: emit::Decline) {
-        let n = self.declined.entry(why.0).or_default();
+        let n = self.declined.entry(why).or_default();
         if *n == 0 {
-            eprintln!("[virglrs] vrend: a shader stays GLSL: {}", why.0);
+            eprintln!("[virglrs] vrend: a shader stays GLSL: {why}");
         }
         *n += 1;
     }
@@ -62,14 +64,20 @@ impl Use {
 
     /// A program linked, from SPIR-V modules or GLSL.
     pub fn linked(&mut self, spirv: bool) {
+        if !self.enabled {
+            return;
+        }
         if spirv {
-            if self.spirv_programs == 0 {
-                eprintln!("[virglrs] vrend: the first SPIR-V program linked");
-            }
             self.spirv_programs += 1;
         } else {
             self.glsl_programs += 1;
         }
+        eprintln!(
+            "[virglrs] vrend: linked a program from {}; {} from SPIR-V and {} from GLSL so far",
+            if spirv { "SPIR-V" } else { "GLSL" },
+            self.spirv_programs,
+            self.glsl_programs
+        );
     }
 }
 
@@ -78,8 +86,8 @@ impl Drop for Use {
         if !self.enabled {
             return;
         }
-        let mut declined: Vec<_> = self.declined.iter().collect();
-        declined.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        let mut declined: Vec<_> = self.declined.iter().map(|(d, n)| (d.to_string(), *n)).collect();
+        declined.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
         eprintln!(
             "[virglrs] vrend: {} programs linked from SPIR-V, {} from GLSL, {} refused by the \
              host; shaders kept GLSL: {declined:?}",

@@ -39,13 +39,27 @@ use crate::vrend::tgsi::{
 };
 
 /// Why the emitter would not write a shader: the first thing it met that it does not handle.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Decline(pub &'static str);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Decline {
+    /// A shape of shader, interface or key, described.
+    Shape(&'static str),
+    /// An opcode, by its TGSI mnemonic.
+    Opcode(&'static str),
+}
+
+impl std::fmt::Display for Decline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Decline::Shape(why) => f.write_str(why),
+            Decline::Opcode(op) => write!(f, "the opcode {op}"),
+        }
+    }
+}
 
 type Result<T> = std::result::Result<T, Decline>;
 
 fn decline<T>(why: &'static str) -> Result<T> {
-    Err(Decline(why))
+    Err(Decline::Shape(why))
 }
 
 /// `GLSL.std.450` instruction numbers.
@@ -1219,7 +1233,7 @@ impl<'a> Emitter<'a> {
                 self.ended = true;
                 Ok(())
             }
-            _ => decline("an opcode this emitter does not handle"),
+            op => Err(Decline::Opcode(op.mnemonic())),
         }
     }
 
@@ -1498,7 +1512,7 @@ mod tests {
         let mut invalid = Vec::new();
         for (name, blocks) in corpora {
             let (mut wrote, mut seen) = (0, 0);
-            let mut declined: BTreeMap<&'static str, u32> = BTreeMap::new();
+            let mut declined: BTreeMap<Decline, u32> = BTreeMap::new();
             for (n, block) in blocks.iter().enumerate() {
                 let Some(inputs) = &block.inputs else { continue };
                 seen += 1;
@@ -1521,10 +1535,11 @@ mod tests {
                             invalid.push((name, n, e));
                         }
                     }
-                    Err(Decline(why)) => *declined.entry(why).or_default() += 1,
+                    Err(why) => *declined.entry(why).or_default() += 1,
                 }
             }
-            let mut by_count: Vec<_> = declined.into_iter().collect();
+            let mut by_count: Vec<_> =
+                declined.into_iter().map(|(d, c)| (d.to_string(), c)).collect();
             by_count.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
             eprintln!("{name}: {wrote} of {seen} written; declined: {by_count:?}");
             written += wrote;
