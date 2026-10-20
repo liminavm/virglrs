@@ -677,6 +677,17 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   GLSL is the C's, block for block from the same replay (the two GLSL logs were identical). The host was GLES 3.2 on zink with KosmicKrisp's
   geometry shaders on, so the blocks say `320 es` and the test's configuration has
   noperspective interpolation.
+  `vrend-shaders-piglit.txt` is the same shape over a piglit session: 1,343 tests across UBOs,
+  SSBOs, atomic counters, image load/store, compute, geometry and tessellation shaders, separate
+  shader objects, transform feedback, texture buffers and variable indexing, recorded on the Rust
+  leg in a stock F44 guest (limina's `spikes/vrend-spirv-gles/record-piglit.sh`) and replayed on
+  both legs with `--ctx 2,3,5,6`. The guest saw the Rust leg's caps, so the C refuses work it
+  never offered (1,460 refused submits against the Rust leg's 35, which matches the seven faults
+  the live worker logged), and the legs' logs differ by those. The fixture keeps the 1,929
+  distinct blocks both legs translated alike, less the 375 whose key their own GLSL does not
+  reveal -- mostly geometry, tessellation and transform-feedback stages, whose key and stream
+  output come from neighbouring stages. 1,554 remain: 1,038 vertex, 353 fragment, 46 geometry,
+  49 tessellation-control, 54 tessellation-evaluation and 14 compute.
   The test beside the GLES one holds the translator's desktop dialect to it; the live
   differential is the same replay, flags included, on the Rust side, where the Rust leg logs three variant blocks more than the C on either flavour, and none
   that differs.
