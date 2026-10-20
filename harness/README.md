@@ -672,30 +672,30 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   corpora, replayed on all their contexts -- with UBOs, indirect addressing, compute and images
   the old fixture lacks. `tgsi_dump`'s spelling drops `_PRECISE` and rounds float immediates to
   four decimals, which changes what 68 of them translate to. So each block carries the C's dump,
-  which the parser is held to, then after `TGSI exact:` the Rust leg's
-  `VIRGLRS_DEBUG=shader-exact` print of the same shader, which the translator is given, then the
-  C's GLSL, block for block from the same replay (the two legs' GLSL logs were identical). The
-  host was GLES 3.2 on zink with KosmicKrisp's geometry shaders on, so the blocks say `320 es`
-  and the test's configuration has noperspective interpolation.
+  which the parser is held to; then after `TGSI exact:` the Rust leg's
+  `VIRGLRS_DEBUG=shader-exact` print of the same shader, which the translator is given, followed
+  by every other input of that translation -- `CFG:` (the host's), `KEY:`, `SO:` (stream output)
+  and `LOCAL_MEM:` (`shader::keytext`) -- which it is translated under; then the C's GLSL, block
+  for block from the same replay (the two legs' GLSL logs were identical). The key is the Rust
+  leg's construction, which is sound where the GLSL matched the C's; key construction itself is
+  held only by the live log diff, so run it on every new capture.
   `vrend-shaders-piglit.txt` is the same shape over a piglit session: 1,343 tests across UBOs,
   SSBOs, atomic counters, image load/store, compute, geometry and tessellation shaders, separate
   shader objects, transform feedback, texture buffers and variable indexing, recorded on the Rust
   leg in a stock F44 guest (limina's `spikes/vrend-spirv-gles/record-piglit.sh`) and replayed on
   both legs with `--ctx 2,3,5,6`. The guest saw the Rust leg's caps, so the C refuses work it was
   never offered (1,460 refused submits against the Rust leg's 35, which matches the seven faults
-  the live worker logged). 1,929 distinct blocks translated alike on both legs. **The fixture
-  holds the 1,554 of them the test already passed** -- 1,038 vertex, 353 fragment, 46 geometry,
-  49 tessellation-control, 54 tessellation-evaluation and 14 compute -- because `key_from_glsl`
-  rebuilds the key from the GLSL and the other 375 (mostly geometry, tessellation and
-  transform-feedback stages, whose key and stream output come from neighbouring stages) did not
-  translate under the key it rebuilt. That selection is the test's own verdict: the 1,554 are a
-  regression gate, and they say nothing about the 375, where a translator bug and an unreadable
-  key look the same. Logging the key beside each shader is what lets those in.
-  The 34 programs whose GLSL differs between the two legs are not in it either. Three of their
-  four kinds are this tree's deliberate GLES departures from the C, where the C is not the
-  golden: a read-write image as two declarations (2a9803c), integer fragment outputs for integer
-  targets (8370e35) and the rasterizer's fixed point size (74deca9). The fourth, 48 fragment
-  variants only the Rust leg built, is not yet tied to the C's refused submits.
+  the live worker logged). It holds every one of the 1,935 distinct blocks the two legs
+  translated alike: 1,176 vertex, 388 fragment, 125 geometry, 90 tessellation-control, 134
+  tessellation-evaluation and 22 compute.
+  50 programs translate differently on the two legs and are left out. 22 of them differ by this
+  tree's deliberate GLES departures from the C, where the C is not the golden: a read-write image
+  as two declarations (2a9803c, 10), integer fragment outputs for integer targets (8370e35, 10)
+  and the rasterizer's fixed point size (74deca9, 2). In the other 28, one leg built a variant the
+  other never did (16 only on the C, 12 only on the Rust), which follows from the legs drawing
+  under different state once the C refuses what the Rust accepts.
+  `key_from_glsl` remains only for the two fixtures recorded before the inputs were logged:
+  `vrend-shaders.txt`, from a GLES 3.1 host this one no longer is, and the desktop log from iris.
   The test beside the GLES one holds the translator's desktop dialect to it; the live
   differential is the same replay, flags included, on the Rust side, where the Rust leg logs three variant blocks more than the C on either flavour, and none
   that differs.

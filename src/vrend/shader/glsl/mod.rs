@@ -1271,7 +1271,7 @@ pub fn create_passthrough_tcs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vrend::shader::{Dialect, MAX_SHADER_IMAGES};
+    use crate::vrend::shader::{Dialect, MAX_SHADER_IMAGES, keytext};
     use crate::vrend::tgsi::fixture;
 
     /// The host's configuration when the corpus was recorded: GLES 3.1 on zink over
@@ -1320,12 +1320,18 @@ mod tests {
         }
     }
 
-    fn translate(cfg: &Config, block: &fixture::Block, key: &Key) -> String {
+    fn translate(
+        cfg: &Config,
+        block: &fixture::Block,
+        key: &Key,
+        so: &StreamOutput,
+        local_mem: u32,
+    ) -> String {
         let shader =
             tgsi::text::parse(block.input().as_bytes(), u32::MAX).expect("the corpus parses");
         let program = tgsi::Program::scan(shader).expect("the corpus scans");
-        let (strings, _, _) = convert(cfg, &program, 0, key, &StreamOutput::default())
-            .unwrap_or_else(|e| panic!("{e}"));
+        let (strings, _, _) =
+            convert(cfg, &program, local_mem, key, so).unwrap_or_else(|e| panic!("{e}"));
         strings.source()
     }
 
@@ -1338,6 +1344,11 @@ mod tests {
     /// when the key says the previous stage writes it, and a vertex stage's colour output takes
     /// the fragment stage's interpolation -- an empty one still adds a space before `out`. This
     /// reads those back into a key.
+    ///
+    /// Only for the fixtures recorded before the translation's inputs were logged beside each
+    /// block -- `vrend-shaders.txt`, from a GLES 3.1 host that no longer exists, and the desktop
+    /// log from iris -- which cannot be recorded again as they were. Every newer fixture carries
+    /// its own inputs.
     fn key_from_glsl(shader: &Shader, glsl: &str) -> Key {
         let processor = shader.processor;
         let mut key = Key::default();
@@ -1424,8 +1435,21 @@ mod tests {
         for (i, block) in blocks.iter().enumerate() {
             let shader =
                 tgsi::text::parse(block.input().as_bytes(), u32::MAX).expect("the corpus parses");
-            let key = key_from_glsl(&shader, block.glsl);
-            let glsl = translate(cfg, block, &key);
+            // A block recorded with its inputs is translated under them; only the fixtures
+            // recorded before they were logged rebuild a key from their GLSL, under `cfg`.
+            let glsl = match &block.inputs {
+                Some(i) => translate(
+                    &keytext::parse_config(i.config),
+                    block,
+                    &keytext::parse_key(i.key),
+                    &keytext::parse_stream_output(i.stream_output),
+                    i.local_mem,
+                ),
+                None => {
+                    let key = key_from_glsl(&shader, block.glsl);
+                    translate(cfg, block, &key, &StreamOutput::default(), 0)
+                }
+            };
             if glsl != block.glsl {
                 failures.push(i);
                 if std::env::var_os("VIRGLRS_TEST_VERBOSE").is_some() {

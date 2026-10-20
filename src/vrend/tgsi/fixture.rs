@@ -22,11 +22,21 @@ const CAPTURES_LOG: &str =
     include_str!("../../../harness/replay/fixtures/vrend-shaders-captures.txt");
 const PIGLIT_LOG: &str = include_str!("../../../harness/replay/fixtures/vrend-shaders-piglit.txt");
 
-/// One shader of the log: the C's TGSI dump, the exact text where the log has one, and the GLSL.
+/// One shader of the log: the C's TGSI dump, the exact text and the translation's other inputs
+/// where the log has them, and the GLSL.
 pub struct Block {
     pub tgsi: &'static str,
     pub exact: Option<&'static str>,
+    pub inputs: Option<Inputs>,
     pub glsl: &'static str,
+}
+
+/// Everything a translation takes besides its program, as `shader::keytext` printed it.
+pub struct Inputs {
+    pub config: &'static str,
+    pub key: &'static str,
+    pub stream_output: &'static str,
+    pub local_mem: u32,
 }
 
 impl Block {
@@ -66,7 +76,23 @@ fn blocks_of(log: &'static str) -> Vec<Block> {
                 Some((tgsi, exact)) => (tgsi, Some(exact)),
                 None => (tgsi, None),
             };
-            Block { tgsi, exact, glsl }
+            // The other inputs follow the exact text as `CFG:`, `KEY:`, `SO:` and `LOCAL_MEM:`.
+            let (exact, inputs) = match exact.and_then(|e| e.split_once("CFG: ")) {
+                Some((exact, rest)) => {
+                    let line = |l: Option<&'static str>, name: &str| {
+                        l.and_then(|l| l.strip_prefix(name))
+                            .unwrap_or_else(|| panic!("no {name} line after CFG"))
+                    };
+                    let mut lines = rest.lines();
+                    let config = lines.next().expect("the CFG line");
+                    let key = line(lines.next(), "KEY: ");
+                    let stream_output = line(lines.next(), "SO: ");
+                    let local_mem = line(lines.next(), "LOCAL_MEM: ").parse().expect("a number");
+                    (Some(exact), Some(Inputs { config, key, stream_output, local_mem }))
+                }
+                None => (exact, None),
+            };
+            Block { tgsi, exact, inputs, glsl }
         })
         .collect()
 }
@@ -76,7 +102,7 @@ fn the_corpus_has_its_shaders() {
     assert_eq!(blocks().len(), 33);
     assert_eq!(desktop_blocks().len(), 30);
     assert_eq!(capture_blocks().len(), 151);
-    assert_eq!(piglit_blocks().len(), 1554);
+    assert_eq!(piglit_blocks().len(), 1935);
 }
 
 /// A dump is text `tgsi_text` reads back; parsing the C's dump and dumping the result must print
