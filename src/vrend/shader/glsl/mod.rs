@@ -28,6 +28,7 @@ use super::{
 use crate::vrend::pipe::slots::{ImageMask, PerImage, PerSampler, SamplerMask};
 use crate::vrend::pipe::{LogicOp, PrimType};
 use crate::vrend::proto::StreamOutput;
+use crate::vrend::shader::layout::Layout;
 use crate::vrend::tgsi::{
     self, File, ImageInfo, ImmType, Interpolate, Location, Processor, ReturnType, Semantic, Shader,
     Texture, Token, scan,
@@ -653,6 +654,13 @@ impl<'a> Context<'a> {
             require_dummy_value: false,
             local_cs_block_size: [0; 3],
         }
+    }
+
+    /// The numbers this translation declares its interfaces at, once the declarations have
+    /// named every SSBO slot.
+    pub fn layout(&self) -> Layout {
+        let first = (self.ssbo_first_binding != u32::MAX).then_some(self.ssbo_first_binding);
+        Layout::new(self.key, first)
     }
 
     /// `fs_emit_layout`: whether the fragment stage declares a `gl_FragCoord` layout. An

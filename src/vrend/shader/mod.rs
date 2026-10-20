@@ -20,6 +20,7 @@
 
 pub mod glsl;
 pub mod keytext;
+pub mod layout;
 
 use super::features::{Feature, Features};
 use super::gl::Gl;

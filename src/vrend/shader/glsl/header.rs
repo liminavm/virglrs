@@ -307,7 +307,7 @@ fn emit_image_decl(ctx: &mut Context<'_>, i: u32, range: i32, image: Image) {
     // From ARB_shader_image_load_store: an image used for loads or atomics must carry a format
     // qualifier matching its unit; one used only for stores need not, but a declared one must
     // match.
-    let binding = i + u32::from(ctx.key.image_binding_offset);
+    let binding = ctx.layout().image_binding(i);
     let loc_bind = if gles { "binding" } else { "location" };
     let mut declare = |access: &str, require_format_specifier: bool, alias: &str| {
         if require_format_specifier {
@@ -462,11 +462,12 @@ fn emit_ios_common(ctx: &mut Context<'_>) -> u32 {
     }
 
     for i in 0..ctx.abo_idx.len() {
-        let (idx, off, size) = (ctx.abo_idx[i], ctx.abo_offsets[i] * 4, ctx.abo_sizes[i]);
+        let (idx, size) = (ctx.abo_idx[i], ctx.abo_sizes[i]);
+        let (binding, off) = ctx.layout().atomic_counter(idx, ctx.abo_offsets[i]);
         hdr!(
             ctx.bufs,
             "layout (binding = {}, offset = {}) uniform atomic_uint ac{}_{}",
-            idx,
+            binding,
             off,
             idx,
             off
@@ -477,7 +478,7 @@ fn emit_ios_common(ctx: &mut Context<'_>) -> u32 {
         ctx.bufs.hdr(";\n");
     }
 
-    let first_binding = ctx.ssbo_first_binding as i64;
+    let layout = ctx.layout();
     if ctx.info.is_indirect(File::Buffer) {
         let mut mask = ctx.ssbo_used_mask;
         while mask != 0 {
@@ -487,12 +488,12 @@ fn emit_ios_common(ctx: &mut Context<'_>) -> u32 {
             if count == 32 {
                 mask = 0;
             }
-            let binding = start as i64 + i64::from(ctx.key.ssbo_binding_offset) - first_binding;
+            let binding = layout.ssbo_binding(start);
             let atomic = if ctx.ssbo_atomic_mask & bit32(start) != 0 { "atomic" } else { "" };
             hdr!(
                 ctx.bufs,
                 "layout (binding = {}, std430) buffer {}ssbo{} {{ uint {}ssbocontents{}[]; }} {}ssboarr{}[{}];\n",
-                binding as i32,
+                binding,
                 sname,
                 start,
                 sname,
@@ -507,14 +508,14 @@ fn emit_ios_common(ctx: &mut Context<'_>) -> u32 {
         while mask != 0 {
             let id = mask.trailing_zeros();
             mask &= mask - 1;
-            let binding = id as i64 + i64::from(ctx.key.ssbo_binding_offset) - first_binding;
+            let binding = layout.ssbo_binding(id);
             let ty = if ctx.ssbo_integer_mask & bit32(id) != 0 { Qual::Int } else { Qual::Uint };
             let coherent =
                 if ctx.ssbo_memory_qualifier[id as usize] == 1 { "coherent" } else { "" };
             hdr!(
                 ctx.bufs,
                 "layout (binding = {}, std430) {} buffer {}ssbo{} {{ {} {}ssbocontents{}[]; }};\n",
-                binding as i32,
+                binding,
                 coherent,
                 sname,
                 id,
@@ -591,7 +592,7 @@ fn emit_ios_generic(
         && io.name == Semantic::Generic
         && !(ctx.prog_type == Processor::Fragment && inout != "in")
     {
-        format!("layout(location = {}) ", 31 - io.sid as i32)
+        format!("layout(location = {}) ", ctx.layout().separable_generic_location(io.sid))
     } else {
         String::new()
     };
@@ -793,7 +794,7 @@ fn emit_ios_generic_outputs(ctx: &mut Context<'_>, can_emit_generic: fn(&Io) -> 
 fn emit_ios_patch(ctx: &mut Context<'_>, prefix: &str, io: &Io, inout: &str, size: i32) -> u64 {
     let mut emitted_patches = 0u64;
     if ctx.separable_program {
-        hdr!(ctx.bufs, "layout(location = {}) ", io.sid);
+        hdr!(ctx.bufs, "layout(location = {}) ", ctx.layout().separable_patch_location(io.sid));
     }
     if io.last == io.first {
         hdr!(ctx.bufs, "{} {} vec4 {};\n", prefix, inout, io.glsl_name);
@@ -1021,7 +1022,8 @@ fn emit_ios_fs(ctx: &mut Context<'_>) {
             if ctx.key.fs.logicop_func.is_some() {
                 emit_logicop_output(ctx, ty, i);
             } else {
-                hdr!(ctx.bufs, "layout (location={}) out {} fsout_c{};\n", i, ty, i);
+                let location = ctx.layout().colour_output_location(i);
+                hdr!(ctx.bufs, "layout (location={}) out {} fsout_c{};\n", location, ty, i);
             }
         }
     } else {
@@ -1041,7 +1043,10 @@ fn emit_ios_fs(ctx: &mut Context<'_>) {
             if !output.glsl_predefined_no_emit {
                 let prefix =
                     if gles && output.name == Semantic::Color && !ctx.cfg.has_dual_src_blend {
-                        format!("layout(location = {})", output.sid)
+                        format!(
+                            "layout(location = {})",
+                            ctx.layout().colour_output_location(output.sid)
+                        )
                     } else {
                         String::new()
                     };
@@ -1093,13 +1098,21 @@ fn emit_ios_fs(ctx: &mut Context<'_>) {
 
 /// A colour output under an emulated logic op: the shader's `fsout_tmp_c<n>`, and the buffer's
 /// `fsout_c<n>`, which the op reads back where it needs the framebuffer.
-fn emit_logicop_output(ctx: &mut Context<'_>, ty: &str, n: impl std::fmt::Display) {
+fn emit_logicop_output(ctx: &mut Context<'_>, ty: &str, n: u32) {
     hdr!(ctx.bufs, "{} fsout_tmp_c{};\n", ty, n);
+    let location = ctx.layout().colour_output_location(n);
     if ctx.logiop_require_inout() {
         let noncoherent = if ctx.cfg.has_fbfetch_coherent { "" } else { ", noncoherent" };
-        hdr!(ctx.bufs, "layout (location={}{}) inout highp {} fsout_c{};\n", n, noncoherent, ty, n);
+        hdr!(
+            ctx.bufs,
+            "layout (location={}{}) inout highp {} fsout_c{};\n",
+            location,
+            noncoherent,
+            ty,
+            n
+        );
     } else {
-        hdr!(ctx.bufs, "layout (location={}) out {} fsout_c{};\n", n, ty, n);
+        hdr!(ctx.bufs, "layout (location={}) out {} fsout_c{};\n", location, ty, n);
     }
 }
 
@@ -1391,7 +1404,7 @@ fn emit_match_interfaces(
         emit_interp_info(ctx, semantic, i);
         // The C's own numbering here, which is not the 31-down the declared generics take.
         if semantic == Semantic::Generic && ctx.separable_program {
-            hdr!(ctx.bufs, "layout(location={}) ", i);
+            hdr!(ctx.bufs, "layout(location={}) ", ctx.layout().padding_location(i));
         }
         hdr!(
             ctx.bufs,
