@@ -50,6 +50,13 @@ enum TypeKey {
         element: Id,
         length: Id,
     },
+    /// An array laid out explicitly, as a block member is: a type of its own, since the same
+    /// element and length without the stride is a different type to the validator.
+    StridedArray {
+        element: Id,
+        length: Id,
+        stride: u32,
+    },
     Pointer {
         class: StorageClass,
         pointee: Id,
@@ -208,6 +215,11 @@ impl Module {
             TypeKey::Array { element, length } => {
                 instruction(&mut self.globals, Op::TypeArray, &[r, element.word(), length.word()]);
             }
+            TypeKey::StridedArray { element, length, stride } => {
+                instruction(&mut self.globals, Op::TypeArray, &[r, element.word(), length.word()]);
+                let stride = *stride;
+                self.decorate(id, Decoration::ArrayStride, &[stride]);
+            }
             TypeKey::Pointer { class, pointee } => {
                 instruction(
                     &mut self.globals,
@@ -268,6 +280,13 @@ impl Module {
 
     pub fn type_sampled_image(&mut self, image: Id) -> Id {
         self.ty(TypeKey::SampledImage { image })
+    }
+
+    /// An array of `length` elements `stride` bytes apart, for a block member.
+    pub fn type_array_strided(&mut self, element: Id, length: u32, stride: u32) -> Id {
+        let uint = self.type_int(32, false);
+        let length = self.constant(uint, &[length]);
+        self.ty(TypeKey::StridedArray { element, length, stride })
     }
 
     pub fn type_pointer(&mut self, class: StorageClass, pointee: Id) -> Id {

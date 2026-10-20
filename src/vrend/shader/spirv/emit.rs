@@ -230,6 +230,10 @@ struct Emitter<'a> {
     immediates: Vec<Id>,
     /// The constant array and how many `uvec4` it holds.
     consts: Option<(Id, u32)>,
+    /// The uniform buffers, by slot: each block's variable and how many `vec4` it holds.
+    ubos: BTreeMap<u16, (Id, u32)>,
+    /// The vertex and instance ids, by system-value register.
+    system_values: BTreeMap<i16, Id>,
     flow: Vec<Construct>,
     early_fragment_tests: bool,
     /// `FS_COLOR0_WRITES_ALL_CBUFS`: colour 0 goes to every draw buffer the host has.
@@ -350,6 +354,8 @@ impl<'a> Emitter<'a> {
             outputs: BTreeMap::new(),
             immediates: Vec::new(),
             consts: None,
+            ubos: BTreeMap::new(),
+            system_values: BTreeMap::new(),
             flow: Vec::new(),
             early_fragment_tests: false,
             write_all_cbufs: false,
@@ -426,7 +432,7 @@ impl<'a> Emitter<'a> {
             }
             File::Constant => match d.dimension {
                 None | Some(0) => Ok(()),
-                Some(_) => decline("a uniform buffer"),
+                Some(slot) => self.declare_ubo(slot, u32::from(d.last) + 1),
             },
             File::Input => self.declare_input(d),
             File::Output => self.declare_output(d),
@@ -449,7 +455,22 @@ impl<'a> Emitter<'a> {
             File::Buffer => decline("a shader storage buffer"),
             File::Memory => decline("shared or global memory"),
             File::HwAtomic => decline("an atomic counter"),
-            File::SystemValue => decline("a system value"),
+            File::SystemValue => {
+                let builtin = match (self.processor, d.semantic.name) {
+                    (Processor::Vertex, Semantic::VertexId) => BuiltIn::VertexId,
+                    (Processor::Vertex, Semantic::InstanceId) => BuiltIn::InstanceId,
+                    _ => return decline("a system value other than the vertex or instance id"),
+                };
+                if d.first != d.last {
+                    return decline("a range of system values");
+                }
+                let ptr = self.m.type_pointer(StorageClass::Input, self.t.int);
+                let var = self.m.global_variable(ptr, StorageClass::Input);
+                self.m.builtin(var, builtin);
+                self.interface.push(var);
+                self.system_values.insert(d.first as i16, var);
+                Ok(())
+            }
             File::Null | File::Immediate | File::Predicate => decline("an unexpected declaration"),
         }
     }
@@ -576,6 +597,27 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Uniform buffer `slot` of `size` `vec4`s, as the GLSL's `uniform <stage>ubo<n> { vec4
+    /// <stage>ubo<n>contents[size]; }` lays it out, at the stage's fixed binding for the slot.
+    fn declare_ubo(&mut self, slot: u16, size: u32) -> Result<()> {
+        let Some(binding) = Layout::ubo_binding(self.stage, u32::from(slot)) else {
+            return decline("a uniform buffer past slot 15");
+        };
+        if self.ubos.contains_key(&slot) {
+            return decline("a uniform buffer declared twice");
+        }
+        let vec4 = self.t.vec4;
+        let contents = self.m.type_array_strided(vec4, size, 16);
+        let block = self.m.type_struct(&[contents]);
+        self.m.decorate(block, Decoration::Block, &[]);
+        self.m.member_decorate(block, 0, Decoration::Offset, &[0]);
+        let ptr = self.m.type_pointer(StorageClass::Uniform, block);
+        let var = self.m.global_variable(ptr, StorageClass::Uniform);
+        self.m.decorate(var, Decoration::Binding, &[binding]);
+        self.ubos.insert(slot, (var, size));
+        Ok(())
+    }
+
     fn constants(&mut self, count: u32) -> Id {
         if let Some((var, _)) = self.consts {
             return var;
@@ -598,10 +640,8 @@ impl<'a> Emitter<'a> {
         }
         let t = &self.t;
         let (vec4, uint, float, int) = (t.vec4, t.uint, t.float, t.int);
-        let planes = self.m.type_array(vec4, NUM_CLIP_PLANES as u32);
-        let stipple = self.m.type_array(uint, POLYGON_STIPPLE_SIZE as u32);
-        self.m.decorate(planes, Decoration::ArrayStride, &[16]);
-        self.m.decorate(stipple, Decoration::ArrayStride, &[16]);
+        let planes = self.m.type_array_strided(vec4, NUM_CLIP_PLANES as u32, 16);
+        let stipple = self.m.type_array_strided(uint, POLYGON_STIPPLE_SIZE as u32, 16);
         // `clip_plane_enabled` is a `bool` in the GLSL; a block member cannot be one in SPIR-V,
         // and std140 lays a `bool` out as a 32-bit word, which is what is read here.
         let block = self.m.type_struct(&[planes, stipple, float, float, uint, int]);
@@ -832,10 +872,43 @@ impl<'a> Emitter<'a> {
                 };
                 Ok(imm)
             }
-            File::Constant => {
-                if src.dimension && src.dim.index != 0 {
-                    return decline("a uniform buffer read");
+            File::Constant if src.dimension && src.dim.index != 0 => {
+                if src.dim.indirect {
+                    return decline("an indirectly addressed constant buffer");
                 }
+                let Some(&(var, size)) = self.ubos.get(&(src.dim.index as u16)) else {
+                    return decline("a read of an undeclared uniform buffer");
+                };
+                let i = if src.indirect {
+                    let base = self.addr(src.ind.file, src.ind.index)?;
+                    let offset = self.int(i32::from(src.index));
+                    let int = self.t.int;
+                    self.op(Op::IAdd, int, &[base, offset])
+                } else {
+                    if u32::try_from(src.index).map_or(true, |i| i >= size) {
+                        return decline("a uniform buffer read past its declared size");
+                    }
+                    self.int(i32::from(src.index))
+                };
+                let vec4 = self.t.vec4;
+                let ptr = self.m.type_pointer(StorageClass::Uniform, vec4);
+                let member = self.int(0);
+                let p = self.op(Op::AccessChain, ptr, &[var, member, i]);
+                let v = self.op(Op::Load, vec4, &[p]);
+                Ok(self.bitcast(uvec4, v))
+            }
+            // `vec4(intBitsToFloat(gl_VertexID))`: the id's bits in every channel.
+            File::SystemValue => {
+                let Some(&var) = self.system_values.get(&src.index) else {
+                    return decline("a read of an undeclared system value");
+                };
+                let int = self.t.int;
+                let id = self.op(Op::Load, int, &[var]);
+                let uint = self.t.uint;
+                let bits = self.bitcast(uint, id);
+                Ok(self.scalar_splat(uvec4, bits))
+            }
+            File::Constant => {
                 if src.dimension && src.dim.indirect {
                     return decline("an indirectly addressed constant buffer");
                 }
@@ -1194,6 +1267,17 @@ impl<'a> Emitter<'a> {
             }
             Uadd => bin!(Op::IAdd),
             Umul => bin!(Op::IMul),
+            // The GLSL's `/` and `%` on integer vectors, whose zero divisor is as undefined there.
+            Udiv => bin!(Op::UDiv),
+            Idiv => bin!(Op::SDiv),
+            Umod => bin!(Op::UMod),
+            Mod => bin!(Op::SMod),
+            Umad => {
+                let (a, b, c) = (s!(0, Ty::Uint), s!(1, Ty::Uint), s!(2, Ty::Uint));
+                let ab = self.op(Op::IMul, uvec4, &[a, b]);
+                let r = self.op(Op::IAdd, uvec4, &[ab, c]);
+                self.store(inst, r, Ty::Uint)
+            }
             And => bin!(Op::BitwiseAnd),
             Or => bin!(Op::BitwiseOr),
             Xor => bin!(Op::BitwiseXor),
@@ -1600,6 +1684,9 @@ pub fn emit(
     so: &StreamOutput,
 ) -> Result<Vec<u32>> {
     let processor = program.shader.processor;
+    if program.info.is_dimension_indirect(File::Constant) {
+        return decline("an array of uniform buffers");
+    }
     if !matches!(processor, Processor::Vertex | Processor::Fragment) {
         return decline("a stage other than vertex or fragment");
     }
@@ -1611,9 +1698,6 @@ pub fn emit(
     }
     // What the draw path binds by name for a GLSL program and by number for this one; each is
     // also refused where it is declared, and this keeps the two from disagreeing.
-    if info.ubo_used_mask != 0 {
-        return decline("a uniform buffer");
-    }
     if !info.sampler_arrays.is_empty() || info.shadow_samp_mask != 0 {
         return decline("a sampler array or a shadow sampler");
     }
@@ -1644,6 +1728,11 @@ pub fn emit(
     let sampled = e.samplers.keys().fold(0u32, |mask, &slot| mask | 1 << slot);
     if sampled != info.samplers_used_mask {
         return decline("a sampler declared and never sampled");
+    }
+    // The same for the uniform buffers the draw path binds by slot.
+    let blocks = e.ubos.keys().fold(0u32, |mask, &slot| mask | 1 << slot);
+    if blocks != info.ubo_used_mask {
+        return decline("uniform buffers other than the ones the draw binds");
     }
     e.finish(info)
 }

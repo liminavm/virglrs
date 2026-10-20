@@ -97,6 +97,12 @@ impl Layout {
         stage.index() as u32 * STAGE_LOCATIONS
     }
 
+    /// The binding of a SPIR-V stage's uniform buffer `slot`: sixteen a stage, slot 0 (the
+    /// constants the stage reads as plain uniforms) never taking one. `None` past fifteen.
+    pub fn ubo_binding(stage: ShaderStage, slot: u32) -> Option<u32> {
+        (1..16).contains(&slot).then(|| stage.index() as u32 * 16 + slot)
+    }
+
     /// The location of a SPIR-V stage's sampler `slot`, past the room its constant array can
     /// take (4096 `uvec4`, `MAX_CONSTS`).
     pub fn sampler_location(stage: ShaderStage, slot: u32) -> u32 {

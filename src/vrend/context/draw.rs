@@ -331,6 +331,11 @@ impl LinkedProgram {
         }
     }
 
+    /// Whether this program was linked from SPIR-V modules, which declare their own bindings.
+    fn is_spirv(&self) -> bool {
+        matches!(self.linkage, Linkage::Graphics { spirv: true, .. })
+    }
+
     /// Whether this program links `variant`.
     pub fn links(&self, variant: VariantId) -> bool {
         match self.linkage {
@@ -412,6 +417,8 @@ impl LinkedProgram {
             self.shadow_samp_mask_locs[s] = vec![None; self.sampler_locs[s].len()];
             self.shadow_samp_add_locs[s] = vec![None; self.sampler_locs[s].len()];
             self.samplers_used_mask[s] = mask;
+            // Bound by `draw_bind_ubo` at the slots the module declared (`Layout::ubo_binding`).
+            self.ubo_used_mask[s] = l.info.ubo_used_mask;
         }
         // Every vertex module reads the block on its way out (the y prescale).
         self.virgl_block_bind = Some(BindingPoint::at(Layout::VIRGL_BLOCK_BINDING));
@@ -1558,6 +1565,7 @@ impl Context {
         let gl = host.gl;
         let s = stage.index();
         let mut mask = sub.program_at(at).ubo_used_mask[s];
+        let spirv = sub.program_at(at).is_spirv();
         let mut dirty = sub.ubos_dirty[s];
         // Nothing dirty is nothing to rebind, whatever is bound. The walk below only narrows this
         // answer, so reaching it first spends a BTree walk per stage per draw to be told what the
@@ -1582,9 +1590,18 @@ impl Context {
                 && let Some(res) = host.bound_resource(cb.resource)
                 && let Storage::Buffer { name, .. } = res.storage
             {
+                // A module declares each block's binding; a GLSL program's are numbered through
+                // the stages, and this walk keeps the count.
+                let binding = if spirv {
+                    let at = crate::vrend::shader::layout::Layout::ubo_binding(stage, i)
+                        .expect("the emitter refuses a block past the fixed slots");
+                    BindingPoint::at(at)
+                } else {
+                    next_ubo_id
+                };
                 gl.bind_buffer_range(
                     GL_UNIFORM_BUFFER,
-                    next_ubo_id,
+                    binding,
                     name,
                     cb.offset as usize,
                     cb.length as usize,
