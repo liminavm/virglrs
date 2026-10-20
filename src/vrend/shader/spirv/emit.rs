@@ -200,6 +200,8 @@ struct Emitter<'a> {
     consts: Option<(Id, u32)>,
     flow: Vec<Selection>,
     early_fragment_tests: bool,
+    /// `FS_COLOR0_WRITES_ALL_CBUFS`: colour 0 goes to every draw buffer the host has.
+    write_all_cbufs: bool,
     /// The `VirglBlock`, declared on the first read of it.
     sysvals: Option<Id>,
     ended: bool,
@@ -308,6 +310,7 @@ impl<'a> Emitter<'a> {
             consts: None,
             flow: Vec::new(),
             early_fragment_tests: false,
+            write_all_cbufs: false,
             sysvals: None,
             ended: false,
         }
@@ -489,10 +492,10 @@ impl<'a> Emitter<'a> {
                 self.early_fragment_tests = p.data != 0;
                 Ok(())
             }
-            Property::FsColor0WritesAllCbufs if p.data != 0 => {
-                decline("colour 0 written to every buffer")
+            Property::FsColor0WritesAllCbufs => {
+                self.write_all_cbufs = p.data == 1;
+                Ok(())
             }
-            Property::FsColor0WritesAllCbufs => Ok(()),
             Property::FsDepthLayout if p.data == 0 => Ok(()),
             Property::NumClipdistEnabled | Property::NumCulldistEnabled if p.data == 0 => Ok(()),
             Property::SeparableProgram => decline("a separable program"),
@@ -1139,6 +1142,9 @@ impl<'a> Emitter<'a> {
                         Sink::Colour { cbuf } => {
                             let location = self.layout.colour_output_location(cbuf);
                             self.m.decorate(var, Decoration::Location, &[location]);
+                            if self.write_all_cbufs && cbuf == 0 {
+                                self.copy_to_every_cbuf(v);
+                            }
                         }
                         Sink::PointSize => unreachable!("matched above"),
                     }
@@ -1175,6 +1181,18 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// Colour 0's value to every other draw buffer the host has, as the GLSL's
+    /// `fsout_c<i> = fsout_c0` does.
+    fn copy_to_every_cbuf(&mut self, v: Id) {
+        for cbuf in 1..self.cfg.max_draw_buffers {
+            let var = self.m.global_variable(self.t.out_vec4, StorageClass::Output);
+            let location = self.layout.colour_output_location(cbuf);
+            self.m.decorate(var, Decoration::Location, &[location]);
+            self.interface.push(var);
+            self.f.op_void(Op::Store, &[var.word(), v.word()]);
+        }
+    }
+
     /// A vertex output carries the interpolation the fragment shader declares for it, as the
     /// GLSL's does from the key: GLES requires the two to agree.
     fn output_interpolation(&mut self, var: Id, sid: u32) -> Result<()> {
@@ -1194,6 +1212,11 @@ impl<'a> Emitter<'a> {
         }
         if self.processor == Processor::Vertex {
             self.vertex_epilogue(info)?;
+        }
+        if self.write_all_cbufs
+            && self.outputs.values().any(|s| matches!(s, Sink::Colour { cbuf } if *cbuf != 0))
+        {
+            return decline("colour 0 written to every buffer beside another colour output");
         }
         self.write_outputs()?;
         self.f.op_void(Op::Return, &[]);
