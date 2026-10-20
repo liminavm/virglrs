@@ -4,7 +4,9 @@
 //! The C's shader logs as fixtures: every shader the classic corpus creates, as `tgsi_dump`
 //! printed it and as `vrend_convert_shader` translated it (`harness/replay/vrend-shader-log.py`
 //! records them). One log is a GLES host's and one a desktop GL host's, the same corpus on each.
-//! The tests here hold the Rust side to those blocks.
+//! A third holds the distinct shaders of every pinned capture, its TGSI printed exactly by the
+//! Rust leg (`VIRGLRS_DEBUG=shader-exact`) beside the C's GLSL for the same block. The tests here
+//! hold the Rust side to those blocks.
 
 #![cfg(test)]
 
@@ -13,6 +15,8 @@ use super::*;
 const LOG: &str = include_str!("../../../harness/replay/fixtures/vrend-shaders.txt");
 const DESKTOP_LOG: &str =
     include_str!("../../../harness/replay/fixtures/vrend-shaders-desktop.iris.txt");
+const CAPTURES_LOG: &str =
+    include_str!("../../../harness/replay/fixtures/vrend-shaders-captures.txt");
 
 /// One shader of the log: its TGSI dump and its GLSL.
 pub struct Block {
@@ -30,6 +34,11 @@ pub fn desktop_blocks() -> Vec<Block> {
     blocks_of(DESKTOP_LOG)
 }
 
+/// The distinct blocks of every pinned capture's GLES log, in first-seen order.
+pub fn capture_blocks() -> Vec<Block> {
+    blocks_of(CAPTURES_LOG)
+}
+
 fn blocks_of(log: &'static str) -> Vec<Block> {
     log.split("TGSI received:\n")
         .skip(1)
@@ -45,6 +54,7 @@ fn blocks_of(log: &'static str) -> Vec<Block> {
 fn the_corpus_has_its_shaders() {
     assert_eq!(blocks().len(), 33);
     assert_eq!(desktop_blocks().len(), 30);
+    assert_eq!(capture_blocks().len(), 151);
 }
 
 /// A dump is text `tgsi_text` reads back; parsing the C's dump and dumping the result must print

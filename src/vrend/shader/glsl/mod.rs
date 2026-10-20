@@ -1333,7 +1333,10 @@ mod tests {
     /// generics each expects of the other, and how the fragment stage wants them
     /// interpolated -- and the C's header names it: an interpolation qualifier on a generic
     /// is the fragment stage's, and a generic declared for the other stage's sake is one it
-    /// expected. This reads those back into a key.
+    /// expected. Colours are read the same way: a fragment stage declares a colour input only
+    /// when the key says the previous stage writes it, and a vertex stage's colour output takes
+    /// the fragment stage's interpolation -- an empty one still adds a space before `out`. This
+    /// reads those back into a key.
     fn key_from_glsl(shader: &Shader, glsl: &str) -> Key {
         let processor = shader.processor;
         let mut key = Key::default();
@@ -1345,11 +1348,46 @@ mod tests {
             let agree = glsl.contains("origin_upper_left");
             key.fs.lower_left_origin = if agree { fs_lower } else { !fs_lower };
         }
+        // A vertex stage needs the noperspective extension only for the fragment stage's sake.
+        if processor == Processor::Vertex
+            && glsl.contains("GL_NV_shader_noperspective_interpolation")
+        {
+            key.fs_info.has_noperspective = true;
+        }
         for line in glsl.lines() {
             let words: Vec<&str> = line.split_whitespace().collect();
             let Some(name) = words.last().and_then(|w| w.strip_suffix(';')) else {
                 continue;
             };
+            if let Some(sid) = name.strip_prefix("vso_c").and_then(|n| n.parse::<u16>().ok()) {
+                let decl = line.strip_prefix("precise").unwrap_or(line);
+                match processor {
+                    Processor::Fragment if words.contains(&"in") => {
+                        key.fs.available_color_in_bits |= 1 << sid;
+                        // A colour interpolated as colour is flat only under flat shading.
+                        key.flatshade |= words.contains(&"flat");
+                    }
+                    Processor::Vertex if words.contains(&"out") => {
+                        let interpolate = if words.contains(&"smooth") {
+                            Interpolate::Perspective
+                        } else if words.contains(&"flat") {
+                            Interpolate::Constant
+                        } else if decl.starts_with("    out") {
+                            Interpolate::Color
+                        } else {
+                            continue;
+                        };
+                        key.fs_info.interps.push(InterpInfo {
+                            semantic_name: Semantic::Color,
+                            semantic_index: sid,
+                            interpolate,
+                            location: Location::Center,
+                        });
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             let Some(sid) = name.strip_prefix("vso_g").and_then(|n| n.parse::<u32>().ok()) else {
                 continue;
             };
@@ -1401,6 +1439,13 @@ mod tests {
     #[test]
     fn every_corpus_shader_translates_to_the_c_glsl() {
         let failures = differing(&corpus_cfg(), &fixture::blocks());
+        assert!(failures.is_empty(), "shaders differing from the C: {failures:?}");
+    }
+
+    #[test]
+    fn every_capture_shader_translates_to_the_c_glsl() {
+        let cfg = Config { glsl_version: 320, has_nopersective: true, ..corpus_cfg() };
+        let failures = differing(&cfg, &fixture::capture_blocks());
         assert!(failures.is_empty(), "shaders differing from the C: {failures:?}");
     }
 

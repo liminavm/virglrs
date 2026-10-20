@@ -666,6 +666,14 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `--no-rebuild --flags 0x809` (desktop GL, as QEMU's default displays give it), twice and byte
   identical. It is 30 blocks, as the C's GLES log on iris is too; the 33-block GLES fixture is
   zink's.
+  `vrend-shaders-captures.txt` holds the distinct shaders of every pinned capture -- 151 from 18
+  corpora, replayed on all their contexts -- with UBOs, indirect addressing, compute and images
+  the old fixture lacks. `tgsi_dump`'s spelling drops `_PRECISE` and rounds float immediates to
+  four decimals, which changes what 68 of them translate to, so its TGSI half is the Rust leg's
+  `VIRGLRS_DEBUG=shader-exact` log and its GLSL half the C's, block for block from the same
+  replay (the two GLSL logs were identical). The host was GLES 3.2 on zink with KosmicKrisp's
+  geometry shaders on, so the blocks say `320 es` and the test's configuration has
+  noperspective interpolation.
   The test beside the GLES one holds the translator's desktop dialect to it; the live
   differential is the same replay, flags included, on the Rust side, where the Rust leg logs three variant blocks more than the C on either flavour, and none
   that differs.
