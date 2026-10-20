@@ -20,7 +20,9 @@
 //!
 //! What a replay needs, and so what this records: every command the guest sent that the renderer
 //! accepted, the bytes each guest-to-host transfer carried, the pixels behind a blob a texture
-//! copies, and every resource create and unref. Batch boundaries, transfer metadata, fences and
+//! copies, every resource create and unref, and every context create and destroy -- a guest
+//! hands a destroyed context's id to the next one, so a session of short-lived processes (a test
+//! suite) is several contexts on one id, which only these records tell apart. Batch boundaries, transfer metadata, fences and
 //! the bound target's size at each draw are recorded for the decoder.
 
 use std::path::PathBuf;
@@ -31,8 +33,8 @@ use crate::ids::{ContextId, ResourceHandle};
 
 /// The dump's magic, "LMVT".
 const MAGIC: u32 = 0x4c4d_5654;
-/// The format version `vrend-replay` requires.
-const VERSION: u32 = 2;
+/// The format version: 3 added the context records, which a version-2 reader never sees.
+const VERSION: u32 = 3;
 /// A record header's bytes: total length, type, command, context, sequence, time, payload length
 /// and auxiliary word count.
 const HEADER: usize = 32;
@@ -59,6 +61,9 @@ enum Kind {
     Pad = 7,
     TransferData = 9,
     BlobData = 10,
+    /// Eight is a gap in the C tracer's numbering, left alone.
+    CtxCreate = 11,
+    CtxDestroy = 12,
 }
 
 /// Which way a recorded transfer went, as the readers number it.
@@ -246,6 +251,20 @@ impl Recorder {
         return self.ring.as_deref();
         #[cfg(not(feature = "trace"))]
         None
+    }
+
+    /// Context `ctx` came to exist, serving `capset`, under the name the guest gave it.
+    pub fn context_create(&self, ctx: ContextId, capset: u32, name: &str) {
+        if let Some(r) = self.ring() {
+            r.put(Kind::CtxCreate, 0, Some(ctx), &[capset], name.as_bytes());
+        }
+    }
+
+    /// Context `ctx` is gone; its id may name a new one from here on.
+    pub fn context_destroy(&self, ctx: ContextId) {
+        if let Some(r) = self.ring() {
+            r.put(Kind::CtxDestroy, 0, Some(ctx), &[], &[]);
+        }
     }
 
     /// A batch of `bytes` begins on `ctx`.

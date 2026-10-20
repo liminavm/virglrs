@@ -1397,6 +1397,8 @@ impl Renderer {
             }
             Bound::Unserved => {}
         }
+        let ctx = &self.contexts[&id];
+        self.traces.stream.context_create(id, u32::from(ctx.capset.raw()), &ctx.name);
         Ok(())
     }
 
@@ -1404,6 +1406,7 @@ impl Renderer {
         let Ok(bound) = self.bound(id) else {
             return;
         };
+        self.traces.stream.context_destroy(id);
         self.contexts.remove(&id);
         // The renderer that served it tears its half down; the other never had one.
         match bound {

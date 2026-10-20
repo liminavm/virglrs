@@ -98,6 +98,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   framebuffer is still drawing through (see `fixtures/surface.score` below).
 - `make-teardown-corpus.py` — writes a synthetic classic corpus that destroys a program and a
   sub-context while the renderer still holds them (see `fixtures/teardown.score` below).
+- `make-ctx-reuse-corpus.py` — writes a version-3 classic corpus in which a faulted context is
+  destroyed and a new one created on its id (see `fixtures/ctx-reuse.score` below).
 - `make-sampler-corpus.py` — writes a synthetic classic corpus that changes only the sampler
   state between draws through one view, by a bind and then by a destroy (see
   `fixtures/sampler.score` below).
@@ -833,6 +835,21 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   holds a rebuild that loses nothing, which is not why the other two exist: it is here because
   the journal walks the sub-contexts, so a corpus that creates and destroys one is where a
   wrong walk would show.
+
+  `ctx-reuse.score` gates the trace's context records (format version 3). A guest gives a
+  destroyed context's id to the next one, so a session of short-lived processes -- piglit, one
+  process per test -- is hundreds of contexts on a handful of ids; and a context that faults stays
+  faulted on both legs, refusing every later batch. A negative test faults its context on purpose,
+  so a replay that keeps one context per id refuses every process after it: a 1,343-test piglit
+  session lost 9,276 of 11,486 batches on the C leg that way, and 9,512 on the Rust leg. The
+  recorder writes `CTXNEW` (capset and name) and `CTXGONE`; the replayer destroys and recreates
+  the context there, attaching every live resource as it does at startup, and keeps the
+  one-context-per-id behaviour for version-2 traces, so every older corpus replays unchanged. The
+  corpus faults its first context, destroys it, and draws in a second on the same id. Arm it with
+  `--no-ctx-lifecycle`: the second context's batch is refused with the first one's fault
+  (`submit-errors 2`, not 1) and `res=11` scores its fill pattern. Replay it as
+  `./vrend-replay.sh ../vm/captures/ctx-reuse.bin --renderer rs --ctx 1 --expect
+  fixtures/ctx-reuse.score`; the score is the C's, and the Rust leg's is byte-identical.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).

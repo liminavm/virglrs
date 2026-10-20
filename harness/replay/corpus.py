@@ -14,6 +14,7 @@ HDR = struct.Struct("<IBBHQQII")   # total_len, type, cmd, ctx, seq, mono_ns, pa
 RES = struct.Struct("<Q12I")       # seq, kind, handle, target, format, bind, w, h, d, array, levels, samples, flags
 
 T_SUBMIT, T_CMD = 1, 2
+T_CTX_CREATE, T_CTX_DESTROY = 11, 12
 RES_CREATE, RES_UNREF = 0, 2
 
 # virgl_context_cmd
@@ -94,6 +95,9 @@ class Corpus:
         self.res = []
         self.recs = []
         self.seq = 1
+        # A trace is version 3 once it carries a context record; until then it is the version-2
+        # shape every pinned corpus was written in, byte for byte.
+        self.version = 2
 
     # ---- resources ----
 
@@ -114,6 +118,16 @@ class Corpus:
                                   len(payload), len(aux))
                          + struct.pack("<%dI" % len(aux), *aux) + payload)
         self.seq += 1
+
+    def ctx_create(self, name="ctx-reuse", capset=2):
+        """The context comes to exist (again): a version-3 record."""
+        self.version = 3
+        self.record(T_CTX_CREATE, 0, (capset,), name.encode())
+
+    def ctx_destroy(self):
+        """The context is gone, and its id free for the next one: a version-3 record."""
+        self.version = 3
+        self.record(T_CTX_DESTROY, 0, (), b"")
 
     def submit(self):
         """Start a batch. Every CMD record up to the next SUBMIT is one submission."""
@@ -277,6 +291,6 @@ class Corpus:
         body = b"".join(self.res) + b"".join(self.recs)
         # head[13] is `res_full`: the resource ring OVERFLOWED and the log no longer reaches the
         # start. A synthesised log is complete by construction, so it is 0.
-        head = [MAGIC, 2, 512, len(body), len(self.recs), 0, 0, 0, 0, 0, 0, 0,
+        head = [MAGIC, self.version, 512, len(body), len(self.recs), 0, 0, 0, 0, 0, 0, 0,
                 len(self.res), 0, 0, 0]
         return struct.pack("<16I", *head) + body

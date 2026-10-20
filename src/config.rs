@@ -181,4 +181,15 @@ impl CapsetId {
             other => CapsetId::Unknown(UnnamedCapset(other)),
         }
     }
+
+    /// The virtio-gpu id: [`CapsetId::from_raw`] undone.
+    pub fn raw(self) -> u8 {
+        match self {
+            CapsetId::Virgl => 1,
+            CapsetId::Virgl2 => 2,
+            CapsetId::Venus => 4,
+            CapsetId::Drm => 6,
+            CapsetId::Unknown(UnnamedCapset(id)) => id,
+        }
+    }
 }

@@ -98,7 +98,7 @@ CCMD = {
 }
 
 TYPES = {1: "SUBMIT", 2: "CMD", 3: "DRAW_FB", 4: "TRANSFER", 5: "FENCE", 6: "RETIRE", 7: "PAD",
-         9: "XFERDATA", 10: "BLOBDATA"}
+         9: "XFERDATA", 10: "BLOBDATA", 11: "CTXNEW", 12: "CTXGONE"}
 RES_KIND = {0: "create", 1: "blob", 2: "unref"}
 # struct vrend_trace_res: u64 seq, then kind + 11 u32 fields.
 RES = struct.Struct("<Q12I")
@@ -165,6 +165,11 @@ def describe(r):
         return "%-8s ctx=%d id=%d" % (t, ctx, fid)
     if typ == 1:
         return "%-8s ctx=%d bytes=%d" % (t, ctx, aux[0] if aux else 0)
+    if typ == 11:
+        return "%-8s ctx=%d capset=%d name=%r" % (t, ctx, aux[0] if aux else 0,
+                                                   payload.decode(errors="replace"))
+    if typ == 12:
+        return "%-8s ctx=%d" % (t, ctx)
     return t
 
 

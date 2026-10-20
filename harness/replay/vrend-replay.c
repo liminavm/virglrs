@@ -40,6 +40,10 @@
 //                 empty diff means the oracle is measuring nothing.
 //   --readback R  score only this resource (default: every colour offscreen, at its unref)
 //   --sweep       score every colour offscreen at its unref -- the default
+//   --no-ctx-lifecycle  ignore a version-3 trace's context create and destroy records and keep
+//                 one context per id for the whole replay, as a version-2 trace replays. The
+//                 positive control for those records: a session whose processes reused an id
+//                 then collides each one's objects with the last one's.
 //   --no-zero-new leave a new resource's contents undefined instead of zeroing them, which is
 //                 how to see what an unwritten resource was reading. Goldens are recorded with
 //                 the zeroing ON, so a score line is the renderer's answer and not its allocator's.
@@ -121,7 +125,7 @@
 #define TRACE_MAGIC 0x4c4d5654u
 
 enum { T_SUBMIT = 1, T_CMD = 2, T_DRAW_FB = 3, T_TRANSFER = 4, T_FENCE = 5, T_RETIRE = 6,
-       T_PAD = 7, T_XFERDATA = 9, T_BLOBDATA = 10 };
+       T_PAD = 7, T_XFERDATA = 9, T_BLOBDATA = 10, T_CTX_CREATE = 11, T_CTX_DESTROY = 12 };
 enum { RES_CREATE = 0, RES_BLOB = 1, RES_UNREF = 2 };
 
 #define VIRGL_CCMD_CREATE_OBJECT        1
@@ -309,9 +313,27 @@ static bool ctx_wanted(uint16_t id)
       if ((uint16_t)ctx_list[i] == id) return true;
    return false;
 }
+
+/* Bring context `id` up and attach every live resource to it: the replayer has no record of which
+ * resources the guest attached to which context, so every replayed context is given all of them,
+ * whether it is created at the start, recreated by a version-3 record, or rebuilt from a journal. */
+static int context_open(uint32_t id, const char *name)
+{
+   int ret = virgl_renderer_context_create(id, (uint32_t)strlen(name), name);
+   if (ret) return ret;
+   for (uint32_t r = 0; r < backing_n; r++)
+      if (backings[r]->live)
+         virgl_renderer_ctx_attach_resource((int)id, (int)backings[r]->handle);
+   return 0;
+}
 static const char *score_path, *expect_path, *caps_path, *overlay_path;
 static const char *rb_score_path, *rb_expect_path;
 static bool zero_new = true;
+/* Whether a version-3 trace's context records are followed (--no-ctx-lifecycle turns it off). */
+static bool ctx_lifecycle = true;
+/* Which context ids are up, and how many create records replaced one. */
+static bool ctx_live[65536];
+static uint32_t ctx_recreated;
 
 /* The score, accumulated in stream order. Two implementations that render the same pixels in a
  * different order are not the same implementation, so the ORDER is part of what is pinned.
@@ -1301,6 +1323,7 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--smoke")) smoke = true;
       else if (!strcmp(argv[i], "--readback") && i + 1 < argc) readback_res = (uint32_t)atoi(argv[++i]);
       else if (!strcmp(argv[i], "--no-zero-new")) zero_new = false;
+      else if (!strcmp(argv[i], "--no-ctx-lifecycle")) ctx_lifecycle = false;
       else if (!strcmp(argv[i], "--rebuild")) {
 #if HAVE_LIMINA_EXT
          rebuild = true;
@@ -1391,11 +1414,17 @@ int main(int argc, char **argv)
       return rc;
    }
 
+   /* Every replayed context exists from the start, as it always has: a version-2 trace says
+    * nothing more, and in a version-3 one a context whose create record was evicted, or that was
+    * created before the recorder armed, still has records to replay. A create record then replaces
+    * the context, which is what the guest's own destroy-and-create did. */
    const char *name = "limina-replay";
    for (int i = 0; i < n_ctx; i++) {
-      ret = virgl_renderer_context_create((uint32_t)ctx_list[i], (uint32_t)strlen(name), name);
+      ret = context_open((uint32_t)ctx_list[i], name);
       if (ret) { fprintf(stderr, "context_create %d failed: %d\n", ctx_list[i], ret); return 2; }
+      ctx_live[(uint16_t)ctx_list[i]] = true;
    }
+   if (head[1] < 3) ctx_lifecycle = false;
 
    /* One probe, because a refusal's ANSWER is part of the ABI and no corpus contains a request
     * that is refused with an errno rather than with -1. This is not the manufactured request the
@@ -1463,6 +1492,34 @@ int main(int argc, char **argv)
             }
             batch_ctx = h.ctx_id;
             break;
+         case T_CTX_CREATE:
+         case T_CTX_DESTROY: {
+            if (!ctx_lifecycle || smoke) break;
+            /* A batch is handed over when the next one begins, so the commands before a destroy
+             * are still pending here: they belong to the context about to go. */
+            if (batch_dw) {
+               if (virgl_renderer_submit_cmd(batch, batch_ctx, (int)batch_dw))
+                  dropped++;
+               submits++;
+               batch_dw = 0;
+            }
+            if (ctx_live[h.ctx_id]) {
+               virgl_renderer_context_destroy(h.ctx_id);
+               ctx_live[h.ctx_id] = false;
+            }
+            if (h.type == T_CTX_CREATE) {
+               /* Under the replay's own name, not the guest's the record carries: the C prints
+                * a context's name before every debug fragment, and the shader-log normaliser
+                * and every pinned log expect this one. The decoder shows the guest's. */
+               if (context_open(h.ctx_id, name))
+                  fprintf(stderr, "context_create %u at seq %llu failed\n", h.ctx_id,
+                          (unsigned long long)h.seq);
+               else
+                  ctx_live[h.ctx_id] = true;
+               ctx_recreated++;
+            }
+            break;
+         }
          case T_CMD: {
             if (smoke) break;
             size_t dw = h.payload_len / 4;
@@ -1741,6 +1798,11 @@ int main(int argc, char **argv)
       if (!smoke && batch_dw && virgl_renderer_submit_cmd(batch, batch_ctx, (int)batch_dw))
          dropped++;
       free(batch);
+      /* Its own stdout line rather than a counter in the score: a version-2 corpus has none, and
+       * its pinned score must not move. */
+      if (ctx_recreated)
+         printf("replay: loop %d followed %u context create record(s)\n", loop, ctx_recreated);
+      ctx_recreated = 0;
       count_addf("loop %d created %u failed %u unrefs %u submits %u cmds %u xfers %u "
                  "copy-fed %u copy-unmatched %u submit-errors %u iosurface-backed %u\n",
                  loop, made, failed, unrefs, submits, cmds, xfers, copy_fed, copy_bad, dropped,
@@ -1827,18 +1889,14 @@ int main(int argc, char **argv)
             continue;
          }
          uint32_t dst = src + 1000;
-         const char *rname = "limina-rebuild";
-         if (virgl_renderer_context_create(dst, (uint32_t)strlen(rname), rname)) {
+         /* The journal names resources; a context that is not attached to them cannot rebuild a
+          * sampler view or a surface over one, and every such create would drop. */
+         if (context_open(dst, "limina-rebuild")) {
             fprintf(stderr, "rebuild: context_create %u failed\n", dst);
             rebuild_failed++;
             free(a);
             continue;
          }
-         /* The journal names resources; a context that is not attached to them cannot rebuild a
-          * sampler view or a surface over one, and every such create would drop. */
-         for (uint32_t r = 0; r < backing_n; r++)
-            if (backings[r]->live)
-               virgl_renderer_ctx_attach_resource((int)dst, (int)backings[r]->handle);
 
          virgl_renderer_limina_replay_begin(dst);
          int rr = virgl_renderer_limina_journal_restore(dst, a, a_len);
