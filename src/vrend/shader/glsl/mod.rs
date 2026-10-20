@@ -124,7 +124,7 @@ pub(super) mod sysval {
 }
 
 /// `MAX_VARYING`.
-pub(super) const MAX_VARYING: u32 = 32;
+pub(crate) const MAX_VARYING: u32 = 32;
 /// The C's `inputs[64]` and `outputs[64]`.
 pub(super) const MAX_IO: usize = 64;
 /// The C's `system_values[32]`.

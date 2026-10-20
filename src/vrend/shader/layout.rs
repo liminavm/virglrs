@@ -16,6 +16,13 @@
 //! changes the GLSL, which is a fix in its own right once a case reproduces it.
 
 use super::Key;
+use crate::vrend::pipe::ShaderStage;
+
+/// The uniform locations one stage's default-block uniforms take in a SPIR-V program. Every
+/// stage of a program shares one location space, and a SPIR-V module cannot know what the
+/// other stages declare, so each stage takes its own range. Six ranges fit the 81,820
+/// locations zink-KosmicKrisp offers (limina's `docs/design/vrend-spirv.md` §2).
+const STAGE_LOCATIONS: u32 = 8192;
 
 /// The numbers of one translation, from its key and what its declarations bound.
 #[derive(Clone, Copy, Debug)]
@@ -78,5 +85,22 @@ impl Layout {
     /// The location of the fragment colour output for colour buffer `cbuf`.
     pub fn colour_output_location(&self, cbuf: u32) -> u32 {
         cbuf
+    }
+
+    /// The binding every stage of a SPIR-V program reads the `VirglBlock` at: past the five
+    /// graphics stages' fixed sixteen uniform-block slots each.
+    pub const VIRGL_BLOCK_BINDING: u32 = 80;
+
+    /// The location of a SPIR-V stage's constant array (the GLSL's `<stage>const0`), at the
+    /// start of the stage's range.
+    pub fn const_location(&self, stage: ShaderStage) -> u32 {
+        stage.index() as u32 * STAGE_LOCATIONS
+    }
+
+    /// The location of a generic varying with semantic index `sid` in a SPIR-V program, which
+    /// takes the separable numbering whether it is separable or not: a SPIR-V stage meets its
+    /// neighbours only by location. `None` past 31, which the numbering has no room for.
+    pub fn varying_location(&self, sid: u32) -> Option<u32> {
+        31u32.checked_sub(sid)
     }
 }
