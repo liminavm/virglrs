@@ -71,6 +71,8 @@ hmac = "0.13.0"
 libc = "0.2"
 rustc-hash = "2.1"
 sha2 = "0.11.0"
+# The SPIR-V grammar's opcodes and enumerants, for the shader translator's SPIR-V writer.
+spirv = "0.4.0"
 zeroize = "1.9.1"
 # The `trace` feature's FIFO, made without an unsafe block of our own.
 nix = { version = "0.31.3", default-features = false, features = ["fs"], optional = true }

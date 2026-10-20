@@ -42,3 +42,7 @@ Build inputs
     2013-2025 The Khronos Group Inc. They keep their own headers and are not relicensed.
 
   - vk.xml, through venus-protocol — Apache-2.0, The Khronos Group Inc.
+
+  - The SPIR-V grammar, through the spirv crate (https://github.com/gfx-rs/rspirv) — Apache-2.0.
+    Its opcodes and enumerants, generated from the Khronos grammar, are compiled into the shader
+    translator's SPIR-V writer.

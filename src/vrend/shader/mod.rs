@@ -21,6 +21,7 @@
 pub mod glsl;
 pub mod keytext;
 pub mod layout;
+pub mod spirv;
 
 use super::features::{Feature, Features};
 use super::gl::Gl;
