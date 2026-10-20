@@ -1489,51 +1489,54 @@ mod tests {
     /// emitter reaches.
     #[test]
     fn every_module_the_emitter_writes_validates() {
-        let blocks = fixture::capture_blocks()
-            .into_iter()
-            .chain(fixture::piglit_blocks())
-            .chain(fixture::desktop_rs_blocks());
+        let corpora = [
+            ("captures", fixture::capture_blocks()),
+            ("piglit", fixture::piglit_blocks()),
+            ("desktop", fixture::desktop_rs_blocks()),
+        ];
         let mut written = 0;
-        let mut declined: BTreeMap<&'static str, u32> = BTreeMap::new();
         let mut invalid = Vec::new();
-        let mut checked = 0;
-        for (n, block) in blocks.enumerate() {
-            let Some(inputs) = &block.inputs else { continue };
-            let shader = tgsi::text::parse(block.input().as_bytes(), u32::MAX).expect("parses");
-            let program = tgsi::Program::scan(shader).expect("scans");
-            let cfg = keytext::parse_config(inputs.config);
-            let key = keytext::parse_key(inputs.key);
-            let so = keytext::parse_stream_output(inputs.stream_output);
-            let (_, info, _) =
-                convert(&cfg, &program, inputs.local_mem, &key, &so).expect("translates");
-            let stage = match program.shader.processor {
-                Processor::Vertex => ShaderStage::Vertex,
-                Processor::Fragment => ShaderStage::Fragment,
-                _ => ShaderStage::Geometry,
-            };
-            match emit(&cfg, &program, stage, &key, &info, &so) {
-                Ok(words) => {
-                    written += 1;
-                    if let Some(verdict) = validate(&words) {
-                        checked += 1;
-                        if let Err(e) = verdict {
-                            invalid.push((n, e));
+        for (name, blocks) in corpora {
+            let (mut wrote, mut seen) = (0, 0);
+            let mut declined: BTreeMap<&'static str, u32> = BTreeMap::new();
+            for (n, block) in blocks.iter().enumerate() {
+                let Some(inputs) = &block.inputs else { continue };
+                seen += 1;
+                let shader = tgsi::text::parse(block.input().as_bytes(), u32::MAX).expect("parses");
+                let program = tgsi::Program::scan(shader).expect("scans");
+                let cfg = keytext::parse_config(inputs.config);
+                let key = keytext::parse_key(inputs.key);
+                let so = keytext::parse_stream_output(inputs.stream_output);
+                let (_, info, _) =
+                    convert(&cfg, &program, inputs.local_mem, &key, &so).expect("translates");
+                let stage = match program.shader.processor {
+                    Processor::Vertex => ShaderStage::Vertex,
+                    Processor::Fragment => ShaderStage::Fragment,
+                    _ => ShaderStage::Geometry,
+                };
+                match emit(&cfg, &program, stage, &key, &info, &so) {
+                    Ok(words) => {
+                        wrote += 1;
+                        if let Some(Err(e)) = validate(&words) {
+                            invalid.push((name, n, e));
                         }
                     }
+                    Err(Decline(why)) => *declined.entry(why).or_default() += 1,
                 }
-                Err(Decline(why)) => *declined.entry(why).or_default() += 1,
             }
+            let mut by_count: Vec<_> = declined.into_iter().collect();
+            by_count.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+            eprintln!("{name}: {wrote} of {seen} written; declined: {by_count:?}");
+            written += wrote;
         }
-        let mut by_count: Vec<_> = declined.into_iter().collect();
-        by_count.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-        eprintln!("written {written}, validated {checked}; declined: {by_count:?}");
         assert!(written > 0, "the emitter wrote nothing at all");
         assert!(
             invalid.is_empty(),
-            "{} modules failed validation, the first (block {}):\n{}",
+            "{} modules failed validation, the first ({} block {}):\n{}",
             invalid.len(),
             invalid[0].0,
-            invalid[0].1
+            invalid[0].1,
+            invalid[0].2
         );
     }
 }
