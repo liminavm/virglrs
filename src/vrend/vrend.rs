@@ -97,6 +97,7 @@ pub struct Vrend {
     pub limits: Limits,
     /// What the translator may assume of the host, read once alongside the limits.
     shader_cfg: shader::Config,
+    spirv: shader::spirv::Use,
     /// What the guest's driver is told of the host, probed once from the same answers.
     caps: caps::CapsV2,
     /// What VideoToolbox decodes here, or `None` when the caller did not ask for video.
@@ -387,11 +388,14 @@ impl Vrend {
         let limits = Limits::query(&gl, &features);
         let shader_cfg = shader::Config::probe(&gl, &features, &limits);
         // Said once, as a property of the host: whether the translator could hand it SPIR-V
-        // rather than GLSL text (limina's docs/design/vrend-spirv.md). Nothing uses the answer yet.
-        match shader::spirv::probe::probe(&gl) {
+        // rather than GLSL text (limina's docs/design/vrend-spirv.md).
+        let probed = shader::spirv::probe::probe(&gl);
+        match &probed {
             Ok(()) => eprintln!("[virglrs] vrend: the host takes SPIR-V shaders"),
             Err(why) => eprintln!("[virglrs] vrend: the host takes no SPIR-V shaders ({why})"),
         }
+        let spirv =
+            shader::spirv::Use::new(&probed, features.has(Feature::gles31_vertex_attrib_binding));
         let formats = Table::probe(&gl, &features);
         let video = config.video.then(decode::Support::probe);
         if let Some(support) = video {
@@ -499,6 +503,7 @@ impl Vrend {
             formats,
             limits,
             shader_cfg,
+            spirv,
             caps,
             video,
             ctx0,
@@ -567,6 +572,7 @@ impl Vrend {
             formats,
             limits,
             shader_cfg,
+            spirv,
             caps: _,
             video,
             ctx0,
@@ -608,6 +614,7 @@ impl Vrend {
             formats,
             limits,
             shader_cfg,
+            spirv,
             resources: resources.sync(),
             pixels,
             guest,

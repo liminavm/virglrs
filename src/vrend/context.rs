@@ -138,6 +138,8 @@ pub struct Host<'a> {
     pub formats: &'a Table,
     pub limits: &'a Limits,
     pub shader_cfg: &'a shader::Config,
+    /// Whether programs go to the host as SPIR-V, and the tally of how they went.
+    pub spirv: &'a mut shader::spirv::Use,
     pub resources: &'a mut crate::Map<ResourceHandle, resource::Slot>,
     /// Which of those copy guest pages this batch, worked out once and read by every sampler
     /// bind. See [`resource::Refresh`].

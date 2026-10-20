@@ -196,6 +196,8 @@ pub enum Linkage {
         /// The variant of each graphics stage, in stage order.
         stages: [Option<VariantId>; 5],
         dual_src: bool,
+        /// Linked from the variants' SPIR-V modules rather than their GLSL.
+        spirv: bool,
     },
     Compute(VariantId),
 }
@@ -385,6 +387,31 @@ impl LinkedProgram {
         if features.has(Feature::ssbo) {
             self.ssbo_used_mask[s] = l.info.ssbo_used_mask;
             self.ssbo_binding_offset[s] = l.info.ssbo_binding_offset;
+        }
+    }
+
+    /// What a program of SPIR-V modules declared by number, recorded where the draw path reads
+    /// a GLSL program's looked-up locations: each stage's constants at its fixed location, and
+    /// the `VirglBlock` at its fixed binding. The emitter refuses the uniform buffers, samplers,
+    /// images and storage buffers a module would need bound beyond those.
+    fn bind_spirv_locs(&mut self, gl: &Gl, walk: &[&Linked<'_>]) {
+        for l in walk {
+            let s = l.stage.index();
+            if l.info.num_consts > 0 {
+                let at = crate::vrend::shader::layout::Layout::const_location(l.stage);
+                self.const_location[s] = Some(UniformLocation::at(at));
+                self.num_consts[s] = l.info.num_consts as usize;
+            }
+        }
+        // Every vertex module reads the block on its way out (the y prescale).
+        self.virgl_block_bind =
+            Some(BindingPoint::at(crate::vrend::shader::layout::Layout::VIRGL_BLOCK_BINDING));
+        if self.sysval_buffer.is_none() {
+            let buf = gl.gen_buffer();
+            gl.bind_buffer(GL_UNIFORM_BUFFER, Some(buf));
+            gl.buffer_data_null(GL_UNIFORM_BUFFER, Sysval::SIZE, GL_DYNAMIC_DRAW);
+            gl.bind_buffer(GL_UNIFORM_BUFFER, None);
+            self.sysval_buffer = Some(buf);
         }
     }
 
@@ -952,23 +979,26 @@ impl SubContext {
 
     /// The current variant of each bound graphics stage, compiled -- `None` for a stage that
     /// is bound but has no compiled variant, which is the C's `!current` failure.
-    fn linked_stages(&self) -> Result<Vec<Linked<'_>>, ShaderStage> {
+    ///
+    /// `spirv` takes each variant's loaded module rather than its compiled GLSL.
+    fn linked_stages(&self, spirv: bool) -> Result<Vec<Linked<'_>>, ShaderStage> {
         let mut out = Vec::new();
         for stage in GRAPHICS_STAGES {
             if !self.has_stage(stage) {
                 continue;
             }
-            out.push(self.linked_stage(stage).ok_or(stage)?);
+            out.push(self.linked_stage(stage, spirv).ok_or(stage)?);
         }
         Ok(out)
     }
 
-    /// The current variant of the stage at `stage`, compiled, or `None` when there is no such
-    /// variant.
-    fn linked_stage(&self, stage: ShaderStage) -> Option<Linked<'_>> {
+    /// The current variant of the stage at `stage`, compiled -- or loaded from its module, with
+    /// `spirv` -- or `None` when there is no such variant.
+    fn linked_stage(&self, stage: ShaderStage, spirv: bool) -> Option<Linked<'_>> {
         let program = self.bound_program(stage)?;
         let variant = program.variants.first()?;
-        Some(Linked { stage, info: &program.info, variant, gl: variant.gl? })
+        let gl = if spirv { variant.gl_spirv? } else { variant.gl? };
+        Some(Linked { stage, info: &program.info, variant, gl })
     }
 
     /// `vrend_destroy_program` for every program linking `variant`, as the C destroys them
@@ -1015,7 +1045,7 @@ pub(super) fn release_variants(
         if let Some(separate) = v.separate {
             gl.delete_program(bound, separate.program);
         }
-        if let Some(name) = v.gl {
+        for name in [v.gl, v.gl_spirv].into_iter().flatten() {
             gl.delete_shader(name);
         }
     }
@@ -1124,6 +1154,7 @@ fn add_shader_program(
     serial: ProgramSerial,
     linked: &[Linked<'_>],
     dual_src: bool,
+    spirv: bool,
 ) -> Result<LinkedProgram, Fault> {
     let gl = host.gl;
     let features = host.features;
@@ -1156,19 +1187,30 @@ fn add_shader_program(
         for l in linked {
             gl.attach_shader(id, l.gl);
         }
-        // The stream-out layout belongs to the last stage before the rasterizer.
-        set_stream_out_varyings(gl, id, gs.or(tes).unwrap_or(vs).info);
-        let dual_src_linked = match bind_fragment_outputs(gl, features, cmd, id, fs.info, dual_src)
-        {
-            Ok(d) => d,
-            Err(e) => {
-                gl.delete_program(host.current.program(), id);
-                return Err(e);
-            }
+        // A module carries its own interface numbers; a GLSL program is told them by name. The
+        // selection kept stream output and dual-source blending out of the modules.
+        let dual_src_linked = if spirv {
+            false
+        } else {
+            // The stream-out layout belongs to the last stage before the rasterizer.
+            set_stream_out_varyings(gl, id, gs.or(tes).unwrap_or(vs).info);
+            let linked = bind_fragment_outputs(gl, features, cmd, id, fs.info, dual_src);
+            let dual_src_linked = match linked {
+                Ok(d) => d,
+                Err(e) => {
+                    gl.delete_program(host.current.program(), id);
+                    return Err(e);
+                }
+            };
+            bind_attrib_locations(gl, host, id, vs.info);
+            dual_src_linked
         };
-        bind_attrib_locations(gl, host, id, vs.info);
         if let Err(log) = gl.link_program(id) {
             gl.delete_program(host.current.program(), id);
+            if spirv {
+                host.spirv.failed("program", &log);
+                return Err(Fault::Shader { cmd, what: "a SPIR-V program the driver refused" });
+            }
             eprintln!("[virglrs] vrend: error linking program:\n{log}");
             for l in linked {
                 eprintln!("{}: GLSL:\n{}", stage_prefix(l.stage), l.variant.strings.source());
@@ -1178,7 +1220,7 @@ fn add_shader_program(
         (ProgramObject::Linked(id), dual_src_linked)
     };
 
-    let linkage = Linkage::Graphics { stages, dual_src: dual_src_linked };
+    let linkage = Linkage::Graphics { stages, dual_src: dual_src_linked, spirv };
     let last_stage = linkage.last_stage();
     let mut prog = LinkedProgram::new(serial, object, linkage);
     prog.fs_blend_equation_advanced = fs.info.fs_blend_equation_advanced;
@@ -1191,15 +1233,20 @@ fn add_shader_program(
         .filter(|s| s.index() <= last_stage.index())
         .filter_map(|s| by_stage(*s))
         .collect();
-    for l in &walk {
-        prog.bind_resource_locs(gl, features, l);
-        if l.info.reads_drawid {
-            prog.reads_drawid = true;
+    if spirv {
+        prog.bind_spirv_locs(gl, &walk);
+    } else {
+        for l in &walk {
+            prog.bind_resource_locs(gl, features, l);
+            if l.info.reads_drawid {
+                prog.reads_drawid = true;
+            }
         }
+        let blocks: Vec<StageBlocks<'_>> =
+            walk.iter().map(|l| (l.stage, l.program_in(&object), l.info)).collect();
+        prog.rebind_ubo_and_sampler_locs(gl, &blocks);
     }
-    let blocks: Vec<StageBlocks<'_>> =
-        walk.iter().map(|l| (l.stage, l.program_in(&object), l.info)).collect();
-    prog.rebind_ubo_and_sampler_locs(gl, &blocks);
+    host.spirv.linked(spirv);
     for l in &walk {
         if let Some(separate) = &l.variant.separate {
             separate.blocks_bound_for.set(Some(serial));
@@ -1278,10 +1325,33 @@ impl Context {
         cmd: Cmd,
         vertices_per_patch: u32,
     ) -> Result<Selected, Fault> {
-        let mut built = self.select_program(host, cmd, vertices_per_patch)?;
+        let built = self.select_program(host, cmd, vertices_per_patch)?;
+        let spirv = self.sub().program_takes_spirv(host.spirv.enabled());
+        match self.link_selected(host, cmd, built, spirv) {
+            // The host refused the modules together, which the probe cannot promise it will not:
+            // the stages give theirs up and the program is linked from GLSL.
+            Err(_) if spirv => {
+                self.abandon_spirv(ShaderStage::Vertex);
+                self.abandon_spirv(ShaderStage::Fragment);
+                self.compile_selected(host, cmd)?;
+                self.link_selected(host, cmd, true, false)
+            }
+            linked => linked,
+        }
+    }
+
+    /// The program linking the selected variants, found or made: from their modules with
+    /// `spirv`, else from their GLSL.
+    fn link_selected(
+        &mut self,
+        host: &mut Host<'_>,
+        cmd: Cmd,
+        mut built: bool,
+        spirv: bool,
+    ) -> Result<Selected, Fault> {
         let sub = self.sub();
         let dual_src = sub.blend.as_ref().is_some_and(|b| blend_is_dual(b, 0));
-        let linked = match sub.linked_stages() {
+        let linked = match sub.linked_stages(spirv) {
             Ok(l) => l,
             Err(_) => return Err(Fault::Shader { cmd, what: "a stage with no compiled variant" }),
         };
@@ -1294,7 +1364,7 @@ impl Context {
         for l in &linked {
             stages[l.stage.index()] = Some(l.variant.id);
         }
-        let want = Linkage::Graphics { stages, dual_src };
+        let want = Linkage::Graphics { stages, dual_src, spirv };
         let same = sub.program().is_some_and(|p| p.linkage == want);
         if same {
             // The selection is settled either way; a flag left standing here would run the
@@ -1326,7 +1396,7 @@ impl Context {
             None => {
                 built = true;
                 let serial = sub.mint_program_serial();
-                let prog = add_shader_program(host, cmd, serial, &linked, dual_src)?;
+                let prog = add_shader_program(host, cmd, serial, &linked, dual_src, spirv)?;
                 let sub = self.sub_mut();
                 sub.programs.push(prog);
                 ProgramSlot { at: sub.programs.len() - 1, serial }
@@ -2727,7 +2797,7 @@ impl Context {
     fn select_compute_program(&mut self, host: &mut Host<'_>, cmd: Cmd) -> Result<bool, Fault> {
         self.select_compute(host, cmd)?;
         let sub = self.sub();
-        let Some(cs) = sub.linked_stage(ShaderStage::Compute) else {
+        let Some(cs) = sub.linked_stage(ShaderStage::Compute, false) else {
             return Err(Fault::Shader { cmd, what: "a stage with no compiled variant" });
         };
         let want = Linkage::Compute(cs.variant.id);

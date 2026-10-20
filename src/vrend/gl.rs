@@ -216,6 +216,14 @@ pub struct UniformLocation(GLint);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct AttribLocation(GLuint);
 
+impl UniformLocation {
+    /// A location the program declared itself, as a SPIR-V module does, rather than one GL was
+    /// asked for by name.
+    pub fn at(location: u32) -> Self {
+        Self(GLint::try_from(location).expect("a declared location fits a GLint"))
+    }
+}
+
 impl ShaderName {
     pub fn raw(self) -> GLuint {
         self.0

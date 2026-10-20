@@ -425,6 +425,8 @@ impl<'a> Emitter<'a> {
     ) -> Result<()> {
         match interpolate {
             Interpolate::Perspective => {}
+            // The GLSL drops the qualifier on a host without it, and the stages must agree.
+            Interpolate::Linear if !self.cfg.has_nopersective => {}
             Interpolate::Linear => self.m.decorate(var, Decoration::NoPerspective, &[]),
             Interpolate::Constant => self.m.decorate(var, Decoration::Flat, &[]),
             Interpolate::Color => return decline("colour interpolation"),
@@ -505,7 +507,7 @@ impl<'a> Emitter<'a> {
         let array = self.m.type_array(self.t.uvec4, count);
         let ptr = self.m.type_pointer(StorageClass::UniformConstant, array);
         let var = self.m.global_variable(ptr, StorageClass::UniformConstant);
-        let location = self.layout.const_location(self.stage);
+        let location = Layout::const_location(self.stage);
         self.m.decorate(var, Decoration::Location, &[location]);
         self.consts = Some((var, count));
         var
@@ -565,7 +567,16 @@ impl<'a> Emitter<'a> {
                     return decline("a read of an undeclared input");
                 };
                 let vec4 = self.t.vec4;
-                let v = self.op(Op::Load, vec4, &[var]);
+                let mut v = self.op(Op::Load, vec4, &[var]);
+                // An attribute whose format the host stores swapped (BGRA) is read back through
+                // `.zyxw` before the source's own swizzle, as the GLSL does.
+                if self.processor == Processor::Vertex
+                    && src.index >= 0
+                    && src.index < 32
+                    && self.key.vs.attrib_zyxw_bitmask & (1 << src.index) != 0
+                {
+                    v = self.shuffle(vec4, v, v, &[2, 1, 0, 3]);
+                }
                 Ok(self.bitcast(uvec4, v))
             }
             File::Immediate => {
@@ -1226,9 +1237,22 @@ pub fn emit(
     if info.separable_program {
         return decline("a separable program");
     }
+    // What the draw path binds by name for a GLSL program and by number for this one; each is
+    // also refused where it is declared, and this keeps the two from disagreeing.
+    if info.ubo_used_mask != 0 || info.samplers_used_mask != 0 {
+        return decline("a uniform buffer or a sampler");
+    }
+    if info.images_used_mask != 0 || info.ssbo_used_mask != 0 || info.reads_drawid {
+        return decline("an image, a storage buffer or the draw id");
+    }
     check_key(key, processor)?;
     let num_consts = u32::try_from(info.num_consts).unwrap_or(0);
     let mut e = Emitter::new(cfg, key, stage, processor);
+    // Declared whenever the GLSL would declare it, read or not: the draw path uploads to it by
+    // that count, and an upload to a location nothing declares is an error.
+    if num_consts > 0 {
+        e.constants(num_consts);
+    }
     for token in &program.shader.tokens {
         if e.ended {
             break;

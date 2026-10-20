@@ -93,7 +93,7 @@ impl Layout {
 
     /// The location of a SPIR-V stage's constant array (the GLSL's `<stage>const0`), at the
     /// start of the stage's range.
-    pub fn const_location(&self, stage: ShaderStage) -> u32 {
+    pub fn const_location(stage: ShaderStage) -> u32 {
         stage.index() as u32 * STAGE_LOCATIONS
     }
 

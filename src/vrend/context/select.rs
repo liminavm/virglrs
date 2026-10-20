@@ -61,6 +61,11 @@ pub struct Variant {
     pub var_info: shader::VarInfo,
     /// The compiled shader, once a program has been assembled with it.
     pub gl: Option<ShaderName>,
+    /// The same shader as a SPIR-V module, where the emitter wrote one and the host takes them;
+    /// dropped for good if the host refuses it, so its programs are linked from GLSL after.
+    pub spirv: Option<Vec<u32>>,
+    /// The module loaded, once a program has been assembled from modules.
+    pub gl_spirv: Option<ShaderName>,
     /// A separable stage's own program, linked at its compile, which every pipeline the stage
     /// serves names.
     pub separate: Option<Separate>,
@@ -314,6 +319,26 @@ impl SubContext {
         program.is_some_and(|p| p.info.separable_program)
     }
 
+    /// Whether the program the bound stages make goes to the host as SPIR-V: a vertex and a
+    /// fragment stage with nothing between, both current variants written as modules, and no
+    /// dual-source blend, whose second output only a GLSL program is told by name. Asked by the
+    /// selection, to know what to compile, and by the link, to know what to link; the two must
+    /// agree, so both ask this.
+    pub(super) fn program_takes_spirv(&self, enabled: bool) -> bool {
+        use ShaderStage::*;
+        if !enabled || self.blend.as_ref().is_some_and(|b| draw::blend_is_dual(b, 0)) {
+            return false;
+        }
+        if [Geometry, TessCtrl, TessEval].into_iter().any(|s| self.has_stage(s)) {
+            return false;
+        }
+        [Vertex, Fragment].into_iter().all(|s| {
+            self.bound_program(s)
+                .and_then(|p| p.variants.first())
+                .is_some_and(|v| v.spirv.is_some())
+        })
+    }
+
     /// The guest's program bound at `stage`, when its text is whole.
     fn bound_tgsi(&self, stage: ShaderStage) -> Option<&Program> {
         let shader = match self.shaders[stage.index()].as_ref()? {
@@ -557,7 +582,7 @@ impl SubContext {
 /// `current = NULL` does, and hands back what it emptied: those variants own GL names, which only
 /// [`draw::release_variants`] may delete, so [`Context::release_refused`] is where they go.
 fn translate(
-    host: &Host<'_>,
+    host: &mut Host<'_>,
     cmd: Cmd,
     shader: &mut Shader,
     key: shader::Key,
@@ -596,11 +621,32 @@ fn translate(
             if log {
                 eprint!("GLSL:\n{}\n", strings.source());
             }
+            let spirv = match stage {
+                ShaderStage::Vertex | ShaderStage::Fragment if host.spirv.enabled() => {
+                    let emitted = shader::spirv::emit::emit(
+                        host.shader_cfg,
+                        &program.tgsi,
+                        stage,
+                        &key,
+                        &info,
+                        so_info,
+                    );
+                    emitted.map_err(|why| host.spirv.declined(why)).ok()
+                }
+                _ => None,
+            };
             program.translated.info = info;
-            program
-                .translated
-                .variants
-                .insert(0, Variant { id, key, strings, var_info, gl: None, separate: None });
+            let variant = Variant {
+                id,
+                key,
+                strings,
+                var_info,
+                gl: None,
+                spirv,
+                gl_spirv: None,
+                separate: None,
+            };
+            program.translated.variants.insert(0, variant);
             Ok(())
         }
         Err(error) => Err(Refused {
@@ -737,10 +783,79 @@ impl Context {
         built |= self.select_tcs(host, cmd, vertices_per_patch)?;
         built |= self.select_bound(host, cmd, Vertex)?;
 
+        if self.sub().program_takes_spirv(host.spirv.enabled()) {
+            let mut loaded = true;
+            for stage in [Vertex, Fragment] {
+                match self.load_spirv_bound(host, stage) {
+                    Ok(b) => built |= b,
+                    Err(why) => {
+                        host.spirv.failed("module", &why);
+                        self.abandon_spirv(stage);
+                        loaded = false;
+                    }
+                }
+            }
+            if loaded {
+                return Ok(built);
+            }
+        }
         for stage in [Vertex, Fragment, Geometry, TessCtrl, TessEval] {
             built |= self.compile_bound(host, cmd, stage)?;
         }
         Ok(built)
+    }
+
+    /// The current variant of the stage at `stage` loaded from its SPIR-V module, when it is not
+    /// yet. Answers whether it loaded one, or what the driver said when it refused.
+    fn load_spirv_bound(
+        &mut self,
+        host: &mut Host<'_>,
+        stage: ShaderStage,
+    ) -> Result<bool, String> {
+        let gl = host.gl;
+        let Some(shader) = self.sub_mut().bound_shader_mut(stage) else {
+            return Ok(false);
+        };
+        let ShaderText::Whole(program) = &mut shader.text else {
+            return Ok(false);
+        };
+        let Some(current) = program.translated.variants.first_mut() else {
+            return Ok(false);
+        };
+        if current.gl_spirv.is_some() {
+            return Ok(false);
+        }
+        let words = current.spirv.as_ref().expect("program_takes_spirv saw a module");
+        let id = gl.create_shader(gl_shader_kind(stage)).ok_or("glCreateShader failed")?;
+        if let Err(why) = gl.load_spirv(id, words) {
+            gl.delete_shader(id);
+            return Err(why);
+        }
+        current.gl_spirv = Some(id);
+        Ok(true)
+    }
+
+    /// The current variant at `stage` gives up its module for good, so every program it is in
+    /// from now on is linked from GLSL. A module already loaded stays until the variant goes:
+    /// a program linked from it may still be running.
+    pub(super) fn abandon_spirv(&mut self, stage: ShaderStage) {
+        let Some(shader) = self.sub_mut().bound_shader_mut(stage) else {
+            return;
+        };
+        if let ShaderText::Whole(program) = &mut shader.text
+            && let Some(current) = program.translated.variants.first_mut()
+        {
+            current.spirv = None;
+        }
+    }
+
+    /// `compile_bound`, for the selection's stages, after a program of modules was refused.
+    pub(super) fn compile_selected(&mut self, host: &mut Host<'_>, cmd: Cmd) -> Result<(), Fault> {
+        use ShaderStage::*;
+        for stage in [Vertex, Fragment, Geometry, TessCtrl, TessEval] {
+            self.compile_bound(host, cmd, stage)?;
+        }
+        Ok(())
     }
 
     /// The control stage: the guest's, or the one injected ahead of an evaluation shader that
@@ -812,6 +927,8 @@ impl Context {
             strings,
             var_info: shader::VarInfo::default(),
             gl: None,
+            spirv: None,
+            gl_spirv: None,
             separate: None,
         };
         if !compile(host.gl, stage, &mut variant) {
