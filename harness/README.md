@@ -669,9 +669,10 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `vrend-shaders-captures.txt` holds the distinct shaders of every pinned capture -- 151 from 18
   corpora, replayed on all their contexts -- with UBOs, indirect addressing, compute and images
   the old fixture lacks. `tgsi_dump`'s spelling drops `_PRECISE` and rounds float immediates to
-  four decimals, which changes what 68 of them translate to, so its TGSI half is the Rust leg's
-  `VIRGLRS_DEBUG=shader-exact` log and its GLSL half the C's, block for block from the same
-  replay (the two GLSL logs were identical). The host was GLES 3.2 on zink with KosmicKrisp's
+  four decimals, which changes what 68 of them translate to. So each block carries the C's dump,
+  which the parser is held to, and after `TGSI exact:` the Rust leg's
+  `VIRGLRS_DEBUG=shader-exact` print of the same shader, which the translator is given; the
+  GLSL is the C's, block for block from the same replay (the two GLSL logs were identical). The host was GLES 3.2 on zink with KosmicKrisp's
   geometry shaders on, so the blocks say `320 es` and the test's configuration has
   noperspective interpolation.
   The test beside the GLES one holds the translator's desktop dialect to it; the live

@@ -1321,7 +1321,8 @@ mod tests {
     }
 
     fn translate(cfg: &Config, block: &fixture::Block, key: &Key) -> String {
-        let shader = tgsi::text::parse(block.tgsi.as_bytes(), u32::MAX).expect("the corpus parses");
+        let shader =
+            tgsi::text::parse(block.input().as_bytes(), u32::MAX).expect("the corpus parses");
         let program = tgsi::Program::scan(shader).expect("the corpus scans");
         let (strings, _, _) = convert(cfg, &program, 0, key, &StreamOutput::default())
             .unwrap_or_else(|e| panic!("{e}"));
@@ -1422,7 +1423,7 @@ mod tests {
         let mut failures = Vec::new();
         for (i, block) in blocks.iter().enumerate() {
             let shader =
-                tgsi::text::parse(block.tgsi.as_bytes(), u32::MAX).expect("the corpus parses");
+                tgsi::text::parse(block.input().as_bytes(), u32::MAX).expect("the corpus parses");
             let key = key_from_glsl(&shader, block.glsl);
             let glsl = translate(cfg, block, &key);
             if glsl != block.glsl {
