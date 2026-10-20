@@ -11,6 +11,10 @@ pub enum Switch {
     /// Every shader as it is created: the TGSI parsed from the guest's text, printed back, and
     /// the GLSL it became -- the C's `shader` switch, in the C's format, so the two logs diff.
     Shader,
+    /// `shader`, with the TGSI printed exactly ([`crate::vrend::tgsi::dump::dump_exact`]) rather
+    /// than in the C's lossy spelling: what a fixture is recorded from, so its TGSI translates to
+    /// what the guest's did. Its log no longer diffs against the C's on the TGSI half.
+    ShaderExact,
     /// Every resource as it comes and goes at the C ABI, and every miss when one is asked for.
     ///
     /// A create the VMM ignores the return of is a resource that silently never exists, and the
@@ -26,8 +30,12 @@ pub enum Switch {
 }
 
 impl Switch {
-    const ALL: &'static [(Switch, &'static str)] =
-        &[(Switch::Shader, "shader"), (Switch::Resource, "resource"), (Switch::Fence, "fence")];
+    const ALL: &'static [(Switch, &'static str)] = &[
+        (Switch::Shader, "shader"),
+        (Switch::ShaderExact, "shader-exact"),
+        (Switch::Resource, "resource"),
+        (Switch::Fence, "fence"),
+    ];
 }
 
 /// The switches `VIRGLRS_DEBUG` asked for, read once when the renderer is built and carried by

@@ -576,9 +576,12 @@ fn translate(
         ShaderKind::Compute { req_local_mem } => (*req_local_mem, &none),
         ShaderKind::Graphics { stream_output } => (0, stream_output),
     };
-    let log = host.debug.enabled(debug::Switch::Shader);
+    let exact = host.debug.enabled(debug::Switch::ShaderExact);
+    let log = exact || host.debug.enabled(debug::Switch::Shader);
     if log {
-        eprint!("TGSI received:\n{}\n", tgsi::dump::dump(&program.tgsi.shader));
+        let tgsi = &program.tgsi.shader;
+        let text = if exact { tgsi::dump::dump_exact(tgsi) } else { tgsi::dump::dump(tgsi) };
+        eprint!("TGSI received:\n{text}\n");
     }
     match shader::convert(host.shader_cfg, &program.tgsi, req_local_mem, &key, so_info) {
         Ok((strings, info, var_info)) => {

@@ -6,6 +6,10 @@
 //! This is what `VREND_DEBUG=shader` prints after "TGSI received:", and it is the first
 //! differential of the shader port: the C's dump of a corpus shader and this dump of the same
 //! text must be byte-identical, which settles that the parser read what the C read.
+//!
+//! The C's spelling loses two things a translation depends on: an instruction's `_PRECISE`
+//! suffix, and every float immediate past four decimals. [`dump_exact`] keeps both, for fixtures
+//! that must translate to what the guest's own text did.
 
 use super::*;
 use crate::vrend::proto::Format;
@@ -248,12 +252,17 @@ fn property(out: &mut String, p: &PropertyToken) {
     out.push('\n');
 }
 
-fn immediate(out: &mut String, index: u32, imm: &Immediate) {
+fn immediate(out: &mut String, index: u32, imm: &Immediate, exact: bool) {
     write!(out, "IMM[{index}] {} {{", imm.ty.name()).expect("String");
     let wide = |i: usize| u64::from(imm.data[i]) | u64::from(imm.data[i + 1]) << 32;
     let mut i = 0;
     while i < 4 {
         match imm.ty {
+            // Shortest round-trip decimal, which `parse_double`'s `strtod` reads back exactly.
+            ImmType::Float64 if exact => {
+                write!(out, "{:?}", f64::from_bits(wide(i))).expect("String");
+                i += 1;
+            }
             ImmType::Float64 => {
                 cfloat(out, f64::from_bits(wide(i)), 8);
                 i += 1;
@@ -266,6 +275,8 @@ fn immediate(out: &mut String, index: u32, imm: &Immediate) {
                 write!(out, "{}", wide(i)).expect("String");
                 i += 1;
             }
+            // The bits, in the `0x` spelling `parse_float` reads back without rounding.
+            ImmType::Float32 if exact => write!(out, "0x{:08x}", imm.uint(i)).expect("String"),
             ImmType::Float32 => cfloat(out, f64::from(imm.float(i)), 4),
             ImmType::Uint32 => write!(out, "{}", imm.uint(i)).expect("String"),
             ImmType::Int32 => write!(out, "{}", imm.int(i)).expect("String"),
@@ -278,7 +289,7 @@ fn immediate(out: &mut String, index: u32, imm: &Immediate) {
     out.push_str("}\n");
 }
 
-fn instruction(out: &mut String, index: u32, indent: &mut i32, inst: &Instruction) {
+fn instruction(out: &mut String, index: u32, indent: &mut i32, inst: &Instruction, exact: bool) {
     let info = inst.opcode.info();
     write!(out, "{index:>3}: ").expect("String");
     *indent -= i32::from(info.pre_dedent);
@@ -289,6 +300,9 @@ fn instruction(out: &mut String, index: u32, indent: &mut i32, inst: &Instructio
     out.push_str(info.mnemonic);
     if inst.saturate {
         out.push_str("_SAT");
+    }
+    if exact && inst.precise {
+        out.push_str("_PRECISE");
     }
     let mut first = true;
     for d in inst.dsts() {
@@ -366,6 +380,16 @@ fn instruction(out: &mut String, index: u32, indent: &mut i32, inst: &Instructio
 /// `tgsi_dump` with no flags: the program as the C prints it, one line per token, ending in a
 /// newline.
 pub fn dump(shader: &Shader) -> String {
+    print(shader, false)
+}
+
+/// [`dump`], but read back by `text::parse` into the same program: instructions keep their
+/// `_PRECISE` suffix and float immediates print exactly.
+pub fn dump_exact(shader: &Shader) -> String {
+    print(shader, true)
+}
+
+fn print(shader: &Shader, exact: bool) -> String {
     let mut out = String::new();
     out.push_str(shader.processor.name());
     out.push('\n');
@@ -375,11 +399,11 @@ pub fn dump(shader: &Shader) -> String {
             Token::Declaration(d) => declaration(&mut out, shader.processor, d),
             Token::Property(p) => property(&mut out, p),
             Token::Immediate(i) => {
-                immediate(&mut out, immno, i);
+                immediate(&mut out, immno, i, exact);
                 immno += 1;
             }
             Token::Instruction(i) => {
-                instruction(&mut out, instno, &mut indent, i);
+                instruction(&mut out, instno, &mut indent, i, exact);
                 instno += 1;
             }
         }
@@ -439,6 +463,37 @@ IMM[2] FLT64 {1.50000000, -0.25000000}
             dump(&s),
             "GEOM\nPROPERTY GS_INPUT_PRIMITIVE TRIANGLES\nDCL IN[][0], POSITION\n  0: END\n"
         );
+    }
+
+    /// What the C's spelling drops -- a precise instruction, an immediate past four decimals, a
+    /// double past eight -- survives the exact dump: it parses back into the same program.
+    #[test]
+    fn an_exact_dump_reads_back_into_the_same_program() {
+        let text = "FRAG
+DCL OUT[0], COLOR
+DCL TEMP[0]
+IMM[0] FLT32 {    0.0039,    1.0000,    0.0000,    0.0000}
+IMM[1] FLT64 {0.10000000, 0.00000000}
+  0: MUL_PRECISE TEMP[0], IMM[0].xxxx, IMM[0].yyyy
+  1: MOV OUT[0], TEMP[0]
+  2: END
+";
+        let mut s = text::parse(text.as_bytes(), 1000).expect("parses");
+        // Values the C's spelling rounds: 1/256, and the double just past 0.1.
+        let mut imms = s.tokens.iter_mut().filter_map(|t| match t {
+            Token::Immediate(imm) => Some(imm),
+            _ => None,
+        });
+        imms.next().expect("IMM[0]").data[0] = 0.003_906_25f32.to_bits();
+        let bits = 0.1f64.to_bits() + 1;
+        let double = imms.next().expect("IMM[1]");
+        double.data[0] = bits as u32;
+        double.data[1] = (bits >> 32) as u32;
+        let exact = dump_exact(&s);
+        assert!(exact.contains("MUL_PRECISE"), "{exact}");
+        assert!(!dump(&s).contains("_PRECISE"), "the C's spelling drops it");
+        let back = text::parse(exact.as_bytes(), 1000).expect("the exact dump parses");
+        assert_eq!(back, s, "{exact}");
     }
 
     #[test]
