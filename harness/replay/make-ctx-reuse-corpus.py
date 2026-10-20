@@ -137,6 +137,9 @@ def build():
     for h in (RES_FIRST, RES_SECOND):
         c.unref(h)
     c.submit()
+    # The second process exits too, as every process in a test session does: a stream can end
+    # with no context alive, and the rebuild gate has to say it skipped them rather than fail.
+    c.ctx_destroy()
     return c
 
 

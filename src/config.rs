@@ -193,3 +193,16 @@ impl CapsetId {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `raw` undoes `from_raw` for every id a guest can name, the unnamed ones included.
+    #[test]
+    fn every_capset_id_round_trips() {
+        for id in 0..=u8::MAX {
+            assert_eq!(CapsetId::from_raw(id).raw(), id);
+        }
+    }
+}

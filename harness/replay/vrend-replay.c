@@ -1451,6 +1451,18 @@ int main(int argc, char **argv)
       sweep = true;
 
    for (int loop = 0; loop < loops; loop++) {
+      /* Every loop starts as the first did, each listed context fresh: a version-3 stream can
+       * end with all of them destroyed, and a second pass into dead contexts replays nothing. */
+      if (loop > 0 && ctx_lifecycle) {
+         for (int i = 0; i < n_ctx; i++) {
+            uint16_t id = (uint16_t)ctx_list[i];
+            if (ctx_live[id])
+               virgl_renderer_context_destroy(id);
+            ctx_live[id] = !context_open(id, name);
+            if (!ctx_live[id])
+               fprintf(stderr, "context_create %u for loop %d failed\n", id, loop);
+         }
+      }
       uint32_t next_res = 0;
       /* Batch assembly: CMD records between two SUBMITs form one submit_cmd call. */
       uint32_t *batch = NULL;
@@ -1775,8 +1787,11 @@ int main(int argc, char **argv)
              * "Illegal resource" as a handle the context has never heard of. */
             if (r->kind != RES_BLOB)
                virgl_renderer_resource_attach_iov((int)r->handle, b->iovs, b->num_iovs);
+            /* Only to the contexts that are up: a version-3 stream destroys contexts, and a
+             * destroyed one is recreated with every live resource attached anyway. */
             for (int i = 0; i < n_ctx; i++)
-               virgl_renderer_ctx_attach_resource(ctx_list[i], (int)r->handle);
+               if (ctx_live[(uint16_t)ctx_list[i]])
+                  virgl_renderer_ctx_attach_resource(ctx_list[i], (int)r->handle);
             /* After the attach, which is what gives vrend the resource a transfer can reach. */
             /* Not a planar YUV one. Zeroing writes at four bytes per texel, which is what
              * every format this scores actually is -- but a planar resource cannot take a
@@ -1881,6 +1896,13 @@ int main(int argc, char **argv)
    if (rebuild) {
       for (int i = 0; i < n_ctx; i++) {
          uint32_t src = (uint32_t)ctx_list[i];
+         /* A context the stream destroyed has no journal left to export: the guest's own
+          * teardown already took it. Said, one line per context, so a skip is never mistaken
+          * for a pass. */
+         if (!ctx_live[(uint16_t)src]) {
+            printf("rebuild: ctx %u skipped: the stream destroyed it\n", src);
+            continue;
+         }
          void *a = NULL; uint64_t a_len = 0;
          int rc = virgl_renderer_limina_journal_export(src, &a, &a_len);
          if (rc) {
