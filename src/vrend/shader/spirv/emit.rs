@@ -201,11 +201,13 @@ struct Sampler {
     ret: Ty,
 }
 
-/// The structured construct an open `IF` or `UIF` is in.
-struct Selection {
-    else_label: Id,
-    merge: Id,
-    in_else: bool,
+/// A structured construct the shader has opened and not yet closed.
+enum Construct {
+    /// An `IF` or `UIF`.
+    Selection { else_label: Id, merge: Id, in_else: bool },
+    /// A `BGNLOOP`: its header, where every iteration starts; the block `CONT` and the end of
+    /// the body branch to; and the block after the loop, where `BRK` goes.
+    Loop { header: Id, continue_target: Id, merge: Id },
 }
 
 struct Emitter<'a> {
@@ -222,14 +224,21 @@ struct Emitter<'a> {
     regs: BTreeMap<(u8, i16), Id>,
     /// Inputs, loaded at their use.
     inputs: BTreeMap<i16, Id>,
+    /// Address registers, each one `int` as the GLSL's `addr<n>` is.
+    addrs: BTreeMap<i16, Id>,
     outputs: BTreeMap<i16, Sink>,
     immediates: Vec<Id>,
     /// The constant array and how many `uvec4` it holds.
     consts: Option<(Id, u32)>,
-    flow: Vec<Selection>,
+    flow: Vec<Construct>,
     early_fragment_tests: bool,
     /// `FS_COLOR0_WRITES_ALL_CBUFS`: colour 0 goes to every draw buffer the host has.
     write_all_cbufs: bool,
+    /// `FS_COORD_ORIGIN` and `FS_COORD_PIXEL_CENTER`, which decide how `gl_FragCoord` reads.
+    fs_lower_left_origin: bool,
+    fs_integer_pixel_center: bool,
+    /// The fragment position input, which the two above shape.
+    frag_coord: Option<Id>,
     /// The `VirglBlock`, declared on the first read of it.
     sysvals: Option<Id>,
     /// Each sampler view's declared return type, by slot.
@@ -337,12 +346,16 @@ impl<'a> Emitter<'a> {
             interface: Vec::new(),
             regs: BTreeMap::new(),
             inputs: BTreeMap::new(),
+            addrs: BTreeMap::new(),
             outputs: BTreeMap::new(),
             immediates: Vec::new(),
             consts: None,
             flow: Vec::new(),
             early_fragment_tests: false,
             write_all_cbufs: false,
+            fs_lower_left_origin: false,
+            fs_integer_pixel_center: false,
+            frag_coord: None,
             sysvals: None,
             views: BTreeMap::new(),
             samplers: BTreeMap::new(),
@@ -417,7 +430,14 @@ impl<'a> Emitter<'a> {
             },
             File::Input => self.declare_input(d),
             File::Output => self.declare_output(d),
-            File::Address => decline("address registers"),
+            File::Address => {
+                let ptr = self.m.type_pointer(StorageClass::Function, self.t.int);
+                for i in d.first..=d.last {
+                    let var = self.f.variable(&mut self.m, ptr);
+                    self.addrs.insert(i as i16, var);
+                }
+                Ok(())
+            }
             File::Sampler => Ok(()),
             File::SamplerView => {
                 for slot in d.first..=d.last {
@@ -441,6 +461,13 @@ impl<'a> Emitter<'a> {
                 // A vertex attribute's location is its register index, which is where the GLSL
                 // path's `glBindAttribLocation` puts `in_<index>`.
                 Processor::Vertex => self.m.decorate(var, Decoration::Location, &[u32::from(i)]),
+                Processor::Fragment if d.has_semantic && d.semantic.name == Semantic::Position => {
+                    if self.frag_coord.is_some() {
+                        return decline("two fragment position inputs");
+                    }
+                    self.m.builtin(var, BuiltIn::FragCoord);
+                    self.frag_coord = Some(var);
+                }
                 Processor::Fragment => {
                     if !d.has_semantic || d.semantic.name != Semantic::Generic {
                         return decline("a fragment input other than a generic varying");
@@ -525,8 +552,14 @@ impl<'a> Emitter<'a> {
 
     fn property(&mut self, p: &tgsi::PropertyToken) -> Result<()> {
         match p.name {
-            // Read only through `gl_FragCoord`, which this emitter does not declare.
-            Property::FsCoordOrigin | Property::FsCoordPixelCenter => Ok(()),
+            Property::FsCoordOrigin => {
+                self.fs_lower_left_origin = p.data != 0;
+                Ok(())
+            }
+            Property::FsCoordPixelCenter => {
+                self.fs_integer_pixel_center = p.data != 0;
+                Ok(())
+            }
             Property::NextShader | Property::MulZeroWins => Ok(()),
             Property::FsEarlyDepthStencil => {
                 self.early_fragment_tests = p.data != 0;
@@ -626,9 +659,8 @@ impl<'a> Emitter<'a> {
             Texture::Array2d => (Dim::Dim2D, true),
             _ => return decline("a texture target this emitter does not sample"),
         };
-        let Some(&ret) = self.views.get(&slot) else {
-            return decline("a sampler with no view declared");
-        };
+        // A sampler with no view declared is a float one, as the GLSL's record defaults to.
+        let ret = self.views.get(&slot).copied().unwrap_or(ReturnType::Unorm);
         let (ret, scalar) = match ret {
             ReturnType::Sint => (Ty::Int, self.t.int),
             ReturnType::Uint => (Ty::Uint, self.t.uint),
@@ -744,10 +776,22 @@ impl<'a> Emitter<'a> {
 
     // ---- operands -----------------------------------------------------------------------
 
+    /// The value of address register `index`.
+    fn addr(&mut self, file: File, index: i16) -> Result<Id> {
+        if file != File::Address {
+            return decline("an indirect index not in an address register");
+        }
+        let Some(&var) = self.addrs.get(&index) else {
+            return decline("a read of an undeclared address register");
+        };
+        let int = self.t.int;
+        Ok(self.op(Op::Load, int, &[var]))
+    }
+
     /// The register `src` names, as raw words, before its swizzle.
     fn load_raw(&mut self, src: &Src, num_consts: u32) -> Result<Id> {
-        if src.indirect {
-            return decline("an indirectly addressed source");
+        if src.indirect && src.file != File::Constant {
+            return decline("an indirectly addressed source outside the constants");
         }
         let uvec4 = self.t.uvec4;
         match src.file {
@@ -761,6 +805,16 @@ impl<'a> Emitter<'a> {
                 };
                 let vec4 = self.t.vec4;
                 let mut v = self.op(Op::Load, vec4, &[var]);
+                // GLES has no `gl_FragCoord` layout, so the GLSL offsets an integer pixel centre
+                // by hand; desktop GL declares it (`frag_coord_modes`).
+                if Some(var) == self.frag_coord
+                    && self.cfg.is_gles()
+                    && self.fs_integer_pixel_center
+                {
+                    let (half, zero) = (self.float(0.5), self.float(0.0));
+                    let offset = self.m.constant_composite(vec4, &[half, half, zero, zero]);
+                    v = self.op(Op::FSub, vec4, &[v, offset]);
+                }
                 // An attribute whose format the host stores swapped (BGRA) is read back through
                 // `.zyxw` before the source's own swizzle, as the GLSL does.
                 if self.processor == Processor::Vertex
@@ -785,13 +839,24 @@ impl<'a> Emitter<'a> {
                 if src.dimension && src.dim.indirect {
                     return decline("an indirectly addressed constant buffer");
                 }
-                let index = u32::try_from(src.index).unwrap_or(u32::MAX);
-                if index >= num_consts {
-                    return decline("a constant past the declared ones");
-                }
                 let var = self.constants(num_consts);
                 let ptr = self.m.type_pointer(StorageClass::UniformConstant, uvec4);
-                let i = self.int(index as i32);
+                let i = if src.indirect {
+                    // `const0[addr<n> + index]`, unchecked as the GLSL's is.
+                    if num_consts == 0 {
+                        return decline("an indirect read of no constants");
+                    }
+                    let base = self.addr(src.ind.file, src.ind.index)?;
+                    let offset = self.int(i32::from(src.index));
+                    let int = self.t.int;
+                    self.op(Op::IAdd, int, &[base, offset])
+                } else {
+                    let index = u32::try_from(src.index).unwrap_or(u32::MAX);
+                    if index >= num_consts {
+                        return decline("a constant past the declared ones");
+                    }
+                    self.int(index as i32)
+                };
                 let p = self.op(Op::AccessChain, ptr, &[var, i]);
                 Ok(self.op(Op::Load, uvec4, &[p]))
             }
@@ -1168,32 +1233,74 @@ impl<'a> Emitter<'a> {
                 self.f.op_void(Op::SelectionMerge, &[merge.word(), 0]);
                 self.f.op_void(Op::BranchConditional, &[c.word(), then.word(), else_label.word()]);
                 self.f.label(then);
-                self.flow.push(Selection { else_label, merge, in_else: false });
+                self.flow.push(Construct::Selection { else_label, merge, in_else: false });
                 Ok(())
             }
             Else => {
-                let Some(sel) = self.flow.last_mut() else {
+                let Some(Construct::Selection { else_label, merge, in_else }) =
+                    self.flow.last_mut()
+                else {
                     return decline("an ELSE outside an IF");
                 };
-                if sel.in_else {
+                if *in_else {
                     return decline("two ELSEs in one IF");
                 }
-                sel.in_else = true;
-                let (else_label, merge) = (sel.else_label, sel.merge);
+                *in_else = true;
+                let (else_label, merge) = (*else_label, *merge);
                 self.f.op_void(Op::Branch, &[merge.word()]);
                 self.f.label(else_label);
                 Ok(())
             }
             Endif => {
-                let Some(sel) = self.flow.pop() else {
+                let Some(Construct::Selection { else_label, merge, in_else }) = self.flow.pop()
+                else {
                     return decline("an ENDIF outside an IF");
                 };
-                self.f.op_void(Op::Branch, &[sel.merge.word()]);
-                if !sel.in_else {
-                    self.f.label(sel.else_label);
-                    self.f.op_void(Op::Branch, &[sel.merge.word()]);
+                self.f.op_void(Op::Branch, &[merge.word()]);
+                if !in_else {
+                    self.f.label(else_label);
+                    self.f.op_void(Op::Branch, &[merge.word()]);
                 }
-                self.f.label(sel.merge);
+                self.f.label(merge);
+                Ok(())
+            }
+            // `while (true) { ... }`, as the GLSL spells a TGSI loop.
+            Bgnloop => {
+                let (header, body) = (self.m.id(), self.m.id());
+                let (continue_target, merge) = (self.m.id(), self.m.id());
+                self.f.op_void(Op::Branch, &[header.word()]);
+                self.f.label(header);
+                self.f.op_void(Op::LoopMerge, &[merge.word(), continue_target.word(), 0]);
+                self.f.op_void(Op::Branch, &[body.word()]);
+                self.f.label(body);
+                self.flow.push(Construct::Loop { header, continue_target, merge });
+                Ok(())
+            }
+            Endloop => {
+                let Some(Construct::Loop { header, continue_target, merge }) = self.flow.pop()
+                else {
+                    return decline("an ENDLOOP outside a loop");
+                };
+                self.f.op_void(Op::Branch, &[continue_target.word()]);
+                self.f.label(continue_target);
+                self.f.op_void(Op::Branch, &[header.word()]);
+                self.f.label(merge);
+                Ok(())
+            }
+            Brk | Cont => {
+                let target = self.flow.iter().rev().find_map(|c| match c {
+                    Construct::Loop { continue_target, merge, .. } => {
+                        Some(if inst.opcode == Brk { *merge } else { *continue_target })
+                    }
+                    Construct::Selection { .. } => None,
+                });
+                let Some(target) = target else {
+                    return decline("a BRK or CONT outside a loop");
+                };
+                self.f.op_void(Op::Branch, &[target.word()]);
+                // Whatever follows in the block is unreachable, and still needs a block to be in.
+                let dead = self.m.id();
+                self.f.label(dead);
                 Ok(())
             }
             Kill => {
@@ -1226,6 +1333,36 @@ impl<'a> Emitter<'a> {
                 Ok(())
             }
             Tex | Txb | Txl | Txf | Txq => self.texture(inst, num_consts),
+            // `addr<n> = int(floor(src))` and `addr<n> = int(src)`, of the one channel the
+            // instruction writes.
+            Arl | Uarl => {
+                let dst = inst.dst[0];
+                if dst.file != File::Address || dst.indirect {
+                    return decline("an address load to a register not an address");
+                }
+                let Some(&var) = self.addrs.get(&dst.index) else {
+                    return decline("a write to an undeclared address register");
+                };
+                let mask = u32::from(dst.writemask & 0xf);
+                if mask.count_ones() != 1 {
+                    return decline("an address load writing other than one channel");
+                }
+                let channel = mask.trailing_zeros();
+                let int = self.t.int;
+                let value = if inst.opcode == Arl {
+                    let a = s!(0, Ty::Float);
+                    let float = self.t.float;
+                    let x =
+                        self.f.op(&mut self.m, Op::CompositeExtract, float, &[a.word(), channel]);
+                    let x = self.ext(float, std450::FLOOR, &[x]);
+                    self.op(Op::ConvertFToS, int, &[x])
+                } else {
+                    let a = s!(0, Ty::Int);
+                    self.f.op(&mut self.m, Op::CompositeExtract, int, &[a.word(), channel])
+                };
+                self.f.op_void(Op::Store, &[var.word(), value.word()]);
+                Ok(())
+            }
             End => {
                 if !self.flow.is_empty() {
                     return decline("an END inside an IF");
@@ -1372,6 +1509,18 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// The `gl_FragCoord` layout the GLSL declares on desktop GL (`emit_ios_fs`): the upper-left
+    /// origin when the shader's and the framebuffer's origins agree, so the two flips cancel, and
+    /// the integer pixel centre as the shader asks. GLES declares neither, and offsets the centre
+    /// by hand where it is read.
+    fn frag_coord_modes(&self) -> (bool, bool) {
+        if self.cfg.is_gles() {
+            return (false, false);
+        }
+        let upper_left = self.fs_lower_left_origin == self.key.fs.lower_left_origin;
+        (upper_left, self.fs_integer_pixel_center)
+    }
+
     /// Colour 0's value to every other draw buffer the host has, as the GLSL's
     /// `fsout_c<i> = fsout_c0` does.
     fn copy_to_every_cbuf(&mut self, v: Id) {
@@ -1412,6 +1561,7 @@ impl<'a> Emitter<'a> {
         self.write_outputs()?;
         self.f.op_void(Op::Return, &[]);
         let main = self.f.id;
+        let frag_coord_modes = self.frag_coord_modes();
         let model = match self.processor {
             Processor::Vertex => ExecutionModel::Vertex,
             _ => ExecutionModel::Fragment,
@@ -1420,8 +1570,16 @@ impl<'a> Emitter<'a> {
         m.end_function(f);
         m.entry_point(model, main, "main", &interface);
         if model == ExecutionModel::Fragment {
-            // GL's default; this emitter declares no gl_FragCoord for the choice to show in.
-            m.execution_mode(main, ExecutionMode::OriginLowerLeft, &[]);
+            let (upper_left, integer_center) = frag_coord_modes;
+            let origin = if upper_left {
+                ExecutionMode::OriginUpperLeft
+            } else {
+                ExecutionMode::OriginLowerLeft
+            };
+            m.execution_mode(main, origin, &[]);
+            if integer_center {
+                m.execution_mode(main, ExecutionMode::PixelCenterInteger, &[]);
+            }
             if early_fragment_tests {
                 m.execution_mode(main, ExecutionMode::EarlyFragmentTests, &[]);
             }
