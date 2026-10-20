@@ -386,6 +386,12 @@ impl Vrend {
         let gl = gl.reading(robust);
         let limits = Limits::query(&gl, &features);
         let shader_cfg = shader::Config::probe(&gl, &features, &limits);
+        // Said once, as a property of the host: whether the translator could hand it SPIR-V
+        // rather than GLSL text (limina's docs/design/vrend-spirv.md). Nothing uses the answer yet.
+        match shader::spirv::probe::probe(&gl) {
+            Ok(()) => eprintln!("[virglrs] vrend: the host takes SPIR-V shaders"),
+            Err(why) => eprintln!("[virglrs] vrend: the host takes no SPIR-V shaders ({why})"),
+        }
         let formats = Table::probe(&gl, &features);
         let video = config.video.then(decode::Support::probe);
         if let Some(support) = video {

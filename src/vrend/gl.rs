@@ -393,6 +393,12 @@ mod procs {
         = gles [try_glTexBufferRange, try_glTexBufferRangeEXT, try_glTexBufferRangeOES], gl [try_glTexBufferRange]);
     resolver!(clear_tex_sub_image: unsafe extern "C" fn(GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, *const c_void)
         = gles [try_glClearTexSubImageEXT], gl [try_glClearTexSubImage]);
+    // No GLES has a SPIR-V entry point; our host Mesa's GLES dispatch carries this one
+    // (limina's docs/design/vrend-spirv.md §4), and an unpatched driver answers the name with a
+    // stub that raises an error -- which is why SPIR-V is a functional probe, not a feature.
+    resolver!(specialize_shader: unsafe extern "C" fn(GLuint, *const GLchar, GLuint, *const GLuint, *const GLuint)
+        = gles [try_glSpecializeShader, try_glSpecializeShaderARB],
+          gl [try_glSpecializeShader, try_glSpecializeShaderARB]);
     resolver!(bind_frag_data_location_indexed: unsafe extern "C" fn(GLuint, GLuint, GLuint, *const GLchar)
         = gles [try_glBindFragDataLocationIndexedEXT], gl [try_glBindFragDataLocationIndexed]);
     resolver!(draw_arrays_instanced_base_instance: unsafe extern "C" fn(GLenum, GLint, GLsizei, GLsizei, GLuint)
@@ -2467,6 +2473,71 @@ impl Gl {
         };
         log.truncate(written.max(0) as usize);
         Err(String::from_utf8_lossy(&log).into_owned())
+    }
+
+    /// The binary formats `glShaderBinary` takes here (`GL_SHADER_BINARY_FORMATS`).
+    pub fn shader_binary_formats(&self) -> Vec<GLenum> {
+        let n = usize::try_from(self.get_integer(GL_NUM_SHADER_BINARY_FORMATS)).unwrap_or(0);
+        let mut formats: Vec<GLint> = vec![0; n];
+        if n != 0 {
+            // SAFETY: `GL_SHADER_BINARY_FORMATS` writes `GL_NUM_SHADER_BINARY_FORMATS` integers,
+            // and `formats` holds that many.
+            unsafe { self.t.glGetIntegerv()(GL_SHADER_BINARY_FORMATS, formats.as_mut_ptr()) };
+        }
+        formats.into_iter().map(|f| f as GLenum).collect()
+    }
+
+    /// `glShaderBinary` with a SPIR-V module, then `glSpecializeShader` at its `main` with no
+    /// specialization constants, and what the driver said when it refused either.
+    pub fn load_spirv(&self, shader: ShaderName, words: &[u32]) -> Result<(), String> {
+        let Some(specialize) = procs::specialize_shader(&self.t, self.api) else {
+            return Err("no glSpecializeShader".to_string());
+        };
+        self.drain_errors();
+        let bytes =
+            GLsizei::try_from(std::mem::size_of_val(words)).expect("a module fits a GLsizei");
+        // SAFETY: one shader name, and the module's bytes with their length given, so the driver
+        // reads exactly `words`.
+        unsafe {
+            self.t.glShaderBinary()(
+                1,
+                &shader.0,
+                GL_SHADER_BINARY_FORMAT_SPIR_V,
+                words.as_ptr().cast(),
+                bytes,
+            )
+        };
+        let err = self.drain_errors();
+        if err != GL_NO_ERROR {
+            return Err(format!("glShaderBinary raised 0x{err:04x}"));
+        }
+        // SAFETY: a NUL-terminated entry point name live for the call, and no constants, so the
+        // two arrays are never read.
+        unsafe { specialize(shader.0, c"main".as_ptr(), 0, std::ptr::null(), std::ptr::null()) };
+        let err = self.drain_errors();
+        let mut status: GLint = 0;
+        // SAFETY: `GL_COMPILE_STATUS` writes exactly one integer.
+        unsafe { self.t.glGetShaderiv()(shader.0, GL_COMPILE_STATUS, &mut status) };
+        if err == GL_NO_ERROR && status != 0 {
+            return Ok(());
+        }
+        let mut log = vec![0u8; 65536];
+        let mut written: GLsizei = 0;
+        // SAFETY: the driver writes at most the capacity given, NUL included, and reports how
+        // many bytes it wrote without the NUL.
+        unsafe {
+            self.t.glGetShaderInfoLog()(
+                shader.0,
+                log.len() as GLsizei,
+                &mut written,
+                log.as_mut_ptr().cast::<GLchar>(),
+            )
+        };
+        log.truncate(written.max(0) as usize);
+        Err(format!(
+            "glSpecializeShader raised 0x{err:04x}, compile status {status}: {}",
+            String::from_utf8_lossy(&log)
+        ))
     }
 
     // ---- programs ----
