@@ -19,6 +19,7 @@
 //! member, so the three are separate fields here and compare the same.
 
 pub mod glsl;
+pub mod keytext;
 
 use super::features::{Feature, Features};
 use super::gl::Gl;

@@ -578,10 +578,18 @@ fn translate(
     };
     let exact = host.debug.enabled(debug::Switch::ShaderExact);
     let log = exact || host.debug.enabled(debug::Switch::Shader);
-    if log {
-        let tgsi = &program.tgsi.shader;
-        let text = if exact { tgsi::dump::dump_exact(tgsi) } else { tgsi::dump::dump(tgsi) };
-        eprint!("TGSI received:\n{text}\n");
+    if exact {
+        // Every other input of the translation follows the program, so a fixture translates the
+        // block under what produced its GLSL rather than under guesses rebuilt from that GLSL.
+        eprint!(
+            "TGSI received:\n{}CFG: {}\nKEY: {}\nSO: {}\nLOCAL_MEM: {req_local_mem}\n\n",
+            tgsi::dump::dump_exact(&program.tgsi.shader),
+            shader::keytext::print_config(host.shader_cfg),
+            shader::keytext::print_key(&key),
+            shader::keytext::print_stream_output(so_info),
+        );
+    } else if log {
+        eprint!("TGSI received:\n{}\n", tgsi::dump::dump(&program.tgsi.shader));
     }
     match shader::convert(host.shader_cfg, &program.tgsi, req_local_mem, &key, so_info) {
         Ok((strings, info, var_info)) => {

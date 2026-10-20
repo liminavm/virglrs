@@ -13,7 +13,8 @@ pub enum Switch {
     Shader,
     /// `shader`, with the TGSI printed exactly ([`crate::vrend::tgsi::dump::dump_exact`]) rather
     /// than in the C's lossy spelling: what a fixture is recorded from, so its TGSI translates to
-    /// what the guest's did. Its log no longer diffs against the C's on the TGSI half.
+    /// what the guest's did, followed by the key and stream output it was translated under
+    /// (`shader::keytext`). Its log no longer diffs against the C's on the TGSI half.
     ShaderExact,
     /// Every resource as it comes and goes at the C ABI, and every miss when one is asked for.
     ///
