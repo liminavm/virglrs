@@ -99,7 +99,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 - `make-teardown-corpus.py` — writes a synthetic classic corpus that destroys a program and a
   sub-context while the renderer still holds them (see `fixtures/teardown.score` below).
 - `make-ctx-reuse-corpus.py` — writes a version-3 classic corpus in which a faulted context is
-  destroyed and a new one created on its id (see `fixtures/ctx-reuse.score` below).
+  destroyed and a new one created on its id (see `fixtures/ctx-reuse.score` below). It is not in
+  `corpora.toml` yet, so `vrend-replay.sh` cannot fetch it: run the script first.
 - `make-sampler-corpus.py` — writes a synthetic classic corpus that changes only the sampler
   state between draws through one view, by a bind and then by a destroy (see
   `fixtures/sampler.score` below).
@@ -672,22 +673,30 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   corpora, replayed on all their contexts -- with UBOs, indirect addressing, compute and images
   the old fixture lacks. `tgsi_dump`'s spelling drops `_PRECISE` and rounds float immediates to
   four decimals, which changes what 68 of them translate to. So each block carries the C's dump,
-  which the parser is held to, and after `TGSI exact:` the Rust leg's
-  `VIRGLRS_DEBUG=shader-exact` print of the same shader, which the translator is given; the
-  GLSL is the C's, block for block from the same replay (the two GLSL logs were identical). The host was GLES 3.2 on zink with KosmicKrisp's
-  geometry shaders on, so the blocks say `320 es` and the test's configuration has
-  noperspective interpolation.
+  which the parser is held to, then after `TGSI exact:` the Rust leg's
+  `VIRGLRS_DEBUG=shader-exact` print of the same shader, which the translator is given, then the
+  C's GLSL, block for block from the same replay (the two legs' GLSL logs were identical). The
+  host was GLES 3.2 on zink with KosmicKrisp's geometry shaders on, so the blocks say `320 es`
+  and the test's configuration has noperspective interpolation.
   `vrend-shaders-piglit.txt` is the same shape over a piglit session: 1,343 tests across UBOs,
   SSBOs, atomic counters, image load/store, compute, geometry and tessellation shaders, separate
   shader objects, transform feedback, texture buffers and variable indexing, recorded on the Rust
   leg in a stock F44 guest (limina's `spikes/vrend-spirv-gles/record-piglit.sh`) and replayed on
-  both legs with `--ctx 2,3,5,6`. The guest saw the Rust leg's caps, so the C refuses work it
+  both legs with `--ctx 2,3,5,6`. The guest saw the Rust leg's caps, so the C refuses work it was
   never offered (1,460 refused submits against the Rust leg's 35, which matches the seven faults
-  the live worker logged), and the legs' logs differ by those. The fixture keeps the 1,929
-  distinct blocks both legs translated alike, less the 375 whose key their own GLSL does not
-  reveal -- mostly geometry, tessellation and transform-feedback stages, whose key and stream
-  output come from neighbouring stages. 1,554 remain: 1,038 vertex, 353 fragment, 46 geometry,
-  49 tessellation-control, 54 tessellation-evaluation and 14 compute.
+  the live worker logged). 1,929 distinct blocks translated alike on both legs. **The fixture
+  holds the 1,554 of them the test already passed** -- 1,038 vertex, 353 fragment, 46 geometry,
+  49 tessellation-control, 54 tessellation-evaluation and 14 compute -- because `key_from_glsl`
+  rebuilds the key from the GLSL and the other 375 (mostly geometry, tessellation and
+  transform-feedback stages, whose key and stream output come from neighbouring stages) did not
+  translate under the key it rebuilt. That selection is the test's own verdict: the 1,554 are a
+  regression gate, and they say nothing about the 375, where a translator bug and an unreadable
+  key look the same. Logging the key beside each shader is what lets those in.
+  The 34 programs whose GLSL differs between the two legs are not in it either. Three of their
+  four kinds are this tree's deliberate GLES departures from the C, where the C is not the
+  golden: a read-write image as two declarations (2a9803c), integer fragment outputs for integer
+  targets (8370e35) and the rasterizer's fixed point size (74deca9). The fourth, 48 fragment
+  variants only the Rust leg built, is not yet tied to the C's refused submits.
   The test beside the GLES one holds the translator's desktop dialect to it; the live
   differential is the same replay, flags included, on the Rust side, where the Rust leg logs three variant blocks more than the C on either flavour, and none
   that differs.
