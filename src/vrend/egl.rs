@@ -148,6 +148,12 @@ pub trait GlContexts: Send + Sync {
     fn destroy(&self, ctx: EGLContext);
 }
 
+/// The reset notification attribute, as EGL 1.5 spells it for desktop GL and
+/// `EGL_EXT_create_context_robustness` for GLES, and the strategy that reports a reset.
+const EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY: EGLint = 0x31BD;
+const EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT: EGLint = 0x3138;
+const EGL_LOSE_CONTEXT_ON_RESET: EGLint = 0x31BF;
+
 /// A client API version to ask `eglCreateContext` for.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Version {
@@ -956,6 +962,17 @@ impl Winsys {
                 proc::EGL_CONTEXT_OPENGL_PROFILE_MASK as EGLint,
                 proc::EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT as EGLint,
             ]);
+        }
+        // Ask to be told when the driver resets this context for hanging the GPU, so the
+        // context's guest can be refused (`Fault::Reset`) rather than left to hang it again.
+        // EGL takes the request only with the robustness extension, spelt per API, and every
+        // context of a share group has to make the same one, which holds: all of ours do.
+        if self.has_extension("EGL_EXT_create_context_robustness") {
+            let strategy = match flavour {
+                Flavour::Gl => EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY,
+                Flavour::Gles => EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT,
+            };
+            attribs.extend([strategy, EGL_LOSE_CONTEXT_ON_RESET]);
         }
         attribs.push(proc::EGL_NONE as EGLint);
         // SAFETY: the display is initialised and the config chosen on it; `attribs` is
@@ -1930,6 +1947,31 @@ mod tests {
             .expect("a shared context");
         winsys.make_current(&second).expect("current");
         winsys.release_current().expect("released");
+    }
+
+    /// Every context vrend makes asks to be told when the driver resets it, on both flavours:
+    /// a context that does not is never told it hung the GPU, so its guest is never refused
+    /// and goes on hanging it (`Fault::Reset`).
+    #[test]
+    fn a_context_of_either_flavour_loses_itself_on_reset() {
+        use super::super::gl::gles;
+        let _display = crate::vrend::one_display_at_a_time();
+        for (flavour, version) in [
+            (Flavour::Gles, Version { major: 3, minor: 1 }),
+            (Flavour::Gl, Version { major: 3, minor: 3 }),
+        ] {
+            let winsys = Winsys::open(flavour).expect("the surfaceless display opens");
+            assert!(winsys.has_extension("EGL_EXT_create_context_robustness"), "{flavour:?}");
+            let ctx = winsys.create_context(version, None).expect("a robust context");
+            winsys.make_current(&ctx).expect("current");
+            let mut strategy = 0;
+            // SAFETY: a context is current on this thread, and the name writes one integer.
+            unsafe {
+                winsys.procs().glGetIntegerv()(gles::GL_RESET_NOTIFICATION_STRATEGY, &mut strategy)
+            };
+            assert_eq!(strategy as u32, gles::GL_LOSE_CONTEXT_ON_RESET, "{flavour:?}");
+            winsys.release_current().expect("released");
+        }
     }
 
     #[cfg(target_os = "macos")]

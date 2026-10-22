@@ -459,6 +459,12 @@ pub enum Fault {
         handle: ObjectHandle,
         lost: Box<Lost>,
     },
+    /// The host reset the context: work it submitted ran so long that the GPU had to be stopped,
+    /// more often than the host allows (zink's `ZINK_HANG_LIMIT`, on a driver that survives a
+    /// hang). Nothing it sends renders any more, and serving it would only hang the GPU again.
+    Reset {
+        status: GLenum,
+    },
 }
 
 /// A `CreateObject` a restore dropped, kept under the handle it would have made until the guest
@@ -473,6 +479,9 @@ impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Fault::Wire(r) => write!(f, "{r}"),
+            Fault::Reset { status } => {
+                write!(f, "the host reset this context for hanging the GPU (status {status:#x})")
+            }
             Fault::IllegalHandle { cmd, handle } => {
                 write!(f, "{}: no such object {handle}", cmd.name())
             }
@@ -1756,6 +1765,12 @@ impl Context {
             if self.replay.is_none() {
                 host.traces.stream.command(host.ctx, wire);
             }
+        }
+        // A context the host reset for hanging the GPU renders nothing more. Refusing it from here
+        // on is what keeps one guest application from restarting the host's GPU over and over.
+        let status = host.gl.reset_status();
+        if status != GL_NO_ERROR {
+            return self.poison(host.ctx, Fault::Reset { status });
         }
         Ok(())
     }

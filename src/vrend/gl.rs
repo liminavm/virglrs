@@ -655,6 +655,17 @@ impl Gl {
         first
     }
 
+    /// Whether the driver reset this context, and whose doing it says that was: `GL_NO_ERROR` when
+    /// it did not, or when the driver cannot say. Only a context created to lose itself on reset
+    /// is ever told (see [`super::egl::Winsys::create_context`]).
+    pub fn reset_status(&self) -> GLenum {
+        match self.t.try_glGetGraphicsResetStatus() {
+            // SAFETY: takes nothing and returns an enum.
+            Some(f) => unsafe { f() },
+            None => GL_NO_ERROR,
+        }
+    }
+
     pub fn get_integer(&self, name: GLenum) -> GLint {
         let mut v: GLint = 0;
         // SAFETY: every name this crate asks for writes exactly one integer.
