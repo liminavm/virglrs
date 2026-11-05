@@ -502,6 +502,16 @@ pub(super) fn emit_lodq(
 }
 
 /// `translate_tex`.
+/// The swizzle a sampler operand puts on its texel, as a GLSL suffix; empty for the identity.
+fn texel_swizzle(swizzle: [u8; 4]) -> String {
+    if swizzle == [0, 1, 2, 3] {
+        return String::new();
+    }
+    let mut s = String::from(".");
+    s.extend(swizzle.iter().map(|&c| ['x', 'y', 'z', 'w'][usize::from(c & 3)]));
+    s
+}
+
 pub(super) fn translate_tex(
     ctx: &mut Context<'_>,
     inst: &Instruction,
@@ -773,7 +783,12 @@ pub(super) fn translate_tex(
     let sampler = srcs[sampler_index].as_str();
     let dstconv = dinfo.dstconv.s();
     let dtp = dtypeprefix.s();
-    let wm_or_none = if dinfo.dst_override_no_wm[0] { "" } else { writemask };
+    // The sampler operand's swizzle selects channels of the fetched texel, the way
+    // `tgsi_to_nir` reads it; the operand's name never carries it (`translate_src`).
+    let texel_swizzle = texel_swizzle(inst.src[sampler_index].swizzle);
+    let writemask = format!("{texel_swizzle}{writemask}");
+    let writemask = writemask.as_str();
+    let wm_or_none = if dinfo.dst_override_no_wm[0] { texel_swizzle.as_str() } else { writemask };
 
     if inst.opcode == Opcode::Txf {
         if (gles && matches!(texture, Texture::D1 | Texture::Array1d))

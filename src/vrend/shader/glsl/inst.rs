@@ -1054,29 +1054,29 @@ fn get_source_info(
                 }
             }
             File::Sampler => {
+                // A sampler's swizzle is the texel's, which `translate_tex` applies: GLSL has no
+                // swizzle of a sampler.
                 let cname = proc_prefix(ctx.prog_type);
                 if ctx.info.is_indirect(File::Sampler) {
                     let basearrayidx = ctx.lookup_sampler_array(i32::from(src.index));
                     if src.indirect {
                         ctx.src_bufs[i] = format!(
-                            "{}samp{}[addr{}+{}]{}",
+                            "{}samp{}[addr{}+{}]",
                             cname,
                             basearrayidx,
                             src.ind.index,
-                            i32::from(src.index) - basearrayidx,
-                            swizzle
+                            i32::from(src.index) - basearrayidx
                         );
                     } else {
                         ctx.src_bufs[i] = format!(
-                            "{}samp{}[{}]{}",
+                            "{}samp{}[{}]",
                             cname,
                             basearrayidx,
-                            i32::from(src.index) - basearrayidx,
-                            swizzle
+                            i32::from(src.index) - basearrayidx
                         );
                     }
                 } else {
-                    ctx.src_bufs[i] = format!("{}samp{}{}", cname, src.index, swizzle);
+                    ctx.src_bufs[i] = format!("{}samp{}", cname, src.index);
                 }
                 // Scan refuses a sampler operand past the last slot, so this is never `None`.
                 let Some(sampler) = SamplerSlot::new(src.index) else {

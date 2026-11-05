@@ -1574,6 +1574,35 @@ mod tests {
     ///
     /// The in-range buffers are what make this about the operand's kind: a bound on the index
     /// alone admits them.
+    /// A sampler operand's swizzle selects channels of the fetched texel, as `tgsi_to_nir`
+    /// reads it. Mesa's video compositor (26.2) fetches alpha as `TEX TEMP.w, .., SAMP[0].wwww`;
+    /// a swizzle pasted onto the sampler's name is GLSL no driver compiles, and the refused
+    /// shader poisons the context, so every VA post-process came back cleared.
+    #[test]
+    fn a_swizzled_sampler_swizzles_the_texel() {
+        let tgsi = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL SAMP[0]\n\
+                    DCL SVIEW[0], 2D, FLOAT\nDCL TEMP[0]\n\
+                    \x20 0: TEX TEMP[0].x, IN[0], SAMP[0], 2D\n\
+                    \x20 1: TEX TEMP[0].w, IN[0], SAMP[0].wwww, 2D\n\
+                    \x20 2: TEX TEMP[0].y, IN[0], SAMP[0].zxyw, 2D\n\
+                    \x20 3: MOV OUT[0], TEMP[0]\n  4: END\n";
+        let shader = tgsi::text::parse(tgsi.as_bytes(), u32::MAX).expect("the shader parses");
+        let program = tgsi::Program::scan(shader).expect("the shader scans");
+        for cfg in [corpus_cfg(), desktop_corpus_cfg()] {
+            let (strings, _, _) =
+                convert(&cfg, &program, 0, &Key::default(), &StreamOutput::default())
+                    .unwrap_or_else(|e| panic!("{e}"));
+            let glsl = strings.source();
+            assert!(!glsl.contains("samp0."), "a swizzle on the sampler's name:\n{glsl}");
+            assert!(
+                glsl.contains("(vso_g0).xy).x)"),
+                "an identity sampler still fetches straight:\n{glsl}"
+            );
+            assert!(glsl.contains(".wwww.w)"), "the texel takes the sampler's swizzle:\n{glsl}");
+            assert!(glsl.contains(".zxyw.y)"), "the texel takes the sampler's swizzle:\n{glsl}");
+        }
+    }
+
     #[test]
     fn a_texture_instruction_whose_sampler_is_a_buffer_is_refused() {
         for (what, inst) in [
